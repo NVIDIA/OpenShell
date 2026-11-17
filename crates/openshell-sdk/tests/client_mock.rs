@@ -126,6 +126,8 @@ fn sandbox_with_phase_ws(
             resource_version: "7".to_string(),
         });
     proto::Sandbox {
+        created_by: String::new(),
+        parent: None,
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("id-{name}"),
             name: name.to_string(),

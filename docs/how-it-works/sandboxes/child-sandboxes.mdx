@@ -1,0 +1,130 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Child Sandboxes"
+sidebar-title: "Child Sandboxes"
+slug: "how-it-works/sandboxes/child-sandboxes"
+description: "Create sandboxes under a root sandbox, and let agents create and run sub-agents in them through MCP tools."
+keywords: "OpenShell, Sandboxes, Child Sandboxes, Sub-agents, MCP"
+---
+
+A child sandbox is an ordinary sandbox created under a root sandbox. It always runs under its parent's policy and can use only its parent's providers. Agents use child sandboxes to run sub-agents, each in its own sandbox, through a small set of MCP tools.
+
+<Note>
+Child sandboxes are experimental. A gateway operator enables them, and the MCP tools, with `experimental_enable_child_sandboxes`. Refer to [Gateway Configuration](/how-it-works/gateways/configuration#child-sandboxes).
+</Note>
+
+## Roots and Children
+
+A sandbox created without a parent is a root. A sandbox created with a parent is a child. Only a root can be a parent, so trees are one level deep: a child cannot have children of its own. Apart from the rules on this page, a child behaves like any other sandbox, with the same lifecycle and commands.
+
+## Create and List Children
+
+Create a child with `--parent` and the name of a root in the same workspace. Every other `sandbox create` option works as usual, except `--policy`.
+
+```shell
+openshell sandbox create --name lead --from codex-agent:local --provider openai --provider anthropic
+openshell sandbox create --name reviewer --parent lead --from claude-agent:local --provider anthropic
+```
+
+The gateway refuses a child of a child with `only one level of child sandboxes is supported`. When a root already has as many children as the gateway's `max_concurrent_children` allows, it refuses with `sandbox 'lead' has reached its limit of 10 children`. Every child counts whatever its state, and keeps its slot until its delete finishes. While one is still being deleted, the refusal says so and you can retry shortly.
+
+`sandbox list` adds a `PARENT` column when the page holds a child. A root shows `-`, and a child whose parent no longer exists shows `deleted (<id>)`. List one root's children with `--parent`:
+
+```shell
+openshell sandbox list --parent lead
+```
+
+## Policy
+
+A child always uses its parent's policy. When it is created, the gateway copies the policy the parent is enforcing into the child. When the parent loads a new policy, the gateway copies that version into each child and delivers it as it delivers any policy update. Until a child has the copy, the gateway refuses it configuration, so it has no new network access; this normally lasts seconds and at most about 30 seconds.
+
+You cannot give a child a policy of its own or change its policy. `sandbox create --parent` refuses `--policy` with `child sandboxes use their parent's policy; omit --policy`, and ignores `OPENSHELL_SANDBOX_POLICY` with a note. Policy updates, approvals and proposals for a child are refused. To change what a child can do, change its parent's policy.
+
+The parent's policy names the parent's filesystem paths, program paths and process user. A child that runs a different image, from `--from` or a template, needs the same user and folder layout as its parent's image. Paths the child's image lacks are skipped, which only removes access, so a child with a different layout can fail to start or find its programs denied. Read the child's startup errors and denials with `openshell logs` or the MCP `logs` tool.
+
+A child always fails closed. If it cannot load its copy, it denies all new network access. If its parent rejects a new policy under the `fail_closed` failure mode, the child is blocked as well, and no new children can be created, until the parent loads a fixed policy.
+
+## Providers
+
+A child can use only providers attached to its parent. Without `--provider`, a child gets all of its parent's providers. With `--provider`, it gets the ones you name, and naming one the parent does not have is refused with `provider 'github' is not attached to parent 'lead'`.
+
+When a provider is detached from the parent, every child stops receiving it at its next configuration update, and the gateway detaches it from the child too. A provider later attached to the parent reaches only children created after that.
+
+## Delete a Parent
+
+The gateway refuses to delete a root that still has children:
+
+```shell
+openshell sandbox delete lead
+```
+
+```text
+sandbox 'lead' has 3 child sandboxes; delete them first
+```
+
+Delete the children, then the parent:
+
+```shell
+openshell sandbox delete reviewer coder helper
+openshell sandbox delete lead
+```
+
+A child's results live only inside the child, so this keeps one command from deleting work nobody has collected. If a child's parent record is gone, for example after a failure, the gateway stops the child. You can still read its logs and delete it, but not start it again.
+
+## MCP Tools
+
+The gateway serves MCP tools at `/mcp` that create and manage sandboxes. Each tool call runs as the matching sandbox RPC, with the same authorization and gateway interceptors as a CLI call.
+
+| Tool | What it does |
+|---|---|
+| `create_sandbox` | Create a sandbox and wait until it is ready, up to 45 seconds. If it is not ready by then, the tool returns its current state with `timed_out: true`, not an error; call it again with the same name to keep waiting. Calling it again returns the existing sandbox with `already_existed: true`. |
+| `list` | List sandboxes and their state. |
+| `exec` | Run a command and return its exit code and output, or start a background job. |
+| `wait` | Wait for a background job, up to 40 seconds, and return its result. |
+| `delete` | Delete a sandbox. |
+| `logs` | Read a sandbox's own log lines, such as startup errors and policy denials. |
+
+### From Inside a Root Sandbox
+
+An agent in a root sandbox calls `http://openshell.local/mcp`. The sandbox's supervisor attaches the sandbox's credential, so the agent holds no token. A sandbox acts only on its own children:
+
+- `create_sandbox` takes a `name`, and optionally a `template` and `providers`. Without a template, the child copies the root's image, CPU and memory, but not a GPU or other device. A template must carry the label `openshell.ai/agent-usable: "true"` and have no driver configuration. The root's MCP tool list names the templates it may use, with their images, so the agent does not need to be told them. Either way, the child gets the root's runtime class and user namespace setting. Without `providers`, the child gets all of the root's.
+- A root created with driver configuration cannot create children through MCP.
+- `list`, `exec`, `wait`, `delete` and `logs` act only on the root's children. Any other name reads as not found.
+- A sandbox can have 8 requests to `openshell.local/mcp` open at once. Another one gets `503` with `too many gateway requests at once; try again`.
+- The root can create children only while the user who created it is a member of the workspace with at least the user role. A platform admin who is not a member must be added with `openshell workspace member add`. A gateway with no admin role configured treats every authenticated user as an admin and skips this check. A child the root creates records the root as its creator, as `sandbox:<id>`; a child you create with `--parent` records you.
+
+### From the Host
+
+`openshell mcp serve` runs a local MCP server over stdio that forwards each call to the active gateway with your CLI login. It uses the same connection and login as the CLI, including mTLS client certificates, and it refreshes an OIDC login for as long as it runs. Add it to your MCP client's configuration:
+
+```json
+{"mcpServers": {"openshell": {"command": "openshell", "args": ["mcp", "serve"]}}}
+```
+
+The tools act in the CLI's workspace. To use another workspace, add `"--workspace", "team"` to `args`. Through `openshell mcp serve` you can act on any sandbox the CLI lets you act on. `create_sandbox` takes `name`, `parent`, `image` and `providers`; use the CLI for other create options. The gateway refuses any `/mcp` request that a browser sends, so a web page cannot use your login.
+
+### Run Long Work
+
+Write agents with these behaviors in mind:
+
+- `exec` waits up to 30 seconds by default and 45 at most. A command that reaches its timeout is reported as timed out but can keep running in the sandbox. Deleting the sandbox stops it.
+- For longer work, such as running a harness, call `exec` with `background: true`. It returns a job id at once. Call `wait` with that id until `state` is `completed` or `lost`. `running` means call `wait` again.
+- A sandbox runs one background job at a time. Starting another while one runs is refused, and the error names the running job. Use more children for parallel work.
+- A job's result can be read until the next job starts in that sandbox. `wait` reports no output while the job runs; to watch progress, run `tail` on `/tmp/openshell/jobs/<n>/out` with `exec`, where `<n>` is the job id before its dash. This path may change while child sandboxes are experimental.
+- Jobs need a writable `/tmp`. A child uses its parent's filesystem policy, so the parent's policy must let `/tmp` be written. The default policy does.
+- Each output stream keeps its first and last 16 KiB.
+
+```text
+exec {name: "reviewer", command: ["claude", "-p", "Review the diff"], background: true}
+→ job: 1-9f2c41ab · running
+wait {name: "reviewer", job: "1-9f2c41ab"}
+→ completed · exit 0 · stdout: the review
+delete {name: "reviewer"}
+```
+
+## Next Steps
+
+- [Gateway Configuration](/how-it-works/gateways/configuration#child-sandboxes) covers the settings that enable child sandboxes and limit them.
+- [Sandbox Templates](/how-it-works/sandboxes/templates) covers creating the templates agents can use.

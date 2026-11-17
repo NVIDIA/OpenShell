@@ -159,7 +159,7 @@ impl DiscoveryState {
 }
 
 async fn cached_snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     workspace: &str,
 ) -> Result<ServiceRouteSnapshot, Status> {
     tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
@@ -388,7 +388,7 @@ async fn records(state: &ServerState, workspace: &str) -> Result<Vec<ObjectRecor
 }
 
 pub async fn snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     workspace: &str,
 ) -> Result<ServiceRouteSnapshot, Status> {
     tokio::time::timeout(SNAPSHOT_TIMEOUT, collect(state, workspace))
@@ -396,7 +396,10 @@ pub async fn snapshot(
         .map_err(|_| Status::unavailable("service discovery collection timed out"))?
 }
 
-async fn collect(state: &ServerState, workspace: &str) -> Result<ServiceRouteSnapshot, Status> {
+async fn collect(
+    state: &Arc<ServerState>,
+    workspace: &str,
+) -> Result<ServiceRouteSnapshot, Status> {
     let before = records(state, workspace).await?;
     if before.is_empty() {
         return finish_snapshot(Vec::new());
@@ -414,7 +417,7 @@ struct ValidatedInstallation {
 }
 
 async fn validate_installations(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     workspace: &str,
     inputs: &DiscoveryConfigInputs,
     before: Vec<ObjectRecord>,
@@ -441,7 +444,7 @@ async fn validate_installations(
 }
 
 async fn publish_installations(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     workspace: &str,
     inputs: &DiscoveryConfigInputs,
     validated: Vec<ValidatedInstallation>,

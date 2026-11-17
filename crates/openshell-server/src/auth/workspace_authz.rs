@@ -216,6 +216,26 @@ pub async fn authorize_workspace(
     }
 }
 
+/// Whether `subject` is a member of `workspace` with at least `min_role`.
+/// Platform admins are not recognized here: only the subject is known.
+pub async fn subject_has_workspace_role(
+    store: &Store,
+    workspace: &str,
+    subject: &str,
+    min_role: MinWorkspaceRole,
+) -> Result<bool, Status> {
+    let member = store
+        .get_message_by_name::<openshell_core::proto::WorkspaceMember>(workspace, subject)
+        .await
+        .map_err(|e| Status::internal(format!("membership lookup failed: {e}")))?;
+    Ok(member.is_some_and(|member| {
+        role_satisfies(
+            ProtoWorkspaceRole::try_from(member.role).unwrap_or(ProtoWorkspaceRole::Unspecified),
+            min_role,
+        )
+    }))
+}
+
 /// Used by `ExecSandbox`, `ForwardTcp`, `WatchSandbox`, `CreateSshSession` — these
 /// RPCs identify a sandbox by its canonical name within an explicit workspace.
 /// User requests authorize that workspace before lookup; sandbox principals

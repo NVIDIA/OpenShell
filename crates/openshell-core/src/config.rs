@@ -366,6 +366,14 @@ pub struct Config {
     /// [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
     pub mutation_replay_window_seconds: u32,
 
+    /// Allow creating child sandboxes under a root sandbox. Disabled by
+    /// default; turning it off blocks only new children.
+    pub enable_child_sandboxes: bool,
+
+    /// Maximum number of children one parent may have at once. Must be
+    /// between 0 and 1000, inclusive; 0 allows none.
+    pub max_concurrent_children: u32,
+
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
     /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
@@ -1097,6 +1105,8 @@ impl Config {
             provisioning_repair_window_seconds: 300,
             mutation_admission_limit_per_caller: DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER,
             mutation_replay_window_seconds: DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS,
+            enable_child_sandboxes: false,
+            max_concurrent_children: 10,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),

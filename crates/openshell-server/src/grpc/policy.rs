@@ -2868,12 +2868,22 @@ pub fn unadmitted_sandbox_config(
             .and_then(|status| status.configuration_admission.as_ref())
             .map_or_else(String::new, |admission| admission.instance_id.clone()),
         workspace: sandbox.object_workspace().to_string(),
-        policy_validation_failure_mode: state
-            .config
-            .policy_validation_failure_mode
-            .as_str()
-            .to_string(),
+        policy_validation_failure_mode: policy_failure_mode(state, sandbox).as_str().to_string(),
         ..Default::default()
+    }
+}
+
+/// The failure mode a sandbox's supervisor applies when it rejects a policy.
+/// Children always fail closed: a child keeping its previous copy could keep
+/// access its parent just lost.
+fn policy_failure_mode(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> openshell_core::PolicyValidationFailureMode {
+    if sandbox.parent.is_some() {
+        openshell_core::PolicyValidationFailureMode::FailClosed
+    } else {
+        state.config.policy_validation_failure_mode
     }
 }
 
@@ -2913,7 +2923,7 @@ pub(super) async fn load_sandbox_config(
 ///
 /// This is a read-only projection shared by polling and stream delivery.
 pub async fn build_sandbox_config_snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     sandbox: &Sandbox,
 ) -> Result<SandboxConfigSnapshot, Status> {
     let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
@@ -3082,7 +3092,7 @@ async fn build_sandbox_config_snapshot_with_sources(
         &settings,
         policy_source,
         &supervisor_middleware_services,
-        state.config.policy_validation_failure_mode,
+        policy_failure_mode(state, sandbox),
         state.extension_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
@@ -3139,11 +3149,7 @@ async fn build_sandbox_config_snapshot_with_sources(
         provider_env_revision,
         supervisor_middleware_services,
         workspace,
-        policy_validation_failure_mode: state
-            .config
-            .policy_validation_failure_mode
-            .as_str()
-            .to_string(),
+        policy_validation_failure_mode: policy_failure_mode(state, sandbox).as_str().to_string(),
         extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
         provider_attachment_epoch: sandbox
             .spec
@@ -3200,6 +3206,7 @@ pub async fn initialize_policy_history(
     store: &Store,
     sandbox: &Sandbox,
     status: InitialPolicyHistoryStatus,
+    provenance: HashMap<String, String>,
 ) -> Result<bool, Status> {
     let Some(policy) = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()) else {
         return Ok(false);
@@ -3226,7 +3233,7 @@ pub async fn initialize_policy_history(
                 load_error: None,
                 created_at_ms: current_time_ms(),
                 loaded_at_ms: None,
-                provenance: HashMap::new(),
+                provenance,
             },
             sandbox.object_workspace(),
         )
@@ -3264,6 +3271,7 @@ pub async fn backfill_legacy_policy_history(state: &Arc<ServerState>) -> Result<
                 state.store.as_ref(),
                 &sandbox,
                 InitialPolicyHistoryStatus::Loaded,
+                HashMap::new(),
             )
             .await
             {
@@ -3900,7 +3908,7 @@ pub(super) async fn load_sandbox_provider_environment(
 
 /// Build the complete provider environment for one persisted sandbox.
 pub async fn build_provider_environment_snapshot(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     sandbox: &Sandbox,
     supports_static_credential_bindings: bool,
     supports_stable_placeholder_environment_keys: bool,
@@ -4241,6 +4249,47 @@ pub(super) async fn handle_update_config(
     result
 }
 
+/// Why a child sandbox's own policy cannot be changed.
+const CHILD_POLICY_WRITE_REFUSED: &str =
+    "child sandboxes use their parent's policy; change the parent's policy instead";
+
+/// Refuse a caller's policy change on a child sandbox. Gateway-internal writes,
+/// such as copying the parent's policy, do not pass through here.
+fn refuse_child_policy_write(sandbox: &Sandbox) -> Result<(), Status> {
+    if sandbox.parent.is_some() {
+        return Err(Status::failed_precondition(CHILD_POLICY_WRITE_REFUSED));
+    }
+    Ok(())
+}
+
+/// Accept and drop a policy write from a child's own supervisor. The
+/// supervisor re-reads the stored policy after writing, so the child keeps
+/// exactly its parent's copy.
+async fn ignore_child_supervisor_policy_write(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<Response<UpdateConfigResponse>, Status> {
+    debug!(
+        sandbox_id = %sandbox.object_id(),
+        "UpdateConfig: dropped startup policy write from child sandbox"
+    );
+    let latest = state
+        .store
+        .get_latest_policy(sandbox.object_id())
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+    let (version, hash) = latest.map_or((0, String::new()), |record| {
+        (record.version, record.policy_hash)
+    });
+    Ok(update_config_response(
+        u32::try_from(version).unwrap_or(0),
+        hash,
+        0,
+        false,
+        HashMap::new(),
+    ))
+}
+
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
@@ -4505,6 +4554,15 @@ async fn handle_update_config_inner(
     }
 
     let sandbox = sandbox.expect("non-global config update resolves a sandbox");
+    if has_policy || has_merge_ops {
+        // A child's supervisor writes back its startup paths like any other
+        // sandbox. Accept and drop the write so the child keeps exactly its
+        // parent's policy.
+        if sandbox_caller && sandbox.parent.is_some() {
+            return ignore_child_supervisor_policy_write(state, &sandbox).await;
+        }
+        refuse_child_policy_write(&sandbox)?;
+    }
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
@@ -5067,7 +5125,23 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 }
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
+    use super::sandbox::child_refusal;
     let message = error.message();
+    match child_refusal::reason(error).as_deref() {
+        Some(child_refusal::PARENT_MISSING) => {
+            return "The parent sandbox no longer exists; delete this child sandbox";
+        }
+        Some(child_refusal::PARENT_POLICY_NOT_COPIED) => {
+            return "Waiting for a copy of the parent sandbox's latest policy";
+        }
+        Some(child_refusal::PARENT_POLICY_UNCOPYABLE) => {
+            return "The parent sandbox's policy cannot be copied to children; fix the parent's policy";
+        }
+        Some(child_refusal::PARENT_POLICY_REJECTED) => {
+            return "The parent sandbox rejected its latest policy; fix the parent's policy";
+        }
+        _ => {}
+    }
     if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
     } else if message.contains("credential") || message.contains("provider") {
@@ -5310,6 +5384,18 @@ pub(super) async fn handle_report_policy_status(
     Ok(Response::new(ReportPolicyStatusResponse {}))
 }
 
+/// Sync a root's children in the background, so the root's report is not
+/// held up by them.
+pub(super) fn spawn_child_policy_sync(state: &Arc<ServerState>, sandbox_id: &str) {
+    let state = Arc::clone(state);
+    let parent_id = sandbox_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = super::sandbox::sync_children(&state, &parent_id).await {
+            warn!(parent_id, error = %error, "failed to sync child sandbox policies");
+        }
+    });
+}
+
 /// Persist the exact sandbox policy revision attempted by a supervisor.
 /// Unary rollout reports and stream acknowledgements share this path.
 pub async fn record_policy_apply_result(
@@ -5355,7 +5441,7 @@ pub async fn record_policy_apply_result(
         return Err(Status::not_found("policy revision not found"));
     }
     if loaded {
-        let newest_loaded = {
+        let (newest_loaded, is_root) = {
             let Some(_mutation_guard) = state
                 .compute
                 .sandbox_mutation_guard_by_id(sandbox_id)
@@ -5372,8 +5458,9 @@ pub async fn record_policy_apply_result(
                 .await
                 .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let is_root = sandbox.parent.is_none();
             let current_version = sandbox.current_policy_version();
-            if current_version > version {
+            let newest_loaded = if current_version > version {
                 // A result can arrive after a newer revision loaded, such as
                 // one queued by a replaced supervisor session. The newer
                 // policy stays active, and so does its endpoint inventory.
@@ -5406,7 +5493,8 @@ pub async fn record_policy_apply_result(
                 state.sandbox_index.update_from_sandbox(&updated);
                 state.sandbox_watch_bus.notify(sandbox_id);
                 updated.current_policy_version()
-            }
+            };
+            (newest_loaded, is_root)
         };
         // Supersede below the newest loaded revision, after the current
         // version settles. Of two results racing, the one finishing last then
@@ -5416,6 +5504,17 @@ pub async fn record_policy_apply_result(
             .store
             .supersede_older_policies(sandbox_id, i64::from(newest_loaded))
             .await;
+        // A root now enforces a new policy: copy it into its children.
+        if is_root {
+            spawn_child_policy_sync(state, sandbox_id);
+        }
+    } else if state.config.policy_validation_failure_mode
+        == openshell_core::PolicyValidationFailureMode::FailClosed
+    {
+        // A root that rejects a revision under fail_closed denies all new
+        // egress; push its children so they are refused too. The sync ignores
+        // a child's own report.
+        spawn_child_policy_sync(state, sandbox_id);
     }
     info!(
         sandbox_id,
@@ -5433,19 +5532,36 @@ pub(super) async fn handle_get_sandbox_logs(
     request: Request<GetSandboxLogsRequest>,
 ) -> Result<Response<GetSandboxLogsResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let req = request.into_inner();
-    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
-        state,
-        &principal,
-        &req.sandbox,
-        selected_workspace_name(req.workspace_scope.as_ref())?,
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let mut req = request.into_inner();
+    // A sandbox caller (only through `/mcp`) reads one of its own children,
+    // ready or not, and only the child's own output: gateway lines about it
+    // can carry audit and internal detail.
+    let sandbox_caller = matches!(principal, Principal::Sandbox(_));
+    let sandbox = if let Principal::Sandbox(caller) = &principal {
+        refuse_log_fields_for_sandbox_caller(&req)?;
+        req.sources = vec!["sandbox".to_string()];
+        super::sandbox::resolve_caller_child(state, caller, &req.sandbox).await?
+    } else {
+        super::sandbox::resolve_and_authorize_sandbox_name(
+            state,
+            &principal,
+            &req.sandbox,
+            selected_workspace_name(req.workspace_scope.as_ref())?,
+            MinWorkspaceRole::User,
+        )
+        .await?
+    };
     let sandbox_id = sandbox.object_id();
 
     let lines = if req.lines == 0 { 2000 } else { req.lines };
-    let tail = state.tracing_log_bus.tail(sandbox_id, lines as usize);
+    // A sandbox caller's line count applies after its source filter, so
+    // dropped gateway lines do not shrink the reply.
+    let tail_len = if sandbox_caller {
+        usize::MAX
+    } else {
+        lines as usize
+    };
+    let tail = state.tracing_log_bus.tail(sandbox_id, tail_len);
 
     let buffer_total = tail.len() as u32;
 
@@ -5481,6 +5597,13 @@ pub(super) async fn handle_get_sandbox_logs(
             }
         })
         .collect();
+    let logs = if sandbox_caller {
+        let mut logs: Vec<SandboxLogLine> = logs;
+        let keep_from = logs.len().saturating_sub(lines as usize);
+        logs.split_off(keep_from)
+    } else {
+        logs
+    };
 
     Ok(Response::new(GetSandboxLogsResponse { logs, buffer_total }))
 }
@@ -5511,6 +5634,34 @@ impl LogStreamState {
 
     fn mark_checked(&mut self, now: std::time::Instant) {
         self.last_existence_check = Some(now);
+    }
+}
+
+/// A sandbox caller's log request may set only the child, the line count and
+/// a start time.
+fn refuse_log_fields_for_sandbox_caller(request: &GetSandboxLogsRequest) -> Result<(), Status> {
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("sources", !request.sources.is_empty()),
+        ("min_level", !request.min_level.is_empty()),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    let allowed = GetSandboxLogsRequest {
+        sandbox: request.sandbox.clone(),
+        lines: request.lines,
+        since_time: request.since_time,
+        ..Default::default()
+    };
+    if *request == allowed {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ))
     }
 }
 
@@ -5713,6 +5864,20 @@ pub(super) async fn handle_submit_policy_analysis(
             accepted_chunks: 0,
             rejected_chunks: 0,
             rejection_reasons: Vec::new(),
+            accepted_chunk_ids: Vec::new(),
+        }));
+    }
+    // A child's proposals are rejected before they are stored, so no route
+    // can approve them later.
+    if sandbox.parent.is_some() {
+        return Ok(Response::new(SubmitPolicyAnalysisResponse {
+            accepted_chunks: 0,
+            rejected_chunks: u32::try_from(req.proposed_chunks.len()).unwrap_or(u32::MAX),
+            rejection_reasons: req
+                .proposed_chunks
+                .iter()
+                .map(|chunk| format!("chunk '{}': {CHILD_POLICY_WRITE_REFUSED}", chunk.rule_name))
+                .collect(),
             accepted_chunk_ids: Vec::new(),
         }));
     }
@@ -6216,6 +6381,7 @@ async fn handle_approve_draft_chunk_inner(
 
     require_no_global_policy(state).await?;
 
+    refuse_child_policy_write(&sandbox)?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -6467,6 +6633,7 @@ async fn handle_approve_all_draft_chunks_inner(
 
     require_no_global_policy(state).await?;
 
+    refuse_child_policy_write(&sandbox)?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -6848,6 +7015,7 @@ async fn handle_undo_draft_chunk_inner(
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
+    refuse_child_policy_write(&sandbox)?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -7032,7 +7200,7 @@ pub(super) async fn handle_get_draft_history(
 /// `PolicyRecord::policy_hash` is persisted metadata and cannot prove what the
 /// payload contains. Decode and validate every record before using its identity
 /// so legacy encodings deduplicate semantically and damaged rows fail closed.
-fn canonical_policy_record_identity(
+pub(super) fn canonical_policy_record_identity(
     record: &PolicyRecord,
 ) -> Result<(ProtoSandboxPolicy, String), Status> {
     let decoded = decode_stored_policy(record.policy_payload.as_slice())
@@ -8425,6 +8593,41 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The child hints follow the refusal's reason, not its wording, and the
+    /// reason travels alongside the message without changing it.
+    #[test]
+    fn child_configuration_hints_follow_the_refusal_reason() {
+        for (reason, hint) in [
+            (
+                "PARENT_SANDBOX_MISSING",
+                "The parent sandbox no longer exists; delete this child sandbox",
+            ),
+            (
+                "PARENT_POLICY_NOT_COPIED",
+                "Waiting for a copy of the parent sandbox's latest policy",
+            ),
+            (
+                "PARENT_POLICY_UNCOPYABLE",
+                "The parent sandbox's policy cannot be copied to children; fix the parent's policy",
+            ),
+            (
+                "PARENT_POLICY_REJECTED",
+                "The parent sandbox rejected its latest policy; fix the parent's policy",
+            ),
+        ] {
+            let refusal = openshell_core::rpc_error::failed_precondition(reason, "reworded");
+            assert_eq!(refusal.message(), "reworded");
+            assert_eq!(configuration_failure_diagnostic(&refusal), hint, "{reason}");
+        }
+        // Wording alone no longer picks a child hint.
+        let unreasoned =
+            Status::failed_precondition("parent sandbox 'lead' rejected its latest policy");
+        assert_eq!(
+            configuration_failure_diagnostic(&unreasoned),
+            "Stored policy structure or safety validation failed; submit a complete valid replacement policy"
+        );
+    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise

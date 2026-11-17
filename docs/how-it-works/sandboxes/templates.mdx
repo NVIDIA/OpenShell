@@ -45,6 +45,18 @@ openshell sandbox create --template gpu-kata --provider github -- claude
 
 The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
 
+## Make a Template Available to Agents
+
+An agent in a root sandbox can create [child sandboxes](/how-it-works/sandboxes/child-sandboxes) from a template only when the template carries the `openshell.ai/agent-usable` label and has no driver configuration:
+
+```shell
+openshell sandbox template create codex-agent \
+  --image registry.example.com/codex:latest \
+  --label openshell.ai/agent-usable=true
+```
+
+The agent's MCP tool list names these templates, with their images, so you do not need to tell the agent which ones exist. It never shows their environment values. A child created from a template still uses its parent's policy, so the parent's policy must allow the programs and hosts the template's image needs.
+
 ## Manage Templates
 
 ```shell

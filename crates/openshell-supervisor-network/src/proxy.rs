@@ -2789,6 +2789,19 @@ async fn handle_mediated_connection(
     }
 
     if policy_local_transparent {
+        // policy.local and openshell.local share one address; only the Host
+        // header tells them apart, and it is checked on every request.
+        if method != "CONNECT"
+            && target.starts_with('/')
+            && crate::gateway_mcp_door::request_host(&buf[..used])
+                .is_some_and(|host| crate::gateway_mcp_door::is_door_host(&host))
+        {
+            let ctx = policy_local_ctx
+                .as_ref()
+                .ok_or_else(|| miette::miette!("sandbox-local gateway context is unavailable"))?;
+            return crate::gateway_mcp_door::handle(ctx, method, target, &buf[..used], &mut client)
+                .await;
+        }
         if !valid_policy_local_request(method, target, request) {
             respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
             return Ok(());
@@ -2834,6 +2847,9 @@ async fn handle_mediated_connection(
     let (raw_host, port) = parse_target(target)?;
     let host = normalize_host(&raw_host);
     let (host_lc, raw_host_lc) = (host.to_ascii_lowercase(), raw_host.to_ascii_lowercase());
+    if crate::gateway_mcp_door::is_door_host(&host_lc) {
+        return crate::gateway_mcp_door::refuse_connect(&mut client).await;
+    }
     let workload_addr = socket_addrs.map_or_else(
         || SocketAddr::from(([0, 0, 0, 0], 0)),
         |(workload, _)| workload,
@@ -5673,6 +5689,23 @@ async fn handle_forward_proxy_inner(
             &path,
             &buf[..used],
             client,
+        )
+        .await;
+    }
+
+    if crate::gateway_mcp_door::is_door_host(&host_lc) {
+        if scheme != "http" || port != 80 {
+            return crate::gateway_mcp_door::refuse_connect(client).await;
+        }
+        if let Some(ctx) = policy_local_ctx {
+            return crate::gateway_mcp_door::handle(&ctx, method, &path, &buf[..used], client)
+                .await;
+        }
+        return crate::gateway_mcp_door::refuse(
+            client,
+            method,
+            503,
+            "openshell.local is not configured",
         )
         .await;
     }
@@ -8840,15 +8873,8 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         );
     }
 
-    #[tokio::test]
-    async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
-        let addr = crate::policy_dns::POLICY_LOCAL_ADDRESS;
-        for ip in [IpAddr::V4(addr), IpAddr::V6(addr.to_ipv6_mapped())] {
-            assert_policy_local_open_served(SocketAddr::new(ip, 80)).await;
-        }
-    }
-
-    async fn assert_policy_local_open_served(destination: SocketAddr) {
+    /// Send one request over a transparent open to the sandbox-local address.
+    async fn staged_sandbox_local_request(destination: SocketAddr, request: &[u8]) -> String {
         let engine = Arc::new(
             native_identity_engine(
                 include_str!("../data/sandbox-policy.rego"),
@@ -8923,8 +8949,72 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             None,
             None,
         ));
+        workload.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            workload.read_to_end(&mut response),
+        )
+        .await
+        .expect("sandbox-local response timed out")
+        .unwrap();
+        handler.await.unwrap().unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
+        let addr = crate::policy_dns::POLICY_LOCAL_ADDRESS;
+        for ip in [IpAddr::V4(addr), IpAddr::V6(addr.to_ipv6_mapped())] {
+            let response = staged_sandbox_local_request(
+                SocketAddr::new(ip, 80),
+                b"GET /v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+            assert!(response.contains("\"format\":\"yaml\""), "{response}");
+        }
+    }
+
+    fn sandbox_local_destination() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS), 80)
+    }
+
+    #[tokio::test]
+    async fn connect_to_the_gateway_door_is_refused_as_plain_http_only() {
+        let engine = Arc::new(
+            native_identity_engine(
+                include_str!("../data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap(),
+        );
+        let (stream, mut workload) = tokio::io::duplex(4096);
+        let stream: BoundaryDuplexStream = Box::new(stream);
+        let handler = tokio::spawn(handle_mediated_connection(
+            tokio::io::BufReader::new(stream),
+            None,
+            None,
+            None,
+            None,
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            AgentProposals::new(false),
+            Arc::new(None),
+            Arc::new(None),
+            Arc::new(None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
         workload
-            .write_all(b"GET /v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nConnection: close\r\n\r\n")
+            .write_all(b"CONNECT openshell.local:443 HTTP/1.1\r\nHost: openshell.local:443\r\n\r\n")
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -8933,12 +9023,118 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             workload.read_to_end(&mut response),
         )
         .await
-        .expect("policy.local response timed out")
+        .expect("door CONNECT response timed out")
         .unwrap();
         handler.await.unwrap().unwrap();
         let response = String::from_utf8(response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
-        assert!(response.contains("\"format\":\"yaml\""), "{response}");
+        assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+        assert!(
+            response.contains("openshell.local is plain HTTP on port 80"),
+            "{response}"
+        );
+    }
+
+    /// Send one explicit-proxy request (no transparent open) and return the response.
+    async fn proxied_request(context: Option<Arc<PolicyLocalContext>>, request: &[u8]) -> String {
+        let engine = Arc::new(
+            native_identity_engine(
+                include_str!("../data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap(),
+        );
+        let (stream, mut workload) = tokio::io::duplex(4096);
+        let stream: BoundaryDuplexStream = Box::new(stream);
+        let handler = tokio::spawn(handle_mediated_connection(
+            tokio::io::BufReader::new(stream),
+            None,
+            None,
+            None,
+            None,
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            context,
+            AgentProposals::new(false),
+            Arc::new(None),
+            Arc::new(None),
+            Arc::new(None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        workload.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            workload.read_to_end(&mut response),
+        )
+        .await
+        .expect("proxied response timed out")
+        .unwrap();
+        handler.await.unwrap().unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn assert_complete_body(response: &str) {
+        let (head, body) = response.split_once("\r\n\r\n").expect("response head");
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("Content-Length")
+            .parse()
+            .unwrap();
+        assert_eq!(length, body.len(), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_proxied_post_reaches_the_gateway_door() {
+        const REQUEST: &[u8] = b"POST http://openshell.local/mcp HTTP/1.1\r\nHost: openshell.local\r\nContent-Length: 2\r\n\r\n{}";
+        let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel("default".to_string());
+        let context = Arc::new(PolicyLocalContext::new(
+            None,
+            None,
+            None,
+            AgentProposals::new(false),
+            workspace_rx,
+        ));
+        // The door answers 503 because the test context has no gateway.
+        let door = proxied_request(Some(context), REQUEST).await;
+        assert!(door.starts_with("HTTP/1.1 503 "), "{door}");
+        assert!(door.contains("no gateway connection"), "{door}");
+        assert_complete_body(&door);
+
+        let unconfigured = proxied_request(None, REQUEST).await;
+        assert!(unconfigured.starts_with("HTTP/1.1 503 "), "{unconfigured}");
+        assert!(
+            unconfigured.ends_with("openshell.local is not configured"),
+            "{unconfigured}"
+        );
+        assert_complete_body(&unconfigured);
+    }
+
+    #[tokio::test]
+    async fn staged_open_reaches_the_gateway_door_only_by_its_host() {
+        // The test context has no gateway, so reaching the door answers 503.
+        let door = staged_sandbox_local_request(
+            sandbox_local_destination(),
+            b"POST /mcp HTTP/1.1\r\nHost: openshell.local\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await;
+        assert!(door.starts_with("HTTP/1.1 503 "), "{door}");
+        assert!(door.contains("no gateway connection"), "{door}");
+
+        // A rebound name on the same address is neither door.
+        let rebound = staged_sandbox_local_request(
+            sandbox_local_destination(),
+            b"POST /mcp HTTP/1.1\r\nHost: attacker.example\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await;
+        assert!(rebound.starts_with("HTTP/1.1 400 "), "{rebound}");
     }
 
     #[tokio::test]

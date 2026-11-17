@@ -45,7 +45,7 @@ pub mod transport;
 pub mod types;
 
 pub use auth::EdgeAuthInterceptor;
-pub use client::{OpenShellClient, WorkspaceScopedClient};
+pub use client::{McpReply, OpenShellClient, WorkspaceScopedClient};
 pub use config::{AuthConfig, ClientConfig, ClientIdentity};
 pub use error::SdkError;
 pub use pagination::{Page, Pager};

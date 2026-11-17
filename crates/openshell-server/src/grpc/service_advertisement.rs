@@ -477,12 +477,12 @@ async fn accept_inner(
 
 /// Discovery must call this before publishing each persisted installation.
 /// Freshness failures are absence; storage/decoding failures are errors.
-pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bool, Status> {
+pub async fn is_current(state: &Arc<ServerState>, record: &Installation) -> Result<bool, Status> {
     Ok(current_routes(state, record).await?.is_some())
 }
 
 pub(super) async fn current_routes(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     record: &Installation,
 ) -> Result<Option<Vec<SandboxServiceRoute>>, Status> {
     Ok(validated_routes(state, record, None)
@@ -557,7 +557,7 @@ pub(super) async fn current_sandbox(
 }
 
 pub(super) async fn validated_routes(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     record: &Installation,
     inputs: Option<&super::policy::DiscoveryConfigInputs>,
 ) -> Result<Option<(Sandbox, Vec<SandboxServiceRoute>)>, Status> {
@@ -592,7 +592,7 @@ pub(super) async fn validated_routes(
 const CLEANUP_PAGE_SIZE: u16 = 128;
 const CLEANUP_RECORD_TIMEOUT: Duration = Duration::from_secs(1);
 
-async fn cleanup_record(state: &ServerState, record: ObjectRecord) -> Result<(), Status> {
+async fn cleanup_record(state: &Arc<ServerState>, record: ObjectRecord) -> Result<(), Status> {
     let installation: Installation = serde_json::from_slice(&record.payload)
         .map_err(|_| Status::internal("invalid stored service installation"))?;
     if installation.expires_at_ms <= current_time_ms() || !is_current(state, &installation).await? {

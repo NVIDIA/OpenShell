@@ -340,6 +340,11 @@ provisioning_repair_window_seconds = 300
 mutation_admission_limit_per_caller = 1000
 mutation_replay_window_seconds = 86400
 
+# Experimental. Allow child sandboxes under a root sandbox and serve /mcp.
+experimental_enable_child_sandboxes = false
+# Most children one parent may have at once; 0 allows none. At most 1000.
+max_concurrent_children = 10
+
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
 policy_validation_failure_mode = "fail_closed"
@@ -680,6 +685,30 @@ This is not an automatic mixed-version migration switch. Do not downgrade while
 an image update is pending or retained sandboxes require the private image
 revision protocol. SQLite supports one gateway process only; activation attests
 that the previous process has stopped, not that sharing a SQLite file enables HA.
+
+## Child Sandboxes
+
+`[openshell.gateway] experimental_enable_child_sandboxes` defaults to `false`.
+When it is `true`, a sandbox can be created as a child of a root sandbox, and
+the gateway serves the MCP tools at `/mcp`. Turning it off blocks new children
+and the MCP tools: agents in sandboxes and `openshell mcp serve` can no longer
+reach any tool. Existing children keep running, keep following their parent's
+policy, and can still be listed, used and deleted from the CLI.
+
+`max_concurrent_children` limits how many children one parent may have at
+once. Every existing child counts, whatever its state, until it is deleted.
+The default is 10, `0` allows none, and the gateway refuses to start with a
+value above 1000.
+
+```toml
+[openshell.gateway]
+experimental_enable_child_sandboxes = true
+max_concurrent_children = 10
+```
+
+The gateway reads both settings at startup. Refer to
+[Child Sandboxes](/how-it-works/sandboxes/child-sandboxes) for how children and
+the MCP tools work.
 
 ## Database Pool
 

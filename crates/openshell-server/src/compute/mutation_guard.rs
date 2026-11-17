@@ -52,6 +52,13 @@ pub enum MutationScope<'a> {
         workspace: &'a str,
         sandbox_id: &'a str,
     },
+    /// Creation of a child sandbox. Also excludes other writers of the parent,
+    /// so concurrent creates under one parent count its children in turn.
+    ChildSandbox {
+        workspace: &'a str,
+        sandbox_id: &'a str,
+        parent_id: &'a str,
+    },
 }
 
 impl<'a> MutationScope<'a> {
@@ -83,6 +90,7 @@ impl<'a> MutationScope<'a> {
     /// - `Sandbox`: S(global) S(workspace) X(sandbox). A legacy sandbox with
     ///   an empty workspace locks the default workspace, where its providers
     ///   resolve.
+    /// - `ChildSandbox`: S(global) S(workspace) X(parent) X(sandbox).
     pub(crate) fn lock_set(&self) -> MutationLockSet {
         let mut set = MutationLockSet::default();
         match *self {
@@ -110,6 +118,19 @@ impl<'a> MutationScope<'a> {
                 );
                 set.insert(MutationLockKey::Sandbox(sandbox_id), LockMode::Exclusive);
             }
+            Self::ChildSandbox {
+                workspace,
+                sandbox_id,
+                parent_id,
+            } => {
+                set.insert(MutationLockKey::Global, LockMode::Shared);
+                set.insert(
+                    MutationLockKey::Workspace(sandbox_workspace_key(workspace)),
+                    LockMode::Shared,
+                );
+                set.insert(MutationLockKey::Sandbox(parent_id), LockMode::Exclusive);
+                set.insert(MutationLockKey::Sandbox(sandbox_id), LockMode::Exclusive);
+            }
         }
         set
     }
@@ -120,7 +141,7 @@ impl<'a> MutationScope<'a> {
             Self::Global => LockScope::Global,
             Self::Workspace(workspace) if workspace.is_empty() => LockScope::Global,
             Self::Workspace(_) => LockScope::Workspace,
-            Self::Sandbox { .. } => LockScope::Sandbox,
+            Self::Sandbox { .. } | Self::ChildSandbox { .. } => LockScope::Sandbox,
         }
     }
 }
@@ -287,6 +308,18 @@ pub struct MutationGuard {
     _local: LocalMutationGuard,
 }
 
+/// Lock held by a sandbox delete until it marks the sandbox `Deleting`.
+#[must_use = "dropping the guard releases the sandbox's delete lock"]
+pub enum SandboxDeleteGuard {
+    /// A root's mutation guard, which excludes child creates on every replica.
+    Root {
+        _guard: MutationGuard,
+    },
+    Local {
+        _guard: LocalMutationGuard,
+    },
+}
+
 /// Times one [`MutationGuard`] from acquisition to release. Guarded work has
 /// no time limit of its own, so a hold longer than the wait timeout means
 /// conflicting acquisitions may have timed out behind it.
@@ -429,6 +462,25 @@ impl ComputeRuntime {
         Ok((lifecycle_guard, mutation_guard))
     }
 
+    /// Lifecycle gate, then the child-create mutation guard, for a new child
+    /// of `parent_id`. Callers must re-read the parent after locking.
+    pub(crate) async fn child_sandbox_create_guards(
+        &self,
+        workspace: &str,
+        sandbox_id: &str,
+        parent_id: &str,
+    ) -> PersistenceResult<(SandboxLifecycleGuard, MutationGuard)> {
+        let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
+        let mutation_guard = self
+            .mutation_guard(MutationScope::ChildSandbox {
+                workspace,
+                sandbox_id,
+                parent_id,
+            })
+            .await?;
+        Ok((lifecycle_guard, mutation_guard))
+    }
+
     /// Local S(global) X(sandbox) for code that already holds the sandbox's
     /// lifecycle gate. The guard parameter documents and enforces the
     /// lifecycle-gate -> mutation-lock order.
@@ -439,10 +491,41 @@ impl ComputeRuntime {
         self.lock_sandbox_local(&lifecycle_guard.sandbox_id).await
     }
 
+    /// Lock for a sandbox delete, for code that holds its lifecycle gate.
+    ///
+    /// A root's delete checks that the root has no children, which a child
+    /// create on any replica can change, so it takes the sandbox's mutation
+    /// guard: on `PostgreSQL` the same database lock a child create takes on
+    /// its parent. Other sandboxes take the local lock of
+    /// [`Self::lock_sandbox_local`]. One read before locking picks the lock;
+    /// a sandbox's parent and workspace never change.
+    pub(super) async fn lock_sandbox_for_delete(
+        &self,
+        lifecycle_guard: &SandboxLifecycleGuard,
+    ) -> PersistenceResult<SandboxDeleteGuard> {
+        let sandbox_id = &lifecycle_guard.sandbox_id;
+        let sandbox = self.store.get_message::<Sandbox>(sandbox_id).await?;
+        match sandbox {
+            Some(sandbox) if sandbox.parent.is_none() => {
+                let guard = self
+                    .mutation_guard(MutationScope::sandbox(
+                        sandbox.object_workspace(),
+                        sandbox_id,
+                    ))
+                    .await?;
+                Ok(SandboxDeleteGuard::Root { _guard: guard })
+            }
+            _ => Ok(SandboxDeleteGuard::Local {
+                _guard: self.lock_sandbox_for_lifecycle(lifecycle_guard).await,
+            }),
+        }
+    }
+
     /// Local S(global) X(sandbox) for lifecycle, driver-watch, and reconcile
     /// paths. They write only this sandbox and its owned records and rely on
     /// compare-and-swap across replicas, so they take no database lock and
-    /// never exclude another sandbox or a provider writer.
+    /// never exclude another sandbox or a provider writer. A root's delete is
+    /// the exception; see [`Self::lock_sandbox_for_delete`].
     pub(super) async fn lock_sandbox_local(&self, sandbox_id: &str) -> LocalMutationGuard {
         self.mutation_locks
             .acquire(&MutationLockSet::sandbox_lifecycle(sandbox_id))
@@ -1537,6 +1620,75 @@ mod tests {
                 .await
                 .expect("by-id guard for an unknown sandbox")
                 .is_none()
+        );
+
+        replica_a.store.close().await;
+        replica_b.store.close().await;
+        schema.drop_schema().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_root_delete_waits_for_a_child_create_on_another_replica() {
+        let schema = TestSchema::create("rootdel").await;
+        let replica_a = postgres_runtime(&schema).await;
+        let replica_b = postgres_runtime(&schema).await;
+        let lead_id = format!("lead-{}", Uuid::new_v4());
+        let worker_id = format!("worker-{}", Uuid::new_v4());
+        replica_a
+            .store
+            .put_message(&stored_sandbox(&lead_id, DEFAULT_WORKSPACE_NAME))
+            .await
+            .expect("seed the root");
+
+        // Replica A is creating a child of the root.
+        let create_guards = replica_a
+            .child_sandbox_create_guards(DEFAULT_WORKSPACE_NAME, &worker_id, &lead_id)
+            .await
+            .expect("child create guards on replica A");
+        let mut delete = {
+            let replica_b = replica_b.clone();
+            let lead_id = lead_id.clone();
+            tokio::spawn(async move {
+                replica_b
+                    .delete_sandbox(DEFAULT_WORKSPACE_NAME, &lead_id)
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut delete)
+                .await
+                .is_err(),
+            "the root delete should wait for the child create on the other replica"
+        );
+
+        let mut worker = stored_sandbox(&worker_id, DEFAULT_WORKSPACE_NAME);
+        worker.parent = Some(openshell_core::proto::SandboxParent {
+            name: lead_id.clone(),
+            id: lead_id.clone(),
+        });
+        replica_a
+            .store
+            .put_message(&worker)
+            .await
+            .expect("store the new child");
+        drop(create_guards);
+
+        let err = tokio::time::timeout(PROCEEDS_WITHIN, delete)
+            .await
+            .expect("the root delete should proceed after release")
+            .expect("delete task")
+            .expect_err("the root now has a child");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        let lead = replica_b
+            .store
+            .get_message::<Sandbox>(&lead_id)
+            .await
+            .expect("read the root")
+            .expect("the refused root still exists");
+        assert!(
+            lead.metadata.unwrap().deletion_time.is_none(),
+            "a refused delete must not mark the root as deleting"
         );
 
         replica_a.store.close().await;

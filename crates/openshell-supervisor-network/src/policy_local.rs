@@ -161,6 +161,7 @@ pub struct PolicyLocalContext {
     denials: DenialLogSource,
     token_grants: Option<Arc<dyn TokenGrantResolver>>,
     workspace_rx: tokio::sync::watch::Receiver<String>,
+    mcp_door: crate::gateway_mcp_door::DoorConnection,
 }
 
 impl std::fmt::Debug for PolicyLocalContext {
@@ -191,6 +192,7 @@ impl PolicyLocalContext {
             denials: DenialLogSource::default(),
             token_grants: None,
             workspace_rx,
+            mcp_door: crate::gateway_mcp_door::DoorConnection::default(),
         }
     }
 
@@ -211,6 +213,16 @@ impl PolicyLocalContext {
             workspace_rx,
         )
         .with_denial_log(DenialLogSource::ShorthandFiles(shorthand_log_dir))
+    }
+
+    /// This sandbox instance's gateway address and credentials.
+    pub(crate) fn gateway(&self) -> Option<&GatewayEndpoint> {
+        self.gateway.as_ref()
+    }
+
+    /// The gateway connection and request slots `openshell.local/mcp` shares.
+    pub(crate) fn mcp_door(&self) -> &crate::gateway_mcp_door::DoorConnection {
+        &self.mcp_door
     }
 
     /// Serve `/v1/denials` from `denials` instead of the process log files.
@@ -265,7 +277,7 @@ pub async fn handle_forward_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let body = read_request_body(initial_request, client).await?;
+    let body = read_request_body(initial_request, client, MAX_POLICY_LOCAL_BODY_BYTES).await?;
     let (status, payload) = route_request(ctx, method, path, &body).await;
     write_json_response(client, status, payload).await
 }
@@ -1343,7 +1355,17 @@ fn network_endpoint_from_json(
     })
 }
 
-async fn read_request_body<S>(initial_request: &[u8], client: &mut S) -> Result<Vec<u8>>
+/// The body length a request declares in `Content-Length`, when it can be read.
+pub(crate) fn declared_body_len(initial_request: &[u8]) -> Option<usize> {
+    let header_end = find_header_end(initial_request)?;
+    parse_content_length(&initial_request[..header_end]).ok()
+}
+
+pub(crate) async fn read_request_body<S>(
+    initial_request: &[u8],
+    client: &mut S,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
@@ -1351,9 +1373,9 @@ where
         return Ok(Vec::new());
     };
     let content_length = parse_content_length(&initial_request[..header_end])?;
-    if content_length > MAX_POLICY_LOCAL_BODY_BYTES {
+    if content_length > max_body_bytes {
         return Err(miette::miette!(
-            "policy.local request body exceeds {MAX_POLICY_LOCAL_BODY_BYTES} bytes"
+            "sandbox-local request body exceeds {max_body_bytes} bytes"
         ));
     }
 
@@ -1367,7 +1389,7 @@ where
             let mut chunk = vec![0u8; remaining.min(8192)];
             let n = client.read(&mut chunk).await.into_diagnostic()?;
             if n == 0 {
-                return Err(miette::miette!("policy.local request body ended early"));
+                return Err(miette::miette!("sandbox-local request body ended early"));
             }
             body.extend_from_slice(&chunk[..n]);
         }
@@ -1375,7 +1397,7 @@ where
     };
     tokio::time::timeout(POLICY_LOCAL_BODY_READ_TIMEOUT, read_loop)
         .await
-        .map_err(|_| miette::miette!("policy.local request body read timed out"))??;
+        .map_err(|_| miette::miette!("sandbox-local request body read timed out"))??;
 
     Ok(body)
 }
@@ -1390,7 +1412,7 @@ fn parse_content_length(headers: &[u8]) -> Result<usize> {
                 .trim()
                 .parse::<usize>()
                 .into_diagnostic()
-                .map_err(|_| miette::miette!("invalid policy.local Content-Length"));
+                .map_err(|_| miette::miette!("invalid sandbox-local Content-Length"));
         }
     }
     Ok(0)

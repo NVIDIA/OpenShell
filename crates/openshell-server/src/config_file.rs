@@ -179,6 +179,16 @@ pub struct GatewayFileSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_delivery_mode: Option<openshell_core::config::ConfigDeliveryMode>,
 
+    // ── Child sandboxes ──────────────────────────────────────────────────
+    /// Allow creating child sandboxes under a root sandbox. Experimental;
+    /// disabled when omitted. Affects only new children.
+    #[serde(default)]
+    pub experimental_enable_child_sandboxes: Option<bool>,
+    /// Most children one parent may have at once, counting every child that
+    /// exists. Omit for the default of 10; 0 allows none; at most 1000.
+    #[serde(default)]
+    pub max_concurrent_children: Option<u32>,
+
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.

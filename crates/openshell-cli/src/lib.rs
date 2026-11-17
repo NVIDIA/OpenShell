@@ -17,6 +17,7 @@ pub mod callback;
 pub mod color;
 pub(crate) mod commands;
 pub mod completers;
+pub mod mcp_bridge;
 pub mod oidc_auth;
 pub mod output;
 pub(crate) mod policy_update;

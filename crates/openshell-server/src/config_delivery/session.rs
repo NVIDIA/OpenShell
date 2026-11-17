@@ -332,6 +332,16 @@ impl SupervisorSessionRegistry {
         });
     }
 
+    /// Whether an update, the bootstrap included, still waits for its
+    /// result to be recorded.
+    #[cfg(test)]
+    pub(crate) fn config_update_in_flight(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.with_config_session(sandbox_id, session_id, |session| {
+            session.is_some_and(|session| session.in_flight.is_some())
+        })
+        .unwrap_or(false)
+    }
+
     fn complete_config_update(
         &self,
         sandbox_id: &str,

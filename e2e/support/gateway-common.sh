@@ -463,6 +463,29 @@ e2e_write_gateway_mtls_auth_config() {
   printf 'enabled = true\n\n'
 }
 
+# Opt the gateway into child sandboxes for the child_sandboxes e2e test: turn
+# on the experimental setting (which also serves /mcp), and write the
+# gateway's OCSF events as JSONL where the test can read the MCP audit fields.
+e2e_enable_child_sandboxes() {
+  local gateway_config=$1
+  local state_dir=$2
+  local with_child_settings="${gateway_config}.child-sandboxes"
+
+  awk '
+    { print }
+    !inserted && $0 == "[openshell.gateway]" {
+      print "experimental_enable_child_sandboxes = true"
+      inserted = 1
+    }
+    END { if (!inserted) exit 42 }
+  ' "${gateway_config}" >"${with_child_settings}"
+  mv "${with_child_settings}" "${gateway_config}"
+
+  export OPENSHELL_OCSF_JSON=1
+  export OPENSHELL_OCSF_LOG_DIR="${state_dir}/gateway-ocsf"
+  export OPENSHELL_E2E_GATEWAY_OCSF_DIR="${OPENSHELL_OCSF_LOG_DIR}"
+}
+
 e2e_write_gateway_oidc_config() {
   local issuer=$1
   local scopes_claim="${2:-scope}"

@@ -20,6 +20,7 @@ use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
 };
+use crate::policy_store::PolicyStoreExt;
 use crate::tracing_bus::CursoredEvent;
 use crate::watch_cursor::WatchCursor;
 use futures::future;
@@ -276,6 +277,72 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     Ok(sandbox)
 }
 
+/// Resolve `name` for a sandbox caller (only through `/mcp`): one of its own
+/// children, in its own workspace. Everything else, the caller itself
+/// included, reads as missing.
+pub(super) async fn resolve_caller_child(
+    state: &ServerState,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    name: &str,
+) -> Result<Sandbox, Status> {
+    let not_found = || Status::not_found(format!("sandbox '{name}' not found"));
+    let caller = state
+        .store
+        .get_message::<Sandbox>(&caller.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(not_found)?;
+    let child = state
+        .store
+        .get_message_by_name::<Sandbox>(caller.object_workspace(), name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(not_found)?;
+    if child
+        .parent
+        .as_ref()
+        .is_some_and(|parent| parent.id == caller.object_id())
+    {
+        Ok(child)
+    } else {
+        Err(not_found())
+    }
+}
+
+/// A sandbox caller's exec may set only the target, command, working
+/// directory, stdin and timeout.
+fn refuse_exec_fields_for_sandbox_caller(request: &ExecSandboxRequest) -> Result<(), Status> {
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("environment", !request.environment.is_empty()),
+        ("tty", request.tty),
+        ("cols", request.cols != 0),
+        ("rows", request.rows != 0),
+        ("no_login_shell", request.no_login_shell),
+        ("request_id", !request.request_id.is_empty()),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    let allowed = ExecSandboxRequest {
+        sandbox: request.sandbox.clone(),
+        command: request.command.clone(),
+        workdir: request.workdir.clone(),
+        stdin: request.stdin.clone(),
+        execution_timeout: request.execution_timeout,
+        ..Default::default()
+    };
+    if *request == allowed {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ))
+    }
+}
+
 fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
     match SandboxPhase::try_from(sandbox.phase()).ok() {
         Some(SandboxPhase::Ready) => Ok(()),
@@ -465,6 +532,15 @@ fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<St
     }
 }
 
+/// The user recorded as a new sandbox's creator. Only users are recorded;
+/// operators are not workspace members, so they leave the field empty.
+fn creator_subject(principal: &crate::auth::principal::Principal) -> String {
+    match principal {
+        crate::auth::principal::Principal::User(user) => user.identity.subject.clone(),
+        _ => String::new(),
+    }
+}
+
 /// Read the staging token a caller named for the active driver, without
 /// removing it. The gateway consumes it later, inside `create_sandbox`.
 fn staging_token_in_spec(spec: &SandboxSpec, driver_name: &str) -> Option<String> {
@@ -553,6 +629,1105 @@ fn sandbox_create_telemetry_attrs(
     }
 }
 
+/// Check the parent named in a create request and return the link to store on
+/// the new child. Returns `None` when no parent is named, for a root sandbox.
+async fn resolve_create_parent(
+    state: &ServerState,
+    workspace: &str,
+    parent_name: &str,
+    spec: &mut SandboxSpec,
+) -> Result<Option<openshell_core::proto::SandboxParent>, Status> {
+    if parent_name.is_empty() {
+        return Ok(None);
+    }
+    ensure_child_sandboxes_enabled(state)?;
+    let parent = state
+        .store
+        .get_message_by_name::<Sandbox>(workspace, parent_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!("parent sandbox '{parent_name}' not found"))
+        })?;
+    check_create_parent(&parent, spec).map(Some)
+}
+
+fn ensure_child_sandboxes_enabled(state: &ServerState) -> Result<(), Status> {
+    if state.config.enable_child_sandboxes {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(
+            "child sandboxes are disabled on this gateway",
+        ))
+    }
+}
+
+/// Check that `parent` can take a child with `spec`, and return the link to
+/// store on the child. A child that names no providers gets all of its
+/// parent's providers. Users and sandbox callers share these checks.
+fn check_create_parent(
+    parent: &Sandbox,
+    spec: &mut SandboxSpec,
+) -> Result<openshell_core::proto::SandboxParent, Status> {
+    let parent_name = parent.object_name();
+    if crate::compute::is_being_deleted(parent) {
+        return Err(Status::failed_precondition(format!(
+            "parent sandbox '{parent_name}' is being deleted"
+        )));
+    }
+    if parent.parent.is_some() {
+        return Err(Status::failed_precondition(
+            "only one level of child sandboxes is supported",
+        ));
+    }
+    if spec.policy.is_some() {
+        return Err(Status::invalid_argument(
+            "a child sandbox uses its parent's policy; omit the policy",
+        ));
+    }
+    let parent_providers = parent
+        .spec
+        .as_ref()
+        .map_or(&[][..], |parent_spec| parent_spec.providers.as_slice());
+    if let Some(provider) = spec
+        .providers
+        .iter()
+        .find(|provider| !parent_providers.contains(provider))
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider}' is not attached to parent '{parent_name}'"
+        )));
+    }
+    if spec.providers.is_empty() {
+        spec.providers = parent_providers.to_vec();
+    }
+    Ok(openshell_core::proto::SandboxParent {
+        name: parent_name.to_string(),
+        id: parent.object_id().to_string(),
+    })
+}
+
+/// A sandbox caller (only through `/mcp`) creating a child of itself: read its
+/// own record and check the request and its creator. The child always goes in
+/// the caller's workspace with the caller as its parent.
+async fn sandbox_caller_create(
+    state: &ServerState,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    request: &CreateSandboxRequest,
+) -> Result<Sandbox, Status> {
+    refuse_fields_for_sandbox_caller(request)?;
+    ensure_child_sandboxes_enabled(state)?;
+    let caller = state
+        .store
+        .get_message::<Sandbox>(&caller.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if caller.parent.is_some() {
+        return Err(Status::failed_precondition(
+            "only root sandboxes can create child sandboxes",
+        ));
+    }
+    refuse_caller_with_driver_config(&caller)?;
+    check_creator_has_access(state, &caller).await?;
+    Ok(caller)
+}
+
+/// A sandbox caller may set only `name`, `workload_template` and
+/// `spec.providers`; the gateway decides everything else.
+fn refuse_fields_for_sandbox_caller(request: &CreateSandboxRequest) -> Result<(), Status> {
+    let spec = request.spec.clone().unwrap_or_default();
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("parent", !request.parent.is_empty()),
+        ("labels", !request.labels.is_empty()),
+        ("annotations", !request.annotations.is_empty()),
+        (
+            "await_main_process_attachment",
+            request.await_main_process_attachment,
+        ),
+        ("request_id", !request.request_id.is_empty()),
+        ("service_exposures", !request.service_exposures.is_empty()),
+        ("spec.log_level", !spec.log_level.is_empty()),
+        ("spec.environment", !spec.environment.is_empty()),
+        ("spec.template", spec.template.is_some()),
+        ("spec.policy", spec.policy.is_some()),
+        (
+            "spec.resource_requirements",
+            spec.resource_requirements.is_some(),
+        ),
+        ("spec.command", !spec.command.is_empty()),
+        ("spec.tty", spec.tty),
+        (
+            "spec.provider_attachment_epoch",
+            !spec.provider_attachment_epoch.is_empty(),
+        ),
+        ("spec.restart_policy", spec.restart_policy != 0),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    refuse_unlisted_fields_for_sandbox_caller(request)
+}
+
+/// Backstop for fields the named checks above do not list, such as ones added
+/// to the request later: anything beyond what a sandbox caller may send.
+fn refuse_unlisted_fields_for_sandbox_caller(request: &CreateSandboxRequest) -> Result<(), Status> {
+    let allowed = CreateSandboxRequest {
+        name: request.name.clone(),
+        workload_template: request.workload_template.clone(),
+        spec: request.spec.as_ref().map(|spec| SandboxSpec {
+            providers: spec.providers.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    if *request == allowed {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ))
+    }
+}
+
+/// The user who created a root must still be a workspace member with at least
+/// the user role for the root to create children. A root with no recorded
+/// creator fails closed. Checked on every create.
+async fn check_creator_has_access(state: &ServerState, caller: &Sandbox) -> Result<(), Status> {
+    let creator = caller.created_by.as_str();
+    if creator.is_empty() {
+        return Err(Status::failed_precondition(
+            "this sandbox was not started by a workspace user, so it cannot create children",
+        ));
+    }
+    // With no admin role configured every authenticated user is a platform
+    // admin and needs no membership, as in `authorize_workspace`. Only the
+    // creator's subject is recorded, so an admin by role is not recognized
+    // once an admin role is configured.
+    if state.admin_role.is_empty() {
+        return Ok(());
+    }
+    // Development gateways create roots as the built-in local user, which has
+    // no membership; it counts only while such users are still allowed.
+    if state.config.auth.allow_unauthenticated_users
+        && creator == crate::multiplex::UNAUTHENTICATED_DEV_SUBJECT
+    {
+        return Ok(());
+    }
+    if !crate::auth::workspace_authz::subject_has_workspace_role(
+        &state.store,
+        caller.object_workspace(),
+        creator,
+        MinWorkspaceRole::User,
+    )
+    .await?
+    {
+        // The agent is not told who the creator is; the audit event records it.
+        let workspace = caller.object_workspace();
+        return Err(Status::permission_denied(format!(
+            "the user who started this sandbox is not a member of workspace '{workspace}' \
+             with the user role; a platform admin can add them with: openshell workspace \
+             member add --workspace {workspace} --subject <user> --role user"
+        )));
+    }
+    Ok(())
+}
+
+/// The spec a sandbox caller's child gets without a template: the caller's
+/// image, CPU and memory, isolation settings, and the named providers.
+/// Nothing else is copied, so no GPU or other device.
+fn spec_copied_from_caller(caller: &Sandbox, providers: Vec<String>) -> SandboxSpec {
+    let template = caller.spec.as_ref().and_then(|spec| spec.template.as_ref());
+    let mut child = SandboxTemplate {
+        image: template.map(|t| t.image.clone()).unwrap_or_default(),
+        resources: template.and_then(|t| cpu_and_memory_only(t.resources.as_ref())),
+        ..Default::default()
+    };
+    copy_isolation_from_caller(caller, &mut child);
+    SandboxSpec {
+        template: Some(child),
+        providers,
+        ..Default::default()
+    }
+}
+
+/// A child is never less isolated than its root or its template: the root's
+/// runtime class wins when it has one, and user namespaces stay on when
+/// either asks for them.
+fn copy_isolation_from_caller(caller: &Sandbox, child: &mut SandboxTemplate) {
+    let root = caller.spec.as_ref().and_then(|spec| spec.template.as_ref());
+    if let Some(root) = root.filter(|root| !root.runtime_class_name.is_empty()) {
+        child
+            .runtime_class_name
+            .clone_from(&root.runtime_class_name);
+    }
+    if root.and_then(|root| root.user_namespaces) == Some(true) {
+        child.user_namespaces = Some(true);
+    }
+}
+
+/// Driver configuration can set isolation, devices and mounts that cannot be
+/// copied safely, so a root that has any cannot create children over MCP.
+fn refuse_caller_with_driver_config(caller: &Sandbox) -> Result<(), Status> {
+    let has_driver_config = caller
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .is_some_and(|template| template.driver_config.is_some());
+    if has_driver_config {
+        return Err(Status::failed_precondition(
+            "this sandbox has driver configuration, which children cannot copy",
+        ));
+    }
+    Ok(())
+}
+
+/// Keep only `cpu` and `memory` under `limits` and `requests`; drop GPUs and
+/// any other extended resource.
+fn cpu_and_memory_only(resources: Option<&Struct>) -> Option<Struct> {
+    let fields: std::collections::BTreeMap<_, _> = resources?
+        .fields
+        .iter()
+        .filter(|(section, _)| matches!(section.as_str(), "limits" | "requests"))
+        .filter_map(|(section, value)| {
+            let Some(Kind::StructValue(quantities)) = value.kind.as_ref() else {
+                return None;
+            };
+            let kept: std::collections::BTreeMap<_, _> = quantities
+                .fields
+                .iter()
+                .filter(|(name, _)| matches!(name.as_str(), "cpu" | "memory"))
+                .map(|(name, quantity)| (name.clone(), quantity.clone()))
+                .collect();
+            (!kept.is_empty()).then(|| {
+                let value = Value {
+                    kind: Some(Kind::StructValue(Struct { fields: kept })),
+                };
+                (section.clone(), value)
+            })
+        })
+        .collect();
+    (!fields.is_empty()).then_some(Struct { fields })
+}
+
+/// Agents may create children only from templates an administrator marked
+/// for them, and never from one with driver configuration.
+fn check_agent_usable_template(template: &SandboxWorkloadTemplate) -> Result<(), Status> {
+    let labelled = template
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.labels.get(AGENT_USABLE_TEMPLATE_LABEL))
+        .is_some_and(|value| value == "true");
+    let has_driver_config = template
+        .spec
+        .as_ref()
+        .is_some_and(|spec| spec.driver_config.is_some());
+    if labelled && !has_driver_config {
+        Ok(())
+    } else {
+        Err(template_not_available(template.object_name()))
+    }
+}
+
+const AGENT_USABLE_TEMPLATE_LABEL: &str = "openshell.ai/agent-usable";
+
+fn template_not_available(name: &str) -> Status {
+    Status::failed_precondition(format!("template '{name}' is not available to agents"))
+}
+
+/// Under the child-create lock, re-read the parent and check that it can take
+/// one more child and still has the child's providers. Every existing child
+/// counts, whatever its state.
+async fn check_parent_has_room(
+    state: &ServerState,
+    workspace: &str,
+    parent: &openshell_core::proto::SandboxParent,
+    providers: &[String],
+) -> Result<(), Status> {
+    let current = state
+        .store
+        .get_message::<Sandbox>(&parent.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?;
+    let usable = current.as_ref().is_some_and(|current| {
+        current.parent.is_none()
+            && current
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.deletion_time.is_none())
+    });
+    if !usable {
+        return Err(Status::failed_precondition(format!(
+            "parent sandbox '{}' is no longer available",
+            parent.name
+        )));
+    }
+    let parent_providers = current
+        .as_ref()
+        .and_then(|current| current.spec.as_ref())
+        .map_or(&[][..], |parent_spec| parent_spec.providers.as_slice());
+    if let Some(provider) = providers
+        .iter()
+        .find(|provider| !parent_providers.contains(provider))
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider}' is not attached to parent '{}'",
+            parent.name
+        )));
+    }
+    // A child keeps its slot until its delete finishes: until then its
+    // compute resources may still run, and a stuck delete must not let a
+    // looping agent exceed the limit.
+    let limit = state.config.max_concurrent_children;
+    let children = crate::compute::count_children(&state.store, workspace, &parent.id).await?;
+    if children.total() >= limit as usize {
+        let leaving = match children.being_deleted {
+            0 => String::new(),
+            n => format!(", {n} of them still being deleted; try again shortly"),
+        };
+        return Err(Status::resource_exhausted(format!(
+            "sandbox '{}' has reached its limit of {limit} children{leaving}",
+            parent.name
+        )));
+    }
+    Ok(())
+}
+
+/// Policy-revision provenance naming the parent a child's policy was copied
+/// from. Gateway-owned: the `internal.openshell.ai/` prefix is reserved.
+const COPIED_FROM_PARENT_ID: &str = "internal.openshell.ai/copied-from-parent-id";
+/// The parent policy version a child's policy revision was copied from.
+const COPIED_FROM_PARENT_VERSION: &str = "internal.openshell.ai/copied-from-parent-version";
+
+/// A parent's policy as copied into a child: the policy, cleaned exactly as a
+/// create cleans it, and the provenance naming the parent version.
+struct ParentPolicyCopy {
+    policy: openshell_core::proto::SandboxPolicy,
+    provenance: HashMap<String, String>,
+}
+
+impl ParentPolicyCopy {
+    /// Copy one parent revision. Create and sync both copy through here, so a
+    /// child's first revision and its later copies of the same parent version
+    /// are identical.
+    fn of(record: &crate::persistence::PolicyRecord, parent_id: &str) -> Result<Self, Status> {
+        let (mut policy, _) = super::policy::canonical_policy_record_identity(record)?;
+        super::policy::clear_provider_credentialed_markers(&mut policy);
+        validate_no_reserved_provider_policy_keys(&policy)?;
+        let policy = validate_and_canonicalize_policy(policy)?;
+        let provenance = HashMap::from([
+            (COPIED_FROM_PARENT_ID.to_string(), parent_id.to_string()),
+            (
+                COPIED_FROM_PARENT_VERSION.to_string(),
+                record.version.to_string(),
+            ),
+        ]);
+        Ok(Self { policy, provenance })
+    }
+
+    fn parent_version(&self) -> i64 {
+        self.provenance
+            .get(COPIED_FROM_PARENT_VERSION)
+            .and_then(|version| version.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// The revisions that decide what a parent enforces: the one at its
+/// `current_policy_version`, the last version it reported loaded, and under
+/// `fail_closed` a failed revision at or above it, which makes the parent
+/// deny all new egress. The newest revision with status "loaded" is not
+/// used: a newer revision marks it superseded before it loads, and a later
+/// failure of the same version, such as a re-apply, marks it failed.
+async fn parent_policy_revisions(
+    state: &ServerState,
+    parent_id: &str,
+) -> Result<
+    Option<(
+        crate::persistence::PolicyRecord,
+        Option<crate::persistence::PolicyRecord>,
+    )>,
+    Status,
+> {
+    let current = state
+        .store
+        .get_message::<Sandbox>(parent_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .map_or(0, |parent| parent.current_policy_version());
+    if current == 0 {
+        return Ok(None);
+    }
+    let Some(enforced) = state
+        .store
+        .get_policy_by_version(parent_id, i64::from(current))
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent policy failed: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let blocking = if state.config.policy_validation_failure_mode
+        == openshell_core::PolicyValidationFailureMode::FailClosed
+    {
+        failed_policy_at_or_above(state, parent_id, enforced.version).await?
+    } else {
+        None
+    };
+    Ok(Some((enforced, blocking)))
+}
+
+/// Under the child-create lock, copy the policy the parent is enforcing: the
+/// revision at its current policy version, not a newer pending or failed one.
+/// A `fail_closed` parent that rejected a newer revision denies all new
+/// egress, so its enforced revision would give a new child more access than
+/// the parent has.
+async fn copy_parent_policy(
+    state: &ServerState,
+    parent: &openshell_core::proto::SandboxParent,
+) -> Result<ParentPolicyCopy, Status> {
+    match parent_policy_revisions(state, &parent.id).await? {
+        None => Err(Status::failed_precondition(format!(
+            "parent sandbox '{}' has no policy yet; try again once it is running",
+            parent.name
+        ))),
+        Some((_, Some(_))) => Err(Status::failed_precondition(format!(
+            "parent sandbox '{}' rejected its latest policy; fix it before creating children",
+            parent.name
+        ))),
+        Some((loaded, None)) => ParentPolicyCopy::of(&loaded, &parent.id),
+    }
+}
+
+/// The newest revision at or above the parent's enforced version that failed
+/// to load. At the enforced version itself, that is a failed re-apply.
+async fn failed_policy_at_or_above(
+    state: &ServerState,
+    parent_id: &str,
+    enforced_version: i64,
+) -> Result<Option<crate::persistence::PolicyRecord>, Status> {
+    const PAGE_SIZE: u32 = 100;
+    let mut before_version = None;
+    loop {
+        let page = state
+            .store
+            .list_policies_before(parent_id, PAGE_SIZE, before_version)
+            .await
+            .map_err(|e| Status::internal(format!("list parent policies failed: {e}")))?;
+        for record in &page {
+            if record.version < enforced_version {
+                return Ok(None);
+            }
+            if record.status == "failed" {
+                return Ok(Some(record.clone()));
+            }
+        }
+        match page.last() {
+            Some(last) if page.len() == PAGE_SIZE as usize => {
+                before_version = Some(last.version);
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// The parent policy version a child's revision was copied from, or 0 when it
+/// was not copied from this parent.
+fn copied_parent_version(record: &crate::persistence::PolicyRecord, parent_id: &str) -> i64 {
+    if record
+        .provenance
+        .get(COPIED_FROM_PARENT_ID)
+        .map(String::as_str)
+        != Some(parent_id)
+    {
+        return 0;
+    }
+    record
+        .provenance
+        .get(COPIED_FROM_PARENT_VERSION)
+        .and_then(|version| version.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Bring each live child of a root up to it, then push every child: remove
+/// providers the root no longer has, and copy the policy the root has loaded
+/// into a child that is behind. Safe to run again. A blocked root's revisions
+/// are not copied; its children are refused at delivery until it loads a fix.
+pub(super) async fn sync_children(state: &Arc<ServerState>, parent_id: &str) -> Result<(), Status> {
+    let Some(parent) = state
+        .store
+        .get_message::<Sandbox>(parent_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+    else {
+        return Ok(());
+    };
+    if parent.parent.is_some() {
+        return Ok(());
+    }
+    let workspace = parent.object_workspace().to_string();
+
+    // Read the parent's policy and list its children under the parent's lock,
+    // which every child create also holds: a create either finished before
+    // the list or reads the newer policy itself.
+    let (copy, children) = {
+        let _parent_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox(&workspace, parent_id))
+            .await
+            .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
+        let copy = parent_policy_copy(state, parent_id).await?;
+        let children: Vec<String> = state
+            .store
+            .collect_messages::<Sandbox>(ObjectListQuery::Workspace(&workspace))
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+            .iter()
+            .filter(|sandbox| {
+                sandbox
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.id == parent_id)
+            })
+            .map(|sandbox| sandbox.object_id().to_string())
+            .collect();
+        (copy, children)
+    };
+
+    // One child's failure must not hold the parent's change back from the
+    // others: log it, carry on, and report it at the end.
+    let mut failed = 0_usize;
+    for child_id in children {
+        if let Err(error) = sync_child(state, &workspace, parent_id, &child_id, copy.as_ref()).await
+        {
+            warn!(parent_id, child_id, error = %error, "failed to sync child sandbox");
+            failed += 1;
+        }
+        // Push every child, copied or not: the parent can become blocked or
+        // unblocked without a new copy, and the child must see that.
+        state.sandbox_watch_bus.notify(&child_id);
+        crate::config_delivery::publish_sandbox(state, &child_id);
+    }
+    if failed > 0 {
+        return Err(Status::unavailable(format!(
+            "{failed} child sandboxes of '{}' were not synced",
+            parent.object_name()
+        )));
+    }
+    Ok(())
+}
+
+/// The copy of the policy a parent has loaded, or none when it has nothing
+/// loaded or is blocked: a blocked parent's children are refused at delivery.
+async fn parent_policy_copy(
+    state: &ServerState,
+    parent_id: &str,
+) -> Result<Option<ParentPolicyCopy>, Status> {
+    match parent_policy_revisions(state, parent_id).await? {
+        Some((loaded, None)) => ParentPolicyCopy::of(&loaded, parent_id).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Bring every root's children up to the root, for syncs lost while the
+/// gateway was down or published by a replica the child is not on, and stop
+/// every child whose parent record is gone.
+pub async fn sync_all_children(state: &Arc<ServerState>) -> Result<(), Status> {
+    let mut children_by_parent: std::collections::BTreeMap<String, Vec<Sandbox>> =
+        std::collections::BTreeMap::new();
+    for sandbox in state
+        .store
+        .collect_messages::<Sandbox>(ObjectListQuery::AllWorkspaces)
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+    {
+        if let Some(parent_id) = sandbox.parent.as_ref().map(|parent| parent.id.clone()) {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(sandbox);
+        }
+    }
+    let mut failed = 0_usize;
+    for (parent_id, children) in children_by_parent {
+        // Only a parent read as not found makes orphans: a store error means
+        // the scan cannot tell, so it leaves these children alone.
+        let result = match parent_is_missing(state, &parent_id).await {
+            Ok(true) => {
+                for child in &children {
+                    stop_orphaned_child(state, child).await;
+                }
+                Ok(())
+            }
+            Ok(false) => sync_children(state, &parent_id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            warn!(parent_id, error = %error, "failed to sync child sandboxes");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        return Err(Status::unavailable(format!(
+            "the children of {failed} parent sandboxes were not all synced"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a child's parent record is gone. Read by id, so a root created
+/// later under the same name is never taken for it. A store error is
+/// returned, never taken as missing.
+pub(super) async fn parent_is_missing(
+    state: &ServerState,
+    parent_id: &str,
+) -> Result<bool, Status> {
+    Ok(state
+        .store
+        .get_message::<Sandbox>(parent_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .is_none())
+}
+
+/// Before a child's configuration is built, check it against its parent's
+/// live record: refuse it while the parent is missing or blocked, and keep
+/// only the providers the parent still has, in the child's order. Returns the
+/// parent's loaded revision, which the child's copy must have reached. A root
+/// passes unchanged.
+pub(super) async fn admit_child(
+    state: &ServerState,
+    child: &mut Sandbox,
+) -> Result<Option<crate::persistence::PolicyRecord>, Status> {
+    let Some(parent_ref) = child.parent.clone() else {
+        return Ok(None);
+    };
+    let Some(parent) = state
+        .store
+        .get_message::<Sandbox>(&parent_ref.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+    else {
+        return Err(child_refusal::status(
+            child_refusal::PARENT_MISSING,
+            crate::compute::orphaned_child_message(&parent_ref),
+        ));
+    };
+    let loaded = match parent_policy_revisions(state, &parent_ref.id).await? {
+        Some((_, Some(_))) => {
+            return Err(child_refusal::status(
+                child_refusal::PARENT_POLICY_REJECTED,
+                format!(
+                    "parent sandbox '{}' rejected its latest policy",
+                    parent_ref.name
+                ),
+            ));
+        }
+        Some((loaded, None)) => Some(loaded),
+        None => None,
+    };
+    let parent_providers = parent.spec.map(|spec| spec.providers).unwrap_or_default();
+    if let Some(spec) = child.spec.as_mut() {
+        spec.providers
+            .retain(|name| parent_providers.contains(name));
+    }
+    Ok(loaded)
+}
+
+/// Whether `provider` is attached to `sandbox` as delivery sees it: for a
+/// child, attached to the child and still to its parent.
+pub(super) async fn provider_attached_for_delivery(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    provider: &str,
+) -> Result<bool, Status> {
+    let attached = |sandbox: &Sandbox| {
+        sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.providers.iter().any(|name| name == provider))
+    };
+    if !attached(sandbox) {
+        return Ok(false);
+    }
+    let Some(parent) = sandbox.parent.as_ref() else {
+        return Ok(true);
+    };
+    Ok(state
+        .store
+        .get_message::<Sandbox>(&parent.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .is_some_and(|parent| attached(&parent)))
+}
+
+/// Reasons a child is refused configuration or a start, carried as an
+/// `ErrorInfo` alongside the message so callers never match its wording.
+pub mod child_refusal {
+    use openshell_core::rpc_error;
+    use tonic::Status;
+
+    pub const PARENT_MISSING: &str = "PARENT_SANDBOX_MISSING";
+    pub const PARENT_POLICY_REJECTED: &str = "PARENT_POLICY_REJECTED";
+    pub const PARENT_POLICY_NOT_COPIED: &str = "PARENT_POLICY_NOT_COPIED";
+    pub const PARENT_POLICY_UNCOPYABLE: &str = "PARENT_POLICY_UNCOPYABLE";
+
+    pub fn status(reason: &str, message: impl Into<String>) -> Status {
+        rpc_error::failed_precondition(reason, message)
+    }
+
+    /// The gateway's reason on `status`, if it set one.
+    pub fn reason(status: &Status) -> Option<String> {
+        rpc_error::decode_details(status)?
+            .error_info()
+            .filter(|info| info.domain == rpc_error::ERROR_DOMAIN)
+            .map(|info| info.reason.clone())
+    }
+}
+
+/// Refuse a child whose policy copy is older than the policy its parent has
+/// loaded, so a missed or failed sync fails closed. Starts a sync, which
+/// publishes the child once its copy lands.
+pub(super) fn refuse_child_behind_parent(
+    state: &Arc<ServerState>,
+    child: &Sandbox,
+    parent_loaded: &crate::persistence::PolicyRecord,
+    child_latest: Option<&crate::persistence::PolicyRecord>,
+) -> Result<(), Status> {
+    let Some(parent) = child.parent.as_ref() else {
+        return Ok(());
+    };
+    let copied = child_latest.map_or(0, |record| copied_parent_version(record, &parent.id));
+    if copied >= parent_loaded.version {
+        return Ok(());
+    }
+    // A copy that can never succeed would refuse the child for good; say why
+    // once per parent version instead of retrying every rebuild.
+    if let Err(reason) = ParentPolicyCopy::of(parent_loaded, &parent.id) {
+        warn_uncopyable_parent_policy_once(&parent.id, parent_loaded.version, &reason);
+        return Err(child_refusal::status(
+            child_refusal::PARENT_POLICY_UNCOPYABLE,
+            format!(
+                "parent sandbox '{}' policy version {} cannot be copied to its children",
+                parent.name, parent_loaded.version
+            ),
+        ));
+    }
+    spawn_child_sync(state, child);
+    Err(child_refusal::status(
+        child_refusal::PARENT_POLICY_NOT_COPIED,
+        format!(
+            "parent sandbox '{}' policy version {} is not yet copied to this child",
+            parent.name, parent_loaded.version
+        ),
+    ))
+}
+
+fn warn_uncopyable_parent_policy_once(parent_id: &str, version: i64, reason: &Status) {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(parent_id.to_string(), version) != Some(version) {
+        warn!(
+            parent_id,
+            version,
+            reason = %reason.message(),
+            "parent sandbox policy cannot be copied to its children; they are refused configuration"
+        );
+    }
+}
+
+/// The children with a background sync running on this replica.
+static CHILD_SYNCS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A child's entry in [`CHILD_SYNCS_IN_FLIGHT`]. Dropping it clears the entry
+/// on every exit, a panic included, so one failed sync never blocks the
+/// child's later ones.
+struct InFlightChildSync(String);
+
+impl InFlightChildSync {
+    fn claim(child_id: &str) -> Option<Self> {
+        Self::syncs()
+            .insert(child_id.to_string())
+            .then(|| Self(child_id.to_string()))
+    }
+
+    fn syncs() -> std::sync::MutexGuard<'static, HashSet<String>> {
+        CHILD_SYNCS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for InFlightChildSync {
+    fn drop(&mut self) {
+        Self::syncs().remove(&self.0);
+    }
+}
+
+/// Bring one child up to its parent in the background, at most one sync per
+/// child on this replica at a time. Stops the child if its parent is gone.
+pub fn spawn_child_sync(state: &Arc<ServerState>, child: &Sandbox) {
+    let child_id = child.object_id().to_string();
+    let Some(entry) = InFlightChildSync::claim(&child_id) else {
+        return;
+    };
+    let state = Arc::clone(state);
+    let child = child.clone();
+    tokio::spawn(async move {
+        let _entry = entry;
+        match sync_one_child(&state, &child).await {
+            Ok(ChildSync::Done) => {
+                state.sandbox_watch_bus.notify(&child_id);
+                crate::config_delivery::publish_sandbox(&state, &child_id);
+            }
+            // Stopping waits on the child's session, so it runs here, apart
+            // from any build. Delivery refuses the orphan meanwhile.
+            Ok(ChildSync::Orphaned) => stop_orphaned_child(&state, &child).await,
+            Err(error) => warn!(child_id, error = %error, "child sandbox sync failed"),
+        }
+    });
+}
+
+/// Stop a child whose parent record is gone. Delivery already refuses it
+/// configuration, which ends new egress; stopping it ends the connections
+/// its supervisor still holds open. Its record and files are kept for
+/// inspection and deletion, and it cannot be started again.
+pub async fn stop_orphaned_child(state: &Arc<ServerState>, child: &Sandbox) {
+    let child_id = child.object_id();
+    // Stop works by name: skip if the orphan was deleted and the name reused.
+    let current = state
+        .store
+        .get_message_by_name::<Sandbox>(child.object_workspace(), child.object_name())
+        .await;
+    if !matches!(&current, Ok(Some(sandbox)) if sandbox.object_id() == child_id) {
+        warn!(
+            child_id,
+            "not stopping orphaned child sandbox: its record is gone, replaced or unreadable"
+        );
+        return;
+    }
+    match state
+        .compute
+        .stop_sandbox(child.object_workspace(), child.object_name())
+        .await
+    {
+        Ok(_) => warn!(
+            child_id,
+            parent_id = child
+                .parent
+                .as_ref()
+                .map_or("", |parent| parent.id.as_str()),
+            "stopped child sandbox whose parent no longer exists"
+        ),
+        Err(error) => warn!(
+            child_id,
+            error = %error,
+            "failed to stop child sandbox whose parent no longer exists"
+        ),
+    }
+}
+
+/// Refuse to start or resume a child whose parent record is gone. A parent
+/// is never recreated under the same id, so no lock is needed.
+async fn refuse_orphaned_child(state: &ServerState, sandbox: &Sandbox) -> Result<(), Status> {
+    if let Some(parent) = sandbox.parent.as_ref()
+        && parent_is_missing(state, &parent.id).await?
+    {
+        return Err(child_refusal::status(
+            child_refusal::PARENT_MISSING,
+            crate::compute::orphaned_child_message(parent),
+        ));
+    }
+    Ok(())
+}
+
+/// What a connecting child's sync found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChildSync {
+    /// Not a child, or brought up to its parent.
+    Done,
+    /// The parent record is gone; the caller stops the child.
+    Orphaned,
+}
+
+/// Bring one child up to its parent, for a child that may have missed a
+/// sync. The child-sandbox lock set includes the parent, so the parent is
+/// read and the child written under one guard.
+pub async fn sync_one_child(
+    state: &Arc<ServerState>,
+    child: &Sandbox,
+) -> Result<ChildSync, Status> {
+    let Some(parent) = child.parent.as_ref() else {
+        return Ok(ChildSync::Done);
+    };
+    let workspace = child.object_workspace();
+    let _guard = state
+        .compute
+        .mutation_guard(MutationScope::ChildSandbox {
+            workspace,
+            sandbox_id: child.object_id(),
+            parent_id: &parent.id,
+        })
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
+    if parent_is_missing(state, &parent.id).await? {
+        return Ok(ChildSync::Orphaned);
+    }
+    let copy = parent_policy_copy(state, &parent.id).await?;
+    sync_child_locked(
+        state,
+        workspace,
+        &parent.id,
+        child.object_id(),
+        copy.as_ref(),
+    )
+    .await?;
+    Ok(ChildSync::Done)
+}
+
+/// Bring one child up to its parent. Takes the same lock set as a provider
+/// attach on that child, so the parent's lock is never held while waiting
+/// for a child's.
+async fn sync_child(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    parent_id: &str,
+    child_id: &str,
+    copy: Option<&ParentPolicyCopy>,
+) -> Result<(), Status> {
+    let _guard = state
+        .compute
+        .mutation_guard(MutationScope::ChildSandbox {
+            workspace,
+            sandbox_id: child_id,
+            parent_id,
+        })
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "acquire sandbox mutation lock"))?;
+    sync_child_locked(state, workspace, parent_id, child_id, copy).await
+}
+
+/// Detach from a live child every provider its parent no longer has, then
+/// write `copy` as its next revision unless it already holds this parent
+/// version or a newer one. Providers are removed whatever the parent's
+/// policy state: losing one is a revocation. The caller holds the
+/// child-sandbox lock set, so the parent's providers read here are current.
+async fn sync_child_locked(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    parent_id: &str,
+    child_id: &str,
+    copy: Option<&ParentPolicyCopy>,
+) -> Result<(), Status> {
+    let Some(child) = state
+        .store
+        .get_message::<Sandbox>(child_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch child sandbox failed: {e}")))?
+    else {
+        return Ok(());
+    };
+    if crate::compute::is_being_deleted(&child) {
+        return Ok(());
+    }
+    let parent_providers = state
+        .store
+        .get_message::<Sandbox>(parent_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+        .and_then(|parent| parent.spec.map(|spec| spec.providers));
+    if let Some(parent_providers) = parent_providers {
+        let lost: Vec<String> = child
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|name| !parent_providers.contains(name))
+            .cloned()
+            .collect();
+        for provider in lost {
+            detach_provider_locked(state, child_id, 0, &provider).await?;
+            info!(
+                parent_id,
+                child_id, provider, "detached a provider its parent lost from child sandbox"
+            );
+        }
+    }
+
+    let Some(copy) = copy else {
+        return Ok(());
+    };
+    let parent_version = copy.parent_version();
+    let latest = state
+        .store
+        .get_latest_policy(child_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch child policy failed: {e}")))?;
+    if latest
+        .as_ref()
+        .is_some_and(|record| copied_parent_version(record, parent_id) >= parent_version)
+    {
+        return Ok(());
+    }
+    let write = crate::policy_store::AtomicPolicyRevisionWrite {
+        id: uuid::Uuid::new_v4().to_string(),
+        sandbox_id: child_id.to_string(),
+        workspace: workspace.to_string(),
+        version: latest.as_ref().map_or(1, |record| record.version + 1),
+        policy_payload: copy.policy.encode_to_vec(),
+        policy_hash: openshell_core::policy_identity::deterministic_policy_hash(&copy.policy),
+        provenance: copy.provenance.clone(),
+        expected_resource_version: 0,
+        annotations: HashMap::new(),
+        backfill_policy: None,
+    };
+    state
+        .store
+        .put_policy_revision_atomic(&write)
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "write child policy"))?;
+    info!(
+        parent_id,
+        child_id,
+        parent_version,
+        version = write.version,
+        "copied parent policy into child sandbox"
+    );
+    Ok(())
+}
+
+/// Under the parent's lock, check that a provider being attached to a child is
+/// attached to its parent.
+async fn check_parent_has_provider(
+    state: &ServerState,
+    parent: &openshell_core::proto::SandboxParent,
+    provider: &str,
+) -> Result<(), Status> {
+    let current = state
+        .store
+        .get_message::<Sandbox>(&parent.id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?;
+    let attached = current
+        .as_ref()
+        .and_then(|current| current.spec.as_ref())
+        .is_some_and(|spec| spec.providers.iter().any(|name| name == provider));
+    if !attached {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider}' is not attached to parent '{}'",
+            parent.name
+        )));
+    }
+    Ok(())
+}
+
 async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
@@ -564,22 +1739,44 @@ async fn handle_create_sandbox_inner(
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
-        MinWorkspaceRole::User,
-    )
-    .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+    // `authorize_workspace` admits a sandbox caller to any workspace, so a
+    // sandbox caller's workspace comes from its own record instead.
+    let caller = match &principal {
+        crate::auth::principal::Principal::Sandbox(caller) => {
+            Some(sandbox_caller_create(state, caller, &request).await?)
+        }
+        _ => None,
+    };
+    let workspace = match &caller {
+        Some(caller) => caller.object_workspace().to_string(),
+        None => {
+            authorize_workspace(
+                &state.store,
+                &state.admin_role,
+                &principal,
+                crate::auth::workspace_authz::selected_workspace_name(
+                    request.workspace_scope.as_ref(),
+                )?,
+                MinWorkspaceRole::User,
+            )
+            .await?
+            .workspace
+        }
+    };
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &workspace)
         .await?
         .ensure_active()?;
 
     let (mut spec, created_from_workload_template) = if workload_template_name.is_empty() {
-        let spec = request
-            .spec
-            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        let spec = match &caller {
+            Some(caller) => spec_copied_from_caller(
+                caller,
+                request.spec.map(|spec| spec.providers).unwrap_or_default(),
+            ),
+            None => request
+                .spec
+                .ok_or_else(|| Status::invalid_argument("spec is required"))?,
+        };
         (spec, None)
     } else {
         let governance_spec = request.spec.unwrap_or_default();
@@ -587,13 +1784,24 @@ async fn handle_create_sandbox_inner(
             .store
             .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
             .await
-            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?;
+        let template = match (template, &caller) {
+            (Some(template), Some(_)) => {
+                check_agent_usable_template(&template)?;
+                template
+            }
+            (Some(template), None) => template,
+            (None, Some(_)) => return Err(template_not_available(&workload_template_name)),
+            (None, None) => return Err(Status::not_found("sandbox template not found")),
+        };
         let provenance = SandboxWorkloadTemplateProvenance {
             name: template.object_name().to_string(),
             resource_version: template.get_resource_version().to_string(),
         };
         let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
+        if let Some(caller) = &caller {
+            copy_isolation_from_caller(caller, resolved.template.get_or_insert_default());
+        }
         resolved.policy = governance_spec.policy;
         resolved.providers = governance_spec.providers;
         resolved.command = governance_spec.command;
@@ -618,6 +1826,11 @@ async fn handle_create_sandbox_inner(
         spec.tty = true;
     }
 
+    let parent = match &caller {
+        Some(caller) => Some(check_create_parent(caller, &mut spec)?),
+        None => resolve_create_parent(state, &workspace, &request.parent, &mut spec).await?,
+    };
+
     // Validate field sizes before any create-side effects.
     validate_sandbox_spec(&request.name, &spec)?;
 
@@ -637,11 +1850,25 @@ async fn handle_create_sandbox_inner(
     } else {
         request.name.clone()
     };
-    let (sandbox_lifecycle_guard, mutation_guard) = state
-        .compute
-        .sandbox_create_guards(&workspace, &id)
-        .await
+    let guards = match &parent {
+        Some(parent) => {
+            state
+                .compute
+                .child_sandbox_create_guards(&workspace, &id, &parent.id)
+                .await
+        }
+        None => state.compute.sandbox_create_guards(&workspace, &id).await,
+    };
+    let (sandbox_lifecycle_guard, mutation_guard) = guards
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
+    let initial_policy_provenance = if let Some(parent) = &parent {
+        check_parent_has_room(state, &workspace, parent, &spec.providers).await?;
+        let copy = copy_parent_policy(state, parent).await?;
+        spec.policy = Some(copy.policy);
+        copy.provenance
+    } else {
+        HashMap::new()
+    };
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -719,6 +1946,13 @@ async fn handle_create_sandbox_inner(
         spec: Some(spec),
         status: None,
         created_from_workload_template,
+        parent,
+        // Records who decided: the user, or for a child created over MCP,
+        // the root sandbox. The user a root acts for is the root's creator.
+        created_by: caller.as_ref().map_or_else(
+            || creator_subject(&principal),
+            |root| format!("sandbox:{}", root.object_id()),
+        ),
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
     sandbox
@@ -772,6 +2006,7 @@ async fn handle_create_sandbox_inner(
     // their revisions cannot change before the sandbox's launch is committed.
     let mut runtime_inputs =
         super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
+    runtime_inputs.initial_policy_provenance = initial_policy_provenance;
 
     state
         .compute
@@ -1070,34 +2305,78 @@ pub(super) async fn handle_list_sandboxes(
 ) -> Result<Response<ListSandboxesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let scope = authorize_list_workspace_selector(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        request.workspace_scope.as_ref(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
     if !request.label_selector.is_empty() {
         crate::grpc::validation::validate_label_selector(&request.label_selector)?;
     }
-    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
-        None
-    } else {
-        let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
-            unreachable!("all-workspaces scope handled above")
+    let (workspace, parent_id) =
+        if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+            // A sandbox caller (only through `/mcp`) lists its own children, in
+            // its own workspace, whatever scope or parent the request names.
+            let caller = state
+                .store
+                .get_message::<Sandbox>(&caller.sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (
+                Some(caller.object_workspace().to_string()),
+                Some(caller.object_id().to_string()),
+            )
+        } else {
+            let scope = authorize_list_workspace_selector(
+                &state.store,
+                &state.admin_role,
+                &principal,
+                request.workspace_scope.as_ref(),
+                MinWorkspaceRole::User,
+            )
+            .await?;
+            let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+                None
+            } else {
+                let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
+                    unreachable!("all-workspaces scope handled above")
+                };
+                let workspace =
+                    super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+                        .await?
+                        .name;
+                Some(workspace)
+            };
+            // Names are unique only within a workspace, so the parent is resolved
+            // there, once, and filtered on by id.
+            let parent_id = if request.parent.is_empty() {
+                None
+            } else {
+                let Some(workspace) = workspace.as_deref() else {
+                    return Err(Status::invalid_argument(
+                        "a parent filter needs a single workspace",
+                    ));
+                };
+                let parent = state
+                    .store
+                    .get_message_by_name::<Sandbox>(workspace, &request.parent)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch parent sandbox failed: {e}")))?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("parent sandbox '{}' not found", request.parent))
+                    })?;
+                Some(parent.object_id().to_string())
+            };
+            (workspace, parent_id)
         };
-        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-            .await?
-            .name;
-        Some(workspace)
-    };
     let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    // The parent's id, not its name, so a token stops working if the parent
+    // is deleted and a new sandbox takes its name.
+    let mut fingerprint = vec![scope_fingerprint, request.label_selector.as_str()];
+    if let Some(parent_id) = parent_id.as_deref() {
+        fingerprint.push(parent_id);
+    }
     let pagination = Pagination::new(
         request.page_size,
         &request.page_token,
         "ListSandboxes",
-        &[scope_fingerprint, &request.label_selector],
+        &fingerprint,
     )?;
     let after = pagination.object_cursor()?;
     let query = match (workspace.as_deref(), request.label_selector.as_str()) {
@@ -1109,6 +2388,14 @@ pub(super) async fn handle_list_sandboxes(
             label_selector: selector,
         },
     };
+    if let Some(parent_id) = parent_id {
+        let (sandboxes, next_cursor) =
+            list_children_page(state, query, after, pagination.page_size(), &parent_id).await?;
+        return Ok(Response::new(ListSandboxesResponse {
+            sandboxes,
+            next_page_token: pagination.next_object_token(next_cursor.as_ref()),
+        }));
+    }
     let page = state
         .store
         .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
@@ -1119,6 +2406,48 @@ pub(super) async fn handle_list_sandboxes(
         sandboxes: page.messages,
         next_page_token,
     }))
+}
+
+/// Fill one response page with a parent's children, reading as many store
+/// pages as needed. When the response fills partway through a store page,
+/// the next cursor is the last record read, so the next page starts right
+/// after it instead of skipping the rest of that store page.
+async fn list_children_page(
+    state: &ServerState,
+    query: ObjectListQuery<'_>,
+    mut after: Option<crate::persistence::ObjectCursor>,
+    page_size: u32,
+    parent_id: &str,
+) -> Result<(Vec<Sandbox>, Option<crate::persistence::ObjectCursor>), Status> {
+    let limit = page_size as usize;
+    let mut children = Vec::new();
+    loop {
+        let page = state
+            .store
+            .list_object_page(Sandbox::object_type(), query, after.as_ref(), page_size)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        let read = page.records.len();
+        for (index, record) in page.records.into_iter().enumerate() {
+            let cursor = crate::persistence::ObjectCursor::from(&record);
+            let sandbox: Sandbox = crate::persistence::decode_record(record)
+                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+            if sandbox
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.id == parent_id)
+            {
+                children.push(sandbox);
+            }
+            if children.len() == limit && index + 1 < read {
+                return Ok((children, Some(cursor)));
+            }
+        }
+        match page.next_cursor {
+            Some(cursor) if children.len() < limit => after = Some(cursor),
+            next_cursor => return Ok((children, next_cursor)),
+        }
+    }
 }
 
 pub(super) async fn handle_create_sandbox_template(
@@ -1253,6 +2582,9 @@ pub(super) async fn handle_list_sandbox_templates(
 ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+        return list_agent_templates(state, &caller.sandbox_id).await;
+    }
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -1301,6 +2633,57 @@ pub(super) async fn handle_list_sandbox_templates(
     Ok(Response::new(ListSandboxTemplatesResponse {
         templates: page.messages,
         next_page_token,
+    }))
+}
+
+/// Most templates a sandbox caller is shown; MCP puts every name into the
+/// `create_sandbox` tool, so the list stays short.
+const MAX_AGENT_TEMPLATES: u32 = 50;
+
+/// A sandbox caller (only through `/mcp`) sees the templates it may create
+/// children from, in its own workspace, whatever scope or selector the request
+/// names, and without their environment.
+async fn list_agent_templates(
+    state: &ServerState,
+    caller_id: &str,
+) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+    let caller = state
+        .store
+        .get_message::<Sandbox>(caller_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let selector = format!("{AGENT_USABLE_TEMPLATE_LABEL}=true");
+    let page = state
+        .store
+        .list_message_page::<SandboxWorkloadTemplate>(
+            ObjectListQuery::WorkspaceSelector {
+                workspace: caller.object_workspace(),
+                label_selector: &selector,
+            },
+            None,
+            MAX_AGENT_TEMPLATES,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?;
+    let templates = page
+        .messages
+        .into_iter()
+        .filter(|template| check_agent_usable_template(template).is_ok())
+        .map(|mut template| {
+            if let Some(workload) = template
+                .spec
+                .as_mut()
+                .and_then(|spec| spec.workload.as_mut())
+            {
+                workload.environment.clear();
+            }
+            template
+        })
+        .collect();
+    Ok(Response::new(ListSandboxTemplatesResponse {
+        templates,
+        next_page_token: String::new(),
     }))
 }
 
@@ -1492,14 +2875,23 @@ pub(super) async fn handle_attach_sandbox_provider(
     if let Some(probe) = attach_wait_probe {
         probe.notify_one();
     }
-    let _mutation_guard = state
-        .compute
-        .mutation_guard(MutationScope::sandbox(
-            sandbox.object_workspace(),
-            sandbox.object_id(),
-        ))
-        .await
-        .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
+    // A child also locks its parent, so the parent's providers cannot change
+    // before the attach is saved.
+    let scope = sandbox.parent.as_ref().map_or_else(
+        || MutationScope::sandbox(sandbox.object_workspace(), sandbox.object_id()),
+        |parent| MutationScope::ChildSandbox {
+            workspace: sandbox.object_workspace(),
+            sandbox_id: sandbox.object_id(),
+            parent_id: &parent.id,
+        },
+    );
+    let _mutation_guard =
+        state.compute.mutation_guard(scope).await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
+    if let Some(parent) = &sandbox.parent {
+        check_parent_has_provider(state, parent, &request.provider).await?;
+    }
     let provider_record = get_provider_record(state.store.as_ref(), &workspace, &request.provider)
         .await
         .map_err(|err| {
@@ -1675,7 +3067,7 @@ pub(super) async fn handle_detach_sandbox_provider(
         )));
     }
 
-    let _mutation_guard = state
+    let mutation_guard = state
         .compute
         .mutation_guard(MutationScope::sandbox(
             sandbox.object_workspace(),
@@ -1709,57 +3101,14 @@ pub(super) async fn handle_detach_sandbox_provider(
     )
     .await?;
 
-    let provider_name = request.provider.clone();
-    let detached = Arc::new(AtomicBool::new(false));
-    let detached_clone = detached.clone();
-    let mutation_id = uuid::Uuid::new_v4().to_string();
-
-    let sandbox = update_sandbox_cas(
+    let (sandbox, detached, receipt) = detach_provider_locked(
         state,
         &sandbox_id,
         request.expected_resource_version,
-        |sandbox| {
-            detached_clone.store(false, Ordering::Relaxed);
-            let Some(ref mut spec) = sandbox.spec else {
-                // Spec should always exist post-creation; if missing, fail CAS to surface error
-                return;
-            };
-
-            if spec.provider_attachment_epoch.is_empty() {
-                spec.provider_attachment_epoch.clone_from(&mutation_id);
-            }
-
-            let before_len = spec.providers.len();
-            spec.providers.retain(|name| name != &provider_name);
-            if spec.providers.len() != before_len {
-                spec.provider_attachment_epoch.clone_from(&mutation_id);
-                detached_clone.store(true, Ordering::Relaxed);
-                // Only dedupe after making a change
-                dedupe_provider_names(&mut spec.providers);
-                crate::compute::provisioning_deadline::attachments_changed(
-                    sandbox,
-                    current_time_ms(),
-                );
-            }
-        },
-    )
-    .await
-    .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
-
-    let detached = detached.load(Ordering::Relaxed);
-    if detached {
-        crate::config_delivery::publish_sandbox(state, &sandbox_id);
-        state.sandbox_watch_bus.notify(&sandbox_id);
-    }
-    let receipt = super::provider_readiness::record_provider_mutation(
-        state,
-        &sandbox,
         &request.provider,
-        ProviderMutationKind::Detach,
-        None,
-        &mutation_id,
     )
     .await?;
+    drop(mutation_guard);
 
     info!(
         sandbox_name = %sandbox_name,
@@ -1768,11 +3117,86 @@ pub(super) async fn handle_detach_sandbox_provider(
         "DetachSandboxProvider request completed successfully"
     );
 
+    // A root's children lose what it loses. Delivery already serves them only
+    // the root's providers; the sync, never cancelled, removes the provider
+    // from their records and pushes each child. It runs for every root, so a
+    // retried detach still reaches children an earlier sync missed. Every
+    // session that follows the provider rebuilds at once, which includes
+    // the children: their records name it until the sync runs.
+    if sandbox.parent.is_none() {
+        if detached {
+            crate::config_delivery::publish_provider(state, &workspace, &request.provider);
+        }
+        super::policy::spawn_child_policy_sync(state, &sandbox_id);
+    }
+
     Ok(Response::new(DetachSandboxProviderResponse {
         sandbox: Some(sandbox),
         detached,
         receipt: Some(receipt),
     }))
+}
+
+/// Detach `provider` from a sandbox: bump its attachment epoch so its
+/// supervisor drops the credential, push the change, and record the
+/// readiness receipt. The caller holds the sandbox's mutation lock.
+async fn detach_provider_locked(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    provider: &str,
+) -> Result<
+    (
+        Sandbox,
+        bool,
+        openshell_core::proto::ProviderMutationReceipt,
+    ),
+    Status,
+> {
+    let provider_name = provider.to_string();
+    let detached = Arc::new(AtomicBool::new(false));
+    let detached_clone = detached.clone();
+    let mutation_id = uuid::Uuid::new_v4().to_string();
+
+    let sandbox = update_sandbox_cas(state, sandbox_id, expected_resource_version, |sandbox| {
+        detached_clone.store(false, Ordering::Relaxed);
+        let Some(ref mut spec) = sandbox.spec else {
+            // Spec should always exist post-creation; if missing, fail CAS to surface error
+            return;
+        };
+
+        if spec.provider_attachment_epoch.is_empty() {
+            spec.provider_attachment_epoch.clone_from(&mutation_id);
+        }
+
+        let before_len = spec.providers.len();
+        spec.providers.retain(|name| name != &provider_name);
+        if spec.providers.len() != before_len {
+            spec.provider_attachment_epoch.clone_from(&mutation_id);
+            detached_clone.store(true, Ordering::Relaxed);
+            // Only dedupe after making a change
+            dedupe_provider_names(&mut spec.providers);
+            crate::compute::provisioning_deadline::attachments_changed(sandbox, current_time_ms());
+        }
+    })
+    .await
+    .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
+
+    let detached = detached.load(Ordering::Relaxed);
+    if detached {
+        crate::config_delivery::publish_sandbox(state, sandbox_id);
+        state.sandbox_watch_bus.notify(sandbox_id);
+    }
+    let receipt = super::provider_readiness::record_provider_mutation(
+        state,
+        &sandbox,
+        provider,
+        ProviderMutationKind::Detach,
+        None,
+        &mutation_id,
+    )
+    .await?;
+    Ok((sandbox, detached, receipt))
 }
 
 pub(super) async fn handle_delete_sandbox(
@@ -1798,6 +3222,9 @@ async fn handle_delete_sandbox_inner(
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
+    if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+        return delete_caller_child(state, caller, &req).await;
+    }
     let name = req.name;
     if name.is_empty() {
         return Err(Status::invalid_argument("sandbox is required"));
@@ -1841,6 +3268,88 @@ async fn handle_delete_sandbox_inner(
         outcome: result.outcome.into(),
         sandbox_id: result.sandbox_id,
     }))
+}
+
+/// A sandbox caller (only through `/mcp`) deleting one of its own children.
+/// The delete is bound to the id that was checked, so a name reused in the
+/// meantime is never deleted in its place.
+async fn delete_caller_child(
+    state: &Arc<ServerState>,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    request: &DeleteSandboxRequest,
+) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let set = [
+        ("workspace_scope", request.workspace_scope.is_some()),
+        ("allow_missing", request.allow_missing),
+        ("request_id", !request.request_id.is_empty()),
+    ];
+    if let Some((field, _)) = set.iter().find(|(_, is_set)| *is_set) {
+        return Err(Status::invalid_argument(format!(
+            "field '{field}' is not allowed for sandbox callers"
+        )));
+    }
+    if *request
+        != (DeleteSandboxRequest {
+            name: request.name.clone(),
+            ..Default::default()
+        })
+    {
+        return Err(Status::invalid_argument(
+            "the request sets fields that are not allowed for sandbox callers",
+        ));
+    }
+    let child = resolve_caller_child(state, caller, &request.name).await?;
+    let preconditions = SandboxDeletePreconditions {
+        expected_sandbox_id: Some(child.object_id().to_string()),
+        ..Default::default()
+    };
+    let result = match state
+        .compute
+        .delete_sandbox_allow_missing_with_preconditions(
+            child.object_workspace(),
+            child.object_name(),
+            false,
+            preconditions,
+        )
+        .await
+    {
+        Ok(result) => result,
+        // The checked child is gone when its name no longer resolves to it;
+        // any other conflict is reported as it is.
+        Err(status) if status.code() == tonic::Code::Aborted => {
+            return Err(aborted_child_delete(
+                state,
+                caller,
+                &request.name,
+                child.object_id(),
+                status,
+            )
+            .await);
+        }
+        Err(status) => return Err(status),
+    };
+    state.telemetry.end_sandbox_session(&result.sandbox_id);
+    info!(sandbox_name = %request.name, "DeleteSandbox request completed successfully");
+    Ok(Response::new(DeleteSandboxResponse {
+        outcome: result.outcome.into(),
+        sandbox_id: result.sandbox_id,
+    }))
+}
+
+/// An aborted delete means the checked child is gone when its name no longer
+/// resolves to it (a name reused in the meantime); any other conflict is
+/// reported as it is.
+async fn aborted_child_delete(
+    state: &ServerState,
+    caller: &crate::auth::principal::SandboxPrincipal,
+    name: &str,
+    checked_id: &str,
+    status: Status,
+) -> Status {
+    match resolve_caller_child(state, caller, name).await {
+        Ok(current) if current.object_id() == checked_id => status,
+        _ => Status::not_found(format!("sandbox '{name}' not found")),
+    }
 }
 
 pub(super) async fn handle_stop_sandbox(
@@ -1915,6 +3424,7 @@ async fn handle_start_sandbox_inner(
         MinWorkspaceRole::User,
     )
     .await?;
+    refuse_orphaned_child(state, &resolved).await?;
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -2011,6 +3521,7 @@ async fn handle_resume_sandbox_inner(
         MinWorkspaceRole::User,
     )
     .await?;
+    refuse_orphaned_child(state, &resolved).await?;
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
     let mut sandbox = state
@@ -2735,14 +4246,21 @@ pub(super) async fn handle_exec_sandbox(
     let req = request.into_inner();
     validate_exec_start(&req)?;
 
-    let sandbox = resolve_and_authorize_sandbox_name(
-        state,
-        &principal,
-        &req.sandbox,
-        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    // Only `/mcp` lets a sandbox caller reach this method, and it may act on
+    // its own children only, never on itself.
+    let sandbox = if let crate::auth::principal::Principal::Sandbox(caller) = &principal {
+        refuse_exec_fields_for_sandbox_caller(&req)?;
+        resolve_caller_child(state, caller, &req.sandbox).await?
+    } else {
+        resolve_and_authorize_sandbox_name(
+            state,
+            &principal,
+            &req.sandbox,
+            crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+            MinWorkspaceRole::User,
+        )
+        .await?
+    };
 
     if let Some(completion) = &completion {
         completion.ensure_target(sandbox.object_id())?;
@@ -7201,6 +8719,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "collision".to_string(),
                 spec: Some(SandboxSpec {
@@ -7279,6 +8798,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "user-catalog".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -7302,6 +8822,3606 @@ mod tests {
         );
     }
 
+    async fn child_sandboxes_state() -> Arc<ServerState> {
+        child_sandboxes_state_with_limit(10).await
+    }
+
+    async fn child_sandboxes_state_with_limit(limit: u32) -> Arc<ServerState> {
+        let mut state = test_server_state().await;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.enable_child_sandboxes = true;
+        config.max_concurrent_children = limit;
+        state
+    }
+
+    async fn put_parent_record(
+        state: &ServerState,
+        name: &str,
+        providers: &[&str],
+        parent: Option<openshell_core::proto::SandboxParent>,
+        deleting: bool,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: id.clone(),
+                    name: name.to_string(),
+                    workspace: "default".to_string(),
+                    deletion_time: deleting.then(|| {
+                        openshell_core::time::timestamp_from_millis(current_time_ms()).unwrap()
+                    }),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    providers: providers.iter().map(ToString::to_string).collect(),
+                    ..Default::default()
+                }),
+                parent,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        put_policy_revision_with_status(
+            state,
+            &id,
+            1,
+            &openshell_policy::restrictive_default_policy(),
+            "loaded",
+        )
+        .await;
+        id
+    }
+
+    async fn put_policy_revision_with_status(
+        state: &ServerState,
+        sandbox_id: &str,
+        version: i64,
+        policy: &openshell_core::proto::SandboxPolicy,
+        status: &str,
+    ) {
+        state
+            .store
+            .put_policy_revision(
+                &uuid::Uuid::new_v4().to_string(),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &openshell_core::policy_identity::deterministic_policy_hash(policy),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .update_policy_status(
+                sandbox_id,
+                version,
+                status,
+                None,
+                (status == "loaded").then(current_time_ms),
+            )
+            .await
+            .unwrap();
+        // As the report handler does: a load moves the sandbox's current
+        // policy version forward.
+        if status == "loaded"
+            && let Some(mut sandbox) = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+            && i64::from(sandbox.current_policy_version()) < version
+        {
+            sandbox.set_current_policy_version(u32::try_from(version).unwrap());
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+    }
+
+    fn lead_policy(advisor_proposed: bool) -> openshell_core::proto::SandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "api".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    advisor_proposed,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    async fn latest_policy(
+        state: &ServerState,
+        sandbox_id: &str,
+    ) -> crate::persistence::PolicyRecord {
+        state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("policy revision")
+    }
+
+    async fn create_child(state: &Arc<ServerState>, name: &str, parent: &str) -> Sandbox {
+        handle_create_sandbox(
+            state,
+            authed_request(child_request(name, parent, SandboxSpec::default())),
+        )
+        .await
+        .expect("child sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox")
+    }
+
+    fn child_request(name: &str, parent: &str, spec: SandboxSpec) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            parent: parent.to_string(),
+            name: name.to_string(),
+            spec: Some(spec),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_records_its_parent() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+
+        let child = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .expect("a child of a root sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+
+        assert_eq!(
+            child.parent,
+            Some(openshell_core::proto::SandboxParent {
+                name: "lead".to_string(),
+                id: lead_id,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_records_its_creator() {
+        let state = child_sandboxes_state().await;
+        let root = handle_create_sandbox(
+            &state,
+            authed_request(child_request("lead", "", SandboxSpec::default())),
+        )
+        .await
+        .expect("root sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+        put_policy_revision_with_status(
+            &state,
+            root.object_id(),
+            1,
+            &openshell_policy::restrictive_default_policy(),
+            "loaded",
+        )
+        .await;
+        let child = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .expect("child sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+
+        assert_eq!(root.created_by, "dev-user");
+        assert_eq!(child.created_by, "dev-user");
+    }
+
+    #[tokio::test]
+    async fn child_without_providers_copies_the_parent_providers() {
+        let state = child_sandboxes_state().await;
+        put_parent_record(&state, "lead", &["a", "b"], None, false).await;
+
+        let mut spec = SandboxSpec::default();
+        resolve_create_parent(&state, "default", "lead", &mut spec)
+            .await
+            .expect("parent resolves");
+        assert_eq!(spec.providers, vec!["a".to_string(), "b".to_string()]);
+
+        let mut spec = SandboxSpec {
+            providers: vec!["a".to_string()],
+            ..Default::default()
+        };
+        resolve_create_parent(&state, "default", "lead", &mut spec)
+            .await
+            .expect("parent resolves");
+        assert_eq!(spec.providers, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn child_provider_detached_before_the_lock_is_refused() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &["a"], None, false).await;
+        let parent = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+
+        // The child resolved its providers when the lead still had "b".
+        let err = check_parent_has_room(
+            &state,
+            "default",
+            &parent,
+            &["a".to_string(), "b".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("provider 'b' is not attached to parent 'lead'"),
+            "{}",
+            err.message()
+        );
+        check_parent_has_room(&state, "default", &parent, &["a".to_string()])
+            .await
+            .expect("providers the lead still has are accepted");
+    }
+
+    #[tokio::test]
+    async fn child_copies_the_policy_its_parent_enforces() {
+        let state = child_sandboxes_state().await;
+        let lead = handle_create_sandbox(
+            &state,
+            authed_request(child_request(
+                "lead",
+                "",
+                SandboxSpec {
+                    policy: Some(lead_policy(false)),
+                    ..Default::default()
+                },
+            )),
+        )
+        .await
+        .expect("root sandbox is created")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+        let lead_id = lead.object_id().to_string();
+        super::super::policy::record_policy_apply_result(&state, &lead_id, 1, true, None, "test")
+            .await
+            .unwrap();
+
+        let child = create_child(&state, "worker1", "lead").await;
+
+        let lead_record = latest_policy(&state, &lead_id).await;
+        let child_record = latest_policy(&state, child.object_id()).await;
+        assert_eq!(child_record.version, 1);
+        assert_eq!(
+            super::super::policy::canonical_policy_record_identity(&child_record).unwrap(),
+            super::super::policy::canonical_policy_record_identity(&lead_record).unwrap(),
+        );
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_ID),
+            Some(&lead_id)
+        );
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn child_copies_the_parent_loaded_revision_not_a_newer_one() {
+        let mut state = child_sandboxes_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .policy_validation_failure_mode =
+            openshell_core::PolicyValidationFailureMode::RetainLastValid;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
+
+        let child = create_child(&state, "worker1", "lead").await;
+
+        let child_record = latest_policy(&state, child.object_id()).await;
+        let (child_policy, _) =
+            super::super::policy::canonical_policy_record_identity(&child_record).unwrap();
+        assert!(
+            child_policy.network_policies.is_empty(),
+            "the child must not get the failed or pending revision"
+        );
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn child_of_a_fail_closed_parent_that_rejected_its_policy_is_refused() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("parent sandbox 'lead' rejected its latest policy"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_of_a_parent_with_no_loaded_policy_is_refused() {
+        let state = child_sandboxes_state().await;
+        handle_create_sandbox(
+            &state,
+            authed_request(child_request(
+                "lead",
+                "",
+                SandboxSpec {
+                    policy: Some(lead_policy(false)),
+                    ..Default::default()
+                },
+            )),
+        )
+        .await
+        .expect("root sandbox is created");
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("parent sandbox 'lead' has no policy yet"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_keeps_advisor_markers_from_an_approved_proposal() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        // An approved proposal leaves its endpoints marked as advisor-proposed.
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(true), "loaded").await;
+
+        let child = create_child(&state, "worker1", "lead").await;
+
+        let child_record = latest_policy(&state, child.object_id()).await;
+        let (child_policy, _) =
+            super::super::policy::canonical_policy_record_identity(&child_record).unwrap();
+        assert!(child_policy.network_policies["api"].endpoints[0].advisor_proposed);
+        assert_eq!(
+            child_record.provenance.get(COPIED_FROM_PARENT_VERSION),
+            Some(&"2".to_string())
+        );
+    }
+
+    fn delete_request(name: &str) -> DeleteSandboxRequest {
+        DeleteSandboxRequest {
+            request_id: String::new(),
+            allow_missing: false,
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_parent_with_live_children_is_refused() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        put_parent_record(&state, "worker1", &[], Some(link.clone()), false).await;
+        put_parent_record(&state, "worker2", &[], Some(link), false).await;
+
+        let err = handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("sandbox 'lead' has 2 child sandboxes; delete them first"),
+            "{}",
+            err.message()
+        );
+        let lead = state
+            .store
+            .get_message::<Sandbox>(&lead_id)
+            .await
+            .unwrap()
+            .expect("the refused parent still exists");
+        assert!(
+            lead.metadata.unwrap().deletion_time.is_none(),
+            "a refused delete must not mark the parent as deleting"
+        );
+    }
+
+    #[tokio::test]
+    async fn children_already_being_deleted_do_not_block_the_parent() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_parent_record(
+            &state,
+            "worker1",
+            &[],
+            Some(openshell_core::proto::SandboxParent {
+                name: "lead".to_string(),
+                id: lead_id,
+            }),
+            true,
+        )
+        .await;
+
+        handle_delete_sandbox_inner(&state, authed_request(delete_request("lead")))
+            .await
+            .expect("only deleting children remain, so the parent can be deleted");
+    }
+
+    /// A root `lead` with one child `worker1`. Returns the child's id.
+    async fn put_lead_and_worker(state: &ServerState) -> String {
+        let lead_id = put_parent_record(state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+        put_parent_record(state, "worker1", &[], Some(link), false).await
+    }
+
+    fn default_scope() -> openshell_core::proto::WorkspaceSelector {
+        openshell_core::proto::workspace_selector("default".to_string())
+    }
+
+    /// A root `lead` with provider `work-github` and a child `worker1` created
+    /// through the API, so the child has the provider and a current copy of
+    /// the lead's v1. Returns both ids.
+    async fn lead_and_child_sharing_a_provider(state: &Arc<ServerState>) -> (String, String) {
+        state
+            .store
+            .put_message(&test_provider_with_credential_key(
+                "work-github",
+                "github",
+                "GITHUB_TOKEN",
+            ))
+            .await
+            .unwrap();
+        let lead_id = put_parent_record(state, "lead", &["work-github"], None, false).await;
+        let worker = create_child(state, "worker1", "lead").await;
+        assert_eq!(worker.spec.as_ref().unwrap().providers, vec!["work-github"]);
+        (lead_id, worker.object_id().to_string())
+    }
+
+    async fn sandbox_spec(state: &ServerState, sandbox_id: &str) -> SandboxSpec {
+        state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .unwrap()
+    }
+
+    async fn detach_from_lead(state: &Arc<ServerState>, provider: &str) {
+        let response = handle_detach_sandbox_provider(
+            state,
+            authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: "lead".to_string(),
+                workspace_scope: Some(default_scope()),
+                provider: provider.to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.detached);
+    }
+
+    /// A root `lead` with a child `worker1` whose `lead` record is then
+    /// removed, as a downgraded gateway or a stalled delete can leave it.
+    /// Returns both ids.
+    async fn orphaned_child(state: &Arc<ServerState>) -> (String, String) {
+        let (lead_id, worker_id) = lead_with_copied_child(state).await;
+        state
+            .store
+            .delete(Sandbox::object_type(), &lead_id)
+            .await
+            .unwrap();
+        (lead_id, worker_id)
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_child_is_refused_configuration() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = orphaned_child(&state).await;
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(!config.configuration_admitted);
+        assert!(
+            config
+                .configuration_error
+                .contains("parent sandbox no longer exists"),
+            "{}",
+            config.configuration_error
+        );
+        assert_eq!(config.policy_validation_failure_mode, "fail_closed");
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_child_cannot_be_started_or_resumed() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, _) = orphaned_child(&state).await;
+
+        let start = handle_start_sandbox(
+            &state,
+            authed_request(StartSandboxRequest {
+                request_id: String::new(),
+                name: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        let resume = handle_resume_sandbox(
+            &state,
+            authed_request(ResumeSandboxRequest {
+                name: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        for err in [start, resume] {
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                err.message().contains(&lead_id)
+                    && err.message().contains("delete this child sandbox"),
+                "{}",
+                err.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_startup_scan_stops_an_orphaned_child_and_keeps_it() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = orphaned_child(&state).await;
+        let mut running = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        running.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&running).await.unwrap();
+
+        sync_all_children(&state).await.unwrap();
+
+        let worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .expect("the orphan's record is kept");
+        assert_eq!(
+            SandboxPhase::try_from(worker.phase()).unwrap(),
+            SandboxPhase::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_root_under_the_old_name_does_not_adopt_an_orphan() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = orphaned_child(&state).await;
+        let before = latest_policy(&state, &worker_id).await;
+        let new_lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_policy_revision_with_status(&state, &new_lead_id, 2, &lead_policy(false), "loaded")
+            .await;
+        let worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            sync_one_child(&state, &worker).await.unwrap(),
+            ChildSync::Orphaned
+        );
+        sync_all_children(&state).await.unwrap();
+
+        let after = latest_policy(&state, &worker_id).await;
+        assert_eq!(after.version, before.version, "nothing is copied");
+        assert!(
+            !child_config(&state, &worker_id)
+                .await
+                .configuration_admitted
+        );
+    }
+
+    fn list_children_request(
+        parent: &str,
+        page_size: i32,
+        page_token: String,
+    ) -> ListSandboxesRequest {
+        ListSandboxesRequest {
+            page_size,
+            page_token,
+            label_selector: String::new(),
+            parent: parent.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        }
+    }
+
+    fn listed_names(response: &ListSandboxesResponse) -> Vec<&str> {
+        response
+            .sandboxes
+            .iter()
+            .map(ObjectName::object_name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_parent_filter_pages_through_only_that_parents_children() {
+        let state = child_sandboxes_state().await;
+        // Store order is creation time, then name: a-lead, b, c, d, e-other.
+        let lead_id = put_parent_record(&state, "a-lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "a-lead".to_string(),
+            id: lead_id,
+        };
+        for name in ["b-child", "c-child", "d-child"] {
+            put_parent_record(&state, name, &[], Some(link.clone()), false).await;
+        }
+        put_parent_record(&state, "e-other", &[], None, false).await;
+
+        // Store pages of two are [a-lead, b-child] [c-child, d-child]
+        // [e-other], so the first response fills on c-child, partway through
+        // the second store page; d-child must still come next.
+        let first = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("a-lead", 2, String::new())),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed_names(&first), ["b-child", "c-child"]);
+        assert!(!first.next_page_token.is_empty());
+
+        let second = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("a-lead", 2, first.next_page_token)),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed_names(&second), ["d-child"]);
+        assert!(second.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_parent_filter_does_not_list_an_old_roots_orphans() {
+        let state = child_sandboxes_state().await;
+        orphaned_child(&state).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let listed = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("lead", 100, String::new())),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(listed.sandboxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_lists_only_its_own_children_whatever_it_asks_for() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        for (name, parent, id) in [
+            ("w1", "lead", &lead_id),
+            ("w2", "lead", &lead_id),
+            ("x1", "other", &other_id),
+        ] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            put_parent_record(&state, name, &[], Some(link), false).await;
+        }
+
+        // Another root's name and every workspace are both ignored.
+        let mut request = list_children_request("other", 100, String::new());
+        request.workspace_scope = Some(openshell_core::proto::all_workspaces_selector());
+        let listed = handle_list_sandboxes(&state, sandbox_request(&lead_id, request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed_names(&listed), ["w1", "w2"]);
+    }
+
+    /// Call an MCP tool as the sandbox `caller_id`, through the real gRPC
+    /// stack and handlers, and return the tool result.
+    async fn call_mcp_tool(
+        state: &Arc<ServerState>,
+        caller_id: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        call_mcp_as(
+            state,
+            sandbox_caller(caller_id),
+            None,
+            None,
+            tool,
+            arguments,
+        )
+        .await
+    }
+
+    fn sandbox_caller(sandbox_id: &str) -> crate::auth::principal::Principal {
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+                auth_epoch: None,
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
+    }
+
+    /// Call one MCP tool as `caller` through the real router and handlers,
+    /// with an RBAC policy and a bridge workspace header when given.
+    async fn call_mcp_as(
+        state: &Arc<ServerState>,
+        caller: crate::auth::principal::Principal,
+        authz_policy: Option<crate::auth::authz::AuthzPolicy>,
+        workspace: Option<&str>,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        });
+        post_mcp_as(state, caller, authz_policy, workspace, body).await["result"].clone()
+    }
+
+    /// Post one JSON-RPC message to `/mcp` as `caller` through the real
+    /// router and handlers, and return the whole reply.
+    async fn post_mcp_as(
+        state: &Arc<ServerState>,
+        caller: crate::auth::principal::Principal,
+        authz_policy: Option<crate::auth::authz::AuthzPolicy>,
+        workspace: Option<&str>,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        use crate::auth::authenticator::test_support::MockAuthenticator;
+        use crate::auth::authenticator::{Authentication, AuthenticatorChain};
+        use tower::ServiceExt;
+
+        let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+            Authentication::Accepted(caller),
+        )))]);
+        let stack = crate::multiplex::AuthGrpcRouter::new(
+            openshell_core::proto::open_shell_server::OpenShellServer::new(
+                crate::OpenShellService::new(state.clone()),
+            ),
+            Some(chain),
+            authz_policy,
+        );
+        let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack)
+            .with_short_create_wait()
+            .with_store(state.store.clone());
+        let mut request = http::Request::post("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer caller-token");
+        if let Some(workspace) = workspace {
+            request = request.header("x-openshell-workspace", workspace);
+        }
+        let response = crate::mcp::router()
+            .layer(axum::Extension(connection))
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        reply
+    }
+
+    #[tokio::test]
+    async fn mcp_list_reaches_the_handler_through_the_grpc_stack() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        put_parent_record(&state, "w1", &[], Some(link), false).await;
+
+        let result = call_mcp_tool(&state, &lead_id, "list", serde_json::json!({})).await;
+        assert_eq!(result["isError"], false, "{result}");
+        let names: Vec<_> = result["structuredContent"]["sandboxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["w1"]);
+    }
+
+    /// Record `subject` as the creator of sandbox `id`.
+    async fn set_creator(state: &ServerState, id: &str, subject: &str) {
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(id)
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.created_by = subject.to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    async fn put_member(state: &ServerState, subject: &str) {
+        state
+            .store
+            .put_message(&openshell_core::proto::WorkspaceMember {
+                metadata: Some(ObjectMeta {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: subject.to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                principal_subject: subject.to_string(),
+                role: openshell_core::proto::WorkspaceRole::User.into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A root created by a workspace member, ready to create children.
+    async fn member_root(state: &Arc<ServerState>, name: &str, providers: &[&str]) -> String {
+        let id = put_parent_record(state, name, providers, None, false).await;
+        put_member(state, "alice").await;
+        set_creator(state, &id, "alice").await;
+        id
+    }
+
+    fn sandbox_child_request(name: &str) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            name: name.to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        }
+    }
+
+    fn quantities(pairs: &[(&str, &str)]) -> Value {
+        let fields = pairs
+            .iter()
+            .map(|(name, quantity)| {
+                let value = Value {
+                    kind: Some(Kind::StringValue((*quantity).to_string())),
+                };
+                ((*name).to_string(), value)
+            })
+            .collect();
+        Value {
+            kind: Some(Kind::StructValue(Struct { fields })),
+        }
+    }
+
+    fn resources(sections: &[(&str, Value)]) -> Struct {
+        Struct {
+            fields: sections
+                .iter()
+                .map(|(section, value)| ((*section).to_string(), value.clone()))
+                .collect(),
+        }
+    }
+
+    /// Give the root a template, as `sandbox create --from` would.
+    async fn set_root_template(state: &Arc<ServerState>, id: &str, template: SandboxTemplate) {
+        let mut root = state
+            .store
+            .get_message::<Sandbox>(id)
+            .await
+            .unwrap()
+            .unwrap();
+        root.spec.as_mut().unwrap().template = Some(template);
+        state.store.put_message(&root).await.unwrap();
+    }
+
+    fn isolated_template() -> SandboxTemplate {
+        SandboxTemplate {
+            image: "registry.example.com/lead:1".to_string(),
+            runtime_class_name: "gvisor".to_string(),
+            user_namespaces: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_child_copies_image_cpu_memory_and_isolation_only() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let mut lead = state
+            .store
+            .get_message::<Sandbox>(&lead_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let lead_resources = resources(&[
+            (
+                "limits",
+                quantities(&[("cpu", "2"), ("memory", "4Gi"), ("nvidia.com/gpu", "1")]),
+            ),
+            (
+                "requests",
+                quantities(&[("cpu", "1"), ("example.com/fpga", "1")]),
+            ),
+            ("claims", quantities(&[("gpu", "a100")])),
+        ]);
+        let spec = lead.spec.as_mut().unwrap();
+        spec.template = Some(SandboxTemplate {
+            resources: Some(lead_resources),
+            labels: HashMap::from([("team".to_string(), "a".to_string())]),
+            agent_socket: "/run/agent.sock".to_string(),
+            ..isolated_template()
+        });
+        spec.resource_requirements = Some(ResourceRequirements {
+            gpu: Some(GpuResourceRequirements { count: Some(1) }),
+        });
+        spec.environment = HashMap::from([("SECRET_MODE".to_string(), "on".to_string())]);
+        lead.metadata.as_mut().unwrap().labels =
+            HashMap::from([("team".to_string(), "a".to_string())]);
+        state.store.put_message(&lead).await.unwrap();
+
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, sandbox_child_request("worker")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+
+        assert_eq!(child.parent.as_ref().unwrap().id, lead_id);
+        assert_eq!(child.object_workspace(), "default");
+        let spec = child.spec.as_ref().unwrap();
+        let template = spec.template.as_ref().unwrap();
+        assert_eq!(template.image, "registry.example.com/lead:1");
+        assert_eq!(
+            template.resources,
+            Some(resources(&[
+                ("limits", quantities(&[("cpu", "2"), ("memory", "4Gi")])),
+                ("requests", quantities(&[("cpu", "1")])),
+            ])),
+            "only CPU and memory are copied"
+        );
+        assert_eq!(template.runtime_class_name, "gvisor");
+        assert_eq!(template.user_namespaces, Some(true));
+        assert!(template.labels.is_empty());
+        assert!(template.agent_socket.is_empty());
+        assert!(spec.resource_requirements.is_none(), "no GPU is copied");
+        assert!(spec.environment.is_empty());
+        assert!(child.metadata.as_ref().unwrap().labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_may_set_only_name_template_and_providers() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let with_spec = |spec: SandboxSpec| CreateSandboxRequest {
+            spec: Some(spec),
+            ..sandbox_child_request("worker")
+        };
+        for (request, field) in [
+            (
+                CreateSandboxRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "other".to_string(),
+                    )),
+                    ..sandbox_child_request("worker")
+                },
+                "workspace_scope",
+            ),
+            (
+                CreateSandboxRequest {
+                    parent: "lead".to_string(),
+                    ..sandbox_child_request("worker")
+                },
+                "parent",
+            ),
+            (
+                CreateSandboxRequest {
+                    labels: HashMap::from([("a".to_string(), "b".to_string())]),
+                    ..sandbox_child_request("worker")
+                },
+                "labels",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        image: "evil".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                "spec.template",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    environment: HashMap::from([("A".to_string(), "b".to_string())]),
+                    ..Default::default()
+                }),
+                "spec.environment",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    command: vec!["sh".to_string()],
+                    ..Default::default()
+                }),
+                "spec.command",
+            ),
+            (
+                with_spec(SandboxSpec {
+                    policy: Some(openshell_policy::restrictive_default_policy()),
+                    ..Default::default()
+                }),
+                "spec.policy",
+            ),
+        ] {
+            let err = handle_create_sandbox(&state, sandbox_request(&lead_id, request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
+    }
+
+    #[test]
+    fn the_backstop_refuses_fields_the_named_checks_miss() {
+        // Checked on its own, as for a field added to the request later.
+        let allowed = CreateSandboxRequest {
+            spec: Some(SandboxSpec {
+                providers: vec!["github".to_string()],
+                ..Default::default()
+            }),
+            workload_template: "agents".to_string(),
+            ..sandbox_child_request("worker")
+        };
+        refuse_unlisted_fields_for_sandbox_caller(&allowed).unwrap();
+        for request in [
+            CreateSandboxRequest {
+                request_id: "r1".to_string(),
+                ..allowed.clone()
+            },
+            CreateSandboxRequest {
+                spec: Some(SandboxSpec {
+                    resource_requirements: Some(ResourceRequirements {
+                        gpu: Some(GpuResourceRequirements { count: Some(1) }),
+                    }),
+                    ..Default::default()
+                }),
+                ..allowed
+            },
+        ] {
+            let err = refuse_unlisted_fields_for_sandbox_caller(&request).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                "the request sets fields that are not allowed for sandbox callers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_uses_only_templates_made_available_to_agents() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let put_template = |name: &str, labelled: bool, driver_config: bool| {
+            let mut template = test_workload_template(name);
+            let metadata = template.metadata.as_mut().unwrap();
+            metadata.id = uuid::Uuid::new_v4().to_string();
+            metadata.workspace = "default".to_string();
+            if labelled {
+                metadata
+                    .labels
+                    .insert(AGENT_USABLE_TEMPLATE_LABEL.to_string(), "true".to_string());
+            }
+            if driver_config {
+                template.spec.as_mut().unwrap().driver_config = Some(Struct::default());
+            }
+            let state = state.clone();
+            async move { state.store.put_message(&template).await.unwrap() }
+        };
+        put_template("agents", true, false).await;
+        put_template("unlabelled", false, false).await;
+        put_template("driver", true, true).await;
+        let from_template = |name: &str, template: &str| CreateSandboxRequest {
+            workload_template: template.to_string(),
+            ..sandbox_child_request(name)
+        };
+
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, from_template("w1", "agents")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        let template = child.spec.as_ref().unwrap().template.as_ref().unwrap();
+        assert_eq!(template.image, "registry.example.com/agent:latest");
+
+        // A template child still runs with the root's isolation settings.
+        set_root_template(&state, &lead_id, isolated_template()).await;
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, from_template("w3", "agents")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        let template = child.spec.as_ref().unwrap().template.as_ref().unwrap();
+        assert_eq!(template.image, "registry.example.com/agent:latest");
+        assert_eq!(template.runtime_class_name, "gvisor");
+        assert_eq!(template.user_namespaces, Some(true));
+
+        for name in ["unlabelled", "driver", "missing"] {
+            let err =
+                handle_create_sandbox(&state, sandbox_request(&lead_id, from_template("w2", name)))
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{name}");
+            assert_eq!(
+                err.message(),
+                format!("template '{name}' is not available to agents")
+            );
+        }
+    }
+
+    /// Store a template in `workspace`, labelled for agents when `labelled`,
+    /// with driver configuration when `driver_config`.
+    async fn put_agent_template(
+        state: &Arc<ServerState>,
+        workspace: &str,
+        name: &str,
+        labelled: bool,
+        driver_config: bool,
+    ) {
+        let mut template = test_workload_template(name);
+        let metadata = template.metadata.as_mut().unwrap();
+        metadata.id = uuid::Uuid::new_v4().to_string();
+        metadata.workspace = workspace.to_string();
+        if labelled {
+            metadata
+                .labels
+                .insert(AGENT_USABLE_TEMPLATE_LABEL.to_string(), "true".to_string());
+        }
+        if driver_config {
+            template.spec.as_mut().unwrap().driver_config = Some(Struct::default());
+        }
+        state.store.put_message(&template).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_lists_only_templates_made_available_to_agents() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        put_agent_template(&state, "default", "agents", true, false).await;
+        put_agent_template(&state, "default", "unlabelled", false, false).await;
+        put_agent_template(&state, "default", "driver", true, true).await;
+        put_agent_template(&state, "other", "elsewhere", true, false).await;
+
+        // Whatever scope or selector the request names.
+        let request = ListSandboxTemplatesRequest {
+            workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            label_selector: "team=runtime".to_string(),
+            ..Default::default()
+        };
+        let listed = handle_list_sandbox_templates(&state, sandbox_request(&lead_id, request))
+            .await
+            .unwrap()
+            .into_inner();
+        let names: Vec<&str> = listed
+            .templates
+            .iter()
+            .map(ObjectName::object_name)
+            .collect();
+        assert_eq!(names, ["agents"]);
+        let workload = listed.templates[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .workload
+            .as_ref()
+            .unwrap();
+        assert_eq!(workload.image, "registry.example.com/agent:latest");
+        assert!(workload.environment.is_empty(), "environment is withheld");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_offers_a_sandbox_its_agent_templates() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        put_agent_template(&state, "default", "agents", true, false).await;
+        put_agent_template(&state, "default", "unlabelled", false, false).await;
+
+        let reply = post_mcp_as(
+            &state,
+            sandbox_caller(&lead_id),
+            None,
+            None,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        let create = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "create_sandbox")
+            .unwrap();
+        let template = &create["inputSchema"]["properties"]["template"];
+        assert_eq!(template["enum"], serde_json::json!(["agents"]), "{create}");
+        let description = create["description"].as_str().unwrap();
+        assert!(
+            description.contains("agents (image registry.example.com/agent:latest)"),
+            "{description}"
+        );
+        assert!(!description.contains("unlabelled"), "{description}");
+    }
+
+    #[test]
+    fn a_child_keeps_isolation_its_template_asked_for() {
+        let plain_root = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut child = isolated_template();
+        copy_isolation_from_caller(&plain_root, &mut child);
+        assert_eq!(child.runtime_class_name, "gvisor");
+        assert_eq!(child.user_namespaces, Some(true));
+
+        let kata_root = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    runtime_class_name: "kata".to_string(),
+                    user_namespaces: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut child = isolated_template();
+        copy_isolation_from_caller(&kata_root, &mut child);
+        assert_eq!(child.runtime_class_name, "kata", "the root's class wins");
+        assert_eq!(child.user_namespaces, Some(true), "never turned off");
+    }
+
+    #[tokio::test]
+    async fn a_root_with_driver_config_cannot_create_children_over_mcp() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        set_root_template(
+            &state,
+            &lead_id,
+            SandboxTemplate {
+                driver_config: Some(Struct::default()),
+                ..isolated_template()
+            },
+        )
+        .await;
+
+        let err = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, sandbox_child_request("worker")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "this sandbox has driver configuration, which children cannot copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_child_may_not_take_a_provider_its_parent_lacks() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &["github"]).await;
+        let request = CreateSandboxRequest {
+            spec: Some(SandboxSpec {
+                providers: vec!["gitlab".to_string()],
+                ..Default::default()
+            }),
+            ..sandbox_child_request("worker")
+        };
+        let err = handle_create_sandbox(&state, sandbox_request(&lead_id, request))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "provider 'gitlab' is not attached to parent 'lead'"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_needs_a_creator_who_still_has_access() {
+        let mut state = member_checked_state().await;
+        let create = |state: Arc<ServerState>, id: String, name: &'static str| async move {
+            handle_create_sandbox(&state, sandbox_request(&id, sandbox_child_request(name))).await
+        };
+
+        let no_creator = put_parent_record(&state, "no-creator", &[], None, false).await;
+        let err = create(state.clone(), no_creator, "w1").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "this sandbox was not started by a workspace user, so it cannot create children"
+        );
+
+        let lost = put_parent_record(&state, "lost", &[], None, false).await;
+        set_creator(&state, &lost, "bob").await;
+        let err = create(state.clone(), lost, "w2").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "the user who started this sandbox is not a member of workspace 'default' with \
+             the user role; a platform admin can add them with: openshell workspace member \
+             add --workspace default --subject <user> --role user"
+        );
+
+        let member = member_root(&state, "member", &[]).await;
+        create(state.clone(), member, "w3").await.unwrap();
+
+        // The built-in development user counts only while such users are
+        // allowed, checked at each create.
+        let dev = put_parent_record(&state, "dev", &[], None, false).await;
+        set_creator(&state, &dev, crate::multiplex::UNAUTHENTICATED_DEV_SUBJECT).await;
+        let err = create(state.clone(), dev.clone(), "w4").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .auth
+            .allow_unauthenticated_users = true;
+        create(state.clone(), dev, "w5").await.unwrap();
+    }
+
+    /// With no admin role configured every authenticated user is a platform
+    /// admin, so a creator needs no membership; a root with no recorded
+    /// creator is still refused.
+    #[tokio::test]
+    async fn a_creator_needs_no_membership_when_no_admin_role_is_configured() {
+        let state = child_sandboxes_state().await;
+        assert!(state.admin_role.is_empty());
+
+        let lead = put_parent_record(&state, "lead", &[], None, false).await;
+        set_creator(&state, &lead, "bob").await;
+        handle_create_sandbox(&state, sandbox_request(&lead, sandbox_child_request("w1")))
+            .await
+            .unwrap();
+
+        let no_creator = put_parent_record(&state, "no-creator", &[], None, false).await;
+        let err = handle_create_sandbox(
+            &state,
+            sandbox_request(&no_creator, sandbox_child_request("w2")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn an_mcp_child_records_the_root_that_created_it() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+
+        let child = handle_create_sandbox(
+            &state,
+            sandbox_request(&lead_id, sandbox_child_request("worker")),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+
+        // The lead decided, so the child names the lead; the lead names the
+        // user it acts for.
+        let by_lead = format!("sandbox:{lead_id}");
+        assert_eq!(child.created_by, by_lead);
+        assert_eq!(
+            sandbox_record(&state, child.object_id()).await.created_by,
+            by_lead,
+            "stored, not only returned"
+        );
+        assert_eq!(sandbox_record(&state, &lead_id).await.created_by, "alice");
+    }
+
+    #[tokio::test]
+    async fn an_audit_event_records_the_user_a_sandbox_acts_for() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let unknown_root = put_parent_record(&state, "old-root", &[], None, false).await;
+        let stack = crate::multiplex::AuthGrpcRouter::new(
+            openshell_core::proto::open_shell_server::OpenShellServer::new(
+                crate::OpenShellService::new(state.clone()),
+            ),
+            None,
+            None,
+        );
+        let connection = crate::mcp::McpConnection::new(stack.caller_authenticator(), stack);
+
+        // Without a store, and for a root without a creator, it is unknown.
+        assert_eq!(
+            crate::mcp::acting_for(&connection, &lead_id).await,
+            "unknown"
+        );
+        let connection = connection.with_store(state.store.clone());
+        assert_eq!(crate::mcp::acting_for(&connection, &lead_id).await, "alice");
+        assert_eq!(
+            crate::mcp::acting_for(&connection, &unknown_root).await,
+            "unknown"
+        );
+        assert_eq!(
+            crate::mcp::acting_for(&connection, "missing").await,
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_sandbox_cannot_create_children() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+        let child_id = put_parent_record(&state, "child", &[], Some(link), false).await;
+        set_creator(&state, &child_id, "alice").await;
+        let err = handle_create_sandbox(
+            &state,
+            sandbox_request(&child_id, sandbox_child_request("grandchild")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "only root sandboxes can create child sandboxes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_execs_only_in_its_own_children() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        for (name, parent, id) in [("mine", "lead", &lead_id), ("theirs", "other", &other_id)] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            put_parent_record(&state, name, &[], Some(link), false).await;
+        }
+        let exec = |name: &str| ExecSandboxRequest {
+            sandbox: name.to_string(),
+            command: vec!["ls".to_string()],
+            ..Default::default()
+        };
+
+        for name in ["theirs", "other", "lead", "missing"] {
+            let err = handle_exec_sandbox(&state, sandbox_request(&lead_id, exec(name)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::NotFound, "{name}");
+            assert_eq!(err.message(), format!("sandbox '{name}' not found"));
+        }
+
+        // Its own child is found; this one is not ready yet.
+        let err = handle_exec_sandbox(&state, sandbox_request(&lead_id, exec("mine")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.message(), "sandbox is not ready");
+
+        for (request, field) in [
+            (
+                ExecSandboxRequest {
+                    environment: HashMap::from([("A".to_string(), "b".to_string())]),
+                    ..exec("mine")
+                },
+                "environment",
+            ),
+            (
+                ExecSandboxRequest {
+                    tty: true,
+                    ..exec("mine")
+                },
+                "tty",
+            ),
+            (
+                ExecSandboxRequest {
+                    cols: 80,
+                    ..exec("mine")
+                },
+                "cols",
+            ),
+            (
+                ExecSandboxRequest {
+                    rows: 24,
+                    ..exec("mine")
+                },
+                "rows",
+            ),
+        ] {
+            let err = handle_exec_sandbox(&state, sandbox_request(&lead_id, request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
+    }
+
+    fn sandbox_principal_for(sandbox_id: &str) -> crate::auth::principal::SandboxPrincipal {
+        let request = sandbox_request(sandbox_id, ());
+        match request
+            .extensions()
+            .get::<crate::auth::principal::Principal>()
+        {
+            Some(crate::auth::principal::Principal::Sandbox(principal)) => principal.clone(),
+            _ => unreachable!("sandbox_request sets a sandbox principal"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_deletes_only_its_own_children() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        for (name, parent, id) in [("mine", "lead", &lead_id), ("theirs", "other", &other_id)] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            put_parent_record(&state, name, &[], Some(link), false).await;
+        }
+        let delete = |name: &str| DeleteSandboxRequest {
+            name: name.to_string(),
+            ..Default::default()
+        };
+
+        for name in ["theirs", "other", "lead", "missing"] {
+            let err = handle_delete_sandbox(&state, sandbox_request(&lead_id, delete(name)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::NotFound, "{name}");
+            assert_eq!(err.message(), format!("sandbox '{name}' not found"));
+        }
+        for (request, field) in [
+            (
+                DeleteSandboxRequest {
+                    allow_missing: true,
+                    ..delete("mine")
+                },
+                "allow_missing",
+            ),
+            (
+                DeleteSandboxRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    ..delete("mine")
+                },
+                "workspace_scope",
+            ),
+        ] {
+            let err = handle_delete_sandbox(&state, sandbox_request(&lead_id, request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
+
+        handle_delete_sandbox(&state, sandbox_request(&lead_id, delete("mine")))
+            .await
+            .expect("its own child is deleted");
+        // Deleting a root with children is refused for users; "other" still
+        // has its child, so the sandbox caller's delete reached only "mine".
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "theirs")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_name_is_not_deleted_in_place_of_the_checked_child() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        let checked_id = put_parent_record(&state, "w", &[], Some(link), false).await;
+        let caller = sandbox_principal_for(&lead_id);
+
+        // While the checked child still holds the name, a conflict is
+        // reported as it is.
+        let conflict = Status::aborted("some other conflict");
+        let status =
+            aborted_child_delete(&state, &caller, "w", &checked_id, conflict.clone()).await;
+        assert_eq!(status.code(), tonic::Code::Aborted);
+
+        // The name now belongs to another root: the delete bound to the
+        // checked id is refused and the new sandbox survives.
+        state
+            .store
+            .delete(Sandbox::object_type(), &checked_id)
+            .await
+            .unwrap();
+        let reused_id = put_parent_record(&state, "w", &[], None, false).await;
+        let err = state
+            .compute
+            .delete_sandbox_allow_missing_with_preconditions(
+                "default",
+                "w",
+                false,
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some(checked_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>(&reused_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // ...and the agent is told its child is gone.
+        let status = aborted_child_delete(&state, &caller, "w", &checked_id, err).await;
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "sandbox 'w' not found");
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_caller_reads_only_its_own_childs_own_lines() {
+        use openshell_core::proto::{GetSandboxLogsRequest, SandboxLogLine};
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let other_id = put_parent_record(&state, "other", &[], None, false).await;
+        let mut child_id = String::new();
+        for (name, parent, id) in [("mine", "lead", &lead_id), ("theirs", "other", &other_id)] {
+            let link = openshell_core::proto::SandboxParent {
+                name: parent.to_string(),
+                id: id.clone(),
+            };
+            let id = put_parent_record(&state, name, &[], Some(link), false).await;
+            if name == "mine" {
+                child_id = id;
+            }
+        }
+        let logs = |name: &str, lines: u32| GetSandboxLogsRequest {
+            sandbox: name.to_string(),
+            lines,
+            ..Default::default()
+        };
+
+        for name in ["theirs", "other", "lead", "missing"] {
+            let err = crate::grpc::policy::handle_get_sandbox_logs(
+                &state,
+                sandbox_request(&lead_id, logs(name, 10)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::NotFound, "{name}");
+        }
+        for (request, field) in [
+            (
+                GetSandboxLogsRequest {
+                    sources: vec!["gateway".to_string()],
+                    ..logs("mine", 10)
+                },
+                "sources",
+            ),
+            (
+                GetSandboxLogsRequest {
+                    min_level: "ERROR".to_string(),
+                    ..logs("mine", 10)
+                },
+                "min_level",
+            ),
+        ] {
+            let err = crate::grpc::policy::handle_get_sandbox_logs(
+                &state,
+                sandbox_request(&lead_id, request),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(
+                err.message(),
+                format!("field '{field}' is not allowed for sandbox callers")
+            );
+        }
+
+        // The child is not ready; its newest sandbox lines still come back,
+        // counted after the gateway lines between them are dropped.
+        for i in 0..6 {
+            for source in ["sandbox", "gateway"] {
+                state.tracing_log_bus.publish_external(SandboxLogLine {
+                    sandbox_id: child_id.clone(),
+                    level: "INFO".to_string(),
+                    message: format!("{source} {i}"),
+                    source: source.to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        let reply = crate::grpc::policy::handle_get_sandbox_logs(
+            &state,
+            sandbox_request(&lead_id, logs("mine", 4)),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let messages: Vec<_> = reply.logs.iter().map(|log| log.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["sandbox 2", "sandbox 3", "sandbox 4", "sandbox 5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_create_retry_returns_the_child_even_at_the_limit() {
+        let state = child_sandboxes_state_with_limit(1).await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+
+        // The child never becomes ready here, so the short wait times out,
+        // and that is not an error.
+        let first = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "w1"}),
+        )
+        .await;
+        assert_eq!(first["isError"], false, "{first}");
+        let reply = &first["structuredContent"];
+        assert_eq!(reply["name"], "w1");
+        assert_eq!(reply["already_existed"], false);
+        assert_eq!(reply["timed_out"], true);
+
+        let retry = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "w1"}),
+        )
+        .await;
+        assert_eq!(retry["isError"], false, "{retry}");
+        assert_eq!(retry["structuredContent"]["already_existed"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_create_refuses_a_name_that_is_not_the_callers_child() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        put_parent_record(&state, "other-root", &[], None, false).await;
+
+        let result = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "other-root"}),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["error"], "already_exists");
+        assert_eq!(
+            result["structuredContent"]["message"],
+            "a sandbox named 'other-root' already exists in this workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_create_reports_a_failed_child() {
+        let state = child_sandboxes_state().await;
+        let lead_id = member_root(&state, "lead", &[]).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        let child_id = put_parent_record(&state, "w1", &[], Some(link), false).await;
+        let mut child = state
+            .store
+            .get_message::<Sandbox>(&child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        child.set_phase(SandboxPhase::Error as i32);
+        child.status.get_or_insert_with(Default::default).conditions =
+            vec![openshell_core::proto::SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                message: "image pull failed".to_string(),
+                ..Default::default()
+            }];
+        state.store.put_message(&child).await.unwrap();
+
+        let result = call_mcp_tool(
+            &state,
+            &lead_id,
+            "create_sandbox",
+            serde_json::json!({"name": "w1"}),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["structuredContent"]["message"],
+            "sandbox 'w1' failed: image pull failed"
+        );
+    }
+
+    fn mcp_user(subject: &str, roles: &[&str]) -> crate::auth::principal::Principal {
+        crate::auth::principal::Principal::User(crate::auth::principal::UserPrincipal {
+            identity: crate::auth::identity::Identity {
+                subject: subject.to_string(),
+                display_name: None,
+                roles: roles.iter().map(ToString::to_string).collect(),
+                scopes: Vec::new(),
+                provider: crate::auth::identity::IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    /// A child-sandbox state whose users are checked against workspace
+    /// membership (an empty admin role would make every user an admin).
+    async fn member_checked_state() -> Arc<ServerState> {
+        let mut state = child_sandboxes_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        state
+    }
+
+    fn mcp_names(result: &serde_json::Value) -> Vec<String> {
+        result["structuredContent"]["sandboxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sandbox| sandbox["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn mcp_users_act_only_in_workspaces_they_belong_to() {
+        let state = member_checked_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        let far_id = put_parent_record(&state, "far", &[], None, false).await;
+        let mut far = state
+            .store
+            .get_message::<Sandbox>(&far_id)
+            .await
+            .unwrap()
+            .unwrap();
+        far.metadata.as_mut().unwrap().workspace = "team".to_string();
+        state.store.delete("sandbox", &far_id).await.unwrap();
+        state.store.put_message(&far).await.unwrap();
+        put_member(&state, "alice").await;
+        let alice = || mcp_user("alice", &["openshell-user"]);
+
+        let list = call_mcp_as(&state, alice(), None, None, "list", serde_json::json!({})).await;
+        assert_eq!(list["isError"], false, "{list}");
+        assert_eq!(mcp_names(&list), vec!["lead".to_string()]);
+        let logs = call_mcp_as(
+            &state,
+            alice(),
+            None,
+            None,
+            "logs",
+            serde_json::json!({"name": "lead"}),
+        )
+        .await;
+        assert_eq!(logs["isError"], false, "{logs}");
+
+        // Another workspace, and a sandbox there, read as missing.
+        let logs = call_mcp_as(
+            &state,
+            alice(),
+            None,
+            Some("team"),
+            "logs",
+            serde_json::json!({"name": "far"}),
+        )
+        .await;
+        assert_eq!(logs["structuredContent"]["error"], "not_found", "{logs}");
+        let list = call_mcp_as(
+            &state,
+            alice(),
+            None,
+            Some("team"),
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(list["isError"], true, "{list}");
+        // So does a sandbox in a workspace the user is not a member of.
+        let bob = mcp_user("bob", &["openshell-user"]);
+        let logs = call_mcp_as(
+            &state,
+            bob,
+            None,
+            None,
+            "logs",
+            serde_json::json!({"name": "lead"}),
+        )
+        .await;
+        assert_eq!(logs["structuredContent"]["error"], "not_found", "{logs}");
+    }
+
+    #[tokio::test]
+    async fn mcp_users_need_the_role_for_each_method() {
+        let state = member_checked_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        put_member(&state, "carol").await;
+        let policy = || crate::auth::authz::AuthzPolicy {
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_enabled: false,
+        };
+
+        let refused = call_mcp_as(
+            &state,
+            mcp_user("carol", &[]),
+            Some(policy()),
+            None,
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            refused["structuredContent"]["error"], "permission_denied",
+            "{refused}"
+        );
+        let allowed = call_mcp_as(
+            &state,
+            mcp_user("carol", &["openshell-user"]),
+            Some(policy()),
+            None,
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(allowed["isError"], false, "{allowed}");
+    }
+
+    #[tokio::test]
+    async fn mcp_users_create_roots_and_children_but_no_grandchildren() {
+        let state = member_checked_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        put_member(&state, "alice").await;
+        let create = |arguments| {
+            call_mcp_as(
+                &state,
+                mcp_user("alice", &["openshell-user"]),
+                None,
+                None,
+                "create_sandbox",
+                arguments,
+            )
+        };
+
+        let root = create(serde_json::json!({"name": "r1", "image": "alpine:3"})).await;
+        assert_eq!(root["isError"], false, "{root}");
+        let r1 = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "r1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r1.parent.is_none());
+        assert_eq!(r1.created_by, "alice");
+        assert_eq!(
+            r1.spec.as_ref().unwrap().template.as_ref().unwrap().image,
+            "alpine:3"
+        );
+
+        let child = create(serde_json::json!({"name": "c1", "parent": "lead"})).await;
+        assert_eq!(child["isError"], false, "{child}");
+        assert_eq!(child["structuredContent"]["parent"], "lead");
+
+        let grandchild = create(serde_json::json!({"name": "g1", "parent": "c1"})).await;
+        assert_eq!(grandchild["isError"], true, "{grandchild}");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_sandbox_caller_ignores_a_workspace_header() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        put_parent_record(&state, "w1", &[], Some(link), false).await;
+        let caller =
+            crate::auth::principal::Principal::Sandbox(crate::auth::principal::SandboxPrincipal {
+                sandbox_id: lead_id,
+                source: crate::auth::principal::SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                    auth_epoch: None,
+                },
+                trust_domain: Some("openshell".to_string()),
+            });
+
+        let list = call_mcp_as(
+            &state,
+            caller,
+            None,
+            Some("team"),
+            "list",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(list["isError"], false, "{list}");
+        assert_eq!(mcp_names(&list), vec!["w1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_parent_filter_needs_one_workspace_and_an_existing_parent() {
+        let state = child_sandboxes_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let mut all_workspaces = list_children_request("lead", 100, String::new());
+        all_workspaces.workspace_scope = Some(openshell_core::proto::all_workspaces_selector());
+        let err = handle_list_sandboxes(&state, authed_request(all_workspaces))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("a parent filter needs a single workspace")
+        );
+
+        let err = handle_list_sandboxes(
+            &state,
+            authed_request(list_children_request("missing", 100, String::new())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_page_token_is_tied_to_the_parent_it_was_listed_for() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        for name in ["worker1", "worker2"] {
+            put_parent_record(&state, name, &[], Some(link.clone()), false).await;
+        }
+        let list = |parent: &str, token: String| {
+            handle_list_sandboxes(
+                &state,
+                authed_request(list_children_request(parent, 1, token)),
+            )
+        };
+
+        let unfiltered = list("", String::new()).await.unwrap().into_inner();
+        let err = list("lead", unfiltered.next_page_token).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let filtered = list("lead", String::new()).await.unwrap().into_inner();
+        let err = list("", filtered.next_page_token.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // A new root under the same name is a different parent.
+        state
+            .store
+            .delete(Sandbox::object_type(), &lead_id)
+            .await
+            .unwrap();
+        put_parent_record(&state, "lead", &[], None, false).await;
+        let err = list("lead", filtered.next_page_token).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn detaching_a_provider_from_a_parent_detaches_it_from_its_children() {
+        let state = child_sandboxes_state().await;
+        let (_, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        let before = sandbox_spec(&state, &worker_id).await;
+
+        detach_from_lead(&state, "work-github").await;
+
+        // The parent's policy did not change, so the child's copy is current
+        // and only the provider is removed, as a detach removes it.
+        eventually(|| async { sandbox_spec(&state, &worker_id).await.providers.is_empty() }).await;
+        let after = sandbox_spec(&state, &worker_id).await;
+        assert_ne!(
+            after.provider_attachment_epoch, before.provider_attachment_epoch,
+            "the supervisor must see a new attachment epoch to drop the credential"
+        );
+        assert_eq!(latest_policy(&state, &worker_id).await.version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_parents_children_still_lose_its_lost_provider() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+
+        detach_from_lead(&state, "work-github").await;
+
+        eventually(|| async { sandbox_spec(&state, &worker_id).await.providers.is_empty() }).await;
+    }
+
+    #[tokio::test]
+    async fn a_child_that_missed_a_provider_detach_loses_it_on_its_own() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        // The lead lost the provider, but the sync that would follow was lost.
+        let mut lead = state
+            .store
+            .get_message::<Sandbox>(&lead_id)
+            .await
+            .unwrap()
+            .unwrap();
+        lead.spec.as_mut().unwrap().providers.clear();
+        state.store.put_message(&lead).await.unwrap();
+        let worker = state
+            .store
+            .get_message::<Sandbox>(&worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        sync_one_child(&state, &worker).await.unwrap();
+
+        assert!(sandbox_spec(&state, &worker_id).await.providers.is_empty());
+    }
+
+    /// Wait for a background sync to reach the store.
+    async fn eventually<F, Fut>(mut reached: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        for _ in 0..500 {
+            if reached().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("not reached within 5 seconds");
+    }
+
+    async fn sandbox_record(state: &ServerState, sandbox_id: &str) -> Sandbox {
+        state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn delivered_variables(state: &Arc<ServerState>, sandbox: &Sandbox) -> Vec<String> {
+        super::super::policy::build_provider_environment_snapshot(state, sandbox, true, true)
+            .await
+            .expect("provider environment")
+            .values
+            .into_iter()
+            .map(|value| value.name)
+            .collect()
+    }
+
+    /// Take a provider from the lead's record without any sync, as when the
+    /// sync after a detach is lost.
+    async fn lead_loses_providers_without_a_sync(state: &ServerState, lead_id: &str) {
+        let mut lead = sandbox_record(state, lead_id).await;
+        lead.spec.as_mut().unwrap().providers.clear();
+        state.store.put_message(&lead).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_loses_a_provider_its_parent_lost_at_its_next_build() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        let worker = sandbox_record(&state, &worker_id).await;
+        assert!(
+            delivered_variables(&state, &worker)
+                .await
+                .contains(&"GITHUB_TOKEN".to_string())
+        );
+
+        lead_loses_providers_without_a_sync(&state, &lead_id).await;
+
+        // No sync ran: the child's record still names the provider, but its
+        // very next build serves none of it.
+        assert_eq!(
+            sandbox_spec(&state, &worker_id).await.providers,
+            vec!["work-github"]
+        );
+        assert!(delivered_variables(&state, &worker).await.is_empty());
+        let inputs = super::super::policy::load_sandbox_config_inputs(&state, worker.clone())
+            .await
+            .unwrap();
+        assert!(inputs.sandbox().spec.as_ref().unwrap().providers.is_empty());
+        let config = child_config(&state, &worker_id).await;
+        assert!(config.configuration_admitted);
+        assert!(
+            !provider_attached_for_delivery(&state, &worker, "work-github")
+                .await
+                .unwrap(),
+            "readiness reports the provider as not attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detach_rebuilds_a_push_mode_child_at_once_without_a_sync() {
+        use openshell_core::proto::{SupervisorMessage, gateway_message, supervisor_message};
+
+        let mut state = child_sandboxes_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+        let (_, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            &worker_id,
+            crate::grpc::test_support::StreamFeatures::Apply,
+        )
+        .await
+        .unwrap();
+        let accepted = harness.inbound.message().await.unwrap().unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) = accepted.payload else {
+            panic!("expected SessionAccepted");
+        };
+        let bootstrap = accepted.bootstrap.expect("push bootstrap");
+        assert!(
+            bootstrap
+                .provider_environment
+                .as_ref()
+                .unwrap()
+                .values
+                .iter()
+                .any(|value| value.name == "GITHUB_TOKEN")
+        );
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                    crate::config_delivery::session::applied_result(&bootstrap),
+                )),
+            })
+            .await
+            .unwrap();
+        // The acknowledgement is recorded under the child's lock; live
+        // updates start once it is.
+        eventually(|| async {
+            !state
+                .supervisor_sessions
+                .config_update_in_flight(&worker_id, &accepted.session_id)
+        })
+        .await;
+        // Holding the child's lock keeps the sync from reaching it. The
+        // detach runs as its own task, as a request would.
+        let _guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", &worker_id))
+            .await
+            .unwrap();
+        let detach_state = Arc::clone(&state);
+        tokio::spawn(async move { detach_from_lead(&detach_state, "work-github").await })
+            .await
+            .unwrap();
+
+        // Acknowledge each update, as a supervisor does, until one without
+        // the credential arrives. The sync started on connect may push one
+        // first. Well under the 30 s re-check, so only the detach's own
+        // notification can explain it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = harness.inbound.message().await.unwrap().unwrap();
+                let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+                    continue;
+                };
+                harness
+                    .outbound
+                    .send(SupervisorMessage {
+                        payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                            crate::config_delivery::session::applied_result(&update),
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                if update
+                    .provider_environment
+                    .unwrap()
+                    .values
+                    .iter()
+                    .all(|value| value.name != "GITHUB_TOKEN")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the child is rebuilt at once, not at its 30 s re-check");
+        assert_eq!(
+            sandbox_spec(&state, &worker_id).await.providers,
+            vec!["work-github"],
+            "no sync has run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connecting_childs_first_configuration_lacks_a_provider_its_parent_lost() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        // The record read when the child connected, before any sync.
+        let read_at_connect = sandbox_record(&state, &worker_id).await;
+        lead_loses_providers_without_a_sync(&state, &lead_id).await;
+
+        let bootstrap =
+            crate::config_delivery::session::build_session_bootstrap(&state, &read_at_connect)
+                .await
+                .unwrap();
+
+        assert!(bootstrap.config.sandbox_config.configuration_admitted);
+        assert!(
+            bootstrap
+                .config
+                .provider_environment
+                .values
+                .iter()
+                .all(|value| value.name != "GITHUB_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_behind_its_parent_is_refused_until_its_copy_lands() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        // The lead loads v2, and the sync that would copy it is lost.
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+        let worker = sandbox_record(&state, &worker_id).await;
+        // Hold the lead's lock, which every child sync takes, so the sync the
+        // refusal starts cannot land before the checks below.
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", &lead_id))
+            .await
+            .unwrap();
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(!config.configuration_admitted);
+        assert_eq!(
+            config.configuration_error,
+            "Waiting for a copy of the parent sandbox's latest policy"
+        );
+        assert_eq!(
+            config.policy_validation_failure_mode,
+            openshell_core::PolicyValidationFailureMode::FailClosed.as_str()
+        );
+        let err =
+            super::super::policy::build_provider_environment_snapshot(&state, &worker, true, true)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            copied_version(&latest_policy(&state, &worker_id).await),
+            Some("1")
+        );
+
+        // The refusal started a sync; once it lands, the child is admitted.
+        drop(guard);
+        eventually(|| async {
+            copied_version(&latest_policy(&state, &worker_id).await) == Some("2")
+        })
+        .await;
+        let config = child_config(&state, &worker_id).await;
+        assert!(config.configuration_admitted);
+        assert!(config.policy.unwrap().network_policies.contains_key("api"));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_parents_child_is_refused_its_provider_environment() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_and_child_sharing_a_provider(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        let worker = sandbox_record(&state, &worker_id).await;
+
+        let err =
+            super::super::policy::build_provider_environment_snapshot(&state, &worker, true, true)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "parent sandbox 'lead' rejected its latest policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_policy_that_cannot_be_copied_refuses_children_and_says_why() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        let mut uncopyable = lead_policy(false);
+        let rule = uncopyable.network_policies.remove("api").unwrap();
+        uncopyable
+            .network_policies
+            .insert("_provider_github".to_string(), rule);
+        put_policy_revision_with_status(&state, &lead_id, 2, &uncopyable, "loaded").await;
+        let worker = sandbox_record(&state, &worker_id).await;
+
+        let err = super::super::policy::load_sandbox_config_inputs(&state, worker)
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "parent sandbox 'lead' policy version 2 cannot be copied to its children"
+        );
+        let config = child_config(&state, &worker_id).await;
+        assert_eq!(
+            config.configuration_error,
+            "The parent sandbox's policy cannot be copied to children; fix the parent's policy"
+        );
+        // No sync is started for a copy that cannot succeed.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            copied_version(&latest_policy(&state, &worker_id).await),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_a_child_policy_is_refused_but_settings_are_allowed() {
+        let state = child_sandboxes_state().await;
+        put_lead_and_worker(&state).await;
+
+        let err = super::super::policy::handle_update_config(
+            &state,
+            authed_request(openshell_core::proto::UpdateConfigRequest {
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("child sandboxes use their parent's policy"),
+            "{}",
+            err.message()
+        );
+
+        super::super::policy::handle_update_config(
+            &state,
+            authed_request(openshell_core::proto::UpdateConfigRequest {
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                setting_key: openshell_core::settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "manual".to_string(),
+                    )),
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("a child's settings can still be changed");
+    }
+
+    /// A sandbox's own supervisor writing back its policy with one extra
+    /// read-only path, as startup path enrichment does.
+    fn supervisor_write_back(
+        sandbox_id: &str,
+        name: &str,
+    ) -> Request<openshell_core::proto::UpdateConfigRequest> {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy
+            .filesystem
+            .get_or_insert_with(Default::default)
+            .read_only
+            .push("/app".to_string());
+        sandbox_request(
+            sandbox_id,
+            openshell_core::proto::UpdateConfigRequest {
+                sandbox: name.to_string(),
+                workspace_scope: Some(default_scope()),
+                policy: Some(policy),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A request made by a sandbox's own supervisor.
+    fn sandbox_request<T>(sandbox_id: &str, inner: T) -> Request<T> {
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+        let mut request = Request::new(inner);
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                    auth_epoch: None,
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        request
+    }
+
+    #[tokio::test]
+    async fn a_child_supervisor_write_back_is_accepted_and_dropped() {
+        let state = child_sandboxes_state().await;
+        let worker_id = put_lead_and_worker(&state).await;
+        let before = latest_policy(&state, &worker_id).await;
+
+        let response = super::super::policy::handle_update_config(
+            &state,
+            supervisor_write_back(&worker_id, "worker1"),
+        )
+        .await
+        .expect("the child's supervisor is answered OK")
+        .into_inner();
+
+        let after = latest_policy(&state, &worker_id).await;
+        assert_eq!(after.version, before.version, "no revision is written");
+        assert_eq!(after.policy_payload, before.policy_payload);
+        assert_eq!(i64::from(response.version), before.version);
+        assert_eq!(response.policy_hash, before.policy_hash);
+    }
+
+    #[tokio::test]
+    async fn a_root_supervisor_write_back_is_still_stored() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let before = latest_policy(&state, &lead_id).await;
+
+        super::super::policy::handle_update_config(&state, supervisor_write_back(&lead_id, "lead"))
+            .await
+            .expect("a root's supervisor write-back is stored");
+
+        assert_eq!(
+            latest_policy(&state, &lead_id).await.version,
+            before.version + 1
+        );
+    }
+
+    /// A root `lead` with a child `worker1` created through the API, so the
+    /// child's v1 is tagged as copied from the lead's v1. Returns both ids.
+    async fn lead_with_copied_child(state: &Arc<ServerState>) -> (String, String) {
+        let lead_id = put_parent_record(state, "lead", &[], None, false).await;
+        let worker = create_child(state, "worker1", "lead").await;
+        (lead_id, worker.object_id().to_string())
+    }
+
+    fn copied_version(record: &crate::persistence::PolicyRecord) -> Option<&str> {
+        record
+            .provenance
+            .get(COPIED_FROM_PARENT_VERSION)
+            .map(String::as_str)
+    }
+
+    #[tokio::test]
+    async fn sync_copies_the_parents_newly_loaded_policy() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+
+        sync_children(&state, &lead_id).await.unwrap();
+
+        let parent_record = latest_policy(&state, &lead_id).await;
+        let (_, parent_hash) =
+            super::super::policy::canonical_policy_record_identity(&parent_record).unwrap();
+        let child_record = latest_policy(&state, &worker_id).await;
+        assert_eq!(child_record.version, 2);
+        assert_eq!(copied_version(&child_record), Some("2"));
+        assert_eq!(child_record.policy_hash, parent_hash);
+
+        sync_children(&state, &lead_id).await.unwrap();
+        assert_eq!(
+            latest_policy(&state, &worker_id).await.version,
+            2,
+            "a second sync writes nothing"
+        );
+    }
+
+    /// Give a child revision 2, tagged as a copy of parent version 5.
+    async fn put_newer_child_copy(state: &ServerState, child_id: &str, parent_id: &str) {
+        let provenance = HashMap::from([
+            (COPIED_FROM_PARENT_ID.to_string(), parent_id.to_string()),
+            (COPIED_FROM_PARENT_VERSION.to_string(), "5".to_string()),
+        ]);
+        let policy = openshell_policy::restrictive_default_policy();
+        state
+            .store
+            .put_policy_revision_atomic(&crate::policy_store::AtomicPolicyRevisionWrite {
+                id: uuid::Uuid::new_v4().to_string(),
+                sandbox_id: child_id.to_string(),
+                workspace: "default".to_string(),
+                version: 2,
+                policy_payload: policy.encode_to_vec(),
+                policy_hash: openshell_core::policy_identity::deterministic_policy_hash(&policy),
+                provenance,
+                expected_resource_version: 0,
+                annotations: HashMap::new(),
+                backfill_policy: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_never_replaces_a_newer_copy() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        // The child already holds a copy of a newer parent version than the
+        // one this sync reads, as when an earlier sync finishes last.
+        put_newer_child_copy(&state, &worker_id, &lead_id).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+
+        sync_children(&state, &lead_id).await.unwrap();
+
+        let child_record = latest_policy(&state, &worker_id).await;
+        assert_eq!(child_record.version, 2);
+        assert_eq!(copied_version(&child_record), Some("5"));
+    }
+
+    #[tokio::test]
+    async fn a_fail_closed_parents_rejected_policy_blocks_its_children_until_it_loads_a_fix() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "pending").await;
+
+        // The parent rejects v2; its failed report pushes the child.
+        let mut pushes = state.sandbox_watch_bus.subscribe(&worker_id);
+        super::super::policy::record_policy_apply_result(
+            &state,
+            &lead_id,
+            2,
+            false,
+            Some("invalid"),
+            "test",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), pushes.recv())
+            .await
+            .expect("the child is pushed")
+            .unwrap();
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(!config.configuration_admitted);
+        assert!(
+            config
+                .configuration_error
+                .contains("fix the parent's policy"),
+            "{}",
+            config.configuration_error
+        );
+        assert_eq!(config.policy_validation_failure_mode, "fail_closed");
+        assert_eq!(
+            latest_policy(&state, &worker_id).await.version,
+            1,
+            "nothing is copied"
+        );
+
+        // The parent loads a fixed v3; its report copies it into the child.
+        put_policy_revision_with_status(&state, &lead_id, 3, &lead_policy(false), "pending").await;
+        super::super::policy::record_policy_apply_result(&state, &lead_id, 3, true, None, "test")
+            .await
+            .unwrap();
+        wait_for_child_version(&state, &worker_id, 2).await;
+
+        assert_eq!(
+            copied_version(&latest_policy(&state, &worker_id).await),
+            Some("3")
+        );
+        assert!(
+            child_config(&state, &worker_id)
+                .await
+                .configuration_admitted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_unblocking_pushes_a_child_whose_copy_is_current() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        put_newer_child_copy(&state, &worker_id, &lead_id).await;
+        assert!(
+            !child_config(&state, &worker_id)
+                .await
+                .configuration_admitted
+        );
+
+        // A retry of v2 loads on the parent; the child needs no new copy.
+        let mut pushes = state.sandbox_watch_bus.subscribe(&worker_id);
+        super::super::policy::record_policy_apply_result(&state, &lead_id, 2, true, None, "test")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), pushes.recv())
+            .await
+            .expect("the child is pushed")
+            .unwrap();
+
+        assert_eq!(
+            latest_policy(&state, &worker_id).await.version,
+            2,
+            "nothing is copied"
+        );
+        assert!(
+            child_config(&state, &worker_id)
+                .await
+                .configuration_admitted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_that_missed_a_sync_catches_up_on_its_own() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let worker = create_child(&state, "worker1", "lead").await;
+        let worker_id = worker.object_id().to_string();
+        // The parent loaded v2, but the sync that would copy it was lost.
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+        // A nested wait on the parent's lock would time out and fail here.
+        state
+            .compute
+            .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+
+        sync_one_child(&state, &worker).await.unwrap();
+
+        let child_record = latest_policy(&state, &worker_id).await;
+        assert_eq!(child_record.version, 2);
+        assert_eq!(copied_version(&child_record), Some("2"));
+        sync_one_child(&state, &worker).await.unwrap();
+        assert_eq!(
+            latest_policy(&state, &worker_id).await.version,
+            2,
+            "a second sync writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_parents_child_copies_nothing_on_its_own() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let worker = create_child(&state, "worker1", "lead").await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+
+        sync_one_child(&state, &worker).await.unwrap();
+
+        assert_eq!(latest_policy(&state, worker.object_id()).await.version, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_sync_catches_up_the_children_of_every_root() {
+        let state = child_sandboxes_state().await;
+        let mut children = Vec::new();
+        for (lead, worker) in [("lead", "worker1"), ("lead2", "worker2")] {
+            let lead_id = put_parent_record(&state, lead, &[], None, false).await;
+            let worker_id = create_child(&state, worker, lead)
+                .await
+                .object_id()
+                .to_string();
+            put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded")
+                .await;
+            children.push(worker_id);
+        }
+
+        sync_all_children(&state).await.unwrap();
+
+        for worker_id in children {
+            assert_eq!(
+                copied_version(&latest_policy(&state, &worker_id).await),
+                Some("2")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_child_failing_to_sync_does_not_hold_back_its_siblings() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let stuck_id = create_child(&state, "worker1", "lead")
+            .await
+            .object_id()
+            .to_string();
+        let free_id = create_child(&state, "worker2", "lead")
+            .await
+            .object_id()
+            .to_string();
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "loaded").await;
+        state
+            .compute
+            .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+        // Another task holds the stuck child's lock until the sync is done.
+        let (held_tx, held_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let holder = {
+            let state = Arc::clone(&state);
+            let stuck_id = stuck_id.clone();
+            tokio::spawn(async move {
+                let _guard = state
+                    .compute
+                    .mutation_guard(MutationScope::sandbox("default", &stuck_id))
+                    .await
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.await;
+            })
+        };
+        held_rx.await.unwrap();
+
+        let err = sync_children(&state, &lead_id).await.unwrap_err();
+        release_tx.send(()).unwrap();
+        holder.await.unwrap();
+        assert!(
+            err.message().contains("1 child sandbox"),
+            "{}",
+            err.message()
+        );
+
+        assert_eq!(latest_policy(&state, &stuck_id).await.version, 1);
+        assert_eq!(
+            copied_version(&latest_policy(&state, &free_id).await),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_synced_copy_matches_a_copy_made_at_create() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        // A marker the gateway stamps at delivery; a copy must clear it.
+        let mut policy = lead_policy(false);
+        policy.network_policies.get_mut("api").unwrap().endpoints[0].provider_credentialed = true;
+        put_policy_revision_with_status(&state, &lead_id, 2, &policy, "loaded").await;
+        let created_id = create_child(&state, "worker1", "lead")
+            .await
+            .object_id()
+            .to_string();
+        // A child whose history was not copied from this parent.
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id.clone(),
+        };
+        let synced_id = put_parent_record(&state, "worker2", &[], Some(link), false).await;
+
+        sync_children(&state, &lead_id).await.unwrap();
+
+        let created = latest_policy(&state, &created_id).await;
+        let synced = latest_policy(&state, &synced_id).await;
+        assert_eq!(copied_version(&created), Some("2"));
+        assert_eq!(copied_version(&synced), Some("2"));
+        assert_eq!(synced.policy_hash, created.policy_hash);
+        assert_eq!(synced.policy_payload, created.policy_payload);
+    }
+
+    /// A parent policy the child cannot load: it binds a credential from a
+    /// provider the child does not have.
+    fn unloadable_on_child() -> openshell_core::proto::SandboxPolicy {
+        let mut policy = lead_policy(false);
+        let endpoint = &mut policy.network_policies.get_mut("api").unwrap().endpoints[0];
+        endpoint.protocol = "rest".to_string();
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
+        endpoint.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
+            provider: "work-cloud".to_string(),
+        });
+        policy
+    }
+
+    /// Wait for the background sync to give a child this revision version.
+    async fn wait_for_child_version(state: &ServerState, child_id: &str, version: i64) {
+        for _ in 0..100 {
+            if latest_policy(state, child_id).await.version >= version {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The configuration a child's own supervisor receives.
+    async fn child_config(
+        state: &Arc<ServerState>,
+        child_id: &str,
+    ) -> openshell_core::proto::GetSandboxConfigResponse {
+        super::super::policy::handle_get_sandbox_config(
+            state,
+            sandbox_request(
+                child_id,
+                openshell_core::proto::GetSandboxConfigRequest {
+                    name: "worker1".to_string(),
+                    workspace_scope: Some(default_scope()),
+                },
+            ),
+        )
+        .await
+        .expect("the child receives a configuration, not an error")
+        .into_inner()
+    }
+
+    #[tokio::test]
+    async fn a_parent_load_report_syncs_its_children() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "pending").await;
+
+        super::super::policy::record_policy_apply_result(&state, &lead_id, 2, true, None, "test")
+            .await
+            .unwrap();
+
+        wait_for_child_version(&state, &worker_id, 2).await;
+        let child_record = latest_policy(&state, &worker_id).await;
+        assert_eq!(copied_version(&child_record), Some("2"));
+    }
+
+    /// Load a pending parent revision through the real report handler and
+    /// wait for the sync to copy it into the child.
+    async fn parent_loads(
+        state: &Arc<ServerState>,
+        lead_id: &str,
+        worker_id: &str,
+        version: u32,
+        policy: &openshell_core::proto::SandboxPolicy,
+    ) {
+        put_policy_revision_with_status(state, lead_id, i64::from(version), policy, "pending")
+            .await;
+        super::super::policy::record_policy_apply_result(
+            state, lead_id, version, true, None, "test",
+        )
+        .await
+        .unwrap();
+        wait_for_child_version(state, worker_id, i64::from(version)).await;
+    }
+
+    async fn late_failure(state: &Arc<ServerState>, lead_id: &str, version: u32) {
+        super::super::policy::record_policy_apply_result(
+            state,
+            lead_id,
+            version,
+            false,
+            Some("late result"),
+            "test",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn new_child_copy(state: &Arc<ServerState>, name: &str) -> Result<i64, Status> {
+        let child = handle_create_sandbox(
+            state,
+            authed_request(child_request(name, "lead", SandboxSpec::default())),
+        )
+        .await?
+        .into_inner()
+        .sandbox
+        .unwrap();
+        Ok(
+            copied_version(&latest_policy(state, child.object_id()).await)
+                .unwrap()
+                .parse()
+                .unwrap(),
+        )
+    }
+
+    fn state_in_mode(
+        mut state: Arc<ServerState>,
+        mode: openshell_core::PolicyValidationFailureMode,
+    ) -> Arc<ServerState> {
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .policy_validation_failure_mode = mode;
+        state
+    }
+
+    /// A "failed" report for a version that already loaded: a re-apply that
+    /// failed, or a late result from a replaced session. Upstream records it
+    /// as failed either way. Children follow the version the parent last
+    /// loaded: under `fail_closed` a failure of that version blocks them, as
+    /// it blocks the parent; under `retain_last_valid` they keep it.
+    #[tokio::test]
+    async fn a_failed_report_for_a_loaded_version_follows_the_parents_failure_mode() {
+        use openshell_core::PolicyValidationFailureMode::{FailClosed, RetainLastValid};
+        for mode in [FailClosed, RetainLastValid] {
+            for newer_loaded in [false, true] {
+                let state = state_in_mode(child_sandboxes_state().await, mode);
+                let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+                parent_loads(&state, &lead_id, &worker_id, 2, &lead_policy(false)).await;
+                if newer_loaded {
+                    parent_loads(&state, &lead_id, &worker_id, 3, &lead_policy(false)).await;
+                }
+                let enforced = if newer_loaded { 3 } else { 2 };
+                let case = format!("{mode:?}, newer loaded: {newer_loaded}");
+
+                late_failure(&state, &lead_id, 2).await;
+
+                let config = child_config(&state, &worker_id).await;
+                let created = new_child_copy(&state, "worker2").await;
+                if mode == FailClosed && !newer_loaded {
+                    assert!(
+                        !config.configuration_admitted,
+                        "{case}: blocked with the parent"
+                    );
+                    assert_eq!(
+                        created.unwrap_err().code(),
+                        tonic::Code::FailedPrecondition,
+                        "{case}"
+                    );
+                } else {
+                    assert!(
+                        config.configuration_admitted,
+                        "{case}: {}",
+                        config.configuration_error
+                    );
+                    assert_eq!(
+                        created.unwrap_or_else(|error| panic!("{case}: {error}")),
+                        enforced,
+                        "{case}: a new child copies the version the parent enforces"
+                    );
+                }
+                assert_eq!(
+                    copied_version(&latest_policy(&state, &worker_id).await),
+                    Some(enforced.to_string().as_str()),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// v1 allows more than v2. After a failed report for v2, a parent that
+    /// retains the last valid policy still enforces v2, so a new child must
+    /// get v2, never the wider v1.
+    #[tokio::test]
+    async fn a_retained_parent_never_hands_children_an_older_wider_policy() {
+        let state = state_in_mode(
+            child_sandboxes_state().await,
+            openshell_core::PolicyValidationFailureMode::RetainLastValid,
+        );
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        // put_parent_record loaded v1 as the restrictive default; make v1 wide.
+        let wide = lead_policy(false);
+        put_policy_revision_with_status(&state, &lead_id, 2, &wide, "loaded").await;
+        let worker = create_child(&state, "worker1", "lead").await;
+        let narrow = openshell_policy::restrictive_default_policy();
+        parent_loads(&state, &lead_id, worker.object_id(), 3, &narrow).await;
+
+        late_failure(&state, &lead_id, 3).await;
+
+        let created = new_child_copy(&state, "worker2").await.unwrap();
+        assert_eq!(created, 3, "the new child copies v3, not the wider v2");
+        let child = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "worker2")
+            .await
+            .unwrap()
+            .unwrap();
+        let (policy, _) = super::super::policy::canonical_policy_record_identity(
+            &latest_policy(&state, child.object_id()).await,
+        )
+        .unwrap();
+        assert!(!policy.network_policies.contains_key("api"));
+    }
+
+    /// Writing a new parent revision marks the loaded one superseded before
+    /// the new one loads. If the new one then fails under `fail_closed`, the
+    /// parent is blocked, and so must its children be.
+    #[tokio::test]
+    async fn a_parent_blocked_by_a_new_revision_blocks_its_children() {
+        let state = child_sandboxes_state().await;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        // Written as the gateway writes it, which supersedes the loaded v1.
+        state
+            .store
+            .put_policy_revision_atomic(&crate::policy_store::AtomicPolicyRevisionWrite {
+                id: uuid::Uuid::new_v4().to_string(),
+                sandbox_id: lead_id.clone(),
+                workspace: "default".to_string(),
+                version: 2,
+                policy_payload: lead_policy(false).encode_to_vec(),
+                policy_hash: openshell_core::policy_identity::deterministic_policy_hash(
+                    &lead_policy(false),
+                ),
+                provenance: HashMap::new(),
+                expected_resource_version: 0,
+                annotations: HashMap::new(),
+                backfill_policy: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .store
+                .get_policy_by_version(&lead_id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "superseded"
+        );
+        // The parent still enforces v1, so a new child copies it.
+        assert_eq!(new_child_copy(&state, "worker2").await.unwrap(), 1);
+
+        late_failure(&state, &lead_id, 2).await;
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(
+            !config.configuration_admitted,
+            "{}",
+            config.configuration_error
+        );
+        assert_eq!(
+            new_child_copy(&state, "worker3").await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    /// Children now read the parent's enforced revision by version, so a
+    /// revision must keep its policy when it is superseded or fails.
+    #[tokio::test]
+    async fn a_superseded_or_failed_revision_keeps_its_policy() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &lead_policy(false), "failed").await;
+        state
+            .store
+            .supersede_older_policies(&lead_id, 3)
+            .await
+            .unwrap();
+
+        for (version, status) in [(1, "superseded"), (2, "failed")] {
+            let record = state
+                .store
+                .get_policy_by_version(&lead_id, version)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, status);
+            assert!(
+                ParentPolicyCopy::of(&record, &lead_id).is_ok(),
+                "v{version} still decodes"
+            );
+        }
+        let failed = state
+            .store
+            .get_policy_by_version(&lead_id, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        let (policy, _) = super::super::policy::canonical_policy_record_identity(&failed).unwrap();
+        assert!(policy.network_policies.contains_key("api"));
+    }
+
+    #[tokio::test]
+    async fn children_fail_closed_even_when_the_gateway_retains_the_last_valid_policy() {
+        let mut state = child_sandboxes_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .policy_validation_failure_mode =
+            openshell_core::PolicyValidationFailureMode::RetainLastValid;
+        let (lead_id, worker_id) = lead_with_copied_child(&state).await;
+        put_policy_revision_with_status(&state, &lead_id, 2, &unloadable_on_child(), "loaded")
+            .await;
+        sync_children(&state, &lead_id).await.unwrap();
+
+        let config = child_config(&state, &worker_id).await;
+        assert!(!config.configuration_admitted);
+        assert!(
+            config
+                .configuration_error
+                .contains("repair credential bindings"),
+            "{}",
+            config.configuration_error
+        );
+        assert_eq!(config.policy_validation_failure_mode, "fail_closed");
+
+        let lead_config = super::super::policy::handle_get_sandbox_config(
+            &state,
+            sandbox_request(
+                &lead_id,
+                openshell_core::proto::GetSandboxConfigRequest {
+                    name: "lead".to_string(),
+                    workspace_scope: Some(default_scope()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            lead_config.policy_validation_failure_mode,
+            "retain_last_valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_proposals_are_rejected_and_not_stored() {
+        let state = child_sandboxes_state().await;
+        let worker_id = put_lead_and_worker(&state).await;
+
+        let response = super::super::policy::handle_submit_policy_analysis(
+            &state,
+            authed_request(openshell_core::proto::SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(default_scope()),
+                name: "worker1".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![openshell_core::proto::PolicyChunk {
+                    rule_name: "api".to_string(),
+                    proposed_rule: lead_policy(false).network_policies.remove("api"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the submission itself succeeds")
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 0);
+        assert_eq!(response.rejected_chunks, 1);
+        assert!(
+            response.rejection_reasons[0].contains("child sandboxes use their parent's policy"),
+            "{:?}",
+            response.rejection_reasons
+        );
+        let stored = state
+            .store
+            .list_draft_chunks(&worker_id, None)
+            .await
+            .unwrap();
+        assert!(stored.is_empty(), "a child's proposal must not be stored");
+    }
+
+    #[tokio::test]
+    async fn approving_a_proposal_on_a_child_is_refused() {
+        let state = child_sandboxes_state().await;
+        put_lead_and_worker(&state).await;
+
+        let err = super::super::policy::handle_approve_draft_chunk(
+            &state,
+            authed_request(openshell_core::proto::ApproveDraftChunkRequest {
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                chunk_id: "chunk-1".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("child sandboxes use their parent's policy"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn attaching_a_provider_the_parent_lacks_to_a_child_is_refused() {
+        let state = child_sandboxes_state().await;
+        put_lead_and_worker(&state).await;
+
+        let err = handle_attach_sandbox_provider(
+            &state,
+            authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: "worker1".to_string(),
+                workspace_scope: Some(default_scope()),
+                provider: "work-github".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("provider 'work-github' is not attached to parent 'lead'"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_being_deleted_keeps_its_slot_until_its_record_is_gone() {
+        let state = child_sandboxes_state_with_limit(2).await;
+        let lead_id = put_parent_record(&state, "lead", &[], None, false).await;
+        let link = openshell_core::proto::SandboxParent {
+            name: "lead".to_string(),
+            id: lead_id,
+        };
+        put_parent_record(&state, "worker1", &[], Some(link.clone()), false).await;
+        let leaving = put_parent_record(&state, "worker2", &[], Some(link), true).await;
+        let create = || {
+            handle_create_sandbox(
+                &state,
+                authed_request(child_request("worker3", "lead", SandboxSpec::default())),
+            )
+        };
+
+        let err = create().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            err.message(),
+            "sandbox 'lead' has reached its limit of 2 children, \
+             1 of them still being deleted; try again shortly"
+        );
+
+        // The driver finished removing it, so its record is gone.
+        state
+            .store
+            .delete(Sandbox::object_type(), &leaving)
+            .await
+            .unwrap();
+        create()
+            .await
+            .expect("the slot is free once the delete finishes");
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_stops_at_the_limit() {
+        let state = child_sandboxes_state_with_limit(2).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+        put_parent_record(&state, "other-lead", &[], None, false).await;
+
+        for name in ["worker1", "worker2"] {
+            handle_create_sandbox(
+                &state,
+                authed_request(child_request(name, "lead", SandboxSpec::default())),
+            )
+            .await
+            .expect("a child under the limit is created");
+        }
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker3", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message()
+                .contains("sandbox 'lead' has reached its limit of 2 children"),
+            "{}",
+            err.message()
+        );
+
+        // Each parent has its own limit.
+        handle_create_sandbox(
+            &state,
+            authed_request(child_request(
+                "worker4",
+                "other-lead",
+                SandboxSpec::default(),
+            )),
+        )
+        .await
+        .expect("another parent's children do not count");
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_with_zero_limit_is_refused() {
+        let state = child_sandboxes_state_with_limit(0).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn concurrent_child_creates_never_exceed_the_limit() {
+        let state = child_sandboxes_state_with_limit(3).await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let creates = (0..8).map(|index| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                handle_create_sandbox(
+                    &state,
+                    authed_request(child_request(
+                        &format!("worker{index}"),
+                        "lead",
+                        SandboxSpec::default(),
+                    )),
+                )
+                .await
+            })
+        });
+        let successes = future::join_all(creates)
+            .await
+            .into_iter()
+            .filter_map(|joined| joined.expect("create task").ok())
+            .count();
+        assert_eq!(successes, 3);
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_is_refused_when_disabled() {
+        let state = test_server_state().await;
+        put_parent_record(&state, "lead", &[], None, false).await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(child_request("worker1", "lead", SandboxSpec::default())),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("child sandboxes are disabled"));
+    }
+
+    #[tokio::test]
+    async fn create_child_sandbox_refuses_an_invalid_parent_or_request() {
+        let state = child_sandboxes_state().await;
+        let lead_id = put_parent_record(&state, "lead", &["work-github"], None, false).await;
+        put_parent_record(
+            &state,
+            "worker1",
+            &[],
+            Some(openshell_core::proto::SandboxParent {
+                name: "lead".to_string(),
+                id: lead_id,
+            }),
+            false,
+        )
+        .await;
+        put_parent_record(&state, "leaving", &[], None, true).await;
+
+        let cases = [
+            (
+                "missing",
+                SandboxSpec::default(),
+                tonic::Code::FailedPrecondition,
+                "parent sandbox 'missing' not found",
+            ),
+            (
+                "leaving",
+                SandboxSpec::default(),
+                tonic::Code::FailedPrecondition,
+                "parent sandbox 'leaving' is being deleted",
+            ),
+            (
+                "worker1",
+                SandboxSpec::default(),
+                tonic::Code::FailedPrecondition,
+                "only one level of child sandboxes is supported",
+            ),
+            (
+                "lead",
+                SandboxSpec {
+                    policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                    ..Default::default()
+                },
+                tonic::Code::InvalidArgument,
+                "a child sandbox uses its parent's policy",
+            ),
+            (
+                "lead",
+                SandboxSpec {
+                    providers: vec!["work-slack".to_string()],
+                    ..Default::default()
+                },
+                tonic::Code::FailedPrecondition,
+                "provider 'work-slack' is not attached to parent 'lead'",
+            ),
+        ];
+        for (parent, spec, code, message) in cases {
+            let err = handle_create_sandbox(
+                &state,
+                authed_request(child_request("nested", parent, spec)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), code, "{parent}: {}", err.message());
+            assert!(
+                err.message().contains(message),
+                "{parent}: {}",
+                err.message()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_sandbox_rejects_a_provider_whose_profile_is_absent() {
         let state = test_server_state().await;
@@ -7314,6 +12434,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "orphan-sandbox".to_string(),
                 spec: Some(SandboxSpec {
@@ -7396,6 +12517,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "reserved-policy-key".to_string(),
                 spec: Some(SandboxSpec {
@@ -7779,6 +12901,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "annotated".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -7839,6 +12962,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "reserved".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -8164,6 +13288,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "partial-id".to_string(),
                 spec: Some(SandboxSpec {
@@ -8235,6 +13360,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "kube-partial-id".to_string(),
                 spec: Some(SandboxSpec {
@@ -8289,6 +13415,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "bad-label".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -8330,6 +13457,7 @@ mod tests {
             handle_create_sandbox(
                 &task_state,
                 authed_request(CreateSandboxRequest {
+                    parent: String::new(),
                     request_id: String::new(),
                     name: "guarded-create".to_string(),
                     spec: Some(SandboxSpec {
@@ -8987,6 +14115,7 @@ mod tests {
         let created = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec {
@@ -9082,6 +14211,7 @@ mod tests {
         let created = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -9136,6 +14266,7 @@ mod tests {
         let created = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -9177,6 +14308,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "from-corrupt".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -9216,6 +14348,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "bad-template-create".to_string(),
                 spec: Some(SandboxSpec {
@@ -9246,6 +14379,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "bad-template-create".to_string(),
                 spec: Some(SandboxSpec::default()),
@@ -9273,6 +14407,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "bad-template-create".to_string(),
                 spec: Some(SandboxSpec {
@@ -9303,6 +14438,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                parent: String::new(),
                 request_id: String::new(),
                 name: "bad-direct-create".to_string(),
                 spec: Some(SandboxSpec {
@@ -10208,6 +15344,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -10226,6 +15363,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -10251,6 +15389,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -10296,6 +15435,7 @@ mod tests {
                 page_size: 100,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
@@ -10309,6 +15449,7 @@ mod tests {
                 page_size: 1,
                 page_token: String::new(),
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
@@ -10323,6 +15464,7 @@ mod tests {
                 page_size: 100,
                 page_token: first_page.next_page_token,
                 label_selector: String::new(),
+                parent: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )

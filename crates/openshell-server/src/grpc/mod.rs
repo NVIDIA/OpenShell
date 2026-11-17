@@ -13,6 +13,7 @@ pub mod provider_readiness;
 mod sandbox;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
+pub use sandbox::{spawn_child_sync, sync_all_children};
 mod service;
 pub mod service_advertisement;
 pub mod service_discovery;

@@ -779,6 +779,24 @@ fn prepare_server_config_with_drivers(
         config.provisioning_repair_window_seconds = window;
     }
 
+    if let Some(enabled) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.experimental_enable_child_sandboxes)
+    {
+        config.enable_child_sandboxes = enabled;
+    }
+    if let Some(limit) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.max_concurrent_children)
+    {
+        if limit > 1000 {
+            return Err(miette::miette!(
+                "max_concurrent_children must be between 0 and 1000"
+            ));
+        }
+        config.max_concurrent_children = limit;
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
@@ -5307,6 +5325,86 @@ mem_mib = "not-a-number"
                         "{error}"
                     );
                 }
+            });
+    }
+
+    #[test]
+    fn server_config_reads_child_sandbox_settings() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                let cases = [
+                    ("", false, 10),
+                    ("experimental_enable_child_sandboxes = true\n", true, 10),
+                    ("max_concurrent_children = 0\n", false, 0),
+                    (
+                        "experimental_enable_child_sandboxes = true\nmax_concurrent_children = 1000\n",
+                        true,
+                        1000,
+                    ),
+                ];
+                for (settings, enabled, limit) in cases {
+                    std::fs::write(
+                        &config_path,
+                        format!("[openshell]\nversion = 2\n[openshell.gateway]\n{settings}"),
+                    )
+                    .unwrap();
+                    let (mut args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "podman",
+                        "--disable-tls",
+                    ]);
+                    let prepared = super::prepare_server_config(&mut args, &matches)
+                        .expect("server config is prepared");
+                    assert_eq!(prepared.config.enable_child_sandboxes, enabled, "{settings}");
+                    assert_eq!(prepared.config.max_concurrent_children, limit, "{settings}");
+                }
+            });
+    }
+
+    #[test]
+    fn server_config_rejects_too_many_concurrent_children() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nmax_concurrent_children = 1001\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                    panic!("a limit above 1000 must be rejected");
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("max_concurrent_children must be between 0 and 1000")
+                );
             });
     }
 

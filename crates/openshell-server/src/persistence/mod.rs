@@ -336,7 +336,7 @@ pub fn generate_name() -> String {
 /// Extracted to avoid repeating the identical decode-and-hydrate block across
 /// `get_message`, `get_message_by_name`, `list_messages`, and
 /// `list_messages_with_selector`.
-fn decode_record<T: Message + Default + SetResourceVersion + ObjectType>(
+pub fn decode_record<T: Message + Default + SetResourceVersion + ObjectType>(
     record: ObjectRecord,
 ) -> PersistenceResult<T> {
     let payload = legacy_time_wire::migrate(T::object_type(), &record.payload)?;

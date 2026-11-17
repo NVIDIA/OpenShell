@@ -658,6 +658,9 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '\n[openshell.drivers.docker.resource_admission]\n'
   printf 'enabled = false\n'
 } > "${GATEWAY_CONFIG}"
+if [ "${OPENSHELL_E2E_CHILD_SANDBOXES:-0}" = "1" ]; then
+  e2e_enable_child_sandboxes "${GATEWAY_CONFIG}" "${STATE_DIR}"
+fi
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"

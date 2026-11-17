@@ -726,6 +726,74 @@ pub fn deny(principal: &Principal, denial: AuthzDenial<'_>, message: impl Into<S
     Status::permission_denied(message)
 }
 
+/// Emit one API Activity event for an MCP tool call: allowed, or refused with
+/// the agent-facing error code.
+/// How an MCP tool call ended, for its audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpOutcome<'a> {
+    Allowed,
+    /// Refused by policy or by the request itself, with the tool's error code.
+    Refused(&'a str),
+    /// Allowed, but failed for an internal or transient reason.
+    Failed(&'a str),
+}
+
+pub fn emit_mcp_tool_call(
+    origin: &RequestOrigin,
+    principal: &Principal,
+    tool: &str,
+    outcome: McpOutcome<'_>,
+    details: &[(&str, String)],
+) {
+    ocsf_emit!(mcp_tool_call_event(
+        origin, principal, tool, outcome, details
+    ));
+}
+
+pub fn mcp_tool_call_event(
+    origin: &RequestOrigin,
+    principal: &Principal,
+    tool: &str,
+    outcome: McpOutcome<'_>,
+    details: &[(&str, String)],
+) -> openshell_ocsf::OcsfEvent {
+    let ctx = crate::gateway_ocsf::context("", "");
+    let mut builder = ApiActivityBuilder::new(&ctx, tool)
+        .actor_user(principal_user(principal))
+        .src_endpoint(origin.source.map_or_else(
+            || Endpoint::from_name("unknown"),
+            ConnectionSource::endpoint,
+        ))
+        .api_service(Service::new("mcp"))
+        .http_request(post("/mcp"));
+    for (key, value) in details {
+        builder = builder.unmapped(key, value.clone());
+    }
+    let builder = match outcome {
+        McpOutcome::Allowed => builder
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(format!("mcp tool call {tool}: allowed")),
+        McpOutcome::Refused(code) => builder
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Low)
+            .status(StatusId::Failure)
+            .status_detail(code)
+            .message(format!("mcp tool call {tool}: refused ({code})")),
+        McpOutcome::Failed(code) => builder
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Unknown)
+            .severity(SeverityId::Low)
+            .status(StatusId::Failure)
+            .status_detail(code)
+            .message(format!("mcp tool call {tool}: failed ({code})")),
+    };
+    builder.build()
+}
+
 /// Emit an API Activity denial for a gRPC request to `path`, paired with a
 /// Detection Finding when a sandbox principal crossed its boundary.
 pub fn emit_authorization_denial_for(
