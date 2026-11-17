@@ -4777,7 +4777,8 @@ impl KubernetesComputeDriver {
             generation_secrets.splice(0..0, [names.sandbox_secret, names.supervisor_secret]);
             for name in &generation_secrets {
                 match secrets.delete(name, &DeleteParams::default()).await {
-                    Ok(_) | Err(KubeError::Api(kube::core::ErrorResponse { code: 404, .. })) => {}
+                    Ok(_) => {}
+                    Err(KubeError::Api(error)) if error.code == 404 => {}
                     Err(error) => return Err(KubernetesDriverError::from_kube(error)),
                 }
             }
@@ -4914,10 +4915,7 @@ impl KubernetesComputeDriver {
                     if !matches!(
                         tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
                             .await,
-                        Ok(Err(KubeError::Api(kube::core::ErrorResponse {
-                            code: 404,
-                            ..
-                        })))
+                        Ok(Err(KubeError::Api(error))) if error.code == 404
                     ) {
                         warn!(sandbox_id, "Sandbox CR deletion was not confirmed");
                         return Ok(true);
@@ -6370,13 +6368,13 @@ fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig)
             ..Default::default()
         },
         spec: Some(NetworkPolicySpec {
-            pod_selector: LabelSelector {
+            pod_selector: Some(LabelSelector {
                 match_labels: Some(BTreeMap::from([(
                     LABEL_MANAGED_BY.to_string(),
                     LABEL_MANAGED_BY_VALUE.to_string(),
                 )])),
                 ..Default::default()
-            },
+            }),
             policy_types: Some(vec!["Ingress".to_string()]),
             ingress: Some(vec![NetworkPolicyIngressRule {
                 from: Some(vec![NetworkPolicyPeer {
@@ -7303,7 +7301,7 @@ fn map_kube_event_to_platform(
         .last_timestamp
         .as_ref()
         .or(obj.first_timestamp.as_ref())
-        .map_or(0, |t| t.0.timestamp_millis());
+        .map_or(0, |t| t.0.as_millisecond());
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("involved_kind".to_string(), involved_kind);
@@ -9965,38 +9963,31 @@ mod tests {
     }
 
     fn kube_api_error(code: u16, message: &str) -> KubeError {
-        KubeError::Api(kube::core::ErrorResponse {
-            status: if code == 404 {
-                "404 Not Found".to_string()
-            } else {
-                "Failure".to_string()
-            },
-            message: message.to_string(),
-            reason: "Failed to parse error data".to_string(),
-            code,
-        })
+        KubeError::Api(
+            kube::core::Status::failure(message, "Failed to parse error data")
+                .with_code(code)
+                .boxed(),
+        )
     }
 
     #[test]
     fn resource_version_conflicts_are_not_reported_as_duplicate_sandboxes() {
-        let conflict = KubeError::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "the object has been modified".to_string(),
-            reason: "Conflict".to_string(),
-            code: 409,
-        });
+        let conflict = KubeError::Api(
+            kube::core::Status::failure("the object has been modified", "Conflict")
+                .with_code(409)
+                .boxed(),
+        );
         assert!(is_kube_resource_version_conflict(&conflict));
         assert!(matches!(
             KubernetesDriverError::from_kube(conflict),
             KubernetesDriverError::Message(_)
         ));
 
-        let duplicate = KubeError::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "already exists".to_string(),
-            reason: "AlreadyExists".to_string(),
-            code: 409,
-        });
+        let duplicate = KubeError::Api(
+            kube::core::Status::failure("already exists", "AlreadyExists")
+                .with_code(409)
+                .boxed(),
+        );
         assert!(matches!(
             KubernetesDriverError::from_kube(duplicate),
             KubernetesDriverError::AlreadyExists
@@ -10004,12 +9995,11 @@ mod tests {
     }
 
     fn expired_watch_error() -> watcher::Error {
-        watcher::Error::WatchError(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "too old resource version".to_string(),
-            reason: "Expired".to_string(),
-            code: 410,
-        })
+        watcher::Error::WatchError(
+            kube::core::Status::failure("too old resource version", "Expired")
+                .with_code(410)
+                .boxed(),
+        )
     }
 
     #[tokio::test]
@@ -14429,9 +14419,10 @@ mod tests {
         }
 
         let mut deleting = reconnecting;
-        deleting.metadata.deletion_timestamp = Some(
-            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(k8s_openapi::chrono::Utc::now()),
-        );
+        deleting.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
         assert_eq!(
             sandbox_runtime_control_availability_from_pod(&deleting),
             SandboxRuntimeControlAvailability::Unavailable

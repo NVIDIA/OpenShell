@@ -44,7 +44,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 - The `openshell` CLI must be available for endpoint checks.
 - Know the active gateway name and endpoint, or be able to inspect local gateway metadata.
 - Know the compute platform: Docker, Podman, Kubernetes, VM, or an out-of-tree driver.
-- For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
+- For Kubernetes: the cluster must run Kubernetes 1.33 or later, `kubectl` must target the cluster that hosts OpenShell, and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.

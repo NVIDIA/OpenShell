@@ -8,7 +8,7 @@
   gather_facts: false
   vars:
     helm_version: 4.2.0
-    k3s_version: 1.29.15+k3s1
+    k3s_version: 1.33.13+k3s2
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -26,7 +26,7 @@
     - name: Download K3s installer
       ansible.builtin.get_url:
         url: "https://raw.githubusercontent.com/k3s-io/k3s/v{{ k3s_version | urlencode }}/install.sh"
-        checksum: sha256:3ce239d57d43b2d836d2b561043433e6decae8b9dc41f5d13908c0fafb0340cd
+        checksum: sha256:9ca7930c31179d83bc13de20078fd8ad3e1ee00875b31f39a7e524ca4ef7d9de
         dest: /tmp/install-k3s.sh
         mode: "0755"
 
