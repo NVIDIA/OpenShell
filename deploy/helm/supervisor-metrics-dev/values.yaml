@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+prometheus:
+  image: prom/prometheus:v3.7.3
+  retention: 6h
+  tls:
+    enabled: false
+    caSecretName: ""
+    clientSecretName: ""
+    serverName: openshell-supervisor.openshell.svc.cluster.local
+grafana:
+  image: grafana/grafana:12.2.1
+supervisorNamespace: openshell
+supervisorRelease: openshell
+# Discover per-sandbox dedicated supervisor Pods instead of the shared Deployment.
+dedicatedSupervisors: false
+supervisorGatewayID: openshell

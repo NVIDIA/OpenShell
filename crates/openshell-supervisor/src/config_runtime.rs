@@ -246,6 +246,7 @@ impl ConfigRuntime {
         };
 
         if reloads_gateway_policy && !result.configuration_admitted {
+            metrics::counter!("openshell_supervisor_policy_updates_total", "outcome" => "validation_rejected").increment(1);
             let disposition = apply_policy_validation_failure(
                 &ctx.opa_engine,
                 result.policy_validation_failure_mode,
@@ -429,6 +430,7 @@ impl ConfigRuntime {
 
         let mut runtime_error = String::new();
         if policy_runtime_changed {
+            let started = std::time::Instant::now();
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = reload_gateway_configuration_runtime(
                 &ctx.opa_engine,
@@ -453,6 +455,14 @@ impl ConfigRuntime {
             )
             .await;
 
+            let outcome = if runtime_result.is_ok() {
+                "success"
+            } else {
+                "runtime_failure"
+            };
+            metrics::counter!("openshell_supervisor_policy_updates_total", "outcome" => outcome)
+                .increment(1);
+            metrics::histogram!("openshell_supervisor_policy_update_duration_seconds", "outcome" => outcome).record(started.elapsed().as_secs_f64());
             match runtime_result {
                 Ok(generation) => {
                     policy_runtime_reconciled = true;
@@ -1366,6 +1376,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             }
         }
         Err(e) => {
+            metrics::counter!("openshell_supervisor_settings_poll_failures_total").increment(1);
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
     }
@@ -1440,6 +1451,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     result
                 }
                 Err(e) => {
+                    metrics::counter!("openshell_supervisor_settings_poll_failures_total")
+                        .increment(1);
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
                     if runtime.extension_authentication_enabled
                         && let Err(refresh_error) =
@@ -3394,6 +3407,73 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn metrics_count_policy_activation_and_rejection_but_not_unchanged_snapshots() {
+        use openshell_core::proto::PolicySource;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        // This test uses Tokio's current-thread runtime, including across awaits.
+        let _recorder = ::metrics::set_default_local_recorder(&recorder);
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let desired = settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+        apply_with_provider(&mut runtime, &ctx, &client, &initial).await;
+        assert!(!metrics_handle.render().contains("policy_updates_total"));
+        apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
+        let mut rejected = desired.clone();
+        rejected.configuration_admitted = false;
+        rejected.configuration_error = "invalid test policy".into();
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::RetainLastValid;
+        apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("openshell_supervisor_policy_updates_total{outcome=\"success\"} 1")
+        );
+        assert!(rendered.contains(
+            "openshell_supervisor_policy_updates_total{outcome=\"validation_rejected\"} 1"
+        ));
+        assert!(!rendered.contains("runtime_failure"));
+
+        // A syntactically admitted configuration can still fail to activate
+        // when its middleware cannot connect. Count that separately.
+        let connector: MiddlewareConnector = Arc::new(|_, _| {
+            Box::pin(async { Err(miette::miette!("scripted middleware unavailable")) })
+        });
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            connector,
+        );
+        let mut runtime = started_runtime(&ctx, &initial);
+        let mut unavailable = desired.clone();
+        unavailable.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "unavailable".into(),
+                grpc_endpoint: "http://unavailable.invalid".into(),
+                ..Default::default()
+            }];
+        apply_with_provider(&mut runtime, &ctx, &client, &unavailable).await;
+        assert!(
+            metrics_handle.render().contains(
+                "openshell_supervisor_policy_updates_total{outcome=\"runtime_failure\"} 1"
+            )
+        );
     }
 
     #[tokio::test]

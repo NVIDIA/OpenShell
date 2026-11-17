@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+prometheus:
+  tls:
+    enabled: true
+    caSecretName: supervisor-metrics-server-ca
+    clientSecretName: supervisor-metrics-client-tls
+    serverName: openshell-supervisor.openshell.svc.cluster.local

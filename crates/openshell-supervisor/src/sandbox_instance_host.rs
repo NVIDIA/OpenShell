@@ -612,6 +612,12 @@ impl Drop for SandboxInstanceExit {
             .unwrap_or_else(|| SandboxInstancePhaseReport::Failed {
                 error: "sandbox instance thread ended without reporting a result".to_string(),
             });
+        let outcome_label = match &outcome {
+            SandboxInstancePhaseReport::Exited { exit_code: 0 } => "exited",
+            SandboxInstancePhaseReport::Exited { .. } => "nonzero_exit",
+            _ => "failed",
+        };
+        metrics::counter!("openshell_supervisor_instance_terminations_total", "outcome" => outcome_label).increment(1);
         self.phase.send_replace(outcome);
         self.changes.notify();
         unbind_thread();

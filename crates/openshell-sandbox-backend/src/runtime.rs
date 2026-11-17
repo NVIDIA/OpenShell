@@ -1618,11 +1618,33 @@ struct CachedGrpcChannel {
 struct TransportAbort {
     connected: AtomicBool,
     aborted: AtomicBool,
+    // 0 = opening, 1 = opened and counted, 2 = closed. Never counts a failed
+    // opening, and every close path can safely call metrics_closed.
+    metrics_state: std::sync::atomic::AtomicU8,
     waker: std::sync::Mutex<Option<std::task::Waker>>,
 }
 
 impl TransportAbort {
+    fn metrics_opened(&self) {
+        if self
+            .metrics_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            metrics::gauge!("openshell_supervisor_runtime_connections").increment(1.0);
+            metrics::counter!("openshell_supervisor_runtime_connections_total").increment(1);
+        }
+    }
+
+    fn metrics_closed(&self) {
+        if self.metrics_state.swap(2, Ordering::AcqRel) == 1 {
+            metrics::gauge!("openshell_supervisor_runtime_connections").decrement(1.0);
+            metrics::counter!("openshell_supervisor_runtime_disconnects_total").increment(1);
+        }
+    }
+
     fn abort(&self) {
+        self.metrics_closed();
         self.aborted.store(true, Ordering::Release);
         let waker = self
             .waker
@@ -1661,6 +1683,64 @@ struct AbortableTransport {
     abort: Arc<TransportAbort>,
 }
 
+#[cfg(test)]
+mod connection_metrics_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn eof_and_drop_close_the_same_transport_once() {
+        use tokio::io::AsyncReadExt as _;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let (inner, peer) = tokio::io::duplex(64);
+        let abort = Arc::new(TransportAbort::default());
+        let mut transport = AbortableTransport {
+            inner: Box::new(inner),
+            abort: abort.clone(),
+        };
+        abort.metrics_opened();
+        drop(peer);
+        assert_eq!(transport.read(&mut [0_u8; 1]).await.unwrap(), 0);
+        drop(transport);
+        let rendered = handle.render();
+        assert!(rendered.contains("openshell_supervisor_runtime_connections 0"));
+        assert!(rendered.contains("openshell_supervisor_runtime_disconnects_total 1"));
+    }
+
+    #[test]
+    fn control_transport_counts_once_and_excludes_failed_openings() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let failed = TransportAbort::default();
+            failed.metrics_closed();
+            failed.metrics_opened();
+            assert!(!handle.render().contains("runtime_connections_total"));
+            let transport = TransportAbort::default();
+            transport.metrics_opened();
+            transport.metrics_opened();
+            assert!(
+                handle
+                    .render()
+                    .contains("openshell_supervisor_runtime_connections 1")
+            );
+            transport.abort();
+            transport.metrics_closed();
+            let rendered = handle.render();
+            assert!(rendered.contains("openshell_supervisor_runtime_connections 0"));
+            assert!(rendered.contains("openshell_supervisor_runtime_connections_total 1"));
+            assert!(rendered.contains("openshell_supervisor_runtime_disconnects_total 1"));
+        });
+    }
+}
+
+impl Drop for AbortableTransport {
+    fn drop(&mut self) {
+        self.abort.metrics_closed();
+    }
+}
+
 impl AbortableTransport {
     fn aborted_error() -> std::io::Error {
         std::io::Error::new(
@@ -1679,7 +1759,16 @@ impl tokio::io::AsyncRead for AbortableTransport {
         if self.abort.poll_aborted(context) {
             return std::task::Poll::Ready(Err(Self::aborted_error()));
         }
-        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(context, buffer);
+        if matches!(&result, std::task::Poll::Ready(Err(_)))
+            || (matches!(&result, std::task::Poll::Ready(Ok(())))
+                && buffer.filled().len() == before
+                && buffer.remaining() > 0)
+        {
+            self.abort.metrics_closed();
+        }
+        result
     }
 }
 
@@ -1692,7 +1781,11 @@ impl tokio::io::AsyncWrite for AbortableTransport {
         if self.abort.poll_aborted(context) {
             return std::task::Poll::Ready(Err(Self::aborted_error()));
         }
-        std::pin::Pin::new(&mut self.inner).poll_write(context, buffer)
+        let result = std::pin::Pin::new(&mut self.inner).poll_write(context, buffer);
+        if matches!(&result, std::task::Poll::Ready(Err(_))) {
+            self.abort.metrics_closed();
+        }
+        result
     }
 
     fn poll_flush(
@@ -2514,6 +2607,7 @@ impl BoundaryClient {
             transport.abort();
             return Err(error);
         }
+        transport.metrics_opened();
         Ok((channel, transport))
     }
 
@@ -4773,8 +4867,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_session_reuses_one_tls_connection_for_concurrent_requests() {
+    async fn grpc_session_metrics_count_one_initial_tls_connection_for_concurrent_requests() {
         const REQUESTS: usize = 8;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
         let certificate = test_certificate();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4850,6 +4947,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(handled.load(Ordering::Acquire), REQUESTS);
         assert_eq!(accepted.load(Ordering::Acquire), 1);
+        let rendered = metrics_handle.render();
+        assert!(rendered.contains("openshell_supervisor_runtime_connections 1"));
+        assert!(rendered.contains("openshell_supervisor_runtime_connections_total 1"));
         server.abort();
     }
 

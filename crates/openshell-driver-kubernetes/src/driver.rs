@@ -3030,6 +3030,34 @@ impl KubernetesComputeDriver {
     ) -> Result<(), KubernetesDriverError> {
         let fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        if self.shared_supervisor.is_none()
+            && let Some(policy) = crate::supervisor_metrics::network_policy(
+                namespace,
+                &self.config.gateway_id,
+                &self.config.sandbox_runtime.metrics,
+            )
+        {
+            let name = policy
+                .metadata
+                .name
+                .as_deref()
+                .expect("metrics policy name");
+            tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                policies.patch(
+                    name,
+                    &PatchParams::apply("openshell"),
+                    &Patch::Apply(&policy),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(
+                    "timeout applying supervisor metrics NetworkPolicy".into(),
+                )
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        }
         for (mut policy, component) in [
             (fence.workload_policy, "sandbox-workload-fence"),
             (fence.supervisor_policy, "sandbox-supervisor-egress"),
@@ -3546,46 +3574,49 @@ impl KubernetesComputeDriver {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         pods.create(
             &PostParams::default(),
-            &crate::app_listener::configure_supervisor_pod(
-                supervisor_pod(
-                    namespace,
-                    names,
-                    sandbox_id,
-                    sandbox_name,
-                    &self.config.gateway_id,
-                    &self.config.supervisor_image,
-                    self.config.supervisor_image_pull_policy,
-                    &self.config.service_account_name,
-                    agent_uid,
-                    agent_gid,
-                    &self.generation_image_pull_secret_names(names),
-                    &self.config.grpc_endpoint,
-                    self.config.supervisor_client_tls(),
-                    main_process_spec,
-                    log_level,
-                    self.config.effective_sa_token_ttl_secs(),
-                    self.config.https_proxy.as_deref(),
-                    self.config.no_proxy.as_deref(),
-                    self.config
-                        .proxy_auth_secret_name
-                        .as_deref()
-                        .zip(self.config.proxy_auth_secret_key.as_deref()),
-                    self.config.proxy_auth_allow_insecure == Some(true),
-                    self.config.proxy_connect_by_hostname == Some(true),
-                    upstream_proxy_ca_bundle_staged,
-                    self.config.provider_spiffe_enabled().then_some(
+            &crate::supervisor_metrics::configure_pod(
+                crate::app_listener::configure_supervisor_pod(
+                    supervisor_pod(
+                        namespace,
+                        names,
+                        sandbox_id,
+                        sandbox_name,
+                        &self.config.gateway_id,
+                        &self.config.supervisor_image,
+                        self.config.supervisor_image_pull_policy,
+                        &self.config.service_account_name,
+                        agent_uid,
+                        agent_gid,
+                        &self.generation_image_pull_secret_names(names),
+                        &self.config.grpc_endpoint,
+                        self.config.supervisor_client_tls(),
+                        main_process_spec,
+                        log_level,
+                        self.config.effective_sa_token_ttl_secs(),
+                        self.config.https_proxy.as_deref(),
+                        self.config.no_proxy.as_deref(),
                         self.config
-                            .provider_spiffe_workload_api_socket_path
-                            .as_str(),
-                    ),
-                    network_additional_ca
-                        .as_ref()
-                        .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
-                    owner,
-                    &self.supervisor_otlp_environment(),
-                )
-                .map_err(KubernetesDriverError::Message)?,
-                &self.config.sandbox_runtime.app_listener,
+                            .proxy_auth_secret_name
+                            .as_deref()
+                            .zip(self.config.proxy_auth_secret_key.as_deref()),
+                        self.config.proxy_auth_allow_insecure == Some(true),
+                        self.config.proxy_connect_by_hostname == Some(true),
+                        upstream_proxy_ca_bundle_staged,
+                        self.config.provider_spiffe_enabled().then_some(
+                            self.config
+                                .provider_spiffe_workload_api_socket_path
+                                .as_str(),
+                        ),
+                        network_additional_ca.as_ref().map(|generation| {
+                            (generation.name.as_str(), generation.digest.as_str())
+                        }),
+                        owner,
+                        &self.supervisor_otlp_environment(),
+                    )
+                    .map_err(KubernetesDriverError::Message)?,
+                    &self.config.sandbox_runtime.app_listener,
+                ),
+                &self.config.sandbox_runtime.metrics,
             ),
         )
         .await

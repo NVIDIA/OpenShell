@@ -7,7 +7,86 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use openshell_ocsf::{ActionId, HttpActivityEvent, OcsfEvent};
+use openshell_ocsf::{ActionId, HttpActivityEvent, OcsfEvent, StatusId};
+
+/// Measures handler lifetime, including cancellation and early returns.
+pub struct ProxyConnection(metrics::Gauge);
+
+impl ProxyConnection {
+    pub fn new(path: &'static str) -> Self {
+        let gauge = metrics::gauge!("openshell_supervisor_proxy_connections", "path" => path);
+        gauge.increment(1.0);
+        Self(gauge)
+    }
+}
+
+impl Drop for ProxyConnection {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
+fn record_network_event(event: &OcsfEvent) {
+    let (layer, action, status) = match event {
+        OcsfEvent::NetworkActivity(event) => ("l4", event.action, event.base.status),
+        OcsfEvent::HttpActivity(event) => ("http", event.action, event.base.status),
+        // Companion findings describe the same incident and must not count again.
+        _ => return,
+    };
+    let outcome = match action {
+        Some(ActionId::Allowed) => Some("allow"),
+        Some(ActionId::Denied) => Some("deny"),
+        _ => None,
+    };
+    if let Some(outcome) = outcome {
+        metrics::counter!("openshell_supervisor_network_decisions_total", "layer" => layer, "outcome" => outcome).increment(1);
+    }
+    if status == Some(StatusId::Failure) && action != Some(ActionId::Denied) {
+        metrics::counter!("openshell_supervisor_network_failures_total", "layer" => layer)
+            .increment(1);
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use openshell_ocsf::{DetectionFindingBuilder, Endpoint, NetworkActivityBuilder};
+
+    #[test]
+    fn metrics_exclude_companion_findings_and_balance_handler_lifetimes() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let ctx = openshell_ocsf::ctx::ctx();
+            let domain = NetworkActivityBuilder::new(&ctx)
+                .dst_endpoint(Endpoint::from_domain("private.example", 443))
+                .action(ActionId::Denied)
+                .status(StatusId::Failure)
+                .build();
+            let finding = DetectionFindingBuilder::new(&ctx)
+                .action(ActionId::Denied)
+                .build();
+            record_network_event(&domain);
+            record_network_event(&finding);
+            {
+                let _guard = ProxyConnection::new("mediated");
+                assert!(
+                    handle
+                        .render()
+                        .contains("openshell_supervisor_proxy_connections{path=\"mediated\"} 1")
+                );
+            }
+            let rendered = handle.render();
+            assert!(rendered.contains(
+                "openshell_supervisor_network_decisions_total{layer=\"l4\",outcome=\"deny\"} 1"
+            ));
+            assert!(!rendered.contains("network_failures_total"));
+            assert!(
+                rendered.contains("openshell_supervisor_proxy_connections{path=\"mediated\"} 0")
+            );
+        });
+    }
+}
 
 /// Emit one egress event, entering an INFO deny span if it is denied HTTP Activity.
 macro_rules! egress_emit {
@@ -53,6 +132,7 @@ pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option
     };
     let emit = || {
         for event in events {
+            record_network_event(&event);
             openshell_ocsf::ocsf_emit!(event);
         }
     };

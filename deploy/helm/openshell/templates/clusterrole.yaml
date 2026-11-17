@@ -123,6 +123,14 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
+  {{- $metrics := get (get $kubernetesConfig "sandbox_runtime" | default dict) "metrics" | default dict }}
+  {{- if and (get $metrics "enabled") (not (include "openshell.supervisorEnabled" .)) }}
+  # Reconcile only this gateway's dedicated metrics ingress policy.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    resourceNames: [{{ printf "openshell-%s-supervisor-metrics" (get $kubernetesConfig "gateway_id") | quote }}]
+    verbs: ["patch"]
+  {{- end }}
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
   # Operator-mode namespaces receive Secret permissions from the

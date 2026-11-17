@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: dedicated supervisor metrics RBAC
+templates:
+  - templates/role.yaml
+  - templates/clusterrole.yaml
+release:
+  name: openshell
+  namespace: openshell
+tests:
+  - it: permits patching only the dedicated metrics policy
+    template: templates/role.yaml
+    set:
+      supervisor.metrics.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [networking.k8s.io]
+            resources: [networkpolicies]
+            resourceNames: [openshell-openshell-supervisor-metrics]
+            verbs: [patch]
+  - it: does not grant metrics policy patch permissions when disabled
+    template: templates/role.yaml
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [networking.k8s.io]
+            resources: [networkpolicies]
+            resourceNames: [openshell-openshell-supervisor-metrics]
+            verbs: [patch]
+  - it: does not grant dedicated metrics policy permissions for shared supervisors
+    template: templates/role.yaml
+    set:
+      supervisor.metrics.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [networking.k8s.io]
+            resources: [networkpolicies]
+            resourceNames: [openshell-openshell-supervisor-metrics]
+            verbs: [patch]
+  - it: permits only the named metrics policy in operator workspace namespaces
+    template: templates/clusterrole.yaml
+    set:
+      supervisor.metrics.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: operator
+          operator_namespace_label: openshell.ai/workspace=true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [networking.k8s.io]
+            resources: [networkpolicies]
+            resourceNames: [openshell-openshell-supervisor-metrics]
+            verbs: [patch]

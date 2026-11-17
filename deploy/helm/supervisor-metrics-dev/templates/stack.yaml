@@ -1,0 +1,270 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- $scrapeTls := .Values.prometheus.tls | default dict }}
+{{- if $scrapeTls.enabled }}
+{{- $_ := required "Prometheus HTTPS scraping requires caSecretName" $scrapeTls.caSecretName }}
+{{- $_ := required "Prometheus HTTPS scraping requires serverName for Pod discovery" $scrapeTls.serverName }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-discovery
+  namespace: {{ .Values.supervisorNamespace }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-discovery
+  namespace: {{ .Values.supervisorNamespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-prometheus
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-discovery
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    scrape_configs:
+      - job_name: openshell-supervisor
+        {{- if $scrapeTls.enabled }}
+        scheme: https
+        tls_config:
+          ca_file: /etc/prometheus/metrics-ca/ca.crt
+          server_name: {{ $scrapeTls.serverName | quote }}
+          {{- if $scrapeTls.clientSecretName }}
+          cert_file: /etc/prometheus/metrics-client/tls.crt
+          key_file: /etc/prometheus/metrics-client/tls.key
+          {{- end }}
+        {{- end }}
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [{{ .Values.supervisorNamespace | quote }}]
+        relabel_configs:
+          {{- if .Values.dedicatedSupervisors }}
+          - source_labels: [__meta_kubernetes_pod_label_openshell_ai_supervisor_metrics]
+            regex: enabled
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_openshell_ai_gateway_id]
+            regex: {{ .Values.supervisorGatewayID | quote }}
+            action: keep
+          {{- else }}
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            regex: openshell-supervisor
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance]
+            regex: {{ .Values.supervisorRelease | quote }}
+            action: keep
+          {{- end }}
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: metrics
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Running
+            action: keep
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: supervisor-prometheus
+        type: prometheus
+        access: proxy
+        url: http://{{ .Release.Name }}-prometheus:9090
+        isDefault: true
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: supervisor
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-dashboard
+data:
+  supervisor.json: |
+{{ .Files.Get "dashboards/supervisor.json" | indent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-prometheus
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-prometheus
+        openshell.ai/supervisor-metrics-scraper: "true"
+    spec:
+      serviceAccountName: {{ .Release.Name }}-prometheus
+      containers:
+        - name: prometheus
+          image: {{ .Values.prometheus.image | quote }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.prometheus.retention }}
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            {{- if $scrapeTls.enabled }}
+            - name: metrics-ca
+              mountPath: /etc/prometheus/metrics-ca
+              readOnly: true
+            {{- if $scrapeTls.clientSecretName }}
+            - name: metrics-client
+              mountPath: /etc/prometheus/metrics-client
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        {{- if $scrapeTls.enabled }}
+        - name: metrics-ca
+          secret:
+            secretName: {{ $scrapeTls.caSecretName | quote }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- if $scrapeTls.clientSecretName }}
+        - name: metrics-client
+          secret:
+            secretName: {{ $scrapeTls.clientSecretName | quote }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
+        {{- end }}
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Release.Name }}-prometheus
+  ports:
+    - port: 9090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-grafana
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-grafana
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: grafana
+          image: {{ .Values.grafana.image | quote }}
+          env:
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Viewer
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/grafana/provisioning/datasources/datasource.yaml
+              subPath: datasource.yaml
+              readOnly: true
+            - name: config
+              mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
+              subPath: dashboards.yaml
+              readOnly: true
+            - name: dashboard
+              mountPath: /var/lib/grafana/dashboards
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/grafana
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+        - name: dashboard
+          configMap:
+            name: {{ .Release.Name }}-dashboard
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-grafana
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Release.Name }}-grafana
+  ports:
+    - port: 3000
+      targetPort: http

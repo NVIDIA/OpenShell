@@ -78,6 +78,33 @@ Common findings:
 - Operator credential retrieval requires direct gateway mTLS, `[openshell.gateway.mtls_auth] operator_enabled = true`, and a verified certificate with exact `OU=operator`. OIDC admin roles and forwarded certificate headers do not grant access. Do not combine the operator certificate with an `Authorization` header. Enabling this role grants gateway-wide administration; never repair a denial by issuing operator certificates to ordinary users. See the published gateway authentication and provider references.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
 
+### Experimental supervisor metrics
+
+Supervisor Prometheus metrics are opt-in in both dedicated and shared modes,
+and separate from the gateway's endpoint. Dedicated processes accept
+`--metrics-bind-address` (`OPENSHELL_SUPERVISOR_METRICS_BIND_ADDRESS`) and the
+same metrics TLS flags; their certificates and scraper reachability must be
+configured per process. The Helm values below configure both Kubernetes topologies. Dedicated supervisor
+Pods receive the metrics environment, a named `metrics` port, and a scraper
+NetworkPolicy from the driver. Metrics TLS Secrets must exist in each sandbox
+namespace. Discover dedicated Pods using `openshell.ai/supervisor-metrics=enabled`
+and `openshell.ai/gateway-id`, rather than the shared Deployment labels. Check the deployed Helm values for `supervisor.metrics.enabled` and
+the supervisor Pod's named `metrics` port (default 9091). With NetworkPolicy
+enabled, only Pods labeled `openshell.ai/supervisor-metrics-scraper: "true"` in
+`supervisor.metrics.scraperNamespace` may scrape it. The listener uses plaintext
+unless `supervisor.metrics.tls.enabled` is set. HTTPS requires a dedicated
+`supervisor.metrics.tls.certSecretName` with `tls.crt` and `tls.key`; required
+scraper certificates also need a metrics-specific `clientCaSecretName` and
+`requireClientCert: true`. Do not reuse gateway API/client identity Secrets or
+gateway control-plane trust. Invalid initial TLS material disables metrics only,
+without plaintext fallback; correct the Secret and restart the supervisor.
+An active listener reloads valid replacements and retains its last valid config
+on failure. Check scraper CA trust, client identity, and TLS server name as well
+as NetworkPolicy when an HTTPS scrape fails.
+Use the published Gateway Metrics page for current configuration. Assigned
+sandbox phase counts are distinct from open runtime control connections;
+readiness and live connections are different observations.
+
 ### Step 2: Identify the Compute Platform
 
 Use gateway metadata, deployment values, or the user's setup notes to identify the driver.

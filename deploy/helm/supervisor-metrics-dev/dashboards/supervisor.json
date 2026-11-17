@@ -1,0 +1,592 @@
+{
+  "uid": "openshell-supervisor-poc",
+  "title": "OpenShell supervisor metrics — local experiment",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "tags": [
+    "openshell",
+    "proof-of-concept"
+  ],
+  "timezone": "browser",
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Assigned sandboxes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, phase) (openshell_supervisor_sandboxes)",
+          "legendFormat": "{{pod}} {{phase}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Open runtime control connections",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "openshell_supervisor_runtime_connections",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Gateway connected (1 = accepted)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "openshell_supervisor_gateway_connected",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Scrape health (1 = reachable)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"openshell-supervisor\"}",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Network decision rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, layer, outcome) (rate(openshell_supervisor_network_decisions_total[$__rate_interval]))",
+          "legendFormat": "{{pod}} {{layer}} {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Active proxy handlers",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "openshell_supervisor_proxy_connections",
+          "legendFormat": "{{pod}} {{path}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Policy activation / rejection rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, outcome) (rate(openshell_supervisor_policy_updates_total[$__rate_interval]))",
+          "legendFormat": "{{pod}} {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Policy activation p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (pod, le) (rate(openshell_supervisor_policy_update_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Gateway connection attempts / settings poll failures",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(openshell_supervisor_gateway_connection_attempts_total[$__rate_interval])",
+          "legendFormat": "{{pod}} attempts"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(openshell_supervisor_settings_poll_failures_total[$__rate_interval])",
+          "legendFormat": "{{pod}} poll failures"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Runtime connections / disconnects",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(openshell_supervisor_runtime_connections_total[$__rate_interval])",
+          "legendFormat": "{{pod}} opened"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(openshell_supervisor_runtime_disconnects_total[$__rate_interval])",
+          "legendFormat": "{{pod}} closed"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Instance terminations / admission failures",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, outcome) (rate(openshell_supervisor_instance_terminations_total[$__rate_interval]))",
+          "legendFormat": "{{pod}} {{outcome}}"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(openshell_supervisor_admission_failures_total[$__rate_interval])",
+          "legendFormat": "{{pod}} admission failures"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Network operational failures",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(openshell_supervisor_network_failures_total[$__rate_interval])",
+          "legendFormat": "{{pod}} {{layer}}"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(openshell_supervisor_upstream_connect_errors_total[$__rate_interval])",
+          "legendFormat": "{{pod}} upstream {{path}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "OCSF export errors / drops",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "supervisor-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(openshell_ocsf_otlp_export_errors_total[$__rate_interval])",
+          "legendFormat": "{{pod}} export errors"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod, reason) (rate(openshell_ocsf_otlp_dropped_total[$__rate_interval]))",
+          "legendFormat": "{{pod}} dropped {{reason}}"
+        }
+      ]
+    }
+  ]
+}

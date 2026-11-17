@@ -150,6 +150,47 @@ deploy:
           sandboxRuntime.image.tag: '{{.IMAGE_TAG_openshell_sandbox}}'
           gatewayConfig.openshell\.drivers\.kubernetes.supervisor_image: '{{.IMAGE_REPO_openshell_supervisor}}:{{.IMAGE_TAG_openshell_supervisor}}'
 profiles:
+  # Supply the dedicated metrics PKI Secrets first; see the dev stack guide.
+  - name: supervisor-metrics-tls
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-supervisor-ha.yaml
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-supervisor-metrics-tls.yaml
+      - op: add
+        path: /deploy/helm/releases/0/setValues
+        value:
+          server.disableTls: "false"
+      - op: add
+        path: /deploy/helm/releases/-
+        value:
+          name: supervisor-metrics
+          chartPath: ../supervisor-metrics-dev
+          namespace: observability
+          createNamespace: true
+          valuesFiles:
+            - ../supervisor-metrics-dev/values-tls.yaml
+  - name: supervisor-metrics
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-supervisor-ha.yaml
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-supervisor-metrics.yaml
+      - op: add
+        path: /deploy/helm/releases/0/setValues
+        value:
+          server.disableTls: "false"
+      - op: add
+        path: /deploy/helm/releases/-
+        value:
+          name: supervisor-metrics
+          chartPath: ../supervisor-metrics-dev
+          namespace: observability
+          createNamespace: true
   # Full HA test path: installs Envoy Gateway and layers both HA replicas and
   # Gateway API routing values onto the OpenShell release.
   - name: high-availability

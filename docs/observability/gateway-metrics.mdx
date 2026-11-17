@@ -12,6 +12,65 @@ The gateway exports Prometheus metrics for API requests, database readiness,
 gateway interceptors, the OCSF log file, and multi-replica capacity. Use them
 to alert on saturation, to follow rollouts, and to choose autoscaling signals.
 
+## Experimental Supervisor Metrics
+
+Supervisors in dedicated and shared modes can serve Prometheus metrics separately
+from the gateway. Pass `--metrics-bind-address=0.0.0.0:9091` or set
+`OPENSHELL_SUPERVISOR_METRICS_BIND_ADDRESS` in either mode. The Helm chart enables
+the listener for either Kubernetes topology with `supervisor.metrics.enabled`.
+The listener is disabled by default and serves plaintext `GET /metrics`.
+
+To serve HTTPS, configure a dedicated metrics server Secret:
+
+```yaml
+supervisor:
+  metrics:
+    enabled: true
+    tls:
+      enabled: true
+      certSecretName: supervisor-metrics-server-tls
+      clientCaSecretName: supervisor-metrics-scraper-ca
+      requireClientCert: true
+```
+
+The server Secret contains `tls.crt` and `tls.key`. For mTLS, supply a
+metrics-specific scraper CA Secret containing `ca.crt` and set
+`requireClientCert: true`. Omit the scraper CA and leave that setting false for
+HTTPS without client certificates. The chart rejects reusing gateway API or
+client identity Secret names for the server key, and rejects gateway trust
+Secret names for the scraper CA. These checks compare names; operators must
+also keep the underlying certificate material separate.
+
+Scrapers that discover Pod IPs must set the TLS server name to a DNS name in
+the metrics certificate. Keep server verification enabled. The supervisor
+reloads valid certificate changes and retains its previous configuration on
+an invalid replacement. Invalid initial material disables metrics without
+falling back to plaintext; correct the Secret and restart the supervisor.
+
+The experimental metrics cover assigned sandboxes by phase, open runtime
+control connections, network decisions, policy runtime activation outcomes,
+and connection failures. They use the `openshell_supervisor_` prefix and
+aggregate across hosted sandboxes without sandbox identity labels. In dedicated
+mode, sandbox lifecycle gauges describe its single sandbox. Gateway connectivity
+tracks the accepted, ready sandbox session; in shared mode it tracks the assignment
+stream. Dedicated processes use the same `--metrics-tls-cert`, `--metrics-tls-key`,
+`--metrics-tls-client-ca`, and `--metrics-require-client-auth` options. The
+Kubernetes driver mounts the configured metrics Secrets into dedicated
+supervisor Pods, declares a `metrics` port, and admits labeled scrapers from
+`supervisor.metrics.scraperNamespace`. Create those Secrets in every sandbox
+namespace before launching sandboxes. Existing supervisors need recreation to
+pick up listener configuration changes.
+
+Scrape each supervisor Pod's `metrics` port. Dedicated Pods carry
+`openshell.ai/supervisor-metrics: enabled` and `openshell.ai/gateway-id`; use
+those labels for Pod discovery and grant the scraper permission to list/watch
+Pods in each sandbox namespace. Shared Deployment labels differ. A Service per
+sandbox is not required. With NetworkPolicy enabled, the
+chart allows scraping only from Pods labeled
+`openshell.ai/supervisor-metrics-scraper: "true"` in
+`supervisor.metrics.scraperNamespace` (default `observability`).
+The supervisor does not export OpenTelemetry metrics.
+
 ## Enable the Metrics Endpoint
 
 The gateway serves `GET /metrics` in the Prometheus text format on its own
@@ -31,7 +90,7 @@ disabled, the gateway records no metrics. Enable it in one of these ways:
 A stopping gateway keeps serving metrics until the process exits.
 
 <Warning>
-The metrics endpoint uses plaintext HTTP with no authentication. Anyone who
+By default, the gateway metrics endpoint uses plaintext HTTP with no authentication. Anyone who
 can reach the port can read the metrics. The Helm chart publishes the port on
 the gateway Service, so a `LoadBalancer` or `NodePort` Service exposes it
 outside the cluster. Keep the Service internal, and restrict the port to your

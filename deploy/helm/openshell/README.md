@@ -748,6 +748,13 @@ discovery endpoint or its TLS CA.
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.metrics.enabled | bool | `false` | Enable the experimental Prometheus listener on dedicated and shared Kubernetes supervisors. |
+| supervisor.metrics.port | int | `9091` | Supervisor metrics port; must differ from runtime, health, and app ports. |
+| supervisor.metrics.scraperNamespace | string | `"observability"` | Namespace allowed to scrape from Pods labeled openshell.ai/supervisor-metrics-scraper=true. |
+| supervisor.metrics.tls.certSecretName | string | `""` | Dedicated metrics server Secret with tls.crt and tls.key. Must not reuse gateway API or client identity Secrets. |
+| supervisor.metrics.tls.clientCaSecretName | string | `""` | Metrics-specific scraper CA Secret with ca.crt. Must not reuse gateway control-plane trust Secrets. |
+| supervisor.metrics.tls.enabled | bool | `false` | Serve metrics over HTTPS. Requires supervisor.metrics.enabled. |
+| supervisor.metrics.tls.requireClientCert | bool | `false` | Require a scraper certificate trusted by clientCaSecretName. |
 | supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
 | supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
 | supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |

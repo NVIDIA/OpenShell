@@ -896,6 +896,36 @@ OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
 
 The gateway flushes buffered spans during shutdown, so spans from in-flight requests survive a `SIGTERM`.
 
+### Supervisor Prometheus Metrics
+
+The experimental supervisor listener supports dedicated and shared processes.
+In Helm, `supervisor.metrics.enabled`, `port`, `scraperNamespace`, and `tls`
+configure both Kubernetes topologies. The in-process Kubernetes driver reads
+these dedicated deployment inputs:
+
+```toml
+[openshell.drivers.kubernetes.sandbox_runtime.metrics]
+enabled = true
+port = 9091
+scraper_namespace = "observability"
+tls_cert_secret_name = "supervisor-metrics-server-tls"
+tls_client_ca_secret_name = "supervisor-metrics-client-ca"
+require_client_auth = true
+```
+
+Metrics are disabled by default. Omit the TLS fields for plaintext scraping.
+TLS server Secrets contain `tls.crt` and `tls.key`; scraper CA Secrets contain
+`ca.crt`. Provision metrics-specific Secrets in every sandbox namespace. Do not
+reuse gateway private keys or gateway control-plane trust. The driver only
+mounts these Secrets into dedicated supervisor Pods, never workload Pods. It
+adds the named `metrics` port, discovery labels, and a NetworkPolicy permitting
+metrics access from labeled scraper Pods in `scraper_namespace`. The existing
+per-sandbox runtime policy continues to admit its workload control connection.
+Listener configuration applies to newly created supervisors. For discovery,
+TLS options, and metric semantics, see [Gateway Metrics](/observability/gateway-metrics).
+Docker, Podman, and VM launch configuration does not yet forward these Kubernetes
+settings; their supervisor binaries accept the metrics flags directly.
+
 ## Supervisor Middleware Services
 
 Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.

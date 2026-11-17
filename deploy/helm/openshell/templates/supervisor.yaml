@@ -12,6 +12,7 @@
 {{- $app := include "openshell.appListenerConfig" . | fromYaml }}
 {{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml }}
 {{- $appPort := get $app "port" | default 8443 }}
+{{- $metricsTls := .Values.supervisor.metrics.tls | default dict }}
 {{- if get $app "enabled" }}
 {{- $_ := required "supervisor app listener requires domain" (get $app "domain") }}
 {{- $_ := required "supervisor app listener requires tls_secret_name" (get $appDeployment "tls_secret_name") }}
@@ -25,7 +26,7 @@
 # One supervisor process per replica hosts a sandbox instance for each sandbox
 # generation placed on it. The process dials the gateway over TLS with the
 # supervisor token the gateway mints for it and receives its assignments from
-# it; nothing but sandbox runtimes and kubelet probes connect to it. The Pod
+# it; sandbox runtimes, kubelet probes, and opt-in metrics scrapers connect. The Pod
 # holds no Kubernetes identity of its own: each instance acts only with the
 # credentials the gateway issued for its generation.
 apiVersion: apps/v1
@@ -85,6 +86,19 @@ spec:
           imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
           args:
             - --mode=shared
+            {{- if .Values.supervisor.metrics.enabled }}
+            - --metrics-bind-address=0.0.0.0:{{ .Values.supervisor.metrics.port }}
+            {{- if $metricsTls.enabled }}
+            - --metrics-tls-cert=/etc/openshell-metrics/server/tls.crt
+            - --metrics-tls-key=/etc/openshell-metrics/server/tls.key
+            {{- if $metricsTls.clientCaSecretName }}
+            - --metrics-tls-client-ca=/etc/openshell-metrics/client-ca/ca.crt
+            {{- end }}
+            {{- if $metricsTls.requireClientCert }}
+            - --metrics-require-client-auth
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - --gateway-endpoint
             - {{ $endpoint | quote }}
             - --address
@@ -132,6 +146,11 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
           ports:
+            {{- if .Values.supervisor.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.supervisor.metrics.port }}
+              protocol: TCP
+            {{- end }}
             {{- if get $app "enabled" }}
             - name: app
               containerPort: {{ $appPort }}
@@ -164,6 +183,16 @@ spec:
             tcpSocket:
               port: health
           volumeMounts:
+            {{- if $metricsTls.enabled }}
+            - name: metrics-server-tls
+              mountPath: /etc/openshell-metrics/server
+              readOnly: true
+            {{- if $metricsTls.clientCaSecretName }}
+            - name: metrics-client-ca
+              mountPath: /etc/openshell-metrics/client-ca
+              readOnly: true
+            {{- end }}
+            {{- end }}
             {{- if get $app "enabled" }}
             - name: app-tls
               mountPath: /etc/openshell/app-tls
@@ -182,6 +211,24 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if $metricsTls.enabled }}
+        - name: metrics-server-tls
+          secret:
+            secretName: {{ $metricsTls.certSecretName | quote }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- if $metricsTls.clientCaSecretName }}
+        - name: metrics-client-ca
+          secret:
+            secretName: {{ $metricsTls.clientCaSecretName | quote }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- end }}
         {{- if get $app "enabled" }}
         - name: app-tls
           secret:

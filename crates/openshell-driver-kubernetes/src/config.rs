@@ -119,6 +119,7 @@ impl FromStr for KubernetesControlConnection {
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
     pub app_listener: KubernetesAppListenerConfig,
+    pub metrics: crate::supervisor_metrics::Config,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
@@ -129,6 +130,7 @@ impl Default for KubernetesSandboxRuntimeConfig {
         Self {
             boundary_port: 5500,
             app_listener: KubernetesAppListenerConfig::default(),
+            metrics: crate::supervisor_metrics::Config::default(),
         }
     }
 }
@@ -146,6 +148,8 @@ pub struct KubernetesAppListenerConfig {
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.app_listener.common.validate()?;
+        self.metrics
+            .validate(self.boundary_port, &self.app_listener.common)?;
         if self.app_listener.common.enabled {
             if !is_dns_subdomain(&self.app_listener.tls_secret_name) {
                 return Err("sandbox_runtime.app_listener.tls_secret_name is required when the app listener is enabled".into());
@@ -262,7 +266,7 @@ impl SharedSupervisorConfig {
 }
 
 /// RFC 1123 subdomain, as Kubernetes object names require.
-fn is_dns_subdomain(value: &str) -> bool {
+pub(crate) fn is_dns_subdomain(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
         && value.split('.').all(|label| {
@@ -638,7 +642,18 @@ impl KubernetesComputeConfig {
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        self.sandbox_runtime.validate()
+        self.sandbox_runtime.validate()?;
+        let metrics = &self.sandbox_runtime.metrics;
+        if metrics.enabled
+            && !self.client_tls_secret_name.is_empty()
+            && (metrics.tls_cert_secret_name.as_deref()
+                == Some(self.client_tls_secret_name.as_str())
+                || metrics.tls_client_ca_secret_name.as_deref()
+                    == Some(self.client_tls_secret_name.as_str()))
+        {
+            return Err("supervisor metrics must not reuse the gateway client trust Secret".into());
+        }
+        Ok(())
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.

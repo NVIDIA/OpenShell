@@ -66,6 +66,43 @@ struct Args {
     #[arg(long, value_enum, default_value_t)]
     mode: SupervisorMode,
 
+    /// Opt-in Prometheus listener for supervisors; restrict scraper access.
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_METRICS_BIND_ADDRESS")]
+    metrics_bind_address: Option<std::net::SocketAddr>,
+
+    /// Certificate served by the metrics HTTPS listener.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_METRICS_TLS_CERT",
+        requires = "metrics_bind_address"
+    )]
+    metrics_tls_cert: Option<PathBuf>,
+
+    /// Private key for the metrics HTTPS listener.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_METRICS_TLS_KEY",
+        requires = "metrics_bind_address"
+    )]
+    metrics_tls_key: Option<PathBuf>,
+
+    /// Metrics-specific CA used to verify scraper client certificates.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_METRICS_TLS_CLIENT_CA",
+        requires = "metrics_bind_address"
+    )]
+    metrics_tls_client_ca: Option<PathBuf>,
+
+    /// Require a trusted scraper client certificate on the metrics listener.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_METRICS_REQUIRE_CLIENT_AUTH",
+        requires = "metrics_bind_address",
+        default_value_t = false
+    )]
+    metrics_require_client_auth: bool,
+
     /// Gateway endpoint for the shared supervisor's outbound connection.
     #[arg(long, required_if_eq("mode", "shared"))]
     gateway_endpoint: Option<String>,
@@ -472,6 +509,12 @@ fn main() -> Result<()> {
             "shared supervisor options require --mode=shared"
         ));
     }
+    let metrics_tls = openshell_supervisor::metrics::tls_config(
+        args.metrics_tls_cert.clone(),
+        args.metrics_tls_key.clone(),
+        args.metrics_tls_client_ca.clone(),
+        args.metrics_require_client_auth,
+    )?;
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
@@ -582,6 +625,12 @@ fn main() -> Result<()> {
         } else if let Some(endpoint) = &args.otlp_ocsf_endpoint {
             info!(endpoint, protocol = %args.otlp_ocsf_protocol, "OTLP OCSF export enabled");
         }
+
+        let _metrics = if let Some(address) = args.metrics_bind_address {
+            openshell_supervisor::metrics::serve(address, None, metrics_tls).await?
+        } else {
+            None
+        };
 
         let workdir = args.workdir.clone();
         let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
@@ -1016,6 +1065,36 @@ mod tests {
             ]
         );
         assert!(supervisor_resource_attributes(None, None).is_empty());
+    }
+
+    #[test]
+    fn metrics_tls_options_are_available_in_dedicated_mode() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--metrics-bind-address",
+            "127.0.0.1:9091",
+            "--metrics-tls-cert",
+            "server.pem",
+            "--metrics-tls-key",
+            "key.pem",
+            "--metrics-tls-client-ca",
+            "scrapers.pem",
+            "--metrics-require-client-auth",
+        ])
+        .unwrap();
+        assert_eq!(args.mode, SupervisorMode::Dedicated);
+        assert!(args.metrics_bind_address.is_some());
+        assert!(
+            openshell_supervisor::metrics::tls_config(
+                args.metrics_tls_cert,
+                args.metrics_tls_key,
+                args.metrics_tls_client_ca,
+                args.metrics_require_client_auth,
+            )
+            .unwrap()
+            .unwrap()
+            .require_client_auth
+        );
     }
 
     #[test]

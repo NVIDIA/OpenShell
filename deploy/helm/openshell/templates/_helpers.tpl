@@ -646,6 +646,16 @@ absent fields so every chart consumer observes the same configuration.
 {{- if and (ne (int (get $legacyRuntime "boundaryPort" | default 5500)) 5500) (not (hasKey $runtimeConfig "boundary_port")) -}}
 {{- $_ := set $runtimeConfig "boundary_port" (int (get $legacyRuntime "boundaryPort")) -}}
 {{- end -}}
+{{- if .Values.supervisor.metrics.enabled -}}
+{{- $metrics := dict "enabled" true "port" (int .Values.supervisor.metrics.port) "scraper_namespace" .Values.supervisor.metrics.scraperNamespace -}}
+{{- $tls := .Values.supervisor.metrics.tls | default dict -}}
+{{- if $tls.enabled -}}
+{{- $_ := set $metrics "tls_cert_secret_name" $tls.certSecretName -}}
+{{- if $tls.clientCaSecretName -}}{{- $_ := set $metrics "tls_client_ca_secret_name" $tls.clientCaSecretName -}}{{- end -}}
+{{- $_ := set $metrics "require_client_auth" ($tls.requireClientCert | default false) -}}
+{{- end -}}
+{{- $_ := set $runtimeConfig "metrics" $metrics -}}
+{{- end -}}
 {{- $_ := set $kubernetes "sandbox_runtime" $runtimeConfig -}}
 {{- $legacyProxy := .Values.upstreamProxy | default dict -}}
 {{- range $legacyKey, $runtimeKey := dict "url" "https_proxy" "noProxy" "no_proxy" "authAllowInsecure" "proxy_auth_allow_insecure" "connectByHostname" "proxy_connect_by_hostname" -}}
@@ -794,6 +804,35 @@ Validate chart values that Helm would otherwise accept silently.
 {{- include "openshell.validateSecretReference" (list "server.sandboxJwt.signingSecretName" .Values.server.sandboxJwt.signingSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "server.tls.certSecretName" .Values.server.tls.certSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "upstreamProxy.authSecret.name" .Values.upstreamProxy.authSecret.name) -}}
+{{- $app := include "openshell.appListenerConfig" . | fromYaml -}}
+{{- $appPort := get $app "port" | default 8443 -}}
+{{- $rawKubernetes := get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict -}}
+{{- $rawRuntime := get $rawKubernetes "sandbox_runtime" | default dict -}}
+{{- $rawShared := get $rawKubernetes "shared_supervisor" | default dict -}}
+{{- $runtimePort := get $rawShared "runtime_port" | default (get $rawRuntime "boundary_port" | default .Values.supervisor.sandboxRuntime.boundaryPort) -}}
+{{- $metricsTls := .Values.supervisor.metrics.tls | default dict }}
+{{- if $metricsTls.enabled }}
+{{- if not .Values.supervisor.metrics.enabled }}
+{{- fail "supervisor metrics TLS requires supervisor.metrics.enabled" }}
+{{- end }}
+{{- $_ := required "supervisor metrics TLS requires a dedicated certSecretName" $metricsTls.certSecretName }}
+{{- if or (eq $metricsTls.certSecretName .Values.server.tls.certSecretName) (eq $metricsTls.certSecretName .Values.server.tls.clientTlsSecretName) }}
+{{- fail "supervisor metrics certSecretName must not reuse gateway API or client identity Secrets" }}
+{{- end }}
+{{- if and $metricsTls.requireClientCert (not $metricsTls.clientCaSecretName) }}
+{{- fail "supervisor metrics requireClientCert requires clientCaSecretName" }}
+{{- end }}
+{{- if and $metricsTls.clientCaSecretName (or (eq $metricsTls.clientCaSecretName .Values.server.tls.certSecretName) (eq $metricsTls.clientCaSecretName .Values.server.tls.clientCaSecretName) (eq $metricsTls.clientCaSecretName .Values.server.tls.clientTlsSecretName)) }}
+{{- fail "supervisor metrics clientCaSecretName must not reuse gateway control-plane trust Secrets" }}
+{{- end }}
+{{- end }}
+{{- if .Values.supervisor.metrics.enabled }}
+{{- $port := int .Values.supervisor.metrics.port }}
+{{- if or (lt $port 1024) (gt $port 65535) (eq $port 5501) (eq $port (int $runtimePort)) (and (get $app "enabled") (eq $port (int $appPort))) }}
+{{- fail "supervisor metrics port must be in 1024..65535 and distinct from runtime, health, and enabled app ports" }}
+{{- end }}
+{{- $_ := required "supervisor metrics requires scraperNamespace" .Values.supervisor.metrics.scraperNamespace }}
+{{- end }}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- $gateway := get $gatewayConfig "openshell.gateway" | default dict -}}
 {{- $credentialDrivers := get $gateway "credential_drivers" -}}

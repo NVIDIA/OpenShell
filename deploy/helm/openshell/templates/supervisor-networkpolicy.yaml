@@ -8,7 +8,8 @@
 # runtime listener. Each sandbox's own egress allowance limits its workload to
 # that port, and the routing preface plus the generation's pinned TLS identity
 # decide which instance it reaches. The supervisor dials the gateway itself,
-# so no ingress from the gateway is needed.
+# so no ingress from the gateway is needed. Opt-in metrics scraping has its
+# own namespace and Pod selector on a separate port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -25,6 +26,18 @@ spec:
     - Ingress
     - Egress
   ingress:
+    {{- if .Values.supervisor.metrics.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.supervisor.metrics.scraperNamespace | quote }}
+          podSelector:
+            matchLabels:
+              openshell.ai/supervisor-metrics-scraper: "true"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.supervisor.metrics.port }}
+    {{- end }}
     - from:
         - namespaceSelector:
             {{- include "openshell.supervisorSandboxNamespaces" (dict "kubernetes" $kubernetes) | nindent 12 }}

@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v2
+name: supervisor-metrics-dev
+description: Ephemeral Prometheus and Grafana for the shared supervisor metrics experiment
+type: application
+version: 0.1.0

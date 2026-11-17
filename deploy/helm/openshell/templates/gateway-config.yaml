@@ -11,6 +11,7 @@ gatewayConfig is the complete non-secret application configuration boundary.
 Database URLs and other credentials remain injected through Secret-backed
 environment variables, files, or volumes outside this ConfigMap.
 */}}
+{{- include "openshell.validateValues" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

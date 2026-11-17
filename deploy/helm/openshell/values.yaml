@@ -56,6 +56,22 @@ sandboxRuntime:
 
 # Trusted control-side runtime image.
 supervisor:
+  metrics:
+    # -- Enable the experimental Prometheus listener on dedicated and shared Kubernetes supervisors.
+    enabled: false
+    # -- Supervisor metrics port; must differ from runtime, health, and app ports.
+    port: 9091
+    # -- Namespace allowed to scrape from Pods labeled openshell.ai/supervisor-metrics-scraper=true.
+    scraperNamespace: observability
+    tls:
+      # -- Serve metrics over HTTPS. Requires supervisor.metrics.enabled.
+      enabled: false
+      # -- Dedicated metrics server Secret with tls.crt and tls.key. Must not reuse gateway API or client identity Secrets.
+      certSecretName: ""
+      # -- Metrics-specific scraper CA Secret with ca.crt. Must not reuse gateway control-plane trust Secrets.
+      clientCaSecretName: ""
+      # -- Require a scraper certificate trusted by clientCaSecretName.
+      requireClientCert: false
   image:
     # -- Supervisor image registry. Empty uses global.image.registry.
     registry: ""

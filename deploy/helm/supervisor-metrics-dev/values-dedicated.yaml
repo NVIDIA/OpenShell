@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Namespace and gateway ID must match the dedicated gateway being observed.
+dedicatedSupervisors: true
+supervisorNamespace: openshell-metrics-dedicated
+supervisorGatewayID: openshell

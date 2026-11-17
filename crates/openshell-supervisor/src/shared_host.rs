@@ -478,6 +478,12 @@ impl SharedHost {
         self.host.changes()
     }
 
+    /// Whether the gateway has accepted the current assignment stream.
+    #[must_use]
+    pub fn gateway_connected(&self) -> bool {
+        *self.gateway_connected.borrow()
+    }
+
     /// Stop one sandbox instance, delete its private files, and forget it.
     pub async fn remove(&self, route: &str) -> Option<SandboxInstanceStatusReport> {
         self.host.remove(route, self.removal_grace).await
@@ -593,6 +599,7 @@ impl SharedHost {
                     );
                 }
                 Err(error) => {
+                    metrics::counter!("openshell_supervisor_admission_failures_total").increment(1);
                     tracing::warn!(
                         route = %assignment.route,
                         sandbox_id = %assignment.sandbox_id,
@@ -1377,6 +1384,7 @@ async fn run_stream(
     attempt_timeout: Duration,
     endpoint: Option<&str>,
 ) -> StreamEnd {
+    metrics::counter!("openshell_supervisor_gateway_connection_attempts_total").increment(1);
     let lost = |accepted: bool| StreamEnd::Lost {
         accepted,
         redial: accepted

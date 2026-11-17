@@ -36,8 +36,10 @@ futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { workspace = true, features = ["tokio", "http1", "server", "server-graceful"] }
+hyper-util = { workspace = true, features = ["tokio", "http1", "server", "server-graceful", "service"] }
 miette = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-proto = { workspace = true }
@@ -68,6 +70,7 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 bytes = { workspace = true }

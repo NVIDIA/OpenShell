@@ -2,6 +2,45 @@
 
 The supervisor loads and reconciles policy, maintains provider credentials, applies network and MCP inspection, and drives the admitted isolation backend through attachment, confirmation, and workload start.
 
+## Experimental supervisor metrics
+
+Both dedicated and shared modes accept `--metrics-bind-address` (or
+`OPENSHELL_SUPERVISOR_METRICS_BIND_ADDRESS`) to serve Prometheus text at
+`/metrics`. The listener is disabled by default. It installs a process-wide
+`metrics` recorder shared by all hosted instance runtimes and the OCSF exporter.
+In dedicated mode, lifecycle gauges describe the single sandbox. Shared mode
+aggregates its assignments. The network-proxy role serves network metrics with
+zero sandbox counts and no gateway session.
+
+Pair `--metrics-tls-cert` with `--metrics-tls-key` for HTTPS. Add
+`--metrics-tls-client-ca` to verify scraper certificates and
+`--metrics-require-client-auth` to require them. Their environment equivalents
+use `OPENSHELL_SUPERVISOR_METRICS_TLS_CERT`,
+`OPENSHELL_SUPERVISOR_METRICS_TLS_KEY`,
+`OPENSHELL_SUPERVISOR_METRICS_TLS_CLIENT_CA`, and
+`OPENSHELL_SUPERVISOR_METRICS_REQUIRE_CLIENT_AUTH`. TLS is independent of the
+gateway control channel and app listener. All cryptographic operations use
+`openshell-crypto`; rustls supplies protocol types and PEM parsing.
+
+Invalid initial TLS material disables only the metrics listener, with no
+plaintext fallback. Correct the files and restart the supervisor to enable it.
+An active listener checks the files every five seconds, including projected
+Secret symlink replacements. It publishes a complete valid replacement and
+retains its previous configuration on failure. Existing connections retain
+their negotiated TLS session. Handshakes have a ten-second deadline and the
+listener bounds concurrent connections to 64.
+
+The `metrics` module samples shared assignment phases and gateway connectivity at
+scrape time. Dedicated mode records lifecycle changes and accepted gateway session
+readiness, including reconnects, from its instance wrapper. Runtime control transport accounting lives in
+`openshell-sandbox-backend`; network decision counters and handler lifetime
+guards live in `openshell-supervisor-network`. Counters use bounded labels and
+exclude companion detection findings. Policy runtime activation outcomes are
+recorded before acknowledgment to the gateway.
+
+See the [local experiment guide](../../deploy/helm/supervisor-metrics-dev/README.md)
+for the metric inventory, dashboard, validation scenarios, and limitations.
+
 ## Backend startup
 
 The supervisor binary selects a backend setup and collects its launch inputs into a public `SandboxInstanceConfig`. Shared startup receives that config and the trusted backend setup separately. The `backend_setup` module owns that backend's launch-data decoder, workload policy discovery, and client construction. Descriptor contents cannot select an implementation.

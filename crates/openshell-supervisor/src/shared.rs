@@ -24,6 +24,13 @@ fn run_platform(args: crate::Args) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+    let metrics_tls = openshell_supervisor::metrics::tls_config(
+        args.metrics_tls_cert.clone(),
+        args.metrics_tls_key.clone(),
+        args.metrics_tls_client_ca.clone(),
+        args.metrics_require_client_auth,
+    )?;
+
     let address = args
         .address
         .ok_or_else(|| miette::miette!("--address is required for --mode=shared"))?;
@@ -128,6 +135,11 @@ from sandbox runtimes)",
                 pool,
             },
         )?;
+        let _metrics = if let Some(address) = args.metrics_bind_address {
+            openshell_supervisor::metrics::serve(address, Some(host.clone()), metrics_tls).await?
+        } else {
+            None
+        };
         let health = tokio::net::TcpListener::bind(address)
             .await
             .into_diagnostic()

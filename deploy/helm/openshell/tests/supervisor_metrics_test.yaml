@@ -1,0 +1,182 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: opt-in supervisor metrics
+templates:
+  - templates/supervisor.yaml
+  - templates/supervisor-networkpolicy.yaml
+set:
+  gatewayConfig:
+    openshell.drivers.kubernetes:
+      supervisor_topology: gateway
+tests:
+  - it: mounts dedicated TLS material and requires scraper certificates
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: supervisor-metrics-server-tls
+      supervisor.metrics.tls.clientCaSecretName: supervisor-metrics-client-ca
+      supervisor.metrics.tls.requireClientCert: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-tls-cert=/etc/openshell-metrics/server/tls.crt
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-tls-key=/etc/openshell-metrics/server/tls.key
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-tls-client-ca=/etc/openshell-metrics/client-ca/ca.crt
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-require-client-auth
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: metrics-server-tls
+            mountPath: /etc/openshell-metrics/server
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: metrics-client-ca
+            secret:
+              secretName: supervisor-metrics-client-ca
+              items:
+                - key: ca.crt
+                  path: ca.crt
+  - it: supports HTTPS without requesting scraper certificates
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: supervisor-metrics-server-tls
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-require-client-auth
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-tls-client-ca=/etc/openshell-metrics/client-ca/ca.crt
+  - it: rejects TLS without the metrics listener
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics TLS requires supervisor.metrics.enabled
+  - it: requires a dedicated server Secret
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics TLS requires a dedicated certSecretName
+  - it: rejects mounting the gateway server key into the supervisor
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: openshell-server-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics certSecretName must not reuse gateway API or client identity Secrets
+  - it: rejects mounting a gateway client identity into the supervisor
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: openshell-client-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics certSecretName must not reuse gateway API or client identity Secrets
+  - it: requires a scraper CA for required client authentication
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: supervisor-metrics-server-tls
+      supervisor.metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics requireClientCert requires clientCaSecretName
+  - it: rejects trusting gateway server CA material for scrapers
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: supervisor-metrics-server-tls
+      supervisor.metrics.tls.clientCaSecretName: openshell-server-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics clientCaSecretName must not reuse gateway control-plane trust Secrets
+  - it: rejects trusting gateway client CA material for scrapers
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: supervisor-metrics-server-tls
+      supervisor.metrics.tls.clientCaSecretName: openshell-server-client-ca
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics clientCaSecretName must not reuse gateway control-plane trust Secrets
+  - it: rejects trusting the gateway client identity Secret for scrapers
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: supervisor-metrics-server-tls
+      supervisor.metrics.tls.clientCaSecretName: openshell-client-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics clientCaSecretName must not reuse gateway control-plane trust Secrets
+  - it: leaves the listener disabled by default
+    template: templates/supervisor.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9091
+            protocol: TCP
+  - it: enables a dedicated metrics listener
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-bind-address=0.0.0.0:9091
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9091
+            protocol: TCP
+  - it: restricts scraping to labeled pods in the collector namespace
+    template: templates/supervisor-networkpolicy.yaml
+    set:
+      supervisor.metrics.enabled: true
+    asserts:
+      - equal:
+          path: spec.ingress[0]
+          value:
+            from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: observability
+                podSelector:
+                  matchLabels:
+                    openshell.ai/supervisor-metrics-scraper: "true"
+            ports:
+              - protocol: TCP
+                port: 9091
+  - it: rejects a metrics port that collides with health
+    template: templates/supervisor.yaml
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.port: 5501
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics port must be in 1024..65535 and distinct from runtime, health, and enabled app ports

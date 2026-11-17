@@ -503,6 +503,12 @@ async fn run_session_loop(config: SessionConfig) {
         }
         follow_home = true;
 
+        // Shared hosts count their assignment stream, rather than each hosted
+        // sandbox session. Dedicated processes own just this control stream.
+        if config.gateway_home.is_none() {
+            metrics::counter!("openshell_supervisor_gateway_connection_attempts_total")
+                .increment(1);
+        }
         let result = run_single_session(&config, &target, redirected, attempt).await;
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);

@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: dedicated supervisor metrics deployment configuration
+templates:
+  - templates/gateway-config.yaml
+tests:
+  - it: leaves dedicated metrics disabled by default
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime = .*metrics = \{'
+  - it: passes dedicated metrics listener and scraper namespace to the driver
+    set:
+      supervisor.metrics.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime = .*metrics = \{'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'metrics = \{[^}]*port = 9091'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'scraper_namespace = "observability"'
+  - it: passes independent metrics TLS Secrets to dedicated supervisors
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: metrics-server
+      supervisor.metrics.tls.clientCaSecretName: metrics-scrapers
+      supervisor.metrics.tls.requireClientCert: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'tls_cert_secret_name = "metrics-server"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'tls_client_ca_secret_name = "metrics-scrapers"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'require_client_auth = true'
+  - it: rejects gateway private key reuse in dedicated mode
+    set:
+      supervisor.metrics.enabled: true
+      supervisor.metrics.tls.enabled: true
+      supervisor.metrics.tls.certSecretName: openshell-server-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics certSecretName must not reuse gateway API or client identity Secrets
+  - it: rejects a conflicting dedicated runtime port
+    set:
+      supervisor.metrics.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          sandbox_runtime:
+            boundary_port: 9091
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor metrics port must be in 1024..65535 and distinct from runtime, health, and enabled app ports

@@ -1224,6 +1224,7 @@ async fn handle_transparent_tcp_connection(
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
 ) -> Result<()> {
     let workload_addr = client.peer_addr().into_diagnostic()?;
+    let _metrics = crate::telemetry::ProxyConnection::new("transparent");
     let original = original_destination(&client).into_diagnostic()?;
     let current_generation = opa_engine.current_generation();
     let mapping = match store.lookup_intent(
@@ -2622,6 +2623,7 @@ async fn handle_mediated_connection(
 ) -> Result<()> {
     // Bind observations to the policy/provider inventory active when this
     // connection was accepted, even if configuration changes while it runs.
+    let _metrics = crate::telemetry::ProxyConnection::new("mediated");
     let endpoint_observation_context = endpoint_observation_tx
         .as_ref()
         .and_then(EndpointObservationSender::capture);
@@ -4691,6 +4693,21 @@ async fn dial_upstream(
     port: u16,
     addrs: &[SocketAddr],
 ) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    let result = dial_upstream_inner(upstream_proxy, host_lc, raw_host_lc, port, addrs).await;
+    if result.is_err() {
+        metrics::counter!("openshell_supervisor_upstream_connect_errors_total", "path" => "proxy")
+            .increment(1);
+    }
+    result
+}
+
+async fn dial_upstream_inner(
+    upstream_proxy: &Option<UpstreamProxyConfig>,
+    host_lc: &str,
+    raw_host_lc: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> std::io::Result<upstream_proxy::PrefixedStream> {
     if let Some(cfg) = upstream_proxy.as_ref() {
         return match cfg.decision(host_lc, port, addrs) {
             upstream_proxy::ProxyDecision::Proxy(endpoint) => {
@@ -4728,6 +4745,20 @@ async fn dial_upstream(
 /// second, policy-bypassing DNS resolution.
 #[cfg(target_os = "linux")]
 async fn dial_transparent_upstream(
+    upstream_proxy: &Option<UpstreamProxyConfig>,
+    host_lc: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    let result = dial_transparent_upstream_inner(upstream_proxy, host_lc, port, addrs).await;
+    if result.is_err() {
+        metrics::counter!("openshell_supervisor_upstream_connect_errors_total", "path" => "transparent").increment(1);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+async fn dial_transparent_upstream_inner(
     upstream_proxy: &Option<UpstreamProxyConfig>,
     host_lc: &str,
     port: u16,

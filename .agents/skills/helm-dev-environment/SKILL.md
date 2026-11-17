@@ -97,6 +97,56 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
   mise run e2e:kubernetes:shared-supervisor
 ```
 
+### Shared supervisor metrics experiment
+
+The `supervisor-metrics` Skaffold profile builds the gateway, supervisor, and
+sandbox from the current checkout, enables a two-member shared supervisor pool
+with gateway TLS, and installs dev-only Prometheus/Grafana in `observability`.
+Run it from `deploy/helm/openshell` with the worktree kubeconfig. Prefer a separate
+cluster for failure injection. The local experiment guide at
+`deploy/helm/supervisor-metrics-dev/README.md` covers startup, loopback UI forwards,
+traffic generation, metrics semantics, and cleanup.
+
+`supervisor.metrics.enabled` defaults to false. Enabling it adds the supervisor
+`--metrics-bind-address` flag and named metrics port (default 9091); the port
+must differ from runtime, health, and any enabled app listener. NetworkPolicy
+permits scraping only from Pods labeled
+`openshell.ai/supervisor-metrics-scraper: "true"` in
+`supervisor.metrics.scraperNamespace` (default `observability`). Metrics are
+plaintext by default and aggregate across hosted sandboxes. Set
+`supervisor.metrics.tls.enabled` with a dedicated `certSecretName` for HTTPS.
+For mTLS, supply a metrics-specific `clientCaSecretName` and set
+`requireClientCert: true`; gateway API/client identity Secrets and gateway
+control-plane CA Secrets must not be reused. The listener checks projected
+Secret files every five seconds, retaining its last valid configuration on a
+bad replacement. Invalid initial material disables metrics without plaintext
+fallback; fix the Secret and restart the supervisor.
+
+The dev Prometheus discovers individual supervisor Pods; neither UI receives
+external Service exposure. The experiment guide documents creating a separate
+metrics PKI, applying `ci/values-supervisor-metrics-tls.yaml` to OpenShell and
+`supervisor-metrics-dev/values-tls.yaml` to the collector, and setting its TLS
+server name for Pod-IP discovery. After creating the four metrics Secrets,
+select the `supervisor-metrics-tls` Skaffold profile for subsequent builds so
+both releases preserve HTTPS/mTLS settings. The supervisor still exports no
+OTLP metrics.
+
+### Dedicated supervisor metrics
+
+Omit `supervisor_topology` for dedicated Kubernetes supervisors. The same
+`supervisor.metrics` Helm values render
+`openshell.drivers.kubernetes.sandbox_runtime.metrics`; the driver supplies
+listener environment, metrics TLS mounts, a named port, and discovery labels
+on each dedicated Pod. Metrics TLS Secrets must exist in every sandbox namespace.
+The driver adds a metrics ingress policy alongside the existing runtime policy;
+the chart grants PATCH only for that gateway's named metrics policy. This does
+not change the workload network fence. Use the dev chart's
+`values-dedicated.yaml` with `values-tls.yaml` for discovery, setting
+`supervisorNamespace` and `supervisorGatewayID` to match the dedicated gateway.
+The experiment guide and findings include the tested isolated dedicated release.
+Existing supervisor Pods retain listener settings until recreated. Docker,
+Podman, and VM launch wiring is separate from this Kubernetes configuration.
+
 ### Shared supervisor high availability
 
 The shared supervisor is always a pool of `supervisor.replicas` members

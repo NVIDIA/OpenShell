@@ -24,6 +24,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+pub mod metrics;
 mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
@@ -814,6 +815,8 @@ pub async fn run_sandbox_with_backend(
         debug!("OCSF context already initialized, keeping existing");
     }
 
+    let mut instance_metrics =
+        metrics::DedicatedInstance::start(config.openshell_endpoint.is_some());
     let (readiness, instance_readiness) = tokio::sync::watch::channel(false);
     let control_readiness = health_socket_path
         .map(ReadinessEndpoint::Unix)
@@ -830,17 +833,39 @@ pub async fn run_sandbox_with_backend(
             Some(((), signal))
         },
     ));
-    let result = Box::pin(run_sandbox_instance(
+    let mut metrics_readiness = instance_readiness;
+    let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+    let shutdown = async move {
+        wait_for_control_shutdown_signal().await;
+        stopping.send_replace(true);
+    };
+    let mut instance = Box::pin(run_sandbox_instance(
         backend_setup,
         config,
         bindings,
         SandboxInstanceControls {
-            shutdown: Box::pin(wait_for_control_shutdown_signal()),
+            shutdown: Box::pin(shutdown),
             suspend,
             readiness,
         },
-    ))
-    .await;
+    ));
+    let result = loop {
+        tokio::select! {
+            result = &mut instance => break result,
+            changed = metrics_readiness.changed() => {
+                instance_metrics.readiness(*metrics_readiness.borrow_and_update());
+                if changed.is_err() {
+                    break instance.await;
+                }
+            }
+            Ok(()) = stopped.changed() => {
+                if *stopped.borrow_and_update() {
+                    instance_metrics.stopping();
+                }
+            }
+        }
+    };
+    instance_metrics.finish(&result);
     drop(control_readiness);
     result
 }
@@ -4657,6 +4682,9 @@ mod tests {
     /// so it can also reproduce the ordering defect on earlier revisions.
     #[tokio::test]
     async fn startup_rejects_missing_admission_before_decoding_payload() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        let _recorder = ::metrics::set_default_local_recorder(&recorder);
         let auth_bundle = openshell_core::jwt::SupervisorAuthBundle {
             session_id: openshell_core::SandboxSessionId::new(),
             runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
@@ -4737,6 +4765,13 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "runtime descriptor supplied without an admitted isolation backend"
+        );
+        let rendered = metrics_handle.render();
+        assert!(rendered.contains("openshell_supervisor_sandboxes{phase=\"failed\"} 1"));
+        assert!(rendered.contains("openshell_supervisor_sandboxes{phase=\"starting\"} 0"));
+        assert!(
+            rendered
+                .contains("openshell_supervisor_instance_terminations_total{outcome=\"failed\"} 1")
         );
     }
 
