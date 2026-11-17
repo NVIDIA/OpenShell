@@ -1040,8 +1040,10 @@ before enabling `enable_sandbox_updates` in the
 The update preserves the sandbox ID and persistent workspace. Kubernetes retains
 its custom resource and persistent volume claim; Docker replaces the stopped
 workload container while retaining the owned workspace volume. Docker requires
-`persist_workspace = true`, locally cached source and target images with matching
-non-root UID/GID, and no image-declared volumes. Existing writable-layer Docker
+`persist_workspace = true`, locally cached source and target images, and no
+image-declared volumes. The target must declare an explicit numeric `USER UID:GID`
+matching the recorded non-root workload identity; symbolic or implicit identities
+are rejected before replacement. Existing writable-layer Docker
 workspaces and custom working directories cannot be updated. Docker rejects
 command and environment changes before acceptance.
 

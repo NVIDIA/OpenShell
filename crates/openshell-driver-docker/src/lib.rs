@@ -2616,8 +2616,19 @@ impl DockerComputeDriver {
             .map_err(|error| internal_status("inspect Docker sandbox outer fence", error))?;
         validate_docker_outer_fence(&inspected)?;
         self.admit_container_resources(&inspected).await?;
-        image_update::validate_committed_resource(&self.config, sandbox_id, &inspected)?;
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
+        let validation = if container_state_needs_start(state) && !launch_authentication.is_empty()
+        {
+            image_update::LaunchValidation::BeforeStoppedRotation
+        } else {
+            image_update::LaunchValidation::Complete
+        };
+        image_update::validate_committed_resource(
+            &self.config,
+            sandbox_id,
+            &inspected,
+            validation,
+        )?;
         let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             inspected
                 .state
@@ -2683,6 +2694,7 @@ impl DockerComputeDriver {
             )
             .await?;
         }
+        image_update::validate_committed_boundary(&self.config, resolved_sandbox_id)?;
         let Some(runtime_descriptor) =
             read_docker_runtime_descriptor(resolved_sandbox_id, &self.config).await?
         else {

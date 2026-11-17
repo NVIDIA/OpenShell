@@ -293,10 +293,10 @@ fn verify_replacement(container: &ContainerInspectResponse, intent: &Intent) -> 
     Ok(())
 }
 
-fn verify_published_boundary(
+fn read_published_boundary(
     intent: &Intent,
     config: &DockerDriverRuntimeConfig,
-) -> Result<(), Status> {
+) -> Result<(BoundaryConfig, SandboxRuntimeDescriptor), Status> {
     let directory = docker_boundary_state_dir_by_id(&intent.sandbox_id, config)?;
     let bootstrap: BoundaryConfig = serde_json::from_slice(
         &std::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
@@ -308,22 +308,62 @@ fn verify_published_boundary(
             .map_err(|_| invalid("replacement Docker descriptor is unavailable"))?,
     )
     .map_err(|_| invalid("replacement Docker descriptor is invalid"))?;
+    Ok((bootstrap, descriptor))
+}
+
+fn verify_boundary_resource_bindings(
+    intent: &Intent,
+    bootstrap: &BoundaryConfig,
+    descriptor: &SandboxRuntimeDescriptor,
+) -> Result<(), Status> {
     let target = intent
         .target_container
         .as_ref()
         .ok_or_else(|| invalid("Docker replacement target is missing"))?;
-    let evidence = isolation::provisioning_evidence(target, &bootstrap.generation)
-        .map_err(|_| invalid("replacement Docker evidence is invalid"))?;
-    if bootstrap.boundary_id != intent.sandbox_id
-        || descriptor.boundary_id != intent.sandbox_id
-        || bootstrap.generation != descriptor.generation
+    let (_, expected) = decode_boundary(intent, target)?;
+    let expected: SandboxRuntimeDescriptor = serde_json::from_slice(&expected)
+        .map_err(|_| invalid("accepted Docker descriptor is invalid"))?;
+    // A launch can be interrupted between these files' atomic writes. Each
+    // must still identify the accepted resource, even when their launch-scoped
+    // generation/session differ. Only stopped Start with fresh auth repairs it.
+    for (id, generation, claims, identity, evidence) in [
+        (
+            &bootstrap.boundary_id,
+            &bootstrap.generation,
+            &bootstrap.resource_claims,
+            &bootstrap.workload_identity,
+            &bootstrap.provisioning_evidence,
+        ),
+        (
+            &descriptor.boundary_id,
+            &descriptor.generation,
+            &descriptor.resource_claims,
+            &descriptor.workload_identity,
+            &descriptor.provisioning_evidence,
+        ),
+    ] {
+        if id != &intent.sandbox_id
+            || claims != &expected.resource_claims
+            || identity != &expected.workload_identity
+            || evidence
+                != &isolation::provisioning_evidence(target, generation)
+                    .map_err(|_| invalid("replacement Docker evidence is invalid"))?
+        {
+            return Err(invalid("replacement Docker resource bindings changed"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_published_boundary(
+    intent: &Intent,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), Status> {
+    let (bootstrap, descriptor) = read_published_boundary(intent, config)?;
+    verify_boundary_resource_bindings(intent, &bootstrap, &descriptor)?;
+    if bootstrap.generation != descriptor.generation
         || bootstrap.session_id != descriptor.session_id
-        || bootstrap.resource_claims != descriptor.resource_claims
-        || bootstrap.resource_claims.get("docker.container_id") != Some(target)
-        || bootstrap.resource_claims.get("docker.image_identity") != Some(&intent.image_id)
-        || bootstrap.workload_identity != descriptor.workload_identity
-        || bootstrap.provisioning_evidence != evidence
-        || descriptor.provisioning_evidence != evidence
+        || bootstrap.provisioning_evidence != descriptor.provisioning_evidence
     {
         return Err(invalid(
             "replacement Docker runtime evidence is inconsistent",
@@ -533,6 +573,33 @@ impl DockerComputeDriver {
         if source_config.user.as_deref() != Some(expected_user.as_str()) {
             return Err(invalid(
                 "Docker native descriptor and workload user disagree",
+            ));
+        }
+        // The update RPC carries no identity-policy override. Admit only an
+        // explicit numeric USER matching the recorded non-root identity;
+        // symbolic or implicit users need image account resolution, which the
+        // initial image-only updater does not perform.
+        let target_identity = image_config.user.as_deref().and_then(|user| {
+            let (uid, gid) = user.split_once(':')?;
+            if uid.is_empty()
+                || gid.is_empty()
+                || !uid
+                    .bytes()
+                    .chain(gid.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?))
+        });
+        if target_identity
+            != Some((
+                descriptor.workload_identity.uid,
+                descriptor.workload_identity.gid,
+            ))
+        {
+            return Err(invalid(
+                "target Docker image must declare matching numeric non-root UID:GID",
             ));
         }
         let mut body: ContainerCreateBody = serde_json::from_value(
@@ -893,10 +960,16 @@ pub fn require_settled(config: &DockerDriverRuntimeConfig, id: &str) -> Result<(
     Ok(())
 }
 
+pub enum LaunchValidation {
+    Complete,
+    BeforeStoppedRotation,
+}
+
 pub fn validate_committed_resource(
     config: &DockerDriverRuntimeConfig,
     id: &str,
     container: &ContainerInspectResponse,
+    validation: LaunchValidation,
 ) -> Result<(), Status> {
     if !valid_native_id(id) {
         return Ok(());
@@ -906,6 +979,30 @@ pub fn validate_committed_resource(
             return Err(invalid("Docker image update is not settled"));
         }
         verify_replacement(container, &intent)?;
+        match validation {
+            LaunchValidation::Complete => return verify_published_boundary(&intent, config),
+            // Use the fresh inspect, not just the earlier list response, to
+            // prove that credentials are rotated only on a stopped workload.
+            LaunchValidation::BeforeStoppedRotation => require_stopped(container)?,
+        }
+        let (bootstrap, descriptor) = read_published_boundary(&intent, config)?;
+        verify_boundary_resource_bindings(&intent, &bootstrap, &descriptor)?;
+    }
+    Ok(())
+}
+
+/// Enforce launch-pair consistency before using credentials or starting any
+/// process. Resource bindings must also be checked before credential rotation.
+pub fn validate_committed_boundary(
+    config: &DockerDriverRuntimeConfig,
+    id: &str,
+) -> Result<(), Status> {
+    if valid_native_id(id)
+        && let Some(intent) = read(config, id)?
+    {
+        if intent.phase != Phase::Applied {
+            return Err(invalid("Docker image update is not settled"));
+        }
         verify_published_boundary(&intent, config)?;
     }
     Ok(())

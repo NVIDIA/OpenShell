@@ -9,6 +9,8 @@ use crate::tests::{
 use crate::workspace::tests::{docker_api, fixture_for};
 use bollard::models::Volume;
 
+mod live;
+
 type Reply = (&'static str, String, u16, serde_json::Value);
 
 struct Fixture {
@@ -163,6 +165,34 @@ impl Fixture {
             ),
         ]
     }
+    fn start_replies(&self, running: bool) -> Vec<Reply> {
+        let mut target = self.target();
+        let state = if running { "running" } else { "exited" };
+        target.state.as_mut().unwrap().running = Some(running);
+        target.state.as_mut().unwrap().status = Some(if running {
+            ContainerStateStatusEnum::RUNNING
+        } else {
+            ContainerStateStatusEnum::EXITED
+        });
+        vec![
+            (
+                "GET",
+                String::new(),
+                200,
+                serde_json::json!([{
+                    "Id":"container-B", "Names":[target.name], "State":state,
+                    "Labels":target.config.as_ref().unwrap().labels
+                }]),
+            ),
+            (
+                "GET",
+                "/containers/container-B/json".into(),
+                200,
+                serde_json::to_value(target).unwrap(),
+            ),
+            self.volume_reply(),
+        ]
+    }
     fn target(&self) -> ContainerInspectResponse {
         let mut target = self.source.clone();
         target.id = Some("container-B".into());
@@ -315,6 +345,47 @@ impl Drop for Fixture {
         if let Some(parent) = self.directory.parent() {
             let _ = std::fs::remove_dir(parent);
         }
+    }
+}
+
+#[tokio::test]
+async fn incompatible_target_identity_is_rejected_before_checkpoint_or_deletion() {
+    // Symbolic and implicit identities require account lookup. The initial
+    // updater rejects those representations rather than assuming that the
+    // source identity can execute a different image's application.
+    for user in [
+        "2000:2000",
+        "1234:2000",
+        "other:other",
+        "1234:other",
+        "1234",
+        "",
+    ] {
+        let fixture = Fixture::new();
+        let bootstrap = std::fs::read(fixture.directory.join(BOUNDARY_CONFIG_FILE)).unwrap();
+        let descriptor = std::fs::read(fixture.directory.join(RUNTIME_DESCRIPTOR_FILE)).unwrap();
+        let mut replies = fixture.preflight();
+        replies.last_mut().unwrap().3["Config"]["User"] = user.into();
+        let (result, requests) = fixture.call(replies, &fixture.request).await;
+        assert!(
+            matches!(result, Err(ref error) if error.code() == tonic::Code::FailedPrecondition),
+            "accepted target USER {user:?}"
+        );
+        // The fake endpoint accepts only the four read-only preflight calls.
+        assert_eq!(requests.len(), 4);
+        assert!(
+            read(&fixture.config, &fixture.p().sandbox_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(fixture.directory.join(BOUNDARY_CONFIG_FILE)).unwrap(),
+            bootstrap
+        );
+        assert_eq!(
+            std::fs::read(fixture.directory.join(RUNTIME_DESCRIPTOR_FILE)).unwrap(),
+            descriptor
+        );
     }
 }
 
@@ -684,11 +755,232 @@ async fn completed_update_clears_pending_inventory_and_keeps_start_bound_to_targ
     );
     require_settled(&fixture.config, &fixture.p().sandbox_id).unwrap();
     let mut target = fixture.target();
-    validate_committed_resource(&fixture.config, &fixture.p().sandbox_id, &target).unwrap();
+    validate_committed_resource(
+        &fixture.config,
+        &fixture.p().sandbox_id,
+        &target,
+        LaunchValidation::Complete,
+    )
+    .unwrap();
     target.id = Some("same-name-foreign-container".into());
     assert!(
-        validate_committed_resource(&fixture.config, &fixture.p().sandbox_id, &target).is_err()
+        validate_committed_resource(
+            &fixture.config,
+            &fixture.p().sandbox_id,
+            &target,
+            LaunchValidation::Complete
+        )
+        .is_err()
     );
+}
+
+#[tokio::test]
+async fn stopped_start_repairs_interrupted_launch_rotation_before_staging() {
+    let fixture = Fixture::new();
+    fixture
+        .call(fixture.apply_replies(), &fixture.request)
+        .await
+        .0
+        .unwrap();
+    let descriptor_path = fixture.directory.join(RUNTIME_DESCRIPTOR_FILE);
+    let previous_descriptor = std::fs::read(&descriptor_path).unwrap();
+    let mut interrupted =
+        decode_docker_launch_authentication(&test_launch_authentication()).unwrap();
+    interrupted.supervisor.runtime_generation =
+        openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-interrupted")
+            .unwrap();
+    let interrupted_authentication = serde_json::to_vec(&interrupted).unwrap();
+    refresh_docker_boundary_authentication(
+        &fixture.p().sandbox_id,
+        &fixture.config,
+        &interrupted_authentication,
+    )
+    .await
+    .unwrap();
+    // Model exit after bootstrap publication but before descriptor publication.
+    std::fs::write(&descriptor_path, previous_descriptor).unwrap();
+    let intent = read(&fixture.config, &fixture.p().sandbox_id)
+        .unwrap()
+        .unwrap();
+    assert!(verify_published_boundary(&intent, &fixture.config).is_err());
+
+    let (docker, server) = docker_api(fixture.start_replies(false)).await;
+    let mut driver = test_driver_with_config(fixture.config.clone());
+    driver.docker = Arc::new(docker);
+    let mut authentication =
+        decode_docker_launch_authentication(&test_launch_authentication()).unwrap();
+    authentication.supervisor.runtime_generation =
+        openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-retry").unwrap();
+    let encoded = serde_json::to_vec(&authentication).unwrap();
+    let error = Box::pin(driver.start_sandbox(
+        &fixture.p().sandbox_id,
+        &fixture.p().name,
+        "generation-retry",
+        &encoded,
+        None,
+    ))
+    .await
+    .unwrap_err();
+    server.await.unwrap();
+    // Deliberately omit the workspace-root staging input: reaching this gate
+    // proves the real Start path repaired publication, without starting a fake
+    // workload or requiring a supervisor process in this unit test.
+    assert!(error.message().contains("workspace for restart"), "{error}");
+    verify_published_boundary(&intent, &fixture.config).unwrap();
+    let repaired = read_docker_runtime_descriptor(&fixture.p().sandbox_id, &fixture.config)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.generation, "generation-retry");
+    assert_eq!(repaired.session_id, authentication.supervisor.session_id);
+    assert_eq!(
+        repaired.resource_claims["docker.container_id"],
+        "container-B"
+    );
+    assert_eq!(
+        repaired.resource_claims["docker.image_identity"],
+        "sha256:corrected"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_launch_pair_requires_stopped_workload_and_fresh_authentication() {
+    for (running, fresh_authentication, inspected_running) in [
+        (true, true, true),
+        (false, false, false),
+        (false, true, true),
+    ] {
+        let fixture = Fixture::new();
+        fixture
+            .call(fixture.apply_replies(), &fixture.request)
+            .await
+            .0
+            .unwrap();
+        let descriptor_path = fixture.directory.join(RUNTIME_DESCRIPTOR_FILE);
+        let previous_descriptor = std::fs::read(&descriptor_path).unwrap();
+        refresh_docker_boundary_authentication(
+            &fixture.p().sandbox_id,
+            &fixture.config,
+            &test_launch_authentication(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(&descriptor_path, &previous_descriptor).unwrap();
+        let previous_bootstrap =
+            std::fs::read(fixture.directory.join(BOUNDARY_CONFIG_FILE)).unwrap();
+        let mut replies = fixture.start_replies(running);
+        if inspected_running {
+            replies[1].3["State"]["Running"] = true.into();
+            replies[1].3["State"]["Status"] = "running".into();
+        }
+        let (docker, server) = docker_api(replies).await;
+        let mut driver = test_driver_with_config(fixture.config.clone());
+        driver.docker = Arc::new(docker);
+        let authentication = if fresh_authentication {
+            test_launch_authentication()
+        } else {
+            Vec::new()
+        };
+        let error = Box::pin(driver.start_sandbox(
+            &fixture.p().sandbox_id,
+            &fixture.p().name,
+            "generation-1",
+            &authentication,
+            None,
+        ))
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains(if !running && inspected_running {
+                "verifiably stopped"
+            } else {
+                "runtime evidence is inconsistent"
+            }),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&descriptor_path).unwrap(),
+            previous_descriptor
+        );
+        assert_eq!(
+            std::fs::read(fixture.directory.join(BOUNDARY_CONFIG_FILE)).unwrap(),
+            previous_bootstrap
+        );
+    }
+}
+
+#[tokio::test]
+async fn launch_repair_never_adopts_changed_immutable_bindings() {
+    let fixture = Fixture::new();
+    fixture
+        .call(fixture.apply_replies(), &fixture.request)
+        .await
+        .0
+        .unwrap();
+    for filename in [BOUNDARY_CONFIG_FILE, RUNTIME_DESCRIPTOR_FILE] {
+        let path = fixture.directory.join(filename);
+        let original = std::fs::read(&path).unwrap();
+        for (pointer, foreign) in [
+            ("/boundary_id", serde_json::json!("foreign-sandbox")),
+            (
+                "/resource_claims/docker.container_id",
+                serde_json::json!("foreign-container"),
+            ),
+            (
+                "/resource_claims/docker.image_identity",
+                serde_json::json!("sha256:foreign"),
+            ),
+            ("/workload_identity/uid", serde_json::json!(2000)),
+            ("/workload_identity/gid", serde_json::json!(2000)),
+        ] {
+            let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            *changed.pointer_mut(pointer).unwrap() = foreign;
+            let changed = serde_json::to_vec(&changed).unwrap();
+            std::fs::write(&path, &changed).unwrap();
+            let (docker, server) = docker_api(fixture.start_replies(false)).await;
+            let mut driver = test_driver_with_config(fixture.config.clone());
+            driver.docker = Arc::new(docker);
+            let error = Box::pin(driver.start_sandbox(
+                &fixture.p().sandbox_id,
+                &fixture.p().name,
+                "generation-1",
+                &test_launch_authentication(),
+                None,
+            ))
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                error.message().contains("resource bindings changed"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), changed);
+        }
+        std::fs::write(path, original).unwrap();
+    }
+    // Native container/image/workspace substitutions must also fail before
+    // credential publication, independently of the private file checks.
+    for (pointer, foreign) in [
+        ("/Id", "foreign-container"),
+        ("/Image", "sha256:foreign"),
+        ("/HostConfig/Mounts/0/Source", "foreign-workspace"),
+    ] {
+        let mut target = serde_json::to_value(fixture.target()).unwrap();
+        *target.pointer_mut(pointer).unwrap() = foreign.into();
+        let target: ContainerInspectResponse = serde_json::from_value(target).unwrap();
+        assert!(
+            validate_committed_resource(
+                &fixture.config,
+                &fixture.p().sandbox_id,
+                &target,
+                LaunchValidation::BeforeStoppedRotation
+            )
+            .is_err()
+        );
+    }
 }
 
 async fn prepared_fixture() -> Fixture {
