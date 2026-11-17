@@ -276,6 +276,8 @@ task running while using those endpoints.
 
 ### Role scheduling validation
 
+See the published `/kubernetes/pod-placement` guide for deployment examples and role diagrams.
+
 Workloads, supervisors, and gateways use `openshell.ai/runtime-role` with values
 `workload`, `supervisor`, and `gateway`. Workload/supervisor anti-affinity defaults
 to preferred and matches across all namespaces. Set

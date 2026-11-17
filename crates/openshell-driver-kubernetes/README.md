@@ -110,7 +110,7 @@ capacity; once bound, its scheduling transition starts a bounded startup grace.
 Standalone drivers expose `--pod-anti-affinity`,
 `--pod-anti-affinity-namespace-selector` (JSON), and `--workload-placement` (JSON),
 with corresponding `OPENSHELL_K8S_*` environment variables. See the
-[gateway configuration reference](../../docs/how-it-works/gateways/configuration.mdx#kubernetes-pod-placement)
+[pod placement guide](../../docs/kubernetes/pod-placement.mdx)
 for deployment examples and cross-namespace scope.
 
 When the gateway exports OTLP traces, the driver sets
