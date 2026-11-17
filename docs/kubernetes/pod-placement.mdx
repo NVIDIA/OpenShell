@@ -78,6 +78,12 @@ Use node selectors to constrain eligible nodes. Gateways use Helm's
 the operator-owned `sandbox_runtime.workload_placement.node_selector` in gateway
 configuration. Caller driver-config opt-in is not required.
 
+You might use, for example, `openshell.ai/node-pool` as a node label to organize
+where pods run within your cluster. This label is only an example; OpenShell
+does not create or require it. Use your own node label keys and values in
+selectors and tolerations. The built-in `openshell.ai/runtime-role` label
+identifies pod roles for automatic anti-affinity.
+
 For example, gateways and supervisors can share an infrastructure pool while
 sandbox workloads use another pool:
 
