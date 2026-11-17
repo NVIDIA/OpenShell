@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reject reviewer roster entries without repository collaborator membership."""
+"""Validate reviewer roster accounts against repository membership and permissions."""
 
 import argparse
 import subprocess
@@ -27,19 +27,31 @@ def main(argv: list[str] | None = None) -> int:
                 pages=True,
             )
         }
-        invalid = sorted(members - collaborators)
+        invalid = []
+        for login in sorted(members - collaborators):
+            permission = _api(f"repos/{args.repo}/collaborators/{login}/permission")[
+                "permission"
+            ]
+            if permission in ("read", "none"):
+                invalid.append(login)
+            elif permission not in ("write", "admin"):
+                raise ValueError(f"unexpected repository permission for {login}")
         if invalid:
-            raise ValueError("non-collaborators in REVIEWERS.md: " + ", ".join(invalid))
+            raise ValueError(
+                "ineligible accounts in REVIEWERS.md: " + ", ".join(invalid)
+            )
     except subprocess.CalledProcessError as exc:
         print(
-            "Cannot list repository collaborators: " + (exc.stderr or str(exc)).strip(),
+            "Cannot verify reviewer access: " + (exc.stderr or str(exc)).strip(),
             file=sys.stderr,
         )
         return 1
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"Reviewer roster: {exc}", file=sys.stderr)
         return 1
-    print(f"All {len(members)} reviewer roster accounts are repository collaborators.")
+    print(
+        f"All {len(members)} reviewer roster accounts are eligible for review requests."
+    )
     return 0
 
 
