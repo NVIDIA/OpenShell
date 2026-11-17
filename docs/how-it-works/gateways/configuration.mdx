@@ -2451,7 +2451,7 @@ gateway service routing also disables the application login endpoint.
 The default is `false`, preserving existing service routing. Enable it with
 `--service-auth-enabled true`, `OPENSHELL_SERVICE_AUTH_ENABLED=true`, or Helm
 `server.serviceAuthEnabled: true`. The canonical Helm setting is
-`gatewayConfig.gateway.service_auth_enabled`. Precedence is CLI > environment >
+`gatewayConfig."openshell.gateway".service_auth_enabled`. Precedence is CLI > environment >
 TOML > default, including explicit `false` values. This setting works with the
 app listener enabled or disabled and with any compute driver supporting gateway
 service forwarding. It uses the gateway's configured authentication and workspace

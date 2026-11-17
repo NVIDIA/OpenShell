@@ -71,7 +71,9 @@ tests:
     template: templates/gateway-config.yaml
     set:
       server.serviceAuthEnabled: true
-      gatewayConfig.gateway.service_auth_enabled: false
+      gatewayConfig:
+        openshell.gateway:
+          service_auth_enabled: false
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
