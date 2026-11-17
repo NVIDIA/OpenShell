@@ -59,10 +59,12 @@ gatewayConfig:
 
 When using the chart, it also derives the shared-supervisor Deployment's
 reciprocal rule from this setting. Required mode leaves pods Pending when no
-separate eligible node exists; it does not
-fall back to colocation. `off` omits generated anti-affinity rules while keeping
+separate eligible node exists; it does not fall back to colocation. `off` omits generated anti-affinity rules while keeping
 operator-authored rules effective. Gateway placement is independent of this
 policy.
+
+Workload placement takes effect on creation or stop/start. Existing pods are not
+moved automatically.
 
 ## Select namespace scope
 
@@ -265,28 +267,6 @@ separation, put the term under
 `weight: 100`. Changing the gateway setting does not change independently
 deployed supervisor pods. Your deployment tooling must maintain those labels
 and rules across rollouts, replacements, and scaling.
-
-## Apply placement changes
-
-Workload placement applies on creation and stop/start, preserving unrelated
-affinity. Running pods are not moved or continuously evicted. Roll out gateway
-and supervisor Pod templates to apply their changed placement or acquire role
-labels. Older unlabeled pods are not selected by role anti-affinity.
-
-## Diagnose Pending pods
-
-Inspect placement, node-pool labels, and the affected pod's scheduling events:
-
-```shell
-kubectl get pods -A -l openshell.ai/runtime-role -o wide
-kubectl get nodes -L openshell.ai/node-pool
-kubectl describe pod POD --namespace NAMESPACE
-```
-
-Check for insufficient eligible nodes, conflicting node selectors or affinity,
-and missing tolerations. Required separation needs enough eligible nodes for
-both roles. A verified capacity wait does not consume the workload's bounded
-startup grace after scheduling.
 
 See the [gateway configuration reference](/how-it-works/gateways/configuration#kubernetes-pod-placement)
 for field names and defaults.
