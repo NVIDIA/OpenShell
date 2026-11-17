@@ -14,18 +14,144 @@ use bollard::models::{
     ContainerInspectResponse, Mount, MountTypeEnum, MountVolumeOptions, Volume, VolumeCreateRequest,
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tonic::Status;
 
 pub const ROLE_LABEL: &str = "openshell.ai/storage-role";
 pub const ROLE: &str = "workspace";
-// Use Docker-specific keys introduced with this feature. The generic
-// workspace-storage/workspace-volume-identity keys were previously accepted as
-// caller labels; neither strip nor reinterpret them on legacy containers.
-pub const IDENTITY_LABEL: &str = "openshell.ai/docker-workspace-volume-identity";
-pub const MODE_LABEL: &str = "openshell.ai/docker-workspace-storage";
-pub const PERSISTENT_MODE: &str = "persistent-v1";
+pub const RECORD_FILE: &str = "workspace-storage.json";
+pub const RECORD_CLAIM: &str = "docker.workspace_storage";
+const MAX_RECORD_BYTES: u64 = 16 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    version: u32,
+    namespace: String,
+    sandbox_id: String,
+    uid: u32,
+    gid: u32,
+    volume_identity: serde_json::Value,
+}
+
+pub fn record_path(id: &str, config: &DockerDriverRuntimeConfig) -> Result<PathBuf, Status> {
+    Ok(super::docker_boundary_state_dir_by_id(id, config)?.join(RECORD_FILE))
+}
+
+pub fn record_bytes(
+    id: &str,
+    config: &DockerDriverRuntimeConfig,
+    volume: &Volume,
+    identity: &ResolvedWorkloadIdentity,
+) -> Result<Vec<u8>, Status> {
+    serde_json::to_vec(&Record {
+        version: 1,
+        namespace: config.sandbox_namespace.clone(),
+        sandbox_id: id.into(),
+        uid: identity.uid,
+        gid: identity.gid,
+        volume_identity: docker_volume_identity(volume),
+    })
+    .map_err(|_| Status::internal("encode private Docker workspace record"))
+}
+
+fn read_record(id: &str, config: &DockerDriverRuntimeConfig) -> Result<Option<Record>, Status> {
+    let path = record_path(id, config)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(Status::failed_precondition(
+                "private Docker workspace record cannot be read",
+            ));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES {
+        return Err(Status::failed_precondition(
+            "private Docker workspace record must be a bounded regular file",
+        ));
+    }
+    let record: Record = serde_json::from_slice(&std::fs::read(path).map_err(|_| {
+        Status::failed_precondition("private Docker workspace record cannot be read")
+    })?)
+    .map_err(|_| Status::failed_precondition("private Docker workspace record is invalid"))?;
+    if record.version != 1
+        || record.namespace != config.sandbox_namespace
+        || record.sandbox_id != id
+        || record.uid == 0
+        || record.gid == 0
+        || record
+            .volume_identity
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            != Some(volume_name(id, config).as_str())
+    {
+        return Err(Status::failed_precondition(
+            "private Docker workspace record belongs to another resource",
+        ));
+    }
+    Ok(Some(record))
+}
+
+pub fn record_claim(
+    id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Option<String>, Status> {
+    read_record(id, config)?
+        .map(|record| {
+            serde_json::to_string(&record)
+                .map_err(|_| Status::internal("encode private Docker workspace claim"))
+        })
+        .transpose()
+}
+
+async fn load_record(
+    id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Option<Record>, Status> {
+    let record = read_record(id, config)?;
+    let descriptor = super::read_docker_runtime_descriptor(id, config).await?;
+    let claim = descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.resource_claims.get(RECORD_CLAIM));
+    match (&record, claim) {
+        (None, None) => return Ok(None), // Legacy container: labels are caller data.
+        (None, Some(_)) => {
+            return Err(Status::failed_precondition(
+                "private Docker workspace record is missing",
+            ));
+        }
+        (Some(record), Some(claim)) => {
+            if serde_json::to_string(record)
+                .map_err(|_| Status::internal("encode private Docker workspace claim"))?
+                != *claim
+            {
+                return Err(Status::failed_precondition(
+                    "private Docker workspace record and descriptor disagree",
+                ));
+            }
+        }
+        (Some(_), None) if descriptor.is_some() => {
+            return Err(Status::failed_precondition(
+                "Docker descriptor lacks its private workspace claim",
+            ));
+        }
+        (Some(_), None) => {} // Fresh create: record precedes container/descriptor.
+    }
+    if let (Some(record), Some(descriptor)) = (&record, descriptor)
+        && (descriptor.boundary_id != id
+            || descriptor.workload_identity.uid != record.uid
+            || descriptor.workload_identity.gid != record.gid)
+    {
+        return Err(Status::failed_precondition(
+            "private Docker workspace runtime identity changed",
+        ));
+    }
+    Ok(record)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Storage {
     WritableLayer,
@@ -128,6 +254,11 @@ pub async fn prepare(
     if mount(sandbox, config, image)?.is_none() {
         return Ok(None);
     }
+    if read_record(&sandbox.id, config)?.is_some() {
+        return Err(Status::failed_precondition(
+            "persistent Docker workspace is already recorded; explicit recovery or removal is required",
+        ));
+    }
     let name = volume_name(&sandbox.id, config);
     // Initial creation must not adopt an existing data volume. Recovery/update
     // will use the recorded volume identity, rather than this creation path.
@@ -168,34 +299,15 @@ pub async fn prepare(
             "persistent Docker workspace initialization identity changed",
         ));
     }
-    Ok(Some(volume))
-}
-
-fn recorded_identity(
-    container: &ContainerInspectResponse,
-) -> Result<Option<serde_json::Value>, Status> {
-    let labels = container
-        .config
-        .as_ref()
-        .and_then(|config| config.labels.as_ref());
-    let mode = labels.and_then(|labels| labels.get(MODE_LABEL));
-    let encoded = labels.and_then(|labels| labels.get(IDENTITY_LABEL));
-    if mode.is_none() && encoded.is_none() {
-        // Legacy/custom-working-directory sandboxes may legitimately have an
-        // externally admitted /sandbox mount. They have no persistence marker.
-        return Ok(None);
-    }
-    if mode.map(String::as_str) != Some(PERSISTENT_MODE) {
+    super::prepare_docker_boundary_state_dir(sandbox, config)?;
+    let bytes = record_bytes(&sandbox.id, config, &volume, identity)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(Status::failed_precondition(
-            "Docker workspace storage mode is missing or unsupported",
+            "private Docker workspace record exceeds its bound",
         ));
     }
-    let encoded = encoded.ok_or_else(|| {
-        Status::failed_precondition("Docker workspace mount lacks recorded ownership")
-    })?;
-    serde_json::from_str(encoded)
-        .map(Some)
-        .map_err(|_| Status::failed_precondition("persistent Docker workspace identity is invalid"))
+    super::image_update::durable_write(&record_path(&sandbox.id, config)?, &bytes)?;
+    Ok(Some(volume))
 }
 
 fn validate_attachment(
@@ -257,29 +369,35 @@ pub async fn admit(
     docker: &Docker,
     container: &ContainerInspectResponse,
     config: &DockerDriverRuntimeConfig,
-) -> Result<(), Status> {
-    let Some(recorded) = recorded_identity(container)? else {
-        return Ok(());
-    };
-    let id = container
+) -> Result<bool, Status> {
+    let Some(id) = container
         .config
         .as_ref()
         .and_then(|config| config.labels.as_ref())
         .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| {
-            Status::failed_precondition("persistent Docker workspace lacks sandbox ID")
-        })?;
-    let name = volume_name(id, config);
-    if recorded.get("name").and_then(serde_json::Value::as_str) != Some(name.as_str()) {
+    else {
+        return Ok(false);
+    };
+    let Some(record) = load_record(id, config).await? else {
+        return Ok(false);
+    };
+    if container
+        .config
+        .as_ref()
+        .and_then(|value| value.user.as_deref())
+        != Some(format!("{}:{}", record.uid, record.gid).as_str())
+    {
         return Err(Status::failed_precondition(
-            "persistent Docker workspace identity names another volume",
+            "persistent Docker workspace workload identity changed",
         ));
     }
+    let name = volume_name(id, config);
     let volume = docker.inspect_volume(&name).await.map_err(|error| {
         Status::unavailable(format!("inspect retained Docker workspace: {error}"))
     })?;
-    validate_attachment(container, &volume, &recorded, config)
+    validate_attachment(container, &volume, &record.volume_identity, config)?;
+    Ok(true)
 }
 
 pub async fn remove(
@@ -287,6 +405,9 @@ pub async fn remove(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<(), Status> {
+    let Some(record) = load_record(sandbox_id, config).await? else {
+        return Ok(());
+    };
     let name = volume_name(sandbox_id, config);
     let volume = match docker.inspect_volume(&name).await {
         Ok(volume) => volume,
@@ -298,6 +419,11 @@ pub async fn remove(
         }
     };
     validate_volume(&volume, sandbox_id, config)?;
+    if docker_volume_identity(&volume) != record.volume_identity {
+        return Err(Status::failed_precondition(
+            "persistent Docker workspace identity changed before removal",
+        ));
+    }
     // Docker refuses removal while another container still uses the volume.
     remove_docker_volume(docker, &name).await
 }
@@ -379,7 +505,21 @@ pub mod tests {
     }
 
     fn fixture() -> (ContainerInspectResponse, Volume, DockerDriverRuntimeConfig) {
-        fixture_for(test_sandbox(), runtime_config())
+        let mut config = runtime_config();
+        config.sandbox_namespace =
+            format!("workspace-test-{}", openshell_core::SandboxSessionId::new());
+        fixture_for(test_sandbox(), config)
+    }
+
+    fn save_fixture_record(volume: &Volume, config: &DockerDriverRuntimeConfig) -> PathBuf {
+        let sandbox = test_sandbox();
+        let directory = super::super::prepare_docker_boundary_state_dir(&sandbox, config).unwrap();
+        super::super::image_update::durable_write(
+            &directory.join(RECORD_FILE),
+            &record_bytes(&sandbox.id, config, volume, &test_workload_identity()).unwrap(),
+        )
+        .unwrap();
+        directory
     }
 
     pub fn fixture_for(
@@ -395,7 +535,7 @@ pub mod tests {
             "Name": volume_name(&sandbox.id, &config), "Driver": "local", "Options": {},
             "Labels": labels, "Mountpoint": "/synthetic/workspace", "Scope": "local", "CreatedAt": "2026-11-10T00:00:00Z"
         })).unwrap();
-        let mut labels = HashMap::from([
+        let labels = HashMap::from([
             (LABEL_SANDBOX_ID.to_string(), sandbox.id),
             (
                 LABEL_SANDBOX_NAMESPACE.to_string(),
@@ -403,11 +543,6 @@ pub mod tests {
             ),
             (LABEL_SANDBOX_WORKSPACE.to_string(), sandbox.workspace),
         ]);
-        labels.insert(
-            IDENTITY_LABEL.into(),
-            docker_volume_identity(&volume).to_string(),
-        );
-        labels.insert(MODE_LABEL.into(), PERSISTENT_MODE.into());
         let container = serde_json::from_value(serde_json::json!({
             "Config": {"Labels": labels, "User": format!("{}:{}", identity.uid, identity.gid)},
             "Mounts": [{"Type": "volume", "Name": volume.name, "Destination": "/sandbox", "RW": true}]
@@ -415,8 +550,8 @@ pub mod tests {
         (container, volume, config)
     }
 
-    #[test]
-    fn legacy_workspace_labels_are_not_a_driver_storage_record() {
+    #[tokio::test]
+    async fn legacy_workspace_labels_are_not_a_driver_storage_record() {
         // These keys were previously accepted as arbitrary template labels.
         // Their values, even persistent-v1 or invalid JSON, must not turn an
         // existing writable-layer container into a driver-owned volume claim.
@@ -424,17 +559,46 @@ pub mod tests {
             serde_json::json!({"openshell.ai/workspace-storage":"persistent-v1"}),
             serde_json::json!({"openshell.ai/workspace-volume-identity":"not-json"}),
             serde_json::json!({"openshell.ai/workspace-storage":"persistent-v1", "openshell.ai/workspace-volume-identity":"not-json"}),
+            serde_json::json!({"openshell.ai/docker-workspace-storage":"persistent-v1", "openshell.ai/docker-workspace-volume-identity":"not-json"}),
         ] {
+            let mut labels = labels;
+            labels[LABEL_SANDBOX_ID] = "sbx-123".into();
             let container =
                 serde_json::from_value(serde_json::json!({"Config":{"Labels":labels}})).unwrap();
-            assert!(recorded_identity(&container).unwrap().is_none());
+            let (_, _, config) = fixture();
+            let (docker, server) = docker_api(vec![]).await;
+            assert!(!admit(&docker, &container, &config).await.unwrap());
+            server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_removal_never_probes_or_removes_an_unrecorded_workspace() {
+        let (_, _, config) = fixture();
+        let (docker, server) = docker_api(vec![]).await;
+        remove(&docker, "sbx-123", &config).await.unwrap();
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_creation_keeps_storage_authority_until_explicit_deletion() {
+        let (_, volume, config) = fixture();
+        let sandbox = test_sandbox();
+        let directory = save_fixture_record(&volume, &config);
+        super::super::cleanup_failed_docker_boundary_state(&sandbox, &config);
+        assert!(record_claim(&sandbox.id, &config).unwrap().is_some());
+        super::super::cleanup_docker_boundary_state(&sandbox, &config);
+        assert!(!directory.exists());
+
+        let directory = super::super::prepare_docker_boundary_state_dir(&sandbox, &config).unwrap();
+        super::super::cleanup_failed_docker_boundary_state(&sandbox, &config);
+        assert!(!directory.exists());
     }
 
     #[test]
     fn retained_workspace_requires_original_volume_identity() {
         let (container, mut volume, config) = fixture();
-        let recorded = recorded_identity(&container).unwrap().unwrap();
+        let recorded = docker_volume_identity(&volume);
         validate_attachment(&container, &volume, &recorded, &config).unwrap();
         volume.created_at = Some("2026-11-11T00:00:00Z".into());
         assert!(validate_attachment(&container, &volume, &recorded, &config).is_err());
@@ -443,7 +607,7 @@ pub mod tests {
     #[test]
     fn retained_workspace_rejects_foreign_backing_and_workload_user() {
         let (mut container, mut volume, config) = fixture();
-        let recorded = recorded_identity(&container).unwrap().unwrap();
+        let recorded = docker_volume_identity(&volume);
         container.config.as_mut().unwrap().user = Some("2000:2000".into());
         assert!(validate_attachment(&container, &volume, &recorded, &config).is_err());
         volume
@@ -455,28 +619,24 @@ pub mod tests {
     #[test]
     fn retained_workspace_rejects_unrecorded_mount_and_foreign_namespace() {
         let (mut container, mut volume, config) = fixture();
+        let recorded = docker_volume_identity(&volume);
         volume
             .labels
             .insert(LABEL_SANDBOX_NAMESPACE.into(), "foreign".into());
         assert!(validate_volume(&volume, "sbx-123", &config).is_err());
-        container
-            .config
-            .as_mut()
-            .unwrap()
-            .labels
-            .as_mut()
-            .unwrap()
-            .remove(IDENTITY_LABEL);
-        assert!(recorded_identity(&container).is_err());
+        container.mounts = None;
+        assert!(validate_attachment(&container, &volume, &recorded, &config).is_err());
     }
 
-    #[test]
-    fn legacy_custom_workspace_mount_keeps_existing_admission_path() {
+    #[tokio::test]
+    async fn legacy_custom_workspace_mount_keeps_existing_admission_path() {
         let container = serde_json::from_value(serde_json::json!({
             "Config": {"Labels": {}, "WorkingDir": "/project"},
             "Mounts": [{"Type":"volume", "Name":"external-data", "Destination":"/sandbox", "RW":true}]
         })).unwrap();
-        assert!(recorded_identity(&container).unwrap().is_none());
+        let (docker, server) = docker_api(vec![]).await;
+        assert!(!admit(&docker, &container, &runtime_config()).await.unwrap());
+        server.await.unwrap();
     }
 
     #[test]
@@ -570,12 +730,16 @@ pub mod tests {
         assert_eq!(requests[1]["Name"], volume.name);
         assert_eq!(requests[1]["Driver"], "local");
         assert_eq!(requests[1]["Labels"][ROLE_LABEL], ROLE);
+        assert!(record_claim("sbx-123", &config).unwrap().is_some());
+        std::fs::remove_dir_all(record_path("sbx-123", &config).unwrap().parent().unwrap())
+            .unwrap();
     }
 
     #[tokio::test]
     async fn disabling_external_admission_does_not_adopt_recreated_workspace_volume() {
         let (container, mut volume, config) = fixture();
         assert!(config.allow_driver_config && !config.resource_admission.enabled);
+        let directory = save_fixture_record(&volume, &config);
         volume.created_at = Some("2026-11-11T00:00:00Z".into());
         let (docker, server) = docker_api(vec![(
             "GET",
@@ -592,11 +756,14 @@ pub mod tests {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn removal_checks_ownership_and_never_forces_an_in_use_volume() {
         let (_, mut volume, config) = fixture();
+        let original = volume.clone();
+        let directory = save_fixture_record(&volume, &config);
         volume
             .labels
             .insert(LABEL_SANDBOX_NAMESPACE.into(), "foreign".into());
@@ -616,7 +783,7 @@ pub mod tests {
             tonic::Code::FailedPrecondition
         );
         server.await.unwrap();
-        let (_, volume, _) = fixture();
+        let volume = original;
         let (docker, server) = docker_api(vec![
             (
                 "GET",
@@ -634,5 +801,6 @@ pub mod tests {
         .await;
         assert!(remove(&docker, "sbx-123", &config).await.is_err());
         server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

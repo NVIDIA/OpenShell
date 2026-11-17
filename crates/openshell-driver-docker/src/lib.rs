@@ -1299,7 +1299,7 @@ impl DockerComputeDriver {
     ) -> Result<(), Status> {
         // Driver-owned state remains checked even when caller resource
         // admission is explicitly disabled by an operator.
-        workspace::admit(&self.docker, container, &self.config).await?;
+        let persistent_workspace = workspace::admit(&self.docker, container, &self.config).await?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
         }
@@ -1361,7 +1361,7 @@ impl DockerComputeDriver {
                         }
                     } else if mount.destination.as_deref()
                         == Some(driver_mounts::DEFAULT_WORKSPACE_ROOT)
-                        && labels.contains_key(workspace::IDENTITY_LABEL)
+                        && persistent_workspace
                     {
                         // Independently checked above, including exact volume
                         // identity and the admitted workload UID/GID.
@@ -1734,14 +1734,14 @@ impl DockerComputeDriver {
         create_docker_channel_volume(&self.docker, sandbox, &self.config, true)
             .await
             .map_err(|status| {
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 DockerProvisioningFailure::new("BoundaryChannelCreateFailed", status.message())
             })?;
         let token_file_created = match write_sandbox_token_file(sandbox, &self.config).await {
             Ok(created) => created,
             Err(status) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "SandboxTokenWriteFailed",
                     status.message(),
@@ -1750,7 +1750,7 @@ impl DockerComputeDriver {
         };
         if !token_file_created {
             cleanup_runtime_volumes().await;
-            cleanup_docker_boundary_state(sandbox, &self.config);
+            cleanup_failed_docker_boundary_state(sandbox, &self.config);
             return Err(DockerProvisioningFailure::new(
                 "SandboxTokenWriteFailed",
                 "Docker control mode requires a gateway sandbox token",
@@ -1769,7 +1769,7 @@ impl DockerComputeDriver {
             Ok(devices) => devices,
             Err(status) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "ContainerCreateFailed",
                     status.message(),
@@ -1787,7 +1787,7 @@ impl DockerComputeDriver {
             Ok(body) => body,
             Err(status) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "ContainerCreateFailed",
                     status.message(),
@@ -1802,7 +1802,7 @@ impl DockerComputeDriver {
             Err(status) => {
                 let _ = remove_docker_channel_volume_by_id(&self.docker, &sandbox.id, &self.config)
                     .await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::from_admission_status(status));
             }
         };
@@ -1824,19 +1824,10 @@ impl DockerComputeDriver {
         )
         .await
         {
-            Ok(Some(volume)) => {
-                create_body
-                    .labels
-                    .get_or_insert_with(Default::default)
-                    .insert(
-                        workspace::IDENTITY_LABEL.into(),
-                        docker_volume_identity(&volume).to_string(),
-                    );
-            }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(status) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::from_status(
                     "WorkspaceStorageFailed",
                     status,
@@ -1869,7 +1860,7 @@ impl DockerComputeDriver {
             Ok(created) => created,
             Err(error) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::from_status(
                     "ContainerCreateFailed",
                     create_status_from_docker_error("create docker sandbox container", error),
@@ -1887,7 +1878,7 @@ impl DockerComputeDriver {
                     )
                     .await;
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::from_status(
                     "OuterFenceInspectFailed",
                     internal_status("inspect Docker sandbox outer fence", error),
@@ -1908,7 +1899,7 @@ impl DockerComputeDriver {
                 )
                 .await;
             cleanup_runtime_volumes().await;
-            cleanup_docker_boundary_state(sandbox, &self.config);
+            cleanup_failed_docker_boundary_state(sandbox, &self.config);
             return Err(DockerProvisioningFailure::from_status(
                 "OuterFenceRejected",
                 status,
@@ -1942,7 +1933,7 @@ impl DockerComputeDriver {
                     )
                     .await;
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "BoundaryConfigWriteFailed",
                     status.message(),
@@ -1979,7 +1970,7 @@ impl DockerComputeDriver {
                     "Failed to clean up Docker container after start failure"
                 );
             }
-            cleanup_docker_boundary_state(sandbox, &self.config);
+            cleanup_failed_docker_boundary_state(sandbox, &self.config);
             cleanup_runtime_volumes().await;
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerStartFailed",
@@ -2016,7 +2007,7 @@ impl DockerComputeDriver {
                     )
                     .await;
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
                     status.message(),
@@ -2485,7 +2476,7 @@ impl DockerComputeDriver {
                 self.clear_runtime_failure(&record.sandbox.id).await;
                 remove_docker_channel_volume_by_id(&self.docker, &record.sandbox.id, &self.config)
                     .await?;
-                cleanup_docker_boundary_state(&record.sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(&record.sandbox, &self.config);
                 self.publish_deleted(record.sandbox.id);
                 return Ok(());
             }
@@ -2833,7 +2824,7 @@ impl DockerComputeDriver {
         sandbox: &DriverSandbox,
         failure: &DockerProvisioningFailure,
     ) {
-        cleanup_docker_boundary_state(sandbox, &self.config);
+        cleanup_failed_docker_boundary_state(sandbox, &self.config);
         let snapshot = pending_sandbox_snapshot(
             sandbox,
             &self.config.sandbox_namespace,
@@ -4891,7 +4882,7 @@ async fn prepare_docker_boundary_files(
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
     let verification_keys = gateway_verification_keys(&launch_authentication.verification_keys)?;
-    let provisioning = isolation::DockerBoundarySpec {
+    let mut provisioning = isolation::DockerBoundarySpec {
         boundary_id: sandbox.id.clone(),
         generation: launch_authentication
             .supervisor
@@ -4921,6 +4912,19 @@ async fn prepare_docker_boundary_files(
     }
     .provision()
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if config.workspace_storage == workspace::Storage::Persistent {
+        let record = workspace::record_claim(&sandbox.id, config)?.ok_or_else(|| {
+            Status::failed_precondition(
+                "private Docker workspace record is missing during provisioning",
+            )
+        })?;
+        for claims in [
+            &mut provisioning.boundary_config.resource_claims,
+            &mut provisioning.runtime_descriptor.resource_claims,
+        ] {
+            claims.insert(workspace::RECORD_CLAIM.into(), record.clone());
+        }
+    }
     let boundary_config = provisioning
         .boundary_config
         .encode()
@@ -6116,9 +6120,23 @@ async fn stop_docker_control_process(mut process: DockerControlProcess) {
     let _ = process.task.await;
 }
 
-/// Make a private, on-disk rollback copy of the driver state before a stopped
-/// workload is replaced. Only regular files are copied: a compromised state
-/// directory cannot smuggle symlinks into the gateway filesystem.
+// Failed or interrupted creation can leave a retained workspace. Keep its
+// independent ownership record until explicit deletion removes that volume.
+fn cleanup_failed_docker_boundary_state(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) {
+    let Ok(path) = workspace::record_path(&sandbox.id, config) else {
+        return;
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cleanup_docker_boundary_state(sandbox, config);
+        }
+        _ => {} // Preserve unreadable/invalid records too; recovery fails closed.
+    }
+}
+
 fn cleanup_docker_boundary_state(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
     cleanup_docker_boundary_state_by_id(&sandbox.id, config);
 }
@@ -6417,15 +6435,8 @@ fn build_container_create_body_for_image(
         }]
     });
     let mut labels = template.labels.clone();
-    // Storage layout and attachment evidence are driver-owned facts.
-    labels.remove(workspace::MODE_LABEL);
-    labels.remove(workspace::IDENTITY_LABEL);
-    if config.workspace_storage == workspace::Storage::Persistent {
-        labels.insert(
-            workspace::MODE_LABEL.into(),
-            workspace::PERSISTENT_MODE.into(),
-        );
-    }
+    // Persistence is recorded in protected driver state, never inferred from
+    // or published over caller-owned template labels.
     labels.insert(
         "openshell.ai/private-image-volume-targets".into(),
         serde_json::to_string(&image.volumes)

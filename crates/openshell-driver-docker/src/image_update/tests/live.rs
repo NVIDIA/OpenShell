@@ -89,10 +89,18 @@ async fn live_stopped_image_replacement_retains_data_and_recovers_a_deleted_sour
         serde_json::from_value(serde_json::to_value(&fixture.source.config).unwrap()).unwrap();
     body.host_config = fixture.source.host_config.clone();
     body.image = Some(images[0].clone());
-    body.labels.as_mut().unwrap().insert(
-        workspace::IDENTITY_LABEL.into(),
-        docker_volume_identity(&volume).to_string(),
-    );
+    let private_record = workspace::record_bytes(
+        &resources.sandbox,
+        &fixture.config,
+        &volume,
+        &test_workload_identity(),
+    )
+    .unwrap();
+    durable_write(
+        &fixture.directory.join(workspace::RECORD_FILE),
+        &private_record,
+    )
+    .unwrap();
     let source_id = docker
         .create_container(
             Some(
@@ -112,6 +120,8 @@ async fn live_stopped_image_replacement_retains_data_and_recovers_a_deleted_sour
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["resource_claims"]["docker.container_id"] = source_id.clone().into();
         value["resource_claims"]["docker.image_identity"] = source.image.clone().unwrap().into();
+        value["resource_claims"][workspace::RECORD_CLAIM] =
+            String::from_utf8(private_record.clone()).unwrap().into();
         value["workload_identity"]["resource_digest"] = source.image.clone().unwrap().into();
         value["provisioning_evidence"] = serde_json::to_value(
             isolation::provisioning_evidence(&source_id, value["generation"].as_str().unwrap())

@@ -137,7 +137,7 @@ fn read(config: &DockerDriverRuntimeConfig, id: &str) -> Result<Option<Intent>, 
     Ok(Some(intent))
 }
 
-fn durable_write(path: &Path, contents: &[u8]) -> Result<(), Status> {
+pub fn durable_write(path: &Path, contents: &[u8]) -> Result<(), Status> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("Docker image-update state directory is missing"))?;
@@ -388,18 +388,12 @@ fn require_owner(
         (LABEL_SANDBOX_ID, p.sandbox_id.as_str()),
         (LABEL_SANDBOX_NAME, p.name.as_str()),
         (LABEL_ISOLATION_ROLE, LABEL_ISOLATION_ROLE_SANDBOX),
-        (workspace::MODE_LABEL, workspace::PERSISTENT_MODE),
     ] {
         if labels.get(key).map(String::as_str) != Some(value) {
             return Err(invalid(
                 "Docker image update refused a changed resource owner or storage layout",
             ));
         }
-    }
-    if !labels.contains_key(workspace::IDENTITY_LABEL) {
-        return Err(invalid(
-            "Docker image update requires recorded persistent storage",
-        ));
     }
     require_stopped(container)
 }
@@ -416,6 +410,9 @@ fn decode_boundary(intent: &Intent, target_id: &str) -> Result<(Vec<u8>, Vec<u8>
         || bootstrap.resource_claims.get("docker.container_id") != Some(&intent.original_container)
         || descriptor.resource_claims != bootstrap.resource_claims
         || descriptor.workload_identity != bootstrap.workload_identity
+        || !descriptor
+            .resource_claims
+            .contains_key(workspace::RECORD_CLAIM)
     {
         return Err(invalid(
             "Docker runtime evidence does not identify the original workload",
@@ -481,6 +478,19 @@ impl DockerComputeDriver {
             }
             _ => Box::pin(self.prepare_image_update(p)).await?,
         };
+        // A saved operation must retain independent storage authority even if
+        // interruption removed its original container before replay.
+        let claim = workspace::record_claim(&p.sandbox_id, &self.config)?
+            .ok_or_else(|| invalid("private Docker workspace record is missing"))?;
+        let descriptor: SandboxRuntimeDescriptor =
+            serde_json::from_slice(&intent.original_descriptor)
+                .map_err(|_| invalid("saved Docker runtime descriptor is invalid"))?;
+        if descriptor.resource_claims.get(workspace::RECORD_CLAIM) != Some(&claim) {
+            return Err(invalid(
+                "private Docker workspace record and accepted operation disagree",
+            ));
+        }
+        let _ = decode_boundary(&intent, "validation-only-target")?;
         if p.validate_only {
             return self.validate_update_resource(&intent, p).await;
         }

@@ -143,10 +143,12 @@ without a workload; an interrupted create requires explicit recovery/removal.
 This option advertises the optional workload update capability. The gateway's
 separate `enable_sandbox_updates` setting must also be enabled to accept updates.
 
-Persistence metadata uses the driver-owned `openshell.ai/docker-workspace-storage`
-and `openshell.ai/docker-workspace-volume-identity` container labels. The older
-generic `openshell.ai/workspace-storage` and `openshell.ai/workspace-volume-identity`
-keys remain caller labels; their presence does not select persistent storage.
+Persistence ownership comes from `workspace-storage.json` in the protected
+per-sandbox driver directory, bound into the private bootstrap and runtime
+descriptor. It records the namespace, sandbox, workload UID/GID and exact volume
+identity. Container labels do not select persistent storage or authorize volume
+admission, updates or removal. All caller template labels retain their existing
+meaning, including generic and Docker-specific workspace label names.
 
 ### Stopped Workload Image Updates
 

@@ -319,11 +319,15 @@ async fn authenticated_replacement_restart_and_removal(cx: &mut Context) -> test
     let fingerprint = &original.host_key_fingerprint;
     assert!(fingerprint.starts_with("SHA256:"));
     let before = container(id);
-    assert_eq!(
-        before["Config"]["Labels"]["openshell.ai/docker-workspace-storage"],
-        "persistent-v1"
-    );
     let volume = workspace_volume(&before);
+    let private_record: Value = serde_json::from_slice(
+        &fs::read(descriptor_path(id).with_file_name("workspace-storage.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(private_record["sandbox_id"], *id);
+    assert_eq!(private_record["volume_identity"]["name"], volume);
+    assert_eq!(private_record["uid"], 1234);
+    assert_eq!(private_record["gid"], 1235);
     let volume_before = docker(&["volume", "inspect", &volume]);
     sandbox.exec(["/bin/sh", "-c", "test \"$(id -u):$(id -g)\" = 1234:1235; cat /app/version; printf preserved-session > /sandbox/session-record"]).await?.expect_stdout("A\n")?;
     cx.cli([
@@ -489,6 +493,10 @@ async fn authenticated_replacement_restart_and_removal(cx: &mut Context) -> test
     assert!(
         !descriptor.exists(),
         "API deletion removed private runtime state"
+    );
+    assert!(
+        !descriptor.parent().unwrap().exists(),
+        "API deletion removed the entire private sandbox directory"
     );
     println!(
         "qualification passed: authenticated mTLS API and SSH exec on A and B; stable sandbox/SSH identity and workspace; gateway restart; Stop/Start; interrupted credential-publication repair; API deletion removed native workload, all {} owned volumes and private runtime state",

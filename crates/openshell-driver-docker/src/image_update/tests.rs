@@ -68,7 +68,7 @@ impl Fixture {
         let authentication =
             decode_docker_launch_authentication(&test_launch_authentication()).unwrap();
         let tls = generate_sandbox_tls_material(authentication.supervisor.session_id).unwrap();
-        let provisioned = isolation::DockerBoundarySpec {
+        let mut provisioned = isolation::DockerBoundarySpec {
             boundary_id: sandbox.id.clone(),
             generation: authentication.supervisor.runtime_generation.to_string(),
             session_id: authentication.supervisor.session_id,
@@ -97,6 +97,17 @@ impl Fixture {
         .provision()
         .unwrap();
         let directory = prepare_docker_boundary_state_dir(&sandbox, &config).unwrap();
+        let record =
+            workspace::record_bytes(&sandbox.id, &config, &volume, &test_workload_identity())
+                .unwrap();
+        durable_write(&directory.join(workspace::RECORD_FILE), &record).unwrap();
+        let claim = String::from_utf8(record).unwrap();
+        for claims in [
+            &mut provisioned.boundary_config.resource_claims,
+            &mut provisioned.runtime_descriptor.resource_claims,
+        ] {
+            claims.insert(workspace::RECORD_CLAIM.into(), claim.clone());
+        }
         durable_write(
             &directory.join(BOUNDARY_CONFIG_FILE),
             &provisioned.boundary_config.encode().unwrap(),
@@ -349,6 +360,69 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn persistent_update_requires_the_private_workspace_record() {
+    for mutation in ["missing", "invalid", "foreign-namespace", "foreign-uid"] {
+        let fixture = Fixture::new();
+        let path = fixture.directory.join(workspace::RECORD_FILE);
+        match mutation {
+            "missing" => std::fs::remove_file(&path).unwrap(),
+            "invalid" => std::fs::write(&path, "not-json").unwrap(),
+            _ => {
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if mutation == "foreign-namespace" {
+                    record["namespace"] = "foreign".into();
+                } else {
+                    record["uid"] = 2000.into();
+                }
+                std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+        }
+        let (result, requests) = fixture
+            .call(vec![fixture.source_reply()], &fixture.request)
+            .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        assert_eq!(requests.len(), 1);
+        assert!(
+            read(&fixture.config, &fixture.p().sandbox_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_requires_storage_authority_before_any_docker_action() {
+    for mutation in ["missing", "changed"] {
+        let fixture = Fixture::new();
+        let (docker, server) = docker_api(fixture.preflight()).await;
+        let mut driver = test_driver_with_config(fixture.config.clone());
+        driver.docker = Arc::new(docker);
+        let intent = driver.prepare_image_update(fixture.p()).await.unwrap();
+        server.await.unwrap();
+        save(&fixture.config, &intent).unwrap();
+        let checkpoint =
+            std::fs::read(path(&fixture.config, &fixture.p().sandbox_id).unwrap()).unwrap();
+        let record = fixture.directory.join(workspace::RECORD_FILE);
+        if mutation == "missing" {
+            std::fs::remove_file(&record).unwrap();
+        } else {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+            value["uid"] = 2000.into();
+            std::fs::write(&record, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let (result, requests) = fixture.call(vec![], &fixture.request).await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        assert!(requests.is_empty());
+        assert_eq!(
+            std::fs::read(path(&fixture.config, &fixture.p().sandbox_id).unwrap()).unwrap(),
+            checkpoint
+        );
+    }
+}
+
+#[tokio::test]
 async fn incompatible_target_identity_is_rejected_before_checkpoint_or_deletion() {
     // Symbolic and implicit identities require account lookup. The initial
     // updater rejects those representations rather than assuming that the
@@ -442,11 +516,11 @@ async fn image_replacement_keeps_native_and_volume_identity_and_publishes_new_ev
         descriptor.resource_claims["docker.image_identity"],
         "sha256:corrected"
     );
-    let record =
-        fixture.target().config.unwrap().labels.unwrap()[workspace::IDENTITY_LABEL].clone();
     assert_eq!(
-        intent.body.labels.unwrap()[workspace::IDENTITY_LABEL],
-        record
+        descriptor.resource_claims[workspace::RECORD_CLAIM],
+        workspace::record_claim(&fixture.p().sandbox_id, &fixture.config)
+            .unwrap()
+            .unwrap()
     );
 }
 
@@ -675,13 +749,13 @@ async fn replacement_cannot_substitute_another_persistent_volume_record() {
     let mut target = fixture.target();
     verify_replacement(&target, &intent).unwrap();
     target
-        .config
+        .host_config
         .as_mut()
         .unwrap()
-        .labels
+        .mounts
         .as_mut()
-        .unwrap()
-        .insert(workspace::IDENTITY_LABEL.into(), "foreign-volume".into());
+        .unwrap()[0]
+        .source = Some("foreign-volume".into());
     assert_eq!(
         verify_replacement(&target, &intent).unwrap_err().code(),
         tonic::Code::FailedPrecondition
@@ -939,7 +1013,16 @@ async fn launch_repair_never_adopts_changed_immutable_bindings() {
             *changed.pointer_mut(pointer).unwrap() = foreign;
             let changed = serde_json::to_vec(&changed).unwrap();
             std::fs::write(&path, &changed).unwrap();
-            let (docker, server) = docker_api(fixture.start_replies(false)).await;
+            let mut replies = fixture.start_replies(false);
+            if filename == RUNTIME_DESCRIPTOR_FILE
+                && matches!(
+                    pointer,
+                    "/boundary_id" | "/workload_identity/uid" | "/workload_identity/gid"
+                )
+            {
+                replies.pop(); // The protected record rejects before volume access.
+            }
+            let (docker, server) = docker_api(replies).await;
             let mut driver = test_driver_with_config(fixture.config.clone());
             driver.docker = Arc::new(docker);
             let error = Box::pin(driver.start_sandbox(
@@ -953,10 +1036,6 @@ async fn launch_repair_never_adopts_changed_immutable_bindings() {
             .unwrap_err();
             server.await.unwrap();
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-            assert!(
-                error.message().contains("resource bindings changed"),
-                "{error}"
-            );
             assert_eq!(std::fs::read(&path).unwrap(), changed);
         }
         std::fs::write(path, original).unwrap();
