@@ -125,9 +125,7 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## E2E and dev release concurrency
 
-`Release Dev` serializes complete runs in the `release-dev` concurrency group without cancelling the active run. New arrivals replace the pending run. A pending cancellation is expected during frequent main updates; cancellation of active E2E by another dev run is not. Inspect the job annotations for the cancellation reason.
-
-The reusable `e2e-suites.yml` and `integration-runner.yml` workflows disable active-run cancellation only for the `Release Dev` caller, including manual dev releases. Their existing concurrency groups and cancellation behavior remain unchanged for other callers. `Branch E2E Checks` still cancels superseded runs on the same mirrored PR branch. Manual `Integration Tests` invocations still cancel competing runs on the same branch and category.
+`Release Dev` finishes its active run and replaces pending runs when new commits arrive. Other callers retain E2E cancellation. Inspect job annotations for cancellation reasons.
 
 ## View Job Logs
 
