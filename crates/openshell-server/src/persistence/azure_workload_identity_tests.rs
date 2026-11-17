@@ -449,3 +449,28 @@ async fn azure_postgres_busy_pools_reuse_sessions_during_identity_outage() {
     // token. Access tokens are used as database passwords and are never printed.
     assert_busy_pool_reuse(&options, &token).await;
 }
+
+#[test]
+fn credential_unavailability_preserves_database_io_error_classification() {
+    use super::super::{PersistenceError, map_db_error};
+
+    // A transport timeout may happen after a statement was sent. It must not
+    // gain the pre-acquisition failure classification used by credentials.
+    let transport_timeout = sqlx::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "database transport timed out",
+    ));
+    assert!(matches!(
+        map_db_error(&transport_timeout),
+        PersistenceError::Database(_)
+    ));
+    let credential_error = unavailable("Azure credential acquisition failed");
+    assert!(matches!(
+        map_db_error(&credential_error),
+        PersistenceError::Unavailable(message) if message.contains("Azure credential acquisition failed")
+    ));
+    assert!(matches!(
+        map_db_error(&sqlx::Error::PoolTimedOut),
+        PersistenceError::Unavailable(_)
+    ));
+}

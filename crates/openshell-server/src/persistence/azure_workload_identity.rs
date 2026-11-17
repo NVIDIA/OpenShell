@@ -36,8 +36,17 @@ fn config_error(message: &'static str) -> sqlx::Error {
     sqlx::Error::Configuration(message.into())
 }
 
+/// Credential acquisition failed before the caller could send a statement.
+/// Keep this distinct from a database transport timeout with an unknown outcome.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct CredentialUnavailable(&'static str);
+
 fn unavailable(message: &'static str) -> sqlx::Error {
-    sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+    sqlx::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        CredentialUnavailable(message),
+    ))
 }
 
 #[derive(Deserialize)]

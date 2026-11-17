@@ -1586,9 +1586,16 @@ pub fn current_time_ms() -> i64 {
 }
 
 fn map_db_error(error: &sqlx::Error) -> PersistenceError {
-    if matches!(error, sqlx::Error::PoolTimedOut)
-        || matches!(error, sqlx::Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
-    {
+    let unavailable = match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => error.get_ref().is_some_and(
+            <dyn std::error::Error + Send + Sync + 'static>::is::<
+                azure_workload_identity::CredentialUnavailable,
+            >,
+        ),
+        _ => false,
+    };
+    if unavailable {
         return PersistenceError::Unavailable(error.to_string());
     }
     if let sqlx::Error::Database(db) = error
