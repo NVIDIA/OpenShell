@@ -11,7 +11,8 @@
 
 use std::time::Duration;
 
-use host_server_support::{HttpRecorder, Request, TEXT_REPLY, WebSocketRecorder};
+use host_server_support::{HttpRecorder, Request, Response, TEXT_REPLY, WebSocketRecorder};
+use serde_json::json;
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::sdk::raw::proto;
 use testkit::{Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
@@ -20,6 +21,8 @@ use crate::support::{self, TEST_HOST, python_binaries_yaml};
 
 const CREDENTIAL_REWRITE_CLIENT: &str = include_str!("scripts/credential_rewrite_client.py");
 const WEBSOCKET_TEXT_CLIENT: &str = include_str!("scripts/websocket_text_client.py");
+const BOUND_CREDENTIAL_CLIENT: &str = include_str!("scripts/bound_credential_client.sh");
+const BASH: &str = "/usr/bin/bash";
 
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
 const TEST_SECRET: &str = "e2e-gating-secret-value";
@@ -300,6 +303,84 @@ async fn profile_websocket_endpoint_rewrites_text_frames(cx: &mut Context) -> te
     Ok(())
 }
 
+/// A provider's credential resolves only at the endpoints its profile
+/// declares: another provider's endpoint and an undeclared path on its own
+/// endpoint get `403`, and the sandbox logs the mismatch without the secret
+/// or its variable name.
+#[testkit::test]
+async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit::Result {
+    const SECRET_A: &str = "e2e-bound-secret";
+    const SECRET_B: &str = "e2e-provider-b-secret";
+    let authorized = |request: &Request| {
+        let authorized = request.header("authorization").as_deref()
+            == Some(format!("Bearer {SECRET_A}").as_str());
+        Response::json(&json!({ "authorized": authorized }))
+    };
+    let server_a = HttpRecorder::serve(authorized).await?;
+    let server_b = HttpRecorder::serve(authorized).await?;
+    let provider_a =
+        install_bound_provider(cx, "binda", "BOUND_TOKEN_A", SECRET_A, server_a.port).await?;
+    let provider_b =
+        install_bound_provider(cx, "bindb", "BOUND_TOKEN_B", SECRET_B, server_b.port).await?;
+
+    let endpoint = |port| {
+        format!(
+            "{{host: {TEST_HOST}, port: {port}, path: /**, protocol: rest, access: full, \
+             enforcement: enforce}}"
+        )
+    };
+    let policy = policy::base_with(&format!(
+        "network_policies:
+  binding:
+    name: binding
+    endpoints: [{}, {}]
+    binaries: [{{path: {BASH}}}]
+",
+        endpoint(server_a.port),
+        endpoint(server_b.port),
+    ))?;
+    // The default image, like the e2e test this replaces, for its bash.
+    let sandbox = cx
+        .sandbox("bind")
+        .policy(policy)
+        .spec(|spec| spec.providers = vec![provider_a, provider_b])
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
+    let output = sandbox
+        .exec([
+            BASH,
+            "-c",
+            BOUND_CREDENTIAL_CLIENT,
+            "bash",
+            TEST_HOST,
+            &server_a.port.to_string(),
+            &server_b.port.to_string(),
+        ])
+        .await?
+        .success()?;
+    testkit::ensure!(
+        output.stdout.trim()
+            == r#"ALLOWED={"authorized":true} ENDPOINT_DENIED=403 PATH_DENIED=403"#,
+        "expected the credential only at its bound endpoint and path; got {}",
+        output.stdout.replace(SECRET_A, "<secret>")
+    );
+
+    let logs = sandbox
+        .logs_until("the endpoint mismatch", |logs| {
+            logs.contains("openshell.provider_credential.endpoint_mismatch")
+                && logs.contains("credential_endpoint_mismatch")
+        })
+        .await?;
+    for leaked in [SECRET_A, SECRET_B, "BOUND_TOKEN_A", "BOUND_TOKEN_B"] {
+        testkit::ensure!(
+            !logs.contains(leaked),
+            "the sandbox logs contain a credential value or variable name"
+        );
+    }
+    Ok(())
+}
+
 /// Run [`WEBSOCKET_CLIENT`] against `server` in a sandbox with `providers`,
 /// and return whether its binary frame reached `server`.
 async fn send_binary_frame(
@@ -360,6 +441,37 @@ async fn profile_endpoint_sandbox(cx: &Context, suffix: &str, endpoint: &str) ->
         binaries = python_binaries_yaml(),
     ))?;
     create_sandbox(cx, suffix, policy, &[&provider]).await
+}
+
+/// Install a provider named `cx.name(suffix)` holding `secret` in `env_var`,
+/// whose profile binds it to `/allowed/**` on `TEST_HOST` at `port` for
+/// [`BASH`].
+async fn install_bound_provider(
+    cx: &Context,
+    suffix: &str,
+    env_var: &str,
+    secret: &str,
+    port: u16,
+) -> Result<String> {
+    let name = cx.name(suffix);
+    let profile = format!(
+        "id: {name}
+display_name: E2E static endpoint binding
+category: other
+credentials:
+  - name: bound_token
+    env_vars: [{env_var}]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - {{host: {TEST_HOST}, port: {port}, path: /allowed/**, protocol: rest, access: full, enforcement: enforce}}
+binaries: [{BASH}]
+"
+    );
+    cx.install_provider(&name, &profile, &[(env_var, secret)])
+        .await?;
+    Ok(name)
 }
 
 /// Install a run-unique provider holding `TEST_SECRET` in `TOKEN_ENV`, whose
