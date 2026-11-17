@@ -2999,10 +2999,11 @@ mod tests {
         let _subscriber = capture.install();
         let correlation = test_correlation("eof-request");
         let (outcome, client) = relay_bytes(b"", Some(&correlation)).await;
-        assert!(matches!(
-            outcome.expect("upstream close"),
-            RelayOutcome::Consumed
-        ));
+        let error = outcome.expect_err("upstream EOF must reach the failure handler");
+        let error = error
+            .downcast_ref::<crate::l7::rest::UpstreamHttpError>()
+            .expect("typed upstream failure");
+        assert!(!error.response_started);
         assert!(
             client.is_empty(),
             "EOF must not become a synthetic HTTP response"
