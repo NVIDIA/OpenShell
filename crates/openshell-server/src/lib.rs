@@ -54,6 +54,7 @@ mod storage_proto;
 mod supervisor_owner;
 mod supervisor_pool;
 pub mod supervisor_session;
+mod supervisor_spread;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -401,6 +402,9 @@ pub struct ServerState {
     /// alongside `gateway_ring` so a redirect can name a dialable address.
     pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
 
+    /// Which gateway replica serves each shared supervisor, for placing them.
+    pub supervisor_spread: Arc<supervisor_spread::SupervisorSpread>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -674,6 +678,7 @@ impl ServerState {
             service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            supervisor_spread: Arc::default(),
             discovery: grpc::service_discovery::DiscoveryState::default(),
             discovery_watches: Arc::new(tokio::sync::Semaphore::new(32)),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
@@ -1016,6 +1021,7 @@ pub(crate) async fn run_server(
             authority.clone(),
             state.credentials.clone(),
             state.replica_id.clone(),
+            state.supervisor_spread.clone(),
         )
         .start(shutdown_rx.clone());
         spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
