@@ -19,6 +19,7 @@ mod image;
 mod labels;
 mod lifecycle;
 mod network;
+mod network_l7;
 mod persistent_workspace;
 mod policy_advisor;
 mod process;
