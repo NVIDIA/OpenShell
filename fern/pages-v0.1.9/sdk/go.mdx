@@ -1,0 +1,152 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Go SDK"
+sidebar-title: "Go"
+description: "Install the OpenShell Go SDK, connect to a gateway, and manage a sandbox."
+keywords: "OpenShell, SDK, Go, Golang, gRPC, Sandbox"
+position: 1
+---
+
+Use the Go SDK to manage OpenShell resources from Go applications, operators,
+and controllers. Its typed subclients follow familiar Kubernetes client
+patterns. The SDK is developed in
+[ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go), which also has
+the full [SDK documentation](https://ai-openshell.github.io/sdk-go/).
+
+## Install the SDK
+
+The SDK requires Go 1.26 or later. SDK releases follow OpenShell releases,
+so SDK `vX.Y.Z` works with a gateway from OpenShell `vX.Y.Z`. Add the version
+that matches your gateway to your Go module:
+
+```shell
+go get github.com/ai-openshell/sdk-go@vX.Y.Z
+```
+
+## Connect to a Gateway
+
+Pass a `host:port` address to `NewClient`. For a local gateway that allows
+unauthenticated plaintext connections:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    v1 "github.com/ai-openshell/sdk-go/openshell/v1"
+)
+
+func main() {
+    client, err := v1.NewClient(v1.Config{
+        Address: "127.0.0.1:8080",
+        Auth:    v1.NoAuth(),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+
+    health, err := client.Health().Check(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("gateway healthy: %v\n", health.Healthy)
+}
+```
+
+For an authenticated TLS gateway, provide the bearer token and TLS settings:
+
+```go
+client, err := v1.NewClient(v1.Config{
+    Address: "gateway.example.com:443",
+    Auth:    v1.StaticToken(os.Getenv("OPENSHELL_TOKEN")),
+    TLS:     &v1.TLSConfig{CAFile: "/path/to/ca.crt"},
+})
+```
+
+Omit `CAFile` to use system roots. For renewable OIDC service credentials, use
+`oidc.NewClientCredentialsAuth` from
+`github.com/ai-openshell/sdk-go/openshell/v1/oidc`.
+
+## Discover the Active Gateway
+
+`gateway.NewClient("")` and `gateway.LoadConfig("")` select the active gateway
+from the user `active_gateway` file first, then fall back to the system
+`/etc/openshell/active_gateway`. `gateway.ListGateways` marks the selected
+gateway as active, including a system default.
+
+## Create and Use a Sandbox
+
+Resource methods take an explicit workspace. The following example creates a
+sandbox in `default`, waits for readiness, runs a command, and requests
+deletion:
+
+```go
+sandbox, err := client.Sandboxes().Create(
+    ctx,
+    "default",
+    "sdk-example",
+    &v1.SandboxSpec{
+        Template: &v1.SandboxTemplate{
+            Image: "registry.example.com/team/python-agent:1.0",
+        },
+    },
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+sandbox, err = client.Sandboxes().WaitReady(ctx, "default", sandbox.Name)
+if err != nil {
+    log.Fatal(err)
+}
+
+result, err := client.Exec().Run(
+    ctx,
+    "default",
+    sandbox.Name,
+    []string{"python", "-c", "print('hello from OpenShell')"},
+)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Print(string(result.Stdout))
+
+if _, err := client.Sandboxes().Delete(ctx, "default", sandbox.Name); err != nil {
+    log.Fatal(err)
+}
+```
+
+The root client also exposes subclients for providers, services, files, SSH,
+TCP forwarding, policy, configuration, templates, and workspaces. List methods
+return lazy pagers so callers choose when to fetch the next page.
+
+## Migrate from `github.com/NVIDIA/OpenShell/sdk/go`
+
+The SDK used to live in this repository as `github.com/NVIDIA/OpenShell/sdk/go`.
+That module is deprecated and gets no further changes, including dependency and
+security updates. As of the move, packages and APIs are the same; only the
+module path is new. Rewrite the imports, then fetch the SDK version that
+matches your gateway:
+
+```shell
+grep -rlZ --include='*.go' --include=go.mod 'github.com/NVIDIA/OpenShell/sdk/go' . | xargs -0 perl -pi -e 's#github.com/NVIDIA/OpenShell/sdk/go#github.com/ai-openshell/sdk-go#g'
+go get github.com/ai-openshell/sdk-go@vX.Y.Z && go mod tidy
+```
+
+Existing builds keep working: the old module's tags stay published, and the
+latest one carries the deprecation notice that `go get` and pkg.go.dev show.
+
+## Next Steps
+
+- Review [Gateway Authentication](/how-it-works/gateways/authentication) before connecting a service to a production gateway.
+- Review [API Errors](/sdk/api-errors) for the gateway error model.
+- Browse the [Go package reference](https://pkg.go.dev/github.com/ai-openshell/sdk-go/openshell/v1) for all exported types and methods.
