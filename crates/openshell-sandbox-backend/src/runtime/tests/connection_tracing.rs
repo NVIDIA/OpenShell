@@ -7,6 +7,7 @@ use std::future::Future;
 #[cfg(unix)]
 use std::future::poll_fn;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::Instrument as _;
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt as _};
@@ -52,7 +53,7 @@ impl<S: tracing::Subscriber + for<'span> LookupSpan<'span>> tracing_subscriber::
         context: LayerContext<'_, S>,
     ) {
         let span = context.span(id).unwrap();
-        if span.name() != "boundary.connect" {
+        if span.name() != "supervisor.boundary.connect" {
             return;
         }
         let mut fields = Fields::default();
@@ -65,12 +66,51 @@ impl<S: tracing::Subscriber + for<'span> LookupSpan<'span>> tracing_subscriber::
         });
     }
 
+    fn on_record(
+        &self,
+        id: &tracing::Id,
+        values: &tracing::span::Record<'_>,
+        _: LayerContext<'_, S>,
+    ) {
+        for span in self.0.lock().unwrap().iter_mut() {
+            if &span.id == id {
+                let mut fields = Fields::default();
+                values.record(&mut fields);
+                span.fields.extend(fields.0);
+            }
+        }
+    }
+
     fn on_close(&self, id: tracing::Id, _: LayerContext<'_, S>) {
         for span in self.0.lock().unwrap().iter_mut() {
             if span.id == id {
                 span.closed = true;
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct RetryingConnector {
+    inner: ReverseTestConnector,
+    attempts: Arc<AtomicUsize>,
+    accepted: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl BoundaryTransportConnector for RetryingConnector {
+    async fn connect(
+        &self,
+        descriptor: &SandboxRuntimeDescriptor,
+    ) -> Result<BoundaryDuplexStream, BackendError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+            return Err(BackendError::Unavailable(
+                "boundary is starting".to_string(),
+            ));
+        }
+        let stream = self.inner.connect(descriptor).await?;
+        self.accepted.notify_one();
+        Ok(stream)
     }
 }
 
@@ -87,6 +127,7 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
         let mut descriptor =
             tls_runtime_descriptor("127.0.0.1:1".parse().unwrap(), certificate.client_tls);
         let mut router = None;
+        let attempts = Arc::new(AtomicUsize::new(0));
         let runtime: Pin<Box<dyn Future<Output = BoundaryDuplexStream> + Send>>;
         let transport = match kind {
             "dial" => {
@@ -104,12 +145,22 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
             "backend" => {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
+                let accepted = Arc::new(tokio::sync::Notify::new());
+                let runtime_accepted = accepted.clone();
                 runtime = Box::pin(async move {
-                    let stream: BoundaryDuplexStream =
-                        Box::new(tokio::net::TcpStream::connect(address).await.unwrap());
+                    let stream: BoundaryDuplexStream = Box::new(
+                        openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                            .await
+                            .unwrap(),
+                    );
+                    runtime_accepted.notified().await;
                     stream
                 });
-                BoundaryTransport::connector(Arc::new(ReverseTestConnector(listener)))
+                BoundaryTransport::connector(Arc::new(RetryingConnector {
+                    inner: ReverseTestConnector(listener),
+                    attempts: attempts.clone(),
+                    accepted,
+                }))
             }
             #[cfg(unix)]
             "runtime_initiated" => {
@@ -139,7 +190,9 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
                 let transport = BoundaryTransport::routed(&descriptor, registration).unwrap();
                 router = Some(listener);
                 runtime = Box::pin(async move {
-                    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                    let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                        .await
+                        .unwrap();
                     stream
                         .write_all(&crate::runtime_routed::encode_route_preface(&route).unwrap())
                         .await
@@ -183,12 +236,22 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
                 assert!(!captured[0].closed, "TLS authentication is still pending");
                 assert_eq!(
                     captured[0].fields,
-                    BTreeMap::from([("transport", kind.to_string())])
+                    BTreeMap::from([
+                        ("openshell.boundary.transport", kind.to_string()),
+                        (
+                            "openshell.boundary.connect_attempts",
+                            if kind == "backend" { "3" } else { "1" }.to_string()
+                        )
+                    ])
                 );
+            }
+            if kind == "backend" {
+                assert_eq!(attempts.load(Ordering::SeqCst), 3);
             }
             authenticate_tx.send(()).unwrap();
             assert_eq!(request.await.unwrap(), (None, false));
             assert!(spans.snapshot()[0].closed);
+            assert_eq!(spans.snapshot()[0].fields["otel.status_code"], "OK");
 
             assert_eq!(client.discover_policy().await.unwrap(), (None, false));
             assert_eq!(spans.snapshot().len(), 1, "cached {kind} connection");
@@ -217,7 +280,11 @@ async fn connection_span_closes_on_error_and_cancellation() {
     let subscriber = tracing_subscriber::registry().with(spans.clone());
     async {
         let discovery = tracing::info_span!("supervisor.boundary.discover_policy");
-        let mut waiting = Box::pin(transport.connect(&descriptor).instrument(discovery.clone()));
+        let mut waiting = Box::pin(
+            transport
+                .connect(&descriptor, ATTACH_REQUEST_TIMEOUT)
+                .instrument(discovery.clone()),
+        );
         poll_fn(|context| {
             assert!(waiting.as_mut().poll(context).is_pending());
             Poll::Ready(())
@@ -232,20 +299,31 @@ async fn connection_span_closes_on_error_and_cancellation() {
         wrong_session.tls = test_certificate().client_tls;
         assert!(matches!(
             transport
-                .connect(&wrong_session)
+                .connect(&wrong_session, ATTACH_REQUEST_TIMEOUT)
                 .instrument(discovery.clone())
                 .await,
             Err(BackendError::Descriptor(_))
         ));
         let captured = spans.snapshot();
         assert_eq!(captured.len(), 2);
-        for span in &captured {
+        assert!(!captured[0].fields.contains_key("otel.status_code"));
+        assert_eq!(captured[1].fields["otel.status_code"], "ERROR");
+        for (index, span) in captured.iter().enumerate() {
             assert!(span.closed);
             assert_eq!(span.parent, discovery.id());
-            assert_eq!(
-                span.fields,
-                BTreeMap::from([("transport", "runtime_initiated".to_string())])
-            );
+            assert_eq!(span.fields, {
+                let mut expected = BTreeMap::from([
+                    (
+                        "openshell.boundary.transport",
+                        "runtime_initiated".to_string(),
+                    ),
+                    ("openshell.boundary.connect_attempts", "1".to_string()),
+                ]);
+                if index == 1 {
+                    expected.insert("otel.status_code", "ERROR".to_string());
+                }
+                expected
+            });
         }
     }
     .with_subscriber(subscriber)

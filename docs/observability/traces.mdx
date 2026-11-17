@@ -45,6 +45,8 @@ Each component names its spans after the operation it performs:
 | Compute drivers | The compute-driver RPC, with child spans prefixed by the driver name | `openshell.compute.v1.ComputeDriver/CreateSandbox`, `docker.provision` |
 | Sandbox supervisors | Lifecycle spans use `supervisor.`; inspected HTTP uses request and stage operation names | `supervisor.startup`, `supervisor.policy.load`, `openshell.http.request`, `openshell.policy.evaluate` |
 
+`supervisor.boundary.connect` separates the authenticated boundary connection wait from `supervisor.boundary.discover_policy`. It records `openshell.boundary.transport` and `openshell.boundary.connect_attempts`, including retries within the same span. Completed connections set `otel.status_code` to `OK` or `ERROR`; cancellation leaves it unset. Reusing a cached connection creates no connect span.
+
 The gateway's client span and the driver's server span for a compute-driver call share the same name, which also appears in `rpc.method`. Their service names and span kinds tell them apart. A driver watch stream records a terminal status when it observes one. If the gateway stops consuming the stream first, the span status stays unset.
 
 ## Resource Attributes

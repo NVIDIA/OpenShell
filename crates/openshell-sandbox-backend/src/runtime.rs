@@ -180,55 +180,69 @@ impl BoundaryTransport {
     /// Open one authenticated physical connection, retrying within the
     /// connect window while the remote boundary starts.
     #[tracing::instrument(
-        name = "boundary.connect",
+        name = "supervisor.boundary.connect",
         skip_all,
-        fields(transport = match &self.0 {
+        fields(openshell.boundary.transport = match &self.0 {
             TransportSource::Dial => "dial",
             TransportSource::Connector(_) => "backend",
             TransportSource::RuntimeInitiated(_) => "runtime_initiated",
             TransportSource::Routed(_) => "routed",
-        })
+        }, openshell.boundary.connect_attempts = 1_u64, otel.status_code = tracing::field::Empty)
     )]
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
         initial_connect_timeout: Duration,
     ) -> Result<BoundaryDuplexStream, BackendError> {
-        let connector = match &self.0 {
-            TransportSource::Dial => None,
-            TransportSource::Connector(connector) => Some(connector.as_ref()),
-            TransportSource::RuntimeInitiated(listener) => {
-                return tokio::time::timeout(CONNECT_RETRY_TIMEOUT, listener.accept(descriptor))
+        let result = async {
+            let connector = match &self.0 {
+                TransportSource::Dial => None,
+                TransportSource::Connector(connector) => Some(connector.as_ref()),
+                TransportSource::RuntimeInitiated(listener) => {
+                    return tokio::time::timeout(
+                        CONNECT_RETRY_TIMEOUT,
+                        listener.accept(descriptor),
+                    )
                     .await
                     .map_err(|_| {
                         BackendError::Unavailable(
                             "timed out waiting for the sandbox runtime to connect".to_string(),
                         )
                     })?;
-            }
-            TransportSource::Routed(registration) => {
-                let window = if registration.has_connected() {
-                    CONNECT_RETRY_TIMEOUT
-                } else {
-                    initial_connect_timeout
-                };
-                return tokio::time::timeout(window, registration.accept(&descriptor.tls))
-                    .await
-                    .map_err(|_| {
-                        BackendError::Unavailable(
-                            "timed out waiting for the sandbox runtime to connect".to_string(),
-                        )
-                    })?;
-            }
-        };
-        let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
-        loop {
-            match connect_boundary_using_connector(descriptor, connector).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
+                TransportSource::Routed(registration) => {
+                    let window = if registration.has_connected() {
+                        CONNECT_RETRY_TIMEOUT
+                    } else {
+                        initial_connect_timeout
+                    };
+                    return tokio::time::timeout(window, registration.accept(&descriptor.tls))
+                        .await
+                        .map_err(|_| {
+                            BackendError::Unavailable(
+                                "timed out waiting for the sandbox runtime to connect".to_string(),
+                            )
+                        })?;
+                }
+            };
+            let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
+            let mut attempts = 0_u64;
+            loop {
+                attempts += 1;
+                tracing::Span::current().record("openshell.boundary.connect_attempts", attempts);
+                match connect_boundary_using_connector(descriptor, connector).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
             }
         }
+        .await;
+        tracing::Span::current().record(
+            "otel.status_code",
+            if result.is_ok() { "OK" } else { "ERROR" },
+        );
+        result
     }
 }
 
