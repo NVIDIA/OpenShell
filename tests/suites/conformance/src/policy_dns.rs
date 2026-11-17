@@ -6,10 +6,8 @@
 //! for 60 s, the JDK for 30 s), so the address must keep taking new
 //! connections for a while after the lookup.
 //!
-//! Only the Docker and Podman drivers offer policy DNS, so this is a features
-//! suite. The upstream server runs on the test host
-//! ([`host_server_support`]) and the sandbox reaches it as
-//! `host.openshell.internal`.
+//! The upstream server runs on the test host ([`host_server_support`]) and
+//! the sandbox reaches it as `host.openshell.internal`.
 
 use std::time::Duration;
 

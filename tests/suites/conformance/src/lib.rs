@@ -17,6 +17,7 @@ mod labels;
 mod lifecycle;
 mod persistent_workspace;
 mod policy_advisor;
+mod policy_dns;
 mod process;
 mod settings;
 mod smoke;
