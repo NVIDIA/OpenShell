@@ -298,7 +298,6 @@ pub async fn run_networking(
     proxy_listener: Option<ProxyListenerConfig>,
     reserved_destination: Option<crate::proxy::ReservedDestination>,
 ) -> Result<Networking> {
-    crate::l7::correlation::init_request_correlation()?;
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.

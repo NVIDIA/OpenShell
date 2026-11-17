@@ -317,7 +317,7 @@ The request span ends after its owned stages, not when response headers are logg
 
 The supervisor owns the request trace. A valid workload `traceparent`, sampled or unsampled, becomes an explicitly untrusted link, never its parent. Invalid or duplicate context is ignored; workload `tracestate` is not adopted. Your backend may show the agent and supervisor as separate linked traces rather than one nested tree.
 
-Inspected requests do not also create a denial-only `supervisor.egress.deny` span. Non-inspected denials use that span: a root at the default log level, or a child of an available connect span at debug level. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation.
+Inspected requests do not also create a denial-only `supervisor.egress.deny` span. Non-inspected HTTP denials use that span: a root at the default log level, or a child of an available connect span at debug level. Shared supervisor hosts do not initialize OTLP exporters, so their records have no supervisor trace IDs. Request ID correlation works independently of those exporters.
 
 The non-inspected denial-span limiter allows at most 10 spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. These denial-specific budgets do not select inspected request spans, which cover every outcome rather than denials alone.
 
@@ -337,13 +337,27 @@ authorization or downstream execution. L4 and uninspected traffic do not provide
 this receipt guarantee. OpenShell does not add the receipt to JSON error bodies.
 
 All OCSF event classes emitted in the inspected request scope carry the request
-ID, including Detection Findings. Policy, middleware, token-grant and finding
-records remain separate, with their original event IDs, timestamps,
-classification and decision fields. The additive `unmapped.http_event_kind`
-field distinguishes decisions, findings, connection events and middleware
-invocations. Explicit control kinds such as `token_grant` remain unchanged.
-Middleware records retain `unmapped.middleware_phase` and their existing
-attribution and transformation details.
+ID, including Detection Findings. Each control emits its own records with event
+IDs, timestamps, classification and decision fields. Use
+`unmapped.http_event_kind` to select the record kind:
+
+| Value | Record kind |
+|---|---|
+| `decision` | HTTP control decision. |
+| `middleware_invocation` | Request, response or WebSocket middleware invocation. |
+| `token_grant` | Provider token grant. |
+| `finding` | Detection Finding. |
+| `connection` | Network or SSH activity, including the HTTP upgrade handoff. |
+| `lifecycle` | Process or application lifecycle. |
+| `configuration` | Configuration state change. |
+| `authentication` | Authentication activity. |
+| `event` | Other event classes. |
+
+Middleware invocation records use `unmapped.middleware_phase` with values
+`request`, `response`, `websocket_preflight`, `websocket_session_start` or
+`websocket_message`. This field is separate from `unmapped.phase`, which describes
+a finding's phase, such as `pre_return`. Attribution and transformation details
+are recorded on the individual invocation.
 
 `unmapped.request_sequence` starts at 1 for each request and records local
 emission order. It does not guarantee downstream delivery order or complete
@@ -353,7 +367,8 @@ Activity or `decision` record as another request.
 
 Errors that end an inspected request retain that request's ID. A policy reload
 records the active request before closing it; an idle connection has no request
-ID. After a WebSocket upgrade, frame events do not reuse the HTTP handshake ID.
+ID. The `101` upgrade handoff record shares the HTTP handshake ID. Later
+WebSocket frame events do not reuse that ID.
 
 The request ID join and enforcement work without tracing, when spans are not
 sampled, and when the collector is unavailable. Sampled OCSF trace fields identify

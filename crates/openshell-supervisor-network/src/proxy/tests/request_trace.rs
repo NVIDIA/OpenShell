@@ -39,6 +39,294 @@ fn assert_request_record_sequence(records: &[serde_json::Value], receipt: &str) 
     }
 }
 
+#[tokio::test]
+async fn shared_proxy_startup_registers_correlation_and_terminal_errors() {
+    use crate::l7::tls::{CertCache, SandboxCa, tls_terminate_client};
+    use openshell_isolation_interface::contract::DuplexStream;
+    use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+
+    const CHILD: &str = "OPENSHELL_REQUEST_CORRELATION_STARTUP_CHILD";
+    const COMPLETED: &str = "shared proxy startup and terminal regressions completed";
+    if std::env::var_os(CHILD).is_none() {
+        // A fresh process prevents scope_connection's cfg(test) auto-init (or
+        // another fixture) from hiding a missing production startup hook.
+        let module = module_path!().split_once("::").unwrap().1;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!(
+                        "{module}::shared_proxy_startup_registers_correlation_and_terminal_errors"
+                    ),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated startup regression must finish")
+        .expect("start isolated startup regression");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(COMPLETED),
+            "isolated startup regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let ip = non_loopback_test_ipv4()
+        .expect("shared proxy regression requires a non-loopback IPv4 address");
+    let listener = TcpListener::bind((ip, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let engine = Arc::new(
+        native_identity_engine(
+            include_str!("../../../data/sandbox-policy.rego"),
+            &format!(
+                r#"
+network_policies:
+  traced_api:
+    name: traced_api
+    endpoints:
+      - host: "{ip}"
+        port: {port}
+        allowed_ips: ["{ip}/32"]
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: GET, path: /allowed }}
+    binaries:
+      - path: /usr/bin/python3
+"#
+            ),
+        )
+        .unwrap(),
+    );
+    let ca = SandboxCa::generate().unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_reader_iter(&mut ca.cert_pem().as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let client_config = Arc::new(
+        openshell_crypto::tls::client_builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let tls = Arc::new(ProxyTlsState::new(
+        CertCache::new(ca),
+        client_config.clone(),
+    ));
+    let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+    // Production accept/connection tasks are spawned independently; the
+    // isolated process gives them the same subscriber without test wrappers.
+    tracing::subscriber::set_global_default(
+        capture
+            .subscriber()
+            .with(openshell_otel::supervisor_span_filter("info")),
+    )
+    .unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+    let proxy = ProxyHandle::start_with_bind_addr(
+        &ProxyPolicy { http_addr: None },
+        Some(([127, 0, 0, 1], 0).into()),
+        engine,
+        Arc::new(BinaryIdentityCache::new()),
+        Arc::new(AtomicU32::new(0)),
+        Some(tls.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        ready_rx,
+        &upstream_proxy::UpstreamProxyArgs::default(),
+        None,
+        None,
+        None,
+        Some(ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: executable_path("/usr/bin/python3"),
+                digest: Some("00".repeat(32).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !openshell_ocsf::register_event_enricher(|_| {}),
+        "shared proxy startup must register correlation before the first request"
+    );
+    ready_tx.send(true).unwrap();
+
+    let scenario = async {
+        // One exchange per real terminal emission boundary, not a sampler or
+        // transport matrix. Each fails only after the client receives its ID.
+        for (connect, encrypted, terminal_prefix) in [
+            (false, false, "Proxy connection error: "),
+            (true, false, "L7 relay error: "),
+            (true, true, "TLS relay error: "),
+        ] {
+            let (release, released) = tokio::sync::oneshot::channel();
+            let serve = async {
+                let (upstream, _) = listener.accept().await.unwrap();
+                let hostname = ip.to_string();
+                let mut upstream: Box<dyn DuplexStream + '_> = if encrypted {
+                    Box::new(
+                        tls_terminate_client(upstream, &tls, &hostname)
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    Box::new(upstream)
+                };
+                let request = read_http_headers(&mut upstream).await;
+                assert!(String::from_utf8_lossy(&request).starts_with("GET /allowed HTTP/1.1\r\n"));
+                upstream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                upstream.flush().await.unwrap();
+                released.await.unwrap();
+                upstream.write_all(b"ok").await.unwrap();
+                // Clean TLS EOF too: the HTTP declared-length failure must
+                // reach the non-benign outer relay-error callsite.
+                upstream.shutdown().await.unwrap();
+            };
+            let exchange = async {
+                let mut client = connect_tcp_nodelay_best_effort(proxy.http_addr().unwrap())
+                    .await
+                    .unwrap();
+                if connect {
+                    client
+                        .write_all(
+                            format!("CONNECT {ip}:{port} HTTP/1.1\r\nHost: {ip}:{port}\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    let established = read_http_headers(&mut client).await;
+                    assert!(established.starts_with(b"HTTP/1.1 200 Connection Established\r\n"));
+                }
+                let mut client: BoundaryDuplexStream = if encrypted {
+                    Box::new(
+                        tokio_rustls::TlsConnector::from(client_config.clone())
+                            .connect(ServerName::try_from(ip.to_string()).unwrap(), client)
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    Box::new(client)
+                };
+                let target = if connect {
+                    "/allowed".to_string()
+                } else {
+                    format!("http://{ip}:{port}/allowed")
+                };
+                client
+                    .write_all(
+                        format!("GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\ntraceparent: 00-{WORKLOAD_TRACE_ID}-{WORKLOAD_SPAN_ID}-01\r\nx-openshell-request-id: forged-receipt\r\nConnection: close\r\n\r\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                client.flush().await.unwrap();
+                let response = read_http_headers(&mut client).await;
+                assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                let receipt = response_request_id(&response).to_string();
+                assert!(uuid::Uuid::parse_str(&receipt).is_ok());
+                release.send(()).unwrap();
+                let mut body = Vec::new();
+                // The downstream TLS stream may omit close_notify when its
+                // failed HTTP relay drops it. The captured event is the oracle.
+                let _ = client.read_to_end(&mut body).await;
+                assert_eq!(body, b"ok");
+                receipt
+            };
+            let ((), receipt) = tokio::join!(serve, exchange);
+            let (records, root) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let records = capture.events.json_events();
+                    let root = capture.spans().into_iter().find(|span| {
+                        span.name == "openshell.http.request"
+                            && span_attribute(span, "openshell.request.id")
+                                .is_some_and(|value| value.as_str() == receipt)
+                    });
+                    if let Some(root) = root
+                        && records.iter().any(|record| {
+                            record["message"]
+                                .as_str()
+                                .is_some_and(|message| message.starts_with(terminal_prefix))
+                                && record["metadata"]["correlation_uid"] == receipt
+                        })
+                    {
+                        break (records, root);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actual outer terminal record must retain the failed request receipt");
+            let correlated = records
+                .iter()
+                .filter(|record| record["metadata"]["correlation_uid"] == receipt)
+                .collect::<Vec<_>>();
+            assert_eq!(correlated.len(), 2, "{records:?}");
+            for (index, record) in correlated.iter().enumerate() {
+                assert_eq!(
+                    record["unmapped"]["request_sequence"],
+                    index + 1,
+                    "{records:?}"
+                );
+            }
+            let terminal = correlated.last().unwrap();
+            assert!(
+                terminal["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(terminal_prefix)
+            );
+            assert!(
+                terminal["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2 bytes remaining")
+            );
+            assert_eq!(terminal["class_uid"], 4001);
+            assert_eq!(terminal["unmapped"]["http_event_kind"], "connection");
+            assert_ne!(receipt, "forged-receipt");
+            assert_ne!(root.span_context.trace_id().to_string(), WORKLOAD_TRACE_ID);
+            assert_eq!(root.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+            assert_eq!(root.links.links.len(), 1);
+            assert!(matches!(
+                root.status,
+                opentelemetry::trace::Status::Error { .. }
+            ));
+            for decision in &correlated[..correlated.len() - 1] {
+                assert_eq!(
+                    decision["trace"]["uid"],
+                    root.span_context.trace_id().to_string()
+                );
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), scenario)
+        .await
+        .expect("real proxy terminal-error exchanges must finish");
+    assert!(
+        !capture
+            .created_span_names()
+            .contains(&"supervisor.egress.deny")
+    );
+    drop(proxy);
+    capture.shutdown();
+    println!("{COMPLETED}");
+}
+
 async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>) {
     let listener = TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -476,11 +764,25 @@ fn inspected_forward_error_receipts_preserve_json_bodies() {
 
 #[tokio::test]
 async fn inspected_forward_http_trace_ends_before_websocket_session() {
+    forward_websocket_trace_case(true).await;
+}
+
+#[tokio::test]
+async fn inspected_forward_websocket_frame_denial_stays_outside_http_scope() {
+    forward_websocket_trace_case(false).await;
+}
+
+async fn forward_websocket_trace_case(allow_frame: bool) {
     let _lock = openshell_otel_test_support::tracing_test_lock().await;
     let ip = non_loopback_test_ipv4()
         .expect("FORWARD trace qualification requires a non-loopback IPv4 address");
     let listener = TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let frame_rule = if allow_frame {
+        "          - allow: { method: WEBSOCKET_TEXT, path: /ws }"
+    } else {
+        ""
+    };
     let engine = Arc::new(
         native_identity_engine(
             include_str!("../../../data/sandbox-policy.rego"),
@@ -497,7 +799,7 @@ network_policies:
         enforcement: enforce
         rules:
           - allow: {{ method: GET, path: /ws }}
-          - allow: {{ method: WEBSOCKET_TEXT, path: /ws }}
+{frame_rule}
     binaries:
       - path: /usr/bin/python3
 "#
@@ -566,9 +868,19 @@ network_policies:
             .unwrap();
         handshake.send(()).unwrap();
         let frame = crate::l7::websocket::read_frame_for_test(&mut upstream).await;
-        assert_eq!(frame, masked_text_frame(b"after-http-root"));
+        if allow_frame {
+            assert_eq!(frame, masked_text_frame(b"after-http-root"));
+            upstream.write_all(b"\x81\x02ok").await.unwrap();
+        } else {
+            assert_eq!(masked_close_code(&frame), 1008);
+            let mut remaining = Vec::new();
+            upstream.read_to_end(&mut remaining).await.unwrap();
+            assert!(
+                remaining.is_empty(),
+                "blocked text must never reach upstream, before or after the policy close"
+            );
+        }
         activity.send(std::time::SystemTime::now()).unwrap();
-        upstream.write_all(b"\x81\x02ok").await.unwrap();
         released.await.unwrap();
     });
     let scenario = async {
@@ -608,12 +920,26 @@ network_policies:
         assert!(root.end_time <= observed_activity.await.unwrap());
         let mut frame = [0; 4];
         app.read_exact(&mut frame).await.unwrap();
-        assert_eq!(&frame, b"\x81\x02ok");
-        assert!(!handler.is_finished());
+        if allow_frame {
+            assert_eq!(&frame, b"\x81\x02ok");
+            assert!(!handler.is_finished());
+        } else {
+            assert_eq!(&frame, b"\x88\x02\x03\xf0");
+        }
         release.send(()).unwrap();
         drop(app);
         upstream.await.unwrap();
-        handler.await.unwrap().unwrap();
+        let result = handler.await.unwrap();
+        if allow_frame {
+            result.unwrap();
+        } else {
+            assert!(
+                result
+                    .expect_err("denied frame must terminate the relay")
+                    .to_string()
+                    .contains("websocket text message denied by policy")
+            );
+        }
         let records = capture.events.json_events();
         assert_eq!(records.len(), 4, "{records:?}");
         assert_request_record_sequence(&records[..2], receipt);
@@ -653,20 +979,50 @@ network_policies:
         );
         assert!(records[2].get("http_response").is_none());
         assert!(records[2].get("http_request").is_none());
+        assert_eq!(records[2]["metadata"]["correlation_uid"], receipt);
+        assert_eq!(records[2]["unmapped"]["request_sequence"], 3);
+        assert_eq!(records[2]["unmapped"]["http_event_kind"], "connection");
+        // NetworkActivity has no trace field; the receipt ties the unchanged
+        // 101 record to the completed HTTP root without changing its schema.
+        assert!(records[2].get("trace").is_none());
+        assert_eq!(
+            span_attribute(&root, "openshell.request.id")
+                .unwrap()
+                .as_str(),
+            receipt
+        );
         assert_eq!(records[3]["class_uid"], 4001);
         assert!(
             records[3]["message"]
                 .as_str()
                 .unwrap()
-                .starts_with("WEBSOCKET_L7_REQUEST allow WEBSOCKET_TEXT ")
+                .starts_with(if allow_frame {
+                    "WEBSOCKET_L7_REQUEST allow WEBSOCKET_TEXT "
+                } else {
+                    "WEBSOCKET_L7_REQUEST deny WEBSOCKET_TEXT "
+                })
         );
         assert_eq!(records[3]["firewall_rule"]["type"], "l7-websocket");
-        for record in &records[2..] {
+        assert_eq!(records[3]["action_id"], if allow_frame { 1 } else { 2 });
+        for record in &records[3..] {
             assert!(record["metadata"].get("correlation_uid").is_none());
             assert!(record["unmapped"].get("request_sequence").is_none());
             assert!(record["unmapped"].get("http_event_kind").is_none());
             assert!(record.get("trace").is_none());
         }
+        let created = capture.created_span_names();
+        assert_eq!(
+            created
+                .iter()
+                .filter(|name| **name == "openshell.http.request")
+                .count(),
+            1,
+            "WebSocket frames must not create HTTP request spans"
+        );
+        assert!(
+            !created.contains(&"supervisor.egress.deny"),
+            "WebSocket NetworkActivity decisions must not gain HTTP denial spans"
+        );
         assert!(!format!("{records:?}").contains("after-http-root"));
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), scenario)

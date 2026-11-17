@@ -177,6 +177,22 @@ pub fn emit_error_event(event: OcsfEvent, error: &miette::Report) {
     }
 }
 
+/// Retain attribution for one explicit handoff record, not ambient protocol
+/// traffic. The request span stays alive only until this value emits or drops.
+#[derive(Debug)]
+pub struct DetachedRequestEvent {
+    scope: Arc<RequestScope>,
+    span: tracing::Span,
+}
+
+impl DetachedRequestEvent {
+    pub(crate) fn emit(self, event: OcsfEvent) {
+        in_request_scope(&self.scope, || {
+            crate::telemetry::emit_inspected_decision([event], Some(&self.span));
+        });
+    }
+}
+
 #[derive(Debug)]
 pub struct RequestCorrelation {
     scope: Arc<RequestScope>,
@@ -358,6 +374,17 @@ impl RequestCorrelation {
     /// an upgraded connection to its longer-lived protocol relay.
     pub(crate) fn finish_http_request(self) {
         drop(self);
+    }
+
+    /// Restore the ambient scope now, retaining the request span only for the
+    /// existing upgrade handoff record after protocol-start validation.
+    pub(crate) fn finish_http_request_for_event(self) -> Option<DetachedRequestEvent> {
+        let event = self.scope.inspected.then(|| DetachedRequestEvent {
+            scope: Arc::clone(&self.scope),
+            span: self.scope.span(),
+        });
+        self.finish_http_request();
+        event
     }
 
     fn finish_http_trace(&self) {

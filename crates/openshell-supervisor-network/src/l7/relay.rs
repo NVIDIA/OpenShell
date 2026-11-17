@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::correlation::{HttpOutcome, RequestCorrelation, RequestStage};
+use crate::l7::correlation::{DetachedRequestEvent, HttpOutcome, RequestCorrelation, RequestStage};
 use crate::l7::middleware::{
     MiddlewareApplyResult, RequestBodyDelivery, UninspectableTrafficGate,
     apply_middleware_chain_with_request_id_and_delivery_correlated,
@@ -1272,6 +1272,7 @@ pub(crate) struct UpgradeRelayOptions<'a> {
     pub(crate) policy_name: String,
     pub(crate) middleware_session: Option<openshell_supervisor_middleware::WebSocketSession>,
     pub(crate) selected_subprotocol: Option<String>,
+    pub(crate) handshake_event: Option<DetachedRequestEvent>,
 }
 
 #[derive(Default)]
@@ -2094,7 +2095,7 @@ where
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
                     options.middleware_session = middleware_session.take();
                     options.selected_subprotocol = websocket_subprotocol;
-                    correlation.finish_http_request();
+                    options.handshake_event = correlation.finish_http_request_for_event();
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -2325,18 +2326,21 @@ where
     } else {
         "raw bidirectional relay (L7 enforcement no longer active)"
     };
-    egress_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Other)
-            .activity_name("Upgrade")
-            .severity(SeverityId::Informational)
-            .dst_endpoint(Endpoint::from_domain(host, port))
-            .message(format!(
-                "101 Switching Protocols — {relay_mode} [host:{host} port:{port} overflow_bytes:{}]",
-                overflow.len()
-            ))
-            .build()
-    );
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .activity_name("Upgrade")
+        .severity(SeverityId::Informational)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(format!(
+            "101 Switching Protocols — {relay_mode} [host:{host} port:{port} overflow_bytes:{}]",
+            overflow.len()
+        ))
+        .build();
+    if let Some(handshake_event) = options.handshake_event.take() {
+        handshake_event.emit(event);
+    } else {
+        egress_emit!(event);
+    }
     if use_websocket_relay {
         let assembly_budget = options.assembly_budget.take().unwrap_or_default();
         let resolver = if options.websocket.credential_rewrite {
@@ -2489,6 +2493,7 @@ pub(crate) fn upgrade_options<'a>(
         policy_name: ctx.policy_name.clone(),
         middleware_session: None,
         selected_subprotocol: None,
+        handshake_event: None,
     }
 }
 
@@ -2961,7 +2966,7 @@ where
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
                     options.middleware_session = middleware_session.take();
                     options.selected_subprotocol = websocket_subprotocol;
-                    correlation.finish_http_request();
+                    options.handshake_event = correlation.finish_http_request_for_event();
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -4660,14 +4665,16 @@ where
             RelayOutcome::Reusable => {} // continue loop
             RelayOutcome::Consumed => break,
             RelayOutcome::Upgraded { overflow, .. } => {
-                correlation.finish_http_request();
                 return handle_upgrade(
                     client,
                     upstream,
                     overflow,
                     &ctx.host,
                     ctx.port,
-                    UpgradeRelayOptions::default(),
+                    UpgradeRelayOptions {
+                        handshake_event: correlation.finish_http_request_for_event(),
+                        ..Default::default()
+                    },
                 )
                 .await;
             }

@@ -314,6 +314,107 @@ async fn finishing_http_restores_the_previous_scope_before_protocol_relay() {
 }
 
 #[tokio::test]
+async fn detached_handoff_preserves_only_its_explicit_record_and_ends_before_frames() {
+    let capture = RequestTracing::new(Some(opentelemetry_sdk::trace::Sampler::AlwaysOn));
+    scope_connection(async {
+        let correlation =
+            RequestCorrelation::with_request_id(&request(), &context(), "handshake".into());
+        correlation.emit(allowed());
+        correlation.record_response_status(101);
+        let handoff = correlation.finish_http_request_for_event().unwrap();
+        assert!(!is_inspected_request());
+        assert!(current_request_span().is_none());
+
+        // Protocol-start work must not inherit the detached HTTP context.
+        crate::telemetry::emit_decision([allowed()], None);
+        tokio::task::yield_now().await;
+        handoff.emit(allowed());
+        assert!(!is_inspected_request());
+        assert!(current_request_span().is_none());
+
+        // The retained root is exported before any longer-lived frame relay.
+        let spans = capture.spans();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "openshell.http.request")
+            .unwrap();
+        assert_eq!(
+            span_attribute(root, "openshell.request.outcome")
+                .unwrap()
+                .as_str(),
+            "upgraded"
+        );
+        crate::telemetry::emit_decision([allowed()], None);
+    })
+    .with_subscriber(capture.subscriber())
+    .await;
+    let events = capture.events.json_events();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0]["metadata"]["correlation_uid"], "handshake");
+    assert_eq!(events[0]["unmapped"]["request_sequence"], 1);
+    assert_eq!(events[2]["metadata"]["correlation_uid"], "handshake");
+    assert_eq!(events[2]["unmapped"]["request_sequence"], 2);
+    assert!(events[0]["trace"]["uid"].is_string());
+    assert_eq!(events[0]["trace"], events[2]["trace"]);
+    for index in [1, 3] {
+        assert!(events[index]["metadata"]["correlation_uid"].is_null());
+        assert!(events[index]["unmapped"]["request_sequence"].is_null());
+        assert!(events[index]["unmapped"]["http_event_kind"].is_null());
+        assert!(events[index]["trace"].is_null());
+    }
+    assert_eq!(capture.created_span_names(), ["openshell.http.request"]);
+    capture.shutdown();
+}
+
+#[tokio::test]
+async fn cancelling_a_detached_handoff_ends_the_root_without_emitting_or_leaking() {
+    let capture = RequestTracing::new(Some(opentelemetry_sdk::trace::Sampler::AlwaysOn));
+    let mut pending = Box::pin(
+        scope_connection(async {
+            let correlation = RequestCorrelation::new(&request(), &context());
+            correlation.record_response_status(101);
+            let handoff = correlation.finish_http_request_for_event().unwrap();
+            assert!(!is_inspected_request());
+            std::future::pending::<()>().await;
+            handoff.emit(allowed());
+        })
+        .with_subscriber(capture.subscriber()),
+    );
+    assert!(futures::poll!(&mut pending).is_pending());
+    assert!(!is_inspected_request());
+    drop(pending);
+    assert_eq!(capture.spans().len(), 1);
+    assert!(capture.events.json_events().is_empty());
+    tracing::subscriber::with_default(capture.subscriber(), || {
+        crate::telemetry::emit_decision([allowed()], None);
+    });
+    let events = capture.events.json_events();
+    assert_eq!(events.len(), 1);
+    assert!(events[0]["metadata"]["correlation_uid"].is_null());
+    assert!(events[0]["unmapped"]["request_sequence"].is_null());
+    assert!(events[0]["trace"].is_null());
+    capture.shutdown();
+}
+
+#[tokio::test]
+async fn an_uninspected_handoff_has_no_detached_attribution() {
+    let capture = OcsfCapture::default();
+    let _subscriber = capture.install();
+    scope_connection(async {
+        let correlation = RequestCorrelation::uninspected();
+        assert!(correlation.finish_http_request_for_event().is_none());
+        assert!(!is_inspected_request());
+        crate::telemetry::emit_decision([allowed()], None);
+    })
+    .await;
+    let events = capture.json_events();
+    assert_eq!(events.len(), 1);
+    assert!(events[0]["metadata"]["correlation_uid"].is_null());
+    assert!(events[0]["unmapped"]["request_sequence"].is_null());
+    assert!(events[0]["unmapped"]["http_event_kind"].is_null());
+}
+
+#[tokio::test]
 async fn stage_results_record_bounded_errors_and_preserve_a_failed_root() {
     use opentelemetry::trace::Status;
     use opentelemetry_sdk::trace::Sampler;

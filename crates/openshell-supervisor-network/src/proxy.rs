@@ -323,6 +323,8 @@ impl ProxyHandle {
         required_proxy_authorization: Option<Arc<str>>,
         reserved_destination: Option<ReservedDestination>,
     ) -> Result<Self> {
+        crate::l7::correlation::init_request_correlation()?;
+
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
         // network namespace is available (e.g. missing CAP_NET_ADMIN) and the
@@ -589,11 +591,14 @@ impl ProxyHandle {
                             )
                             .await
                             {
-                                egress_emit!(build_proxy_connection_error_event(
-                                    peer_addr,
-                                    transparent_destination_addr,
-                                    format!("Proxy connection error: {err}"),
-                                ));
+                                crate::l7::correlation::emit_error_event(
+                                    build_proxy_connection_error_event(
+                                        peer_addr,
+                                        transparent_destination_addr,
+                                        format!("Proxy connection error: {err}"),
+                                    ),
+                                    &err,
+                                );
                             }
                         });
                     }
@@ -6693,7 +6698,7 @@ async fn handle_forward_proxy_inner(
                     } else {
                         HttpOutcome::PlatformError
                     },
-                    Some("request_middleware_denied"),
+                    denial.is_none().then_some("request_middleware_failed"),
                 );
                 let response = denial.as_ref().map_or_else(
                     || {
@@ -7304,7 +7309,7 @@ async fn handle_forward_proxy_inner(
             websocket_permessage_deflate,
             websocket_subprotocol,
         } => {
-            correlation.finish_http_request();
+            let handshake_event = correlation.finish_http_request_for_event();
             // Protocols whose rules apply to individual HTTP requests never
             // upgrade (see `upgrade_refusal_for_protocol`). No current path
             // forwards upgrade headers for them: the request-side refusal
@@ -7347,6 +7352,7 @@ async fn handle_forward_proxy_inner(
                     ..Default::default()
                 }
             };
+            upgrade_options.handshake_event = handshake_event;
             upgrade_options.generation_guard = Some(&forward_generation_guard);
             upgrade_options.assembly_budget = Some(opa_engine.websocket_assembly_budget());
             upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
