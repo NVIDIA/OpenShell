@@ -7,10 +7,21 @@ metadata:
   name: {{ include "openshell.fullname" . }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.service.type }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   ports:
-    - port: {{ .Values.service.port }}
+    - port: {{ include "openshell.servicePort" . }}
       targetPort: grpc
       protocol: TCP
       name: grpc

@@ -821,3 +821,16 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: supervisor_topology requires the kubernetes compute driver
+
+  - it: points the supervisor pool at the gateway Service on servicePort
+    template: templates/supervisor.yaml
+    set:
+      service.servicePort: 443
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: https://openshell.gateway.svc.cluster.local:443
+        documentIndex: 0

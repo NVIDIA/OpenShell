@@ -502,7 +502,19 @@ matchLabels:
 {{- .Values.server.grpcEndpoint -}}
 {{- else -}}
 {{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
-{{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
+{{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int (include "openshell.servicePort" .)) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Port the gateway Service exposes. It defaults to service.port, the gateway's
+listener, which the Service always targets through the named grpc port.
+*/}}
+{{- define "openshell.servicePort" -}}
+{{- if kindIs "invalid" .Values.service.servicePort -}}
+{{- .Values.service.port -}}
+{{- else -}}
+{{- .Values.service.servicePort -}}
 {{- end -}}
 {{- end }}
 
@@ -824,6 +836,21 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if and $metricsEnabled (or (eq $metricsPort $servicePort) (eq $metricsPort $healthPort)) -}}
 {{- fail "service.metricsPort must differ from service.port and service.healthPort when metrics.enabled=true" -}}
+{{- end -}}
+{{- if not (kindIs "invalid" .Values.service.servicePort) -}}
+{{- $exposedPortValue := toString .Values.service.servicePort -}}
+{{- if or (not (regexMatch `^[0-9]+$` $exposedPortValue)) (lt (int $exposedPortValue) 1) (gt (int $exposedPortValue) 65535) -}}
+{{- fail "service.servicePort must be an integer between 1 and 65535, or null to expose service.port" -}}
+{{- end -}}
+{{- if and $metricsEnabled (eq (int $exposedPortValue) $metricsPort) -}}
+{{- fail "service.servicePort must differ from service.metricsPort when metrics.enabled=true; the gateway Service exposes both" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.service.loadBalancerSourceRanges (ne .Values.service.type "LoadBalancer") -}}
+{{- fail "service.loadBalancerSourceRanges requires service.type=LoadBalancer" -}}
+{{- end -}}
+{{- if and .Values.service.loadBalancerClass (ne .Values.service.type "LoadBalancer") -}}
+{{- fail "service.loadBalancerClass requires service.type=LoadBalancer" -}}
 {{- end -}}
 {{- if and .Values.grpcRoute.enabled (dig "replicaRouting" "enabled" false .Values.grpcRoute) -}}
 {{- if ne $workloadKind "statefulset" -}}
