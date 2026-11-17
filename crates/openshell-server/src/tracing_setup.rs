@@ -52,8 +52,8 @@ where
         {
             return writeln!(
                 writer,
-                "{} OCSF {}",
-                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                "{:.3} OCSF {}",
+                jiff::Timestamp::now(),
                 ocsf.format_shorthand()
             );
         }
@@ -389,6 +389,10 @@ mod gateway_format_tests {
         reader.rewind().unwrap();
         let mut output = String::new();
         reader.read_to_string(&mut output).unwrap();
+        let timestamp = output.split_once(" OCSF ").unwrap().0;
+        timestamp.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(timestamp.len(), 24);
+        assert!(timestamp.ends_with('Z'));
         assert!(output.contains(&expected), "missing OCSF details: {output}");
         assert!(!output.contains("ocsf_event"));
         assert!(output.contains("ordinary diagnostic"));

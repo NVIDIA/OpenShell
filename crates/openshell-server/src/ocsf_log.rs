@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use jiff::{Timestamp, civil::Date, tz::Offset};
 use openshell_ocsf::OcsfEvent;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
@@ -234,7 +234,7 @@ fn run_writer(collector: &Collector) {
                 collector.complete(Some("unavailable"));
                 continue;
             }
-            match writer.append(&line, Utc::now().date_naive()) {
+            match writer.append(&line, Offset::UTC.to_datetime(Timestamp::now()).date()) {
                 Ok(()) => {
                     backoff = Duration::from_millis(500);
                     collector.complete(None);
@@ -255,7 +255,7 @@ fn run_writer(collector: &Collector) {
 struct FileWriter {
     config: OcsfLogConfig,
     file: Option<File>,
-    day: Option<NaiveDate>,
+    day: Option<Date>,
 }
 
 impl FileWriter {
@@ -291,7 +291,9 @@ impl FileWriter {
             options.mode(0o600);
         }
         let mut file = options.open(&self.config.path)?;
-        self.day = Some(DateTime::<Utc>::from(file.metadata()?.modified()?).date_naive());
+        let modified =
+            Timestamp::try_from(file.metadata()?.modified()?).map_err(io::Error::other)?;
+        self.day = Some(Offset::UTC.to_datetime(modified).date());
         let discarded = recover_tail(&mut file)?;
         if discarded > 0 {
             metrics::counter!("openshell_ocsf_log_recovery_discarded_bytes_total")
@@ -305,7 +307,7 @@ impl FileWriter {
         Ok(())
     }
 
-    fn append(&mut self, line: &[u8], today: NaiveDate) -> io::Result<()> {
+    fn append(&mut self, line: &[u8], today: Date) -> io::Result<()> {
         if self.file.is_none() {
             self.open()?;
         }
@@ -367,7 +369,7 @@ fn recover_tail(file: &mut File) -> io::Result<u64> {
     Ok(length)
 }
 
-fn rotate(path: &Path, day: NaiveDate) -> io::Result<()> {
+fn rotate(path: &Path, day: Date) -> io::Result<()> {
     loop {
         let mut name = path.as_os_str().to_os_string();
         name.push(format!(".{day}.{}", uuid::Uuid::new_v4()));
@@ -410,7 +412,7 @@ fn prune_rotated(path: &Path, max_files: usize) -> io::Result<()> {
         let Some((day, unique)) = suffix.split_once('.') else {
             continue;
         };
-        if let Ok(day) = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        if let Ok(day) = Date::strptime("%Y-%m-%d", day)
             && uuid::Uuid::parse_str(unique).is_ok()
             && entry.file_type()?.is_file()
         {
@@ -626,7 +628,7 @@ mod tests {
     fn same_day_archives_never_overwrite_and_pruning_ignores_unrelated_files() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        let today = Utc::now().date_naive();
+        let today = Offset::UTC.to_datetime(Timestamp::now()).date();
         for contents in ["first\n", "second\n", "third\n"] {
             std::fs::write(&path, contents).unwrap();
             rotate(&path, today).unwrap();
@@ -637,11 +639,20 @@ mod tests {
             .collect();
         contents.sort();
         assert_eq!(contents, ["first\n", "second\n", "third\n"]);
-        let unrelated = directory.path().join("events.jsonl.notes");
-        std::fs::write(&unrelated, "keep").unwrap();
+        let unrelated = [
+            directory.path().join("events.jsonl.notes"),
+            directory
+                .path()
+                .join(format!("events.jsonl.20260101.{}", uuid::Uuid::new_v4())),
+        ];
+        for path in &unrelated {
+            std::fs::write(path, "keep").unwrap();
+        }
         prune_rotated(&path, 1).unwrap();
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
-        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+        for path in unrelated {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+        }
     }
 
     #[test]
@@ -652,13 +663,25 @@ mod tests {
         settings.rotation = OcsfLogRotation::Daily;
         settings.max_files = std::num::NonZeroUsize::new(1);
         let mut writer = FileWriter::new(settings);
-        let today = Utc::now().date_naive();
-        writer.append(b"{}\n", today).unwrap();
-        writer
-            .append(b"{\"next\":true}\n", today.succ_opt().unwrap())
+        std::fs::write(&path, b"{}\n").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_767_225_599))
             .unwrap();
+        let today = Date::new(2026, 1, 1).unwrap();
+        writer.append(b"{\"next\":true}\n", today).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"next\":true}\n");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        assert!(std::fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with("events.jsonl.2025-12-31.")
+        }));
     }
 
     #[tokio::test]

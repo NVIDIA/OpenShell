@@ -68,7 +68,7 @@ clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
