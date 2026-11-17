@@ -98,6 +98,13 @@ pub fn from_yaml(yaml: &str) -> Result<proto::SandboxPolicy> {
         .context("parse the policy")
 }
 
+/// [`base`] with the top-level sections in `yaml`, such as
+/// `network_policies` or `network_middlewares`, added. Use it for policy
+/// settings [`Endpoint`] doesn't cover, such as L7 rules.
+pub fn base_with(yaml: &str) -> Result<proto::SandboxPolicy> {
+    from_yaml(&format!("{BASE}{yaml}"))
+}
+
 /// Replace `sandbox`'s policy with `policy` through `policy set --wait`, and
 /// wait up to two minutes until the sandbox has loaded it.
 pub async fn set(sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result {
@@ -231,6 +238,11 @@ mod tests {
                 .expect("the serialized policy parses");
         assert_eq!(round_trip, expected);
         assert_eq!(from_yaml(&yaml).expect("the YAML parses"), expected);
+        assert_eq!(
+            base_with(yaml.strip_prefix(BASE).expect("starts with the base"))
+                .expect("the YAML parses"),
+            expected
+        );
     }
 
     #[test]

@@ -125,9 +125,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   configures (`.rest(Access::Full)`, `.credential_binding(provider)`, ...).
   Pass the result to `cx.sandbox(..).policy(policy)`, or `policy::to_yaml`
   for the CLI. `policy::binaries_yaml(binaries)` writes a `binaries:` list
-  into policy YAML a test writes by hand. `policy::from_yaml` reads a policy
-  file, and `policy::set(&sandbox, &policy)` replaces a running sandbox's
-  policy and waits until it is loaded.
+  into policy YAML a test writes by hand. `policy::base_with(yaml)` adds YAML
+  sections, such as L7 rules, to the base policy. `policy::from_yaml` reads a
+  policy file, and `policy::set(&sandbox, &policy)` replaces a running
+  sandbox's policy and waits until it is loaded.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
 - `cx.import_profile(profile)` to import a provider profile and return its
   `id`, and `cx.create_provider(name, type, credentials)` to create a
