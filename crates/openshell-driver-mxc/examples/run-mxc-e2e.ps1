@@ -336,8 +336,11 @@ function Start-Gw([string]$DbUrl = "sqlite::memory:") {
     # --config token: Start-Process -ArgumentList does not quote array elements, so a
     # config path containing a space gets split and the gateway's arg parser rejects it.
     $env:OPENSHELL_GATEWAY_CONFIG = $toml
+    # The database URL embeds the checkout path, so it can contain spaces: quote each
+    # argument ourselves (same helper as the other native launches in this script).
+    $gwArguments = @("--disable-tls", "--db-url", $DbUrl, "--port", $Port, "--log-level", "info")
     $p = Start-Process -FilePath $gateway `
-        -ArgumentList @("--disable-tls", "--db-url", $DbUrl, "--port", $Port, "--log-level", "info") `
+        -ArgumentList (($gwArguments | ForEach-Object { Quote-NativeArgument ([string]$_) }) -join ' ') `
         -WorkingDirectory $here -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
     $deadline = (Get-Date).AddSeconds(30)
