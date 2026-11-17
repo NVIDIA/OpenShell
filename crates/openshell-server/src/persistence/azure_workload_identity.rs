@@ -28,8 +28,8 @@ use tokio::time::Instant;
 const POSTGRES_SCOPE: &str = "https://ossrdbms-aad.database.windows.net/.default";
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const CLOCK_SKEW: Duration = Duration::from_secs(30);
-// SQLx exposes no notification for returned idle connections. Poll only while
-// refresh is unavailable/in flight; a valid cached token keeps SQLx's native wait.
+// SQLx exposes no notification for returned idle connections. Poll alongside
+// credential acquisition so returned sessions can win without waiting for Entra.
 const REUSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn config_error(message: &'static str) -> sqlx::Error {
