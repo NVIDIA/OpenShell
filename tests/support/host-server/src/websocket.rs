@@ -148,6 +148,10 @@ mod tests {
 
     /// Complete a handshake with `recorder`, send `frames`, and close.
     async fn send_frames(recorder: &WebSocketRecorder, frames: &[(u8, Vec<u8>)]) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "standalone test support has no openshell-core dependency and enables TCP_NODELAY below"
+        )]
         let mut stream = TcpStream::connect(("127.0.0.1", recorder.port))
             .await
             .unwrap();

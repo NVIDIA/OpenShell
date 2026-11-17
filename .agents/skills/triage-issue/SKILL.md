@@ -15,6 +15,8 @@ For a specific issue, assess it when requested. For batch triage, first show the
 
 Do not apply an acceptance state, place issues on the roadmap, or make a product investment decision. Do not introduce `agent:*` workflow labels. Follow `SECURITY.md` if the report may disclose a vulnerability; do not copy sensitive details into a public comment.
 
+Follow [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications): defer area/topic classification labels until the work is accepted. They drive subscriber notifications, so technical classification alone must not send unaccepted intake to those streams. Continue to record appropriate triage state.
+
 ## Assess one issue
 
 1. Run `gh issue view <id> --json number,title,body,state,labels,author,comments`. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current `state:*` label definitions and resolve unclear meanings. Check for previous triage, new human evidence, an existing owner, and duplicate issues.
@@ -22,6 +24,7 @@ Do not apply an acceptance state, place issues on the roadmap, or make a product
 3. For bugs, verify reproduction steps using only OpenShell deployments. Do not install third-party tools solely to demonstrate reproducibility. Check the OpenShell version and relevant deployment details. For features, check the user-facing workflow and alternatives. Consider applicable middleware, interceptors, providers, and other extension points; prefer an applicable extension when it satisfies the use case, and do not dismiss it merely because it runs another service.
 4. For proposed configuration, CLI, SDK, or other UX changes, request notional examples of the suggested interaction if missing. Keep the issue framed entirely in terms of OpenShell.
 5. Reproduce or investigate enough to distinguish a confirmed bug, feasible feature, missing evidence, duplicate, already-fixed behavior, or expected behavior. State what was observed and what remains uncertain. Do not turn a failed reproduction attempt alone into a dismissal.
-6. Post a concise comment beginning with `> **📋 triage-agent**`. Explain the evidence, any exact missing information, and the next human decision. Replace the previous assessment state with the appropriate current assessment state only after checking repository definitions. Preserve maintainer acceptance, execution state, roadmap decisions, and unrelated labels; do not accumulate assessment states.
+6. Post a concise comment beginning with `> **📋 triage-agent**`. Explain the evidence, any exact missing information, and the next human decision. Keep this assessment judgment and comment in triage.
+7. Use [`/label-issue`](../label-issue/SKILL.md) to reconcile labels. Pass the assessment outcome and reviewed label subset through its assessment-only path. For accepted work, request classification when needed.
 
 If substantial technical uncertainty remains, recommend `create-spike` with specific questions to answer. A direct user request can separately authorize planning or implementation through `build-from-issue`; it does not change the issue's recorded disposition.

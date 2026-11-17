@@ -363,6 +363,7 @@ pub fn supervisor_pod(
     network_additional_ca: Option<(&str, &str)>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
+    attach_request_timeout_seconds: Option<u64>,
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -404,6 +405,12 @@ pub fn supervisor_pod(
             .iter()
             .map(|(name, value)| env_var(name, value)),
     );
+    if let Some(timeout_seconds) = attach_request_timeout_seconds {
+        environment.push(env_var(
+            "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+            &timeout_seconds.to_string(),
+        ));
+    }
     if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
         environment.push(env_var(
             openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -1055,6 +1062,7 @@ mod tests {
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod")
     }
@@ -1140,6 +1148,7 @@ mod tests {
                 ),
                 ("TRACEPARENT", TRACEPARENT.to_string()),
             ],
+            None,
         )
         .expect("render supervisor Pod");
         let environment = pod.spec.expect("Pod spec").containers[0]
@@ -1154,6 +1163,56 @@ mod tests {
             "http://collector:4317"
         );
         assert_eq!(environment["TRACEPARENT"], TRACEPARENT);
+    }
+
+    #[test]
+    fn supervisor_pod_sets_attach_request_timeout_only_when_configured() {
+        let env = |timeout: Option<u64>| {
+            supervisor_pod(
+                "sandbox",
+                &SandboxRuntimeNames::new("pair"),
+                "pair",
+                "demo",
+                "gateway",
+                "supervisor:latest",
+                None,
+                "sandbox-sa",
+                1000,
+                1000,
+                &[],
+                "https://gateway:8080",
+                SupervisorClientTls::Disabled,
+                "{}",
+                "info",
+                600,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+                owner(),
+                &[],
+                timeout,
+            )
+            .unwrap()
+            .spec
+            .expect("Pod spec")
+            .containers[0]
+                .env
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|variable| (variable.name, variable.value.unwrap_or_default()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(!env(None).contains_key("OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"));
+        assert_eq!(
+            env(Some(900))["OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"],
+            "900"
+        );
     }
 
     #[test]
@@ -1261,6 +1320,7 @@ mod tests {
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -1430,6 +1490,7 @@ mod tests {
                 Some(("openshell-additional-ca-gateway-generation", digest)),
                 owner(),
                 &[],
+                None,
             )
             .expect("render supervisor Pod with destination trust");
             let pod = crate::app_listener::configure_supervisor_pod(
@@ -1622,6 +1683,7 @@ mod tests {
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod")
     }

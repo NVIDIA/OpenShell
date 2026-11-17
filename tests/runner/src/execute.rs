@@ -20,7 +20,9 @@ use anyhow::{Context, Result, ensure};
 use tmachine::Session;
 use tmachine::config::Config;
 
-use crate::bundle::{Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY, TEST_TIMEOUT_SECS};
+use crate::bundle::{
+    Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY, TEST_GRACE_SECS, TEST_TIMEOUT_SECS,
+};
 use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
@@ -31,9 +33,9 @@ const NEXTEST_LOG: &str = "nextest.log";
 // Matches the installers' own wait: an HA k3s gateway booted from a cached
 // disk can take minutes to report healthy.
 const READY_TIMEOUT_SECS: u64 = 300;
-/// How long the nextest run may take in total. Individual tests are bounded
-/// by the nextest profile's slow-timeout; this catches a run that stops
-/// making progress some other way.
+/// How long the test run may take in total. Individual tests are bounded by
+/// [`TEST_TIMEOUT_SECS`]; this catches a run that stops making progress some
+/// other way.
 const RUN_TIMEOUT: Duration = Duration::from_mins(45);
 /// Slack beyond the readiness check's own timeout for SSH and process start.
 const READY_SLACK: Duration = Duration::from_mins(1);
@@ -45,9 +47,6 @@ const NEXTEST_NO_TESTS_RUN: i32 = 4;
 /// The variable that tells a test its per-test limit; testkit reads it
 /// (`openshell_testkit::TIMEOUT_ENV`).
 const TEST_TIMEOUT_ENV: &str = "OPENSHELL_TEST_TIMEOUT_SECS";
-/// How long a stopped test has between SIGTERM and SIGKILL. Matches nextest's
-/// default, so both kinds of bundle stop a hung test the same way.
-const TEST_GRACE_SECS: u64 = 10;
 /// A testkit program's exit code when a test failed. It exits 2 when tests
 /// could not run.
 const PROGRAM_TEST_FAILED: i32 = 1;

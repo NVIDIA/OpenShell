@@ -6,6 +6,7 @@
 mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;
+mod mutation_admission;
 pub mod mutation_lock;
 mod postgres;
 #[cfg(test)]
@@ -16,11 +17,12 @@ mod sqlite;
 pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
+pub use mutation_admission::ADMISSION_OBJECT_TYPE as MUTATION_ADMISSION_OBJECT_TYPE;
 
 use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 pub use mutation_lock::{LockMode, MutationLockKey, MutationLockSet};
@@ -39,6 +41,11 @@ pub type PersistenceResult<T> = Result<T, PersistenceError>;
 /// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
 /// requests into independently retryable, bounded write statements.
 pub const DELETE_MANY_BATCH_SIZE: usize = 128;
+
+/// Maximum number of object ids sent in one existence lookup.
+///
+/// Keep this well below `SQLite`'s bind-variable limit.
+pub const EXISTING_IDS_BATCH_SIZE: usize = 500;
 
 /// Persistence-layer error type.
 #[derive(Debug, Error, Clone)]
@@ -766,6 +773,61 @@ impl Store {
         ))
     }
 
+    /// Insert a durable mutation admission unless its caller bucket already
+    /// holds `limit` admissions. Returns `Ok(None)` when the bucket is full.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.create_mutation_admission", otel.status_code = tracing::field::Empty, object.id = %id, workspace = %bucket, max_count = limit)
+    )]
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        store_dispatch_traced!(self.create_mutation_admission(id, name, bucket, payload, limit))
+    }
+
+    /// List completed mutation admissions last written at or before
+    /// `cutoff_ms`, oldest first, optionally for one bucket. Admissions are
+    /// rewritten only once, on completion, so `resource_version > 1` marks them
+    /// for every gateway version.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.list_completed_mutation_admissions", otel.status_code = tracing::field::Empty, limit = limit)
+    )]
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        bucket: Option<&str>,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<mutation_admission::CompletedAdmission>> {
+        store_dispatch_traced!(self.list_completed_mutation_admissions(bucket, cutoff_ms, limit))
+    }
+
+    /// Delete mutation admissions by id and mark their buckets for recount.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete_mutation_admissions", otel.status_code = tracing::field::Empty, object_count = ids.len())
+    )]
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        store_dispatch_traced!(self.delete_mutation_admissions(ids))
+    }
+
+    /// Backdate an object's last write to exercise expiry.
+    #[cfg(test)]
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        store_dispatch!(self.backdate(id, updated_at_ms))
+    }
+
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",
@@ -828,6 +890,28 @@ impl Store {
     )]
     pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
         store_dispatch_traced!(self.delete_many(object_type, ids))
+    }
+
+    /// Return the subset of `ids` that exist for an object type, using bounded
+    /// primary-key lookups.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(
+            otel.name = "store.existing_ids",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            object_count = ids.len(),
+            batch_count = ids.len().div_ceil(EXISTING_IDS_BATCH_SIZE),
+        )
+    )]
+    pub async fn existing_ids(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashSet<String>> {
+        store_dispatch_traced!(self.existing_ids(object_type, ids))
     }
 
     /// Count objects of a given type within a workspace.

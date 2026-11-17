@@ -4,7 +4,7 @@
 use serde::Deserialize;
 
 use crate::context::Context;
-use crate::error::{Error, Result, ResultExt as _};
+use crate::error::{Result, ResultExt as _};
 use crate::yaml_file::YamlFile;
 
 impl Context {
@@ -17,7 +17,6 @@ impl Context {
             id: String,
         }
         let id = serde_yml::from_str::<Profile>(profile)
-            .map_err(|error| Error::from_error(&error))
             .context("read the provider profile's id")?
             .id;
         // Deleting a missing profile succeeds, so register the delete before

@@ -15,6 +15,18 @@ pub enum Poll<T> {
     Pending(String),
 }
 
+/// Fail unless `future` finishes within `timeout`. For a deadline shorter
+/// than the step's own, such as one that must fit inside the runner's kill.
+pub async fn with_deadline<T>(
+    what: &str,
+    timeout: Duration,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| Error::msg(format!("{what} did not finish within {timeout:?}")))?
+}
+
 /// Observe until the condition holds or `timeout` elapses.
 ///
 /// An error from `observe` fails immediately. On timeout, the error reports

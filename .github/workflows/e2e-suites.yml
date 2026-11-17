@@ -31,6 +31,11 @@ on:
         description: Immutable ID of the prepared integration inputs artifact
         required: true
         type: string
+      external-drivers:
+        description: Also run the rows that run a compute driver as an external service, which need the integration inputs prepared with external-drivers
+        required: false
+        type: boolean
+        default: false
       prebuilt:
         description: Run the rows with this run's prebuilt tests instead of building them in every job; conformance rows take the openshell-conformance-x86_64-unknown-linux-musl artifact, other rows their family's openshell-e2e-bundle-<family>-x86_64-unknown-linux-musl artifact
         required: false
@@ -66,6 +71,7 @@ jobs:
         id: rows
         env:
           FAMILY: ${{ inputs.family }}
+          EXTERNAL_DRIVERS: ${{ inputs.external-drivers }}
         run: |
           set -euo pipefail
           # Only amd64 for now: CI has no arm64 runner with KVM for tmachine,
@@ -76,10 +82,14 @@ jobs:
           # workspace of its own.
           rows='[
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb-external-docker-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true},
             {"environment":"fedora-podman-rootful","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-k3s","installer":"k3s","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful-cdi","installer":"deb","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful-keycloak","installer":"deb","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
@@ -91,18 +101,19 @@ jobs:
             {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"host-gateway","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-default","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-auto","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-keep-id","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootful-userns-private","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-default","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-auto","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-keep-id","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-private","installer":"binaries","family":"drivers/podman","gateway":"tmachine","runner":"ubuntu-24.04"}
+            {"environment":"fedora-podman-rootful-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"}
           ]'
           # `suite` names the row's tests in the job and artifact names.
-          matrix=$(jq -c --arg family "${FAMILY}" '{include: map(
+          matrix=$(jq -c --arg family "${FAMILY}" --arg external "${EXTERNAL_DRIVERS}" '{include: map(
               select($family == "" or .family == $family or (.family | startswith($family + "/")))
+              | select((.external_driver // false) == false or $external == "true")
               | .package //= ""
               | .suite = (if .package == "" then .family else "\(.family)/\(.package)" end)
               | .artifact = ([.suite, .environment, .installer] | join("-") | gsub("/"; "-"))

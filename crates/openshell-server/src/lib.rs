@@ -14,6 +14,7 @@
 //! external endpoint; it does not switch on driver names.
 
 mod auth;
+mod bus_sweeper;
 pub mod certgen;
 pub mod cli;
 mod compute;
@@ -322,6 +323,9 @@ pub(crate) struct ServerStartupConfig {
 /// Server state shared across handlers.
 #[derive(Debug)]
 pub struct ServerState {
+    pub(crate) discovery: grpc::service_discovery::DiscoveryState,
+    /// Process-local bound on active discovery streams.
+    pub(crate) discovery_watches: Arc<tokio::sync::Semaphore>,
     /// Server configuration.
     pub config: Config,
 
@@ -670,6 +674,8 @@ impl ServerState {
             service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            discovery: grpc::service_discovery::DiscoveryState::default(),
+            discovery_watches: Arc::new(tokio::sync::Semaphore::new(32)),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -1282,13 +1288,18 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
-    // The poller exists to observe writes made by other replicas. Single-
-    // replica backends have none, so it would only add load.
+    // The poller and sweeper exist to observe writes made by other replicas.
+    // Single-replica backends have none, so they would only add load.
     if !store.is_single_replica() {
         sandbox_watch::spawn_store_poller(
             store.clone(),
             state.sandbox_watch_bus.clone(),
             sandbox_watch::DEFAULT_STORE_POLL_INTERVAL,
+            shutdown_rx.clone(),
+        );
+        bus_sweeper::spawn(
+            store.clone(),
+            state.tracing_log_bus.clone(),
             shutdown_rx.clone(),
         );
     }
@@ -1300,6 +1311,7 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     grpc::service_advertisement::spawn_cleanup(state.clone(), shutdown_rx.clone());
+    grpc::mutation_replay::spawn_expiry_sweeper(state.clone(), shutdown_rx.clone());
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
@@ -2362,6 +2374,10 @@ async fn build_compute_runtime(
         .and_then(|runtime| {
             runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
         })
+        .and_then(|runtime| {
+            runtime
+                .with_provisioning_repair_window_seconds(config.provisioning_repair_window_seconds)
+        })
         .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
@@ -2617,7 +2633,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::sync::watch;
     use tokio_rustls::TlsConnector;
 
@@ -3157,7 +3173,11 @@ mod tests {
                 .iter()
                 .map(|service| service.name.as_str())
                 .collect::<Vec<_>>(),
-            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+            [
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.ServiceDiscovery"
+            ]
         );
 
         stop_listener(shutdown, handle).await;
@@ -3167,7 +3187,7 @@ mod tests {
         let connect_addr: SocketAddr = format!("127.0.0.1:{}", addr.port())
             .parse()
             .expect("failed to build loopback connect addr");
-        let mut stream = TcpStream::connect(connect_addr)
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(connect_addr)
             .await
             .expect("failed to connect to test listener");
         stream
@@ -3376,7 +3396,7 @@ mod tests {
         ));
 
         let connector = test_tls_connector(&tls_dir.path().join("ca.pem"), None);
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect to metrics listener");
         let mut tls_stream = connector
@@ -3402,7 +3422,7 @@ mod tests {
             "expected a successful HTTPS metrics response"
         );
 
-        let mut plaintext = TcpStream::connect(address)
+        let mut plaintext = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect for plaintext request");
         plaintext
@@ -3481,7 +3501,7 @@ mod tests {
             &directory.path().join("ca.pem"),
             Some((&metrics_client_cert, &metrics_client_key)),
         );
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect with metrics client certificate");
         let mut metrics_client = metrics_connector
@@ -3511,7 +3531,7 @@ mod tests {
             &directory.path().join("ca.pem"),
             Some((&gateway_client_cert, &gateway_client_key)),
         );
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect with gateway client certificate");
         let rejected_response = match gateway_connector
@@ -3545,7 +3565,7 @@ mod tests {
         );
 
         let anonymous_connector = test_tls_connector(&directory.path().join("ca.pem"), None);
-        let stream = TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("failed to connect without a client certificate");
         let anonymous_response = match anonymous_connector
@@ -4068,7 +4088,7 @@ mod tests {
 
     /// Status code of `GET path`, or `None` when nothing answers.
     async fn http_status(address: SocketAddr, path: &str) -> Option<u16> {
-        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[address])
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .ok()?;
         stream
@@ -4178,10 +4198,11 @@ mod tests {
             loop {
                 let (mut client, _) = listener.accept().await.expect("accept");
                 openshell_core::net::set_tcp_nodelay_best_effort(&client);
-                let mut upstream =
-                    openshell_core::net::connect_tcp_nodelay_best_effort(&upstream_addresses)
-                        .await
-                        .expect("connect to PostgreSQL");
+                let mut upstream = openshell_core::net::connect_tcp_nodelay_best_effort(
+                    upstream_addresses.as_slice(),
+                )
+                .await
+                .expect("connect to PostgreSQL");
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
                 });

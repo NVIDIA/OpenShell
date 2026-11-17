@@ -231,9 +231,7 @@ fn env(name: &str) -> Option<String> {
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path)
-        .map_err(Error::from_display)
-        .context(format!("read {}", path.display()))
+    std::fs::read(path).context(format!("read {}", path.display()))
 }
 
 #[cfg(test)]

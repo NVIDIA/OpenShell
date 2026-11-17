@@ -40,6 +40,9 @@ const SLOW_TERMINATE_AFTER: u64 = 4;
 /// bundle, so a hung test fails after two minutes instead of holding the lane
 /// until the job times out.
 pub const TEST_TIMEOUT_SECS: u64 = SLOW_PERIOD_SECS * SLOW_TERMINATE_AFTER;
+/// How long a stopped test has between SIGTERM and SIGKILL, on either kind of
+/// bundle.
+pub const TEST_GRACE_SECS: u64 = 10;
 
 /// The nextest configuration written into a nextest bundle.
 fn nextest_config() -> String {
@@ -47,7 +50,7 @@ fn nextest_config() -> String {
         r#"# Written by the OpenShell test runner.
 [profile.openshell]
 fail-fast = false
-slow-timeout = {{ period = "{SLOW_PERIOD_SECS}s", terminate-after = {SLOW_TERMINATE_AFTER} }}
+slow-timeout = {{ period = "{SLOW_PERIOD_SECS}s", terminate-after = {SLOW_TERMINATE_AFTER}, grace-period = "{TEST_GRACE_SECS}s" }}
 
 [profile.openshell.junit]
 path = "junit.xml"
@@ -358,7 +361,9 @@ mod tests {
     #[test]
     fn nextest_profile_stops_a_test_at_the_shared_timeout() {
         let config = nextest_config();
-        assert!(config.contains(r#"slow-timeout = { period = "30s", terminate-after = 4 }"#));
+        assert!(config.contains(
+            r#"slow-timeout = { period = "30s", terminate-after = 4, grace-period = "10s" }"#
+        ));
         assert_eq!(TEST_TIMEOUT_SECS, 120);
     }
 

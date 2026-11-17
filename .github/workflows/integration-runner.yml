@@ -24,7 +24,7 @@ on:
         type: string
         default: >-
           [
-            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"}
+            {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"e2e-podman"}
           ]
 
 permissions:

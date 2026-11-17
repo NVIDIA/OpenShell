@@ -218,6 +218,12 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
+    /// Path to a PEM CA bundle for an OIDC issuer signed by a private CA.
+    /// Must be a regular file no larger than 1 MiB. The certificates augment
+    /// platform trust roots for OIDC requests only.
+    #[arg(long, env = "OPENSHELL_OIDC_CA_BUNDLE")]
+    oidc_ca_bundle: Option<PathBuf>,
+
     /// Development only: permit OIDC metadata and JWKS over HTTP when the
     /// endpoint uses a numeric loopback address.
     #[arg(
@@ -408,6 +414,18 @@ fn resolve_legacy_driver_selector_env(args: &mut RunArgs) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+fn in_range(name: &str, value: u32, range: std::ops::RangeInclusive<u32>) -> Result<u32> {
+    if range.contains(&value) {
+        Ok(value)
+    } else {
+        Err(miette::miette!(
+            "{name} must be between {} and {}",
+            range.start(),
+            range.end()
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -718,9 +736,53 @@ fn prepare_server_config_with_drivers(
         config.image_preparation_timeout_seconds = seconds;
     }
 
+    if let Some(limit) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.mutation_admission_limit_per_caller)
+    {
+        config.mutation_admission_limit_per_caller = in_range(
+            "mutation_admission_limit_per_caller",
+            limit,
+            openshell_core::config::MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE,
+        )?;
+    }
+
+    if let Some(seconds) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.mutation_replay_window_seconds)
+    {
+        config.mutation_replay_window_seconds = in_range(
+            "mutation_replay_window_seconds",
+            seconds,
+            openshell_core::config::MUTATION_REPLAY_WINDOW_SECONDS_RANGE,
+        )?;
+    }
+
+    if let Some(raw) = std::env::var_os("OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS") {
+        let raw = raw.to_str().ok_or_else(|| {
+            miette::miette!(
+                "OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS must be an integer number of seconds"
+            )
+        })?;
+        let window = raw.parse::<i64>().map_err(|_| {
+            miette::miette!(
+                "OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS must be an integer number of seconds"
+            )
+        })?;
+        validate_provisioning_repair_window_seconds(window)?;
+        config.provisioning_repair_window_seconds = window;
+    } else if let Some(window) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.provisioning_repair_window_seconds)
+    {
+        validate_provisioning_repair_window_seconds(window)?;
+        config.provisioning_repair_window_seconds = window;
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
+            ca_bundle: args.oidc_ca_bundle.clone(),
             dangerously_allow_insecure_http: args.oidc_dangerously_allow_insecure_http,
             jwks_allowed_origins: args.oidc_jwks_allowed_origins.clone(),
             audience: args.oidc_audience.clone(),
@@ -1593,6 +1655,9 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         if args.oidc_issuer.is_none() && arg_defaulted(matches, "oidc_issuer") {
             args.oidc_issuer = Some(oidc.issuer.clone());
         }
+        if args.oidc_ca_bundle.is_none() && arg_defaulted(matches, "oidc_ca_bundle") {
+            args.oidc_ca_bundle.clone_from(&oidc.ca_bundle);
+        }
         if arg_defaulted(matches, "oidc_dangerously_allow_insecure_http") {
             args.oidc_dangerously_allow_insecure_http = oidc.dangerously_allow_insecure_http;
         }
@@ -1645,6 +1710,15 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.db_lock_max_connections = Some(max_connections);
     }
+}
+
+fn validate_provisioning_repair_window_seconds(window: i64) -> Result<()> {
+    if !(1..=86_400).contains(&window) {
+        return Err(miette::miette!(
+            "provisioning_repair_window_seconds must be between 1 and 86400"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u64>) -> Result<()> {
@@ -4325,6 +4399,7 @@ compute_driver = "podman"
             .remove("OPENSHELL_OIDC_AUDIENCE")
             .remove("OPENSHELL_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP")
             .remove("OPENSHELL_OIDC_JWKS_ALLOWED_ORIGINS")
+            .remove("OPENSHELL_OIDC_CA_BUNDLE")
             .run(|| {
                 let (mut args, matches) =
                     parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
@@ -4332,6 +4407,7 @@ compute_driver = "podman"
                     r#"
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com"
+ca_bundle = "/etc/openshell/oidc-ca.pem"
 audience = "openshell-cli"
 dangerously_allow_insecure_http = true
 jwks_allowed_origins = ["https://keys.example.com"]
@@ -4340,6 +4416,10 @@ jwks_allowed_origins = ["https://keys.example.com"]
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
                 assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
+                assert_eq!(
+                    args.oidc_ca_bundle.as_deref(),
+                    Some(std::path::Path::new("/etc/openshell/oidc-ca.pem"))
+                );
                 assert_eq!(args.oidc_audience, "openshell-cli");
                 assert!(args.oidc_dangerously_allow_insecure_http);
                 assert_eq!(
@@ -4980,6 +5060,196 @@ mem_mib = "not-a-number"
                     .contains("image_preparation_timeout_seconds must be between 1 and 86400")
             );
         }
+            });
+    }
+
+    fn with_gateway_toml(
+        gateway: &str,
+        check: impl FnOnce(miette::Result<super::ServerStartupConfig>),
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    format!("[openshell]\nversion = 2\n[openshell.gateway]\n{gateway}\n"),
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                check(super::prepare_server_config(&mut args, &matches));
+            });
+    }
+
+    #[test]
+    fn server_config_prepares_mutation_admission_settings_from_toml() {
+        with_gateway_toml("", |prepared| {
+            let config = prepared.expect("defaults are accepted").config;
+            assert_eq!(config.mutation_admission_limit_per_caller, 1000);
+            assert_eq!(config.mutation_replay_window_seconds, 86_400);
+        });
+        with_gateway_toml(
+            "mutation_admission_limit_per_caller = 5000\nmutation_replay_window_seconds = 3600",
+            |prepared| {
+                let config = prepared.expect("bounded settings are accepted").config;
+                assert_eq!(config.mutation_admission_limit_per_caller, 5000);
+                assert_eq!(config.mutation_replay_window_seconds, 3600);
+            },
+        );
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_mutation_admission_settings() {
+        for (gateway, message) in [
+            (
+                "mutation_admission_limit_per_caller = 0",
+                "mutation_admission_limit_per_caller must be between 1 and 1000000",
+            ),
+            (
+                "mutation_admission_limit_per_caller = 1000001",
+                "mutation_admission_limit_per_caller must be between 1 and 1000000",
+            ),
+            (
+                "mutation_replay_window_seconds = 59",
+                "mutation_replay_window_seconds must be between 60 and 604800",
+            ),
+            (
+                "mutation_replay_window_seconds = 604801",
+                "mutation_replay_window_seconds must be between 60 and 604800",
+            ),
+        ] {
+            with_gateway_toml(gateway, |prepared| {
+                let Err(error) = prepared else {
+                    panic!("{gateway} must be rejected");
+                };
+                assert!(error.to_string().contains(message), "{error}");
+            });
+        }
+    }
+
+    #[test]
+    fn server_config_prepares_provisioning_repair_window_from_toml() {
+        assert_eq!(
+            openshell_core::Config::new(None).provisioning_repair_window_seconds,
+            300
+        );
+        for seconds in [1, 86_400] {
+            super::validate_provisioning_repair_window_seconds(seconds).unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_seconds = 900\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(prepared.config.provisioning_repair_window_seconds, 900);
+            });
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_provisioning_repair_window() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                for window in [-1, 0, 86_401] {
+                    std::fs::write(
+                        &config_path,
+                        format!(
+                            "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_seconds = {window}\n"
+                        ),
+                    )
+                    .unwrap();
+                    let (mut args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "podman",
+                        "--disable-tls",
+                    ]);
+                    let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                        panic!("unbounded repair window must be rejected");
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("provisioning_repair_window_seconds must be between 1 and 86400")
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn server_config_env_overrides_provisioning_repair_window() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .set("OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS", "600")
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_seconds = 900\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(prepared.config.provisioning_repair_window_seconds, 600);
             });
     }
 
