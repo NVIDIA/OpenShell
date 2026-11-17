@@ -34,6 +34,7 @@ mod context;
 mod error;
 pub mod gateway;
 mod image;
+mod logs;
 mod output;
 pub mod policy;
 mod poll;
@@ -55,6 +56,7 @@ pub use context::{
 pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
 pub use image::{PYTHON_BINARIES, base_image, python_image};
+pub use logs::{LOGS_TIMEOUT, Logs};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until, with_deadline};
 pub use program::main;

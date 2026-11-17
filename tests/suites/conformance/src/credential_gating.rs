@@ -13,9 +13,7 @@ use std::time::Duration;
 use host_server_support::{HttpRecorder, Request, TEST_HOST, WebSocketRecorder};
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::sdk::raw::proto;
-use testkit::{
-    Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _, Sandbox, YamlFile,
-};
+use testkit::{Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
 
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
 const TEST_SECRET: &str = "e2e-gating-secret-value";
@@ -207,12 +205,12 @@ async fn policy_binding_updates_provider_environment_live(cx: &mut Context) -> t
     let sandbox = create_sandbox(cx, "live", unbound.clone(), &[&provider]).await?;
     wait_for_token(&sandbox, "TOKEN_ABSENT").await?;
 
-    set_policy(cx, &sandbox, &bound)
+    policy::set(&sandbox, &bound)
         .await
         .context("bind the provider")?;
     wait_for_token(&sandbox, "TOKEN_PLACEHOLDER").await?;
 
-    set_policy(cx, &sandbox, &unbound)
+    policy::set(&sandbox, &unbound)
         .await
         .context("unbind the provider")?;
     wait_for_token(&sandbox, "TOKEN_ABSENT").await
@@ -393,21 +391,3 @@ async fn wait_for_token(sandbox: &Sandbox, expected: &str) -> Result {
     Ok(())
 }
 
-/// Replace `sandbox`'s policy with `policy` and wait until it is applied.
-async fn set_policy(cx: &Context, sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result {
-    let file = YamlFile::new(&policy::to_yaml(policy)?)?;
-    cx.cli([
-        "policy",
-        "set",
-        sandbox.name(),
-        "--policy",
-        file.path()?,
-        "--wait",
-        "--timeout",
-        "120",
-    ])
-    .await?
-    .success()
-    .context("policy set")?;
-    Ok(())
-}

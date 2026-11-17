@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 libtest-mimic = "0.8"
 linkme = "0.3"
+prost-types = "0.14"
 quick-junit = "0.8"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
