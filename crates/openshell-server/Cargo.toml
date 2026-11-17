@@ -128,6 +128,7 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 openshell-credential-issuer = { path = "../openshell-credential-issuer", features = ["test-support"] }
 tracing-core = "0.1"
 rustls-pki-types = "1.9"

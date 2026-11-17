@@ -38,6 +38,7 @@ tower-http = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 opentelemetry-proto = { workspace = true, features = ["logs"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

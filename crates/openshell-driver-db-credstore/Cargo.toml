@@ -23,6 +23,7 @@ toml = { workspace = true }
 tonic = { workspace = true }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 tempfile = "3"
 tokio = { workspace = true }
 

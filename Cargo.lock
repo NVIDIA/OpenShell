@@ -4542,6 +4542,7 @@ dependencies = [
  "libc",
  "miette",
  "openshell-core",
+ "openshell-crypto",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4981,6 +4982,7 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "nix 0.29.0",
+ "openshell-crypto",
  "openshell-prover",
  "serde",
  "serde_json",

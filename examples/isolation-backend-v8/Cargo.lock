@@ -1649,6 +1649,7 @@ dependencies = [
  "async-stream",
  "clap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-isolation-interface",
  "openshell-sandbox-backend",
  "prost",
@@ -2177,6 +2178,7 @@ name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
  "hyper-util",
+ "openshell-crypto",
  "serde",
  "thiserror",
  "tokio",
