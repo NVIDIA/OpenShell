@@ -10108,9 +10108,9 @@ network_policies:
             record["actor"]["process"]["name"],
             binary.to_string_lossy().as_ref()
         );
-        assert_eq!(
-            record["actor"]["process"]["cmd_line"],
-            command.to_string_lossy().as_ref()
+        assert!(
+            record["actor"]["process"].get("cmd_line").is_none(),
+            "{record}"
         );
         assert!(
             record["message"]
