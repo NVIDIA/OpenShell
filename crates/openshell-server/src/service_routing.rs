@@ -514,6 +514,12 @@ pub async fn proxy_sandbox_service_request(
     state: Arc<ServerState>,
     mut req: Request<Body>,
 ) -> impl IntoResponse {
+    if !state.config.service_routing.enabled {
+        return service_error_response(
+            StatusCode::NOT_FOUND,
+            "Gateway service routing is disabled",
+        );
+    }
     let Some(host) = request_host(&req).map(str::to_string) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -526,13 +532,6 @@ pub async fn proxy_sandbox_service_request(
         service,
     } = target;
     let service_name = service.unwrap_or_default();
-
-    if !state.config.service_routing.enabled {
-        return service_error_response(
-            StatusCode::NOT_FOUND,
-            "Gateway service routing is disabled",
-        );
-    }
 
     if state.config.service_routing.auth_enabled {
         if req
@@ -1455,52 +1454,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_login_requires_gateway_routing_and_auth() {
+        use tower::ServiceExt as _;
+
+        for routing_enabled in [false, true] {
+            for auth_enabled in [false, true] {
+                let mut state = crate::grpc::test_support::test_server_state().await;
+                let config = &mut Arc::get_mut(&mut state).unwrap().config;
+                config.service_routing.enabled = routing_enabled;
+                config.service_routing.auth_enabled = auth_enabled;
+                let response = crate::http_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri("/auth/services")
+                            .header(header::HOST, "gateway.example.com")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if routing_enabled && auth_enabled {
+                    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+                } else {
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_gateway_routing_rejects_http_and_websocket_on_both_routers() {
         use tower::ServiceExt as _;
 
-        for hashed in [false, true] {
-            for listener_enabled in [false, true] {
-                let mut state = crate::grpc::test_support::test_server_state().await;
-                let inner = Arc::get_mut(&mut state).unwrap();
-                inner.config.service_routing.enabled = false;
-                inner.config.supervisor_app_listener.enabled = listener_enabled;
-                inner.config.name = "gateway-a".into();
-                inner.config.service_routing.service_hostname_format = if hashed {
-                    ServiceHostnameFormat::Hashed
-                } else {
-                    ServiceHostnameFormat::Readable
-                };
-                inner.service_route_index =
-                    Arc::new(ServiceRouteIndex::new(Some("gateway-a".into())));
-                inner
-                    .service_route_index
-                    .register("default", "my-sandbox", "web")
-                    .unwrap();
-                let host = if hashed {
-                    "enh47uqyj7bpyttz.openshell.localhost"
-                } else {
-                    "default--my-sandbox--web.openshell.localhost"
-                };
-                for service_only in [false, true] {
-                    for websocket in [false, true] {
-                        let router = if service_only {
-                            crate::service_http_router(state.clone())
-                        } else {
-                            crate::http_router(state.clone())
-                        };
-                        let mut request = Request::builder().uri("/app").header(header::HOST, host);
-                        if websocket {
-                            request = request
-                                .header(header::CONNECTION, "upgrade")
-                                .header(header::UPGRADE, "websocket")
-                                .header("sec-websocket-version", "13")
-                                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        for auth_enabled in [false, true] {
+            for hashed in [false, true] {
+                for listener_enabled in [false, true] {
+                    let mut state = crate::grpc::test_support::test_server_state().await;
+                    let inner = Arc::get_mut(&mut state).unwrap();
+                    inner.config.service_routing.enabled = false;
+                    inner.config.service_routing.auth_enabled = auth_enabled;
+                    inner.config.supervisor_app_listener.enabled = listener_enabled;
+                    inner.config.name = "gateway-a".into();
+                    inner.config.service_routing.service_hostname_format = if hashed {
+                        ServiceHostnameFormat::Hashed
+                    } else {
+                        ServiceHostnameFormat::Readable
+                    };
+                    inner.service_route_index =
+                        Arc::new(ServiceRouteIndex::new(Some("gateway-a".into())));
+                    inner
+                        .service_route_index
+                        .register("default", "my-sandbox", "web")
+                        .unwrap();
+                    let host = if hashed {
+                        "enh47uqyj7bpyttz.openshell.localhost"
+                    } else {
+                        "default--my-sandbox--web.openshell.localhost"
+                    };
+                    for service_only in [false, true] {
+                        for websocket in [false, true] {
+                            let router = if service_only {
+                                crate::service_http_router(state.clone())
+                            } else {
+                                crate::http_router(state.clone())
+                            };
+                            let mut request =
+                                Request::builder().uri("/app").header(header::HOST, host);
+                            if websocket {
+                                request = request
+                                    .header(header::CONNECTION, "upgrade")
+                                    .header(header::UPGRADE, "websocket")
+                                    .header("sec-websocket-version", "13")
+                                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+                            }
+                            let response = router
+                                .oneshot(request.body(Body::empty()).unwrap())
+                                .await
+                                .unwrap();
+                            assert_eq!(response.status(), StatusCode::NOT_FOUND);
                         }
-                        let response = router
-                            .oneshot(request.body(Body::empty()).unwrap())
-                            .await
-                            .unwrap();
-                        assert_eq!(response.status(), StatusCode::NOT_FOUND);
                     }
                 }
             }
