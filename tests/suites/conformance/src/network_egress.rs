@@ -19,7 +19,8 @@ use testkit::sdk::raw::proto;
 use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
 
 use crate::support::{
-    TEST_HOST, expect_values, json_result, python_binaries_yaml, python_sandbox, run_python,
+    TEST_HOST, expect_values, json_result, policy_revisions, python_binaries_yaml, python_sandbox,
+    run_python,
 };
 
 const STATUS_CLIENT: &str = include_str!("scripts/status_client.py");
@@ -406,14 +407,6 @@ async fn expect_statuses(sandbox: &Sandbox, port: &str, expected: impl Fn(i64) -
         );
     }
     Ok(())
-}
-
-/// The sandbox's policy revisions, from `policy list --output json`.
-async fn policy_revisions(cx: &Context, sandbox: &Sandbox) -> Result<Value> {
-    cx.cli(["policy", "list", sandbox.name(), "--output", "json"])
-        .await?
-        .success()?
-        .json()
 }
 
 /// The contents of `path` in the sandbox, once it exists. A timeout reports

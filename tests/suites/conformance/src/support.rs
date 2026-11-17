@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Helpers the network suites share. Not a suite.
+//! Helpers the network and policy suites share. Not a suite.
 //!
 //! Their clients are Python scripts in `src/scripts/` that take the server's
 //! host and port as arguments, run in a long-running sandbox from
@@ -67,6 +67,14 @@ pub fn expect_values<K: AsRef<str>>(result: &Value, expected: &[(K, Value)]) -> 
         .collect();
     testkit::ensure!(wrong.is_empty(), "{}\nresult: {result}", wrong.join("\n"));
     Ok(())
+}
+
+/// The sandbox's policy revisions, from `policy list --output json`.
+pub async fn policy_revisions(cx: &Context, sandbox: &Sandbox) -> Result<Value> {
+    cx.cli(["policy", "list", sandbox.name(), "--output", "json"])
+        .await?
+        .success()?
+        .json()
 }
 
 /// `binaries:` for policy YAML that lets the image's Python connect.
