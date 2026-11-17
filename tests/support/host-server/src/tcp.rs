@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use testkit::{Poll, Result};
+use testkit::{Poll, Result, ResultExt as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -100,6 +100,35 @@ impl TcpServer {
     }
 }
 
+/// Connect to `port` on the test host's loopback, send `request`, and return
+/// what arrives until the other end closes. For a port the test reaches from
+/// the host, such as one `openshell forward` listens on.
+pub async fn exchange(port: u16, request: &[u8]) -> Result<Vec<u8>> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "standalone test support has no openshell-core dependency and enables TCP_NODELAY below"
+    )]
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .context(format!("connect to 127.0.0.1:{port}"))?;
+    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    stream
+        .write_all(request)
+        .await
+        .context(format!("send to 127.0.0.1:{port}"))?;
+    let mut reply = Vec::new();
+    tokio::time::timeout(READ_TIMEOUT, stream.read_to_end(&mut reply))
+        .await
+        .map_err(|_| {
+            testkit::Error::msg(format!(
+                "127.0.0.1:{port} didn't close within {READ_TIMEOUT:?}; read {} byte(s)",
+                reply.len()
+            ))
+        })?
+        .context(format!("read from 127.0.0.1:{port}"))?;
+    Ok(reply)
+}
+
 impl Drop for TcpServer {
     fn drop(&mut self) {
         self.task.abort();
@@ -170,5 +199,12 @@ mod tests {
         stream.read_to_end(&mut reply).await.unwrap();
         assert_eq!(reply, b"reply");
         assert_eq!(server.received(), b"first second");
+    }
+
+    #[tokio::test]
+    async fn exchange_returns_the_reply_until_close() {
+        let server = TcpServer::reply_when_idle(b"reply".to_vec()).await.unwrap();
+        assert_eq!(exchange(server.port, b"hello").await.unwrap(), b"reply");
+        assert_eq!(server.received(), b"hello");
     }
 }

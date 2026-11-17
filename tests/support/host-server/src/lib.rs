@@ -16,7 +16,8 @@
 //!   frames that arrive.
 //! - [`TcpServer`] records raw bytes, and echoes them or answers once the
 //!   client goes idle.
-//! - [`free_port`] finds a port nothing listens on.
+//! - [`free_port`] finds a port nothing listens on, and [`exchange`] sends
+//!   bytes to a loopback port and reads the reply.
 
 mod http;
 mod tcp;
@@ -28,7 +29,7 @@ use testkit::{Result, ResultExt as _};
 use tokio::net::TcpListener;
 
 pub use http::{HttpRecorder, Request, Response};
-pub use tcp::TcpServer;
+pub use tcp::{TcpServer, exchange};
 pub use websocket::{TEXT_REPLY, WebSocketRecorder};
 
 /// The name a sandbox reaches these servers by.
