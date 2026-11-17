@@ -118,6 +118,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   credentials)` does both. Chain `.config(key, value)` before the `.await`
   to set provider config.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
+- `cx.service_get(service_url, headers)` to request an exposed sandbox
+  service. It connects to the gateway's endpoint and sends the service URL's
+  host as the Host header, so the test machine doesn't need to resolve
+  service hosts. It returns the status and body whatever the status.
 - `cx.client()` for SDK calls testkit does not wrap.
 - `?` and `.context(..)` on I/O, JSON, YAML, SDK and gRPC results, which
   convert into `testkit::Error`.
