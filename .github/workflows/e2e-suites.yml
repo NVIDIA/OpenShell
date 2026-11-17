@@ -18,6 +18,11 @@ name: E2E Suites
 on:
   workflow_call:
     inputs:
+      cancel-in-progress:
+        description: Cancel active runs in the same concurrency group
+        required: false
+        type: boolean
+        default: true
       family:
         description: Run only the rows of this family and the workspaces under it (for example conformance or drivers); empty runs every row
         required: false
@@ -55,7 +60,7 @@ permissions:
 # workflow to avoid colliding with (and cancelling) the caller's other jobs.
 concurrency:
   group: ${{ github.workflow }}-e2e-suites-${{ inputs.family }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.workflow != 'Release Dev' }}
+  cancel-in-progress: ${{ inputs['cancel-in-progress'] }}
 
 jobs:
   # The rows live here, in one place. Add an environment or a suite by adding a

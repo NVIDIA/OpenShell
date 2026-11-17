@@ -34,7 +34,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-integration-${{ inputs.category }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.workflow != 'Release Dev' }}
+  cancel-in-progress: true
 
 jobs:
   integration:
