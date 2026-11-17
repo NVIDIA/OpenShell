@@ -5,7 +5,8 @@
 //! `ssh` client that pins the host key.
 //!
 //! Ported from `e2e/rust/tests/ssh_host_identity.rs`. The check across a
-//! gateway restart needs gateway control, which testkit doesn't have yet.
+//! gateway restart needs gateway control, which testkit doesn't have yet
+//! (#5652).
 
 use std::path::Path;
 use std::time::Duration;
