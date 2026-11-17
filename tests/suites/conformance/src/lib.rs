@@ -21,6 +21,7 @@ mod lifecycle;
 mod persistent_workspace;
 mod policy_advisor;
 mod process;
+mod providers;
 mod settings;
 mod smoke;
 mod ssh;
