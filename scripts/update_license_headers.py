@@ -66,6 +66,7 @@ SIDECAR_LICENSE_FILES: set[str] = {
     "deploy/deb/control.in",
     "scripts/keycloak-realm.json",
     "sdk/conformance/oauth-client-credentials.json",
+    "sdk/conformance/oidc-token-bundle.json",
     "sdk/typescript/biome.json",
     "sdk/typescript/tsconfig.build.json",
     "sdk/typescript/tsconfig.json",

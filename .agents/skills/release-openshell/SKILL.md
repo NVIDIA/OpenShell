@@ -33,8 +33,8 @@ Release creates `vX.Y.Z` at that exact commit, then rebuilds and publishes all
 stable artifacts without rerunning qualification. Embedded versions change, so
 stable artifacts are not byte-identical to the qualified prerelease. An existing
 stable tag may be retried only if it already points to the selected commit. A retry
-publishes only missing artifacts; published images, charts, release assets, npm,
-and PyPI versions are kept, while the snap is uploaded again.
+publishes only missing artifacts; published images, charts, release assets, and
+npm versions are kept, while the snap is uploaded again.
 Stable images are saved as OCI archives during the build and pushed under the
 stable version tags during publication. Their SBOMs are verified before updating
 `latest`; the qualified prerelease's commit-SHA image tags remain unchanged.
@@ -83,3 +83,7 @@ updating a Snap Store support track. Docs retain an
 immutable version and advance latest only for a newer version.
 
 Watch the stable release run and report its result.
+
+## Python SDK
+
+Core no longer builds or publishes the Python SDK for releases. The stable, prerelease, and rolling `dev` GitHub Releases carry no wheel, and nothing in core publishes to PyPI. `openshell` `0.1.7` is the last core-built wheel. From `0.1.8` on, [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python) publishes `openshell` on the same day as each stable core release, once its update PR for the core tag merges.

@@ -37,9 +37,9 @@ pub struct AtomicPolicyRevisionWrite {
     /// Populate the create-time baseline, or replace it while startup admission
     /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
-    /// Allow `backfill_policy` to replace an existing baseline while startup
-    /// admission is blocked. Only a management repair may do this; a
-    /// sandbox-originated write must conflict instead of overwriting it.
+    /// Allow `backfill_policy` to replace the saved `Sandbox.spec.policy` while
+    /// first startup is blocked. Only an authorized user or operator can replace
+    /// it; a sandbox upload must conflict if a different policy was saved first.
     pub replace_startup_baseline: bool,
 }
 
@@ -777,8 +777,8 @@ mod tests {
                 }
             }
         }
-        // A sandbox backfill chosen from an empty baseline cannot replace a
-        // management repair that commits before its atomic projection.
+        // An upload chosen when spec.policy was absent cannot replace an
+        // operator's repair saved before this write commits.
         write.replace_startup_baseline = false;
         let blocked = Sandbox {
             spec: Some(SandboxSpec {

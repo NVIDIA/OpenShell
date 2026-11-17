@@ -15,6 +15,10 @@ default features, so this instrumentation does not
 require the compute runtime or Unix-only sandbox library. It is a development
 dependency only.
 
+## Connections without inspection
+
+Before the supervisor forwards a connection it cannot inspect (`tls: skip`, transparent TCP, h2c, unsupported tunnels, SQL passthrough), `uninspectable_traffic_gate` checks the matching middleware chain. Any `fail_closed` entry denies the connection, and an all-`fail_open` chain relays it with a bypass finding. For `tls: skip`, the gate runs before `200 Connection Established`, so a denial is a `403`.
+
 ## Sandbox instance inputs
 
 `run_networking` takes a `SandboxInstanceNetwork` with the sandbox identity,
@@ -41,3 +45,52 @@ at debug, and emits no OCSF denial event: a standard OpenTelemetry SDK retries
 for the life of the agent, and one event per retry would flood the OCSF log.
 The supervisor installs its OTLP relay receiver as the handler while the agent
 trace relay is active.
+
+## Static credential placement
+
+Substitution checks the declared request location before writing upstream.
+Credentials without placement metadata default to the Authorization header. HTTP placement violations return a safe 403 response;
+WebSocket violations close the connection with policy denial. Both paths emit a
+domain event and a detection finding without credential values or placeholders.
+Explicit body and WebSocket
+rewrite flags authorize those locations for ordinary static credentials. SigV4
+signing retains the endpoint-scoped resolver's existing trusted access.
+
+## HTTP enforcement correlation
+
+Each inspected HTTP request has one UUID shared by middleware, OCSF
+`metadata.correlation_uid`, and the protected `x-openshell-request-id` response
+header. Application correlation must use another header. The receipt is only a
+join key: it does not establish identity, authorization or complete delivery.
+L4 and passthrough traffic do not provide this header guarantee.
+
+The emission hook adds request correlation to every OCSF class in the current
+request scope, including findings. Policy, middleware, token-grant and finding
+records are individual events with their own timestamps and classification.
+`unmapped.http_event_kind` identifies decisions, findings, connection events,
+middleware invocations and token grants. Middleware invocations use
+`unmapped.middleware_phase` for request, response and WebSocket phases.
+`unmapped.request_sequence` starts at 1 per request and describes local emission
+order, not downstream delivery order. Count policy outcomes by selecting the
+actual policy/firewall control record within a receipt group, not every
+`decision` record.
+
+Request IDs and audit outcomes do not depend on OpenTelemetry, sampling or
+collector availability. Inspected requests have a supervisor-owned request span
+and children around stages that actually run, with valid workload W3C context
+only as an untrusted link. Their records never create an extra denial-only span,
+even if the request span is disabled or unsampled. Uninspected HTTP denials use
+bounded `supervisor.egress.deny` spans. The ambient HTTP audit scope ends before
+protocol-start validation; one-shot attribution joins the existing upgrade
+handoff record to the handshake and releases the request span before frames.
+Later WebSocket frames do not reuse the handshake receipt. Terminal errors carry their request context explicitly,
+and policy-reload cancellation records the active request before dropping it.
+Idle connection closures have no HTTP receipt.
+The request span ends after its owned stages, not when response headers are logged.
+The `openshell.upstream.send` stage measures request writes and flush; response
+handling is measured separately. Handled middleware failures remain stage errors
+even when the local rejection response is delivered successfully. Receipt
+filtering preserves raw HTTP bytes
+and borrows unchanged header blocks. It removes only protected receipt fields
+and their `Connection` or `Trailer` nominations, including folded continuations,
+without adding general response-header validation.

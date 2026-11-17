@@ -78,6 +78,7 @@ runs:
       shell: bash
       env:
         CLUSTER_NAME: ${{ inputs.cluster-name }}
+        CALICO_VERSION: v3.30.3
       run: |
         set -euo pipefail
         collect_cni_diagnostics() {
@@ -98,9 +99,18 @@ runs:
           exit "$failure_status"
         }
         trap collect_cni_diagnostics ERR
-        curl -fsSL https://raw.githubusercontent.com/projectcalico/calico/v3.30.3/manifests/calico.yaml \
+        curl -fsSL "https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests/calico.yaml" \
           -o "$RUNNER_TEMP/calico.yaml"
         sed 's@192.168.0.0/16@10.244.0.0/16@g' "$RUNNER_TEMP/calico.yaml" > "$RUNNER_TEMP/calico-kind.yaml"
+        # The kind node's containerd pulls Docker Hub anonymously and is rate
+        # limited. The host daemon pulls through the runner's registry mirror.
+        for component in cni node kube-controllers; do
+          image="docker.io/calico/$component:$CALICO_VERSION"
+          archive="$RUNNER_TEMP/calico-$component-linux-amd64.tar"
+          docker pull --platform linux/amd64 "$image"
+          docker image save --platform linux/amd64 --output "$archive" "$image"
+          kind load image-archive "$archive" --name "$CLUSTER_NAME"
+        done
         kubectl --context "kind-$CLUSTER_NAME" apply -f "$RUNNER_TEMP/calico-kind.yaml"
         kubectl --context "kind-$CLUSTER_NAME" -n kube-system rollout status daemonset/calico-node --timeout=300s
         kubectl --context "kind-$CLUSTER_NAME" -n kube-system rollout status deployment/calico-kube-controllers --timeout=300s

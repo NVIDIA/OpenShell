@@ -68,6 +68,7 @@ impl TestRegistry {
 
 fn hello() -> SupervisorHello {
     SupervisorHello {
+        supports_service_advertisements: false,
         sandbox_id: Uuid::new_v4().to_string(),
         instance_id: Uuid::new_v4().to_string(),
         connection_epoch: 0,

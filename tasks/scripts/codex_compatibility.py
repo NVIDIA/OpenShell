@@ -129,7 +129,7 @@ async def invoke_codex(context: dict, directory: Path) -> dict:
             result = await thread.run(prompt, output_schema=schema)
     except (openai_codex.CodexError, RuntimeError, ValueError) as error:
         raise ValueError(
-            f"Codex SDK review failed ({type(error).__name__}); no assessment is available."
+            f"Codex SDK review failed ({type(error).__name__}): {error}; no assessment is available."
         ) from None
     finally:
         await codex.close()

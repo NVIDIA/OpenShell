@@ -126,16 +126,7 @@ spec:
         {{- end }}
         # Most gateway settings live in the ConfigMap-backed TOML file
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
-        # env vars that the TOML references by name. Some process-level
-        # settings consumed by libraries outside gateway code also remain here.
-        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
-        # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
-        # outbound TLS verification. This is a process-level env var
-        # consumed by the TLS stack itself, not by gateway code, so it
-        # cannot be represented in the gateway TOML schema.
-        - name: SSL_CERT_FILE
-          value: /etc/openshell-tls/oidc-ca/ca.crt
-        {{- end }}
+        # env vars that the TOML references by name.
         # The gateway stages normalized, content-addressed supervisor trust
         # artifacts under its XDG state directory. Keep that state on a
         # dedicated writable volume for both StatefulSet and Deployment modes.
@@ -192,6 +183,16 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
+        {{- if .Values.metrics.tls.enabled }}
+        - name: metrics-tls-cert
+          mountPath: /etc/openshell-metrics/server
+          readOnly: true
+        {{- if .Values.metrics.tls.clientCaSecretName }}
+        - name: metrics-tls-client-ca
+          mountPath: /etc/openshell-metrics/client-ca
+          readOnly: true
+        {{- end }}
+        {{- end }}
         {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
@@ -224,7 +225,7 @@ spec:
         - name: health
           containerPort: {{ .Values.service.healthPort }}
           protocol: TCP
-        {{- if .Values.service.metricsPort }}
+        {{- if include "openshell.metricsEnabled" . }}
         - name: metrics
           containerPort: {{ .Values.service.metricsPort }}
           protocol: TCP
@@ -303,6 +304,19 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
+    {{- if .Values.metrics.tls.enabled }}
+    - name: metrics-tls-cert
+      secret:
+        secretName: {{ .Values.metrics.tls.certSecretName | default .Values.server.tls.certSecretName }}
+    {{- if .Values.metrics.tls.clientCaSecretName }}
+    - name: metrics-tls-client-ca
+      secret:
+        secretName: {{ .Values.metrics.tls.clientCaSecretName }}
+        items:
+          - key: ca.crt
+            path: ca.crt
+    {{- end }}
+    {{- end }}
     {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
@@ -335,6 +349,9 @@ spec:
     {{- end }}
     - name: gateway-state
       emptyDir: {}
+  {{- with .Values.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}
@@ -345,6 +362,10 @@ spec:
   {{- end }}
   {{- with .Values.tolerations }}
   tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.topologySpreadConstraints }}
+  topologySpreadConstraints:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}

@@ -25,7 +25,7 @@ use crate::persistence::{ObjectListQuery, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
-const MAX_APP_SERVICE_ROUTES: u32 = 1024;
+pub(super) const MAX_APP_SERVICE_ROUTES: u32 = 1024;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -93,22 +93,29 @@ pub(super) async fn expose_service_endpoint(
     target_port: u32,
     authorization_mode: ServiceAuthorizationMode,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
+    // Hold the hardening guard across sandbox validation, route counting and
+    // persistence. Acquisition is unconditional because advertisements also
+    // serialize service edits when the application listener is disabled.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(workspace, sandbox.object_id()))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire sandbox mutation lock")
+        })?;
+    let current = state
+        .store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .map_err(|_| Status::unavailable("sandbox storage unavailable"))?
+        .filter(|s| {
+            s.metadata
+                .as_ref()
+                .is_none_or(|m| m.deletion_time.is_none())
+        })
+        .ok_or_else(|| Status::not_found("sandbox removed"))?;
+    let sandbox = &current;
     let sandbox_name = sandbox.object_name();
-    // Count and persist under the same fleet-wide sandbox guard, including
-    // create-time exposure, so concurrent gateways cannot overfill the allowlist.
-    let _mutation_guard = if state.config.supervisor_app_listener.enabled {
-        Some(
-            state
-                .compute
-                .mutation_guard(MutationScope::sandbox(workspace, sandbox.object_id()))
-                .await
-                .map_err(|error| {
-                    super::persistence_error_to_status(error, "acquire sandbox mutation lock")
-                })?,
-        )
-    } else {
-        None
-    };
 
     let now = crate::persistence::current_time_ms();
     let key = service_routing::endpoint_key(sandbox_name, service);
@@ -373,6 +380,11 @@ pub(super) async fn handle_delete_service(
         probe.resume.notified().await;
     }
 
+    let _guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(workspace, sandbox.object_id()))
+        .await
+        .map_err(|_| Status::unavailable("service mutation lock unavailable"))?;
     let endpoint_id = endpoint.object_id().to_string();
     let endpoint_version = endpoint.get_resource_version();
     let deleted = state
@@ -409,8 +421,22 @@ pub(super) async fn configured_app_routes(
     if !state.config.supervisor_app_listener.enabled {
         return Ok(Vec::new());
     }
-    let mut service_routes: Vec<_> = app_service_endpoints(state, sandbox)
-        .await?
+    Ok(configured_app_routes_from_endpoints(
+        state,
+        sandbox,
+        app_service_endpoints(state, sandbox).await?,
+    ))
+}
+
+pub(super) fn configured_app_routes_from_endpoints(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    endpoints: Vec<ServiceEndpoint>,
+) -> Vec<openshell_core::proto::SandboxServiceRoute> {
+    if !state.config.supervisor_app_listener.enabled {
+        return Vec::new();
+    }
+    let mut service_routes: Vec<_> = endpoints
         .into_iter()
         .filter(|ep| {
             ep.sandbox_id == sandbox.object_id()
@@ -429,7 +455,7 @@ pub(super) async fn configured_app_routes(
         })
         .collect();
     service_routes.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(service_routes)
+    service_routes
 }
 
 async fn app_service_endpoints(

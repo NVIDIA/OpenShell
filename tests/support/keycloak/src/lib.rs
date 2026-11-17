@@ -26,7 +26,7 @@
 //! ```ignore
 //! #[testkit::test]
 //! async fn example(cx: &mut testkit::Context) -> testkit::Result {
-//!     let kc = keycloak::KeycloakContext::new(cx).await?;
+//!     let kc = keycloak_support::KeycloakContext::new(cx).await?;
 //!     let grant = kc.keycloak().password_grant().await?;
 //!     kc.cli(["status"]).await?.success()?; // Context methods still work
 //!     Ok(())
@@ -34,7 +34,8 @@
 //! ```
 //!
 //! The fixture owns no Keycloak state, so it has nothing to clean up. Tests
-//! that create resources in Keycloak or `OpenShell` must remove them.
+//! that create resources in Keycloak or `OpenShell` must remove them, for
+//! example with [`Context::on_cleanup`].
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -157,7 +158,6 @@ impl Keycloak {
                     .kill_on_drop(true)
                     .output()
                     .await
-                    .map_err(|error| Error::from_error(&error))
                     .context("run curl")?;
                 Ok(if output.status.success() {
                     Poll::Ready(())
@@ -185,9 +185,8 @@ impl Keycloak {
         .await
         .context("Keycloak password grant")?;
 
-        let response: Value = serde_json::from_slice(&stdout)
-            .map_err(|error| Error::from_error(&error))
-            .context("decode Keycloak grant response")?;
+        let response: Value =
+            serde_json::from_slice(&stdout).context("decode Keycloak grant response")?;
         let token = |name: &str| {
             response
                 .get(name)
@@ -223,7 +222,7 @@ fn required(name: &str) -> Result<String> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             Error::msg(format!(
-                "{name} is not set; this suite needs a Keycloak realm (see the keycloak crate docs)"
+                "{name} is not set; this suite needs a Keycloak realm (see the keycloak-support crate docs)"
             ))
         })
 }
@@ -252,20 +251,14 @@ async fn post_form(url: &str, fields: &[&str], secret: (&str, &str)) -> Result<V
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|error| Error::from_error(&error))
         .context("run curl")?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     stdin
         .write_all(secret.1.as_bytes())
         .await
-        .map_err(|error| Error::from_error(&error))
         .context("write request body")?;
     drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| Error::from_error(&error))
-        .context("wait for curl")?;
+    let output = child.wait_with_output().await.context("wait for curl")?;
     testkit::ensure!(
         output.status.success(),
         "POST {url} failed ({}): {}{}",

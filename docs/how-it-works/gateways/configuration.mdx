@@ -87,6 +87,9 @@ version = 2
 [openshell.gateway.tls]
 # ... gateway listener TLS ...
 
+[openshell.gateway.metrics_tls]
+# ... dedicated metrics listener TLS ...
+
 [openshell.gateway.oidc]
 # ... JWT bearer auth ...
 
@@ -101,6 +104,50 @@ version = 2
 ```
 
 The gateway selector is `compute_driver = "<driver>"`. It accepts one scalar driver name. Omit it to retain auto-detection.
+
+## Slow sandbox startup
+
+For slow isolation backends, increase these startup windows. Each defaults to
+`300` seconds (5 minutes) and accepts `1` through `86400` seconds. Environment
+variables override TOML values.
+
+| Setting | Scope | Environment variable |
+|---|---|---|
+| `provisioning_repair_window_seconds` | `[openshell.gateway]`: configuration repair after admission starts | `OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS` |
+| `runtime_bootstrap_grace_seconds` | `[openshell.drivers.kubernetes]`: sandbox startup | `OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS` |
+| `sandbox_attach_request_timeout_seconds` | `[openshell.drivers.kubernetes]`: dedicated supervisor startup | `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS` |
+
+For a 15-minute Kubernetes startup window, set both driver settings to `900`.
+On shared supervisor deployments, set `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS=900`
+directly; the driver setting does not configure shared hosts. Directly launched
+supervisors also accept `--attach-request-timeout-seconds`.
+
+Restart affected gateways and supervisors to apply changes. Existing admission
+deadlines stay unchanged. After a timeout, wait for cleanup before starting the
+sandbox again. CLI wait and image-preparation timeouts are separate settings.
+
+## Request ID capacity
+
+Clients that send a `request_id` get a durable admission for each mutation, such
+as sandbox create, start, exec, or delete. A successful admission keeps its slot
+until its replay window ends, and an unresolved one keeps it until an operator
+reconciles it. The gateway deletes expired admissions in the background about
+once a minute, and immediately for a caller that reaches the limit. Admissions are counted per caller identity across every replica
+that shares the database. When a caller's admissions reach the limit, the gateway
+rejects new requests with `RESOURCE_EXHAUSTED`. Requests without a `request_id`
+do not use this capacity.
+
+| Setting | Default | Allowed values |
+|---|---|---|
+| `mutation_admission_limit_per_caller` | `1000` | `1` through `1000000` |
+| `mutation_replay_window_seconds` | `86400` (24 hours) | `60` through `604800` (7 days) |
+
+Set both under `[openshell.gateway]`, using the same values on every replica.
+Size the limit for the most request-ID mutations one caller makes within the
+replay window. For example, creating and deleting 400 sandboxes takes 800. A
+shorter window frees capacity sooner, but a client that retries after the window
+ends can run the mutation again. For replay behavior, refer to
+[API Errors](/sdk/api-errors).
 
 ## Additional Destination CAs
 
@@ -275,9 +322,23 @@ credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
 
+# Per-sandbox caps on concurrent relays. SSH sessions and service forwards
+# have separate budgets. Each defaults to 20 and must be at least 1.
+max_ssh_connections_per_sandbox     = 20
+max_service_connections_per_sandbox = 20
+
 # Absolute image preparation and initial supervisor startup budget.
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800
+
+# Admission repair window in seconds; existing deadlines are preserved.
+provisioning_repair_window_seconds = 300
+
+# Request-ID admissions one caller identity can hold, 1 through 1000000, and the
+# seconds a successful request ID stays replayable, 60 through 604800. Every
+# replica sharing the database must use the same values.
+mutation_admission_limit_per_caller = 1000
+mutation_replay_window_seconds = 86400
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
@@ -351,6 +412,14 @@ client_ca_path        = "/etc/openshell/certs/client-ca.pem"
 # external_key_path     = "/etc/openshell/certs/external-key.pem"
 # external_server_names = ["gateway.example.com"]
 
+# Dedicated metrics-listener TLS. Omit this table to retain the plaintext
+# metrics listener. Use a CA that is distinct from the gateway client CA.
+[openshell.gateway.metrics_tls]
+cert_path           = "/etc/openshell/metrics/server/tls.crt"
+key_path            = "/etc/openshell/metrics/server/tls.key"
+client_ca_path      = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
+
 [openshell.gateway.gateway_jwt]
 signing_key_path = "/etc/openshell/jwt/signing.pem"
 public_key_path  = "/etc/openshell/jwt/public.pem"
@@ -373,6 +442,7 @@ service_name = "openshell-gateway"
 
 [openshell.gateway.oidc]
 issuer                           = "https://idp.example.com/realms/openshell"
+ca_bundle                        = "/etc/openshell/oidc-ca.pem" # Optional private issuer CA.
 audience                         = "openshell-cli"
 jwks_ttl_secs                    = 3600 # Must be greater than zero.
 jwks_allowed_origins             = ["https://keys.example.com"] # Default: issuer origin only.
@@ -437,7 +507,76 @@ authentication mechanism accepts them or `allow_unauthenticated_users = true`.
 
 The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
 
+`[openshell.gateway.oidc] ca_bundle` points to a certificate-only PEM bundle for an issuer signed by a private CA. The path must resolve to a regular file no larger than 1 MiB (1,048,576 bytes). The bundle augments platform trust roots for OIDC discovery and JWKS requests only; it does not replace native CA discovery or change trust for provider refresh, token exchange, telemetry, Vault, or other gateway HTTPS clients. Set the same value with `--oidc-ca-bundle` or `OPENSHELL_OIDC_CA_BUNDLE`. For Helm deployments, `server.oidc.caConfigMapName` mounts the ConfigMap's `ca.crt` key and renders this path automatically.
+
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
+
+## Metrics Listener TLS
+
+The dedicated metrics listener is configured with `metrics_bind_address`. It
+remains plaintext unless `[openshell.gateway.metrics_tls]` is configured, which
+preserves compatibility with existing Prometheus deployments. TLS for this
+listener is independent from `[openshell.gateway.tls]`: it has its own server
+certificate, optional client CA, and reload worker.
+
+```toml
+[openshell.gateway]
+metrics_bind_address = "0.0.0.0:9090"
+
+[openshell.gateway.metrics_tls]
+cert_path           = "/etc/openshell/metrics/server/tls.crt"
+key_path            = "/etc/openshell/metrics/server/tls.key"
+client_ca_path      = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
+```
+
+`cert_path` and `key_path` are required whenever the table is present. Omit
+`client_ca_path` for HTTPS with anonymous scraping. Set `client_ca_path` and
+`require_client_auth = true` for mTLS; a client without a certificate, or with
+a certificate from another CA, cannot scrape `/metrics`. When
+`require_client_auth = false`, anonymous clients remain allowed, but any client
+certificate they present must validate against `client_ca_path`.
+
+The metrics client CA must be distinct from the gateway listener client CA. In
+Kubernetes, sandbox workloads receive gateway client credentials for their
+control-plane connection. Reusing that CA for metrics would let those workload
+identities access the metrics endpoint. The metrics server certificate may be
+the same certificate used by the gateway listener when its SANs cover the
+metrics Service DNS name.
+
+The listener watches its certificate, key, and optional client CA files. A
+valid change is applied without restarting the gateway; an invalid replacement
+keeps the last known-good configuration active. Reload logs and OCSF events
+include `listener=metrics` to distinguish this boundary from gateway TLS.
+
+If the metrics certificate, key, or client CA cannot be loaded at startup,
+the gateway continues serving its control-plane and health listeners but
+disables the metrics listener. It does not fall back to plaintext. Correct the
+mounted Secret and restart the gateway to restore metrics scraping. On
+Kubernetes, this applies to a Secret that exists with malformed contents: a
+Secret that is missing entirely, or a client CA Secret without a `ca.crt`
+key, never reaches the gateway, because kubelet fails the non-optional volume
+mounts and the pod does not start (`FailedMount`).
+
+For Helm installations, `metrics.enabled` defaults to `true` and
+`service.metricsPort` defaults to `9090`. Set `metrics.enabled=false` to disable
+the dedicated listener and its container and Service ports while retaining
+the configured port. This does not disable OpenTelemetry export. The port
+must remain an integer from 1 to 65535, even when metrics are disabled.
+
+To migrate from `service.metricsPort: 0` or `false`, set
+`metrics.enabled=false` and restore a valid port such as `9090` in the same
+upgrade. The chart rejects legacy disable values with migration guidance,
+even when `metrics.enabled` is explicitly set, rather than silently enabling
+the endpoint. Metrics TLS requires `metrics.enabled=true`.
+
+Set `metrics.tls.enabled=true` and provide the
+operator-managed Secret names through `metrics.tls.certSecretName` and, for
+mTLS, `metrics.tls.clientCaSecretName`. The chart does not create
+metrics-specific PKI or monitoring resources. It rejects a
+`metrics.tls.clientCaSecretName` that reuses the gateway client CA or client
+TLS Secret names; that comparison is by name only and cannot detect a
+different Secret holding the same CA.
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
@@ -544,7 +683,7 @@ that the previous process has stopped, not that sharing a SQLite file enables HA
 
 ## Database Pool
 
-`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.
+`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving. On Postgres, a caller that gets no connection within 5 seconds fails instead of waiting for the database to answer, usually with a retryable `UNAVAILABLE` error whose reason is `DATABASE_UNAVAILABLE`.
 
 Omit the key to use the backend default, which is unchanged from earlier releases:
 
@@ -600,7 +739,7 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector. [OTLP Collectors](/observability/overview#otlp-collectors) shows where each signal goes.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
@@ -744,6 +883,7 @@ Each OCSF event becomes one log record:
 | Timestamp | The OCSF `time`. The observed timestamp is when the gateway received the event. |
 | Severity | Unknown, Informational, and Other are INFO, Low is WARN, Medium is WARN2, High is ERROR, Critical is ERROR2, and Fatal is FATAL. The severity text is the OCSF severity name. |
 | Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. |
+| Trace context | The trace and span ID of the sampled span active when the event was emitted, for every OCSF class. Absent when no sampled span was active. |
 
 `schema_version` in this table is deprecated and ignored; the gateway logs a warning at startup when it is set.
 
@@ -843,7 +983,7 @@ max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-Each service advertises operation and phase pairs through `Describe`. A sandbox policy attaches the service by its registration `name`; the gateway operator controls which bindings that attachment can use. Registration names must be unique and cannot start with the reserved `openshell/` namespace. The name in the service manifest is for diagnostics only.
+Each service advertises operation and phase pairs through `Describe`. A sandbox policy attaches the service by its registration `name`; the gateway operator controls which bindings that attachment can use. Registration names must be unique and cannot start with the reserved `openshell/` namespace. The name in the service manifest is for diagnostics only. A service that requires the `openshell.supervisor-middleware.http-hooks` capability receives its HTTP bindings through the [HTTP hooks](/extensibility/supervisor-middleware/operations#http).
 
 | `binding_policy` | What the gateway and supervisor require |
 | --- | --- |
@@ -866,7 +1006,7 @@ The gateway connects to every registered service and validates `Describe` before
 
 Startup also requires compatible [extension protocol metadata](/extensibility/overview#protocol-negotiation). Upgrade legacy gateways and operator-run services together during a coordinated outage; neither mixed legacy/current pairing is supported. A service rejects a gateway that omits peer metadata, and a gateway rejects a service that omits metadata, uses another protocol major, or requires unsupported gateway capabilities. Protected `GetGatewayInfo` and `openshell gateway info` report the resulting non-secret snapshot.
 
-`max_payload_bytes` is the shared operator limit for inspectable logical payloads across the bindings authorized for this service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
+`max_payload_bytes` is the shared operator limit for inspectable logical payloads across the bindings authorized for this service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. HTTP hook bindings that advertise a zero limit are excluded from the limit comparison and always get no body modes. The value must be greater than zero, unless every authorized binding is such a binding. Otherwise it must be no larger than each remaining binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
 
 `timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to HTTP request evaluation, HTTP response preflight and unit exchanges, WebSocket preflight, and each WebSocket message. Accepted streaming protocols have no connection-wide RPC deadline.
 
@@ -1210,6 +1350,9 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy              = "if_not_present"
 image_pull_secrets             = ["regcred"]
+# Startup windows in seconds; defaults are 300.
+# runtime_bootstrap_grace_seconds = 900
+# sandbox_attach_request_timeout_seconds = 900
 # Defaults to the gateway version; override to pin a specific build.
 # sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
 sandbox_runtime_image_pull_policy = "if_not_present"
@@ -1271,6 +1414,9 @@ workspace_default_storage_size = "10Gi"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"
+# Kubernetes RuntimeClass for dedicated supervisor pods. Only the administrator
+# sets it. It never inherits the workload class. Empty (default) = omit.
+# supervisor_runtime_class_name = "kata-supervisor"
 # Pod annotation keys that sandbox templates may set. Each entry is an exact
 # key or a `<domain>/*` wildcard. Empty (default) rejects every template
 # annotation. Keys under openshell.ai (OpenShell sandbox identity) and
@@ -1769,6 +1915,8 @@ Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. O
 
 Config preflight validates configuration without loading launch-signing keys, so a successful result does not confirm that the key files exist or form a usable pair. Gateway startup validates configured or discovered signing bundles. Sandbox creation checks the selected driver's launch-signing requirement before image preparation.
 
+When `allow_unauthenticated_users = true`, preflight prints a warning to stderr and still exits 0.
+
 To validate the exact daemon arguments that a wrapper will pass, place them after
 `--` instead of using `--path`:
 
@@ -1862,6 +2010,58 @@ Expose services with the existing commands. For direct listener testing, an
 unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 `default--demo.services.example.com`; a service named `web` uses
 `default--demo--web.services.example.com`. Configure DNS or your ingress to reach
-the owning supervisor while preserving that hostname. Automatic discovery and
-application URL publication are separate work; current CLI URLs still identify
-the existing gateway path.
+the owning supervisor while preserving that hostname. The discovery API supplies accepted supervisor endpoints. Application URL
+publication is separate work; current CLI URLs still identify the existing
+gateway path.
+
+Enabled supervisors report installed service routes through their authenticated
+gateway sessions. The gateway accepts only current configuration and ownership,
+resolves the supervisor endpoint through the compute driver, and expires
+installation evidence unless renewed. Reports do not establish application
+health or confirm that external ingress is ready. No additional reporting port
+or application credentials are required. Shared Kubernetes discovery selects the
+acknowledged pool owner's Pod IP and app port. The gateway revalidates the
+ownership term and live membership against shared storage. During takeover,
+old installations are withdrawn and the new endpoint appears only after the
+replacement installs the configuration. Application connections may need to
+reconnect; the sandbox workload and public URL remain unchanged.
+
+Shared listeners require both current configuration and a gateway-issued serving
+lease of at most fifteen seconds. Lease deadlines include queueing time; keep
+supervisor and gateway clocks synchronized. Loss of serving authority closes
+application streams even if configuration continues renewing. Under a partition,
+allow for pool membership failure detection before the last serving lease expires.
+Storage errors prevent lease renewal. Discovery expiry and serving expiry are
+separate from external ingress readiness.
+
+Both discovery RPCs require `supervisor_app_listener.enabled = true`. When the
+listener is disabled, they return `FAILED_PRECONDITION` without collecting routes
+or starting a watch.
+
+Discovery clients use the separate `openshell.v1.ServiceDiscovery` gRPC service.
+Call `GetServiceRouteSnapshot` or `WatchServiceRoutes` with
+one explicit workspace selector, `sandbox:read`, and workspace user access. Each
+response replaces the workspace route view and includes the hostname, supervisor
+TLS endpoint, installation version, and expiry. Preserve the hostname as TLS SNI
+and HTTP authority when routing directly to the endpoint. Remove absent routes
+and expire cached entries even during discovery errors. An API error does not
+mean the workspace has no routes. Watches end after one minute; reconnect and
+relist when they end. Discovery-only machine credentials are separate work.
+
+Discovery limits apply per gateway process: 1,000 installation records, 4,096
+routes, and 4 MiB per snapshot, with a ten-second collection timeout. Up to four
+collections and 16 unary requests run concurrently. Collections wait for a free
+slot within the ten-second timeout; unary requests are limited
+to four per principal and eight per workspace. Watches are limited to 32 total,
+four per principal, and 16 per workspace. Capacity and size limits return
+`RESOURCE_EXHAUSTED`; storage failures, configuration changes during collection,
+and timeouts return `UNAVAILABLE`; corrupt
+records return `INTERNAL`. Disabling the app listener returns `FAILED_PRECONDITION`.
+
+Consumers share a one-second collection cache, bounded to 16 workspaces. Cache reuse adds at most one refresh interval to collection freshness;
+cached routes never outlive their advertised expiry. Collections publish the
+latest accepted renewal for an unchanged, revalidated installation; the gateway
+does not create a new lease when serving discovery. Watches recheck bearer
+credentials and workspace access every second and terminate if either is lost.
+OIDC token revocation follows the configured verifier's semantics; offline JWT
+verification cannot detect issuer-side revocation before token expiry.

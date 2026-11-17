@@ -14,7 +14,7 @@ use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, ContainerWaitResponse, CreateImageInfo, DeviceRequest, HealthConfig,
     HealthStatusEnum, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions,
-    ProgressDetail, SystemInfo, VolumeCreateRequest,
+    ProgressDetail, SystemInfo, SystemVersion, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -95,6 +95,9 @@ const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 // request a bounded opportunity to mark the control exit intentional before
 // publishing a fail-closed runtime error.
 const SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+// Longer than the supervisor's own bound on stopping its workload, so it
+// finishes stopping before Docker kills it.
+const SUPERVISOR_STOP_TIMEOUT_SECS: i32 = 10;
 const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 30_000_000_000;
 // Docker probes at this interval only before the first healthy result and
 // within the start period.
@@ -917,9 +920,12 @@ impl DockerComputeDriver {
                 .map_err(|err| {
                     Error::execution(format!("failed to create Docker client: {err}"))
                 })?;
-        docker.version().await.map_err(|err| {
+        let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        if let Some(warning) = unsupported_docker_engine_warning(&version) {
+            warn!("{warning}");
+        }
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
@@ -5328,6 +5334,37 @@ fn docker_network_trust_supervisor_mount(
     })
 }
 
+/// Read the image identity pinned at provisioning, including after a restart.
+/// Re-resolving the template's tag here could identify a different image.
+async fn docker_workload_image_environment(
+    sandbox: &DriverSandbox,
+    directory: &Path,
+) -> Result<Vec<String>, Status> {
+    let bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+        .await
+        .map_err(|error| Status::internal(format!("read Docker image launch identity: {error}")))?;
+    let bootstrap: BoundaryConfig = serde_json::from_slice(&bytes)
+        .map_err(|_| Status::internal("decode Docker image launch identity"))?;
+    let mut environment = Vec::new();
+    if let Some(image) = sandbox_image(sandbox) {
+        environment.push(format!(
+            "{}={image}",
+            openshell_core::sandbox_env::CONTAINER_IMAGE
+        ));
+    }
+    if let Some(uid) = bootstrap
+        .resource_claims
+        .get("docker.image_identity")
+        .filter(|uid| !uid.trim().is_empty())
+    {
+        environment.push(format!(
+            "{}={uid}",
+            openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+        ));
+    }
+    Ok(environment)
+}
+
 async fn spawn_docker_control_process(
     docker: &Docker,
     sandbox: &DriverSandbox,
@@ -5354,6 +5391,7 @@ async fn spawn_docker_control_process(
     let workspace_root = tokio::fs::read_to_string(directory.join(WORKSPACE_ROOT_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker workspace root: {error}")))?;
+    let image_environment = docker_workload_image_environment(sandbox, &directory).await?;
     let supervisor_name = format!("{}-supervisor", container_name_for_sandbox(sandbox));
     let _ = docker
         .remove_container(
@@ -5404,6 +5442,7 @@ async fn spawn_docker_control_process(
             openshell_core::telemetry::enabled_env_value()
         ),
     ];
+    environment.extend(image_environment);
     environment.extend(supervisor_otlp_environment(config));
     if config.guest_tls.is_some() {
         environment.push(format!(
@@ -5574,7 +5613,7 @@ async fn spawn_docker_control_process(
             _ = &mut shutdown_requested => {
                 let _ = monitored_docker.stop_container(
                     &monitored_supervisor_id,
-                    Some(StopContainerOptionsBuilder::default().t(5).build()),
+                    Some(StopContainerOptionsBuilder::default().t(SUPERVISOR_STOP_TIMEOUT_SECS).build()),
                 ).await;
                 let _ = remove_supervisor().await;
             }
@@ -5998,6 +6037,31 @@ fn docker_cdi_gpu_inventory(info: &SystemInfo) -> CdiGpuInventory {
             .filter(|device| device.source.as_deref() == Some("cdi"))
             .filter_map(|device| device.id.as_deref()),
     )
+}
+
+/// Oldest Docker Engine major version the driver is supported on.
+const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
+
+/// Warn text when the daemon is a Docker Engine older than the supported
+/// minimum. Older engines fail sandbox bundle staging with opaque errors.
+fn unsupported_docker_engine_warning(version: &SystemVersion) -> Option<String> {
+    let engine = version
+        .components
+        .iter()
+        .flatten()
+        .find(|component| component.name == "Engine")?;
+    let major: u64 = engine
+        .version
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (major < MIN_DOCKER_ENGINE_MAJOR).then(|| {
+        format!(
+            "Docker Engine {} is older than the supported minimum {MIN_DOCKER_ENGINE_MAJOR}.0; sandbox creation may fail. See the support matrix in the OpenShell docs.",
+            engine.version
+        )
+    })
 }
 
 fn docker_info_reports_wsl2(info: &SystemInfo) -> bool {

@@ -463,7 +463,8 @@ e2e_export_gateway_restart_metadata \
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-e2e_run_openshell_conformance "VM"
+OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
+  e2e_run_openshell_conformance "VM"
 if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
   echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
   exit 0

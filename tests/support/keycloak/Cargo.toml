@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "keycloak"
+name = "keycloak-support"
 description = "Keycloak fixture for test suites that need an OIDC issuer"
 version = "0.0.0"
 edition = "2024"

@@ -12,7 +12,7 @@ position: 2
 
 OpenShell governs what agents can do in two ways: it instruments the kernel to enforce policy on every file access, system call, and network connection at runtime, and it uses formal verification to check what a policy change would allow before it is applied.
 
-- **Kernel-level enforcement.** Each agent runs in an isolated sandbox. Kernel controls confine which files it can access and which system calls it can make, and every network connection passes through a policy check before it leaves the sandbox. Agents never see real credentials; OpenShell adds them only to requests bound for approved endpoints.
+- **Kernel-level enforcement.** Each agent runs in an isolated sandbox. Kernel controls confine which files it can access and which system calls it can make, and every network connection passes through a policy check before it leaves the sandbox. OpenShell supplies credential placeholders to agents and adds real credentials only to requests bound for approved endpoints.
 - **Formally verified policy changes.** Before a policy change is approved, OpenShell uses formal verification to flag risky new access it would grant, such as reaching a new host with credentials or calling a new API method, so those changes wait for human review.
 
 The **gateway** is the control plane: it manages the lifecycle of sandboxes and
@@ -55,7 +55,7 @@ trusted process observations.
 ### Mediated Channel
 
 The **supervisor** and **sandbox** talk over the OpenShell Sandbox Protocol:
-one mutually authenticated HTTP/2 connection that carries many independent
+one HTTP/2 connection authenticated with TLS and a sandbox JWT that carries many independent
 streams. The compute driver picks the transport: a Unix socket for Docker and
 Podman, TCP for Kubernetes, or vsock for MicroVM. Authentication and protocol
 behavior are the same on all of them. The **supervisor** presents a
@@ -112,7 +112,7 @@ network.
 |---|---|---|---|
 | Docker | Its own container | Authenticated Unix socket on a driver-owned volume | Workload container has networking turned off |
 | Podman | Its own container | Authenticated Unix socket on a driver-owned volume | Workload container has networking turned off |
-| Kubernetes | Its own pod | Private service with mutual TLS | NetworkPolicy allows only the **supervisor** service |
+| Kubernetes | Its own pod | Private service with server-authenticated TLS and a sandbox JWT | NetworkPolicy allows only the **supervisor** service |
 | VM | A process on the host | Authenticated vsock | Guest has no network device |
 
 The runtime's job is to build the boundary and prove it's in place. It never
@@ -126,15 +126,15 @@ do.
 
 ## How Components Authenticate
 
-Three connections tie a sandbox together. The gateway is the only component
-that signs credentials, and every credential names exactly one sandbox.
+Three connections tie a sandbox session together. The gateway signs the
+session's gateway and sandbox JWTs, each bound to that sandbox and generation.
 
-![OpenShell sandbox authentication showing the compute driver giving the supervisor a bootstrap credential, the gateway issuing a gateway JWT and sandbox JWT, and the supervisor presenting the sandbox JWT over mutual TLS to the sandbox, which holds only the gateway's public key.](../images/openshell-sandbox-authentication.svg)
+![OpenShell sandbox authentication showing the gateway preissuing session JWTs, delivery to dedicated supervisors through the compute driver or to shared supervisors through a host-JWT-authenticated assignment stream, and the supervisor presenting the sandbox JWT over server-authenticated TLS to the sandbox.](../images/openshell-sandbox-authentication.svg)
 
 | Connection | Who connects | How it's protected |
 |---|---|---|
 | **Supervisor** to gateway | The **supervisor** dials out to the gateway. | A gateway JWT, over TLS when the gateway has TLS enabled. |
-| **Supervisor** to **sandbox** | The **supervisor** dials into the workload over the driver's private channel. | Mutual TLS, plus a sandbox JWT. |
+| **Supervisor** to **sandbox** | The **supervisor** acts as the TLS and gRPC client over the driver's private channel. The runtime can initiate the underlying transport connection. | TLS authenticates the **sandbox** server; the sandbox JWT authenticates the **supervisor**. No TLS client certificate is used. |
 | Agent to **supervisor** | The agent never connects directly. The **sandbox** relays its traffic over the connection above. | Covered by the supervisor-to-sandbox channel. |
 
 The **supervisor** verifies the gateway's TLS certificate with its CA. User
@@ -143,27 +143,32 @@ workload; the gateway JWT authenticates supervisor RPCs.
 
 ### Getting the first credential
 
-The **supervisor** needs a starting credential to prove which sandbox it belongs
-to. How it gets one depends on the runtime:
+The gateway prepares session credentials for each sandbox generation and
+delivers them through trusted launch provisioning:
 
-- **Docker, Podman, and MicroVM.** The driver hands the **supervisor** its initial
-  tokens directly, in files only the **supervisor** can read.
-- **Kubernetes.** The **supervisor** presents its pod's ServiceAccount token. The
-  gateway asks the Kubernetes driver to verify the token and confirm that the
-  pod belongs to the expected sandbox before it issues any JWTs.
+- **Docker, Podman, and MicroVM.** The driver supplies the dedicated
+  **supervisor** with private credential files.
+- **Kubernetes, dedicated supervisor.** The driver mounts the preissued
+  credential bundle from a Secret into the **supervisor** pod.
+- **Kubernetes, shared supervisor.** Each sandbox's credential bundle arrives
+  in its assignment over the authenticated supervisor-host stream.
 
-Either way, the gateway checks the claim against its own record of the sandbox
-before returning credentials.
+A separate `IssueSandboxToken` exchange accepts a compute-driver bootstrap
+identity. On Kubernetes, the driver validates a projected ServiceAccount token
+and its pod and owner identity. The gateway compares the driver and runtime
+identity with its stored sandbox record before returning a gateway JWT. This
+exchange is not required for supervisors provisioned with a credential bundle.
 
 ### Gateway and Sandbox JWTs
 
 The gateway issues a pair of JWTs for each run of a sandbox:
 
-- **Gateway JWT.** Sent with every **supervisor** call to the gateway. It allows
-  only the calls a **supervisor** needs, such as fetching policy, pushing logs, and
+- **Gateway JWT.** Authenticates the **supervisor**'s sandbox-specific calls to
+  the gateway. It allows only the calls a **supervisor** needs, such as fetching policy, pushing logs, and
   relaying sessions. It is not a user credential and can't manage other
   sandboxes.
-- **Sandbox JWT.** Sent with every **supervisor** call to the **sandbox**.
+- **Sandbox JWT.** Authenticates boundary opening and the **supervisor**'s control
+  and mediation streams to the **sandbox**.
   The **sandbox** holds only the gateway's public key, so it can verify the
   token but can never create one.
 
@@ -172,11 +177,17 @@ one run of that sandbox, called a generation. Restarting a sandbox starts a new
 generation with fresh tokens and fresh TLS certificates, and the old ones stop
 working.
 
+Shared Kubernetes supervisors also use a separate, gateway-scoped supervisor-host
+JWT to receive assignments. The pool's replicas share this token, which
+authorizes only the host assignment stream. The gateway checks assignment
+ownership separately, and each assigned sandbox still uses its own session JWTs.
+See [Multi-tenant Supervisor](/kubernetes/high-availability#experimental-multi-tenant-supervisor).
+
 ### Renewing and revoking
 
-The **supervisor** keeps its tokens in memory and renews both together before they
-expire. Renewal works only while the sandbox still exists, so deleting a
-sandbox cuts off its **supervisor**.
+The **supervisor** keeps its session tokens in memory and renews both together
+before they expire. Renewal works only while the sandbox still exists, so
+deleting a sandbox ends that sandbox's session.
 
 Shared deployments, such as Kubernetes, should set `gateway_jwt.ttl_secs` so
 tokens expire. Local single-user gateways can leave it unset, which issues
@@ -184,14 +195,21 @@ tokens that last for the life of the sandbox run.
 
 ### What the agent can see
 
-The agent shares its side of the boundary with the **sandbox**, so
-the **sandbox** holds nothing worth stealing: no gateway signing key, no
-gateway JWT, and no provider credentials. It can verify that it's talking to
-the right **supervisor**, but it can't impersonate one.
+The agent shares its container or guest with the trusted **sandbox** runtime.
+The runtime holds no gateway signing key, gateway JWT, or provider credentials.
+It still protects its TLS private key and enforcement state from the agent.
+It can verify that it's talking to the right **supervisor**, but it can't
+impersonate one.
 
-If the **supervisor** disconnects, the **sandbox** freezes the agent. Only the
-same **supervisor** process can reconnect and resume it. A new **supervisor** can't
-take over a running sandbox, even with valid credentials.
+If the **supervisor** disconnects, the **sandbox** freezes the agent. The same
+**supervisor** process can reconnect and resume it within the recovery window.
+In a [shared Kubernetes supervisor pool](/kubernetes/high-availability#recover-from-a-supervisor-failure),
+the gateway can authorize a replacement **supervisor** with a signed takeover
+grant for that sandbox generation and a higher ownership epoch. When the
+replacement confirms the boundary, a runtime that supports takeover revokes the
+previous owner's access and resumes the agent. Valid session credentials alone do not
+authorize takeover. If recovery does not complete before the deadline, the
+runtime terminates the workload.
 
 ## Working With Your Existing Infrastructure
 

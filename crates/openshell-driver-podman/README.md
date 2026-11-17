@@ -131,6 +131,9 @@ the consumed sandbox bootstrap from a copy in the supervisor's private
 filesystem, verifies the fence, and starts the same pair. A failed supervisor
 start stops the workload. Delete removes the companion first, then the workload,
 channel, workspace, and driver-owned secrets. User-owned volumes are retained.
+Delete keeps a channel, control, or workspace volume whose
+`openshell.ai/sandbox-id` label is missing or names another sandbox, and logs a
+warning.
 
 Only workload containers appear in sandbox list/watch results. Readiness uses
 the supervisor's private health socket; there is no shell, legacy marker, or

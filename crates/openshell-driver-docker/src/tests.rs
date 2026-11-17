@@ -149,6 +149,21 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
 
     let bootstrap: BoundaryConfig =
         serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    // A restart keeps the original image identity even if the mutable
+    // template reference now names another image in the registry.
+    let sandbox = test_sandbox();
+    let image_env = docker_workload_image_environment(&sandbox, &directory)
+        .await
+        .unwrap();
+    assert!(image_env.contains(&format!(
+        "{}=image-test",
+        openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+    )));
+    assert!(image_env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::CONTAINER_IMAGE,
+        sandbox_image(&sandbox).unwrap()
+    )));
     let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
         .await
         .unwrap()
@@ -3257,6 +3272,38 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
         second_request.device_ids.as_ref().unwrap(),
         &vec!["nvidia.com/gpu=1".to_string()]
     );
+}
+
+fn engine_version(name: &str, version: &str) -> SystemVersion {
+    SystemVersion {
+        components: Some(vec![bollard::models::SystemVersionComponents {
+            name: name.to_string(),
+            version: version.to_string(),
+            details: None,
+        }]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn warns_on_docker_engine_older_than_minimum() {
+    let warning = unsupported_docker_engine_warning(&engine_version("Engine", "26.1.5+dfsg1"))
+        .expect("old engine warns");
+    assert!(warning.contains("26.1.5+dfsg1"), "{warning}");
+    assert!(warning.contains("28.0"), "{warning}");
+}
+
+#[test]
+fn no_warning_for_supported_unknown_or_other_engines() {
+    for version in [
+        engine_version("Engine", "28.0.0"),
+        engine_version("Engine", "29.9.3"),
+        engine_version("Engine", "garbage"),
+        engine_version("Other Engine", "5.8.2"),
+        SystemVersion::default(),
+    ] {
+        assert!(unsupported_docker_engine_warning(&version).is_none());
+    }
 }
 
 #[test]

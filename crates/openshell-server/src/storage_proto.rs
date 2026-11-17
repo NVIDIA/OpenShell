@@ -177,8 +177,9 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "33e32bb6cb2251b3e75c6425555502e6c2fd675b640094437ef06856a46866e3";
+        "daa132037ee47c7a46b08dfab9bab379961bc06ff3e9ebbb329809b724f2a4f6";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -596,8 +597,10 @@ mod tests {
                 }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell" | "SandboxUpdates")
-                        | ("openshell.inference.v1", "Inference")
+                    (
+                        "openshell.v1",
+                        "OpenShell" | "SandboxUpdates" | "ServiceDiscovery"
+                    ) | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -652,7 +655,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            113 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -662,7 +665,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -723,7 +726,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (335, 31),
+                (344, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

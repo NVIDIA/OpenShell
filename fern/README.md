@@ -49,7 +49,7 @@ The automated site uses these version types:
 
 Release Dev waits for the development artifacts and Helm chart, then calls `.github/workflows/sync-docs.yml` once. The reusable workflow updates `dev`, validates the generated site, commits and pushes the branch when needed, and publishes the production site once.
 
-Release follows the same sequence for a stable tag through `release-publish.yml` after the release artifacts, SDK package, Helm chart, and wheel publication complete. One sync copies the tagged source into both the immutable `vX.Y.Z` snapshot and `latest` when the release is not older than the current version, then publishes the production site once. The version selector pins `latest` and `dev` first, followed by versioned snapshots in descending version order. Other historical entries follow in their existing order.
+Release follows the same sequence for a stable tag through `release.yml` after the release artifacts, SDK package, Helm chart, and PyPI wheel publication complete. One sync copies the tagged source into both the immutable `vX.Y.Z` snapshot and `latest` when the release is not older than the current version, then publishes the production site once. The version selector pins `latest` and `dev` first, followed by versioned snapshots in descending version order. Other historical entries follow in their existing order.
 
 The sync workflow still accepts an optional Fern availability badge, but the current Release Dev and Release jobs do not request one. The next `dev` sync replaces the existing `dev` Beta badge with an unbadged entry. Other entries retain their badge setting until that entry is synced or removed.
 

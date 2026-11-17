@@ -109,6 +109,7 @@ pub fn install(
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(GatewayEventFormat)
+                .with_ansi(openshell_core::color::stdout_ansi())
                 .with_filter(filter_from(filter_directives)),
         )
         .with(
@@ -263,6 +264,7 @@ mod tests {
             sandbox_id: "portable-audit".into(),
             sandbox_name: "portable-audit".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "gateway-host".into(),
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
@@ -318,6 +320,7 @@ mod tests {
             sandbox_id: "sandbox-filter-test".into(),
             sandbox_name: "filter-test".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "gateway-host".into(),
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),

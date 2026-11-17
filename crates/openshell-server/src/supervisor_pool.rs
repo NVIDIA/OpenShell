@@ -48,14 +48,15 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use openshell_core::ObjectWorkspace as _;
 use openshell_core::jwt::{SandboxId, SupervisorTakeover};
-use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta, Provider};
+use openshell_core::proto::datamodel::v1::CredentialHandle;
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::time::now_ms;
+use openshell_core::{ObjectId as _, ObjectWorkspace as _};
+use openshell_credential_issuer::SecretOwner;
 use openshell_supervisor_control::pool_timing::RECORD_WRITE_BOUND;
 use openshell_supervisor_control::proto::{
-    SandboxInstanceAssignment, SandboxInstanceStatus, SandboxInstanceTakeover,
+    SandboxInstanceAssignment, SandboxInstancePhase, SandboxInstanceStatus, SandboxInstanceTakeover,
 };
 use openshell_supervisor_control::{
     ConnectedMember, InstanceOwner, InstancePlacement, MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES,
@@ -76,6 +77,7 @@ use crate::gateway_ring::GatewayRing;
 use crate::persistence::{
     AtomicWrite, ObjectCursor, ObjectRecord, PersistenceError, Store, WriteCondition,
 };
+use crate::supervisor_spread::SupervisorSpread;
 
 const MEMBER_OBJECT_TYPE: &str = "supervisor_pool_member";
 const OWNER_OBJECT_TYPE: &str = "supervisor_instance_owner";
@@ -181,6 +183,7 @@ pub struct LiveMember {
     pub process_id: String,
     pub runtime_address: String,
     pub leaving: bool,
+    pub gateway_replica: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +393,7 @@ pub struct SupervisorPool {
     /// Keeps the pool's launch material.
     credentials: CredentialRuntime,
     replica_id: String,
+    spread: Arc<SupervisorSpread>,
     member_ttl: Duration,
     /// How often the records of served members are refreshed.
     member_refresh: Duration,
@@ -487,6 +491,96 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Revalidate an application endpoint against durable pool authority, rather
+/// than a replica's eventually refreshed placement cache. Never treats the
+/// member's runtime port as an application port.
+pub async fn app_endpoint_current(
+    store: &Store,
+    sandbox: &Sandbox,
+    endpoint: &openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+) -> Result<bool, PersistenceError> {
+    let Some(metadata) = &sandbox.metadata else {
+        return Ok(false);
+    };
+    let identity = PersistedSandboxIdentity::read(&metadata.annotations)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    let Some(assignment_row) = store
+        .get_by_name(ASSIGNMENT_OBJECT_TYPE, "", &endpoint.pool_route)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let assignment: AssignmentPayload = serde_json::from_slice(&assignment_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if assignment.route != endpoint.pool_route
+        || assignment.sandbox_id != sandbox.object_id()
+        || assignment.generation != identity.runtime_generation.as_str()
+        || assignment.phase != RecordPhase::Published
+    {
+        return Ok(false);
+    }
+    let Some(row) = store
+        .get(OWNER_OBJECT_TYPE, &owner_object_id(&endpoint.pool_route))
+        .await?
+    else {
+        return Ok(false);
+    };
+    let owner: OwnerPayload = serde_json::from_slice(&row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if owner.route != endpoint.pool_route
+        || owner.sandbox_id != sandbox.object_id()
+        || owner.generation != identity.runtime_generation.as_str()
+        || owner.phase != OwnerPhase::Granted
+        || owner.auth_epoch != endpoint.ownership_epoch
+        || owner.auth_epoch != identity.auth_epoch.get()
+    {
+        return Ok(false);
+    }
+    let Some(member_row) = store
+        .get(MEMBER_OBJECT_TYPE, &member_object_id(&owner.member_id))
+        .await?
+    else {
+        return Ok(false);
+    };
+    if now_ms().saturating_sub(member_row.updated_at_ms)
+        >= i64::try_from(MEMBER_TTL.as_millis()).expect("bounded member TTL")
+    {
+        return Ok(false);
+    }
+    let member: MemberPayload = serde_json::from_slice(&member_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if member.member_id != owner.member_id
+        || member.process_id != owner.process_id
+        || member.leaving
+        || member
+            .runtime_address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|a| a.ip())
+            != endpoint.host.parse::<std::net::IpAddr>().ok()
+    {
+        return Ok(false);
+    }
+    let Some(report_row) = store
+        .get(
+            REPORT_OBJECT_TYPE,
+            &report_object_id(&owner.route, owner.auth_epoch),
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let report: ReportPayload = serde_json::from_slice(&report_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    Ok(report.route == owner.route
+        && report.sandbox_id == owner.sandbox_id
+        && report.member_id == owner.member_id
+        && report.process_id == owner.process_id
+        && report.auth_epoch == owner.auth_epoch
+        && report.ready
+        && report.phase == SandboxInstancePhase::Supervising as i32)
 }
 
 /// The ring over live members that are not leaving.
@@ -650,14 +744,9 @@ fn decode_report(record: &ObjectRecord) -> Option<ReportPayload> {
     (record.id == report_object_id(&payload.route, payload.auth_epoch)).then_some(payload)
 }
 
-/// The synthetic credential owner of one sandbox's launch material, scoped
-/// like the sandbox's SSH host key.
-fn material_owner(payload: &AssignmentPayload) -> (String, &str, &str) {
-    (
-        format!("sandbox-instance-{}", payload.sandbox_id),
-        payload.workspace.as_str(),
-        payload.sandbox_id.as_str(),
-    )
+/// The credential owner of one sandbox assignment's launch material.
+fn material_owner(payload: &AssignmentPayload) -> SecretOwner<'_> {
+    SecretOwner::supervisor_instance(&payload.workspace, &payload.sandbox_id)
 }
 
 /// Whether `generation` of `sandbox` can still run: the sandbox exists,
@@ -683,6 +772,7 @@ impl SupervisorPool {
         authority: Arc<SandboxSessionJwtAuthority>,
         credentials: CredentialRuntime,
         replica_id: String,
+        spread: Arc<SupervisorSpread>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -690,6 +780,7 @@ impl SupervisorPool {
             authority,
             credentials,
             replica_id,
+            spread,
             member_ttl: MEMBER_TTL,
             member_refresh: openshell_supervisor_control::pool_timing::MEMBER_REFRESH_INTERVAL,
             unowned_grace: UNOWNED_GRACE,
@@ -1082,6 +1173,7 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
+                gateway_replica: payload.gateway_replica,
             });
         }
         members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
@@ -1356,13 +1448,10 @@ impl SupervisorPool {
     ) -> Result<CredentialHandle, String> {
         let value = std::str::from_utf8(material)
             .map_err(|_| "sandbox instance launch material is not UTF-8".to_string())?;
-        let (name, workspace, owner_id) = material_owner(payload);
         let handles = self
             .credentials
-            .store_provider_credentials_with_object_id(
-                &name,
-                workspace,
-                owner_id,
+            .store_secrets_with_object_id(
+                material_owner(payload),
                 &Uuid::new_v4().to_string(),
                 &HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), value.to_string())]),
                 &HashMap::new(),
@@ -1383,20 +1472,13 @@ impl SupervisorPool {
     async fn load_material(&self, payload: &AssignmentPayload) -> Result<Vec<u8>, String> {
         let handle = CredentialHandle::decode(payload.material_handle.as_slice())
             .map_err(|_| "invalid launch material credential handle".to_string())?;
-        let (name, workspace, owner_id) = material_owner(payload);
-        let owner = Provider {
-            metadata: Some(ObjectMeta {
-                id: owner_id.to_string(),
-                name,
-                workspace: workspace.to_string(),
-                ..Default::default()
-            }),
-            credential_handles: HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), handle)]),
-            ..Default::default()
-        };
         let mut resolved = self
             .credentials
-            .resolve_provider_handles(&owner, 0)
+            .resolve_secrets(
+                material_owner(payload),
+                &HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), handle)]),
+                0,
+            )
             .await
             .map_err(|status| {
                 format!(
@@ -1416,12 +1498,9 @@ impl SupervisorPool {
         payload: &AssignmentPayload,
         handle: CredentialHandle,
     ) -> Result<(), String> {
-        let (name, workspace, owner_id) = material_owner(payload);
         self.credentials
-            .delete_provider_credential_handles(
-                &name,
-                workspace,
-                owner_id,
+            .delete_secrets(
+                material_owner(payload),
                 &HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), handle)]),
             )
             .await
@@ -2057,6 +2136,7 @@ impl SupervisorPool {
         }
         self.remove_withdrawn().await;
         let members = self.live_members().await?;
+        self.spread.observe(&members);
         let ring = ring_of(&members);
         let listed_at = tokio::time::Instant::now();
         // Listed before the owners, so a report row of a term newer than the
@@ -2598,6 +2678,7 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
+                gateway_replica: payload.gateway_replica,
             });
         Ok(takeover_cause(owner, member.as_ref()))
     }
@@ -2795,6 +2876,19 @@ impl SupervisorPool {
             );
         }
         lock(&self.minted).retain(|term, _| current_terms.contains(term));
+        let mut placed: BTreeMap<&str, usize> = served
+            .iter()
+            .map(|(member, _)| (member.as_str(), 0))
+            .collect();
+        for owner in view.owners.values() {
+            if let Some(count) = placed.get_mut(owner.member_id.as_str()) {
+                *count += 1;
+            }
+        }
+        crate::gateway_metrics::record_supervisor_hosts(
+            placed.len(),
+            placed.values().copied().max().unwrap_or(0),
+        );
         Some(view)
     }
 
@@ -2966,6 +3060,7 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
+                Arc::default(),
             );
             let unique = Arc::get_mut(&mut pool).expect("unique");
             unique.unowned_grace = Duration::ZERO;
@@ -2998,6 +3093,7 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
+                Arc::default(),
             )
         }
 
@@ -5215,6 +5311,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_endpoints_require_current_acknowledged_owner_and_live_member() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let sandbox_id = fixture.owner(&route).await.unwrap().sandbox_id;
+        let mut sandbox = fixture
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
+            host: "10.0.0.1".into(),
+            port: 9443,
+            pool_route: route.clone(),
+            ownership_epoch: 1,
+            ..Default::default()
+        };
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        let report = ReportPayload {
+            route: route.clone(),
+            member_id: "m1".into(),
+            process_id: "p1".into(),
+            auth_epoch: 1,
+            sandbox_id: sandbox_id.clone(),
+            phase: SandboxInstancePhase::Supervising as i32,
+            ready: true,
+            exit_code: 0,
+            connected_at_ms: now_ms(),
+        };
+        fixture.write_report(report.clone()).await;
+        assert!(
+            app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.host = "10.0.0.2".into();
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.host = "10.0.0.1".into();
+        fixture.member("m1", "p1", true).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.member("m1", "p1", false).await;
+        // Returning to the same host process is still a new ownership term.
+        grant_next_term(&fixture, &route, "m1", "p1").await;
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            crate::auth::sandbox_session::AUTH_EPOCH_ANNOTATION.into(),
+            "2".into(),
+        );
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.ownership_epoch = 2;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap(),
+            "old acknowledged report cannot authorize the new term"
+        );
+        fixture
+            .write_report(ReportPayload {
+                auth_epoch: 2,
+                ..report
+            })
+            .await;
+        assert!(
+            app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.member("m1", "p2", false).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.remove_owner_record(&route).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn reports_count_only_for_their_owners_term() {
         let fixture = Fixture::new().await;
         fixture.member("m1", "p1", false).await;
@@ -5348,6 +5542,7 @@ mod tests {
             process_id: process_id.to_string(),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
+            gateway_replica: String::new(),
         };
         assert_eq!(takeover_cause(&owner, None), Some("expired"));
         assert_eq!(
@@ -5372,6 +5567,7 @@ mod tests {
             process_id: format!("p-{id}"),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
+            gateway_replica: String::new(),
         };
         let members = vec![member("m1", false), member("m2", false), member("m3", true)];
         let ring = ring_of(&members);

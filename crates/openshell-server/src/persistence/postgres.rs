@@ -36,7 +36,14 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
         .map(|migration| migration.sql.as_ref())
 }
 
-use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::mutation_admission::{
+    self, ADMISSION_OBJECT_TYPE, AdmissionTx, COUNTER_OBJECT_TYPE, CompletedAdmission, Counter,
+    RECOUNT_STATUS, counter_id,
+};
+use super::{
+    DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, EXISTING_IDS_BATCH_SIZE, POLICY_OBJECT_TYPE,
+};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
@@ -275,6 +282,46 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 /// wait on itself until the acquire times out.
 pub const MIN_MAX_CONNECTIONS: u32 = 2;
 
+/// How long a data-pool caller waits for a connection, including opening one.
+pub(super) const DATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether a connect or migration failure means `PostgreSQL` is not serving
+/// yet, so startup retries it. A bad host, credentials, or certificate stays
+/// fatal.
+fn is_unavailable_at_startup(error: &sqlx::Error) -> bool {
+    use std::io::ErrorKind;
+    match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+        ),
+        // read_only_sql_transaction, too_many_connections, admin_shutdown,
+        // crash_shutdown, cannot_connect_now.
+        sqlx::Error::Database(error) => matches!(
+            error.code().as_deref(),
+            Some("25006" | "53300" | "57P01" | "57P02" | "57P03")
+        ),
+        _ => false,
+    }
+}
+
+fn map_startup_error(error: &sqlx::Error) -> PersistenceError {
+    if is_unavailable_at_startup(error) {
+        PersistenceError::Unavailable(error.to_string())
+    } else {
+        map_db_error(error)
+    }
+}
+
 impl PostgresStore {
     /// Connect and size the data and lock pools, falling back to
     /// [`DEFAULT_MAX_CONNECTIONS`] and `MUTATION_LOCK_POOL_MAX_CONNECTIONS`.
@@ -304,9 +351,10 @@ impl PostgresStore {
         );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(DATA_POOL_ACQUIRE_TIMEOUT)
             .connect(url)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| map_startup_error(&e))?;
         let lock_pool = PgPoolOptions::new()
             .max_connections(lock_pool_size)
             .min_connections(0)
@@ -351,22 +399,30 @@ impl PostgresStore {
         POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))?;
+            .map_err(|e| match &e {
+                sqlx::migrate::MigrateError::Execute(error)
+                | sqlx::migrate::MigrateError::ExecuteMigration(error, _)
+                    if is_unavailable_at_startup(error) =>
+                {
+                    PersistenceError::Unavailable(e.to_string())
+                }
+                _ => map_migrate_error(&e),
+            })?;
         self.migrate_legacy_time_payloads().await
     }
 
     async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
-        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let mut transaction = self.pool.begin().await.map_err(|e| map_startup_error(&e))?;
         // Serialize this application-level data migration across gateway replicas.
         sqlx::query("SELECT pg_advisory_xact_lock(3052)")
             .execute(&mut *transaction)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| map_startup_error(&e))?;
         let rows =
             sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id FOR UPDATE")
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|e| map_db_error(&e))?;
+                .map_err(|e| map_startup_error(&e))?;
 
         for row in rows {
             let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
@@ -384,11 +440,14 @@ impl PostgresStore {
                     .bind(id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|e| map_db_error(&e))?;
+                    .map_err(|e| map_startup_error(&e))?;
             }
         }
 
-        transaction.commit().await.map_err(|e| map_db_error(&e))
+        transaction
+            .commit()
+            .await
+            .map_err(|e| map_startup_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection
@@ -1022,6 +1081,116 @@ RETURNING resource_version, created_at_ms, updated_at_ms
         }))
     }
 
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        mutation_admission::admit(PgAdmission(tx), id, name, bucket, payload, limit).await
+    }
+
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        bucket: Option<&str>,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<CompletedAdmission>> {
+        // The object type is a literal so the planner can use the partial indexes
+        // from migration 010, whose predicate it must match exactly.
+        let rows: Vec<(String, Vec<u8>)> = match bucket {
+            None => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND updated_at_ms <= $1
+ORDER BY updated_at_ms LIMIT $2",
+                )
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some(bucket) => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND workspace = $1
+  AND updated_at_ms <= $2
+ORDER BY updated_at_ms LIMIT $3",
+                )
+                .bind(bucket)
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| map_db_error(&e))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, payload)| CompletedAdmission { id, payload })
+            .collect())
+    }
+
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut mark = QueryBuilder::<Postgres>::new("UPDATE objects SET status = ");
+            mark.push_bind(RECOUNT_STATUS)
+                .push(" WHERE object_type = ")
+                .push_bind(COUNTER_OBJECT_TYPE)
+                .push(" AND workspace IN (SELECT workspace FROM objects WHERE object_type = ")
+                .push_bind(ADMISSION_OBJECT_TYPE)
+                .push(" AND id IN (");
+            let mut separated = mark.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated("))");
+            mark.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+            let mut delete =
+                QueryBuilder::<Postgres>::new("DELETE FROM objects WHERE object_type = ");
+            delete.push_bind(ADMISSION_OBJECT_TYPE).push(" AND id IN (");
+            let mut separated = delete.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            deleted += delete
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(deleted)
+    }
+
+    #[cfg(test)]
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        sqlx::query("UPDATE objects SET updated_at_ms = $1 WHERE id = $2")
+            .bind(updated_at_ms)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -1096,6 +1265,32 @@ WHERE object_type = $1 AND workspace = $2 AND name = $3
                 .rows_affected();
         }
         Ok(deleted)
+    }
+
+    pub async fn existing_ids(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashSet<String>> {
+        let mut existing = HashSet::with_capacity(ids.len());
+        for ids in ids.chunks(EXISTING_IDS_BATCH_SIZE) {
+            let mut query =
+                QueryBuilder::<Postgres>::new("SELECT id FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            existing.extend(rows.iter().map(|row| row.get::<String, _>("id")));
+        }
+        Ok(existing)
     }
 
     pub async fn count_in_workspace(
@@ -2202,6 +2397,87 @@ WHERE object_type = $1 AND scope = $2
     }
 }
 
+struct PgAdmission(sqlx::Transaction<'static, Postgres>);
+
+impl AdmissionTx for PgAdmission {
+    async fn counter(&mut self, bucket: &str) -> PersistenceResult<Option<Counter>> {
+        // Row lock orders this count against concurrent recount marks.
+        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT hit_count, status, updated_at_ms FROM objects WHERE object_type = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .fetch_optional(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(row.map(|(count, status, updated_at_ms)| Counter {
+            count,
+            recount: status.is_some(),
+            updated_at_ms,
+        }))
+    }
+
+    async fn count(&mut self, bucket: &str) -> PersistenceResult<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE object_type = $1 AND workspace = $2")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .fetch_one(&mut *self.0)
+            .await
+            .map_err(|e| map_db_error(&e))
+    }
+
+    async fn insert(
+        &mut self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)",
+        )
+        .bind(ADMISSION_OBJECT_TYPE)
+        .bind(id)
+        .bind(name)
+        .bind(bucket)
+        .bind(payload)
+        .bind(now_ms)
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn put_counter(
+        &mut self,
+        bucket: &str,
+        counter: &Counter,
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version, hit_count, status)
+VALUES ($1, $2, $3, ''::bytea, $4, $4, '{}'::jsonb, 1, $5, $6)
+ON CONFLICT (id) DO UPDATE SET hit_count = EXCLUDED.hit_count, status = EXCLUDED.status, updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .bind(bucket)
+        .bind(now_ms)
+        .bind(counter.count)
+        .bind(counter.recount.then_some(RECOUNT_STATUS))
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn commit(self) -> PersistenceResult<()> {
+        self.0.commit().await.map_err(|e| map_db_error(&e))
+    }
+}
+
 fn row_to_object_record(row: sqlx::postgres::PgRow) -> ObjectRecord {
     let labels_jsonb: Option<serde_json::Value> = row.get("labels");
     let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
@@ -2282,6 +2558,55 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_to_a_refusing_server_fails_unavailable_within_the_acquire_timeout() {
+        let url = PostgresStore::refusing_url_for_tests().await;
+        let started = std::time::Instant::now();
+
+        let error = PostgresStore::connect(&url, None, None)
+            .await
+            .expect_err("nothing listens on the port");
+
+        assert!(
+            matches!(error, PersistenceError::Unavailable(_)),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < DATA_POOL_ACQUIRE_TIMEOUT + Duration::from_secs(3),
+            "connect waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn startup_retries_io_errors_only_while_postgres_does_not_answer() {
+        use std::io::ErrorKind;
+        let io = |kind: ErrorKind| map_startup_error(&sqlx::Error::Io(kind.into()));
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Unavailable(_)),
+                "{kind:?}"
+            );
+        }
+        // An unresolvable host, a missing certificate file, a failed TLS handshake.
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Database(_)),
+                "{kind:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn lock_connection_timeout_is_contention_only_if_the_pool_filled_during_the_wait() {

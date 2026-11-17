@@ -156,7 +156,7 @@ pub async fn authorize_workspace(
                     &user.identity.subject,
                 )
                 .await
-                .map_err(|e| Status::internal(format!("membership lookup failed: {e}")))?;
+                .map_err(|e| crate::grpc::persistence_error_to_status(e, "membership lookup"))?;
 
             let Some(member) = member else {
                 let workspace_arg = shell_quote_for_hint(&workspace);

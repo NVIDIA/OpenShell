@@ -30,6 +30,10 @@ mod linux {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use crate::accept_errors::{
+        RESOURCE_ERROR_BACKOFF, ResourceBackoffLogger, is_peer_reset, is_pending_network_error,
+        is_transient_resource_error,
+    };
     use crate::boundary_io::BoundaryRuntimeState;
     use crate::delegated::{AgentSignaler, spawn_workload};
     use crate::main_session::{MainOutput, MainSession};
@@ -93,6 +97,10 @@ mod linux {
     /// Bound the wait for a flush before acknowledging termination. A timed-out
     /// blocking task cannot be cancelled and may outlive the acknowledgement.
     const FILESYSTEM_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+    /// Bound the process runtime's shutdown after the boundary stops serving.
+    /// A blocking task such as a supervisor's agent `Wait` can outlive the
+    /// termination that would end it, and the shutdown cannot cancel it.
+    const PROCESS_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     /// Bounds one runtime-initiated dial, including finding the supervisor
@@ -293,7 +301,17 @@ mod linux {
             launcher,
             qualification,
         )?);
-        serve(&config.listener, runtime)
+        serve_then_stop(process_runtime, &config.listener, runtime)
+    }
+
+    fn serve_then_stop(
+        process_runtime: tokio::runtime::Runtime,
+        config: &BoundaryListenerConfig,
+        runtime: Arc<BoundaryRuntime>,
+    ) -> Result<(), String> {
+        let result = serve(config, runtime);
+        process_runtime.shutdown_timeout(PROCESS_RUNTIME_SHUTDOWN_TIMEOUT);
+        result
     }
 
     fn make_boundary_nondumpable() -> Result<(), String> {
@@ -603,6 +621,36 @@ mod linux {
         Some(Ok(()))
     }
 
+    /// What the boundary control accept loop does with an accept error.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ControlAcceptErrorAction {
+        /// Keep polling the listener immediately. A refused or already-dead
+        /// peer must not stop the listener.
+        Continue,
+        /// Retry after a short backoff: transient resource exhaustion.
+        Backoff,
+        /// Unrecoverable: end the boundary.
+        Fatal,
+    }
+
+    fn control_accept_error_action(error: &io::Error) -> ControlAcceptErrorAction {
+        if is_peer_reset(error)
+            || is_pending_network_error(error)
+            || matches!(
+                error.kind(),
+                // PermissionDenied is this listener's own local-peer
+                // rejection (an injected EACCES), not an accept failure.
+                io::ErrorKind::Interrupted | io::ErrorKind::PermissionDenied
+            )
+        {
+            ControlAcceptErrorAction::Continue
+        } else if is_transient_resource_error(error) {
+            ControlAcceptErrorAction::Backoff
+        } else {
+            ControlAcceptErrorAction::Fatal
+        }
+    }
+
     fn serve(config: &BoundaryListenerConfig, runtime: Arc<BoundaryRuntime>) -> Result<(), String> {
         let dial_tls = match config {
             BoundaryListenerConfig::RuntimeInitiatedTlsTcp { tls, .. }
@@ -618,12 +666,16 @@ mod linux {
         let active_connections = Arc::new(AtomicUsize::new(0));
         let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         tracing::info!(?config, "Boundary control listener ready");
+        // Warn once per exhaustion episode plus a bounded re-warn cadence,
+        // not on every backoff retry.
+        let mut resource_backoff_log = ResourceBackoffLogger::new();
         loop {
             if let Some(result) = take_termination(&runtime) {
                 return result;
             }
             match listener.accept() {
                 Ok(stream) => {
+                    resource_backoff_log.reset();
                     // Unauthenticated sockets use only a bounded async TLS
                     // task, never an OS thread or an authenticated session slot.
                     let Ok(pending) = pending_handshakes.clone().try_acquire_owned() else {
@@ -647,20 +699,24 @@ mod linux {
                         }
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                // A refused or already-dead peer must not stop the listener.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::PermissionDenied
-                            | io::ErrorKind::NotConnected
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::ConnectionAborted
-                    ) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) => return Err(format!("accept boundary control connection: {error}")),
+                Err(error) => match control_accept_error_action(&error) {
+                    ControlAcceptErrorAction::Continue => {}
+                    ControlAcceptErrorAction::Backoff => {
+                        if resource_backoff_log.should_log(&error) {
+                            tracing::warn!(
+                                %error,
+                                "Boundary control accept hit a transient resource limit; retrying"
+                            );
+                        }
+                        std::thread::sleep(RESOURCE_ERROR_BACKOFF);
+                    }
+                    ControlAcceptErrorAction::Fatal => {
+                        return Err(format!("accept boundary control connection: {error}"));
+                    }
+                },
             }
         }
     }
@@ -3069,10 +3125,10 @@ mod linux {
                     | RuntimeState::Ready(_) => None,
                 }
             };
-            if matches!(*connection, SupervisorConnectionState::Frozen { .. })
+            if let SupervisorConnectionState::Frozen { recovery_id } = *connection
                 && let Some(process) = process
             {
-                if !process.boundary_runtime.resume() {
+                if !process.boundary_runtime.resume(recovery_id) {
                     return Err((
                         BoundaryErrorKind::Process,
                         "frozen workload could not be resumed".to_string(),
@@ -3170,11 +3226,13 @@ mod linux {
                         | RuntimeState::Ready(_) => None,
                     }
                 };
+                // The recovery identity is allocated before the freeze so a
+                // failed deferred sweep can name it.
+                let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
                 if let Some(process) = &process {
                     self.network_broker.set_workload_frozen(true);
-                    let _ = process.boundary_runtime.freeze();
+                    let _ = process.boundary_runtime.freeze(recovery_id);
                 }
-                let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
                 recovery_id
             };
@@ -4828,6 +4886,8 @@ mod linux {
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "sockaddr_vm exceeds socklen_t")
                 })?;
+            // SAFETY: socket() creates a fresh descriptor and takes only
+            // scalar arguments; the result is checked below before any use.
             let raw_fd = unsafe {
                 libc::socket(
                     libc::AF_VSOCK,
@@ -4838,6 +4898,8 @@ mod linux {
             if raw_fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: raw_fd was checked non-negative above and is uniquely
+            // owned; this is its single wrap into an OwnedFd.
             let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
             let address = libc::sockaddr_vm {
                 svm_family: family,
@@ -4846,6 +4908,8 @@ mod linux {
                 svm_cid: libc::VMADDR_CID_ANY,
                 svm_zero: [0; 4],
             };
+            // SAFETY: bind operates on the live OwnedFd with a fully
+            // initialized sockaddr_vm of the declared length.
             let result = unsafe {
                 libc::bind(
                     fd.as_raw_fd(),
@@ -4856,6 +4920,7 @@ mod linux {
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: listen operates on the live, bound OwnedFd.
             if unsafe { libc::listen(fd.as_raw_fd(), 16) } < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -4879,6 +4944,9 @@ mod linux {
                     listener,
                     server_config,
                 } => {
+                    // SAFETY: accept4 takes the live listener descriptor with
+                    // SOCK_CLOEXEC and a valid null address buffer; the
+                    // returned descriptor is checked below before any use.
                     let raw_fd = unsafe {
                         libc::accept4(
                             listener.as_raw_fd(),
@@ -4890,8 +4958,11 @@ mod linux {
                     if raw_fd < 0 {
                         Err(io::Error::last_os_error())
                     } else {
+                        // SAFETY: raw_fd was checked non-negative above and
+                        // is uniquely owned; this is its single wrap.
+                        let stream = unsafe { File::from_raw_fd(raw_fd) };
                         Ok(ControlStream::PendingTls {
-                            stream: PlainControlStream::Vsock(unsafe { File::from_raw_fd(raw_fd) }),
+                            stream: PlainControlStream::Vsock(stream),
                             server_config: server_config.clone(),
                         })
                     }
@@ -5086,8 +5157,26 @@ mod linux {
         ) -> io::Result<openshell_isolation_interface::contract::BoundaryDuplexStream> {
             match self {
                 Self::Vsock(file) => {
-                    let stream =
-                        unsafe { std::os::unix::net::UnixStream::from_raw_fd(file.into_raw_fd()) };
+                    let raw_fd = file.into_raw_fd();
+                    // SAFETY: `into_raw_fd` handed over a valid, open,
+                    // solely-owned descriptor exactly once, so this is its
+                    // single re-wrap. The descriptor is an AF_VSOCK stream
+                    // reinterpreted as a Unix stream; the stream only ever
+                    // sees family-agnostic operations (fcntl, read/write,
+                    // epoll registration via `from_std`, and shutdown), which
+                    // behave the same on AF_VSOCK streams. `peer_addr`,
+                    // `local_addr`, and `peer_cred` must never be called on
+                    // it: they would fail at runtime on a vsock descriptor.
+                    // The surface is fenced by this private enum and by the
+                    // `Box<dyn DuplexStream>` erasure in `into_tokio`. The
+                    // dial side performs the same reinterpretation in the
+                    // `RuntimeInitiatedVsock` arm of `dial_supervisor`, but
+                    // files its vsock descriptors under the `Unix` variant
+                    // (not `Vsock`) and uses only `take_error()` (a
+                    // SOL_SOCKET getsockopt) and `writable()`, both
+                    // family-agnostic; the allowed-ops list above covers
+                    // this accept-side stream only.
+                    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
                     stream.set_nonblocking(true)?;
                     Ok(Box::new(tokio::net::UnixStream::from_std(stream)?))
                 }
@@ -5277,6 +5366,10 @@ mod linux {
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tests dial from the confined workload, where socket options are not under test"
+    )]
     mod tests {
         use super::*;
         use openshell_core::jwt::{
@@ -5290,6 +5383,10 @@ mod linux {
         use openshell_sandbox_backend::protobuf::WireMessage as _;
         use openshell_sandbox_backend::runtime_routed::{RuntimeRouter, new_route_handle};
         use rcgen::PKCS_ED25519;
+
+        use crate::boundary_io::test_proc_stat::{
+            ProcessGroupKillGuard, process_group_of, process_parent, process_stopped,
+        };
 
         struct FailedWaitProcess;
 
@@ -6187,6 +6284,242 @@ mod linux {
             assert_eq!(
                 runtime.connections.require_active(&principal),
                 Err(SandboxAuthError::TerminalSession)
+            );
+        }
+
+        /// Send one logical request on its own exchange and return the reply.
+        async fn exchange_request(
+            channel: tonic::transport::Channel,
+            handle: &str,
+            request: Request,
+            token: &str,
+        ) -> Response {
+            let request = RequestEnvelope::new(request).expect("encode request");
+            let frames = tokio_stream::iter([
+                openshell_sandbox_backend::isolation_protocol::exchange_frame(handle),
+                openshell_sandbox_backend::isolation_protocol::request_chunk(&request)
+                    .expect("typed logical request"),
+            ]);
+            let mut body = SandboxProtocolClient::new(channel)
+                .exchange(bearer_request(frames, token))
+                .await
+                .expect("exchange logical request")
+                .into_inner();
+            let mut frame = Vec::new();
+            while let Some(chunk) = body.message().await.expect("read gRPC response") {
+                frame.extend_from_slice(&chunk_data(chunk).unwrap());
+            }
+            openshell_sandbox_backend::boundary_protocol::decode_frame::<ResponseEnvelope>(&frame)
+                .expect("decode logical response")
+                .response
+        }
+
+        /// A shared supervisor outlives the sandboxes it serves and keeps
+        /// their exchanges open, so SIGTERM must end the process without
+        /// waiting for the supervisor to close them.
+        #[test]
+        fn sigterm_exits_while_the_supervisor_holds_an_exchange_open() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_SIGTERM_CHILD";
+            const EXIT_BUDGET: Duration = Duration::from_secs(10);
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::sigterm_exits_while_the_supervisor_holds_an_exchange_open",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, client_tls) = stage_test_tls(directory.path(), "sigterm");
+            let socket_path = directory.path().join("supervisor.sock");
+            let listener = BoundaryListenerConfig::RuntimeInitiatedUnix {
+                socket_path: socket_path.clone(),
+                tls: server_tls,
+            };
+            let supervisor_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("supervisor runtime");
+            let supervisor_listener = {
+                let _entered = supervisor_runtime.enter();
+                tokio::net::UnixListener::bind(&socket_path).expect("bind supervisor socket")
+            };
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let (network_broker, workload_launcher) = test_network_broker();
+            let (verification_key, token) = test_auth_material("sigterm");
+            let boundary = {
+                let _entered = process_runtime.enter();
+                Arc::new(
+                    BoundaryRuntime::new(
+                        BoundaryConfig {
+                            boundary_id: "sigterm".to_string(),
+                            generation: "generation-1".to_string(),
+                            session_id: test_session_id(),
+                            session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                                .expect("session rotation"),
+                            auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                            gateway_id: "test-gateway".to_string(),
+                            verification_keys: vec![verification_key],
+                            listener: listener.clone(),
+                            resource_claims: std::collections::BTreeMap::new(),
+                            resource_claim_files: std::collections::BTreeMap::new(),
+                            workload_identity: test_workload_identity(),
+                            provisioning_evidence: test_provisioning_evidence(),
+                            child_env: std::collections::HashMap::new(),
+                        },
+                        process_runtime.handle().clone(),
+                        network_broker,
+                        workload_launcher,
+                        test_runtime_qualification(),
+                    )
+                    .expect("test boundary runtime"),
+                )
+            };
+            let opening = test_open_request(&boundary.config);
+            let (signalled_sender, signalled) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let supervisor = std::panic::AssertUnwindSafe(|| {
+                    supervisor_runtime.block_on(async move {
+                        let (stream, _) = supervisor_listener.accept().await.expect("runtime dial");
+                        let server_name =
+                            rustls::pki_types::ServerName::try_from(client_tls.server_name.clone())
+                                .expect("valid server name");
+                        let stream = tokio_rustls::TlsConnector::from(Arc::new(
+                            test_client_config(&client_tls),
+                        ))
+                        .connect(server_name, stream)
+                        .await
+                        .expect("verify runtime TLS");
+                        let mut stream = Some(stream);
+                        let channel = tonic::transport::Endpoint::from_static(
+                            "http://boundary.openshell.internal",
+                        )
+                        .connect_with_connector(tower::service_fn(
+                            move |_: tonic::transport::Uri| {
+                                let stream = stream.take();
+                                async move {
+                                    stream.map(hyper_util::rt::TokioIo::new).ok_or_else(|| {
+                                        io::Error::other("the runtime connection is in use")
+                                    })
+                                }
+                            },
+                        ))
+                        .await
+                        .expect("gRPC over the runtime connection");
+                        let handle = test_open_boundary(channel.clone(), opening, &token).await;
+                        let attach = Request::Attach {
+                            supervisor_instance_id: test_supervisor_instance_id(),
+                            policy: Box::new(takeover_test_policy()),
+                            supervisor_takeover: None,
+                            supervisor_recovery_timeout_secs: None,
+                        };
+                        assert!(matches!(
+                            exchange_request(channel.clone(), &handle, attach, &token).await,
+                            Response::Attached { .. }
+                        ));
+                        assert!(matches!(
+                            exchange_request(channel.clone(), &handle, Request::Confirm, &token)
+                                .await,
+                            Response::Confirmed { .. }
+                        ));
+                        let start = Request::StartAgent {
+                            sandbox_id: "sigterm".to_string(),
+                            spec: AgentSpecWire {
+                                program: "/bin/sleep".to_string(),
+                                args: vec!["300".to_string()],
+                                workdir: None,
+                                timeout_secs: 0,
+                                interactive: false,
+                                otlp_relay_active: false,
+                            },
+                            ca_cert: None,
+                            ca_bundle: None,
+                            provider_env_revision: 0,
+                            provider_env: std::collections::HashMap::new(),
+                            provider_files: std::collections::HashMap::new(),
+                        };
+                        let process_id =
+                            match exchange_request(channel.clone(), &handle, start, &token).await {
+                                Response::Started { process_id, .. } => process_id,
+                                response => panic!("the agent did not start: {response:?}"),
+                            };
+                        // The supervisor waits for the agent and for workload
+                        // connections for as long as the sandbox runs.
+                        let mut parked = Vec::new();
+                        for request in [Request::Wait { process_id }, Request::AcceptNetwork] {
+                            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+                            sender
+                                .send(
+                                    openshell_sandbox_backend::isolation_protocol::exchange_frame(
+                                        &handle,
+                                    ),
+                                )
+                                .await
+                                .expect("bind exchange");
+                            sender
+                                .send(
+                                    openshell_sandbox_backend::isolation_protocol::request_chunk(
+                                        &RequestEnvelope::new(request).expect("encode request"),
+                                    )
+                                    .expect("typed request"),
+                                )
+                                .await
+                                .expect("send request");
+                            let pending = SandboxProtocolClient::new(channel.clone())
+                                .exchange(bearer_request(ReceiverStream::new(receiver), &token))
+                                .await
+                                .expect("open exchange")
+                                .into_inner();
+                            parked.push((sender, pending));
+                        }
+                        for (_, pending) in &mut parked {
+                            assert!(
+                                tokio::time::timeout(Duration::from_millis(500), pending.message())
+                                    .await
+                                    .is_err(),
+                                "a parked exchange answered before termination"
+                            );
+                        }
+                        signalled_sender
+                            .send(std::time::Instant::now())
+                            .expect("report SIGTERM time");
+                        nix::sys::signal::kill(
+                            nix::unistd::Pid::this(),
+                            nix::sys::signal::Signal::SIGTERM,
+                        )
+                        .expect("send SIGTERM");
+                        std::future::pending::<()>().await;
+                        drop(parked);
+                    });
+                });
+                if std::panic::catch_unwind(supervisor).is_err() {
+                    std::process::exit(1);
+                }
+            });
+
+            // The parked `Wait` blocks shutdown only when the shutdown cancels
+            // the agent's reaper before it records the exit, so a task that
+            // never ends stands in for that loss.
+            process_runtime.spawn_blocking(|| {
+                loop {
+                    std::thread::park();
+                }
+            });
+            install_boundary_signal_handlers().expect("install termination handlers");
+            serve_then_stop(process_runtime, &listener, boundary)
+                .expect("terminate after supervisor confirmation");
+            let elapsed = signalled
+                .recv()
+                .expect("the supervisor sent SIGTERM")
+                .elapsed();
+            assert!(
+                elapsed < EXIT_BUDGET,
+                "the boundary took {elapsed:?} to stop after SIGTERM"
             );
         }
 
@@ -9276,17 +9609,6 @@ mod linux {
             }
         }
 
-        /// Whether the process is stopped, as a frozen workload is.
-        fn process_stopped(pid: u32) -> bool {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    stat.rsplit_once(") ")
-                        .map(|(_, fields)| fields.starts_with('T'))
-                })
-                .unwrap_or(false)
-        }
-
         /// An owner operation holds the ownership guard across `block_on`, a
         /// promotion waits for it, and a DNS answer waits behind the
         /// promotion, on a runtime with a single worker. The answer waits
@@ -9493,6 +9815,342 @@ mod linux {
                 .expect("a replay does not wait for owner operations")
                 .expect("replay");
             drop(in_progress);
+        }
+
+        /// Many idle piped execs must leave the control plane responsive:
+        /// the blocking pool they share with the gRPC exchange, exec
+        /// spawn/reap, and `AcceptNetwork` must not fill with threads parked
+        /// on idle exec pipes.
+        ///
+        /// The pool is capped at 16 rather than 4 for a reason worth keeping
+        /// in sync with the implementation: before the readiness-based exec
+        /// streams, every idle piped exec parked three blocking threads
+        /// (reaper waitid, stdout read, stderr read through
+        /// `tokio::fs::File`), so 12 execs demanded 36 threads and the pool
+        /// saturated around the sixth exec. After it, only the per-exec
+        /// reaper still parks one thread: 12 reapers plus the fresh exec's
+        /// spawn transient is 13 of 16, leaving three spare threads for
+        /// control traffic. A cap of 4 could not host 12 idle execs even
+        /// after the fix, so the test would fail on both sides.
+        ///
+        /// Every step runs on its own thread with a channel deadline
+        /// because `start_exec` blocks on the process runtime and
+        /// `serve_request` blocks on its socket pair; an in-thread timeout
+        /// can preempt neither. A stalled step fails its receive instead of
+        /// hanging the suite.
+        #[test]
+        fn many_idle_execs_leave_the_control_plane_responsive() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_IDLE_EXEC_CHILD";
+            const SANDBOX: &str = "sandbox-idle-exec";
+            const GENERATION: &str = "generation-idle-exec";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::many_idle_execs_leave_the_control_plane_responsive",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(16)
+                .enable_all()
+                .build()
+                .expect("bounded blocking-pool process runtime");
+            let _entered = process_runtime.enter();
+            let boundary = takeover_test_runtime(&gateway, SANDBOX, GENERATION, &process_runtime);
+            let owner = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("owner principal");
+            assert!(matches!(
+                boundary.attach(takeover_test_policy(), false),
+                Response::Attached { .. }
+            ));
+            boundary
+                .commit_attach(&owner, test_supervisor_instance_id(), None, None)
+                .expect("attach owner");
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            boundary.commit_confirm(&owner).expect("confirm owner");
+            let Response::Started { process_id, .. } = boundary.start_agent(
+                SANDBOX.to_string(),
+                AgentSpecWire {
+                    program: "/bin/sleep".to_string(),
+                    args: vec!["60".to_string()],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                    otlp_relay_active: false,
+                },
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("owner could not start the workload");
+            };
+
+            let start_exec_on_thread = |spec: ExecSpecWire| {
+                let boundary = boundary.clone();
+                let (done, result) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let request = RequestEnvelope::new(Request::Exec { spec: spec.clone() })
+                        .expect("build exec request");
+                    let _ = done.send(
+                        boundary
+                            .start_exec(
+                                &request.request_id,
+                                &request.payload_digest,
+                                request.exec_admission_deadline_unix_ms,
+                                spec,
+                            )
+                            .map(|started| started.process_id)
+                            .map_err(|error| format!("{error:?}")),
+                    );
+                });
+                result.recv_timeout(Duration::from_secs(10))
+            };
+            let idle_spec = || ExecSpecWire {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 30".to_string()],
+                shell: None,
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            };
+            let mut exec_ids = Vec::new();
+            for index in 0..12 {
+                let exec_id = start_exec_on_thread(idle_spec())
+                    .unwrap_or_else(|_| panic!("idle exec {index} did not start within 10s"))
+                    .expect("idle exec starts");
+                exec_ids.push(exec_id);
+            }
+
+            exec_ids.push(
+                start_exec_on_thread(ExecSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "exit 0".to_string()],
+                    shell: None,
+                    runtime_helper: None,
+                    env: Vec::new(),
+                    workdir: None,
+                    pty: false,
+                })
+                .expect("fresh exec did not start within 10s")
+                .expect("fresh exec starts while idle execs occupy the pool"),
+            );
+
+            let control_boundary = boundary.clone();
+            let (control_done, control_result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = control_done.send(serve_request(
+                    &control_boundary,
+                    &owner,
+                    Request::DiscoverPolicy,
+                ));
+            });
+            assert!(matches!(
+                control_result
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("control request is served within 10s"),
+                Response::ImagePolicy { .. }
+            ));
+
+            // Cleanup: end every exec and the workload inside the isolated
+            // limit so no `sleep 30` child outlives the test binary.
+            for exec_id in &exec_ids {
+                let _ = boundary.signal(exec_id, SignalWire::Kill);
+            }
+            for exec_id in &exec_ids {
+                assert!(
+                    matches!(boundary.wait(exec_id), Response::Exited { .. }),
+                    "exec {exec_id} must be reaped"
+                );
+            }
+            assert_eq!(boundary.terminate(&process_id), Response::Terminated);
+            let workload = boundary.running_process(&process_id).expect("workload");
+            let terminated_by = std::time::Instant::now() + Duration::from_secs(10);
+            while !workload.has_exited() && std::time::Instant::now() < terminated_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(workload.has_exited(), "workload did not exit");
+        }
+
+        /// The deferred descendant sweeps of a freeze and its recovery must
+        /// both be delivered. The disconnect suite only asserts the workload
+        /// root stops, which the synchronous killpg covers regardless of the
+        /// deferral, so this test proves the deferred SIGSTOP reaches a
+        /// descendant outside every registered process group — and the
+        /// deferred SIGCONT continues it after recovery. Without it, an
+        /// implementation that never delivers a batch passes the suite while
+        /// the freeze contract silently weakens.
+        #[test]
+        fn deferred_descendant_sweeps_deliver_across_disconnect_and_recovery() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_DEFERRED_SWEEP_CHILD";
+            const SANDBOX: &str = "sandbox-deferred-sweep";
+            const GENERATION: &str = "generation-deferred-sweep";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::deferred_descendant_sweeps_deliver_across_disconnect_and_recovery",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let _entered = process_runtime.enter();
+            // A generous recovery deadline so a loaded CI runner cannot expire
+            // the freeze mid-test; the sweeps themselves take milliseconds.
+            let boundary = takeover_test_runtime_with_recovery(
+                &gateway,
+                SANDBOX,
+                GENERATION,
+                &process_runtime,
+                Some(Duration::from_mins(1)),
+            );
+            let supervisor_instance_id = test_supervisor_instance_id();
+            let owner = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("owner principal");
+            assert!(matches!(
+                boundary.attach(takeover_test_policy(), false),
+                Response::Attached { .. }
+            ));
+            boundary
+                .commit_attach(&owner, supervisor_instance_id, None, None)
+                .expect("attach owner");
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            boundary.commit_confirm(&owner).expect("confirm owner");
+
+            // The workload's descendant leaves the root's process group via
+            // setsid, so only the deferred sweep — not the synchronous
+            // killpg — can stop it.
+            let Response::Started { process_id, .. } = boundary.start_agent(
+                SANDBOX.to_string(),
+                AgentSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "/usr/bin/setsid /bin/sleep 600 & wait".to_string(),
+                    ],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                    otlp_relay_active: false,
+                },
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("owner could not start the workload");
+            };
+            let workload = boundary.running_process(&process_id).expect("workload");
+            let root_pid = workload.signaler.pid();
+            // A failed assertion must not orphan the fixtures: each guard
+            // kills its whole group on drop unless disarmed for the normal
+            // cleanup below. The workload root leads the group it was
+            // registered under, and the setsid descendant leads its own.
+            let mut workload_guard = ProcessGroupKillGuard::new(root_pid);
+            let descendant_pid = {
+                let found_by = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let found = std::fs::read_dir("/proc")
+                        .expect("read /proc")
+                        .flatten()
+                        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                        .find(|pid| process_parent(*pid) == Some(root_pid));
+                    if let Some(pid) = found {
+                        break pid;
+                    }
+                    assert!(
+                        std::time::Instant::now() < found_by,
+                        "the workload never spawned its out-of-group descendant"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            let mut descendant_guard = ProcessGroupKillGuard::new(descendant_pid);
+            // The descendant separates asynchronously: `setsid` runs after
+            // the fork, so wait for the split before disconnecting.
+            let separated_by = std::time::Instant::now() + Duration::from_secs(5);
+            while process_group_of(descendant_pid) == process_group_of(root_pid) {
+                assert!(
+                    std::time::Instant::now() < separated_by,
+                    "the fixture must keep the descendant off the workload's process group"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Losing the supervisor freezes the workload: the root group
+            // stops synchronously, and the deferred sweep must stop the
+            // descendant too.
+            boundary.transport_disconnected(owner.connection_id());
+            assert!(matches!(
+                *lock(&boundary.supervisor_connection),
+                SupervisorConnectionState::Frozen { .. }
+            ));
+            let stopped_by = std::time::Instant::now() + Duration::from_secs(5);
+            while !process_stopped(descendant_pid) {
+                assert!(
+                    std::time::Instant::now() < stopped_by,
+                    "the deferred freeze sweep never stopped the out-of-group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Recovery resumes it: the roots synchronously, the descendant
+            // through the deferred sweep.
+            let replacement = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("replacement principal");
+            boundary
+                .commit_attach(&replacement, supervisor_instance_id, None, None)
+                .expect("reattach replacement");
+            boundary
+                .commit_confirm(&replacement)
+                .expect("reconfirm replacement");
+            let running_by = std::time::Instant::now() + Duration::from_secs(5);
+            while process_stopped(descendant_pid) {
+                assert!(
+                    std::time::Instant::now() < running_by,
+                    "the deferred resume sweep never continued the out-of-group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Cleanup: kill the out-of-group descendant explicitly, then end
+            // the workload inside the isolated limit.
+            descendant_guard.disarm();
+            workload_guard.disarm();
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(descendant_pid).unwrap()),
+                nix::sys::signal::SIGKILL,
+            );
+            assert_eq!(boundary.terminate(&process_id), Response::Terminated);
+            let terminated_by = std::time::Instant::now() + Duration::from_secs(10);
+            while !workload.has_exited() && std::time::Instant::now() < terminated_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(workload.has_exited(), "workload did not exit");
         }
 
         /// A replacement whose connection is lost while it is promoted is the
@@ -10048,6 +10706,244 @@ mod linux {
                 process_runtime.block_on(session.process.wait()),
                 Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(0))
             ));
+        }
+
+        #[test]
+        fn transient_accept_resource_errors_back_off_instead_of_ending_the_boundary() {
+            for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+                assert_eq!(
+                    control_accept_error_action(&io::Error::from_raw_os_error(code)),
+                    ControlAcceptErrorAction::Backoff,
+                    "errno {code} should back off and retry"
+                );
+            }
+        }
+
+        #[test]
+        fn dead_peers_do_not_end_the_boundary_control_listener() {
+            for error in [
+                io::Error::new(io::ErrorKind::Interrupted, "interrupted"),
+                io::Error::from_raw_os_error(libc::EACCES),
+                io::Error::new(io::ErrorKind::NotConnected, "not connected"),
+                io::Error::new(io::ErrorKind::ConnectionReset, "reset"),
+                io::Error::new(io::ErrorKind::ConnectionAborted, "aborted"),
+                // Linux reports already-pending network errors of a queued
+                // connection from accept; the man page says to retry them.
+                io::Error::from_raw_os_error(libc::ENETDOWN),
+                io::Error::from_raw_os_error(libc::EPROTO),
+                io::Error::from_raw_os_error(libc::EHOSTUNREACH),
+                io::Error::from_raw_os_error(libc::ENETUNREACH),
+            ] {
+                assert_eq!(
+                    control_accept_error_action(&error),
+                    ControlAcceptErrorAction::Continue
+                );
+            }
+        }
+
+        #[test]
+        fn unrecoverable_accept_errors_end_the_boundary_control_listener() {
+            for error in [
+                io::Error::from_raw_os_error(libc::EBADF),
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid"),
+            ] {
+                assert_eq!(
+                    control_accept_error_action(&error),
+                    ControlAcceptErrorAction::Fatal
+                );
+            }
+        }
+
+        /// Drive `serve` through a real EMFILE: exhaust the descriptor table
+        /// while a control connection is queued, require the accept loop to
+        /// keep retrying, then free a descriptor and require the loop to
+        /// still serve and shut down cleanly.
+        ///
+        /// The descriptor table is process-global, so the EMFILE window runs
+        /// in an isolated child of this test binary, like the reaper test in
+        /// `managed_children`.
+        #[test]
+        fn serve_keeps_serving_through_transient_resource_errors() {
+            const HELPER_ENV: &str = "OPENSHELL_BOUNDARY_SERVE_EMFILE_HELPER";
+
+            /// Read until the control listener closes the connection. It may
+            /// answer garbage with a TLS alert record before it closes.
+            fn drain_until_closed(socket: &socket2::Socket) {
+                let mut buffer = [std::mem::MaybeUninit::new(0_u8); 8];
+                while socket.recv(&mut buffer).expect("control connection answer") > 0 {}
+            }
+            if std::env::var_os(HELPER_ENV).is_none() {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "boundary_server::linux::tests::serve_keeps_serving_through_transient_resource_errors",
+                        "--nocapture",
+                    ])
+                    .env(HELPER_ENV, "1")
+                    .output()
+                    .expect("start isolated boundary serve test process");
+                assert!(
+                    output.status.success(),
+                    "boundary serve test failed:\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                return;
+            }
+
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "serve-emfile");
+            let socket_path = directory.path().join("control.sock");
+            let (broker, launcher) = test_network_broker();
+            let (verification_key, _token) = test_auth_material("serve-emfile");
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let runtime = Arc::new(
+                BoundaryRuntime::new(
+                    BoundaryConfig {
+                        boundary_id: "serve-emfile".to_string(),
+                        generation: "generation-1".to_string(),
+                        session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
+                        auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                        gateway_id: "test-gateway".to_string(),
+                        verification_keys: vec![verification_key],
+                        listener: BoundaryListenerConfig::Unix {
+                            socket_path: socket_path.clone(),
+                            tls: server_tls.clone(),
+                        },
+                        resource_claims: std::collections::BTreeMap::new(),
+                        resource_claim_files: std::collections::BTreeMap::new(),
+                        workload_identity: test_workload_identity(),
+                        provisioning_evidence: test_provisioning_evidence(),
+                        child_env: std::collections::HashMap::new(),
+                    },
+                    process_runtime.handle().clone(),
+                    broker,
+                    launcher,
+                    test_runtime_qualification(),
+                )
+                .expect("test boundary runtime"),
+            );
+            let config = BoundaryListenerConfig::Unix {
+                socket_path: socket_path.clone(),
+                tls: server_tls,
+            };
+            let server = std::thread::spawn(move || serve(&config, runtime));
+
+            // The client socket is allocated before the descriptor table
+            // fills, so queueing the connection later needs no descriptor.
+            let client = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                .expect("client socket");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("client read timeout");
+            let peer = socket2::SockAddr::unix(&socket_path).expect("client address");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !socket_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                socket_path.exists(),
+                "boundary control listener was not bound"
+            );
+
+            // Readiness probe: a garbage connection that the server accepts
+            // and then closes proves serve finished loading its TLS identity
+            // (bind completed) and is polling accept, so filling the
+            // descriptor table cannot race the identity load.
+            let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                .expect("probe socket");
+            probe
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("probe read timeout");
+            probe.connect(&peer).expect("connect probe");
+            probe
+                .send(&[0_u8; 16])
+                .expect("send garbage to the control listener");
+            drain_until_closed(&probe);
+            drop(probe);
+            assert!(
+                !server.is_finished(),
+                "serve ended before the descriptor table was filled"
+            );
+
+            // Lower the soft limit to just above the current descriptor use
+            // and fill every slot below it, so the next accept that needs a
+            // descriptor fails with EMFILE. The hard limit caps the target so
+            // setrlimit cannot fail on a tight container limit.
+            let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+            let open = u64::try_from(
+                std::fs::read_dir("/proc/self/fd")
+                    .expect("count open descriptors")
+                    .count(),
+            )
+            .expect("descriptor count");
+            let soft_target = nofile
+                .maximum
+                .map_or_else(|| open + 16, |max| (open + 16).min(max));
+            rustix::process::setrlimit(
+                rustix::process::Resource::Nofile,
+                rustix::process::Rlimit {
+                    current: Some(soft_target),
+                    maximum: nofile.maximum,
+                },
+            )
+            .expect("lower descriptor soft limit");
+            // An empty fill list means the table was already at the limit,
+            // which still gives accept its EMFILE.
+            let mut fillers = Vec::new();
+            while let Ok(file) = File::open("/dev/null") {
+                fillers.push(file);
+            }
+
+            // Queue the control connection: the accept loop now hits EMFILE
+            // with a pending peer and must back off and retry for as long as
+            // the table stays full.
+            client.connect(&peer).expect("queue control connection");
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !server.is_finished(),
+                "serve ended on a transient EMFILE accept error"
+            );
+
+            // Freeing one descriptor lets the loop accept the queued
+            // connection: the garbage bytes are consumed, the listener
+            // answers with a TLS alert, and the connection closes, which
+            // only happens if accept recovered.
+            drop(fillers.pop().expect("a filler descriptor to free"));
+            client
+                .send(&[0_u8; 16])
+                .expect("send garbage after recovery");
+            drain_until_closed(&client);
+            assert!(
+                !server.is_finished(),
+                "serve ended after the descriptor table recovered"
+            );
+
+            // End the loop the way production does and require a termination
+            // result, not an accept failure.
+            request_boundary_termination(libc::SIGTERM);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !server.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                server.is_finished(),
+                "serve ignored the termination request"
+            );
+            let message = server
+                .join()
+                .expect("serve thread panicked")
+                .expect_err("serve returned success without a supervisor");
+            assert!(
+                message.contains("SIGTERM")
+                    && !message.contains("accept boundary control connection"),
+                "serve ended with an unexpected error: {message}"
+            );
         }
     }
 }

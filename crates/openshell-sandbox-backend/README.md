@@ -199,8 +199,9 @@ selects which instance's generation-pinned TLS identity the supervisor then
 demands. Unknown, removed, and replaced handles are closed before any
 handshake. Handshakes are bounded globally and per route, and an
 authenticated connection only fills its own instance's spare queue. A routed
-instance waits up to five minutes for its first connection, since it is
-registered before its workload Pod is scheduled, and the usual connect window
+instance waits up to its configured initial attachment budget (five minutes
+by default) for its first connection, since it is registered before its
+workload Pod is scheduled, and the usual connect window
 afterwards. The launch material and status of one hosted instance
 (`SandboxInstanceRegistration`, `SandboxInstanceStatusReport`) are defined by
 `openshell-supervisor-control`, which depends on this crate for the runtime

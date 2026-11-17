@@ -19,6 +19,7 @@
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:podman
 #   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:podman
 #   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:podman
+#   OPENSHELL_DEV_OTLP_ENDPOINT=http://127.0.0.1:4317 mise run gateway:podman
 
 set -euo pipefail
 
@@ -110,27 +111,6 @@ port_is_in_use() {
     return $?
   fi
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
-}
-
-append_local_otlp_config_if_available() {
-  local config_path=$1
-  if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export, OCSF log export, and the agent trace relay disabled."
-    return
-  fi
-
-  cat >>"${config_path}" <<'EOF'
-
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-
-[openshell.gateway.otlp.ocsf]
-enabled = true
-
-[openshell.gateway.otlp.agent]
-enabled = true
-EOF
-  echo "OTLP trace export, OCSF log export, and the agent trace relay enabled for http://127.0.0.1:4317."
 }
 
 register_gateway_metadata() {
@@ -273,7 +253,7 @@ if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
   printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
 fi
 
-append_local_otlp_config_if_available "${CONFIG_PATH}"
+append_dev_otlp_config "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://${CLI_ENDPOINT_HOST}:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

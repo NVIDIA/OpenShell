@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use openshell_credential_issuer::refresh::CredentialRefresh;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -174,12 +175,14 @@ async fn retrieve(
             ));
         }
     }
-    let refreshes = crate::provider_refresh::list_refresh_states_for_provider(
-        state.store.as_ref(),
-        provider.object_id(),
-    )
-    .await
-    .map_err(sanitize)?;
+    let refreshes: Vec<StoredProviderCredentialRefreshStateV2> = state
+        .refresh
+        .list(Some(provider.object_id()))
+        .await
+        .map_err(sanitize)?
+        .iter()
+        .map(Into::into)
+        .collect();
     let mut owners = HashMap::new();
     for key in &request.credential_keys {
         let matching: Vec<_> = refreshes
@@ -248,29 +251,22 @@ async fn retrieve(
         ensure_refreshable(refresh)?;
         if minted.insert(refresh.object_id().to_string()) {
             refresh_audit.attempts += 1;
-            crate::provider_refresh::refresh_from_snapshot(
-                state.store.as_ref(),
-                &state.credentials,
-                Some(&state.compute),
-                refresh.clone(),
-            )
-            .await
-            .map_err(sanitize)?;
+            CredentialRefresh::ensure_fresh(&state.refresh, refresh.into())
+                .await
+                .map_err(sanitize)?;
             refresh_audit.completed += 1;
         }
     }
     // Capture refresh generations before resolving the final provider snapshot.
     let mut delivery_owners = HashMap::new();
     for owner in owners.values() {
-        let latest = crate::provider_refresh::get_refresh_state(
-            state.store.as_ref(),
-            workspace,
-            provider.object_id(),
-            &owner.credential_key,
-        )
-        .await
-        .map_err(sanitize)?
-        .ok_or_else(|| Status::aborted("credential refresh was deleted"))?;
+        let latest = state
+            .refresh
+            .get(workspace, provider.object_id(), &owner.credential_key)
+            .await
+            .map_err(sanitize)?
+            .ok_or_else(|| Status::aborted("credential refresh was deleted"))?;
+        let latest = StoredProviderCredentialRefreshStateV2::from(&latest);
         if latest.object_id() != owner.object_id()
             || crate::provider_refresh::effective_authorization_epoch(&latest)?
                 != crate::provider_refresh::effective_authorization_epoch(owner)?
@@ -321,15 +317,13 @@ async fn retrieve(
     }
     // A refresh grant can be reconfigured without a provider update.
     for owner in delivery_owners.values() {
-        let latest = crate::provider_refresh::get_refresh_state(
-            state.store.as_ref(),
-            workspace,
-            current.object_id(),
-            &owner.credential_key,
-        )
-        .await
-        .map_err(sanitize)?
-        .ok_or_else(|| Status::aborted("credential refresh was deleted"))?;
+        let latest = state
+            .refresh
+            .get(workspace, current.object_id(), &owner.credential_key)
+            .await
+            .map_err(sanitize)?
+            .ok_or_else(|| Status::aborted("credential refresh was deleted"))?;
+        let latest = StoredProviderCredentialRefreshStateV2::from(&latest);
         if latest
             .metadata
             .as_ref()
