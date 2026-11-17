@@ -1863,7 +1863,7 @@ Direct listener authentication belongs to the ingress provider.
 
 Gateway service auth is opt-in with `[openshell.gateway].service_auth_enabled = true`,
 `--service-auth-enabled true`, or `OPENSHELL_SERVICE_AUTH_ENABLED=true`. Helm uses
-`server.serviceAuthEnabled` or canonical `gatewayConfig.gateway.service_auth_enabled`.
+`server.serviceAuthEnabled` or canonical `gatewayConfig."openshell.gateway".service_auth_enabled`.
 It defaults to false and is independent of `supervisor_app_listener.enabled`.
 When debugging unexpected application 401/403 responses or browser login, check
 this flag before inspecting the configured gateway authentication and workspace
