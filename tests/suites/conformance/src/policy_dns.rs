@@ -18,10 +18,26 @@ use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
 
 const TEST_HOST: &str = "host.openshell.internal";
 
-/// How long the client keeps the address before connecting again. It is past
-/// the supervisor's current 30 s mapping ceiling and within the 60 s that
-/// NVIDIA/OpenShell#4674 asks for.
-const CACHED_ADDRESS_AGE: Duration = Duration::from_secs(45);
+/// How long the client keeps the address before connecting again.
+///
+/// Policy DNS gives a host alias such as `TEST_HOST` a mapping that expires
+/// exactly 30 s after the lookup (`MAX_MAPPING_TTL` in
+/// `openshell-supervisor-network`), with no grace period. Waiting 33 s
+/// outlasts that mapping by a few seconds, so the test fails while #4674 is
+/// open whatever the timing of the exec calls. The wait starts after the
+/// first connection returns, so the address is older still when the test
+/// reuses it.
+///
+/// A shorter wait would need a mapping with a shorter lifetime. Other names
+/// take their upstream DNS TTL, but a conformance test can't control the
+/// sandbox's upstream resolver, and the host server is reachable only through
+/// the host alias.
+///
+/// This wait checks that the address outlasts the current 30 s limit. It
+/// doesn't check a particular longer lifetime, such as the 60 s libcurl
+/// caches for. A unit test with an injected clock should cover the exact
+/// lifetime the fix guarantees.
+const CACHED_ADDRESS_AGE: Duration = Duration::from_secs(33);
 
 /// Resolves `TEST_HOST` the way a client does and prints the synthetic IPv4
 /// address policy DNS handed out.
