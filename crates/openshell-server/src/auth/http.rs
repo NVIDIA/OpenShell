@@ -91,7 +91,7 @@ fn sanitize_callback_host(raw: &Option<String>) -> (String, String) {
 /// Create the auth router.
 pub fn router(state: Arc<ServerState>) -> Router {
     let mut router = Router::new();
-    if state.config.service_routing.auth_enabled {
+    if state.config.service_routing.enabled && state.config.service_routing.auth_enabled {
         router = router.route(
             "/auth/services",
             get(service_browser_login).post(service_browser_login),
