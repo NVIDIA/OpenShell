@@ -13,6 +13,7 @@ publish = false
 
 [dependencies]
 openshell-testkit = { path = "../../testkit/testkit" }
+serde_json = "1"
 tokio = { version = "1.43", features = ["io-util", "net", "rt", "time"] }
 tungstenite = "0.26"
 
