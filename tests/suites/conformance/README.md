@@ -10,7 +10,7 @@ nextest run the tests as the library's unit tests. The crate also builds the
 |---|---|
 | `smoke` | Create a sandbox, run `echo` in it, delete it |
 | `lifecycle` | SDK: long-running and run-to-completion sandboxes, prompt delete when the workload is slow to handle TERM, the default command, restart of a stopped sandbox, deleting a stopped sandbox, exec past the startup recovery deadline, the final phase when the main command exits, the main command's environment, `--no-keep` cleanup |
-| `cli` | The same lifecycle through the `openshell` CLI: status, create, get, list, exec, stop, start, delete |
+| `cli` | The same lifecycle through the `openshell` CLI: status, create, get, list, exec, stop, start, delete; `--no-keep` sandboxes are deleted after the main process exits, and retained ones still accept exec |
 | `persistent-workspace` | Files in `/sandbox` survive stop and start |
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
 | `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |

@@ -1613,7 +1613,11 @@ pub(crate) async fn forward_provider_status_query_to_owner(
     })
 }
 
-pub async fn open_routed_relay_with_target(
+/// Open a relay into a sandbox wherever its supervisor is connected.
+///
+/// Entry points open relays through `sandbox_access::SandboxAccess`, which
+/// applies the access rules first.
+pub(crate) async fn open_routed_relay_with_target(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     target: relay_open::Target,
