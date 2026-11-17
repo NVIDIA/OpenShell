@@ -6370,17 +6370,19 @@ impl ComputeRuntime {
                 self.spawn_driver_sandbox_cleanup(sandbox.object_id(), sandbox.object_name());
                 return Ok(());
             }
-            info!(
-                sandbox_id,
-                attempt,
-                expected_resource_version = sandbox_resource_version(&sandbox),
-                "Sandbox record changed while applying driver deletion; retrying"
-            );
-            tokio::task::yield_now().await;
+            if attempt < DELETE_PHASE_CAS_RETRY_LIMIT {
+                info!(
+                    sandbox_id,
+                    attempt,
+                    expected_resource_version = sandbox_resource_version(&sandbox),
+                    "Sandbox removal after driver deletion did not complete; retrying"
+                );
+                tokio::task::yield_now().await;
+            }
         }
         warn!(
             sandbox_id,
-            "Sandbox record kept changing after driver deletion; leaving it to reconciliation"
+            "Sandbox removal after driver deletion did not complete; leaving it to reconciliation"
         );
         Ok(())
     }
@@ -17331,7 +17333,8 @@ mod tests {
         .await
         .expect("install conflict trigger");
 
-        let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver.clone()).await;
         runtime.store = store;
         let sandbox = sandbox_record("sb-race", "race", SandboxPhase::Deleting);
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -17353,6 +17356,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.delete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successful retry must reclaim driver-owned resources");
     }
 
     /// Driver watch events arrive on a background stream, so the store writes
