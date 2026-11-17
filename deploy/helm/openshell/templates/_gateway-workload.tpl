@@ -12,7 +12,7 @@ Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 {{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
 {{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
 {{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
-{{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
+{{- $credentialDrivers := .Values.gateway.credentialDrivers | default dict -}}
 {{- $vaultResources := get $credentialDrivers "vault" | default dict -}}
 {{- $legacyCredentialDrivers := .Values.server.credentialDrivers | default dict -}}
 {{- $legacyVaultResources := get $legacyCredentialDrivers "vault" | default dict -}}
@@ -26,21 +26,26 @@ metadata:
     # leave pods running with stale config. The operator-owned additional-CA
     # ConfigMap is not checksummed; restart the gateway after changing its data.
     checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
-    {{- with .Values.podAnnotations }}
+    {{- with .Values.gateway.podAnnotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
   labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    {{- with .Values.podLabels }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
+    {{- mergeOverwrite (deepCopy (.Values.gateway.podLabels | default dict)) (include "openshell.labels" . | fromYaml) | toYaml | nindent 4 }}
 spec:
-  terminationGracePeriodSeconds: {{ .Values.podLifecycle.terminationGracePeriodSeconds }}
-  {{- with .Values.imagePullSecrets }}
+  terminationGracePeriodSeconds: {{ .Values.gateway.podLifecycle.terminationGracePeriodSeconds }}
+  {{- $pullSecrets := .Values.imagePullSecrets -}}
+  {{- if ne .Values.gateway.imagePullSecrets nil -}}{{- $pullSecrets = .Values.gateway.imagePullSecrets -}}{{- end }}
+  {{- with $pullSecrets }}
   imagePullSecrets:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   serviceAccountName: {{ include "openshell.serviceAccountName" . }}
+  {{- if hasKey .Values.gateway.serviceAccount "automountServiceAccountToken" }}
+  automountServiceAccountToken: {{ .Values.gateway.serviceAccount.automountServiceAccountToken }}
+  {{- end }}
+  {{- with .Values.gateway.schedulerName }}
+  schedulerName: {{ . | quote }}
+  {{- end }}
   {{- if .Values.server.hostGatewayIP }}
   hostAliases:
     - ip: {{ .Values.server.hostGatewayIP | quote }}
@@ -48,22 +53,22 @@ spec:
         - host.docker.internal
         - host.openshell.internal
   {{- end }}
-  {{- with .Values.podSecurityContext }}
+  {{- with .Values.gateway.podSecurityContext }}
   securityContext:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   containers:
     - name: openshell-gateway
       securityContext:
-        {{- toYaml .Values.securityContext | nindent 8 }}
+        {{- toYaml .Values.gateway.securityContext | nindent 8 }}
       image: {{ include "openshell.image" . | quote }}
       imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
       args:
         - --config
         - /etc/openshell/gateway.toml
-        {{- if not .Values.server.externalDbSecret }}
+        {{- if not .Values.gateway.externalDbSecret }}
         - --db-url
-        - {{ .Values.server.dbUrl | quote }}
+        - {{ .Values.gateway.dbUrl | quote }}
         {{- end }}
       env:
         - name: OPENSHELL_REPLICA_ID
@@ -84,7 +89,7 @@ spec:
             fieldRef:
               fieldPath: status.podIP
         - name: OPENSHELL_PEER_ENDPOINT
-          value: {{ printf "%s://$(OPENSHELL_POD_IP):%d" (ternary "http" "https" (default false .Values.server.disableTls)) (int .Values.service.port) | quote }}
+          value: {{ printf "%s://$(OPENSHELL_POD_IP):%d" (ternary "http" "https" (default false .Values.gateway.disableTls)) (int .Values.gateway.service.port) | quote }}
         {{- end }}
         - name: OPENSHELL_SERVICE_ACCOUNT_NAME
           value: {{ include "openshell.serviceAccountName" . | quote }}
@@ -96,7 +101,7 @@ spec:
           value: /var/run/secrets/openshell-peer/token
         - name: OPENSHELL_PEER_POD_LABELS
           value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" (include "openshell.name" .) .Release.Name | quote }}
-        {{- if not .Values.server.disableTls }}
+        {{- if not .Values.gateway.disableTls }}
         - name: OPENSHELL_PEER_TLS_SERVER_NAME
           value: {{ printf "%s.%s.svc.cluster.local" (include "openshell.fullname" .) .Release.Namespace | quote }}
         {{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
@@ -117,11 +122,11 @@ spec:
               name: {{ include "openshell.credentialStorageKeyEncryptionKeySecretName" . }}
               key: {{ include "openshell.credentialStorageKeyEncryptionKeySecretKey" . }}
         {{- end }}
-        {{- if .Values.server.externalDbSecret }}
+        {{- if .Values.gateway.externalDbSecret }}
         - name: OPENSHELL_DB_URL
           valueFrom:
             secretKeyRef:
-              name: {{ .Values.server.externalDbSecret }}
+              name: {{ .Values.gateway.externalDbSecret }}
               key: uri
         {{- end }}
         # Most gateway settings live in the ConfigMap-backed TOML file
@@ -133,12 +138,12 @@ spec:
         - name: XDG_STATE_HOME
           value: /var/lib/openshell-state
         - name: OPENSHELL_TELEMETRY_ENABLED
-          value: {{ .Values.server.telemetryEnabled | quote }}
+          value: {{ .Values.gateway.telemetryEnabled | quote }}
         {{- if $spiffeSocketPath }}
         - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
           value: {{ $spiffeSocketPath | quote }}
         {{- end }}
-        {{- with .Values.server.extraEnv }}
+        {{- with .Values.gateway.extraEnv }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       volumeMounts:
@@ -165,7 +170,7 @@ spec:
           subPath: ca.crt
           readOnly: true
         {{- end }}
-        {{- if not .Values.server.disableTls }}
+        {{- if not .Values.gateway.disableTls }}
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
           readOnly: true
@@ -183,17 +188,17 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if .Values.metrics.tls.enabled }}
+        {{- if .Values.gateway.metrics.tls.enabled }}
         - name: metrics-tls-cert
           mountPath: /etc/openshell-metrics/server
           readOnly: true
-        {{- if .Values.metrics.tls.clientCaSecretName }}
+        {{- if .Values.gateway.metrics.tls.clientCaSecretName }}
         - name: metrics-tls-client-ca
           mountPath: /etc/openshell-metrics/client-ca
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.gateway.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
@@ -213,48 +218,48 @@ spec:
           mountPath: {{ dir $spiffeSocketPath | quote }}
           readOnly: true
         {{- end }}
-        {{- with .Values.server.extraVolumeMounts }}
+        {{- with .Values.gateway.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         - name: gateway-state
           mountPath: /var/lib/openshell-state
       ports:
         - name: grpc
-          containerPort: {{ .Values.service.port }}
+          containerPort: {{ .Values.gateway.service.port }}
           protocol: TCP
         - name: health
-          containerPort: {{ .Values.service.healthPort }}
+          containerPort: {{ .Values.gateway.service.healthPort }}
           protocol: TCP
         {{- if include "openshell.metricsEnabled" . }}
         - name: metrics
-          containerPort: {{ .Values.service.metricsPort }}
+          containerPort: {{ .Values.gateway.service.metricsPort }}
           protocol: TCP
         {{- end }}
       startupProbe:
         httpGet:
           path: /healthz
           port: health
-        periodSeconds: {{ .Values.probes.startup.periodSeconds }}
-        timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
-        failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+        periodSeconds: {{ .Values.gateway.probes.startup.periodSeconds }}
+        timeoutSeconds: {{ .Values.gateway.probes.startup.timeoutSeconds }}
+        failureThreshold: {{ .Values.gateway.probes.startup.failureThreshold }}
       livenessProbe:
         httpGet:
           path: /healthz
           port: health
-        initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
-        periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
-        timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
-        failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+        initialDelaySeconds: {{ .Values.gateway.probes.liveness.initialDelaySeconds }}
+        periodSeconds: {{ .Values.gateway.probes.liveness.periodSeconds }}
+        timeoutSeconds: {{ .Values.gateway.probes.liveness.timeoutSeconds }}
+        failureThreshold: {{ .Values.gateway.probes.liveness.failureThreshold }}
       readinessProbe:
         httpGet:
           path: /readyz
           port: health
-        initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
-        periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
-        timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
-        failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+        initialDelaySeconds: {{ .Values.gateway.probes.readiness.initialDelaySeconds }}
+        periodSeconds: {{ .Values.gateway.probes.readiness.periodSeconds }}
+        timeoutSeconds: {{ .Values.gateway.probes.readiness.timeoutSeconds }}
+        failureThreshold: {{ .Values.gateway.probes.readiness.failureThreshold }}
       resources:
-        {{- toYaml .Values.resources | nindent 8 }}
+        {{- toYaml .Values.gateway.resources | nindent 8 }}
   volumes:
     - name: gateway-config
       configMap:
@@ -262,7 +267,7 @@ spec:
     - name: sandbox-jwt
       secret:
         secretName: {{ include "openshell.sandboxJwtSecretName" . }}
-        defaultMode: {{ .Values.server.sandboxJwt.secretDefaultMode | default 0400 }}
+        defaultMode: {{ .Values.gateway.sandboxJwt.secretDefaultMode | default 0400 }}
     - name: gateway-peer-token
       projected:
         defaultMode: 0400
@@ -279,10 +284,10 @@ spec:
           - key: ca.crt
             path: ca.crt
     {{- end }}
-    {{- if not .Values.server.disableTls }}
+    {{- if not .Values.gateway.disableTls }}
     - name: tls-cert
       secret:
-        secretName: {{ .Values.server.tls.certSecretName }}
+        secretName: {{ .Values.gateway.tls.certSecretName }}
     {{- if .Values.certManager.serverIssuerRef.name }}
     - name: tls-external-cert
       secret:
@@ -291,36 +296,36 @@ spec:
     {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
     - name: peer-client-tls
       secret:
-        secretName: {{ .Values.server.tls.clientTlsSecretName }}
+        secretName: {{ .Values.gateway.tls.clientTlsSecretName }}
     - name: tls-client-ca
       secret:
         {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
-        secretName: {{ .Values.server.tls.certSecretName }}
+        secretName: {{ .Values.gateway.tls.certSecretName }}
         items:
           - key: ca.crt
             path: ca.crt
         {{- else }}
-        secretName: {{ .Values.server.tls.clientCaSecretName }}
+        secretName: {{ .Values.gateway.tls.clientCaSecretName }}
         {{- end }}
     {{- end }}
     {{- end }}
-    {{- if .Values.metrics.tls.enabled }}
+    {{- if .Values.gateway.metrics.tls.enabled }}
     - name: metrics-tls-cert
       secret:
-        secretName: {{ .Values.metrics.tls.certSecretName | default .Values.server.tls.certSecretName }}
-    {{- if .Values.metrics.tls.clientCaSecretName }}
+        secretName: {{ .Values.gateway.metrics.tls.certSecretName | default .Values.gateway.tls.certSecretName }}
+    {{- if .Values.gateway.metrics.tls.clientCaSecretName }}
     - name: metrics-tls-client-ca
       secret:
-        secretName: {{ .Values.metrics.tls.clientCaSecretName }}
+        secretName: {{ .Values.gateway.metrics.tls.clientCaSecretName }}
         items:
           - key: ca.crt
             path: ca.crt
     {{- end }}
     {{- end }}
-    {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
+    {{- if and (get $oidcRuntimeConfig "issuer") .Values.gateway.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
-        name: {{ .Values.server.oidc.caConfigMapName }}
+        name: {{ .Values.gateway.oidc.caConfigMapName }}
     {{- end }}
     {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
     - name: vault-ca
@@ -344,27 +349,27 @@ spec:
         driver: csi.spiffe.io
         readOnly: true
     {{- end }}
-    {{- with .Values.server.extraVolumes }}
+    {{- with .Values.gateway.extraVolumes }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
     - name: gateway-state
       emptyDir: {}
-  {{- with .Values.priorityClassName }}
+  {{- with .Values.gateway.priorityClassName }}
   priorityClassName: {{ . }}
   {{- end }}
-  {{- with .Values.nodeSelector }}
+  {{- with .Values.gateway.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .Values.affinity }}
+  {{- with .Values.gateway.affinity }}
   affinity:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .Values.tolerations }}
+  {{- with .Values.gateway.tolerations }}
   tolerations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .Values.topologySpreadConstraints }}
+  {{- with .Values.gateway.topologySpreadConstraints }}
   topologySpreadConstraints:
     {{- toYaml . | nindent 4 }}
   {{- end }}

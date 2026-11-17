@@ -41,4 +41,4 @@ tests:
       server.dataStorageSize: 20
     asserts:
       - failedTemplate:
-          errorMessage: "server.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi"
+          errorMessage: "gateway.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi"

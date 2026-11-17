@@ -99,7 +99,7 @@ tests:
       resources.requests.cpu: 100m
     asserts:
       - failedTemplate:
-          errorMessage: "grpcRoute.replicaRouting.enabled supports autoscaling.maxReplicas of at most 15; a GRPCRoute holds at most 16 rules."
+          errorMessage: "grpcRoute.replicaRouting.enabled supports gateway.autoscaling.maxReplicas of at most 15; a GRPCRoute holds at most 16 rules."
 
   - it: requires a StatefulSet for stable replica names
     template: templates/statefulset.yaml
@@ -108,4 +108,4 @@ tests:
       workload.kind: deployment
     asserts:
       - failedTemplate:
-          errorMessage: "grpcRoute.replicaRouting.enabled requires workload.kind=statefulset so each replica has a stable name."
+          errorMessage: "grpcRoute.replicaRouting.enabled requires gateway.workload.kind=statefulset so each replica has a stable name."

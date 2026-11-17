@@ -57,15 +57,24 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
+### Component values migration
+
+Gateway deployment settings live under `gateway`, supervisor settings under
+`supervisor`, and sandbox resource settings under `sandbox`. Application settings
+stay in top-level `gatewayConfig`. Legacy paths work before chart `0.2.0`; export
+stored overrides, migrate them, and use `--reset-values -f migrated-values.yaml`
+to remove aliases retained by `--reuse-values`. Refer to
+[the migration guide](../../../docs/kubernetes/migrate-gateway-config.mdx).
+
 ### Gateway metrics
 
 The chart enables its dedicated Prometheus endpoint by default. Set
-`metrics.enabled=false` to omit the listener and its container and Service
-ports without changing `service.metricsPort` (default `9090`). The port must
+`gateway.metrics.enabled=false` to omit the listener and its container and Service
+ports without changing `gateway.service.metricsPort` (default `9090`). The port must
 remain between 1 and 65535 even when disabled. Legacy `metricsPort: 0` or
-`false` values fail rendering; migrate them to `metrics.enabled=false` and a
-valid port in the same upgrade. `metrics.tls.enabled=true` requires
-`metrics.enabled=true`. This setting does not disable OpenTelemetry export.
+`false` values fail rendering; migrate them to `gateway.metrics.enabled=false` and a
+valid port in the same upgrade. `gateway.metrics.tls.enabled=true` requires
+`gateway.metrics.enabled=true`. This setting does not disable OpenTelemetry export.
 
 ### Shared supervisor plumbing
 
@@ -87,7 +96,7 @@ it into that Secret (the gateway Role may `get`/`patch` only that Secret), and
 renews it at half its lifetime; the supervisor mounts the Secret and presents
 the token on the private `openshell.supervisor.host.v1` assignment stream,
 which accepts nothing else. The topology requires gateway TLS and the signing
-key (`server.disableTls` is rejected; the gateway refuses to start without
+key (`gateway.disableTls` is rejected; the gateway refuses to start without
 `gateway_jwt`). New sandbox generations run as sandbox instances in that
 process. The chart starts `--mode=shared`, sets `--gateway-endpoint` to the
 gateway gRPC URL, mounts the token at `--token-file`, and binds `--address`
@@ -115,7 +124,7 @@ The shared supervisor is always a pool of `supervisor.replicas` members
 average per Pod, two to four members, one removal every two minutes after five
 minutes of stabilization). It requires the resource metrics API, usually
 Metrics Server. The HPA omits the Deployment's fixed replica count and ignores
-`supervisor.replicas`; top-level `autoscaling` still controls only the gateway.
+`supervisor.replicas`; `gateway.autoscaling` still controls only the gateway.
 Do not combine the HPA overlay with the manual 1→2→1 scaling E2E: that test
 expects Helm to own replicas. Changing HPA bounds or target must leave the
 gateway config and supervisor Pod template unchanged, as checked by
@@ -125,8 +134,8 @@ chart renders the gateway's
 `recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
 the driver's `shared_supervisor` table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with a 60-second
-grace period, no affinity unless `supervisor.affinity` is set (top-level
-`affinity` applies only to the gateway), the pool identity env vars
+grace period, no affinity unless `supervisor.affinity` is set (
+`gateway.affinity` applies only to the gateway), the pool identity env vars
 (`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` and `_ADVERTISE_IP` from the Pod name
 and IP), and a `maxUnavailable: 1` PodDisruptionBudget unless
 `supervisor.podDisruptionBudget.enabled=false` (default `true`; toggling it
@@ -325,10 +334,10 @@ streams during gateway rollouts and scale events.
 
 ### TLS behaviour
 
-`ci/values-skaffold.yaml` sets `server.disableTls: true`, so Skaffold-based deploys run
-plaintext by default. Override `server.disableTls=false` to exercise TLS/mTLS.
+`ci/values-skaffold.yaml` sets `gateway.disableTls: true`, so Skaffold-based deploys run
+plaintext by default. Override `gateway.disableTls=false` to exercise TLS/mTLS.
 
-| Mode | `server.disableTls` | Gateway scheme |
+| Mode | `gateway.disableTls` | Gateway scheme |
 |------|---------------------|----------------|
 | Skaffold dev (default) | `true` | `http://` |
 | TLS enabled | `false` (or omitted) | `https://` |
@@ -493,7 +502,7 @@ operations while gateway pods roll, so file sync exercises the same relay retry
 path as interactive sessions.
 
 If you reuse an existing Skaffold cluster for the full kube suite, make sure the
-chart has `server.hostGatewayIP` set so sandbox pods can resolve
+chart has `gatewayConfig["openshell.drivers.kubernetes"].host_gateway_ip` set so sandbox pods can resolve
 `host.openshell.internal` back to the test host. The e2e wrapper detects this on
 chart installs; manual reuse may require:
 
@@ -501,7 +510,7 @@ chart installs; manual reuse may require:
 HOST_GATEWAY_IP="${OPENSHELL_E2E_HOST_GATEWAY_IP:?set host gateway IP}"
 KUBECONFIG=kubeconfig helm upgrade openshell deploy/helm/openshell \
   --namespace openshell --reuse-values \
-  --set "server.hostGatewayIP=${HOST_GATEWAY_IP}" \
+  --set "gatewayConfig.openshell\\.drivers\\.kubernetes.host_gateway_ip=${HOST_GATEWAY_IP}" \
   --wait --timeout 5m
 ```
 
@@ -516,11 +525,11 @@ BackendTLSPolicy values to the Helm install:
 helm upgrade --install openshell deploy/helm/openshell \
   --set grpcRoute.enabled=true \
   --set grpcRoute.backendTLSPolicy.enabled=true \
-  --set server.tls.enableMtls=false \
+  --set gateway.tls.enableMtls=false \
   ...
 ```
 
-This requires `server.tls.enableMtls=false` because ingress proxies cannot
+This requires `gateway.tls.enableMtls=false` because ingress proxies cannot
 present client certificates to the backend. The certgen hook creates a backend
 CA ConfigMap from the server Secret's `ca.crt` key. With cert-manager, a
 separate post-install Job polls for the cert-manager-issued certificate (up to
@@ -532,7 +541,7 @@ Key Helm values:
 - `grpcRoute.backendTLSPolicy.enabled`: create the BackendTLSPolicy resource
 - `grpcRoute.backendTLSPolicy.caCertificateConfigMapName`: override ConfigMap name
 - `grpcRoute.backendTLSPolicy.hostname`: override backend validation hostname
-- `server.tls.enableMtls`: must be `false` for BackendTLSPolicy
+- `gateway.tls.enableMtls`: must be `false` for BackendTLSPolicy
 - `pkiInitJob.timeoutSeconds`: polling duration for cert-manager mode
 - `pkiInitJob.failOnTimeout`: fail install if cert-manager times out
 
@@ -596,7 +605,7 @@ must expose HTTPS at the configured service DNS name and publish the issuing CA
 certificate as the `ca.crt` key in the `openbao-ca` ConfigMap. Local e2e uses
 OpenBao dev TLS and an `openbao-0` DNS alias matching its generated certificate.
 The Helm value
-`server.credentialDrivers.vault.caConfigMapName` mounts that key into the
+`gateway.credentialDrivers.vault.caConfigMapName` mounts that key into the
 gateway and renders the driver's `ca_bundle` setting. Non-loopback HTTP
 addresses fail gateway startup, and hostname verification requires the service
 DNS name in the server certificate SANs.

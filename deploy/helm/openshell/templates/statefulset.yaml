@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 {{- include "openshell.validateValues" . }}
@@ -11,7 +12,7 @@ metadata:
 spec:
   serviceName: {{ include "openshell.peerServiceName" . }}
   {{- if ne (include "openshell.autoscalingEnabled" .) "true" }}
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.gateway.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
@@ -23,10 +24,10 @@ spec:
         name: openshell-data
       spec:
         accessModes: ["ReadWriteOnce"]
-        {{- with .Values.server.dataStorageClass }}
+        {{- with .Values.gateway.dataStorageClass }}
         storageClassName: {{ . | quote }}
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.server.dataStorageSize | default "1Gi" | quote }}
+            storage: {{ .Values.gateway.dataStorageSize | default "1Gi" | quote }}
 {{- end }}

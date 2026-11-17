@@ -75,10 +75,10 @@ app.kubernetes.io/component: certgen
 Create the name of the service account to use
 */}}
 {{- define "openshell.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "openshell.fullname" .) .Values.serviceAccount.name }}
+{{- if .Values.gateway.serviceAccount.create }}
+{{- default (include "openshell.fullname" .) .Values.gateway.serviceAccount.name }}
 {{- else }}
-{{- default "default" .Values.serviceAccount.name }}
+{{- default "default" .Values.gateway.serviceAccount.name }}
 {{- end }}
 {{- end }}
 
@@ -86,10 +86,10 @@ Create the name of the service account to use
 Create the name of the service account assigned to sandbox pods
 */}}
 {{- define "openshell.sandboxServiceAccountName" -}}
-{{- if .Values.sandboxServiceAccount.create }}
-{{- default (printf "%s-sandbox" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-") .Values.sandboxServiceAccount.name }}
+{{- if .Values.sandbox.serviceAccount.create }}
+{{- default (printf "%s-sandbox" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-") .Values.sandbox.serviceAccount.name }}
 {{- else }}
-{{- default "default" .Values.sandboxServiceAccount.name }}
+{{- default "default" .Values.sandbox.serviceAccount.name }}
 {{- end }}
 {{- end }}
 
@@ -111,7 +111,7 @@ Whether this chart owns gateway RBAC objects. Missing legacy values default to
 enabled so upgrades with --reuse-values preserve the old topology.
 */}}
 {{- define "openshell.rbacCreate" -}}
-{{- $rbac := .Values.rbac | default dict -}}
+{{- $rbac := .Values.gateway.rbac | default dict -}}
 {{- $create := true -}}
 {{- if hasKey $rbac "create" -}}
 {{- $create = get $rbac "create" -}}
@@ -123,7 +123,7 @@ enabled so upgrades with --reuse-values preserve the old topology.
 The rbac.clusterScoped values map, tolerating missing legacy values.
 */}}
 {{- define "openshell.clusterScopedRbacValues" -}}
-{{- $rbac := .Values.rbac | default dict -}}
+{{- $rbac := .Values.gateway.rbac | default dict -}}
 {{- $clusterScoped := dict -}}
 {{- if hasKey $rbac "clusterScoped" -}}
 {{- $clusterScoped = get $rbac "clusterScoped" | default dict -}}
@@ -198,20 +198,20 @@ ghcr.io/nvidia/openshell/sandbox
 {{- define "openshell.sandboxRuntimeImageOverrideEnabled" -}}
 {{- $defaultRepository := include "openshell.defaultSandboxRuntimeRepository" . -}}
 {{- $global := .Values.global.image -}}
-{{- $registry := .Values.sandboxRuntime.image.registry | default $global.registry -}}
-{{- $repository := ternary (printf "%s/%s" $registry .Values.sandboxRuntime.image.repository) .Values.sandboxRuntime.image.repository (ne $registry "") -}}
-{{- if or (ne $repository $defaultRepository) .Values.sandboxRuntime.image.tag .Values.sandboxRuntime.image.digest .Values.global.image.tag -}}true{{- end -}}
+{{- $registry := .Values.sandbox.runtime.image.registry | default $global.registry -}}
+{{- $repository := ternary (printf "%s/%s" $registry .Values.sandbox.runtime.image.repository) .Values.sandbox.runtime.image.repository (ne $registry "") -}}
+{{- if or (ne $repository $defaultRepository) .Values.sandbox.runtime.image.tag .Values.sandbox.runtime.image.digest .Values.global.image.tag -}}true{{- end -}}
 {{- end }}
 
 {{/* Sandbox runtime image override. */}}
 {{- define "openshell.sandboxRuntimeImage" -}}
 {{- $global := .Values.global.image -}}
-{{- $registry := .Values.sandboxRuntime.image.registry | default $global.registry -}}
-{{- $repository := ternary (printf "%s/%s" $registry .Values.sandboxRuntime.image.repository) .Values.sandboxRuntime.image.repository (ne $registry "") -}}
-{{- if .Values.sandboxRuntime.image.digest -}}
-{{- printf "%s@%s" $repository .Values.sandboxRuntime.image.digest -}}
+{{- $registry := .Values.sandbox.runtime.image.registry | default $global.registry -}}
+{{- $repository := ternary (printf "%s/%s" $registry .Values.sandbox.runtime.image.repository) .Values.sandbox.runtime.image.repository (ne $registry "") -}}
+{{- if .Values.sandbox.runtime.image.digest -}}
+{{- printf "%s@%s" $repository .Values.sandbox.runtime.image.digest -}}
 {{- else -}}
-{{- $tag := .Values.sandboxRuntime.image.tag | default $global.tag | default .Chart.AppVersion -}}
+{{- $tag := .Values.sandbox.runtime.image.tag | default $global.tag | default .Chart.AppVersion -}}
 {{- printf "%s:%s" $repository $tag -}}
 {{- end -}}
 {{- end }}
@@ -223,9 +223,9 @@ both gateway.toml and the workload, overriding built-in PKI and cert-manager
 defaults.
 */}}
 {{- define "openshell.gatewayClientCaEnabled" -}}
-{{- if .Values.server.disableTls -}}
-{{- else if not .Values.server.tls.enableMtls -}}
-{{- else if eq .Values.server.tls.clientCaSecretName "" -}}
+{{- if .Values.gateway.disableTls -}}
+{{- else if not .Values.gateway.tls.enableMtls -}}
+{{- else if eq .Values.gateway.tls.clientCaSecretName "" -}}
 {{- else -}}
 true
 {{- end -}}
@@ -253,11 +253,11 @@ Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
 
 {{/*
 Namespace where sandbox pods are created. An explicit
-.Values.server.sandboxNamespace is used verbatim. Otherwise it defaults to
+.Values.sandbox.namespace is used verbatim. Otherwise it defaults to
 .Release.Namespace so `helm install -n my-ns` works without extra overrides.
 */}}
 {{- define "openshell.sandboxNamespace" -}}
-{{- .Values.server.sandboxNamespace | default .Release.Namespace -}}
+{{- .Values.sandbox.namespace | default .Release.Namespace -}}
 {{- end }}
 
 {{/*
@@ -274,8 +274,8 @@ shared workspace mode.
 {{- if and (get $app "enabled") (get $appDeployment "tls_secret_name") (not (include "openshell.supervisorEnabled" .)) -}}
 {{- $names = append $names (get $appDeployment "tls_secret_name") -}}
 {{- end -}}
-{{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) -}}
-{{- $names = append $names .Values.server.tls.clientTlsSecretName -}}
+{{- if and (ne $workspaceMode "shared") (not .Values.gateway.disableTls) -}}
+{{- $names = append $names .Values.gateway.tls.clientTlsSecretName -}}
 {{- end -}}
 {{- if eq $workspaceMode "managed" -}}
 {{- range (get $kubernetesConfig "image_pull_secrets" | default list) -}}
@@ -319,8 +319,8 @@ When server.credentialStorage.existingSecret is set, returns that name instead
 of the chart-generated name (for GitOps / helm-template workflows).
 */}}
 {{- define "openshell.credentialStorageKeyEncryptionKeySecretName" -}}
-{{- if .Values.server.credentialStorage.existingSecret -}}
-{{- .Values.server.credentialStorage.existingSecret -}}
+{{- if .Values.gateway.credentialStorage.existingSecret -}}
+{{- .Values.gateway.credentialStorage.existingSecret -}}
 {{- else -}}
 {{- printf "%s-credential-storage-key-encryption-key" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -344,7 +344,7 @@ OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY
 Name of the Secret holding gateway-minted sandbox JWT signing material.
 */}}
 {{- define "openshell.sandboxJwtSecretName" -}}
-{{- .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
+{{- .Values.gateway.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
 {{- end }}
 
 {{- define "openshell.peerServiceName" -}}
@@ -501,8 +501,8 @@ matchLabels:
 {{- if .Values.server.grpcEndpoint -}}
 {{- .Values.server.grpcEndpoint -}}
 {{- else -}}
-{{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
-{{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
+{{- $scheme := ternary "http" "https" (default false .Values.gateway.disableTls) -}}
+{{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.gateway.service.port) -}}
 {{- end -}}
 {{- end }}
 
@@ -536,7 +536,7 @@ Gateway workload kind. StatefulSet is the default because the default SQLite
 database requires persistent per-pod storage.
 */}}
 {{- define "openshell.workloadKind" -}}
-{{- $workload := .Values.workload | default dict -}}
+{{- $workload := .Values.gateway.workload | default dict -}}
 {{- if not (kindIs "map" $workload) -}}
 {{- fail "workload must be a map with kind and allowMultiReplicaStatefulSet fields." -}}
 {{- end -}}
@@ -585,11 +585,11 @@ Whether the dedicated metrics listener is enabled. Missing legacy values
 default to enabled; an explicit false must not be replaced by that default.
 */}}
 {{- define "openshell.metricsEnabled" -}}
-{{- $metrics := .Values.metrics | default dict -}}
+{{- $metrics := .Values.gateway.metrics | default dict -}}
 {{- $enabled := true -}}
 {{- if hasKey $metrics "enabled" -}}
 {{- if not (kindIs "bool" $metrics.enabled) -}}
-{{- fail "metrics.enabled must be a boolean" -}}
+{{- fail "gateway.metrics.enabled must be a boolean" -}}
 {{- end -}}
 {{- $enabled = $metrics.enabled -}}
 {{- end -}}
@@ -627,7 +627,7 @@ absent fields so every chart consumer observes the same configuration.
 {{- if hasKey $gatewayConfig "openshell.drivers.kubernetes.resource_admission" -}}
 {{- $_ := set $kubernetes "resource_admission" (get $gatewayConfig "openshell.drivers.kubernetes.resource_admission") -}}
 {{- end -}}
-{{- $legacySandbox := .Values.sandboxRuntime.image | default dict -}}
+{{- $legacySandbox := .Values.sandbox.runtime.image | default dict -}}
 {{- if and (include "openshell.sandboxRuntimeImageOverrideEnabled" .) (not (hasKey $kubernetes "sandbox_runtime_image")) -}}
 {{- $_ := set $kubernetes "sandbox_runtime_image" (include "openshell.sandboxRuntimeImage" .) -}}
 {{- end -}}
@@ -718,7 +718,7 @@ absent fields so every chart consumer observes the same configuration.
 {{- $sandboxGid := include "openshell.sandboxId" (dict "name" "server.sandboxGid" "value" (get $legacyServer "sandboxGid")) -}}
 {{- if ne $sandboxGid "" -}}{{- $_ := set $kubernetes "sandbox_gid" (int64 $sandboxGid) -}}{{- end -}}
 {{- end -}}
-{{- $legacySpiffe := .Values.server.providerTokenGrants.spiffe | default dict -}}
+{{- $legacySpiffe := .Values.gateway.providerTokenGrants.spiffe | default dict -}}
 {{- if and (get $legacySpiffe "enabled") (not (hasKey $kubernetes "provider_spiffe_workload_api_socket_path")) -}}
 {{- $_ := set $kubernetes "provider_spiffe_workload_api_socket_path" (get $legacySpiffe "workloadApiSocketPath") -}}
 {{- end -}}
@@ -756,7 +756,7 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (get $kubernetes "provider_spiffe_workload_api_socket_path") -}}
 {{- fail "supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity" -}}
 {{- end -}}
-{{- if .Values.server.disableTls -}}
+{{- if .Values.gateway.disableTls -}}
 {{- fail "supervisor_topology=gateway requires gateway TLS; the supervisor token travels only over TLS" -}}
 {{- end -}}
 {{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
@@ -776,67 +776,67 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- $_ := include "openshell.supervisorPoolConfig" . -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
-{{- $workload := .Values.workload | default dict -}}
+{{- $workload := .Values.gateway.workload | default dict -}}
 {{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}
 {{- $maxReplicasSource := include "openshell.maxReplicasSource" . -}}
 {{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
-{{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
+{{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set gateway.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
 {{- end -}}
 {{- if and .Values.certManager.serverIssuerRef.name (not .Values.certManager.enabled) -}}
 {{- fail "certManager.serverIssuerRef.name is set but certManager.enabled is false — the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name." -}}
 {{- end -}}
 {{- if not (or (eq $workloadKind "statefulset") (eq $workloadKind "deployment")) -}}
-{{- fail "workload.kind must be one of: statefulset, deployment." -}}
+{{- fail "gateway.workload.kind must be one of: statefulset, deployment." -}}
 {{- end -}}
-{{- if and (eq $workloadKind "deployment") (not .Values.server.externalDbSecret) -}}
-{{- fail "workload.kind=deployment requires server.externalDbSecret; use workload.kind=statefulset for the default SQLite database." -}}
+{{- if and (eq $workloadKind "deployment") (not .Values.gateway.externalDbSecret) -}}
+{{- fail "gateway.workload.kind=deployment requires gateway.externalDbSecret; use gateway.workload.kind=statefulset for the default SQLite database." -}}
 {{- end -}}
 {{- include "openshell.validateAutoscaling" . -}}
-{{- if and (gt $maxReplicas 1) (not .Values.server.externalDbSecret) -}}
-{{- fail (printf "%s > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." $maxReplicasSource) -}}
+{{- if and (gt $maxReplicas 1) (not .Values.gateway.externalDbSecret) -}}
+{{- fail (printf "%s > 1 requires gateway.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." $maxReplicasSource) -}}
 {{- end -}}
 {{- if and (eq $workloadKind "statefulset") (gt $maxReplicas 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
-{{- fail (printf "%s > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." $maxReplicasSource) -}}
+{{- fail (printf "%s > 1 with gateway.workload.kind=statefulset requires gateway.workload.allowMultiReplicaStatefulSet=true; use gateway.workload.kind=deployment for external database-backed multi-replica gateways." $maxReplicasSource) -}}
 {{- end -}}
-{{- $servicePortValue := toString .Values.service.port -}}
-{{- $healthPortValue := toString .Values.service.healthPort -}}
-{{- $metricsPortValue := toString .Values.service.metricsPort -}}
+{{- $servicePortValue := toString .Values.gateway.service.port -}}
+{{- $healthPortValue := toString .Values.gateway.service.healthPort -}}
+{{- $metricsPortValue := toString .Values.gateway.service.metricsPort -}}
 {{- if not (regexMatch `^-?[0-9]+$` $servicePortValue) -}}
-{{- fail "service.port must be an integer." -}}
+{{- fail "gateway.service.port must be an integer." -}}
 {{- end -}}
 {{- if not (regexMatch `^-?[0-9]+$` $healthPortValue) -}}
-{{- fail "service.healthPort must be an integer." -}}
+{{- fail "gateway.service.healthPort must be an integer." -}}
 {{- end -}}
 {{- $servicePort := int $servicePortValue -}}
 {{- $healthPort := int $healthPortValue -}}
 {{- $metricsPort := int $metricsPortValue -}}
 {{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
-{{- fail "service.port must be between 1 and 65535." -}}
+{{- fail "gateway.service.port must be between 1 and 65535." -}}
 {{- end -}}
 {{- if or (lt $healthPort 1) (gt $healthPort 65535) -}}
-{{- fail "service.healthPort must be between 1 and 65535 because gateway probes require it." -}}
+{{- fail "gateway.service.healthPort must be between 1 and 65535 because gateway probes require it." -}}
 {{- end -}}
 {{- if eq $servicePort $healthPort -}}
-{{- fail "service.port and service.healthPort must be different." -}}
+{{- fail "gateway.service.port and gateway.service.healthPort must be different." -}}
 {{- end -}}
 {{- if or (not (regexMatch `^[0-9]+$` $metricsPortValue)) (lt $metricsPort 1) (gt $metricsPort 65535) -}}
-{{- fail "service.metricsPort must be an integer between 1 and 65535; to disable metrics, set metrics.enabled=false and keep a valid service.metricsPort (default 9090)" -}}
+{{- fail "gateway.service.metricsPort must be an integer between 1 and 65535; to disable metrics, set gateway.metrics.enabled=false and keep a valid gateway.service.metricsPort (default 9090)" -}}
 {{- end -}}
 {{- if and $metricsEnabled (or (eq $metricsPort $servicePort) (eq $metricsPort $healthPort)) -}}
-{{- fail "service.metricsPort must differ from service.port and service.healthPort when metrics.enabled=true" -}}
+{{- fail "gateway.service.metricsPort must differ from gateway.service.port and gateway.service.healthPort when gateway.metrics.enabled=true" -}}
 {{- end -}}
 {{- if and .Values.grpcRoute.enabled (dig "replicaRouting" "enabled" false .Values.grpcRoute) -}}
 {{- if ne $workloadKind "statefulset" -}}
-{{- fail "grpcRoute.replicaRouting.enabled requires workload.kind=statefulset so each replica has a stable name." -}}
+{{- fail "grpcRoute.replicaRouting.enabled requires gateway.workload.kind=statefulset so each replica has a stable name." -}}
 {{- end -}}
 {{- if gt $maxReplicas 15 -}}
 {{- fail (printf "grpcRoute.replicaRouting.enabled supports %s of at most 15; a GRPCRoute holds at most 16 rules." $maxReplicasSource) -}}
 {{- end -}}
 {{- end -}}
-{{- include "openshell.validateSecretReference" (list "server.externalDbSecret" .Values.server.externalDbSecret) -}}
-{{- include "openshell.validateSecretReference" (list "server.credentialStorage.existingSecret" .Values.server.credentialStorage.existingSecret) -}}
-{{- include "openshell.validateSecretReference" (list "server.sandboxJwt.signingSecretName" .Values.server.sandboxJwt.signingSecretName) -}}
-{{- include "openshell.validateSecretReference" (list "server.tls.certSecretName" .Values.server.tls.certSecretName) -}}
+{{- include "openshell.validateSecretReference" (list "gateway.externalDbSecret" .Values.gateway.externalDbSecret) -}}
+{{- include "openshell.validateSecretReference" (list "gateway.credentialStorage.existingSecret" .Values.gateway.credentialStorage.existingSecret) -}}
+{{- include "openshell.validateSecretReference" (list "gateway.sandboxJwt.signingSecretName" .Values.gateway.sandboxJwt.signingSecretName) -}}
+{{- include "openshell.validateSecretReference" (list "gateway.tls.certSecretName" .Values.gateway.tls.certSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "upstreamProxy.authSecret.name" .Values.upstreamProxy.authSecret.name) -}}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- $gateway := get $gatewayConfig "openshell.gateway" | default dict -}}
@@ -855,12 +855,12 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
 {{- fail "gatewayConfig.openshell.drivers.kubernetes.workspace_mode must be one of: shared, managed, operator." -}}
 {{- end -}}
-{{- if kindIs "invalid" .Values.server.tls.clientCaSecretName -}}
-{{- fail "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}
+{{- if kindIs "invalid" .Values.gateway.tls.clientCaSecretName -}}
+{{- fail "gateway.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}
 {{- end -}}
-{{- $dataStorageSize := .Values.server.dataStorageSize -}}
+{{- $dataStorageSize := .Values.gateway.dataStorageSize -}}
 {{- if and (eq $workloadKind "statefulset") $dataStorageSize (not (regexMatch "^[0-9]+(\\.[0-9]+)?([KMGTPE]i|[kMGTPE])$" (toString $dataStorageSize))) -}}
-{{- fail "server.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi" -}}
+{{- fail "gateway.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi" -}}
 {{- end -}}
 {{- end }}
 
@@ -887,4 +887,13 @@ Validate chart values that Helm would otherwise accept silently.
 {{- $app = get $config "openshell.drivers.kubernetes.sandbox_runtime.app_listener" -}}
 {{- end -}}
 {{- toYaml $app -}}
+{{- end -}}
+
+{{/* A supervisor account has no gateway or sandbox RBAC. */}}
+{{- define "openshell.supervisorServiceAccountName" -}}
+{{- if .Values.supervisor.serviceAccount.create -}}
+{{- default (printf "%s-supervisor" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-") .Values.supervisor.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.supervisor.serviceAccount.name -}}
+{{- end -}}
 {{- end -}}

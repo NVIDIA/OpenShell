@@ -1,5 +1,8 @@
 # Migrate Helm gateway configuration to `gatewayConfig`
 
+These mappings apply to the main OpenShell gateway chart. The separate
+`openshell-workspace` chart keeps its existing values interface.
+
 Chart schema v2 replaces application-specific Helm values with one non-secret
 `gatewayConfig` map. Its top-level keys are TOML tables; nested maps are TOML
 inline tables. A top-level YAML list is an ordered TOML array of tables, with
@@ -8,8 +11,9 @@ and mounts) remain chart values.
 
 ## Upgrade compatibility
 
-The chart accepts the 0.1.x application values as deprecated aliases while
-moving to `gatewayConfig`. When both forms set the same runtime field,
+The chart accepts the old deployment and application values as deprecated
+aliases before chart `0.2.0`. Starting with `0.2.0`, supplying an old path fails
+with its replacement instead of silently deploying defaults. When both forms set the same runtime field,
 `gatewayConfig` wins. Runtime images and proxy settings may therefore be
 migrated incrementally. Kubernetes pull policy spellings such as `Always` are
 accepted aliases and normalize to `always`, `if_not_present`, or `never`.
@@ -21,10 +25,85 @@ generically and cannot determine whether an arbitrary string such as
 `api_token` is confidential. It rejects `database_url`, inline URL credentials,
 and PEM private keys, but is not a general secret scanner.
 
-Keep `server.disableTls`, TLS Secret names, `server.hostGatewayIP`, `server.externalDbSecret`,
-`server.sandboxNamespace`, `server.oidc.caConfigMapName`, certificate settings and
-Service settings: these own Kubernetes resources. The chart derives their
-runtime counterparts.
+Keep Kubernetes resource inputs in their owning component's values. The chart
+derives mounted file paths, listener ports, TLS fields, namespaces, and service
+account names from those inputs so the resources and runtime configuration agree.
+
+## Component deployment values
+
+The chart groups deployment settings under `gateway`, `supervisor`, and `sandbox`.
+`gatewayConfig`, `pkiInitJob`, `grpcRoute`, `certManager`, and `openshiftRoute` stay
+at the top level. `gateway.image` and `sandbox.image` keep their existing paths.
+
+| Old path | Replacement |
+| --- | --- |
+| `replicaCount`, `workload`, `autoscaling` | Corresponding keys under `gateway` |
+| `nodeSelector`, `affinity`, `tolerations`, `priorityClassName`, `topologySpreadConstraints` | Corresponding keys under `gateway` |
+| `resources`, `probes`, `podLifecycle` | Corresponding keys under `gateway` |
+| `podAnnotations`, `podLabels`, `podSecurityContext`, `securityContext` | Corresponding keys under `gateway` |
+| `serviceAccount`, `rbac`, `service`, `metrics`, `credentialDrivers` | Corresponding keys under `gateway` |
+| `server.extraEnv`, `server.extraVolumes`, `server.extraVolumeMounts` | Corresponding keys under `gateway` |
+| `server.dataStorageSize`, `server.dataStorageClass`, `server.externalDbSecret`, `server.dbUrl`, `server.telemetryEnabled` | Corresponding keys under `gateway` |
+| `server.disableTls`, `server.tls`, `server.credentialStorage` | Corresponding keys under `gateway` |
+| `server.sandboxJwt.signingSecretName`, `server.sandboxJwt.secretDefaultMode` | Corresponding keys under `gateway.sandboxJwt` |
+| `server.oidc.caConfigMapName`, `server.providerTokenGrants.spiffe` | Corresponding keys under `gateway` |
+| `server.credentialDrivers.kubernetesSecrets.createNamespace`, `server.credentialDrivers.kubernetesSecrets.rbac` | Corresponding keys under `gateway.credentialDrivers.kubernetesSecrets` |
+| `server.credentialDrivers.vault.caConfigMapName` | `gateway.credentialDrivers.vault.caConfigMapName` |
+| `sandboxServiceAccount`, `sandboxRuntime`, `networkPolicy` | `sandbox.serviceAccount`, `sandbox.runtime`, `sandbox.networkPolicy` |
+| `server.sandboxNamespace`, `server.sandboxImagePullSecrets` | `sandbox.namespace`, `sandbox.imagePullSecrets` |
+
+There is no `gateway.server` map. Database URLs remain outside `gatewayConfig`,
+which rejects `database_url`. Use `gateway.externalDbSecret` for a PostgreSQL URI.
+`gateway.telemetryEnabled` controls the existing environment-only telemetry flag.
+Remove `server.ocsfLog.schemaVersion`; it was already ignored. To enable OCSF file
+output, set `path` in `gatewayConfig["openshell.gateway.ocsf_log"]`.
+
+During the compatibility window, explicit component settings override legacy
+aliases entry by entry. Lists replace whole lists, and explicit empty maps or
+lists clear legacy values. `false`, zero, and empty strings retain their meaning.
+Null component values inherit legacy overrides or chart defaults; the sparse
+defaults in `values.yaml` avoid masking old overrides. Install and upgrade notes
+list deprecated paths and the removal version.
+
+Gateway and shared supervisor pods independently support `nodeSelector`,
+`affinity`, `tolerations`, `topologySpreadConstraints`, `priorityClassName`,
+`schedulerName`, `resources`, pod metadata, security contexts, shutdown grace
+periods, and service accounts. CPU utilization autoscaling needs a positive CPU
+request; supervisor memory autoscaling uses an absolute memory target. Component
+`imagePullSecrets` override chart-wide pull secrets when supplied; an empty list
+disables inheritance.
+
+`gateway.serviceAccount`, `supervisor.serviceAccount`, and `sandbox.serviceAccount`
+accept `create`, `name`, `labels`, and `annotations`. `create: false` selects an
+existing account; an empty name selects `default`. `create: true` generates a name
+when omitted. Supervisor accounts receive no gateway RBAC, and token automount
+defaults to `false`. Sandbox workloads always disable token automount and use a
+scoped projected bootstrap token; setting their automount override to `true` is
+rejected. In managed workspace mode, the driver provisions the named sandbox
+account in each workspace namespace; provision custom metadata there separately.
+With externally managed workspaces, provision the named account in each workspace
+namespace. `workspaceResources.enabled=false` disables Helm's sandbox account
+creation along with its other workspace resources.
+
+Export stored overrides before upgrading:
+
+```shell
+helm get values openshell -n openshell -o yaml > migrated-values.yaml
+```
+
+Move the keys in that file using the mappings on this page, retaining unrelated
+overrides. Then replace the release's stored values:
+
+```shell
+helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> -n openshell --reset-values -f migrated-values.yaml
+```
+
+`--reuse-values` retains old paths and fails at `0.2.0` even if canonical overrides
+are also supplied. Keep a copy of the exported values until the upgrade succeeds.
+Equivalent old and new configuration preserves resource names, Service selectors,
+and PVC references. Changes to pod specifications or the configuration checksum
+can still roll pods during an upgrade.
 
 ## Mapping
 
@@ -42,7 +121,7 @@ runtime counterparts.
 | `upstreamProxy.*` | `openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*,proxy_connect_by_hostname}`. |
 | `server.credentialDrivers.{kubernetesSecrets,vault}.*` | `openshell.gateway.credential_drivers` and `openshell.credential_drivers.*` |
 | `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | `openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`; omit it to disable SPIFFE provider grants. |
-| `server.hostGatewayIP` | Retained as the chart-owned host-alias input; the chart derives `openshell.drivers.kubernetes.host_gateway_ip`. |
+| `server.hostGatewayIP` | `openshell.drivers.kubernetes.host_gateway_ip`; the chart uses the effective value for pod host aliases too. |
 
 ## Examples
 

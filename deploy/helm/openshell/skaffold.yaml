@@ -95,7 +95,7 @@ deploy:
       #  namespace: envoy-gateway-system
       #  createNamespace: true
       #  # wait ensures Gateway API CRDs are registered before the openshell
-      #  # release attempts to create Gateway and HTTPRoute resources.
+      #  # release attempts to create Gateway and HTTPRoute gateway.resources.
       #  wait: true
       # SPIRE — installs SPIRE Server, Agent, Controller Manager, CSI Driver,
       # and OIDC Discovery Provider using the SPIFFE hardened charts.
@@ -147,8 +147,8 @@ deploy:
           gateway.image.tag: '{{.IMAGE_TAG_openshell_gateway}}'
           supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
           supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'
-          sandboxRuntime.image.repository: '{{.IMAGE_REPO_openshell_sandbox}}'
-          sandboxRuntime.image.tag: '{{.IMAGE_TAG_openshell_sandbox}}'
+          sandbox.runtime.image.repository: '{{.IMAGE_REPO_openshell_sandbox}}'
+          sandbox.runtime.image.tag: '{{.IMAGE_TAG_openshell_sandbox}}'
           gatewayConfig.openshell\.drivers\.kubernetes.supervisor_image: '{{.IMAGE_REPO_openshell_supervisor}}:{{.IMAGE_TAG_openshell_supervisor}}'
 profiles:
   # Full HA test path: installs Envoy Gateway and layers both HA replicas and
@@ -181,7 +181,7 @@ profiles:
       - op: add
         path: /deploy/helm/releases/0/setValues
         value:
-          server.disableTls: "false"
+          gateway.disableTls: "false"
   - name: credential-driver-kubernetes-secrets
     patches:
       - op: add

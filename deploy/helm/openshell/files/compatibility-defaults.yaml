@@ -1,0 +1,194 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Internal defaults for migrated paths only; retained values use values.yaml.
+replicaCount: 1
+workload:
+  kind: statefulset
+  allowMultiReplicaStatefulSet: false
+sandboxRuntime:
+  image:
+    registry: ''
+    repository: openshell/sandbox
+    pullPolicy: null
+    tag: ''
+    digest: ''
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ''
+sandboxServiceAccount:
+  create: true
+  annotations: {}
+  name: ''
+rbac:
+  create: true
+  clusterScoped:
+    create: true
+    clusterRoleName: ''
+    clusterRoleBindingName: ''
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  fsGroup: 1000
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  seccompProfile:
+    type: RuntimeDefault
+service:
+  type: ClusterIP
+  port: 8080
+  healthPort: 8081
+  metricsPort: 9090
+metrics:
+  enabled: true
+  tls:
+    enabled: false
+    certSecretName: ''
+    clientCaSecretName: ''
+    requireClientCert: false
+podLifecycle:
+  terminationGracePeriodSeconds: 30
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: null
+  metrics: []
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 120
+probes:
+  startup:
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+  liveness:
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 1
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 1
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 3
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ''
+topologySpreadConstraints: []
+server:
+  name: ''
+  logLevel: info
+  otlp:
+    endpoint: ''
+    serviceName: ''
+  ocsfLog:
+    enabled: false
+    path: /tmp/gateway-ocsf.jsonl
+    schemaVersion: ''
+    rotation: daily
+    maxFiles: 7
+    queueCapacity: 10000
+    queueMaxBytes: 16777216
+  extraVolumes: []
+  extraVolumeMounts: []
+  extraEnv: []
+  telemetryEnabled: true
+  sandboxNamespace: ''
+  dbUrl: sqlite:/var/openshell/openshell.db
+  dataStorageSize: ''
+  dataStorageClass: ''
+  externalDbSecret: ''
+  sandboxImagePullSecrets: []
+  workspaceDefaultStorageSize: ''
+  workspaceStorageClass: ''
+  defaultRuntimeClassName: ''
+  sandboxUid: ''
+  sandboxGid: ''
+  grpcEndpoint: ''
+  hostGatewayIP: ''
+  enableUserNamespaces: false
+  drivers:
+    kubernetes:
+      allowDriverConfig: false
+      resourceAdmission:
+        enabled: true
+        requiredLabels: null
+      workspaceMode: shared
+      operatorNamespaceLabel: ''
+      operatorNamespaceFile: ''
+  disableTls: false
+  enableLoopbackServiceHttp: true
+  serviceHostnameFormat: ''
+  enableWebsocketTunnel: false
+  policyValidationFailureMode: fail_closed
+  grpcRateLimit:
+    requests: 0
+    windowSeconds: 0
+  credentialStorage:
+    existingSecret: ''
+  credentialDrivers:
+    kubernetesSecrets:
+      enabled: false
+      namespace: ''
+      createNamespace: false
+      rbac:
+        create: true
+    vault:
+      enabled: false
+      address: ''
+      caConfigMapName: ''
+      mount: secret
+      kvVersion: '2'
+      authMethod: kubernetes
+      role: ''
+      kubernetesAuthMount: kubernetes
+      serviceAccountTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tokenPath: ''
+      timeoutSecs: ''
+  auth:
+    allowUnauthenticatedUsers: false
+  tls:
+    certSecretName: openshell-server-tls
+    enableMtls: true
+    clientCaSecretName: openshell-server-client-ca
+    clientTlsSecretName: openshell-client-tls
+  sandboxJwt:
+    signingSecretName: ''
+    gatewayId: ''
+    ttlSecs: 3600
+    k8sSaTokenTtlSecs: 3600
+    secretDefaultMode: ''
+  providerTokenGrants:
+    spiffe:
+      enabled: false
+      workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
+  oidc:
+    issuer: ''
+    dangerouslyAllowInsecureHttp: false
+    jwksAllowedOrigins: []
+    audience: openshell-cli
+    jwksTtl: 3600
+    rolesClaim: ''
+    adminRole: ''
+    userRole: ''
+    scopesClaim: ''
+    caConfigMapName: ''
+credentialDrivers:
+  vault:
+    caConfigMapName: ''
+networkPolicy:
+  enabled: true

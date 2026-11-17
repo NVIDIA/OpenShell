@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 {{- if and .Values.grpcRoute.enabled (dig "replicaRouting" "enabled" false .Values.grpcRoute) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -12,7 +13,7 @@ metadata:
     {{- include "openshell.labels" $ | nindent 4 }}
 spec:
   ports:
-    - port: {{ $.Values.service.port }}
+    - port: {{ $.Values.gateway.service.port }}
       targetPort: grpc
       protocol: TCP
       name: grpc

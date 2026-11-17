@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,18 +9,18 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
-  type: {{ .Values.service.type }}
+  type: {{ .Values.gateway.service.type }}
   ports:
-    - port: {{ .Values.service.port }}
+    - port: {{ .Values.gateway.service.port }}
       targetPort: grpc
       protocol: TCP
       name: grpc
       appProtocol: grpc
-      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
-      nodePort: {{ .Values.service.nodePort }}
+      {{- if and (eq .Values.gateway.service.type "NodePort") .Values.gateway.service.nodePort }}
+      nodePort: {{ .Values.gateway.service.nodePort }}
       {{- end }}
     {{- if include "openshell.metricsEnabled" . }}
-    - port: {{ .Values.service.metricsPort }}
+    - port: {{ .Values.gateway.service.metricsPort }}
       targetPort: metrics
       protocol: TCP
       name: metrics

@@ -1,9 +1,10 @@
+{{- include "openshell.resolveValues" . -}}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 {{- if .Values.openshiftRoute.enabled }}
-{{- if .Values.server.disableTls }}
-{{- fail "openshiftRoute.enabled=true requires TLS (server.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS." }}
+{{- if .Values.gateway.disableTls }}
+{{- fail "openshiftRoute.enabled=true requires TLS (gateway.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS." }}
 {{- end }}
 {{- if and .Values.certManager.serverIssuerRef.name (not .Values.openshiftRoute.host) }}
 {{- fail "openshiftRoute.enabled=true with certManager.serverIssuerRef requires an explicit openshiftRoute.host \u2014 without one, OpenShift generates a hostname absent from certManager.serverDnsNames, causing the gateway to serve its internal certificate to external clients." }}

@@ -13,7 +13,7 @@ tests:
       service.port: 0
     asserts:
       - failedTemplate:
-          errorPattern: "service.port must be between 1 and 65535"
+          errorPattern: "gateway.service.port must be between 1 and 65535"
 
   - it: rejects a primary gateway listener above the valid port range
     template: templates/statefulset.yaml
@@ -21,7 +21,7 @@ tests:
       service.port: 65536
     asserts:
       - failedTemplate:
-          errorPattern: "service.port must be between 1 and 65535"
+          errorPattern: "gateway.service.port must be between 1 and 65535"
 
   - it: rejects a disabled health listener because probes require it
     template: templates/statefulset.yaml
@@ -29,7 +29,7 @@ tests:
       service.healthPort: 0
     asserts:
       - failedTemplate:
-          errorPattern: "service.healthPort must be between 1 and 65535 because gateway probes require it"
+          errorPattern: "gateway.service.healthPort must be between 1 and 65535 because gateway probes require it"
 
   - it: rejects a health listener above the valid port range
     template: templates/statefulset.yaml
@@ -37,7 +37,7 @@ tests:
       service.healthPort: 65536
     asserts:
       - failedTemplate:
-          errorPattern: "service.healthPort must be between 1 and 65535 because gateway probes require it"
+          errorPattern: "gateway.service.healthPort must be between 1 and 65535 because gateway probes require it"
 
   - it: rejects a health listener that collides with the primary listener
     template: templates/statefulset.yaml
@@ -45,7 +45,7 @@ tests:
       service.healthPort: 8080
     asserts:
       - failedTemplate:
-          errorPattern: "service.port and service.healthPort must be different"
+          errorPattern: "gateway.service.port and gateway.service.healthPort must be different"
 
   - it: rejects a metrics listener that collides with the primary listener
     template: templates/statefulset.yaml
@@ -53,7 +53,7 @@ tests:
       service.metricsPort: 8080
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must differ from service.port and service.healthPort"
+          errorPattern: "gateway.service.metricsPort must differ from gateway.service.port and gateway.service.healthPort"
 
   - it: rejects a metrics listener that collides with the health listener
     template: templates/statefulset.yaml
@@ -61,7 +61,7 @@ tests:
       service.metricsPort: 8081
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must differ from service.port and service.healthPort"
+          errorPattern: "gateway.service.metricsPort must differ from gateway.service.port and gateway.service.healthPort"
 
   - it: rejects a negative metrics listener port
     template: templates/statefulset.yaml
@@ -69,7 +69,7 @@ tests:
       service.metricsPort: -1
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must be an integer between 1 and 65535"
+          errorPattern: "gateway.service.metricsPort must be an integer between 1 and 65535"
 
   - it: rejects a boolean primary port
     template: templates/statefulset.yaml
@@ -77,7 +77,7 @@ tests:
       service.port: true
     asserts:
       - failedTemplate:
-          errorPattern: "service.port must be an integer"
+          errorPattern: "gateway.service.port must be an integer"
 
   - it: rejects a boolean health port
     template: templates/statefulset.yaml
@@ -85,7 +85,7 @@ tests:
       service.healthPort: true
     asserts:
       - failedTemplate:
-          errorPattern: "service.healthPort must be an integer"
+          errorPattern: "gateway.service.healthPort must be an integer"
 
   - it: rejects a boolean metrics port
     template: templates/statefulset.yaml
@@ -93,7 +93,7 @@ tests:
       service.metricsPort: true
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must be an integer"
+          errorPattern: "gateway.service.metricsPort must be an integer"
 
   - it: rejects false instead of treating it as a disabled metrics port
     template: templates/statefulset.yaml
@@ -101,7 +101,7 @@ tests:
       service.metricsPort: false
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must be an integer"
+          errorPattern: "gateway.service.metricsPort must be an integer"
 
   - it: rejects a fractional metrics port
     template: templates/statefulset.yaml
@@ -109,7 +109,7 @@ tests:
       service.metricsPort: 9090.5
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must be an integer"
+          errorPattern: "gateway.service.metricsPort must be an integer"
 
   - it: rejects a metrics listener above the valid port range
     template: templates/statefulset.yaml
@@ -117,7 +117,7 @@ tests:
       service.metricsPort: 65536
     asserts:
       - failedTemplate:
-          errorPattern: "service.metricsPort must be an integer between 1 and 65535"
+          errorPattern: "gateway.service.metricsPort must be an integer between 1 and 65535"
 
   - it: accepts boundary ports with metrics disabled
     template: templates/gateway-config.yaml

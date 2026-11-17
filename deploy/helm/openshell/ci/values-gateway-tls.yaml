@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 # Gateway API overlay with TLS termination at the Envoy Gateway listener.
 #
 # Exercises the HTTPS listener branch of templates/gateway.yaml for
@@ -16,20 +15,17 @@ grpcRoute:
   enabled: true
   gateway:
     create: true
-    className: "eg"
+    className: eg
     listener:
       port: 443
       protocol: HTTPS
       tls:
         certificateRefs:
-          - name: openshell-ingress-tls
+        - name: openshell-ingress-tls
   hostnames: []
-
-server:
-  # Envoy terminates TLS at the edge; the gateway listens plaintext behind it.
-  disableTls: true
-
 gatewayConfig:
   openshell.gateway.oidc:
-    issuer: "https://keycloak.example.com/realms/openshell"
-    audience: "openshell-cli"
+    issuer: https://keycloak.example.com/realms/openshell
+    audience: openshell-cli
+gateway:
+  disableTls: true

@@ -1,7 +1,8 @@
+{{- include "openshell.resolveValues" . -}}
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 {{- include "openshell.validateValues" . }}
-{{- if and (include "openshell.supervisorEnabled" .) .Values.networkPolicy.enabled }}
+{{- if and (include "openshell.supervisorEnabled" .) .Values.sandbox.networkPolicy.enabled }}
 {{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml }}
 {{- $shared := get $kubernetes "shared_supervisor" }}
 # Only sandbox workloads in this gateway's sandbox namespaces reach the routed

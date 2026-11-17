@@ -158,7 +158,7 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.listener.protocol=HTTPS \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
-  --set server.disableTls=true \
+  --set gateway.disableTls=true \
   --set 'gatewayConfig.openshell\.gateway\.oidc.issuer=https://keycloak.example.com/realms/openshell' \
   --set 'gatewayConfig.openshell\.gateway\.oidc.audience=openshell-cli' \
   --set 'grpcRoute.hostnames[0]=gateway.example.com'
@@ -199,7 +199,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.tls.enableMtls=false \
+  --set gateway.tls.enableMtls=false \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.create=true \
   --set grpcRoute.gateway.className=eg \
@@ -212,7 +212,7 @@ helm upgrade --install openshell \
   --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 
-The gateway pod continues to serve TLS, while `server.tls.enableMtls=false` disables mTLS client certificate authentication because the Gateway proxy cannot present a client certificate to the backend. The chart will fail the install if you try to enable both `grpcRoute.backendTLSPolicy.enabled=true` and `server.tls.enableMtls=true` simultaneously. The BackendTLSPolicy hostname defaults to the service FQDN, which matches the SAN on the server certificate. Use OIDC for authentication (configured in `gatewayConfig.openshell.gateway.oidc`).
+The gateway pod continues to serve TLS, while `gateway.tls.enableMtls=false` disables mTLS client certificate authentication because the Gateway proxy cannot present a client certificate to the backend. The chart will fail the install if you try to enable both `grpcRoute.backendTLSPolicy.enabled=true` and `gateway.tls.enableMtls=true` simultaneously. The BackendTLSPolicy hostname defaults to the service FQDN, which matches the SAN on the server certificate. Use OIDC for authentication (configured in `gatewayConfig.openshell.gateway.oidc`).
 
 The example above uses the default `pkiInitJob` for TLS, which creates the backend CA ConfigMap immediately. If using cert-manager instead (`--set certManager.enabled=true`), the Certificate resources are regular release objects, and a separate post-install/post-upgrade Job (`<release>-certgen-backend-ca`) polls for up to 120 seconds waiting for cert-manager to issue the server certificate, then creates the backend CA ConfigMap. This means a single `helm install` is sufficient in most cases.
 
@@ -252,14 +252,14 @@ With more than one gateway replica, a sandbox's SSH, port-forward, and exec conn
 ```shell
 helm upgrade <release-name> oci://ghcr.io/nvidia/openshell/helm-chart \
   --reuse-values --namespace <namespace> \
-  --set workload.kind=statefulset \
-  --set workload.allowMultiReplicaStatefulSet=true \
+  --set gateway.workload.kind=statefulset \
+  --set gateway.workload.allowMultiReplicaStatefulSet=true \
   --set grpcRoute.replicaRouting.enabled=true
 ```
 
-The chart renders one Service per replica and a GRPCRoute rule that matches the `x-openshell-replica` request header. The CLI and SDKs send `x-openshell-want-owner: 1` on `GetSandbox`, read the owner from the `x-openshell-owner` response header, and set it as `x-openshell-replica`. If the proxy answers `UNAVAILABLE` with an empty message, `no healthy upstream`, or `connection failure`, they retry once without it. Replica routing requires `workload.kind=statefulset`, `workload.allowMultiReplicaStatefulSet=true`, and at most 15 replicas.
+The chart renders one Service per replica and a GRPCRoute rule that matches the `x-openshell-replica` request header. The CLI and SDKs send `x-openshell-want-owner: 1` on `GetSandbox`, read the owner from the `x-openshell-owner` response header, and set it as `x-openshell-replica`. If the proxy answers `UNAVAILABLE` with an empty message, `no healthy upstream`, or `connection failure`, they retry once without it. Replica routing requires `gateway.workload.kind=statefulset`, `gateway.workload.allowMultiReplicaStatefulSet=true`, and at most 15 replicas.
 
-If the release uses `workload.kind=deployment`, this upgrade replaces the Deployment with a StatefulSet, so every gateway pod restarts at once. The StatefulSet also requests a 1Gi PersistentVolumeClaim per replica, which stays `Pending` on clusters without a default StorageClass.
+If the release uses `gateway.workload.kind=deployment`, this upgrade replaces the Deployment with a StatefulSet, so every gateway pod restarts at once. The StatefulSet also requests a 1Gi PersistentVolumeClaim per replica, which stays `Pending` on clusters without a default StorageClass.
 
 ## SSH Relay
 
@@ -294,8 +294,8 @@ helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.name=gateway-a \
-  --set server.serviceHostnameFormat=hashed
+  --set gatewayConfig.openshell\\.gateway.name=gateway-a \
+  --set gatewayConfig.openshell\\.gateway.service_hostname_format=hashed
 ```
 
 With a routing name set, each gateway emits opaque, fixed-length hashed

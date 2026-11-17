@@ -1,0 +1,157 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Legacy runtime fields and their schema-v2 replacements.
+server.name:
+  table: openshell.gateway
+  field: name
+server.logLevel:
+  table: openshell.gateway
+  field: log_level
+server.enableLoopbackServiceHttp:
+  table: openshell.gateway
+  field: enable_loopback_service_http
+server.serviceHostnameFormat:
+  table: openshell.gateway
+  field: service_hostname_format
+server.enableWebsocketTunnel:
+  table: openshell.gateway
+  field: enable_websocket_tunnel
+server.policyValidationFailureMode:
+  table: openshell.gateway
+  field: policy_validation_failure_mode
+server.otlp.endpoint:
+  table: openshell.gateway.otlp
+  field: endpoint
+server.otlp.serviceName:
+  table: openshell.gateway.otlp
+  field: service_name
+server.auth.allowUnauthenticatedUsers:
+  table: openshell.gateway.auth
+  field: allow_unauthenticated_users
+server.oidc.issuer:
+  table: openshell.gateway.oidc
+  field: issuer
+server.oidc.dangerouslyAllowInsecureHttp:
+  table: openshell.gateway.oidc
+  field: dangerously_allow_insecure_http
+server.oidc.jwksAllowedOrigins:
+  table: openshell.gateway.oidc
+  field: jwks_allowed_origins
+server.oidc.audience:
+  table: openshell.gateway.oidc
+  field: audience
+server.oidc.jwksTtl:
+  table: openshell.gateway.oidc
+  field: jwks_ttl_secs
+server.oidc.rolesClaim:
+  table: openshell.gateway.oidc
+  field: roles_claim
+server.oidc.adminRole:
+  table: openshell.gateway.oidc
+  field: admin_role
+server.oidc.userRole:
+  table: openshell.gateway.oidc
+  field: user_role
+server.oidc.scopesClaim:
+  table: openshell.gateway.oidc
+  field: scopes_claim
+server.ocsfLog.path:
+  table: openshell.gateway.ocsf_log
+  field: path
+server.ocsfLog.rotation:
+  table: openshell.gateway.ocsf_log
+  field: rotation
+server.ocsfLog.maxFiles:
+  table: openshell.gateway.ocsf_log
+  field: max_files
+server.ocsfLog.queueCapacity:
+  table: openshell.gateway.ocsf_log
+  field: queue_capacity
+server.ocsfLog.queueMaxBytes:
+  table: openshell.gateway.ocsf_log
+  field: queue_max_bytes
+server.grpcRateLimit.requests:
+  table: openshell.gateway
+  field: grpc_rate_limit_requests
+server.grpcRateLimit.windowSeconds:
+  table: openshell.gateway
+  field: grpc_rate_limit_window_seconds
+server.sandboxJwt.gatewayId:
+  table: openshell.gateway.gateway_jwt
+  field: gateway_id
+server.sandboxJwt.ttlSecs:
+  table: openshell.gateway.gateway_jwt
+  field: ttl_secs
+server.sandboxJwt.k8sSaTokenTtlSecs:
+  table: openshell.drivers.kubernetes
+  field: sa_token_ttl_secs
+server.workspaceDefaultStorageSize:
+  table: openshell.drivers.kubernetes
+  field: workspace_default_storage_size
+server.workspaceStorageClass:
+  table: openshell.drivers.kubernetes
+  field: workspace_storage_class
+server.defaultRuntimeClassName:
+  table: openshell.drivers.kubernetes
+  field: default_runtime_class_name
+server.sandboxUid:
+  table: openshell.drivers.kubernetes
+  field: sandbox_uid
+server.sandboxGid:
+  table: openshell.drivers.kubernetes
+  field: sandbox_gid
+server.grpcEndpoint:
+  table: openshell.drivers.kubernetes
+  field: grpc_endpoint
+server.hostGatewayIP:
+  table: openshell.drivers.kubernetes
+  field: host_gateway_ip
+server.enableUserNamespaces:
+  table: openshell.drivers.kubernetes
+  field: enable_user_namespaces
+server.drivers.kubernetes.allowDriverConfig:
+  table: openshell.drivers.kubernetes
+  field: allow_driver_config
+server.drivers.kubernetes.workspaceMode:
+  table: openshell.drivers.kubernetes
+  field: workspace_mode
+server.drivers.kubernetes.operatorNamespaceLabel:
+  table: openshell.drivers.kubernetes
+  field: operator_namespace_label
+server.drivers.kubernetes.operatorNamespaceFile:
+  table: openshell.drivers.kubernetes
+  field: operator_namespace_file
+server.drivers.kubernetes.resourceAdmission:
+  table: openshell.drivers.kubernetes
+  field: resource_admission
+server.credentialDrivers.kubernetesSecrets.namespace:
+  table: openshell.credential_drivers.kubernetes-secrets
+  field: namespace
+server.credentialDrivers.vault.address:
+  table: openshell.credential_drivers.vault
+  field: address
+server.credentialDrivers.vault.mount:
+  table: openshell.credential_drivers.vault
+  field: mount
+server.credentialDrivers.vault.kvVersion:
+  table: openshell.credential_drivers.vault
+  field: kv_version
+server.credentialDrivers.vault.authMethod:
+  table: openshell.credential_drivers.vault
+  field: auth_method
+server.credentialDrivers.vault.role:
+  table: openshell.credential_drivers.vault
+  field: role
+server.credentialDrivers.vault.kubernetesAuthMount:
+  table: openshell.credential_drivers.vault
+  field: kubernetes_auth_mount
+server.credentialDrivers.vault.serviceAccountTokenPath:
+  table: openshell.credential_drivers.vault
+  field: service_account_token_path
+server.credentialDrivers.vault.tokenPath:
+  table: openshell.credential_drivers.vault
+  field: token_path
+server.credentialDrivers.vault.timeoutSecs:
+  table: openshell.credential_drivers.vault
+  field: timeout_secs

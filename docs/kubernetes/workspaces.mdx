@@ -102,7 +102,7 @@ The gateway labels managed namespaces with `openshell.ai/managed-by=openshell`,
 ### Pull Images from a Private Registry
 
 If the sandbox images require an image-pull Secret, create that Secret in the
-configured source namespace (`server.sandboxNamespace`, which defaults to the
+configured source namespace (`sandbox.namespace`, which defaults to the
 Helm release namespace) and list its name in the gateway values:
 
 ```yaml
