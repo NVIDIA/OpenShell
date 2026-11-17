@@ -318,3 +318,134 @@ async fn postgres_azure_refresh_reconnects_both_pools_and_replicas() {
         .unwrap();
     admin.close().await;
 }
+
+/// Busy pools must wait for reusable sessions even when refresh fails or stalls.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL; run mise run test:rust:postgres"]
+async fn postgres_azure_busy_pools_reuse_sessions_during_identity_outage() {
+    let url = std::env::var(super::super::test_postgres::TEST_POSTGRES_URL_ENV).unwrap();
+    let admin = PgPool::connect(&url).await.unwrap();
+    let role = format!("azure_busy_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'busy-pool-token'"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    let mut scoped = url::Url::parse(&url).unwrap();
+    scoped.set_username(&role).unwrap();
+    scoped.set_password(None).unwrap();
+    let options: PgConnectOptions = scoped.as_str().parse().unwrap();
+    let options = options.ssl_mode(PgSslMode::Disable).password("");
+
+    assert_busy_pool_reuse(&options, "busy-pool-token").await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {role}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+async fn assert_busy_pool_reuse(options: &PgConnectOptions, access_token: &str) {
+    for (capacity, delay) in [
+        (1, Duration::ZERO),
+        (2, Duration::ZERO),
+        (2, Duration::from_secs(15)),
+    ] {
+        let (_directory, server, identity) = fixture().await;
+        token_response(&server, access_token).await;
+        // Both pool kinds on two replicas use the same acquisition adapter.
+        let pools: Vec<_> = (0..4)
+            .map(|_| {
+                CredentialPool::azure(
+                    PgPoolOptions::new()
+                        .max_connections(capacity)
+                        .acquire_timeout(Duration::from_secs(5)),
+                    options.clone(),
+                    Arc::clone(&identity),
+                )
+            })
+            .collect();
+        for pool in &pools {
+            drop(pool.acquire().await.unwrap());
+        }
+        identity.token.lock().await.as_mut().unwrap().expires_at = Instant::now();
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_delay(delay))
+            .mount(&server)
+            .await;
+
+        for pool in &pools {
+            let mut held = pool.acquire().await.unwrap();
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *held)
+                .await
+                .unwrap();
+            let pool = pool.clone();
+            let mut waiter = tokio::spawn(async move { pool.acquire().await });
+            // Poll the waiter before release: the original code fails here on 503.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+                    .await
+                    .is_err(),
+                "busy acquisition must wait for a healthy session during an identity outage"
+            );
+            held.ping().await.unwrap();
+            drop(held);
+            let mut reused = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let actual: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *reused)
+                .await
+                .unwrap();
+            assert_eq!(
+                actual, pid,
+                "reuse the returned physical session without authentication"
+            );
+        }
+        // If no session returns, retain the same finite acquisition deadline.
+        // The checked-out healthy connection must survive the waiter's failure.
+        let mut held = pools[0].acquire().await.unwrap();
+        let started = Instant::now();
+        let error = pools[0].acquire().await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(7));
+        assert!(
+            matches!(error, sqlx::Error::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        held.ping().await.unwrap();
+        drop(held);
+        if capacity == 1 {
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "a saturated pool must not request a token while awaiting an existing session"
+            );
+        }
+        for pool in pools {
+            pool.close().await;
+        }
+    }
+}
+
+/// Run in an AKS Pod with gateway workload identity and its password-free URL.
+/// Only initial credential acquisition uses real Entra. Expired cache entries
+/// and an unavailable/stalled issuer reproduce the review scenario deterministically;
+/// every physical database session uses the real Azure role and verified TLS.
+#[tokio::test]
+#[ignore = "requires AKS gateway workload identity and OPENSHELL_DB_URL"]
+async fn azure_postgres_busy_pools_reuse_sessions_during_identity_outage() {
+    let url = std::env::var("OPENSHELL_DB_URL").unwrap();
+    let options = validate_url(&url).unwrap();
+    let identity = AzureWorkloadIdentity::from_env().unwrap();
+    let token = identity
+        .access_token(Duration::from_secs(30))
+        .await
+        .unwrap();
+    // The mock issuer receives only fixture assertions, never the real projected
+    // token. Access tokens are used as database passwords and are never printed.
+    assert_busy_pool_reuse(&options, &token).await;
+}

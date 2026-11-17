@@ -28,6 +28,9 @@ use tokio::time::Instant;
 const POSTGRES_SCOPE: &str = "https://ossrdbms-aad.database.windows.net/.default";
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const CLOCK_SKEW: Duration = Duration::from_secs(30);
+// SQLx exposes no notification for returned idle connections. Poll only while
+// refresh is unavailable/in flight; a valid cached token keeps SQLx's native wait.
+const REUSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn config_error(message: &'static str) -> sqlx::Error {
     sqlx::Error::Configuration(message.into())
@@ -107,6 +110,14 @@ impl AzureWorkloadIdentity {
             client,
             token: Mutex::new(None),
         }))
+    }
+
+    fn cached_access_token(&self, connection_budget: Duration) -> Option<String> {
+        let cached = self.token.try_lock().ok()?;
+        cached
+            .as_ref()
+            .filter(|token| token.expires_at > Instant::now() + connection_budget + CLOCK_SKEW)
+            .map(|token| token.value.clone())
     }
 
     async fn access_token(&self, connection_budget: Duration) -> Result<String, sqlx::Error> {
@@ -282,23 +293,71 @@ impl CredentialPool {
                 return self.inner.acquire().await;
             };
             let budget = self.inner.options().get_acquire_timeout();
+            let mut refresh_error = None;
             let acquired = tokio::time::timeout(budget, async {
-                if let Some(mut connection) = self.inner.try_acquire() {
-                    if connection.ping().await.is_ok() {
-                        return Ok(connection);
-                    }
-                    let _ = connection.close().await;
+                if let Some(connection) = self.try_reuse().await? {
+                    return Ok(connection);
                 }
-                let token = identity.access_token(budget).await?;
-                let options = (*self.inner.connect_options()).clone().password(&token);
-                self.inner.set_connect_options(options);
-                self.inner.acquire().await
+                let reusable = async {
+                    loop {
+                        if let Some(connection) = self.try_reuse().await? {
+                            return Ok(connection);
+                        }
+                        tokio::time::sleep(REUSE_POLL_INTERVAL).await;
+                    }
+                };
+                tokio::pin!(reusable);
+                let opening = async {
+                    let token = loop {
+                        // Preserve SQLx's native queuing when credentials are
+                        // cached, including when every connection is checked out.
+                        if let Some(token) = identity.cached_access_token(budget) {
+                            break token;
+                        }
+                        // At capacity, only a returned session can serve us.
+                        // Do not make healthy busy sessions depend on Entra.
+                        if self.inner.size() < self.inner.options().get_max_connections() {
+                            break identity.access_token(budget).await?;
+                        }
+                        tokio::time::sleep(REUSE_POLL_INTERVAL).await;
+                    };
+                    let options = (*self.inner.connect_options()).clone().password(&token);
+                    self.inner.set_connect_options(options);
+                    self.inner.acquire().await
+                };
+                tokio::select! {
+                    biased;
+                    result = &mut reusable => result,
+                    result = opening => match result {
+                        Ok(connection) => Ok(connection),
+                        Err(error) if self.inner.size() == 0 => Err(error),
+                        Err(error) => {
+                            // A failed refresh must not preempt an existing
+                            // healthy session that can return before the deadline.
+                            refresh_error = Some(error);
+                            reusable.await
+                        }
+                    },
+                }
             })
             .await;
-            acquired.map_err(|_| unavailable(
+            acquired.unwrap_or_else(|_| Err(refresh_error.unwrap_or_else(|| unavailable(
                 "Azure database connection acquisition timed out; check workload identity and PostgreSQL connectivity",
-            ))?
+            ))))
         })
+    }
+
+    async fn try_reuse(&self) -> Result<Option<PoolConnection<Postgres>>, sqlx::Error> {
+        if self.inner.is_closed() {
+            return Err(sqlx::Error::PoolClosed);
+        }
+        if let Some(mut connection) = self.inner.try_acquire() {
+            if connection.ping().await.is_ok() {
+                return Ok(Some(connection));
+            }
+            let _ = connection.close().await;
+        }
+        Ok(None)
     }
 
     pub(super) async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {

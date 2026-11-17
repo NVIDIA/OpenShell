@@ -733,8 +733,10 @@ Sandbox ServiceAccounts do not need this federation or database credentials.
 The gateway caches access tokens until near their reported expiry and rereads
 the projected token file on refresh. Both data and advisory-lock pools obtain
 valid credentials before opening connections. Healthy sessions remain usable
-through token expiry or an Entra outage; new connections fail within the pool
-acquisition deadline if refresh fails. The gateway does not fall back to a
+through token expiry or an Entra outage. Requests can wait for a busy healthy
+session to return, even if token refresh fails or stalls. New physical
+connections still require a valid token; acquisitions fail within the pool
+deadline if neither credential acquisition nor session reuse succeeds. The gateway does not fall back to a
 password, node identity, or Azure CLI credentials. Check the gateway identity,
 federated subject, projected volume, and Entra connectivity when refresh fails;
 never print token files or token responses while diagnosing authentication.
