@@ -6,3 +6,11 @@
 # the header lives in /usr/include/z3/ rather than /usr/include/. The extra -I
 # is harmless on systems where the path doesn't exist.
 BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/include/z3"
+
+# Windows packages carry their C/C++ runtime rather than requiring the Visual
+# C++ redistributable. Native build scripts (cc/cmake) also consume crt-static.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

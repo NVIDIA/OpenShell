@@ -73,12 +73,15 @@ mise run --skip-tools windows:build:arm64
 The tasks produce `openshell.exe`, `openshell-gateway.exe`,
 `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe` under
 `target/<target-triple>/release/`. Keep these binaries from the same build
-together with the matching `libz3.dll` staged by the build task. The target
+together. The target
 triples are `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
 `CARGO_TARGET_DIR` can override the output root.
-The runtime host also needs the matching Visual C++ runtime.
+These executables use the static CRT, and the gateway embeds Z3. They do not
+require `libz3.dll` or the Visual C++ redistributable. Windows system DLLs and
+the separate MXC executor remain required.
 
-The build uses pinned prebuilt Z3 by default. Compile and test hosts do not
+The build compiles checksum-pinned Z3 5.1.0 source with the static runtime.
+Cold builds require CMake and take longer; Cargo caches the compiled library. Compile and test hosts do not
 need a working MXC runtime; running native sandboxes does. These tasks do not
 install an MSI, register a Windows service, or publish a release.
 

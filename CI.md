@@ -78,6 +78,8 @@ The [Windows MSVC workflow on `windows`](https://github.com/NVIDIA/OpenShell/blo
 runs native x64 and ARM64 lanes. Windows PR checks are opt-in: add
 `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
+These lanes run packaging helper regressions, Clippy, native tests, and release
+builds that reject Z3 or redistributable CRT DLL imports on both architectures.
 Windows checks are not required for merging and do not run in merge queues.
 Pushes to `windows` and manual runs on that branch seed the lint/test caches and run dependent
 release binary builds. Those jobs use `continue-on-error: true`, so inspect

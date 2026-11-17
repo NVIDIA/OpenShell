@@ -10,7 +10,6 @@ param(
     [string] $IdentityFile = (Join-Path $env:USERPROFILE '.ssh/openshell-mxc-test'),
     [ValidateSet('auto', 'arm64', 'x64')] [string] $Architecture = 'auto',
     [string] $BuildDirectory,
-    [string] $Z3DllPath,
     [string] $RemoteRoot,
     [string] $WxcExecPath,
     [string] $Scenario,
@@ -36,21 +35,6 @@ $sshOptions = @('-i', $IdentityFile, '-o', 'BatchMode=yes', '-o', 'IdentitiesOnl
 $scpOptions = @('-i', $IdentityFile, '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
     '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-P', "$SshPort")
 function Quote-PS([string] $Value) { return "'" + $Value.Replace("'", "''") + "'" }
-function Find-Z3Runtime([string] $BuildRoot, [string] $RustTarget, [string] $ExplicitPath) {
-    if ($ExplicitPath) {
-        if (-not (Test-Path -LiteralPath $ExplicitPath -PathType Leaf)) { throw "Missing Z3 runtime: $ExplicitPath" }
-        return (Resolve-Path -LiteralPath $ExplicitPath).Path
-    }
-    $release = Join-Path $BuildRoot "$RustTarget/release"
-    $adjacent = Join-Path $release 'libz3.dll'
-    if (Test-Path -LiteralPath $adjacent -PathType Leaf) { return $adjacent }
-    # Windows prebuilt-z3 links an import library rather than a static library.
-    $candidates = @(Get-ChildItem -Path (Join-Path $release 'build/z3-sys-*/out/z3-*/bin/libz3.dll') -File -ErrorAction SilentlyContinue)
-    if ($candidates.Count -eq 0) { throw 'libz3.dll not found in the target build cache. Supply -Z3DllPath matching the linked Z3 build.' }
-    $hashes = @($candidates | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash } | Select-Object -Unique)
-    if ($hashes.Count -ne 1) { throw 'Multiple different Z3 runtimes found. Supply -Z3DllPath matching the linked Z3 build.' }
-    return $candidates[0].FullName
-}
 function Read-CacheHashes([string] $Json) {
     # Windows PowerShell 5.1 emits decoded JSON arrays as one pipeline object.
     # Explicitly enumerate so callers do not get a nested array with -contains.
@@ -123,8 +107,7 @@ try {
     }
     $examples = 'crates/openshell-driver-mxc/examples'
     $files += @{ source = (Join-Path $BuildDirectory "$target/release/examples/mxc-forwarding-agent.exe"); path = 'bin/mxc-forwarding-agent.exe' }
-    $files += @{ source = (Find-Z3Runtime $BuildDirectory $target $Z3DllPath); path = 'bin/libz3.dll' }
-    foreach ($path in @("$examples/run-mxc-e2e.ps1", "$examples/mxc-gateway.toml", 'tasks/scripts/run-mxc-remote.ps1')) {
+    foreach ($path in @("$examples/run-mxc-e2e.ps1", "$examples/mxc-gateway.toml", 'tasks/scripts/run-mxc-remote.ps1', 'tasks/scripts/windows-runtime.ps1')) {
         $files += @{ source = (Join-Path $repo $path); path = $path }
     }
     foreach ($policy in Get-ChildItem (Join-Path $repo "$examples/e2e-policies") -File) {

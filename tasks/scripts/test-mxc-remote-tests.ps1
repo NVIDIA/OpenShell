@@ -11,7 +11,7 @@ foreach ($name in @('test-mxc-remote.ps1', 'run-mxc-remote.ps1')) {
     if ($errors.Count) { throw ($errors | Out-String) }
     # Load pure functions only; do not start builds or SSH sessions.
     foreach ($function in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-        if ($function.Name -in @('Quote-PS', 'Find-Z3Runtime', 'Read-CacheHashes', 'Get-PeMachine')) { Invoke-Expression $function.Extent.Text }
+        if ($function.Name -in @('Quote-PS', 'Read-CacheHashes', 'Get-PeMachine')) { Invoke-Expression $function.Extent.Text }
     }
     $count++
 }
@@ -35,12 +35,6 @@ function Pe-Bytes([int] $Machine) {
 }
 $fixture = [IO.Path]::GetTempFileName()
 try {
-    if ((Find-Z3Runtime '' '' $fixture) -ne $fixture) { throw 'Explicit Z3 DLL path regression.' }
-    $count++
-    $rejected = $false
-    try { Find-Z3Runtime ([IO.Path]::GetTempPath()) ('missing-' + [guid]::NewGuid().ToString('N')) '' | Out-Null } catch { $rejected = $true }
-    if (-not $rejected) { throw 'Missing Z3 DLL accepted.' }
-    $count++
     foreach ($machine in @(0xaa64, 0x8664)) {
         [IO.File]::WriteAllBytes($fixture, (Pe-Bytes $machine))
         if ((Get-PeMachine $fixture) -ne $machine) { throw 'PE architecture regression.' }
@@ -53,27 +47,4 @@ try {
     $count++
     # Reader cleanup must permit rewriting/deleting even after rejection.
 } finally { Remove-Item -LiteralPath $fixture }
-$cacheFixture = Join-Path ([IO.Path]::GetTempPath()) ('openshell-z3-test-' + [guid]::NewGuid().ToString('N'))
-$target = 'aarch64-pc-windows-msvc'
-$first = Join-Path $cacheFixture "$target/release/build/z3-sys-first/out/z3-5.1.0/bin/libz3.dll"
-$second = Join-Path $cacheFixture "$target/release/build/z3-sys-second/out/z3-5.1.0/bin/libz3.dll"
-try {
-    New-Item -ItemType Directory -Path (Split-Path $first), (Split-Path $second) -Force | Out-Null
-    [IO.File]::WriteAllBytes($first, (Pe-Bytes 0xaa64))
-    if ((Find-Z3Runtime $cacheFixture $target '') -ne $first) { throw 'Target-specific Z3 discovery regression.' }
-    $count++
-    Copy-Item -LiteralPath $first -Destination $second
-    if (-not (Find-Z3Runtime $cacheFixture $target '')) { throw 'Identical cached Z3 runtimes rejected.' }
-    $count++
-    [IO.File]::WriteAllBytes($second, (Pe-Bytes 0x8664))
-    $rejected = $false
-    try { Find-Z3Runtime $cacheFixture $target '' | Out-Null } catch { $rejected = $true }
-    if (-not $rejected) { throw 'Ambiguous Z3 runtimes accepted.' }
-    $count++
-} finally {
-    # Only tear down the explicitly created fixture paths, not a recursive root.
-    foreach ($path in @($first, $second)) { if (Test-Path $path) { Remove-Item -LiteralPath $path } }
-    Get-ChildItem -LiteralPath $cacheFixture -Directory -Recurse | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
-    Remove-Item -LiteralPath $cacheFixture
-}
 Write-Host "$count remote-script regression checks passed. No runtime qualification claimed."
