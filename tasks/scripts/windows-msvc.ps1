@@ -447,6 +447,13 @@ function Invoke-VsCargo {
         [Parameter(Mandatory = $true)] [string] $LogName
     )
 
+    if ($CargoArgs.StartsWith('cargo ') -and $CargoArgs -notmatch '--manifest-path') {
+        # The old prebuilt solver was optimized even in debug/test builds.
+        # An unoptimized native Z3 can exhaust otherwise unchanged solver budgets.
+        $config = Join-Path $RepoRoot '.cargo/windows-msvc.toml'
+        $CargoArgs = 'cargo --config "' + $config + '" ' + $CargoArgs.Substring(6)
+    }
+
     & rustup target add $RustTarget
     if ($LASTEXITCODE -ne 0) {
         throw "rustup target add $RustTarget failed"

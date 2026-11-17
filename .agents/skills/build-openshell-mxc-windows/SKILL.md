@@ -105,6 +105,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
 | `.github/workflows/windows-msvc.yml` | Opt-in PR lint, test, and release builds plus advisory `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 | `tasks/scripts/windows-runtime.ps1` | Architecture and normal/delay PE import checks for static CRT/Z3 packages. |
+| `.cargo/windows-msvc.toml` | Windows wrapper-only dependency profiles that keep native Z3 optimized in dev/test builds, matching the previous prebuilt solver. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
 Use the code that is already in the repo. Do not generate a parallel Windows
@@ -524,6 +525,10 @@ feature builds a static library and selects the static MSVC runtime from the
 Windows targets' `crt-static` setting. Keep this source pin separate from the
 z3-src crate's bundled solver version. Cargo caches compiled Z3 per target;
 cold builds require CMake and take longer than prebuilt-library downloads.
+The wrapper explicitly loads `.cargo/windows-msvc.toml` for workspace commands
+so native Z3 uses Release optimization in dev/test builds. Do not loosen solver
+budgets to compensate for a Debug native solver. Other Rust debug profiles and
+non-Windows builds remain unchanged.
 The artifact report
 computes SHA256 through .NET directly and does not rely on the `Get-FileHash`
 module being available inside the mise-launched Windows PowerShell process.
