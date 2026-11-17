@@ -7638,21 +7638,26 @@ mod tests {
 
     #[test]
     fn parse_credential_expiry_rejects_invalid_timestamp() {
-        let err = parse_credential_expiry_pairs(&["API_TOKEN=next-week".to_string()])
-            .expect_err("invalid timestamp should error");
+        for value in ["next-week", "2026-01-01T00:00:00"] {
+            let err = parse_credential_expiry_pairs(&[format!("API_TOKEN={value}")])
+                .expect_err("invalid timestamp should error");
 
-        assert!(
-            err.to_string()
-                .contains("must be a Unix epoch millisecond timestamp or RFC3339 timestamp")
-        );
+            assert!(
+                err.to_string()
+                    .contains("must be a Unix epoch millisecond timestamp, RFC3339 timestamp, or ISO 8601 timestamp with a UTC offset")
+            );
+        }
     }
 
     #[test]
-    fn parse_credential_expiry_cli_value_accepts_rfc3339_offsets() {
-        let parsed = parse_credential_expiry_cli_value("2026-01-01T01:00:00+01:00")
-            .expect("parse RFC3339 with offset");
-
-        assert_eq!(parsed, 1_767_225_600_000);
+    fn parse_credential_expiry_cli_value_accepts_rfc3339_and_iso8601() {
+        for value in ["2026-01-01T01:00:00+01:00", "2026-01-01T01+01"] {
+            assert_eq!(
+                parse_credential_expiry_cli_value(value).unwrap(),
+                1_767_225_600_000,
+                "{value}"
+            );
+        }
     }
 
     #[test]
