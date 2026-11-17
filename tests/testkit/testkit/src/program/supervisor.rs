@@ -132,6 +132,13 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
             ),
         }
         runs.push(run);
+        // Keep the report current, so a run that is stopped from outside, such
+        // as by a run-level timeout, still leaves the results so far.
+        if let Some(path) = &options.junit
+            && let Err(error) = junit::write(path, &junit::report(program, &runs))
+        {
+            eprintln!("{program}: write {}: {error}", path.display());
+        }
     }
 
     let not_run = selected_count - runs.len();
