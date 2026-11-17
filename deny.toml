@@ -16,6 +16,7 @@ maximum-db-staleness = "P30D"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — required by russh/ssh-key and RSA test fixtures; no patched release is available" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — existing PEM consumers require a separate API migration" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained: retained SQLx, Kubernetes and workspace APIs require coordinated migration; this informational advisory has no patched version" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
