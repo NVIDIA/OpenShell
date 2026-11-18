@@ -100,7 +100,7 @@ def create_client(api_key: str):
         from anthropic import Anthropic
     except ImportError:
         raise ClassifierError(
-            "Run with uv run --no-project tasks/scripts/managed_label_classifier.py"
+            "Run with uv run --no-project .agents/agents/labeler/bin/classifier.py"
             " to install the pinned anthropic SDK"
         ) from None
     return Anthropic(

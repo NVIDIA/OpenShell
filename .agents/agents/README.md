@@ -7,8 +7,7 @@ Agents live in `.agents/agents/<name>/`. Names are descriptive nouns specifying 
 ```text
 .agents/
 |-- skills/
-|   `-- invoke-agent/
-|       `-- SKILL.md
+|   `-- agent-behavior -> ../agents/agent-name/skills/agent-behavior
 `-- agents/
     |-- README.md
     `-- agent-name/
@@ -39,7 +38,7 @@ Only `README.md` and a `run.*` entry point are required. Add other directories w
 - `run.*` is the agent-root entry point for humans, workflows, and interactive callers. Use the implementation language's extension, such as `run.py` or `run.sh`. It can delegate to a shared launcher.
 - `bin/` holds supporting scripts, tools, and implementation modules.
 - `prompts/` holds model or harness prompts.
-- `skills/` holds agent-owned behavioral skills. Discoverable invocation skills live in [`.agents/skills/`](../skills) and direct callers through `run.*`. Reference canonical instructions and contracts rather than copying them.
+- `skills/` holds canonical agent-owned skills. A symlink in [`.agents/skills/`](../skills) can expose the same skill for discovery. Reference canonical instructions and contracts rather than copying them.
 - `references/` holds contracts and supporting guidance.
 - `tests/` holds explicitly selected deterministic and integration tests.
 - `evals/` holds model-quality cases and scoring code.
@@ -62,10 +61,10 @@ labeler/
 |-- prompts/
 |   `-- classify.md
 |-- skills/
-|   `-- classify-labels/
-|       `-- SKILL.md
-|-- references/
-|   `-- result-contract.md
+|   `-- label-issue/
+|       |-- SKILL.md
+|       `-- references/
+|           `-- result-contract.md
 `-- tests/
     |-- run_test.py
     |-- acceptance_test.py

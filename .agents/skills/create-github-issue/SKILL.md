@@ -137,7 +137,7 @@ GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matc
 
 Follow the [accepted-work definition](../../../CONTRIBUTING.md#accepted-work) and [Label Discovery](../../../CONTRIBUTING.md#label-discovery). A direct request authorizes the requested phase; maintainers control issue disposition and roadmap decisions.
 
-Use [`/label-issue`](../label-issue/SKILL.md) for classification after acceptance; see [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications).
+Use [`/label-issue`](../../agents/labeler/skills/label-issue/SKILL.md) for classification after acceptance; see [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications).
 
 ## Useful Options
 

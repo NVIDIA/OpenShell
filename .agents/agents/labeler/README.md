@@ -7,12 +7,12 @@ activation prerequisites.
 
 ## Execution boundary
 
-Select an invocation with `labeling_agent_events.select_invocation`, then call the
+Select an invocation with `events.select_invocation`, then call the
 shared helper's preparation. Only `status: ready` with `classifier_required: true`
 creates a model session. Pass the prepared evidence and trusted classifier
-instructions to `managed_label_classifier.session_request`, call `classify`, and
+instructions to `classifier.session_request`, call `classify`, and
 return its proposal to the shared preview/application helper. Follow the shared
-[command/result contract](https://github.com/NVIDIA/OpenShell/blob/70fa003b902416459b2c08131b5cc265294d35d6/.agents/skills/label-issue/references/result-contract.md).
+[command/result contract](skills/label-issue/references/result-contract.md).
 
 Include the result schema and referenced classification guidance in the trusted
 instructions: the runtime cannot fetch referenced files or expand evidence.
@@ -27,7 +27,7 @@ on representative evidence before rollout; CLI cost estimates are not CMA measur
 ## Smoke-test CLI
 
 ```shell
-uv run --no-project tasks/scripts/managed_label_classifier.py \
+uv run --no-project .agents/agents/labeler/bin/classifier.py \
   --instructions /path/to/trusted-classifier-instructions.md \
   --evidence /path/to/prepared-evidence.json \
   --agent-id agent_CONFIGURED_ID --agent-version 1 \

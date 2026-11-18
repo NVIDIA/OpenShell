@@ -6,7 +6,7 @@
 import unittest
 from unittest.mock import Mock
 
-from labeling_agent_events import Invocation, item_number, select_invocation
+from events import Invocation, item_number, select_invocation
 
 REPO = "NVIDIA/OpenShell"
 

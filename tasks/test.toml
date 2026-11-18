@@ -113,22 +113,29 @@ hide = true
 
 ["test:accepted-work"]
 description = "Test the shared accepted-work library"
-run = "uv run --no-project python -m unittest discover -s tasks/scripts -p label_accepted_work_test.py"
+env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
+run = "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p acceptance_test.py"
 hide = true
 
 ["test:label-issue"]
 description = "Test issue labeling and stale closure provenance"
+env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
 run = [
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p 'label_issue*_test.py'",
+  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p reconciliation_test.py",
+  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p evidence_test.py",
+  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p policy_test.py",
+  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p checkpoint_test.py",
+  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p github_test.py",
   "uv run --no-project python -m unittest discover -s tasks/scripts -p stale_closure_test.py",
 ]
 hide = true
 
 ["test:labeling-agent"]
 description = "Test managed labeling classifier and invocation routing offline"
+env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
 run = [
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p managed_label_classifier_test.py",
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p labeling_agent_events_test.py",
+  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p classifier_test.py",
+  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p events_test.py",
 ]
 hide = true
 

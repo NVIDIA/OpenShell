@@ -6,14 +6,14 @@ Run from the checkout root with authenticated `gh`. Set `repo`, integer `item`, 
 
 ```shell
 packet_dir=$(mktemp -d /tmp/openshell-label-issue.XXXXXX)
-uv run --no-project python tasks/scripts/label_issue.py prepare \
+uv run --no-project python .agents/agents/labeler/bin/reconciliation.py prepare \
   --repo "$repo" --item "$item" --trusted-actor "$label_actor" --output "$packet_dir"
 ```
 
 Classify only when `status` is `ready` and `classifier_required` is true. Read `packet.json`; `manifest.json` supplies snapshot identity, taxonomy definitions, malformed-removal candidates and artifact metadata. Other outcomes stop classification; assessment-only preparation uses the [assessment path](#separately-authorized-assessment).
 
 ```shell
-uv run --no-project python tasks/scripts/label_issue.py expand \
+uv run --no-project python .agents/agents/labeler/bin/reconciliation.py expand \
   --snapshot "$packet_dir/manifest.json" --evidence-id 'comment:72'
 ```
 
@@ -22,7 +22,7 @@ Use evidence IDs from the snapshot; repeat `--evidence-id` as needed. Deferred t
 Write `result.json` using the contract below, then:
 
 ```shell
-uv run --no-project python tasks/scripts/label_issue.py preview \
+uv run --no-project python .agents/agents/labeler/bin/reconciliation.py preview \
   --snapshot "$packet_dir/manifest.json" --result "$packet_dir/result.json" \
   --executor "$label_actor" --human --output "$packet_dir/preview.json"
 ```
@@ -32,7 +32,7 @@ Review label differences, ambiguity, prerequisites and exact ordered `mutation_r
 For an authorized one-item application:
 
 ```shell
-uv run --no-project python tasks/scripts/label_issue.py apply \
+uv run --no-project python .agents/agents/labeler/bin/reconciliation.py apply \
   --snapshot "$packet_dir/manifest.json" --result "$packet_dir/result.json" \
   --trusted-actor "$label_actor" --executor "$label_actor" \
   --expected-preview "$packet_dir/preview.json" --human --output "$packet_dir/applied.json"

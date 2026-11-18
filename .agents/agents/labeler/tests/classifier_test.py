@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from managed_label_classifier import (
+from classifier import (
     API_VERSION,
     BETA,
     AgentConfig,
@@ -348,7 +348,7 @@ class CliTests(unittest.TestCase):
             instructions.write_text("Trusted classifier instructions")
             evidence.write_text('{"title": "Test evidence"}')
             arguments = [
-                "managed_label_classifier.py",
+                "classifier.py",
                 "--instructions",
                 str(instructions),
                 "--evidence",
@@ -363,7 +363,7 @@ class CliTests(unittest.TestCase):
             with (
                 patch("sys.argv", arguments),
                 patch("sys.stdout", new_callable=io.StringIO) as output,
-                patch("managed_label_classifier.create_client") as client,
+                patch("classifier.create_client") as client,
             ):
                 self.assertEqual(main(), 0)
                 client.assert_not_called()
