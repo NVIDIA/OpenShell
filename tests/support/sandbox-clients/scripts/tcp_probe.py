@@ -11,7 +11,7 @@
 # went as one JSON line; failures to connect or read are results, not errors.
 #
 # argv[4]: connect timeout in seconds.
-# argv[5]: read timeout in seconds, for all of the reading.
+# argv[5]: timeout in seconds for sending and all of the reading.
 # argv[6]: idle timeout in seconds: stop reading after this long without
 #          bytes. 0 waits for the read timeout instead.
 import json
@@ -47,9 +47,10 @@ def exchange(sock):
     """Send PAYLOAD and read until the connection ends. Returns the bytes
     read and how reading ended."""
     received = bytearray()
+    deadline = time.monotonic() + READ_TIMEOUT
     try:
+        sock.settimeout(READ_TIMEOUT)
         sock.sendall(PAYLOAD)
-        deadline = time.monotonic() + READ_TIMEOUT
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -63,6 +64,8 @@ def exchange(sock):
             if not chunk:
                 return received, "closed"
             received += chunk
+    except socket.timeout:
+        return received, "timeout"
     except ConnectionResetError:
         return received, "reset"
     except OSError as error:
