@@ -13,7 +13,7 @@ use metrics_util::MetricKind;
 use metrics_util::registry::{Registry, Storage};
 use opentelemetry::{KeyValue, metrics as otel};
 
-use super::{BUCKETED_HISTOGRAMS, LATENCY_BUCKETS_SECONDS};
+use super::LATENCY_BUCKETS_SECONDS;
 
 type Descriptions = Mutex<HashMap<(MetricKind, KeyName), (SharedString, &'static str)>>;
 
@@ -134,15 +134,7 @@ impl Storage<Key> for Instruments {
             .f64_histogram(key.name_shared().into_inner())
             .with_description(description)
             .with_unit(unit);
-        if BUCKETED_HISTOGRAMS.contains(&key.name())
-            || matches!(
-                key.name(),
-                "openshell_server_grpc_request_duration_seconds"
-                    | "openshell_server_http_request_duration_seconds"
-                    | "openshell_server_readiness_database_probe_duration_seconds"
-                    | "openshell_gateway_interceptor_latency_seconds"
-            )
-        {
+        if key.name().ends_with("_seconds") {
             builder = builder.with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec());
         }
         Arc::new(HistogramSeries {

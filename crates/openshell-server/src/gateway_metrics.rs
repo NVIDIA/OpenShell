@@ -913,6 +913,8 @@ mod tests {
                 gauge!(RELAY_PENDING).increment(2.0);
                 pending.decrement(3.0);
                 histogram!(RELAY_CLAIM_DURATION_SECONDS).record(0.005);
+                let queue_wait_name = "openshell_supervisor_config_queue_wait_seconds";
+                histogram!(queue_wait_name).record(0.2);
                 assert_eq!(handle.is_some(), prometheus);
                 if let Some(handle) = handle {
                     let rendered = handle.render();
@@ -922,6 +924,7 @@ mod tests {
                     assert!(request.ends_with(" 3"), "{request}");
                     assert!(rendered.contains("openshell_server_relay_pending 3"));
                     assert!(rendered.contains("openshell_server_relay_claim_duration_seconds_count 1"));
+                    assert!(rendered.contains(&format!("# TYPE {queue_wait_name} summary")));
                 }
                 for _ in 0..2 {
                     provider.force_flush().unwrap();
@@ -946,6 +949,17 @@ mod tests {
                     let point = histogram.data_points().next().unwrap();
                     assert_eq!(point.count(), 1);
                     assert!((point.sum() - 0.005).abs() < f64::EPSILON);
+                    assert_eq!(point.bounds().collect::<Vec<_>>(), LATENCY_BUCKETS_SECONDS);
+
+                    let queue_wait = metrics
+                        .iter()
+                        .find(|metric| metric.name() == queue_wait_name)
+                        .unwrap();
+                    let AggregatedMetrics::F64(MetricData::Histogram(queue_wait)) = queue_wait.data()
+                    else {
+                        panic!("expected queue wait histogram");
+                    };
+                    let point = queue_wait.data_points().next().unwrap();
                     assert_eq!(point.bounds().collect::<Vec<_>>(), LATENCY_BUCKETS_SECONDS);
                 }
                 provider.shutdown().unwrap();
