@@ -18,7 +18,9 @@ This RFC adds **workspace secrets**: named, workspace-scoped secret values that
 OpenShell stores but never injects into sandboxes. A provider's refresh
 configuration can name a workspace secret in place of an inline material value.
 When the gateway mints or refreshes a credential, it reads the secret's current
-value. Rotating that one secret updates every provider that references it.
+value. Rotating that one secret updates every provider that references it. A
+secret created without refresh use is reveal-only: a generic, operator-readable
+value that no refresh can reference.
 
 Each secret declares, when it is created, the only token endpoints it may be
 sent to. That set never changes, so no one can redirect a secret to a server
@@ -66,8 +68,11 @@ it changes refresh state in a way that must survive mixed-version gateways.
 ## Non-goals
 
 - Injecting workspace secrets into sandboxes or using them as provider
-  credentials. They are minting material only. Shared static credentials
-  already fit a single static `Provider` in the workspace.
+  credentials. They are refresh material or reveal-only values. Shared static
+  credentials already fit a single static `Provider` in the workspace.
+- A general-purpose secrets manager. Workspace secrets have no per-secret
+  access control, versions, expiry, or binary values; see
+  [Reveal-only secrets](#reveal-only-secrets).
 - Sharing one secret across workspaces. #5563 defers installation-wide
   secrets. They can later follow `ProviderProfile`'s pattern, where an omitted
   workspace selector means platform scope.
@@ -107,16 +112,25 @@ endpoint already receives the secret in ordinary operation.
 
 A `Secret` is a workspace-scoped resource with standard `ObjectMeta`: name,
 gateway-generated ID, labels, `resource_version`, and immutable workspace. It
-holds one value and an immutable list of allowed endpoints.
+holds one value. An optional, immutable `refresh_use` allows the value to be
+used as provider refresh material and lists the token endpoints it may be sent
+to. A secret without it is reveal-only.
 
 ```protobuf
 message Secret {
   openshell.datamodel.v1.ObjectMeta metadata = 1;
   string description = 2;
-  // Token endpoints this value may be sent to. Fixed at creation.
-  repeated string allowed_endpoints = 3;
+  // Present only when the value may be used as refresh material. Fixed at
+  // creation.
+  SecretRefreshUse refresh_use = 3;
   // Last time the value was written. The value itself is never returned.
   google.protobuf.Timestamp value_update_time = 4;
+}
+
+message SecretRefreshUse {
+  // Required and non-empty. Absolute https URLs, compared exactly after
+  // normalization (lowercase scheme and host, default port removed).
+  repeated string allowed_endpoints = 1;
 }
 
 message CreateSecretRequest {
@@ -125,9 +139,8 @@ message CreateSecretRequest {
   string description = 3;
   // Required and non-empty.
   string value = 4 [(openshell.options.v1.secret) = true];
-  // Required and non-empty. Absolute https URLs, compared exactly after
-  // normalization (lowercase scheme and host, default port removed).
-  repeated string allowed_endpoints = 5;
+  // Omit for a reveal-only secret.
+  SecretRefreshUse refresh_use = 5;
   map<string, string> labels = 6;
   string request_id = 7;
 }
@@ -190,7 +203,7 @@ whose deletion has not finished is still returned, with `metadata.deletion_time`
 set, so listing pages stay full and the secret's name and quota use stay
 visible. It cannot be updated, revealed, or referenced, and creating a secret
 with the same name first finishes the earlier deletion. Values are
-bounded by the existing provider map value limit. `allowed_endpoints` cannot be
+bounded by the existing provider map value limit. `refresh_use` cannot be
 updated. Moving a client to a new token endpoint means creating a new secret,
 and only someone who knows the value can do that.
 
@@ -213,8 +226,37 @@ retries them.
 
 The CLI adds `openshell secret create|update|get|list|delete`. Values come from
 `--value-env VAR` or `--value-file PATH`, never from a command-line argument.
-`--allowed-endpoint URL` is repeatable on `create`. The CLI has no reveal
-command.
+`--allowed-endpoint URL` is repeatable on `create` and sets `refresh_use`;
+omitting it creates a reveal-only secret. The CLI has no reveal command.
+
+### Reveal-only secrets
+
+Issue #5563 also asks for arbitrary non-injectable secrets that a control-plane
+service reads by reference. A secret without `refresh_use` serves that: it is
+stored, rotated, and deleted like any other, and only `RevealSecret` can return
+its value. Configuration rejects it as refresh material with "not enabled for
+provider refresh". The minter never sees it, and if it ever did, an empty
+endpoint list allows no endpoint.
+
+Refresh use is a separate optional message rather than an empty
+`allowed_endpoints` list. Proto3 cannot distinguish an unset list from an empty
+one, and "empty means no refresh" is easy to misread later as "empty means
+unrestricted". With a message, presence is explicit, and a present message
+must name at least one endpoint.
+
+The generic case is deliberately small, which keeps OpenShell from becoming a
+secrets manager:
+
+- Values are never injectable, and there is no per-secret access control or
+  consumer tracking: workspace admins write, operators reveal.
+- The delete guard knows only refresh references. Deleting a reveal-only
+  secret is not blocked by whatever reads it, so readers must handle a
+  missing secret.
+- A value is one opaque string of at most 8 KiB. Binary data needs an encoding
+  such as base64. There are no versions, expiry, or multiple keys. Operators
+  who need those are better served by external references, which RFC 0023
+  leaves open.
+- An operator certificate can reveal every workspace's secrets.
 
 ### Referencing secrets from refresh configuration
 
@@ -267,8 +309,9 @@ Validation rules:
   `material` or `material_secrets`.
 - Required-material checks, the AWS source-key pairing rule, and #5663's "Basic
   requires `client_secret`" rule all count a referenced key as present.
-- The secret must exist in the provider's workspace. The effective token
-  endpoint must be in its `allowed_endpoints`. That endpoint is the one the
+- The secret must exist in the provider's workspace and have `refresh_use`.
+  The effective token endpoint must be in its `allowed_endpoints`. That
+  endpoint is the one the
   minter will call: a `token_url`, an Entra URL derived from `tenant_id`, or
   the Google default.
 - References are limited to the OAuth2 and Google service account strategies.
@@ -646,6 +689,14 @@ left out to keep the first version narrow: the handler would have to fail
 closed when scope enforcement is disabled, when the admin role is unset, and for
 local development identities, and the scope would be the first exception to
 `openshell:all`. It can be added later without changing the RPC.
+
+### Use an empty endpoint list for reveal-only secrets
+
+A reveal-only secret could be one with an empty `allowed_endpoints` list,
+without a separate message. That is fail-closed in the minter, but proto3 cannot
+tell an unset list from an empty one, and the rule that empty means "no
+refresh" invites a later reading of "no restriction". An explicit optional
+message makes eligibility visible and keeps a present list non-empty.
 
 ### Typed OAuth client registration
 

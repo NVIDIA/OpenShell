@@ -330,9 +330,10 @@ Use a workspace secret when many providers share one secret, such as the
 client secret of a confidential OAuth client that every user's provider
 refreshes through. The gateway reads the secret's current value at each mint,
 so updating the secret reaches every provider that references it without
-reauthorizing users. Workspace secrets are minting material only: OpenShell
-never injects them into sandboxes, and `openshell secret get` and
-`openshell secret list` never show their values.
+reauthorizing users. OpenShell never injects workspace secrets into sandboxes,
+and `openshell secret get` and `openshell secret list` never show their values.
+A secret created without `--allowed-endpoint` is reveal-only: no refresh can
+reference it, and only an operator can read it through the `RevealSecret` RPC.
 
 Create the secret with the token endpoints it may be sent to:
 
