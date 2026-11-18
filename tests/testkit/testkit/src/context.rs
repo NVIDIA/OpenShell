@@ -14,6 +14,7 @@ use rand::Rng;
 
 use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup, Key};
 use crate::cli::{Cli, CliOutput};
+use crate::cli_child::CliChild;
 use crate::cli_sandbox::CliSandboxBuilder;
 use crate::error::{Error, Result, ResultExt};
 use crate::output::Outcome;
@@ -77,6 +78,81 @@ impl Context {
         S: AsRef<std::ffi::OsStr>,
     {
         self.handles.cli.run_with_env(None, env, args).await
+    }
+
+    /// Start the CLI with `args` and keep it running, with stdin, stdout,
+    /// and stderr piped to the test. See [`CliChild`].
+    pub fn cli_spawn<I, S>(&self, args: I) -> Result<CliChild>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.spawn(args)
+    }
+
+    /// Like [`Context::cli_spawn`], with `stdin` as the CLI's stdin, such
+    /// as [`std::process::Stdio::null`], a file, or a pseudo-terminal.
+    pub fn cli_spawn_with_stdin<I, S>(
+        &self,
+        args: I,
+        stdin: impl Into<std::process::Stdio>,
+    ) -> Result<CliChild>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.spawn_with_stdin(args, stdin)
+    }
+
+    /// The entry called `name` in a paginated `--output json` listing from
+    /// `list` (e.g. `["sandbox", "template", "list", "--all-workspaces"]`),
+    /// where `collection` is the JSON key holding the entries. Follows every
+    /// page. A listing without that key is an error, so a "not listed" check
+    /// cannot pass on a malformed listing.
+    pub async fn cli_find_listed(
+        &self,
+        list: &[&str],
+        collection: &str,
+        name: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        const PAGE_SIZE: &str = "1000";
+        /// More pages than any test gateway should have; stops a repeated
+        /// token from looping forever.
+        const MAX_PAGES: usize = 1000;
+
+        let mut token = String::new();
+        for _ in 0..MAX_PAGES {
+            let mut args = list.to_vec();
+            args.extend([
+                "--page-size",
+                PAGE_SIZE,
+                "--page-token",
+                &token,
+                "--output",
+                "json",
+            ]);
+            let page: serde_json::Value = self.cli(args).await?.success()?.json()?;
+            let Some(entries) = page[collection].as_array() else {
+                return Err(Error::msg(format!(
+                    "`{}` output has no '{collection}' array",
+                    list.join(" ")
+                )));
+            };
+            if let Some(entry) = entries.iter().find(|entry| entry["name"] == name) {
+                return Ok(Some(entry.clone()));
+            }
+            token = page["next_page_token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if token.is_empty() {
+                return Ok(None);
+            }
+        }
+        Err(Error::msg(format!(
+            "`{}` did not finish within {MAX_PAGES} pages",
+            list.join(" ")
+        )))
     }
 
     /// The CLI that [`Context::cli`] runs, for code that can't borrow the

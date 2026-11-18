@@ -44,7 +44,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 - The `openshell` CLI must be available for endpoint checks.
 - Know the active gateway name and endpoint, or be able to inspect local gateway metadata.
 - Know the compute platform: Docker, Podman, Kubernetes, VM, or an out-of-tree driver.
-- For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
+- For Kubernetes: 1.33 is the minimum tested version; compatibility with older clusters is not guaranteed. `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
@@ -523,6 +523,13 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+If Kubernetes rejects `app.kubernetes.io/version` on a resource or certgen hook,
+inspect the rendered label and chart app version. Charts normalize SemVer build
+metadata for labels (`0.1.9+build.1` becomes `0.1.9_build.1`) without changing
+the app version or image references. Upgrade older charts that emit `+` in
+labels; use explicit image tags or digests when the app version is not a valid
+container image tag.
+
 When checking a Helm values migration, compare the rendered `gateway.toml`
 with the intended `gatewayConfig` tables. Explicit resource-admission settings
 and the Kubernetes Secrets credential namespace take precedence over deprecated
@@ -684,7 +691,7 @@ configuration, policy status, and endpoint status reports. Lifecycle paths
 (start, stop, delete, restart, supervisor connection and process-exit state,
 driver-watch updates, and reconcile) take only a process-local shared global
 and exclusive sandbox lock, with no time limit and no mutation advisory lock
-(start, restart, and delete also take the SSH identity key below), so only
+(start, restart, and delete also take the SSH identity keys below), so only
 a global change on the same replica blocks them directly. Provider,
 workspace-profile, and other replicas' global changes delay them only while
 another operation on the same sandbox waits behind the change, holding that
@@ -820,13 +827,27 @@ key exclusively for every guarded mutation, so mutations can queue behind
 them until the rollout finishes.
 
 SSH host identity provisioning and cleanup, in sandbox create, start,
-restart, and delete, take one more fleet-wide key, `classid = 1330860872` and
-`objid = 1213158228` (key `0x4F535348484F5354`), on a data connection instead
-of the lock pool, with a 10-second PostgreSQL `lock_timeout`. Sandbox create
-holds its mutation guard while it waits for that key. A wait that runs out
-returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
+restart, and delete, take two more keys on one data connection instead of the
+lock pool, with one 10-second deadline covering the data-pool lock slot, the
+connection, and both keys: the legacy fleet-wide key,
+`classid = 1330860872` and `objid = 1213158228` (key
+`0x4F535348484F5354`), and then an exclusive key derived from the sandbox id,
+so different sandboxes don't wait on each other. Current gateways hold the
+legacy key as `ShareLock` and older gateways as `ExclusiveLock`, so during a
+rolling upgrade an older gateway's SSH identity step still waits for, and
+blocks, every other one. A backend that holds the legacy key as `ShareLock`
+holds or waits for exactly one sandbox's SSH identity key, so its other
+advisory lock row in `pg_locks` is that sandbox's key.
+Sandbox create holds its mutation guard while it waits for those keys. A wait
+that runs out returns `UNAVAILABLE` with "lock sandbox SSH identity failed",
+and neither
 `openshell_server_mutation_lock_timeouts_total` nor
-`openshell_server_mutation_lock_errors_total` counts it.
+`openshell_server_mutation_lock_errors_total` counts it. A 10-second wait for
+one of the replica's data-pool lock slots (half of
+`database_max_connections`), which provider refresh shares, fails the same way (or with "credential refresh
+coordination unavailable") and logs "data-pool lock slots stayed busy". At a
+small `database_max_connections`, slow refresh mints or slow credential
+drivers cause it, and raising the pool fixes it.
 
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
@@ -1731,8 +1752,8 @@ renew a 30-second lease; rejected configuration or expired freshness closes
 routes. When the listener is enabled, polling delays are capped at five seconds
 even if the configured interval is longer; failed polls do not renew the lease.
 App traffic uses application/edge authentication independently of gateway
-user authentication. This listener stage does not add service discovery or
-change the public URLs printed by the CLI.
+user authentication. The discovery API publishes accepted listener installations; public URLs
+printed by the CLI continue to use the gateway path.
 
 When enabled application routes are not published, check the authenticated
 supervisor session and installed configuration before checking ingress. The
@@ -1744,7 +1765,16 @@ compute driver once per challenge/report exchange, with fresh resolution for the
 next challenge. Acceptance still checks durable ownership and shared member
 readiness; ambiguous shared ownership must not publish an address.
 
-For shared pools, compare the discovered endpoint to the
+For discovery troubleshooting, request `GetServiceRouteSnapshot` for an explicit
+active workspace using an identity with `sandbox:read` and workspace user access.
+Both discovery RPCs return `FAILED_PRECONDITION` when
+`supervisor_app_listener.enabled` is false; enable the listener before discovering routes.
+`WatchServiceRoutes` rechecks access every second and ends after one minute;
+clients must reconnect/relist. Compare installation versions separately from
+snapshot revisions: lease renewal changes expiry and the snapshot revision while
+preserving installation identity. Treat unavailable/corrupt/over-limit results as
+errors, and expire cached routes independently. Do not turn an error into an
+empty replacement. For shared pools, compare the discovered endpoint to the
 acknowledged owner's Pod IP and configured app port, not its runtime port or a
 load-balanced supervisor Service. Publication requires a current ownership term,
 live member, and acknowledged ready report. During takeover old streams may close;
@@ -1752,3 +1782,32 @@ verify workload identity/memory survives and new connections reach the replaceme
 Shared serving leases last at most fifteen seconds from issuance, independently
 of configuration renewal; include membership failure detection when measuring a
 partition's stale-owner interval. Storage failures prevent renewal.
+
+Application ingress consumers call the separate `openshell.v1.ServiceDiscovery`
+service, rather than `OpenShell`. Discovery snapshots share a one-second cache
+per workspace (16 cached workspaces, four concurrent collections). The gateway
+admits 16 unary requests (four per principal, eight per workspace), and 32 watches
+(four per principal, 16 per workspace). `RESOURCE_EXHAUSTED` means capacity or
+record/route/byte limits; `UNAVAILABLE` means storage or collection timeout.
+Watches recheck bearer credentials and membership every second. Allow one refresh
+interval for withdrawals; route lease expiry remains independently enforced.
+
+## Azure PostgreSQL workload identity
+
+When `database_auth = "azure-workload-identity"` is configured, verify the gateway
+ServiceAccount client-ID annotation and gateway Pod label
+`azure.workload.identity/use: "true"`. AKS must enable OIDC and workload identity;
+the federated subject must match the gateway namespace and ServiceAccount with
+audience `api://AzureADTokenExchange`. Check that the webhook injected
+`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`, without
+printing the token file or environment secrets. The database URL must omit the
+password, name the mapped PostgreSQL role, and use `sslmode=verify-full`.
+
+Both database pools refresh credentials before opening connections and retain
+healthy sessions. A refresh outage can therefore affect new physical connections while
+existing connections continue working. Requests can wait for healthy busy
+sessions to return within their normal acquisition deadline, even when refresh
+fails or stalls. Check Entra egress, the federated
+credential, and PostgreSQL role mapping; do not suggest CLI login, node identity,
+or a password fallback. Sandbox ServiceAccounts must not carry gateway database
+federation. See the published gateway configuration documentation for setup.

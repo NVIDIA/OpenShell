@@ -80,6 +80,7 @@ async fn forward_inspection_selects_only_the_owner_admitting_the_request() {
             }),
             "5c4b3a29-1807-4f6e-8d5c-4b3a29180716",
             None,
+            None,
         )
         .await
         .expect("prepare admitted forward request");
@@ -130,6 +131,7 @@ async fn forward_inspection_retains_installation_through_guarded_write() {
         }),
         "5c4b3a29-1807-4f6e-8d5c-4b3a29180716",
         None,
+        None,
     )
     .await
     .expect("prepare authenticated request");
@@ -178,6 +180,7 @@ async fn forward_inspection_retains_installation_through_guarded_write() {
             response_middleware: None,
             endpoint_observer: None,
         },
+        None,
     );
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
         .await

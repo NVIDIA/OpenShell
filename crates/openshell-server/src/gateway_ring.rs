@@ -84,6 +84,23 @@ impl GatewayRing {
         Some(self.points[index].1.as_str())
     }
 
+    /// The first replica clockwise from `key` whose `load` is below `cap`,
+    /// or the owner of `key` when every replica is full.
+    pub fn first_below(&self, key: &str, cap: usize, load: impl Fn(&str) -> usize) -> Option<&str> {
+        let owner = self.owner_for(key)?;
+        let start = self
+            .points
+            .partition_point(|(candidate, _)| *candidate < hash_point(key));
+        let mut seen = std::collections::HashSet::new();
+        self.points[start..]
+            .iter()
+            .chain(&self.points[..start])
+            .map(|(_, id)| id.as_str())
+            .filter(|id| seen.insert(*id))
+            .find(|id| load(id) < cap)
+            .or(Some(owner))
+    }
+
     /// The same ring with `replica_id` taken out.
     pub fn without(&self, replica_id: &str) -> Self {
         Self {
@@ -249,5 +266,45 @@ mod tests {
             moved < total / 2,
             "adding one replica moved {moved} of {total} sandboxes"
         );
+    }
+
+    #[test]
+    fn first_below_skips_full_replicas_and_falls_back_to_the_owner() {
+        let ring = GatewayRing::new(["gw-0", "gw-1"]);
+        let owner = ring.owner_for("sup-0").unwrap();
+        let other = if owner == "gw-0" { "gw-1" } else { "gw-0" };
+
+        assert_eq!(ring.first_below("sup-0", 1, |_| 0), Some(owner));
+        assert_eq!(
+            ring.first_below("sup-0", 1, |id| usize::from(id == owner)),
+            Some(other)
+        );
+        assert_eq!(ring.first_below("sup-0", 1, |_| 1), Some(owner));
+        assert_eq!(GatewayRing::default().first_below("sup-0", 1, |_| 0), None);
+    }
+
+    /// Supervisors arriving one by one under a cap of their even share fill
+    /// every replica to within that cap.
+    #[test]
+    fn first_below_spreads_arrivals_evenly() {
+        for (replicas, supervisors) in [(2, 2), (3, 7), (4, 40)] {
+            let ids: Vec<String> = (0..replicas).map(|i| format!("gw-{i}")).collect();
+            let ring = GatewayRing::new(&ids);
+            let cap = usize::div_ceil(supervisors, replicas);
+            let mut load: HashMap<String, usize> = HashMap::new();
+            for i in 0..supervisors {
+                let home = ring
+                    .first_below(&format!("sup-{i}"), cap, |id| {
+                        load.get(id).copied().unwrap_or(0)
+                    })
+                    .unwrap()
+                    .to_string();
+                *load.entry(home).or_default() += 1;
+            }
+            assert!(
+                load.values().all(|count| *count <= cap) && load.len() == replicas,
+                "{supervisors} supervisors on {replicas} replicas: {load:?}"
+            );
+        }
     }
 }

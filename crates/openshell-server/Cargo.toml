@@ -99,10 +99,11 @@ sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 spiffe = { workspace = true }
 async-trait = "0.1"
+async-stream = "0.3"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.65.0"
+russh = "0.65.2"
 rand = { workspace = true }
 rand-ssh = { package = "rand", version = "0.10" }
 petname = "2"
@@ -140,7 +141,7 @@ openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 base64 = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging"] }
 rcgen = { workspace = true }
-rsa = { version = "0.9", features = ["pem"] }
+rsa = "0.10"
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"

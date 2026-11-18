@@ -31,6 +31,7 @@ use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::instrument::WithSubscriber as _;
 
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
 const HOST: &str = "api.example.test";
@@ -104,7 +105,6 @@ struct Route<'a> {
     method: &'a str,
     binary: &'a str,
     enforcement: &'a str,
-    deny_path: Option<&'a str>,
     body_rewrite: bool,
     protocol: &'a str,
 }
@@ -116,7 +116,6 @@ fn route<'a>(name: &'a str, path: &'a str) -> Route<'a> {
         method: "GET",
         binary: "/usr/bin/curl",
         enforcement: "enforce",
-        deny_path: None,
         body_rewrite: false,
         protocol: "rest",
     }
@@ -186,10 +185,6 @@ impl Fixture {
                 if route.protocol == "mcp" {
                     endpoint["mcp"] = serde_json::json!({"versions": ["2025-11-25"]});
                 }
-                // An explicit empty deny_rules list is invalid authored policy.
-                if let Some(path) = route.deny_path {
-                    endpoint["deny_rules"] = serde_json::json!([{"method": "GET", "path": path}]);
-                }
                 if route.body_rewrite {
                     endpoint["request_body_credential_rewrite"] = true.into();
                 }
@@ -246,11 +241,7 @@ impl Fixture {
     }
 
     fn grant_key(&self, path: &str, owner: &str) -> String {
-        let snapshot = self.state.snapshot();
-        format!(
-            "{HOST}\t{PORT}\t{path}\trev:{}\tinstallation:{}\t{owner}:access_token",
-            snapshot.revision, snapshot.installation_id
-        )
+        self.state.snapshot().scoped_key(&key(path, owner))
     }
 
     fn reload_policy(&mut self) {
@@ -304,17 +295,20 @@ impl Fixture {
             notified: false,
         };
         let (mut relay_upstream, upstream) = tokio::io::duplex(16 * 1024);
-        let relay = tokio::spawn(async move {
-            crate::proxy::relay_inspected_http_stream_for_test(
-                &mut client,
-                &mut relay_upstream,
-                configs,
-                engine,
-                &middleware_engine,
-                &ctx,
-            )
-            .await
-        });
+        let relay = tokio::spawn(
+            async move {
+                crate::proxy::relay_inspected_http_stream_for_test(
+                    &mut client,
+                    &mut relay_upstream,
+                    configs,
+                    engine,
+                    &middleware_engine,
+                    &ctx,
+                )
+                .await
+            }
+            .with_current_subscriber(),
+        );
         Connection {
             app,
             relay,
@@ -1004,6 +998,70 @@ async fn failure_then_reconnect(route_selection: bool) {
 }
 
 #[tokio::test]
+async fn token_grant_refusal_never_creates_a_denial_only_span() {
+    use super::correlation_dispatch_tests::capture_request_spans;
+
+    for sampled in [true, false] {
+        let evidence = capture_request_spans(sampled, async {
+            let fixture = Fixture::new(&[route("a", "/a/**")], &[("/a/**", "a", "aud-a")], 1);
+            fixture.resolver.fail_once.store(true, Ordering::SeqCst);
+            let mut connection = fixture.connect();
+            let response = connection.exchange("GET", "/a/item", true).await;
+            assert!(connection.observes_eof().await);
+            let capture = connection.finish().await;
+            assert_eq!(capture.bytes_seen, 0);
+            response
+        })
+        .await;
+        evidence.assert_no_deny_span(sampled);
+        assert!(evidence.output.starts_with("HTTP/1.1 502"));
+        if sampled {
+            assert_eq!(
+                evidence
+                    .spans
+                    .iter()
+                    .filter(|span| span.name == "openshell.credential.prepare")
+                    .count(),
+                1
+            );
+            assert!(
+                evidence
+                    .spans
+                    .iter()
+                    .all(|span| span.name != "openshell.upstream.send")
+            );
+        }
+        let records: Vec<_> = evidence
+            .events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(records.len(), 2, "{:?}", evidence.events);
+        assert_eq!(records[0]["action"], "Allowed");
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("L7_REQUEST allow ")
+        );
+        assert_eq!(records[1]["action"], "Denied");
+        assert!(
+            records[1]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Token grant failed ")
+        );
+        for record in records {
+            assert!(record.get("http_response").is_none());
+            assert_eq!(
+                record["metadata"]["correlation_uid"],
+                crate::test_support::response_request_id(evidence.output.as_bytes())
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn single_endpoint_recovers_after_one_grant_failure() {
     failure_then_reconnect(false).await;
 }
@@ -1418,6 +1476,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
             &info,
             "request-final-body",
             None,
+            None,
         ),
     )
     .await
@@ -1431,11 +1490,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
         std::str::from_utf8(&injected.raw_header).expect("injected HTTP request"),
         "aud-transformed",
     );
-    let snapshot = state.snapshot();
-    let expected_key = format!(
-        "{HOST}\t{PORT}\t/api/**\trev:{}\tinstallation:{}\ttransformed:access_token",
-        snapshot.revision, snapshot.installation_id
-    );
+    let expected_key = state.snapshot().scoped_key(&key("/api/**", "transformed"));
     resolver.assert_calls(&[(&expected_key, "aud-transformed")]);
 }
 

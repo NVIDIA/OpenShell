@@ -44,7 +44,9 @@ use openshell_ocsf::{
     NetworkActivityBuilder, SeverityId, StateId, StatusId,
 };
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub(crate) const MIN_MAPPING_TTL: Duration = Duration::from_secs(1);
@@ -55,7 +57,7 @@ pub(crate) const POLICY_LOCAL_ADDRESS: std::net::Ipv4Addr = std::net::Ipv4Addr::
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyntheticAnswer {
-    pub(crate) address: std::net::IpAddr,
+    pub(crate) address: IpAddr,
     pub(crate) ttl: Duration,
     pub(crate) mapping_id: uuid::Uuid,
     pub(crate) mapping_generation: u64,
@@ -86,11 +88,24 @@ pub(crate) enum PolicyDnsError {
 ///
 /// No socket is bound by this type. A later runtime adapter owns listener and
 /// namespace lifecycle and calls the bounded wire helpers in this module.
-pub(crate) struct PolicyDnsService<R> {
+pub(crate) struct PolicyDnsService<R = SocketTrustedResolver> {
     policy: Arc<OpaEngine>,
     resolver: R,
     store: Arc<ResolvedEndpointStore>,
-    trusted_host_gateway: Option<std::net::IpAddr>,
+    trusted_host_gateway: Option<IpAddr>,
+    refreshes: Mutex<BTreeMap<IpAddr, RefreshLock>>,
+}
+
+type RefreshLock = Arc<tokio::sync::Mutex<Option<Instant>>>;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConnectLookupError {
+    #[error("transparent destination mapping is unavailable: {0}")]
+    Mapping(#[from] MappingLookupError),
+    #[error("transparent TCP mapping refresh failed: {0}")]
+    Refresh(#[from] PolicyDnsError),
+    #[error("transparent TCP mapping refresh recently failed")]
+    Backoff,
 }
 
 impl<R: TrustedResolver> PolicyDnsService<R> {
@@ -98,14 +113,67 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         policy: Arc<OpaEngine>,
         resolver: R,
         store: Arc<ResolvedEndpointStore>,
-        trusted_host_gateway: Option<std::net::IpAddr>,
+        trusted_host_gateway: Option<IpAddr>,
     ) -> Self {
         Self {
             policy,
             resolver,
             store,
             trusted_host_gateway,
+            refreshes: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Return connection intent, refreshing only expired policy-backed mappings.
+    /// The caller must still authorize the process and pin the current mapping.
+    pub(crate) async fn lookup_for_connect(
+        &self,
+        address: IpAddr,
+        port: u16,
+    ) -> Result<MappingLookup, ConnectLookupError> {
+        let generation = self.policy.current_generation();
+        let lookup = || {
+            self.store
+                .lookup_intent(address, port, generation, Instant::now())
+        };
+        match lookup() {
+            Err(MappingLookupError::Expired) => {}
+            result => return result.map_err(Into::into),
+        }
+        let record = self.store.expired_for_connect(address, port, generation)?;
+        // Only known, eligible allocations acquire entries, bounded by the
+        // store's allocation budget. Concurrent connects share one refresh.
+        let refresh = self
+            .refreshes
+            .lock()
+            .map_err(|_| MappingLookupError::LockPoisoned)?
+            .entry(address)
+            .or_default()
+            .clone();
+        let mut failed_at = refresh.lock().await;
+        match lookup() {
+            Err(MappingLookupError::Expired) => {}
+            result => return result.map_err(Into::into),
+        }
+        if self.policy.current_generation() != generation {
+            return Err(MappingLookupError::StalePolicy.into());
+        }
+        if failed_at.is_some_and(|failed| failed.elapsed() < MIN_MAPPING_TTL) {
+            return Err(ConnectLookupError::Backoff);
+        }
+        let answer = self
+            .answer_query(
+                record.normalized_name.as_str(),
+                record.family,
+                Instant::now(),
+            )
+            .await;
+        *failed_at = answer.as_ref().err().map(|_| Instant::now());
+        let answer = answer?;
+        if (answer.address, answer.policy_generation) != (record.synthetic_address, generation) {
+            return Err(MappingLookupError::StalePolicy.into());
+        }
+        lookup().map_err(Into::into)
     }
 
     pub(crate) async fn answer_query(
@@ -114,6 +182,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         family: AddressFamily,
         now: Instant,
     ) -> Result<SyntheticAnswer, PolicyDnsError> {
+        let started = Instant::now();
         let normalized_name =
             NormalizedName::parse(raw_name).map_err(|_| PolicyDnsError::InvalidName)?;
         if normalized_name.as_str() == crate::policy_local::POLICY_LOCAL_HOST {
@@ -190,7 +259,14 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             }
         };
         let ttl = clamp_mapping_ttl(trusted_answer.ttl);
+        // Start the lease after resolution: a TTL-zero answer must still be
+        // usable when the trusted resolver takes longer than the TTL floor.
+        let now = now + started.elapsed();
         let allocation_identity = allocation_identity(&eligible);
+        let eligible_ports = eligible
+            .iter()
+            .flat_map(|endpoint| endpoint.ports.iter().copied())
+            .collect();
         let mut contracts = Vec::new();
         for endpoint in eligible {
             for port in endpoint.ports {
@@ -228,6 +304,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             allocation_identity,
             policy_generation: snapshot.generation,
             ttl,
+            eligible_ports,
             contracts,
         };
         let record = self.publish_guarded(
@@ -358,7 +435,7 @@ struct EligibleEndpoint {
 fn eligible_endpoints(
     endpoints: &[crate::opa::MatchedEndpoint],
     name: &NormalizedName,
-    trusted_host_gateway: Option<std::net::IpAddr>,
+    trusted_host_gateway: Option<IpAddr>,
 ) -> Result<Vec<EligibleEndpoint>, PolicyDnsError> {
     let mut eligible = Vec::new();
     for endpoint in endpoints {
@@ -764,6 +841,277 @@ landlock: { compatibility: best_effort }
 process: { run_as_user: sandbox, run_as_group: sandbox }
 ";
 
+    struct ScriptedResolver {
+        answers: Mutex<std::collections::VecDeque<Result<TrustedAnswer, resolver::ResolveError>>>,
+        calls: AtomicUsize,
+    }
+
+    impl TrustedResolver for ScriptedResolver {
+        async fn resolve(
+            &self,
+            _: &NormalizedName,
+            _: AddressFamily,
+        ) -> Result<TrustedAnswer, resolver::ResolveError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected DNS query")
+        }
+    }
+
+    fn dns_answer(addresses: &[&str]) -> TrustedAnswer {
+        TrustedAnswer {
+            addresses: addresses.iter().map(|ip| ip.parse().unwrap()).collect(),
+            ttl: Duration::ZERO,
+        }
+    }
+
+    fn scripted_service(
+        policy: &str,
+        answers: Vec<Result<TrustedAnswer, resolver::ResolveError>>,
+    ) -> PolicyDnsService<ScriptedResolver> {
+        let base = service(policy, vec![]);
+        PolicyDnsService::new(
+            base.policy,
+            ScriptedResolver {
+                answers: Mutex::new(answers.into()),
+                calls: AtomicUsize::new(0),
+            },
+            base.store,
+            None,
+        )
+    }
+
+    async fn expired_answer<R: TrustedResolver>(service: &PolicyDnsService<R>) -> SyntheticAnswer {
+        service
+            .answer_query(
+                "db.example",
+                AddressFamily::Ipv4,
+                Instant::now().checked_sub(Duration::from_mins(1)).unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn expired_mapping_refresh_validates_backs_off_and_recovers() {
+        for (case, failure, sweep) in [
+            ("NXDOMAIN", Err(resolver::ResolveError::NxDomain), false),
+            ("forbidden address", Ok(dns_answer(&["127.0.0.1"])), true),
+        ] {
+            let service = scripted_service(
+                BASE_POLICY,
+                vec![
+                    Ok(dns_answer(&["8.8.8.8"])),
+                    failure,
+                    Ok(dns_answer(&["8.8.4.4"])),
+                ],
+            );
+            let answer = expired_answer(&service).await;
+            if sweep {
+                assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
+            }
+            assert!(
+                matches!(
+                    service.lookup_for_connect(answer.address, 5432).await,
+                    Err(ConnectLookupError::Refresh(_))
+                ),
+                "{case}"
+            );
+            assert!(matches!(
+                service.store.lookup(
+                    answer.address,
+                    5432,
+                    answer.policy_generation,
+                    Instant::now()
+                ),
+                Err(MappingLookupError::Expired)
+            ));
+            assert!(matches!(
+                service.lookup_for_connect(answer.address, 5432).await,
+                Err(ConnectLookupError::Backoff)
+            ));
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
+
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let recovered = service
+                .lookup_for_connect(answer.address, 5432)
+                .await
+                .unwrap();
+            assert_eq!(recovered.record.synthetic_address, answer.address);
+            assert_ne!(recovered.record.mapping_id, answer.mapping_id);
+            assert_eq!(
+                recovered.record.contracts[0].pinned_addresses,
+                ["8.8.4.4".parse::<IpAddr>().unwrap()]
+            );
+            let reused = service
+                .lookup_for_connect(answer.address, 5432)
+                .await
+                .unwrap();
+            assert_eq!(reused.record.mapping_id, recovered.record.mapping_id);
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_partial_mapping_recovers_every_policy_eligible_port() {
+        let policy = BASE_POLICY.replace(
+            "- { host: db.example, port: 5432, protocol: tcp }",
+            "- { host: db.example, port: 5432, protocol: tcp, allowed_ips: [8.8.8.8/32] }\n      - { host: db.example, port: 443, protocol: tcp, allowed_ips: [8.8.4.4/32] }",
+        );
+        let service = scripted_service(
+            &policy,
+            vec![
+                Ok(dns_answer(&["8.8.8.8", "8.8.4.4"])),
+                Ok(dns_answer(&["8.8.8.8"])),
+                Ok(dns_answer(&["8.8.8.8", "8.8.4.4"])),
+            ],
+        );
+        let answer = expired_answer(&service).await;
+        service
+            .lookup_for_connect(answer.address, 5432)
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.lookup_for_connect(answer.address, 443).await,
+            Err(ConnectLookupError::Mapping(
+                MappingLookupError::PortMismatch
+            ))
+        ));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
+        let recovered = service
+            .lookup_for_connect(answer.address, 443)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .pinned_addresses_for(&[PolicyEndpointId {
+                    policy_name: "database".into(),
+                    endpoint_index: 1
+                }])
+                .unwrap(),
+            ["8.8.4.4".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn connect_lookup_rejects_ineligible_refresh_without_dns() {
+        for case in ["wrong port", "expired observation", "stale generation"] {
+            let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
+            let answer = expired_answer(&service).await;
+            let (address, port, expected) = match case {
+                "wrong port" => (answer.address, 3306, MappingLookupError::PortMismatch),
+                "expired observation" => {
+                    let observed = service
+                        .answer_query(
+                            "unknown.example",
+                            AddressFamily::Ipv4,
+                            Instant::now().checked_sub(Duration::from_mins(1)).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    (observed.address, 5432, MappingLookupError::Expired)
+                }
+                _ => {
+                    service
+                        .policy
+                        .reload(
+                            include_str!("../../data/sandbox-policy.rego"),
+                            "network_policies: {}\n",
+                        )
+                        .unwrap();
+                    (answer.address, 5432, MappingLookupError::StalePolicy)
+                }
+            };
+            let result = service.lookup_for_connect(address, port).await;
+            assert!(
+                matches!(result, Err(ConnectLookupError::Mapping(error)) if error == expected),
+                "{case}: {result:?}"
+            );
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_expired_connections_share_one_refresh() {
+        let base = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
+        let answer = expired_answer(&base).await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let service = Arc::new(PolicyDnsService::new(
+            base.policy,
+            BlockingResolver {
+                started: started.clone(),
+                release: release.clone(),
+            },
+            base.store,
+            None,
+        ));
+        let mut connects = Vec::new();
+        for _ in 0..16 {
+            let service = service.clone();
+            connects.push(tokio::spawn(async move {
+                service.lookup_for_connect(answer.address, 5432).await
+            }));
+        }
+        started.notified().await;
+        // Resolution takes longer than the fresh answer's one-second floor.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut mapping_id = None;
+            for connect in connects {
+                let mapping = connect.await.unwrap().unwrap();
+                assert_eq!(
+                    *mapping_id.get_or_insert(mapping.record.mapping_id),
+                    mapping.record.mapping_id
+                );
+            }
+        })
+        .await
+        .expect("one DNS response must satisfy all waiting connects");
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_during_expired_mapping_refresh_fails_closed() {
+        let base = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
+        let answer = expired_answer(&base).await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let service = Arc::new(PolicyDnsService::new(
+            base.policy,
+            BlockingResolver {
+                started: started.clone(),
+                release: release.clone(),
+            },
+            base.store,
+            None,
+        ));
+        let refreshing = service.clone();
+        let connect =
+            tokio::spawn(async move { refreshing.lookup_for_connect(answer.address, 5432).await });
+        started.notified().await;
+        service
+            .policy
+            .reload(
+                include_str!("../../data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap();
+        release.notify_one();
+        assert!(connect.await.unwrap().is_err());
+        assert!(
+            service
+                .lookup_for_connect(answer.address, 5432)
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn stages_unknown_name_without_upstream_resolution() {
         let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
@@ -887,7 +1235,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .expect("policy-backed names keep their reserved capacity");
     }
 
-    struct OcsfCapture(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+    struct OcsfCapture(Arc<Mutex<Vec<serde_json::Value>>>);
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OcsfCapture {
         fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
@@ -928,7 +1276,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         }
 
         let service = service(BASE_POLICY, Vec::new());
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
         let _subscriber = tracing::subscriber::set_default(
             tracing_subscriber::registry().with(OcsfCapture(Arc::clone(&events))),
         );
@@ -1434,7 +1782,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             self.release.notified().await;
             Ok(TrustedAnswer {
                 addresses: vec!["8.8.8.8".parse().unwrap()],
-                ttl: Duration::from_secs(10),
+                ttl: Duration::ZERO,
             })
         }
     }
