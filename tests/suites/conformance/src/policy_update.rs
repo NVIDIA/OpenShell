@@ -15,8 +15,6 @@ use testkit::policy;
 use testkit::sdk::raw::proto;
 use testkit::{Context, Result, Sandbox};
 
-use crate::support::policy_revisions;
-
 /// A network-only policy the supervisor fills in with the filesystem paths it
 /// needs at startup, which makes a second revision.
 const SPARSE_POLICY: &str = include_str!(concat!(
@@ -35,11 +33,12 @@ const LOAD_TIMEOUT: Duration = Duration::from_mins(2);
 async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("pset")
+        .image(testkit::python_image())
         .policy(policy::base())
         .command(["sleep", "infinity"])
         .create_ready()
         .await?;
-    let initial = settled(cx, &sandbox).await?;
+    let initial = settled(&sandbox).await?;
 
     let mut one_rule = policy::base();
     policy::allow(&mut one_rule, "rule_0", "api.anthropic.com", 443, &["/**"]);
@@ -50,7 +49,7 @@ async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::R
     let mut versions = vec![version(&initial)?];
     for (step, next) in [("one rule", &one_rule), ("two rules", &two_rules)] {
         policy::set(&sandbox, next).await?;
-        let updated = settled(cx, &sandbox).await?;
+        let updated = settled(&sandbox).await?;
         testkit::ensure!(
             version(&updated)? > version(&previous)?,
             "setting {step} didn't make a newer version: before {previous}, after {updated}"
@@ -62,7 +61,7 @@ async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::R
         );
 
         policy::set(&sandbox, next).await?;
-        let repeated = settled(cx, &sandbox).await?;
+        let repeated = settled(&sandbox).await?;
         for field in ["version", "hash"] {
             testkit::ensure!(
                 repeated[field] == updated[field],
@@ -75,7 +74,7 @@ async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::R
         previous = updated;
     }
 
-    let revisions = policy_revisions(cx, &sandbox).await?;
+    let revisions = sandbox.policy_revisions().await?;
     let listed: Vec<u64> = revisions["revisions"]
         .as_array()
         .into_iter()
@@ -98,11 +97,12 @@ async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::R
 async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("pscop")
+        .image(testkit::python_image())
         .policy(scoped_policy()?)
         .command(["sleep", "infinity"])
         .create_ready()
         .await?;
-    let before = settled(cx, &sandbox).await?;
+    let before = settled(&sandbox).await?;
     let rules_before = &before["policy"]["network_policies"];
     testkit::ensure!(
         rules_before.is_object(),
@@ -134,7 +134,7 @@ async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> t
             args.extend(["--binary", binary]);
         }
         cx.cli(args).await?.failure()?;
-        let unchanged = policy_get(cx, &sandbox).await?;
+        let unchanged = policy_get(&sandbox).await?;
         for field in ["version", "hash", "policy"] {
             testkit::ensure!(
                 unchanged[field] == before[field],
@@ -150,7 +150,7 @@ async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> t
         "api.example.com:443,8443:POST:/admin",
     )
     .await?;
-    let allowed = policy_get(cx, &sandbox).await?;
+    let allowed = policy_get(&sandbox).await?;
     testkit::ensure!(
         version(&allowed)? > version(&before)? && allowed["hash"] != before["hash"],
         "the allow didn't make a new revision: before {before}, after {allowed}"
@@ -181,7 +181,7 @@ async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> t
         "api.example.com:443,8443:POST:/admin/private",
     )
     .await?;
-    let denied = policy_get(cx, &sandbox).await?;
+    let denied = policy_get(&sandbox).await?;
     testkit::ensure!(
         version(&denied)? > version(&allowed)?,
         "the deny didn't make a new revision: before {allowed}, after {denied}"
@@ -219,8 +219,8 @@ async fn sparse_initial_policy_revision_is_loaded(cx: &mut Context) -> testkit::
         LOAD_TIMEOUT,
         Duration::from_secs(2),
         async || {
-            let active = policy_get(cx, &sandbox).await?;
-            let revisions = policy_revisions(cx, &sandbox).await?;
+            let active = policy_get(&sandbox).await?;
+            let revisions = sandbox.policy_revisions().await?;
             let statuses = statuses(&revisions);
             let expected = [(1_u64, "superseded".to_string()), (2, "loaded".to_string())];
             Ok(
@@ -280,20 +280,9 @@ async fn update(cx: &Context, sandbox: &Sandbox, flag: &str, rule: &str) -> Resu
     Ok(())
 }
 
-/// The sandbox's active policy, from `policy get --full --output json`.
-async fn policy_get(cx: &Context, sandbox: &Sandbox) -> Result<Value> {
-    let active: Value = cx
-        .cli([
-            "policy",
-            "get",
-            sandbox.name(),
-            "--full",
-            "--output",
-            "json",
-        ])
-        .await?
-        .success()?
-        .json()?;
+/// The sandbox's active policy, checked for a version and hash.
+async fn policy_get(sandbox: &Sandbox) -> Result<Value> {
+    let active = sandbox.active_policy().await?;
     version(&active)?;
     testkit::ensure!(
         active["hash"].as_str().is_some_and(|hash| !hash.is_empty()),
@@ -304,14 +293,14 @@ async fn policy_get(cx: &Context, sandbox: &Sandbox) -> Result<Value> {
 
 /// The active policy once its revision is loaded and no revision is pending.
 /// Fails if a revision failed to load.
-async fn settled(cx: &Context, sandbox: &Sandbox) -> Result<Value> {
+async fn settled(sandbox: &Sandbox) -> Result<Value> {
     testkit::poll_until(
         &format!("the policy of sandbox {} to be loaded", sandbox.name()),
         LOAD_TIMEOUT,
         Duration::from_secs(1),
         async || {
-            let active = policy_get(cx, sandbox).await?;
-            let revisions = policy_revisions(cx, sandbox).await?;
+            let active = policy_get(sandbox).await?;
+            let revisions = sandbox.policy_revisions().await?;
             let statuses = statuses(&revisions);
             testkit::ensure!(
                 statuses.iter().all(|(_, status)| status != "failed"),

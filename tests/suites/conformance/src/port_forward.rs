@@ -7,9 +7,8 @@
 
 use std::time::Duration;
 
+use sandbox_clients_support::scripts::ECHO_SERVER;
 use testkit::{Context, policy};
-
-const ECHO_SERVER: &str = include_str!("scripts/echo_server.py");
 
 /// How long `forward start` and the first echo through it may take.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(60);

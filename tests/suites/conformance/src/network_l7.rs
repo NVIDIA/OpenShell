@@ -12,31 +12,33 @@
 
 mod mcp;
 
-use host_server_support::{HttpRecorder, Request, Response};
-use serde_json::json;
-use testkit::{Context, Result, ResultExt as _, policy};
-
-use crate::support::{
-    TEST_HOST, expect_values, json_result, python_binaries_yaml, python_sandbox, run_python,
-};
-
-const REST_CLIENT: &str = include_str!("scripts/rest_client.py");
-const REST_UPGRADE_CLIENT: &str = include_str!("scripts/rest_upgrade_client.py");
-const GRAPHQL_CLIENT: &str = include_str!("scripts/graphql_client.py");
-const JSONRPC_CLIENT: &str = include_str!("scripts/jsonrpc_client.py");
-const JSONRPC_AUDIT_CLIENT: &str = include_str!("scripts/jsonrpc_audit_client.py");
+use host_server_support::{HttpRecorder, Request, Response, TEST_HOST};
+use sandbox_clients_support::{self as clients, http, http_raw, scripts};
+use serde_json::{Value, json};
+use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, Sandbox, policy};
 
 /// A REST endpoint that allows only `GET /allowed` passes that request and
 /// answers a `POST` to the same path with `403` before it reaches upstream.
 #[testkit::test]
 async fn rest_rules_allow_get_and_deny_post(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::serve(rest_upstream).await?;
-    let sandbox = python_sandbox(cx, "rest", rest_policy(server.port, "enforce")?).await?;
-    let output = run_python(&sandbox, REST_CLIENT, &[TEST_HOST, &port(&server)]).await?;
-    expect_values(
-        &json_result(&output)?,
-        &[("get", json!(200)), ("post", json!(403))],
-    )?;
+    let sandbox = cx
+        .sandbox("rest")
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(rest_policy(server.port, "enforce")?)
+        .create_ready()
+        .await?;
+    for (request, expected) in [
+        (clients::Request::get("/allowed"), 200),
+        (clients::Request::new("POST", "/allowed").body("test"), 403),
+    ] {
+        let reply = http(&sandbox, TEST_HOST, server.port, &request).await?;
+        testkit::ensure!(
+            reply.status() == Some(expected),
+            "expected {expected} for {request:?}; got {reply:?}"
+        );
+    }
     let methods: Vec<String> = server
         .requests()
         .iter()
@@ -56,11 +58,16 @@ async fn rest_rules_allow_get_and_deny_post(cx: &mut Context) -> testkit::Result
 async fn rest_upgrade_is_refused_in_enforce_and_audit_modes(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::serve(rest_upstream).await?;
     for (suffix, enforcement) in [("enfrc", "enforce"), ("audit", "audit")] {
-        let sandbox = python_sandbox(cx, suffix, rest_policy(server.port, enforcement)?).await?;
-        run_python(&sandbox, REST_UPGRADE_CLIENT, &[TEST_HOST, &port(&server)])
+        let sandbox = cx
+            .sandbox(suffix)
+            .image(testkit::python_image())
+            .command(["sleep", "infinity"])
+            .policy(rest_policy(server.port, enforcement)?)
+            .create_ready()
+            .await?;
+        expect_upgrade_refused(&sandbox, server.port)
             .await
-            .context(format!("{enforcement} mode"))?
-            .expect_stdout("REST_UPGRADE_REFUSED\n")?;
+            .context(format!("{enforcement} mode"))?;
     }
     Ok(())
 }
@@ -106,10 +113,18 @@ async fn graphql_rules_allow_and_deny_operations(cx: &mut Context) -> testkit::R
     binaries: {binaries}
 ",
         port = server.port,
-        binaries = python_binaries_yaml(),
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
     ))?;
-    let sandbox = python_sandbox(cx, "gql", policy).await?;
-    let output = run_python(&sandbox, GRAPHQL_CLIENT, &[TEST_HOST, &port(&server)]).await?;
+    let sandbox = cx
+        .sandbox("gql")
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(policy)
+        .create_ready()
+        .await?;
+    let output = sandbox
+        .run_python(scripts::GRAPHQL_CLIENT, &[TEST_HOST, &port(&server)])
+        .await?;
     let mut expected = Vec::new();
     for path in ["forward", "raw"] {
         for (key, status) in [
@@ -123,10 +138,10 @@ async fn graphql_rules_allow_and_deny_operations(cx: &mut Context) -> testkit::R
             ("mutation_allowed", 200),
             ("deny_rule_denied", 403),
         ] {
-            expected.push((format!("{path}_{key}"), json!(status)));
+            expected.push((format!("{path}_{key}"), status));
         }
     }
-    expect_values(&json_result(&output)?, &expected)
+    expect_statuses(&output, expected)
 }
 
 /// JSON-RPC rules allow listed methods whatever their params, deny a
@@ -159,10 +174,18 @@ async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Resu
     binaries: {binaries}
 ",
         port = server.port,
-        binaries = python_binaries_yaml(),
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
     ))?;
-    let sandbox = python_sandbox(cx, "jrpc", policy).await?;
-    let output = run_python(&sandbox, JSONRPC_CLIENT, &[TEST_HOST, &port(&server)]).await?;
+    let sandbox = cx
+        .sandbox("jrpc")
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(policy)
+        .create_ready()
+        .await?;
+    let output = sandbox
+        .run_python(scripts::JSONRPC_CLIENT, &[TEST_HOST, &port(&server)])
+        .await?;
     let mut expected = Vec::new();
     for path in ["forward", "raw"] {
         for (key, status) in [
@@ -172,7 +195,7 @@ async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Resu
             ("method_tools_call_with_unmatched_params_allowed", 200),
             ("method_tools_delete_denied", 403),
         ] {
-            expected.push((format!("{path}_{key}"), json!(status)));
+            expected.push((format!("{path}_{key}"), status));
         }
     }
     for (key, status) in [
@@ -180,9 +203,9 @@ async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Resu
         ("forward_batch_one_denied", 403),
         ("forward_invalid_json_denied", 403),
     ] {
-        expected.push((key.to_string(), json!(status)));
+        expected.push((key.to_string(), status));
     }
-    expect_values(&json_result(&output)?, &expected)
+    expect_statuses(&output, expected)
 }
 
 /// A JSON-RPC endpoint without `enforcement` audits an unlisted method and
@@ -209,15 +232,23 @@ async fn jsonrpc_default_audit_mode_still_denies_response_frames(
     binaries: {binaries}
 ",
         port = server.port,
-        binaries = python_binaries_yaml(),
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
     ))?;
-    let sandbox = python_sandbox(cx, "jaud", policy).await?;
-    let output = run_python(&sandbox, JSONRPC_AUDIT_CLIENT, &[TEST_HOST, &port(&server)]).await?;
-    expect_values(
-        &json_result(&output)?,
-        &[
-            ("forward_unknown_method_audited", json!(200)),
-            ("forward_response_frame_hard_denied", json!(403)),
+    let sandbox = cx
+        .sandbox("jaud")
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(policy)
+        .create_ready()
+        .await?;
+    let output = sandbox
+        .run_python(scripts::JSONRPC_AUDIT_CLIENT, &[TEST_HOST, &port(&server)])
+        .await?;
+    expect_statuses(
+        &output,
+        [
+            ("forward_unknown_method_audited".to_string(), 200),
+            ("forward_response_frame_hard_denied".to_string(), 403),
         ],
     )
 }
@@ -240,7 +271,7 @@ fn rest_policy(port: u16, enforcement: &str) -> Result<testkit::sdk::raw::proto:
               path: /allowed
     binaries: {binaries}
 ",
-        binaries = python_binaries_yaml(),
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
     ))
 }
 
@@ -262,6 +293,50 @@ fn jsonrpc_upstream(request: &Request) -> Response {
         "POST" => Response::json(&json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
         _ => Response::new(200),
     }
+}
+
+/// Send a WebSocket upgrade for `/allowed`, in origin and absolute form,
+/// and fail unless the sandbox refuses each as unsupported on a REST
+/// endpoint.
+async fn expect_upgrade_refused(sandbox: &Sandbox, port: u16) -> Result {
+    for target in [
+        "/allowed".to_string(),
+        format!("http://{TEST_HOST}:{port}/allowed"),
+    ] {
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {TEST_HOST}:{port}\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let reply = http_raw(sandbox, TEST_HOST, port, request.as_bytes()).await?;
+        let received = reply.received_text();
+        testkit::ensure!(
+            reply.status() == Some(403)
+                && received.contains("unsupported_l7_protocol")
+                && received.contains("REST endpoints"),
+            "expected the upgrade to {target} refused; got {reply:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Fail unless the client's JSON result maps exactly the keys in
+/// `expected` to their statuses.
+fn expect_statuses(
+    output: &testkit::ExecOutput,
+    expected: impl IntoIterator<Item = (String, u16)>,
+) -> Result {
+    let result = output.last_json()?;
+    let expected: Value = expected
+        .into_iter()
+        .map(|(key, status)| (key, json!(status)))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    testkit::ensure!(
+        result == expected,
+        "unexpected statuses:\nexpected: {expected}\ngot:      {result}"
+    );
+    Ok(())
 }
 
 fn ok_json() -> Response {

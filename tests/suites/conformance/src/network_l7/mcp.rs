@@ -12,13 +12,10 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use host_server_support::{HttpRecorder, Request, Response};
+use host_server_support::{HttpRecorder, Request, Response, TEST_HOST};
+use sandbox_clients_support::scripts::MCP_CLIENT;
 use serde_json::{Value, json};
-use testkit::{Context, Result, ResultExt as _, policy};
-
-use crate::support::{TEST_HOST, python_binaries_yaml, python_sandbox, run_python};
-
-const MCP_CLIENT: &str = include_str!("../scripts/mcp_client.py");
+use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, policy};
 const SESSIONLESS: &str = "2026-07-28";
 
 /// The sessionless revision: discovery, an allowed and a denied tool, and a
@@ -85,16 +82,22 @@ async fn run_profile(cx: &Context, suffix: &str, versions: &[&str]) -> Result {
     binaries: {binaries}
 ",
         port = server.port,
-        binaries = python_binaries_yaml(),
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
     ))?;
-    let sandbox = python_sandbox(cx, suffix, policy).await?;
-    let output = run_python(
-        &sandbox,
-        MCP_CLIENT,
-        &[TEST_HOST, &server.port.to_string(), &versions_json],
-    )
-    .await
-    .context(format!("MCP revisions {versions:?}"))?;
+    let sandbox = cx
+        .sandbox(suffix)
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(policy)
+        .create_ready()
+        .await?;
+    let output = sandbox
+        .run_python(
+            MCP_CLIENT,
+            &[TEST_HOST, &server.port.to_string(), &versions_json],
+        )
+        .await
+        .context(format!("MCP revisions {versions:?}"))?;
     for version in versions {
         let marker = format!("MCP_OK version={version}");
         testkit::ensure!(

@@ -29,6 +29,5 @@ mod process;
 mod settings;
 mod smoke;
 mod ssh;
-mod support;
 mod templates;
 mod workspaces;

@@ -11,59 +11,21 @@
 
 use std::time::Duration;
 
-use host_server_support::{HttpRecorder, Request, Response, TEXT_REPLY, WebSocketRecorder};
+use host_server_support::{
+    HttpRecorder, Request, Response, TEST_HOST, TEXT_REPLY, WebSocketRecorder,
+};
+use sandbox_clients_support::{self as clients, http, scripts};
 use serde_json::json;
 use testkit::policy::{self, Access, Endpoint as _};
 use testkit::sdk::raw::proto;
 use testkit::{Context, Error, GrpcCode, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
 
-use crate::support::{self, TEST_HOST, python_binaries_yaml};
-
-const CREDENTIAL_REWRITE_CLIENT: &str = include_str!("scripts/credential_rewrite_client.py");
-const WEBSOCKET_TEXT_CLIENT: &str = include_str!("scripts/websocket_text_client.py");
-const BOUND_CREDENTIAL_CLIENT: &str = include_str!("scripts/bound_credential_client.sh");
 const BASH: &str = "/usr/bin/bash";
 
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
 const TEST_SECRET: &str = "e2e-gating-secret-value";
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
-/// POSTs a body containing the provider's token to `TEST_HOST` on the port
-/// in `argv[1]`, directly rather than through a proxy.
-const BODY_CLIENT: &str = r#"
-import os, sys, urllib.request
-body = ("prefix-" + os.environ["E2E_GATING_TOKEN"] + "-suffix").encode()
-request = urllib.request.Request(f"http://host.openshell.internal:{sys.argv[1]}/token", data=body, headers={"Content-Type": "text/plain"})
-urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=10).read()
-"#;
-
-/// Upgrades to WebSocket at `TEST_HOST` on the port in `argv[1]`, sends one
-/// binary frame, and waits briefly for the connection to be closed.
-const WEBSOCKET_CLIENT: &str = r#"
-import base64, os, socket, sys
-host, port = "host.openshell.internal", int(sys.argv[1])
-with socket.create_connection((host, port), timeout=10) as sock:
-    key = base64.b64encode(os.urandom(16)).decode()
-    sock.sendall(f"GET /ws HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = sock.recv(4096)
-        if not chunk:
-            sys.exit(f"closed during the upgrade: {response!r}")
-        response += chunk
-    if not response.startswith(b"HTTP/1.1 101"):
-        sys.exit(f"upgrade failed: {response!r}")
-    payload, mask = b"binary-credential-channel", os.urandom(4)
-    sock.sendall(bytes([0x82, 0x80 | len(payload)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
-    sock.settimeout(3)
-    try:
-        sock.recv(4096)
-    except (TimeoutError, ConnectionError):
-        pass
-"#;
-
-/// Prints `TOKEN_ABSENT`, `TOKEN_PLACEHOLDER`, or `TOKEN_UNSAFE` for the
-/// provider's environment variable, without printing its value.
 const TOKEN_PRESENCE: &str = r#"if [ "${E2E_GATING_TOKEN+x}" != x ]; then
   echo TOKEN_ABSENT
 else
@@ -82,11 +44,17 @@ async fn profile_rest_endpoint_keeps_body_placeholder(cx: &mut Context) -> testk
     let provider = install_gating_provider(cx, Some((server.port, websocket.port))).await?;
 
     let mut policy = policy::base();
-    allow(&mut policy, server.port)
-        .rest(Access::Full)
-        .request_body_credential_rewrite(false);
+    policy::allow(
+        &mut policy,
+        "credential_gating",
+        TEST_HOST,
+        server.port,
+        PYTHON_BINARIES,
+    )
+    .rest(Access::Full)
+    .request_body_credential_rewrite(false);
     let sandbox = create_sandbox(cx, "rest", policy, &[&provider]).await?;
-    run_python(&sandbox, BODY_CLIENT, server.port).await?;
+    post_token_body(&sandbox, server.port).await?;
     expect_placeholder_body(&server).await
 }
 
@@ -124,25 +92,44 @@ async fn policy_binding_requires_inspection_or_opt_in(cx: &mut Context) -> testk
     let provider = install_gating_provider(cx, None).await?;
 
     let mut l4 = policy::base();
-    allow(&mut l4, server.port).credential_binding(&provider);
+    policy::allow(
+        &mut l4,
+        "credential_gating",
+        TEST_HOST,
+        server.port,
+        PYTHON_BINARIES,
+    )
+    .credential_binding(&provider);
     // The wording checks follow the #5264 tests.
     let error = expect_rejected(cx, "l4", l4, &provider).await?;
     testkit::ensure!(error.contains("credentialed endpoint"), "{error}");
     testkit::ensure!(error.contains("L4-only"), "{error}");
 
     let mut tls_skip = policy::base();
-    allow(&mut tls_skip, server.port)
-        .rest(Access::Full)
-        .tls_skip()
-        .credential_binding(&provider);
+    policy::allow(
+        &mut tls_skip,
+        "credential_gating",
+        TEST_HOST,
+        server.port,
+        PYTHON_BINARIES,
+    )
+    .rest(Access::Full)
+    .tls_skip()
+    .credential_binding(&provider);
     let error = expect_rejected(cx, "tls", tls_skip, &provider).await?;
     testkit::ensure!(error.contains("credentialed endpoint"), "{error}");
     testkit::ensure!(error.contains("tls:") && error.contains("skip"), "{error}");
 
     let mut opt_in = policy::base();
-    allow(&mut opt_in, server.port)
-        .allow_uninspected_credentials()
-        .credential_binding(&provider);
+    policy::allow(
+        &mut opt_in,
+        "credential_gating",
+        TEST_HOST,
+        server.port,
+        PYTHON_BINARIES,
+    )
+    .allow_uninspected_credentials()
+    .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "optin", opt_in, &[&provider]).await?;
     sandbox.exec(["true"]).await?.success()?;
     Ok(())
@@ -158,12 +145,18 @@ async fn policy_binding_rest_body_keeps_placeholder_without_rewrite(
     let provider = install_gating_provider(cx, None).await?;
 
     let mut policy = policy::base();
-    allow(&mut policy, server.port)
-        .rest(Access::Full)
-        .request_body_credential_rewrite(false)
-        .credential_binding(&provider);
+    policy::allow(
+        &mut policy,
+        "credential_gating",
+        TEST_HOST,
+        server.port,
+        PYTHON_BINARIES,
+    )
+    .rest(Access::Full)
+    .request_body_credential_rewrite(false)
+    .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "body", policy, &[&provider]).await?;
-    run_python(&sandbox, BODY_CLIENT, server.port).await?;
+    post_token_body(&sandbox, server.port).await?;
     expect_placeholder_body(&server).await
 }
 
@@ -177,12 +170,18 @@ async fn policy_binding_rest_body_rewrite_sends_secret_upstream(
     let provider = install_gating_provider(cx, None).await?;
 
     let mut policy = policy::base();
-    allow(&mut policy, server.port)
-        .rest(Access::Full)
-        .request_body_credential_rewrite(true)
-        .credential_binding(&provider);
+    policy::allow(
+        &mut policy,
+        "credential_gating",
+        TEST_HOST,
+        server.port,
+        PYTHON_BINARIES,
+    )
+    .rest(Access::Full)
+    .request_body_credential_rewrite(true)
+    .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "rw", policy, &[&provider]).await?;
-    run_python(&sandbox, BODY_CLIENT, server.port).await?;
+    post_token_body(&sandbox, server.port).await?;
     let request = one_request(&server).await?;
     testkit::ensure!(
         request.body == format!("prefix-{TEST_SECRET}-suffix"),
@@ -201,9 +200,15 @@ async fn policy_binding_updates_provider_environment_live(cx: &mut Context) -> t
 
     let policy_binding = |bind: bool| {
         let mut policy = policy::base();
-        let endpoint = allow(&mut policy, server.port)
-            .rest(Access::Full)
-            .request_body_credential_rewrite(false);
+        let endpoint = policy::allow(
+            &mut policy,
+            "credential_gating",
+            TEST_HOST,
+            server.port,
+            PYTHON_BINARIES,
+        )
+        .rest(Access::Full)
+        .request_body_credential_rewrite(false);
         if bind {
             endpoint.credential_binding(&provider);
         }
@@ -242,13 +247,25 @@ async fn profile_rest_endpoint_rewrites_header_and_body(cx: &mut Context) -> tes
         ),
     )
     .await?;
-    support::run_python(
-        &sandbox,
-        CREDENTIAL_REWRITE_CLIENT,
-        &[TEST_HOST, &server.port.to_string()],
-    )
-    .await?
-    .expect_stdout("REWRITE_OK\n")?;
+    let token = provider_token(&sandbox).await?;
+    let body = json!({ "credential": token }).to_string();
+    for _ in 0..2 {
+        let reply = http(
+            &sandbox,
+            TEST_HOST,
+            server.port,
+            &clients::Request::new("POST", "/probe")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(body.clone()),
+        )
+        .await?;
+        testkit::ensure!(
+            reply.status() == Some(200),
+            "expected 200; got {:?}",
+            reply.status()
+        );
+    }
 
     let requests = server.wait_for_requests(2).await?;
     let authorization = format!("Bearer {TEST_SECRET}");
@@ -281,13 +298,13 @@ async fn profile_websocket_endpoint_rewrites_text_frames(cx: &mut Context) -> te
         ),
     )
     .await?;
-    support::run_python(
-        &sandbox,
-        WEBSOCKET_TEXT_CLIENT,
-        &[TEST_HOST, &server.port.to_string()],
-    )
-    .await?
-    .expect_stdout(&format!("{TEXT_REPLY}\n"))?;
+    sandbox
+        .run_python(
+            scripts::WEBSOCKET_TEXT_CLIENT,
+            &[TEST_HOST, &server.port.to_string()],
+        )
+        .await?
+        .expect_stdout(&format!("{TEXT_REPLY}\n"))?;
 
     let texts = server.texts();
     testkit::ensure!(
@@ -343,7 +360,7 @@ async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit:
         .sandbox("bind")
         .image(testkit::python_image())
         .policy(policy)
-        .spec(|spec| spec.providers = vec![provider_a, provider_b])
+        .providers([provider_a, provider_b])
         .command(["sleep", "infinity"])
         .create_ready()
         .await?;
@@ -351,7 +368,7 @@ async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit:
         .exec([
             BASH,
             "-c",
-            BOUND_CREDENTIAL_CLIENT,
+            scripts::BOUND_CREDENTIAL_CLIENT,
             "bash",
             TEST_HOST,
             &server_a.port.to_string(),
@@ -381,7 +398,7 @@ async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit:
     Ok(())
 }
 
-/// Run [`WEBSOCKET_CLIENT`] against `server` in a sandbox with `providers`,
+/// Run [`scripts::WEBSOCKET_BINARY_CLIENT`] against `server` in a sandbox with `providers`,
 /// and return whether its binary frame reached `server`.
 async fn send_binary_frame(
     cx: &Context,
@@ -390,25 +407,26 @@ async fn send_binary_frame(
     providers: &[&str],
 ) -> Result<bool> {
     let mut policy = policy::base();
-    allow(&mut policy, server.port).websocket(Access::ReadWrite);
+    policy::allow(
+        &mut policy,
+        "credential_gating",
+        TEST_HOST,
+        server.port,
+        PYTHON_BINARIES,
+    )
+    .websocket(Access::ReadWrite);
     let sandbox = create_sandbox(cx, suffix, policy, providers).await?;
-    run_python(&sandbox, WEBSOCKET_CLIENT, server.port).await?;
+    sandbox
+        .run_python(
+            scripts::WEBSOCKET_BINARY_CLIENT,
+            &[TEST_HOST, &server.port.to_string()],
+        )
+        .await?;
     server
         .wait_for_handshake()
         .await
         .context("upstream should receive the WebSocket handshake")?;
     server.wait_until_finished().await
-}
-
-/// Let the image's Python reach `TEST_HOST` on `port`.
-fn allow(policy: &mut proto::SandboxPolicy, port: u16) -> &mut proto::NetworkEndpoint {
-    policy::allow(
-        policy,
-        "credential_gating",
-        TEST_HOST,
-        port,
-        PYTHON_BINARIES,
-    )
 }
 
 /// Install a run-unique provider holding `TEST_SECRET` in `TOKEN_ENV`. With
@@ -438,7 +456,7 @@ async fn profile_endpoint_sandbox(cx: &Context, suffix: &str, endpoint: &str) ->
     endpoints: [{endpoint}]
     binaries: {binaries}
 ",
-        binaries = python_binaries_yaml(),
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
     ))?;
     create_sandbox(cx, suffix, policy, &[&provider]).await
 }
@@ -514,7 +532,7 @@ fn sandbox_with(
     cx.sandbox(suffix)
         .policy(policy)
         .image(testkit::python_image())
-        .spec(|spec| spec.providers = providers.iter().map(ToString::to_string).collect())
+        .providers(providers.iter().copied())
         .command(["sleep", "infinity"])
 }
 
@@ -551,14 +569,34 @@ async fn expect_rejected(
     }
 }
 
-/// Run `script` with the image's Python and `port` as its argument.
-async fn run_python(sandbox: &Sandbox, script: &str, port: u16) -> Result {
-    let port = port.to_string();
-    sandbox
-        .exec(["python3", "-c", script, &port])
+/// The provider token's placeholder, as the sandbox's environment holds it.
+async fn provider_token(sandbox: &Sandbox) -> Result<String> {
+    let output = sandbox
+        .exec(["printenv", TOKEN_ENV])
         .await?
         .success()
-        .context("run the client in the sandbox")?;
+        .context("read the provider token from the sandbox environment")?;
+    Ok(output.stdout.trim().to_string())
+}
+
+/// POST `prefix-<token>-suffix` to `/token` on `TEST_HOST` at `port`, and
+/// fail unless it gets `200`.
+async fn post_token_body(sandbox: &Sandbox, port: u16) -> Result {
+    let token = provider_token(sandbox).await?;
+    let reply = http(
+        sandbox,
+        TEST_HOST,
+        port,
+        &clients::Request::new("POST", "/token")
+            .header("Content-Type", "text/plain")
+            .body(format!("prefix-{token}-suffix")),
+    )
+    .await?;
+    testkit::ensure!(
+        reply.status() == Some(200),
+        "expected 200; got {:?}",
+        reply.status()
+    );
     Ok(())
 }
 
