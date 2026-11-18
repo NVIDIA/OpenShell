@@ -275,14 +275,8 @@ mod linux {
         }
         crate::managed_children::start_orphan_reaper()
             .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
-        // Decide provider-file delivery before the listener exists: the
-        // filter that lets read-only opens run natively is installed only
-        // for a store that passed every check.
-        let provider_files =
-            crate::provider_files::ProviderFiles::select(config.provider_file_store.as_ref())?;
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start_with(provider_files.open_mediation())
-                .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
+        let (launcher, listener) = crate::linux::workload_launcher::start()
+            .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
             // Validation requires every supervisor address to share one port.
@@ -294,7 +288,7 @@ mod linux {
             | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
             | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => None,
         };
-        let network_broker = NetworkBroker::start(listener, protected_control_port, provider_files)
+        let network_broker = NetworkBroker::start(listener, protected_control_port)
             .map_err(|error| format!("start sandbox network broker: {error}"))?;
         let process_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -5706,7 +5700,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                provider_file_store: None,
             };
             let debug = format!("{config:?}");
             assert!(debug.contains("test-key"));
@@ -5821,7 +5814,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                provider_file_store: None,
             };
             assert!(allows_runtime_supplementary_groups(&config));
         }
@@ -5906,7 +5898,6 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
-                    provider_file_store: None,
                 },
                 tokio::runtime::Handle::current(),
                 broker,
@@ -6380,7 +6371,6 @@ mod linux {
                             workload_identity: test_workload_identity(),
                             provisioning_evidence: test_provisioning_evidence(),
                             child_env: std::collections::HashMap::new(),
-                            provider_file_store: None,
                         },
                         process_runtime.handle().clone(),
                         network_broker,
@@ -6901,7 +6891,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                provider_file_store: None,
             };
 
             validate_config(&config).unwrap();
@@ -7082,7 +7071,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                provider_file_store: None,
             };
             for address in [
                 "127.0.0.1:5500",
@@ -7739,7 +7727,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                provider_file_store: None,
             };
 
             validate_config(&config).expect("valid runtime claim configuration");
@@ -8037,7 +8024,6 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
-                        provider_file_store: None,
                     },
                     tokio::runtime::Handle::current(),
                     network_broker,
@@ -8347,7 +8333,6 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
-                        provider_file_store: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -8766,7 +8751,6 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
-                    provider_file_store: None,
                 },
                 process_runtime.handle().clone(),
                 network_broker,
@@ -8986,7 +8970,6 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
-                    provider_file_store: None,
                 },
                 process_runtime.handle().clone(),
                 network_broker,
@@ -10407,7 +10390,6 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
-                        provider_file_store: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -10838,7 +10820,6 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
-                        provider_file_store: None,
                     },
                     process_runtime.handle().clone(),
                     broker,

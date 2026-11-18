@@ -16,8 +16,8 @@ use openshell_isolation_interface::contract::{
 };
 use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, GatewayVerificationKey, ProviderFileStore,
-    SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
+    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
 use serde::Serialize;
 
@@ -79,9 +79,6 @@ pub struct DockerBoundarySpec {
     pub host_gateway_ip: Option<IpAddr>,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
-    /// The provider-file volume mounted into this container, if the driver
-    /// created one. Absent, the sandbox serves provider files virtually.
-    pub provider_file_store: Option<ProviderFileStore>,
 }
 
 /// Protected container config and matching host descriptor.
@@ -121,7 +118,6 @@ impl DockerBoundarySpec {
                 workload_identity: self.workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
-                provider_file_store: self.provider_file_store,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
@@ -208,23 +204,9 @@ mod tests {
             )
             .unwrap(),
             child_env: HashMap::new(),
-            provider_file_store: Some(ProviderFileStore {
-                private_root: PathBuf::from("/.openshell/provider-files"),
-                public_root: PathBuf::from("/run/openshell"),
-            }),
         }
         .provision()
         .unwrap();
-
-        // The store reaches the sandbox bootstrap only; the supervisor-side
-        // descriptor has no such field.
-        assert_eq!(
-            provisioned.boundary_config.provider_file_store,
-            Some(ProviderFileStore {
-                private_root: PathBuf::from("/.openshell/provider-files"),
-                public_root: PathBuf::from("/run/openshell"),
-            })
-        );
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,

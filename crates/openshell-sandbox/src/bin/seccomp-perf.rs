@@ -22,16 +22,16 @@ use openshell_sandbox::perf::{BenchmarkOptions, Layer, Protocol, WorkerRun};
 #[command(
     about = "Measure native and seccomp-filtered socket and file-open performance",
     long_about = "Measure native and seccomp-filtered TCP socket and file-open performance.\n\n\
-        Layers `notify-only` and `native-opens`, and `--landlock`, attribute the cost of a \
-        workload file open; see the perf module documentation."
+        Layer `notify-only` and `--landlock` attribute the cost of a workload file open; \
+        see the perf module documentation."
 )]
 struct Cli {
     /// Benchmark layer. `all` is native and filtered; `attribution` adds the
-    /// harness-only notify-only layer and native provider-file delivery.
+    /// harness-only notify-only layer.
     #[arg(
         long,
         default_value = "all",
-        value_parser = ["native", "filtered", "notify-only", "native-opens", "all", "attribution"]
+        value_parser = ["native", "filtered", "notify-only", "all", "attribution"]
     )]
     layer: String,
     /// Protocol to benchmark. `all` is the TCP pair; `file` is the file-open

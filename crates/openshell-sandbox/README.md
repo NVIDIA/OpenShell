@@ -44,13 +44,10 @@ probe exercises both sides.
 
 ## Provider files
 
-Provider files appear to the workload beneath `/run/openshell/providers`. The
-bootstrap selects one of two deliveries before the workload listener exists.
-
-**Virtual** delivery is the default and the only one for a bootstrap without
-`provider_file_store`. Every workload `open`, `openat`, and `openat2` notifies
-the broker, which serves a provider path by injecting a read-only descriptor
-for a sealed in-memory file and continues every other open.
+Provider files appear to the workload beneath `/run/openshell/providers`.
+Every workload `open`, `openat`, and `openat2` notifies the broker, which
+serves a provider path by injecting a read-only descriptor for a sealed
+in-memory file and continues every other open.
 
 Each published file is an immutable revision backed by one in-memory file. The
 runtime creates that file when the revision is published, not when the
@@ -78,125 +75,6 @@ only those candidates have their whole path read and decided. An open whose
 first six bytes cannot be read, or match neither, continues, and unrelated
 `openat2` calls do not require a copy of their `open_how`. Every continued
 open remains subject to the kernel and Landlock.
-
-**Native** delivery uses a store the driver provisions: one filesystem mounted
-twice into the workload container.
-
-| Mount | Access | Contents |
-|---|---|---|
-| Private root, beneath `/.openshell` | Writable | `public/` and `staging/`, owned by the workload identity |
-| Public root, `/run/openshell` | Read-only | The store's `public/` directory |
-
-The runtime and the workload share one UID, so file modes cannot separate them.
-The mandatory Landlock baseline grants the workload no access right beneath
-`/.openshell`, so through the private root it cannot open, list, create,
-remove, rename, or truncate anything. The kernel refuses every write and
-metadata change through the read-only public mount. Provider files keep mode
-`0600`, as an injected descriptor reports.
-
-The runtime builds each generation under `staging/`, which has no public path,
-and exchanges it with `public/providers` in one `renameat2(RENAME_EXCHANGE)`.
-The workload sees the previous generation or the next, never a partial one, and
-no path exposes a staged or replaced generation. The public root is the parent
-of `providers` because a mount of `providers` itself would pin the first
-generation's inode.
-
-A file descriptor opened before an update keeps reading the file it opened for
-as long as it stays open. A directory descriptor has no such guarantee. The
-runtime removes a replaced generation one second after replacing it, so that an
-open already walking into the published directory at the exchange still finds
-its file instead of failing with `ENOENT`.
-
-The exchange moves the replaced generation out of `public`, the only part of
-the store Landlock lets the workload read. An open caught between resolving
-`providers` and opening its file then reaches a file whose parent directories
-are no longer beneath the public root. A kernel with the upstream change to
-Landlock's handling of disconnected directories (CVE-2025-68736) judges that
-open by the read-only mount it came through and allows it. A kernel without
-the change refuses it with `EACCES`, in a window of microseconds per update.
-
-The runtime does not guess which kernel it runs on. After the store passes
-validation and before the workload launcher or listener exists, it runs the
-case once. A throwaway thread applies the workload's Landlock layers to itself:
-the mandatory baseline and a filesystem policy that lists only the public
-root. Landlock confines that thread alone, and the runtime joins it before
-continuing. The thread confirms that the private root is closed to it, reads a
-probe file by its public path, and holds the published directory. The runtime
-exchanges that generation out to `staging`, and the thread opens the file again
-beneath the directory it holds. The probe file carries no provider content and
-is removed before startup continues.
-
-| Probe outcome | Result |
-|---|---|
-| The open after the exchange succeeds | Native delivery |
-| The open after the exchange fails with `EACCES` | Virtual delivery, once the store is proven empty |
-| Anything else | Startup fails |
-
-"Anything else" covers confinement that cannot be applied or does not hide the
-private root, a probe file unreadable before the exchange, a step that times
-out, and a probe generation that cannot be removed.
-
-Linux 7.0 passes the probe. Under the Docker mounts, with the baseline alone
-and with a user filesystem policy, no confined open by absolute path failed
-across more than 10,000 exchanges; the ignored test
-`confined_absolute_opens_survive_publication` measures that. No kernel without
-the change was available, so the refusal path is tested by injecting the
-outcome and by a real Landlock refusal on a store that is not a mount.
-
-An update equal to the published generation exchanges and retains nothing,
-unless the workload changed a published mode, in which case the generation is
-replaced.
-
-The store retains at most eight replaced generations and 1 MiB of their
-content. An update that would exceed either bound first waits, for at most that
-second, until the oldest ages out. A replaced generation whose removal fails
-stays counted. If the bounds still cannot be met, the update fails before
-anything is written and the published generation is unchanged.
-One thread removes replaced generations and exits when none is waiting; the
-next update retries a removal that failed.
-
-Before selecting native delivery the runtime requires all of the following,
-and removes whatever an earlier run left:
-
-- The public root is `/run/openshell`, and the private root lies beneath the
-  real `/.openshell` directory with no symlink on the way.
-- `public` and `staging` are real directories on one filesystem, owned by the
-  runtime's UID, and `public` holds nothing but `providers`.
-- The public root is the same directory as `public`, on a read-only mount, and
-  the private mount is writable.
-- The filesystem supports the atomic exchange.
-
-A declared store that fails any check stops startup. The runtime does not fall
-back to virtual delivery: the driver mounted the store at the provider path,
-where files from an earlier run could stay readable through a relative open
-that path interception does not see. A driver that cannot provision a store
-declares none.
-
-A kernel that fails the capability probe described above is a separate case,
-not a validation failure. The store is valid, and the runtime selects virtual
-delivery only after it confirms that the store holds one empty `providers`
-directory and nothing in `staging`, so no provider file remains at the
-provider path. If the store cannot be shown empty, startup fails. Under this
-fallback the runtime logs
-`Provider files delivered virtually: kernel Landlock refuses opens in a replaced generation`,
-intercepts every open, and adds no public-root grant to a user filesystem
-policy.
-
-With native delivery the listener filter lets `open` and `openat` run in the
-kernel when their flags request read-only access and carry none of `O_CREAT`,
-`O_TRUNC`, or `O_TMPFILE`. Every other open and every `openat2` still notify. A
-user
-filesystem policy that lists paths also receives the public root, read-only,
-so provider files stay readable as they are under virtual delivery.
-
-Landlock does not mediate `chmod` or `stat`. The workload owns the store's
-files, so through the private path it can change their modes and can `stat` a
-name it knows. A changed mode grants it nothing, because Landlock still refuses
-the open; it can only deny the workload its own provider files until the next
-update. The runtime restores the modes it needs before each update and at
-startup, and each update publishes new inodes. Staged and replaced generations
-have names from the cryptographic random source, so the workload cannot find
-them to `stat`.
 
 A boundary configured with `RuntimeInitiatedTlsTcp` binds no listener. It dials
 only the driver-provided supervisor addresses, which must be concrete,

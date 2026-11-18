@@ -3,36 +3,26 @@
 
 //! Read-only provider files.
 //!
-//! Delivery is chosen once, before the workload listener is installed:
+//! Every workload file open notifies the broker, which serves a path beneath
+//! the provider prefix by injecting a read-only descriptor for a sealed
+//! in-memory file and continues every other open.
 //!
-//! - **Virtual** (the default): every workload file open notifies the
-//!   broker, which serves a path beneath the provider prefix by injecting a
-//!   read-only descriptor for a sealed in-memory file.
-//! - **Native**: the driver provisioned a validated
-//!   [`crate::provider_store::NativeStore`]. Provider files are real files on
-//!   a mount the workload can only read, so read-only opens no longer notify.
-//!
-//! Virtual delivery keeps two things apart. A [`Revision`] is one immutable
-//! version of one file, and a [`Snapshot`] is the complete set a publication
-//! replaces at once; neither knows how bytes reach the workload. What a
-//! delivery prepares for a revision is its backing: here a [`SealedMemfd`],
-//! created once when the revision is published and reopened for each
-//! workload open.
+//! Two things are kept apart. A [`Revision`] is one immutable version of one
+//! file, and a [`Snapshot`] is the complete set a publication replaces at
+//! once; neither knows how bytes reach the workload. What a revision prepares
+//! at publication is its backing, a [`SealedMemfd`], created once when the
+//! revision is published and reopened for each workload open.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use rustix::fs::{Mode, OFlags, SealFlags};
 
-use openshell_sandbox_backend::boundary_protocol::ProviderFileStore;
-
-use crate::linux::seccomp_notify::{Notification, NotificationListener, OpenMediation};
+use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::task_memory;
-use crate::provider_store::{NativeStore, PUBLIC_ROOT};
 
 const PREFIX: &str = "/run/openshell/providers/";
 const PROC_PREFIX: &str = "/proc/";
@@ -45,8 +35,8 @@ const MAX_PATH_BYTES: usize = 4_096;
 /// its content.
 const FILE_MODE: Mode = Mode::from_bits_truncate(0o600);
 
-/// One immutable version of one provider file: its bytes, and what the
-/// delivery prepared at publication to serve them.
+/// One immutable version of one provider file: its bytes, and what was
+/// prepared at publication to serve them.
 struct Revision<Backing> {
     content: Box<[u8]>,
     backing: Backing,
@@ -163,7 +153,7 @@ impl SealedMemfd {
     }
 }
 
-/// The published generation of virtually delivered provider files.
+/// The published generation of provider files.
 #[derive(Default)]
 struct VirtualFiles {
     /// Replaced as a whole. Open handlers clone the selected revision before
@@ -231,113 +221,13 @@ impl VirtualFiles {
     }
 }
 
-/// The public root of the native store this process selected, if any.
-///
-/// Set at most once, before any workload process is prepared. Child Landlock
-/// preparation reads it to keep provider files readable under a user policy.
-static NATIVE_PUBLIC_ROOT: OnceLock<PathBuf> = OnceLock::new();
-
-/// The path a user filesystem policy must leave readable for natively
-/// delivered provider files, or `None` under virtual delivery.
-pub fn native_public_root() -> Option<&'static Path> {
-    NATIVE_PUBLIC_ROOT.get().map(PathBuf::as_path)
-}
-
-#[derive(Clone)]
-enum Delivery {
-    /// Sealed in-memory files, injected into each workload open.
-    Virtual(Arc<VirtualFiles>),
-    /// Real files in a validated store.
-    Native(Arc<NativeStore>),
-}
-
-/// The provider files of one sandbox and how the workload receives them.
-#[derive(Clone)]
+/// The provider files of one sandbox.
+#[derive(Clone, Default)]
 pub struct ProviderFiles {
-    delivery: Delivery,
-}
-
-impl Default for ProviderFiles {
-    fn default() -> Self {
-        Self {
-            delivery: Delivery::Virtual(Arc::default()),
-        }
-    }
+    files: Arc<VirtualFiles>,
 }
 
 impl ProviderFiles {
-    /// Choose delivery from the driver's bootstrap, before the workload
-    /// listener exists.
-    ///
-    /// No declared store means virtual delivery, exactly as before the store
-    /// existed. A declared store must pass every check of
-    /// [`NativeStore::open`], or startup fails. There is no fallback to
-    /// virtual delivery for a store that fails: the driver mounted it at the
-    /// provider path, where files from an earlier run could remain readable
-    /// through a relative open that path interception does not see, and a
-    /// mount that is not what the driver declared is not one to work around.
-    /// A driver that cannot provision a store declares none.
-    ///
-    /// One outcome is neither of those. A store that passed every check, on
-    /// a kernel whose Landlock refuses an open caught by a generation
-    /// exchange, is delivered virtually. That is a property of the kernel,
-    /// not a fault in the store, and it is taken only once the store is
-    /// proven empty, so no provider file is left at the provider path. The
-    /// native public root stays unset, so no policy grant is added for it.
-    pub(crate) fn select(store: Option<&ProviderFileStore>) -> Result<Self, String> {
-        let Some(config) = store else {
-            return Ok(Self::default());
-        };
-        Self::selected(NativeStore::open(config))
-    }
-
-    fn selected(opened: io::Result<Option<NativeStore>>) -> Result<Self, String> {
-        let Some(store) =
-            opened.map_err(|error| format!("provider file store failed validation: {error}"))?
-        else {
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(openshell_ocsf::SeverityId::Low)
-                    .status(openshell_ocsf::StatusId::Success)
-                    .state(openshell_ocsf::StateId::Disabled, "virtual")
-                    .message(
-                        "Provider files delivered virtually: kernel Landlock refuses opens in a replaced generation"
-                            .to_string()
-                    )
-                    .build()
-            );
-            return Ok(Self::default());
-        };
-        // First selection wins; a process selects once.
-        let _ = NATIVE_PUBLIC_ROOT.set(PathBuf::from(PUBLIC_ROOT));
-        openshell_ocsf::ocsf_emit!(
-            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(openshell_ocsf::SeverityId::Informational)
-                .status(openshell_ocsf::StatusId::Success)
-                .state(openshell_ocsf::StateId::Enabled, "native")
-                .message("Provider files delivered from a read-only mount".to_string())
-                .build()
-        );
-        Ok(Self {
-            delivery: Delivery::Native(Arc::new(store)),
-        })
-    }
-
-    /// Which workload opens must reach the broker for this delivery.
-    pub(crate) fn open_mediation(&self) -> OpenMediation {
-        match self.delivery {
-            Delivery::Virtual(_) => OpenMediation::All,
-            Delivery::Native(_) => OpenMediation::WriteCapable,
-        }
-    }
-
-    #[cfg(any(test, feature = "perf-harness"))]
-    pub(crate) fn native_for_test(store: NativeStore) -> Self {
-        Self {
-            delivery: Delivery::Native(Arc::new(store)),
-        }
-    }
-
     pub(crate) fn validate(desired: &HashMap<String, String>) -> io::Result<()> {
         if desired.len() > 64 || desired.values().map(String::len).sum::<usize>() > MAX_TOTAL_BYTES
         {
@@ -360,10 +250,7 @@ impl ProviderFiles {
 
     pub(crate) fn replace(&self, desired: HashMap<String, String>) -> io::Result<()> {
         Self::validate(&desired)?;
-        match &self.delivery {
-            Delivery::Virtual(files) => files.publish(desired),
-            Delivery::Native(store) => store.publish(&desired),
-        }
+        self.files.publish(desired)
     }
 
     pub(crate) fn handle_open(
@@ -403,14 +290,6 @@ impl ProviderFiles {
             }
             return listener.respond_continue(notification.id);
         }
-        let files = match &self.delivery {
-            Delivery::Virtual(files) => files,
-            // Provider files are real files on a read-only mount. Only
-            // opens that can change the filesystem and `openat2` notify, and
-            // the kernel decides each of them: Landlock and the mount refuse
-            // a write.
-            Delivery::Native(_) => return listener.respond_continue(notification.id),
-        };
         if start != PREFIX.as_bytes()[..PROC_PREFIX.len()] {
             return listener.respond_continue(notification.id);
         }
@@ -422,7 +301,7 @@ impl ProviderFiles {
         if !path.starts_with(PREFIX) {
             return listener.respond_continue(notification.id);
         }
-        let Some(revision) = files.revision(&path) else {
+        let Some(revision) = self.files.revision(&path) else {
             return listener.respond_errno(notification.id, libc::ENOENT);
         };
         let flags = match open_flags(&notification) {
@@ -464,11 +343,6 @@ fn safe_component(value: &str) -> bool {
 }
 
 fn validate_path(path: &str) -> io::Result<()> {
-    provider_and_file(path).map(|_| ())
-}
-
-/// Split a provider file path into its validated provider and file names.
-pub fn provider_and_file(path: &str) -> io::Result<(&str, &str)> {
     let suffix = path.strip_prefix(PREFIX).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -487,7 +361,7 @@ pub fn provider_and_file(path: &str) -> io::Result<(&str, &str)> {
             "invalid provider file path",
         ));
     }
-    Ok((provider, name))
+    Ok(())
 }
 
 /// Serve a write open of the caller's own thread name file.
@@ -625,10 +499,7 @@ fn open_flags(notification: &Notification) -> io::Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Delivery, MAX_FILE_BYTES, OpenMediation, ProviderFileStore, ProviderFiles, SealedMemfd,
-        VirtualFiles, comm_target,
-    };
+    use super::{MAX_FILE_BYTES, ProviderFiles, SealedMemfd, VirtualFiles, comm_target};
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::{self, Read as _, Seek as _, SeekFrom};
@@ -649,10 +520,7 @@ mod tests {
     }
 
     fn virtual_files(provider_files: &ProviderFiles) -> &VirtualFiles {
-        match &provider_files.delivery {
-            Delivery::Virtual(files) => files,
-            Delivery::Native(_) => panic!("virtual delivery expected"),
-        }
+        &provider_files.files
     }
 
     /// What the broker injects for a workload open of `path`, or `None`
@@ -694,37 +562,6 @@ mod tests {
         ] {
             assert_eq!(comm_target(path, caller_tid, group), expected, "{path}");
         }
-    }
-
-    #[test]
-    fn only_an_unqualified_kernel_falls_back_to_virtual_delivery() {
-        // No declared store: virtual, as before the store existed.
-        let absent = ProviderFiles::select(None).unwrap();
-        assert!(matches!(absent.open_mediation(), OpenMediation::All));
-        // A valid, empty store on a kernel that failed the capability probe.
-        let fallback = ProviderFiles::selected(Ok(None)).unwrap();
-        assert!(matches!(fallback.open_mediation(), OpenMediation::All));
-        // A declared store that fails validation, or whose probe or cleanup
-        // failed, stops startup instead.
-        for (private_root, public_root) in [
-            ("/tmp/provider-files", "/run/openshell"),
-            ("/.openshell/provider-files", "/run/other"),
-            ("/.openshell/missing-provider-files", "/run/openshell"),
-        ] {
-            let error = ProviderFiles::select(Some(&ProviderFileStore {
-                private_root: private_root.into(),
-                public_root: public_root.into(),
-            }))
-            .err()
-            .unwrap_or_else(|| panic!("{private_root} {public_root} must fail startup"));
-            assert!(error.contains("failed validation"), "{error}");
-        }
-        let error = ProviderFiles::selected(Err(io::Error::other("probe incomplete")))
-            .err()
-            .expect("an incomplete probe must fail startup");
-        assert!(error.contains("probe incomplete"), "{error}");
-        // None of these selected native delivery.
-        assert!(super::native_public_root().is_none());
     }
 
     #[test]
@@ -968,7 +805,7 @@ mod tests {
         assert_eq!(prepared, 2);
         unchanged();
 
-        // The delivery still publishes afterwards.
+        // Publication still works afterwards.
         provider_files.replace(files(&[(TOKEN, "token")])).unwrap();
         assert_eq!(read(&provider_files, TOKEN).unwrap(), "token");
         assert!(open(&provider_files, CONFIG).is_none());

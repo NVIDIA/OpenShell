@@ -81,18 +81,6 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     Ok(())
 }
 
-/// Enforce only the Landlock layers of a prepared sandbox on the calling
-/// thread, leaving seccomp alone.
-///
-/// The provider-file capability probe confines a throwaway thread exactly as
-/// a workload's filesystem is confined and still reports back.
-pub(crate) fn enforce_landlock(prepared: PreparedSandbox) -> Result<()> {
-    for ruleset in prepared.landlock {
-        landlock::enforce(ruleset)?;
-    }
-    Ok(())
-}
-
 /// Enforce the capability-free child filter stack.
 ///
 /// Landlock precedes sandbox-TGID self-protection. The ordinary workload

@@ -16,9 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::linux::seccomp_notify::{
-    NotificationListener, OpenMediation, install_workload_listener_with,
-};
+use crate::linux::seccomp_notify::{NotificationListener, install_workload_listener};
 
 type LaunchJob = Box<dyn FnOnce() + Send + 'static>;
 
@@ -68,19 +66,8 @@ impl WorkloadLauncher {
 }
 
 /// Start the only workload launcher and return its listener to an unfiltered
-/// sandbox thread. Every workload file open notifies the listener.
+/// sandbox thread.
 pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
-    start_with(OpenMediation::All)
-}
-
-/// Start the only workload launcher with an explicit file-open mediation.
-///
-/// [`OpenMediation::WriteCapable`] is valid only when the broker that
-/// receives the listener does not serve provider files by descriptor
-/// injection.
-pub fn start_with(
-    open_mediation: OpenMediation,
-) -> io::Result<(WorkloadLauncher, NotificationListener)> {
     let (jobs_tx, jobs_rx) = mpsc::sync_channel::<LaunchJob>(64);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let alive = Arc::new(AtomicBool::new(true));
@@ -88,7 +75,7 @@ pub fn start_with(
     thread::Builder::new()
         .name("openshell-workload-launcher".to_string())
         .spawn(move || {
-            match install_workload_listener_with(open_mediation) {
+            match install_workload_listener() {
                 Ok(listener) => {
                     if ready_tx.send(Ok(listener)).is_err() {
                         thread_alive.store(false, Ordering::Release);
