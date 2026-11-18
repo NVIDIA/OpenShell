@@ -38,12 +38,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CARGO_TARGET="${CARGO_TARGET_DIR:-${ROOT}/target}"
 OPENSHELL_CLI="${CARGO_TARGET}/release/openshell"
 SANDBOX_NAMESPACE="${OPENSHELL_KVPOC_NAMESPACE:-kvpoc-sandboxes}"
-TOPOLOGY="${OPENSHELL_KVPOC_TOPOLOGY:-dedicated}"
 
-# The probes are root-mode by definition: they exercise what a root
-# workload can do to its own guest.
-WORKLOAD="root"
-DEMO_POLICY="${ROOT}/e2e/kubevirt/demo-policy-root.yaml"
+# Every KubeVirt guest is the root class by definition: the probes
+# exercise what a root workload can do to its own guest.
+DEMO_POLICY="${ROOT}/e2e/kubevirt/demo-policy.yaml"
 NAME="kvpoc-probe"
 VM_SELECTOR="openshell.ai/sandbox-name=${NAME}"
 FENCE_PREFIX="openshell-kubevirt-fence-"
@@ -205,7 +203,7 @@ LAUNCHER="$(launcher_pod_name)"
 [ -n "${LAUNCHER}" ] || fail "no virt-launcher pod found"
 SUPERVISOR_POD="$(supervisor_pod_name)"
 echo "launcher: ${LAUNCHER}"
-echo "supervisor: ${SUPERVISOR_POD} (${TOPOLOGY} topology)"
+echo "supervisor: ${SUPERVISOR_POD}"
 
 # Listeners in the launcher pod's network namespace (the netns the guest's
 # masquerade traffic lands in). /proc/net/tcp is hex-encoded
@@ -265,13 +263,8 @@ K8S_API_IP="$(kubectl get svc -n default kubernetes \
     -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
 NODE_IP="$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
 echo "fence reachability from the launcher netns:"
-if [ "${TOPOLOGY}" = "gateway" ]; then
-    SUPERVISOR_SVC_IP="$(kubectl get svc -n openshell \
-        kvpoc-openshell-supervisor -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
-else
-    SUPERVISOR_SVC_IP="$(kubectl get svc -n "${SANDBOX_NAMESPACE}" \
-        "${SUPERVISOR_POD}" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
-fi
+SUPERVISOR_SVC_IP="$(kubectl get svc -n "${SANDBOX_NAMESPACE}" \
+    "${SUPERVISOR_POD}" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
 [ -n "${SUPERVISOR_SVC_IP}" ] && probe_tcp "${SUPERVISOR_SVC_IP}:5500" "supervisor Service (expected: the fence's allow target)"
 [ -n "${KUBEDNS_IP}" ] && probe_tcp "${KUBEDNS_IP}:53" "kube-dns (cluster DNS)"
 [ -n "${K8S_API_IP}" ] && probe_tcp "${K8S_API_IP}:443" "Kubernetes API service"

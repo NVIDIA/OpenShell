@@ -1515,25 +1515,20 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # upstream Agent Sandbox controller. "kubevirt" provisions `kubevirt.io/v1`
 # VirtualMachine objects directly — the KubeVirt controller replaces the
 # Agent Sandbox controller, and each sandbox boots a purpose-built guest
-# image whose init stages the boundary and runs `openshell-sandbox`. The kubevirt
-# runtime currently supports only `workspace_mode = "shared"` and supports
-# the same supervisor topologies as the pod runtime: the default is a
-# dedicated supervisor Pod per sandbox (which requires `grpc_endpoint` to be
-# reachable from those Pods), and `supervisor_topology = "gateway"` places
-# each generation on the gateway's shared supervisor. See
-# `e2e/kubevirt/README.md` for the PoC workflow, guest-image build, and
-# known gaps.
+# image whose init stages the boundary and runs `openshell-sandbox`. The
+# kubevirt runtime currently supports only `workspace_mode = "shared"` and
+# only the dedicated supervisor topology: one supervisor Pod per sandbox
+# (which requires `grpc_endpoint` to be reachable from those Pods); the
+# gateway-shared supervisor is rejected. Every KubeVirt guest runs its
+# workload as root and its in-guest boundary is untrusted: the security
+# boundary is the NetworkPolicy fence, the supervisor's policy, and the
+# driver's Kubernetes checks — guest configuration (the nftables relay,
+# the DNS relay) is required for networking to work and is never relied
+# on for security. Provider files and provider env vars are unsupported —
+# nothing secret enters the guest. See `e2e/kubevirt/README.md` for the
+# PoC workflow, guest-image build, and known gaps.
 # runtime                      = "kubevirt"
 
-# Settings used only when runtime = "kubevirt".
-# workload selects how the guest workload runs: "sandboxed" (the default —
-# unprivileged, Landlock + seccomp enforced by the in-guest boundary) or
-# "root" (the privileged VM class — the workload runs as root, in-guest
-# enforcement is removed, the security boundary is the fence + the
-# supervisor's policy + per-boot trusted code; requires the dedicated
-# supervisor topology; provider files and provider env vars are
-# unsupported — nothing secret enters the guest).
-# workload                   = "root"
 # guest_image is the containerDisk providing the bootable guest filesystem
 # (Alpine + supervisor + kernel, built by `e2e/kubevirt/build-guest-image.sh`);
 # it is NOT an arbitrary sandbox OCI image. cpu_cores and memory size the
@@ -1541,17 +1536,7 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # surviving stop/start. Guest egress is fenced by a per-sandbox
 # NetworkPolicy to the sandbox's supervisor only — no DNS, no gateway: the
 # boundary's in-guest DNS relay forwards through the supervisor's network
-# mediation.
-# Supervisor topologies: the default provisions one dedicated supervisor
-# Pod per sandbox (supervisor_image, and the supervisor settings above,
-# apply as on the pod runtime; the guest's boundary dials that Pod's
-# per-sandbox Service, and a NetworkPolicy fences guest egress to only
-# that Pod). supervisor_topology = "gateway" instead places each
-# generation on the gateway's shared supervisor: the guest's boundary
-# dials the shared supervisor Service named by shared_supervisor, whose
-# ClusterIP and pod selector are resolved through the API at create time,
-# and the fence admits only that Service. Either way no gateway token or
-# endpoint reaches the guest.
+# mediation. No gateway token or endpoint reaches the guest.
 # [openshell.drivers.kubernetes.kubevirt]
 # guest_image              = "openshell/sandbox-vm:dev"
 # guest_image_pull_policy  = "IfNotPresent"

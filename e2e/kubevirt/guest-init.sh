@@ -241,9 +241,17 @@ main() {
         fi
         ts "environment verified clean (no B64 or token vars)"
         # Run the boundary as a child (not exec) so PID 1 can power off on
-        # exit (see the wait + poweroff below). Root mode (uid/gid 0)
-        # launches the privileged boundary; the sandboxed default uses
-        # the capability-free launch.
+        # exit (see the wait + poweroff below). Every KubeVirt guest is
+        # the untrusted root-workload class: the workload runs as uid 0
+        # and the boundary launches in privileged mode (in-guest
+        # enforcement is meaningless against root — the fence, the
+        # supervisor's policy, and the driver's checks are the boundary).
+        # The identity must be exactly 0/0; anything else is a tampered
+        # or mismatched payload.
+        if [ "${launch_uid}" != "0" ] || [ "${launch_gid}" != "0" ]; then
+            ts "FATAL: KubeVirt guests run as root; payload identity ${launch_uid}:${launch_gid} is invalid"
+            return 1
+        fi
         # The boundary binary comes from the initramfs bind path when
         # staged (the initramfs pins the image inode at
         # /run/openshell/openshell-sandbox); otherwise the rootfs copy is
@@ -255,16 +263,9 @@ main() {
             BOUNDARY_BIN=/run/openshell/openshell-sandbox
             ts "boundary from the verified trusted path (${BOUNDARY_BIN})"
         fi
-        if [ "${launch_uid}" = "0" ] && [ "${launch_gid}" = "0" ]; then
-            ts "launching privileged (root-workload) boundary"
-            "${BOUNDARY_BIN}" launch-privileged \
-                /.openshell/state/bootstrap/boundary.json &
-        else
-            # shellcheck disable=SC2086
-            "${BOUNDARY_BIN}" launch-capability-free \
-                "${launch_uid}" "${launch_gid}" \
-                /.openshell/state/bootstrap/boundary.json &
-        fi
+        ts "launching privileged (root-workload) boundary"
+        "${BOUNDARY_BIN}" launch-privileged \
+            /.openshell/state/bootstrap/boundary.json &
         SANDBOX_PID=$!
     else
         # No boundary payload: the gateway cannot have created this VM

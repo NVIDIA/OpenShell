@@ -43,23 +43,10 @@ case "${1:-}" in
     --demo) RUN_DEMO=1 ;;
     --probes) RUN_PROBES=1 ;;
 esac
-# The probes exercise the root workload mode by definition; the gateway's
-# kubevirt config must select it at render time, so set the variable here
-# (before the gateway TOML heredoc below reads it).
-if [ "${RUN_PROBES}" = "1" ]; then
-    export OPENSHELL_KVPOC_WORKLOAD=root
-fi
-
-# Supervisor topology for this run: "dedicated" (the default — one
-# supervisor Pod per sandbox, matching the pod path's default) or "gateway"
-# (the Helm-shared supervisor). Exported for run-demo.sh, whose checks are
-# topology-aware.
-TOPOLOGY="${OPENSHELL_KVPOC_TOPOLOGY:-dedicated}"
-case "${TOPOLOGY}" in
-    dedicated|gateway) ;;
-    *) echo "OPENSHELL_KVPOC_TOPOLOGY must be 'dedicated' or 'gateway', got '${TOPOLOGY}'" >&2; exit 1 ;;
-esac
-export OPENSHELL_KVPOC_TOPOLOGY="${TOPOLOGY}"
+# Every KubeVirt guest is the root workload class (the only class), and
+# the only supported topology is the dedicated supervisor (one Pod per
+# sandbox): the config validation rejects the gateway-shared supervisor
+# for the kubevirt runtime.
 
 # The k3d docker bridge gateway is the host address guests use to reach the
 # gateway (k3d prints it at cluster creation; derive it from the network).
@@ -79,14 +66,6 @@ echo "==> Building openshell-gateway and openshell CLI"
 cargo build --release -p openshell-gateway -p openshell-cli
 
 TLS_DIR="${STATE_DIR}/tls"
-# Shared supervisor: rendered from the OpenShell Helm chart (see
-# e2e/kubevirt/README.md) into the release namespace. The gateway mints
-# the supervisor assignment token into the token Secret and resolves the
-# Service (ClusterIP, selector, port) at create time.
-SUPERVISOR_SERVICE="${OPENSHELL_KVPOC_SUPERVISOR_SERVICE:-kvpoc-openshell-supervisor}"
-SUPERVISOR_NAMESPACE="${OPENSHELL_KVPOC_SUPERVISOR_NAMESPACE:-openshell}"
-SUPERVISOR_PORT="${OPENSHELL_KVPOC_SUPERVISOR_PORT:-5500}"
-SUPERVISOR_TOKEN_SECRET="${OPENSHELL_KVPOC_SUPERVISOR_TOKEN_SECRET:-kvpoc-openshell-supervisor-token}"
 SUPERVISOR_CA_SECRET="${OPENSHELL_KVPOC_SUPERVISOR_CA_SECRET:-kvpoc-server-tls}"
 PKI_DIR="${STATE_DIR}/tls/pki"
 if [ ! -f "${PKI_DIR}/server/tls.crt" ]; then
@@ -96,15 +75,7 @@ if [ ! -f "${PKI_DIR}/server/tls.crt" ]; then
         --server-san localhost --server-san "${GATEWAY_NAME}" \
         >/dev/null
 fi
-# Keep the supervisor's gateway-CA Secret in sync with the PKI the gateway
-# serves (the supervisor mounts it to verify the assignment-stream
-# connection). See e2e/kubevirt/README.md for the supervisor deployment.
-if kubectl get namespace "${SUPERVISOR_NAMESPACE}" >/dev/null 2>&1; then
-    kubectl -n "${SUPERVISOR_NAMESPACE}" create secret generic "${SUPERVISOR_CA_SECRET}" \
-        --from-file=ca.crt="${PKI_DIR}/ca.crt" \
-        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-fi
-# The dedicated topology's supervisor Pods live in the sandbox namespace and
+# The dedicated supervisor Pods live in the sandbox namespace and
 # verify the gateway through this CA (client_tls_secret_name).
 kubectl create namespace "${SANDBOX_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl -n "${SANDBOX_NAMESPACE}" create secret generic "${SUPERVISOR_CA_SECRET}" \
@@ -125,27 +96,11 @@ rm -f "${STATE_DIR}"/gateway.db*
 # default) runs one supervisor Pod per sandbox with the locally imported
 # supervisor image and the gateway-CA client-TLS Secret synced into the
 # sandbox namespace above.
-if [ "${TOPOLOGY}" = "gateway" ]; then
-    TOPOLOGY_CONFIG='supervisor_topology = "gateway"'
-    DEDICATED_KEYS=''
-    SHARED_SUPERVISOR_CONFIG=$(cat <<FRAG
-
-[openshell.drivers.kubernetes.shared_supervisor]
-service_name = "${SUPERVISOR_SERVICE}"
-service_namespace = "${SUPERVISOR_NAMESPACE}"
-runtime_port = ${SUPERVISOR_PORT}
-token_secret_name = "${SUPERVISOR_TOKEN_SECRET}"
-FRAG
-)
-else
-    TOPOLOGY_CONFIG=''
-    DEDICATED_KEYS=$(cat <<FRAG
+DEDICATED_KEYS=$(cat <<FRAG
 supervisor_image = "${OPENSHELL_KVPOC_SUPERVISOR_IMAGE:-kvpoc/openshell-supervisor:dev}"
 client_tls_secret_name = "${SUPERVISOR_CA_SECRET}"
 FRAG
 )
-    SHARED_SUPERVISOR_CONFIG=''
-fi
 
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
@@ -183,7 +138,6 @@ runtime = "kubevirt"
 gateway_id = "kvpoc"
 namespace = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
-${TOPOLOGY_CONFIG}
 ${DEDICATED_KEYS}
 
 [openshell.drivers.kubernetes.kubevirt]
@@ -191,8 +145,6 @@ guest_image = "${GUEST_IMAGE}"
 guest_image_pull_policy = "IfNotPresent"
 cpu_cores = 1
 memory = "1Gi"
-workload = "${OPENSHELL_KVPOC_WORKLOAD:-sandboxed}"
-${SHARED_SUPERVISOR_CONFIG}
 EOF
 
 # Register the gateway for the CLI (mTLS: the shared supervisor requires
@@ -239,10 +191,6 @@ echo "  namespace:  ${SANDBOX_NAMESPACE}"
 echo "  guest disk: ${GUEST_IMAGE}"
 echo
 
-# Stamp the attach-wait window BEFORE the gateway launches: a supervisor
-# whose token is still valid can attach within a second of the gateway
-# coming up, and a later stamp would miss its log line.
-GATEWAY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # The gateway may run on a restricted kubeconfig (e.g. one minted from the
 # chart's gateway ServiceAccount, to prove the Helm RBAC is sufficient):
 # set OPENSHELL_KVPOC_GATEWAY_KUBECONFIG. The demo's own kubectl calls keep
@@ -265,31 +213,6 @@ for _ in $(seq 1 60); do
 done
 
 if [ "${RUN_DEMO}" = "1" ] || [ "${RUN_PROBES}" = "1" ]; then
-    # The gateway topology's supervisor Deployment must attach to the
-    # gateway's assignment stream before the first create: the token the
-    # gateway mints is only served once the replica is attached, and a
-    # create racing that attach leaves the boundary's dial refused.
-    if [ "${TOPOLOGY}" = "gateway" ]; then
-        echo "==> waiting for the shared supervisor replica to attach"
-        # Only lines logged after this gateway's launch count (the stamp
-        # was taken before the binary started), so a quick rerun cannot
-        # satisfy the check with the previous gateway's attach line.
-        ATTACHED=1
-        for _ in $(seq 1 60); do
-            if kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/"${SUPERVISOR_SERVICE}" \
-                --since-time="${GATEWAY_STARTED_AT}" 2>/dev/null \
-                | grep -q "gateway accepted the supervisor host"; then
-                ATTACHED=0
-                break
-            fi
-            sleep 2
-        done
-        if [ "${ATTACHED}" != "0" ]; then
-            echo "the shared supervisor replica did not attach to the gateway" >&2
-            kill "${GATEWAY_PID}" 2>/dev/null || true
-            exit 1
-        fi
-    fi
     if [ "${RUN_PROBES}" = "1" ]; then
         "${ROOT}/e2e/kubevirt/run-probes.sh" || {
             kill "${GATEWAY_PID}" 2>/dev/null || true
