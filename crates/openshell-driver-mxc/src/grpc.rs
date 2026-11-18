@@ -134,7 +134,12 @@ impl ComputeDriver for ComputeDriverService {
             return Err(Status::invalid_argument("sandbox_id and name are required"));
         }
         self.backend
-            .start_sandbox(&req.sandbox_id, &req.name, req.launch_authentication)
+            .start_sandbox(
+                &req.sandbox_id,
+                &req.name,
+                &req.generation_id,
+                req.launch_authentication,
+            )
             .await?;
         Ok(Response::new(StartSandboxResponse::default()))
     }

@@ -908,18 +908,47 @@ impl russh::server::Handler for SshHandler {
             session.channel_failure(channel)?;
             return Ok(());
         }
-        let command = String::from_utf8_lossy(data).trim().to_string();
+        let command = String::from_utf8_lossy(data);
+        #[cfg(not(windows))]
+        let command = command.trim();
+        let command = command.to_string();
         if command.is_empty() {
             session.channel_success(channel)?;
             return Ok(());
         }
-        match self
-            .start_shell(channel, session.handle(), Some(command))
-            .await
+        #[cfg(windows)]
+        let result = if let Some(payload) =
+            data.strip_prefix(openshell_core::ssh_exec::ARGV_PREFIX.as_bytes())
         {
+            self.start_mxc_argv(channel, session.handle(), payload)
+                .await
+        } else {
+            self.start_shell(channel, session.handle(), Some(command))
+                .await
+        };
+        #[cfg(not(windows))]
+        let result = self
+            .start_shell(channel, session.handle(), Some(command))
+            .await;
+        match result {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
                 warn!(%error, ?channel, "failed to start boundary exec");
+                #[cfg(windows)]
+                {
+                    // Exit status is needed even if the boundary cannot spawn
+                    // the process. A bare channel failure can strand the relay.
+                    session.channel_success(channel)?;
+                    session.extended_data(
+                        channel,
+                        1,
+                        format!("openshell: {error}\r\n").into_bytes(),
+                    )?;
+                    session.exit_status_request(channel, 1)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                }
+                #[cfg(not(windows))]
                 session.channel_failure(channel)?;
             }
         }
@@ -1465,6 +1494,40 @@ impl SshHandler {
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn start_mxc_argv(
+        &mut self,
+        channel: ChannelId,
+        handle: Handle,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        let request = serde_json::from_slice::<openshell_core::ssh_exec::SshExecArgv>(payload)
+            .map_err(|_| anyhow::anyhow!("invalid MXC exec request"))?;
+        let mut argv = request.command.into_iter();
+        let program = argv
+            .next()
+            .filter(|program| !program.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("MXC exec requires an executable"))?;
+        let state = self
+            .channels
+            .get(&channel)
+            .ok_or_else(|| anyhow::anyhow!("exec on unknown channel {channel:?}"))?;
+        self.start_exec_spec(
+            channel,
+            handle,
+            openshell_isolation_interface::contract::ExecSpec {
+                program,
+                args: argv.collect(),
+                shell: None,
+                runtime_helper: None,
+                env: request.environment.into_iter().collect(),
+                workdir: (!request.workdir.is_empty()).then_some(request.workdir),
+                pty: state.pty_request.is_some(),
+            },
+        )
+        .await
     }
 
     async fn start_exec_spec(

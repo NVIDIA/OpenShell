@@ -9,6 +9,26 @@ use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
+    match arguments.get(1).map(String::as_str) {
+        Some("--print-arg") if arguments.len() == 3 => {
+            println!("{}", arguments[2]);
+            return Ok(());
+        }
+        Some("--exit-on-file") if arguments.len() == 4 => {
+            let mut launches = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&arguments[2])?;
+            writeln!(launches, "launched")?;
+            drop(launches);
+            let exit_file = std::path::Path::new(&arguments[3]);
+            while !exit_file.try_exists()? {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     if !(arguments.len() == 3 || (matches!(arguments.len(), 4 | 5) && arguments[3] == "http")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

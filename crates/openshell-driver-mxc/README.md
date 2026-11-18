@@ -219,7 +219,8 @@ not required; driver-owned guest TLS fields are rejected.
 |---|---|
 | Filesystem and UI policy | Mapped to the MXC ProcessContainer fence |
 | Network policy and provider credentials | Standard host supervisor proxy; proxy-aware workloads only |
-| Exec, signals, retained output | Authenticated Sandbox Protocol; ConPTY resize is not yet supported |
+| Exec, signals, retained output | Gateway SSH relay to the in-process supervisor adapter, then the authenticated Sandbox Protocol. Exec requires `--no-tty`. |
+| Sandbox restart | Retire the old runtime and launch from the stored spec with fresh authentication. Policy-granted workspace files persist. |
 | Dynamic forwarding | Standard supervisor `ForwardTcp` path through sandbox loopback connect |
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer |
 | Gateway restart recovery | Not yet supported; live MXC generations remain in-memory |

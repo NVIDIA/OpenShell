@@ -539,18 +539,12 @@ impl MxcComputeBackend {
         Ok(())
     }
 
-    /// Restart a stopped sandbox by running its lifecycle again with the fresh
-    /// launch credentials the gateway supplies for this start.
-    ///
-    /// Stop tears the runtime down completely; for an isolation session that
-    /// includes deprovisioning the agent user. Restart therefore provisions a
-    /// new runtime generation (and, for an isolation session, a new agent user)
-    /// from the stored sandbox spec. Host paths named by the policy, such as the
-    /// workspace, are unaffected by stop and so persist across the restart.
+    /// Replace the retired runtime while keeping the workspace and sandbox ID.
     pub async fn start_sandbox(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        requested_generation: &str,
         fresh_launch_authentication: Vec<u8>,
     ) -> Result<(), tonic::Status> {
         if fresh_launch_authentication.is_empty() {
@@ -570,51 +564,83 @@ impl MxcComputeBackend {
             }
             entry.lifecycle_gate.clone()
         };
-        let startup_guard = gate.lock_owned().await;
+        let startup_guard = gate.clone().lock_owned().await;
 
-        let (mut sandbox, previous_host, previous_boundary) = {
+        let (mut sandbox, previous) = {
             let registry = self.registry.lock().await;
-            let entry = registry.get(sandbox_id).ok_or_else(|| {
-                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
-            })?;
-            match entry.phase_state {
-                PhaseState::Stopped | PhaseState::Failed(_) => {}
-                // A retried start of a sandbox that is already up is not an error.
-                PhaseState::Running | PhaseState::Starting => return Ok(()),
-            }
+            let entry = registry
+                .get(sandbox_id)
+                .filter(|entry| Arc::ptr_eq(&entry.lifecycle_gate, &gate))
+                .ok_or_else(|| {
+                    tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+                })?;
             (
                 entry.sandbox.clone(),
-                entry.host_state_dir.clone(),
-                entry.boundary_state_dir.clone(),
+                launch_authentication(&entry.sandbox)?.supervisor,
             )
         };
-        if let Some(spec) = sandbox.spec.as_mut() {
-            spec.launch_authentication = fresh_launch_authentication;
-        } else {
-            return Err(tonic::Status::failed_precondition(
-                "stored MXC sandbox has no spec to restart",
-            ));
-        }
+        sandbox
+            .spec
+            .as_mut()
+            .expect("launch authentication requires a spec")
+            .launch_authentication = fresh_launch_authentication;
         let launch = launch_authentication(&sandbox)?;
         launch
             .validate()
             .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
-        let sandbox_config = sandbox_config(&sandbox)?;
         let generation = safe_component(launch.supervisor.runtime_generation.as_str())?.to_string();
+        if generation != requested_generation {
+            return Err(tonic::Status::failed_precondition(
+                "start generation does not match MXC launch authentication",
+            ));
+        }
+        let sandbox_config = sandbox_config(&sandbox)?;
         let host_state_dir = self
             .config
             .state_dir
             .join(safe_component(sandbox_id)?)
             .join(&generation);
         let boundary_state_dir = PathBuf::from(&sandbox_config.cwd)
-            .join(".openshell-runtime")
+            .join(BOUNDARY_STAGING_DIR)
             .join(&generation);
-        if previous_host != host_state_dir {
-            cleanup_runtime_directory(&previous_host);
+
+        let (shutdown, terminated, previous_host, previous_boundary) = {
+            let mut registry = self.registry.lock().await;
+            let entry = registry
+                .get_mut(sandbox_id)
+                .expect("lifecycle gate protects the entry");
+            // The gateway can retain the generation ID while rotating the auth
+            // epoch on restart. A completed main process can leave the old
+            // supervisor running, so phase alone cannot make a start idempotent.
+            let epoch = launch.supervisor.auth_epoch;
+            let same_launch = launch.supervisor.runtime_generation == previous.runtime_generation
+                && epoch == previous.auth_epoch;
+            if same_launch
+                && matches!(
+                    entry.phase_state,
+                    PhaseState::Running | PhaseState::Starting
+                )
+            {
+                return Ok(());
+            }
+            if same_launch || epoch < previous.auth_epoch {
+                return Err(tonic::Status::failed_precondition(
+                    "MXC sandbox start requires fresh launch authentication",
+                ));
+            }
+            (
+                entry.shutdown_tx.take(),
+                entry.terminated_rx.clone(),
+                entry.host_state_dir.clone(),
+                entry.boundary_state_dir.clone(),
+            )
+        };
+        if let Some(shutdown) = shutdown {
+            let _ = shutdown.send(());
         }
-        if previous_boundary != boundary_state_dir {
-            cleanup_runtime_directory(&previous_boundary);
-        }
+        wait_for_termination(terminated, sandbox_name).await?;
+        cleanup_runtime_directory(&previous_host);
+        cleanup_runtime_directory(&previous_boundary);
 
         let starting = make_sandbox_with_condition(
             &sandbox,
@@ -623,12 +649,11 @@ impl MxcComputeBackend {
         );
         {
             let mut registry = self.registry.lock().await;
-            let entry = registry.get_mut(sandbox_id).ok_or_else(|| {
-                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
-            })?;
+            let entry = registry
+                .get_mut(sandbox_id)
+                .expect("lifecycle gate protects the entry");
             entry.sandbox = starting.clone();
             entry.phase_state = PhaseState::Starting;
-            entry.shutdown_tx = None;
             entry.terminated_rx = None;
             entry.host_state_dir.clone_from(&host_state_dir);
             entry.boundary_state_dir.clone_from(&boundary_state_dir);
@@ -747,14 +772,16 @@ struct LifecycleContext {
 }
 
 async fn run_lifecycle(context: LifecycleContext, startup_guard: tokio::sync::OwnedMutexGuard<()>) {
-    if let Err(error) = run_lifecycle_inner(&context, startup_guard).await {
+    // Retain the lifecycle gate until a pre-launch failure is published.
+    let mut startup_guard = Some(startup_guard);
+    if let Err(error) = run_lifecycle_inner(&context, &mut startup_guard).await {
         set_failed(&context, &error).await;
     }
 }
 
 async fn run_lifecycle_inner(
     context: &LifecycleContext,
-    startup_guard: tokio::sync::OwnedMutexGuard<()>,
+    startup_guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<(), String> {
     let main = mxc_main_process_config(
         context.sandbox.spec.as_ref(),
@@ -950,22 +977,28 @@ async fn run_lifecycle_inner(
         entry.terminated_rx = Some(terminated_rx);
         entry.phase_state = PhaseState::Running;
     }
-    drop(startup_guard);
+    drop(startup_guard.take());
     let result = monitor_runtime_pair(boundary, supervisor, shutdown_rx).await;
-    let _ = terminated_tx.send(true);
     if let Ok(mut attribution) = context.attribution.lock() {
         attribution.forget(&context.sandbox.id);
     }
-    match result {
-        RuntimePairExit::Shutdown => Ok(()),
-        RuntimePairExit::Boundary(status) => Err(format!(
+    let failure = match result {
+        RuntimePairExit::Shutdown => None,
+        RuntimePairExit::Boundary(status) => Some(format!(
             "MXC ProcessContainer exited before supervisor shutdown: {status}"
         )),
-        RuntimePairExit::Supervisor(status) => Err(format!(
+        RuntimePairExit::Supervisor(status) => Some(format!(
             "MXC supervisor exited while ProcessContainer was active: {status}"
         )),
-        RuntimePairExit::Wait(error) => Err(error),
+        RuntimePairExit::Wait(error) => Some(error),
+    };
+    if let Some(message) = failure {
+        set_failed(context, &message).await;
     }
+    // A start waiting on this signal can now replace the registry entry and
+    // ETW registration without being overwritten by the retiring runtime.
+    let _ = terminated_tx.send(true);
+    Ok(())
 }
 
 fn spawn_supervisor(
@@ -1127,34 +1160,23 @@ async fn set_failed(context: &LifecycleContext, message: &str) {
 }
 
 fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::Status> {
-    let driver_config = sandbox
+    let config = sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref());
-    let config = match driver_config {
-        // The MXC-specific `--driver-config-json` is the most deliberately
-        // targeted input, so it takes priority over the generic command.
-        Some(config) => serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
+        .and_then(|template| template.driver_config.as_ref())
+        .ok_or_else(|| {
+            tonic::Status::invalid_argument(
+                "mxc requires template.driver_config.mxc with command and cwd",
+            )
+        })?;
+    let config: MxcSandboxConfig =
+        serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
             tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?,
-        // The driver-agnostic `sandbox create -- <COMMAND>` syntax. The working
-        // directory also hosts boundary state, so it must be writable by the
-        // gateway user; use a per-sandbox directory under its temp folder.
-        None => MxcSandboxConfig {
-            command: sandbox
-                .spec
-                .as_ref()
-                .map(|spec| spec.command.clone())
-                .unwrap_or_default(),
-            cwd: default_sandbox_cwd(&sandbox.id)?,
-            denied_paths: Vec::new(),
-        },
-    };
+        })?;
     if config.command.first().is_none_or(String::is_empty) {
         return Err(tonic::Status::invalid_argument(
-            "mxc sandbox command must contain an executable: set it with \
-             `sandbox create -- <COMMAND>` or `--driver-config-json`",
+            "mxc driver_config.command must contain an executable",
         ));
     }
     let mut denied_paths = Vec::with_capacity(config.denied_paths.len());
@@ -1484,19 +1506,6 @@ fn path_key(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn default_sandbox_cwd(sandbox_id: &str) -> Result<String, tonic::Status> {
-    let directory = std::env::temp_dir()
-        .join("openshell-mxc")
-        .join(safe_component(sandbox_id)?);
-    std::fs::create_dir_all(&directory).map_err(|error| {
-        tonic::Status::internal(format!(
-            "create default MXC working directory {}: {error}",
-            directory.display()
-        ))
-    })?;
-    Ok(directory.display().to_string())
-}
-
 fn launch_authentication(
     sandbox: &DriverSandbox,
 ) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, tonic::Status> {
@@ -1805,37 +1814,6 @@ fn platform_event(sandbox_id: String, reason: &str, message: String) -> WatchSan
 // the driver. Keep lifecycle/security tests below during their migration.
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn generic_command_is_used_without_driver_config() {
-        let sandbox = DriverSandbox {
-            id: "generic-command-sandbox".to_string(),
-            spec: Some(DriverSandboxSpec {
-                command: vec!["cmd.exe".into(), "/c".into(), "exit".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let config = sandbox_config(&sandbox).expect("generic command is accepted");
-        assert_eq!(config.command, vec!["cmd.exe", "/c", "exit"]);
-        let cwd = Path::new(&config.cwd);
-        assert!(cwd.is_absolute() && cwd.is_dir(), "{}", config.cwd);
-        assert!(cwd.ends_with("generic-command-sandbox"));
-        let _ = std::fs::remove_dir(cwd);
-
-        let empty = DriverSandbox {
-            id: "empty-command-sandbox".to_string(),
-            spec: Some(DriverSandboxSpec::default()),
-            ..Default::default()
-        };
-        let error = sandbox_config(&empty).expect_err("a command is required");
-        assert!(error.message().contains("sandbox create -- <COMMAND>"));
-        let _ = std::fs::remove_dir(
-            std::env::temp_dir()
-                .join("openshell-mxc")
-                .join("empty-command-sandbox"),
-        );
-    }
-
     #[test]
     fn mxc_driver_command_reaches_supervisor_without_generic_command() {
         let command = vec![

@@ -1335,11 +1335,8 @@ fn ssh_upload_command(proxy_command: &str) -> Command {
 ///   `"/sandbox/sub/file"` -> `("/sandbox/sub", "file")`
 ///   `"file.txt"`          -> `(".", "file.txt")`
 fn split_sandbox_path(path: &str) -> (&str, &str) {
-    match path.rfind(['/', '\\']) {
-        Some(0) => (&path[..1], &path[1..]),
-        Some(pos) if pos == 2 && path.as_bytes().get(1) == Some(&b':') => {
-            (&path[..=pos], &path[pos + 1..])
-        }
+    match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
         Some(pos) => (&path[..pos], &path[pos + 1..]),
         None => (".", path),
     }
@@ -3052,6 +3049,7 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+        assert_eq!(split_sandbox_path(r"/tmp/a\b"), ("/tmp", r"a\b"));
     }
 
     #[test]

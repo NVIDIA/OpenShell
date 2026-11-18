@@ -2538,6 +2538,7 @@ pub(super) async fn handle_exec_sandbox(
     }
 
     require_ready_sandbox(&sandbox)?;
+    let command_str = exec_relay_command(&req, state.compute.configured_driver_name())?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -2552,8 +2553,6 @@ pub(super) async fn handle_exec_sandbox(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(&req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let stdin_payload = req.stdin;
     let execution_timeout = req
         .execution_timeout
@@ -3077,6 +3076,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
     }
 
     require_ready_sandbox(&sandbox)?;
+    let command_str = exec_relay_command(req, state.compute.configured_driver_name())?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
@@ -3088,8 +3088,6 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
     let no_login_shell = req.no_login_shell;
     let execution_timeout = req
@@ -3398,6 +3396,33 @@ fn exec_loop_result(exit_code: Option<i32>, close_seen: bool) -> Result<i32, Sta
             "exec relay closed before the SSH channel finished",
         )),
     }
+}
+
+fn exec_relay_command(req: &ExecSandboxRequest, driver_name: &str) -> Result<String, Status> {
+    use openshell_core::ssh_exec::{ARGV_PREFIX, SshExecArgv};
+
+    if driver_name != "mxc" {
+        return build_remote_exec_command(req).map_err(|error| {
+            Status::invalid_argument(format!("command construction failed: {error}"))
+        });
+    }
+    if req.tty {
+        return Err(Status::failed_precondition(
+            "Windows MXC exec does not support a PTY. Use --no-tty.",
+        ));
+    }
+    let payload = serde_json::to_string(&SshExecArgv {
+        command: req.command.clone(),
+        environment: req.environment.clone(),
+        workdir: req.workdir.clone(),
+    })
+    .map_err(|_| Status::internal("encode MXC exec arguments"))?;
+    if ARGV_PREFIX.len() + payload.len() > MAX_COMMAND_STRING_LEN {
+        return Err(Status::invalid_argument(format!(
+            "assembled command exceeds {MAX_COMMAND_STRING_LEN} byte limit"
+        )));
+    }
+    Ok(format!("{ARGV_PREFIX}{payload}"))
 }
 
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
@@ -4311,6 +4336,32 @@ mod tests {
             "'def f():\n    return 1'"
         );
         assert_eq!(shell_escape("line1\r\nline2").unwrap(), "'line1\r\nline2'");
+    }
+
+    #[test]
+    fn mxc_exec_relay_preserves_argv_and_leaves_linux_shell_format_unchanged() {
+        use openshell_core::ssh_exec::{ARGV_PREFIX, SshExecArgv};
+
+        let req = ExecSandboxRequest {
+            command: vec![
+                r"C:\Program Files\tool.exe".into(),
+                "literal & value".into(),
+                String::new(),
+            ],
+            environment: std::collections::HashMap::from([("NAME".into(), "two words".into())]),
+            workdir: r"C:\sandbox\work".into(),
+            ..Default::default()
+        };
+        let encoded = exec_relay_command(&req, "mxc").unwrap();
+        let payload: SshExecArgv =
+            serde_json::from_str(encoded.strip_prefix(ARGV_PREFIX).unwrap()).unwrap();
+        assert_eq!(payload.command, req.command);
+        assert_eq!(payload.environment, req.environment);
+        assert_eq!(payload.workdir, req.workdir);
+        assert_eq!(
+            exec_relay_command(&req, "docker").unwrap(),
+            build_remote_exec_command(&req).unwrap()
+        );
     }
 
     // ---- build_remote_exec_command ----
