@@ -29,6 +29,7 @@ IDLE_TIMEOUT = float(sys.argv[6])
 result = {
     "connect": None,
     "errno": None,
+    "dns": False,
     "error": None,
     "connect_ms": None,
     "read_end": None,
@@ -77,7 +78,11 @@ except socket.timeout:
     result["connect"] = "timeout"
 except OSError as error:
     result["connect"] = "failed"
-    result["errno"] = error.errno
+    # A resolver failure's code is an EAI_* value, not an errno.
+    if isinstance(error, socket.gaierror):
+        result["dns"] = True
+    else:
+        result["errno"] = error.errno
     result["error"] = repr(error)
 else:
     result["connect"] = "ok"

@@ -28,10 +28,12 @@ const EACCES: i32 = 13;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectOutcome {
     Connected,
-    /// The connect failed with `errno`, or none for an error without one.
+    /// The connect failed with `errno`, or none for an error without one,
+    /// such as a name that didn't resolve ([`ConnectOutcome::is_dns_failure`]).
     /// `error` is Python's description of it.
     Failed {
         errno: Option<i32>,
+        dns: bool,
         error: String,
     },
     TimedOut,
@@ -48,6 +50,11 @@ impl ConnectOutcome {
             Self::Failed { errno, .. } => *errno,
             Self::Connected | Self::TimedOut => None,
         }
+    }
+
+    /// Whether the connect failed because the name didn't resolve.
+    pub fn is_dns_failure(&self) -> bool {
+        matches!(self, Self::Failed { dns: true, .. })
     }
 
     /// Whether the connect failed with `EACCES` or `EPERM`, as the sandbox
@@ -147,6 +154,7 @@ async fn run(
 struct ProbeJson {
     connect: ConnectJson,
     errno: Option<i32>,
+    dns: bool,
     error: Option<String>,
     connect_ms: u64,
     read_end: Option<ReadEndJson>,
@@ -180,6 +188,7 @@ fn parse_probe(value: serde_json::Value) -> Result<Probe> {
         ConnectJson::Ok => ConnectOutcome::Connected,
         ConnectJson::Failed => ConnectOutcome::Failed {
             errno: json.errno,
+            dns: json.dns,
             error: json.error.unwrap_or_default(),
         },
         ConnectJson::Timeout => ConnectOutcome::TimedOut,
