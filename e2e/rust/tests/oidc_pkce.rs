@@ -1457,8 +1457,8 @@ async fn delete_workspace(admin: &LoginSession, workspace: &str) {
 }
 
 // Keep RBAC fixtures running until cleanup so authorization checks do not also
-// exercise fast canonical-process completion. That lifecycle belongs to the
-// dedicated sandbox_lifecycle suite.
+// exercise fast canonical-process completion. The conformance `lifecycle`
+// suite covers that.
 async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sandbox_name: &str) {
     let create = run_workspace_cli(
         session,

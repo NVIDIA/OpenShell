@@ -521,6 +521,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-ssh-supervision"
+version = "0.0.0"
+dependencies = [
+ "nix",
+ "openshell-testkit",
+ "tokio",
+]
+
+[[package]]
 name = "container-engine-support"
 version = "0.0.0"
 dependencies = [

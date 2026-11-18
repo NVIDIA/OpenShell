@@ -30,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = { package = "noyalib", version = "0.0.53", default-features = false, features = ["std", "compat-serde-yaml"] }
 tempfile = "3"
-tokio = { version = "1.43", features = ["macros", "process", "rt", "time"] }
+tokio = { version = "1.43", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tonic = "0.14"
 
 [target.'cfg(unix)'.dependencies]

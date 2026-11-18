@@ -26,6 +26,6 @@ openshell-crypto = { path = "../../../crates/openshell-crypto" }
 openshell-testkit = { path = "../../testkit/testkit" }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["process", "time"] }
 
 [workspace]
