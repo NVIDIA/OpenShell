@@ -16,6 +16,7 @@ pub mod color;
 pub mod compute;
 pub mod config;
 pub mod container_paths;
+pub mod create_retry;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;

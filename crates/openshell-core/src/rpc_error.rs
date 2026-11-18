@@ -16,6 +16,12 @@ pub use tonic_types::{ErrorDetails, StatusExt};
 /// Domain of gateway-owned machine-readable error reasons.
 pub const ERROR_DOMAIN: &str = "openshell.nvidia.com";
 
+/// Reason on `Unavailable` when a request timed out waiting for a mutation lock.
+pub const MUTATION_LOCK_TIMEOUT: &str = "MUTATION_LOCK_TIMEOUT";
+
+/// Reason on `AlreadyExists` when the existing sandbox is still being deleted.
+pub const SANDBOX_DELETING: &str = "SANDBOX_DELETING";
+
 /// Decode supported details without trusting inconsistent envelopes or delays.
 /// Unknown and malformed details remain available on the original status.
 pub fn decode_details(status: &Status) -> Option<ErrorDetails> {
@@ -88,9 +94,43 @@ pub fn resource_version_conflict(message: impl Into<String>, version: Option<u64
 
 /// Return a transient failure with a minimum delay for retry-safe operations.
 pub fn unavailable(reason: &str, message: impl Into<String>, delay: Duration) -> Status {
+    status_with_retry(Code::Unavailable, reason, message, delay)
+}
+
+/// Return a name conflict that clears on its own, with a minimum delay.
+pub fn already_exists_transient(
+    reason: &str,
+    message: impl Into<String>,
+    delay: Duration,
+) -> Status {
+    status_with_retry(Code::AlreadyExists, reason, message, delay)
+}
+
+fn status_with_retry(
+    code: Code,
+    reason: &str,
+    message: impl Into<String>,
+    delay: Duration,
+) -> Status {
     let mut details = ErrorDetails::with_error_info(reason, ERROR_DOMAIN, HashMap::new());
     details.set_retry_info(Some(delay));
-    Status::with_error_details(Code::Unavailable, message, details)
+    Status::with_error_details(code, message, details)
+}
+
+/// Rebuild `status` with a new message, keeping its decodable details.
+pub fn with_message(status: &Status, message: impl Into<String>) -> Status {
+    let message = message.into();
+    match decode_details(status) {
+        Some(details) => Status::with_error_details(status.code(), message, details),
+        None => Status::new(status.code(), message),
+    }
+}
+
+/// Whether `status` carries `reason` in its `ErrorInfo`.
+pub fn has_reason(status: &Status, reason: &str) -> bool {
+    decode_details(status)
+        .and_then(|details| details.error_info().map(|info| info.reason == reason))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -132,6 +172,22 @@ mod tests {
             status.details().to_vec().into(),
         );
         assert!(decode_details(&mismatched).is_none());
+    }
+
+    #[test]
+    fn with_message_keeps_reason_and_retry_delay() {
+        let original = unavailable("BUSY", "busy", Duration::from_secs(2));
+        let status = with_message(&original, "busy; cleanup pending");
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "busy; cleanup pending");
+        assert!(has_reason(&status, "BUSY"));
+        let details = decode_details(&status).unwrap();
+        assert_eq!(
+            details.retry_info().unwrap().retry_delay,
+            Some(Duration::from_secs(2))
+        );
+        let plain = with_message(&Status::unavailable("x"), "y");
+        assert!(plain.details().is_empty());
     }
 
     #[test]

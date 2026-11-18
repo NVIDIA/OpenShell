@@ -45,6 +45,7 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_last_sandbox_if_matches, get_gateway_metadata, save_last_sandbox,
 };
+use openshell_core::create_retry::{RetryPolicy, retry_create};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
@@ -459,6 +460,7 @@ pub struct SandboxCreateConfig<'a> {
     pub suppress_credential_warnings: bool,
     pub restart_policy: &'a str,
     pub provision_timeout_secs: Option<u32>,
+    pub create_retry: RetryPolicy,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -491,6 +493,7 @@ impl Default for SandboxCreateConfig<'_> {
             suppress_credential_warnings: false,
             restart_policy: "never",
             provision_timeout_secs: None,
+            create_retry: RetryPolicy::default(),
         }
     }
 }
@@ -531,6 +534,7 @@ pub async fn sandbox_create(
         suppress_credential_warnings,
         restart_policy,
         provision_timeout_secs,
+        create_retry,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -715,7 +719,23 @@ pub async fn sandbox_create(
             .collect(),
     };
 
-    let response = match client.create_sandbox(request).await {
+    let created = retry_create(
+        create_retry,
+        || {
+            let mut client = client.clone();
+            let request = request.clone();
+            async move { client.create_sandbox(request).await }
+        },
+        |status| Some(status),
+        |wait, attempt| {
+            eprintln!(
+                "gateway busy; retrying create in {:.1}s (attempt {attempt})",
+                wait.as_secs_f64()
+            );
+        },
+    )
+    .await;
+    let response = match created {
         Ok(resp) => resp,
         Err(status) if status.code() == Code::AlreadyExists => {
             return Err(miette::miette!(

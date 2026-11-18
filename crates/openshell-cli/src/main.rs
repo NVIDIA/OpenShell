@@ -20,6 +20,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_core::create_retry::RetryPolicy;
 use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
 
 /// Resolved gateway context: name + gateway endpoint.
@@ -1585,6 +1586,16 @@ enum SandboxCommands {
         /// (default: 300, or `OPENSHELL_PROVISION_TIMEOUT`).
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<std::num::NonZeroU32>,
+
+        /// Seconds to keep retrying a create the gateway rejects while busy
+        /// (default: 60).
+        #[arg(long, value_name = "SECONDS", conflicts_with = "no_create_retry")]
+        create_retry_timeout: Option<u64>,
+
+        /// Fail on the first create error instead of retrying while the
+        /// gateway is busy.
+        #[arg(long)]
+        no_create_retry: bool,
 
         /// Auto-create missing providers from local credentials.
         ///
@@ -3435,6 +3446,8 @@ async fn run_async() -> Result<()> {
                     detach,
                     restart_policy,
                     timeout,
+                    create_retry_timeout,
+                    no_create_retry,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3531,6 +3544,17 @@ async fn run_async() -> Result<()> {
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
                             provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
+                            create_retry: if no_create_retry {
+                                RetryPolicy::none()
+                            } else {
+                                create_retry_timeout.map_or_else(
+                                    RetryPolicy::lock_contention,
+                                    |secs| {
+                                        RetryPolicy::lock_contention()
+                                            .max_elapsed(std::time::Duration::from_secs(secs))
+                                    },
+                                )
+                            },
                         },
                         &cli.workspace,
                         &tls,

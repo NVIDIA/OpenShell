@@ -322,6 +322,7 @@ Key flags:
 - `--env-from KEY[=ENVVAR]`: Read a sandbox environment value from the CLI process environment without putting its value in arguments; use `--provider` to keep credentials hidden from the workload
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
+- `--create-retry-timeout SECONDS` / `--no-create-retry`: Set how long create retries while the gateway is busy (default 60), or turn retry off
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads

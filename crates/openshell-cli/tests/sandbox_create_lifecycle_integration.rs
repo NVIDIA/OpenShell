@@ -10,6 +10,7 @@ use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::load_last_sandbox;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_core::create_retry::RetryPolicy;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
@@ -65,6 +66,8 @@ struct SandboxState {
     fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    /// Statuses returned by successive `CreateSandbox` calls before it succeeds.
+    create_failures: Arc<Mutex<Vec<Status>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     stop_response: Arc<Mutex<Option<Sandbox>>>,
@@ -192,6 +195,10 @@ impl OpenShell for TestOpenShell {
             })
             .collect();
         self.state.create_requests.lock().await.push(request);
+        let failure = self.state.create_failures.lock().await.pop();
+        if let Some(status) = failure {
+            return Err(status);
+        }
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
         } else {
@@ -1851,6 +1858,73 @@ async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
                     .is_none_or(|spec| spec.providers.is_empty()),
                 "no provider should be attached without an explicit --provider"
             );
+        })
+        .await;
+}
+
+fn lock_timeout() -> Status {
+    openshell_core::rpc_error::unavailable(
+        openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+        "busy",
+        Duration::from_millis(10),
+    )
+}
+
+#[tokio::test]
+async fn sandbox_create_retries_while_the_gateway_is_busy() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.create_failures.lock().await = vec![lock_timeout(), lock_timeout()];
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            Box::pin(run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-gateway"),
+                    command: &["true".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            ))
+            .await
+            .expect("create should succeed after the busy responses");
+            assert_eq!(create_requests(&server).await.len(), 3);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_fails_on_first_busy_response_without_retry() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.create_failures.lock().await = vec![lock_timeout()];
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            Box::pin(run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-gateway"),
+                    command: &["true".into()],
+                    create_retry: RetryPolicy::none(),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            ))
+            .await
+            .expect_err("retry is disabled");
+            assert_eq!(create_requests(&server).await.len(), 1);
         })
         .await;
 }

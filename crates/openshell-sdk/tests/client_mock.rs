@@ -14,8 +14,8 @@ use openshell_core::proto::sandbox_updates_server::{SandboxUpdates, SandboxUpdat
 use openshell_core::replica_routing;
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
-    RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
-    SandboxTemplateListOptions, ServiceAuthorizationMode, ServiceExposure,
+    RefreshedToken, RetryPolicy, SandboxPhase, SandboxRef, SandboxSpec, SandboxTemplateCreateSpec,
+    SandboxTemplateListOptions, SdkError, ServiceAuthorizationMode, ServiceExposure,
     ServiceStatus as SdkServiceStatus, WatchEvent, WatchOptions,
 };
 use std::collections::HashMap;
@@ -51,6 +51,9 @@ struct MockState {
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
+    /// Statuses returned by successive `create_sandbox` calls before it succeeds.
+    create_failures: Mutex<Vec<Status>>,
+    create_calls: AtomicU32,
     last_template_create: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
     last_template_get: Mutex<Option<proto::GetSandboxTemplateRequest>>,
     last_template_list: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
@@ -354,6 +357,11 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::CreateSandboxRequest>,
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let req = request.into_inner();
+        self.state.create_calls.fetch_add(1, Ordering::SeqCst);
+        let failure = self.state.create_failures.lock().await.pop();
+        if let Some(status) = failure {
+            return Err(status);
+        }
         let name = if req.name.is_empty() {
             "generated".to_string()
         } else {
@@ -2125,6 +2133,55 @@ async fn unauthenticated_without_refresher_surfaces_error() {
         1,
         "exactly one attempt; no retry without a refresher"
     );
+}
+
+// ---- Create retry ----
+
+fn lock_timeout() -> Status {
+    openshell_core::rpc_error::unavailable(
+        openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+        "busy",
+        Duration::from_millis(10),
+    )
+}
+
+async fn create_with_failures(
+    failures: Vec<Status>,
+    policy: Option<RetryPolicy>,
+) -> (Result<SandboxRef, SdkError>, u32) {
+    let state = Arc::new(MockState {
+        create_failures: Mutex::new(failures),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let mut client = connect(&endpoint).await;
+    if let Some(policy) = policy {
+        client = client.with_create_retry(policy);
+    }
+    let result = client.create_sandbox(SandboxSpec::default()).await;
+    (result, state.create_calls.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn create_retries_lock_timeouts_until_it_succeeds() {
+    let (result, calls) = create_with_failures(vec![lock_timeout(), lock_timeout()], None).await;
+    result.unwrap();
+    assert_eq!(calls, 3);
+}
+
+#[tokio::test]
+async fn create_retry_can_be_disabled() {
+    let (result, calls) =
+        create_with_failures(vec![lock_timeout()], Some(RetryPolicy::none())).await;
+    assert!(result.unwrap_err().is_lock_contention());
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn create_does_not_retry_other_errors() {
+    let (result, calls) = create_with_failures(vec![Status::unavailable("down")], None).await;
+    assert_eq!(result.unwrap_err().code(), "rpc");
+    assert_eq!(calls, 1);
 }
 
 // ---- Workspace-scoped client tests ----
