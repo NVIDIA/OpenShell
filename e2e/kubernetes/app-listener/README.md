@@ -178,7 +178,7 @@ or real Kubernetes reachability.
 ## Discovery-driven proxy path
 
 Build the gateway, CLI, and optional proxy from the same stack. Deploy dedicated
-supervisors with the listener enabled and set `public_url` to an HTTPS origin
+supervisors with the listener enabled and set `base_url` to an HTTPS origin
 whose port differs from both the gateway port-forward and listener port. Deploy
 `deploy/helm/openshell-sandbox-proxy` with two replicas, the gateway CA, and one
 explicit workspace. Provide a workspace-authorized discovery identity when the
@@ -187,8 +187,9 @@ ports through NetworkPolicy; the proxy needs no Kubernetes API access.
 
 Create a sandbox with an unnamed service and expose a second named service.
 Verify `service expose`, API get/list, create-time response maps, and SDK results
-retain the public origin. The gateway alternative must remain independently
-available. From a permitted client Pod, use the returned hostname as SNI and
+retain the public origin. When gateway service routing is enabled, verify its
+alternative independently. When disabled, verify that gateway URLs are empty
+and application forwarding returns `404`. From a permitted client Pod, use the returned hostname as SNI and
 HTTP authority while connecting to each proxy Pod and then its Service. Verify
 the supervisor certificate using only the public application CA. No application
 private key is mounted in the proxy.

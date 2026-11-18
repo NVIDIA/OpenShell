@@ -320,7 +320,7 @@ Return to [Setup](/kubernetes/setup) to complete the installation.
 With supervisor application listeners and service discovery enabled, the optional
 `openshell-sandbox-proxy` forwards TLS directly to the discovered supervisor.
 Application payloads bypass the gateway. Configure the application public origin
-with `supervisor.app_listener.public_url`; the gateway API endpoint and internal
+with `supervisor.app_listener.base_url`; the gateway API endpoint and internal
 supervisor listener port can differ from that origin.
 
 Deploy the standalone chart in `deploy/helm/openshell-sandbox-proxy` with a gateway
