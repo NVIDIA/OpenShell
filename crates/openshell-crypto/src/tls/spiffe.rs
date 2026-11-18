@@ -157,7 +157,6 @@ impl ServerCertVerifier for SpiffeServerVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pki;
 
     const PREFIX: &str = "spiffe://example.org/spire/agent/k8s_psat/production";
 
@@ -188,7 +187,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "aws-lc", feature = "openssl"))]
     fn certificate_verification_requires_trust_validity_and_one_authorized_uri() {
+        use crate::pki;
+
+        #[cfg(all(feature = "openssl", not(feature = "aws-lc")))]
+        crate::install_default_context(crate::CryptoContext::new(Box::new(crate::OpenSsl)))
+            .unwrap();
+
         let ca_key = pki::generate_keypair().unwrap();
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
