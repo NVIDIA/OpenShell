@@ -127,13 +127,13 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/z3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Build and validate static Z3 package
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/z3
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 package-z3 ${{ matrix.rust_target }}
       - name: Upload verified package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
