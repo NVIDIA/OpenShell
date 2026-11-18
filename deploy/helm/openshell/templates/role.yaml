@@ -3,7 +3,8 @@
 {{- $allowDriverConfig := get $kubernetesConfig "allow_driver_config" | default false -}}
 {{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
 {{- $additionalCaEnabled := ne (get $supervisorNetwork "additionalCaConfigMapName" | default "") "" -}}
-{{- if and (eq $workspaceMode "shared") (or (include "openshell.workspaceResourcesEnabled" .) $additionalCaEnabled) (include "openshell.rbacCreate" .) }}
+{{- $kubevirtRuntime := eq (get $kubernetesConfig "runtime" | default "") "kubevirt" -}}
+{{- if and (eq $workspaceMode "shared") (or (include "openshell.workspaceResourcesEnabled" .) $additionalCaEnabled $kubevirtRuntime) (include "openshell.rbacCreate" .) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1
@@ -14,7 +15,46 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
-  {{- if include "openshell.workspaceResourcesEnabled" . }}
+  {{- if $kubevirtRuntime }}
+  # KubeVirt runtime: the driver provisions kubevirt.io VirtualMachines
+  # directly (the durable lifecycle handle: created Halted, patched to
+  # Once, watched for status, digest-pinned after the first boot, deleted
+  # with the sandbox) and reads the paired VirtualMachineInstances for
+  # their phase.
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+  # The dedicated supervisor Pod: created gated, patched to release the
+  # bootstrap scheduling gate, watched by the failure reconciler, deleted
+  # on stop, and listed by the launcher-label lookups.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  # The per-sandbox supervisor Service (re-created on start when deleted
+  # out of band) and the label-based cleanup when the VM is already gone.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "delete"]
+  # Bootstrap Secrets are created per generation, rewritten (patched) by
+  # start, pruned by label (list), and deleted by exact name on teardown.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete", "get", "list", "patch"]
+  # The per-sandbox workspace PVC, and the label-based cleanup of
+  # non-owner-referenced claims when the VM is already gone.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "delete", "get", "list"]
+  # The egress fence, the namespace-wide launcher isolation floor, and the
+  # control-ingress policy: created or validated, and deleted on teardown
+  # or drift.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "delete"]
+  {{- else if include "openshell.workspaceResourcesEnabled" . }}
   {{- if $allowDriverConfig }}
   # Metadata-only admission of caller-selected PVCs requires get permission.
   - apiGroups: [""]
