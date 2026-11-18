@@ -5189,7 +5189,6 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "toml",
  "tonic",
- "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
  "tower",
