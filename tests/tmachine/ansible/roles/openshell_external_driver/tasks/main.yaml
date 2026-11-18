@@ -121,5 +121,7 @@
     dest: /etc/openshell-test/gateway-overrides.toml
     mode: "0644"
     content: |
+      [openshell]
+      version = 2
       [openshell.drivers.{{ openshell_external_driver_name }}]
       socket_path = "{{ openshell_external_driver_socket }}"

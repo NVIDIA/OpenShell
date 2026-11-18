@@ -55,6 +55,8 @@
   ansible.builtin.copy:
     dest: /etc/openshell-test/gateway-overrides.toml
     content: |
+      [openshell]
+      version = 2
       [openshell.drivers.{{ environment_driver }}]
       allow_driver_config = true
     owner: root
