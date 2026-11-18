@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "package-z3", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -59,8 +59,9 @@ $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindo
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
-$Z3Version = '5.1.0'
-$Z3SourceSha256 = 'e7ab3f8b682d5f55e813f951c7f9bb4fb9a48567ce6143d7adae23027e0e42a0'
+$Z3Pin = Get-Content -LiteralPath (Join-Path $RepoRoot 'tasks/windows-z3.json') -Raw | ConvertFrom-Json
+$Z3Version = $Z3Pin.version
+$Z3SourceSha256 = $Z3Pin.sourceSha256
 $PrebuiltZ3Version = $Z3Version
 $Z3WorkspaceFeatures = '--features openshell-prover/prebuilt-z3'
 $Z3ServerFeatures = '--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3'
@@ -525,6 +526,64 @@ function Reset-WindowsCMakeGeneratorCache([string] $RustTarget) {
     }
 }
 
+function Invoke-Z3Package([string] $RustTarget) {
+    $source = Resolve-Z3Source
+    $vsDevCmd = Resolve-VsDevCmd $RustTarget
+    $ninja = Resolve-NinjaPath
+    $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    $cmakePath = if ($cmake) { $cmake.Source } else { Join-Path (Split-Path (Split-Path $ninja)) 'CMake/bin/cmake.exe' }
+    if (-not (Test-Path -LiteralPath $cmakePath)) { throw 'Install Visual Studio CMake tools to package Z3.' }
+    $build = Join-Path $TargetDir "z3-build/$RustTarget"
+    $output = Join-Path $TargetDir 'windows-z3-packages'
+    $install = Join-Path $build 'install'
+    $package = Join-Path $build 'package'
+    New-Item -ItemType Directory -Path $build, $output -Force | Out-Null
+    if (Test-Path -LiteralPath $package) { Remove-Item -LiteralPath $package -Recurse -Force }
+    $flags = @(
+        '-G Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
+        '-DZ3_BUILD_LIBZ3_SHARED=OFF', '-DZ3_BUILD_LIBZ3_MSVC_STATIC=ON',
+        '-DZ3_LINK_TIME_OPTIMIZATION=OFF', '-DZ3_BUILD_EXECUTABLE=ON',
+        '-DZ3_BUILD_TEST_EXECUTABLES=OFF', '-DZ3_ENABLE_EXAMPLE_TARGETS=OFF',
+        '-DZ3_BUILD_PYTHON_BINDINGS=OFF', '-DZ3_BUILD_DOTNET_BINDINGS=OFF', '-DZ3_BUILD_JAVA_BINDINGS=OFF'
+    )
+    $log = Join-Path $LogDir "package-z3-$RustTarget.log"
+    $cmd = @(
+        "call `"$vsDevCmd`" -arch=$(Get-VsTargetArch $RustTarget) -host_arch=$(Get-HostArch)",
+        "`"$cmakePath`" -S `"$source`" -B `"$build`" $($flags -join ' ') -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_INSTALL_PREFIX=`"$install`"",
+        "`"$cmakePath`" --build `"$build`" --target install --parallel $WindowsBuildJobs"
+    ) -join ' && '
+    Write-Host "==> Building pinned Z3 $Z3Version /MT package for $RustTarget (one-time dependency build)"
+    & cmd /d /c "$cmd > `"$log`" 2>&1"
+    if ($LASTEXITCODE -ne 0) { Get-Content -LiteralPath $log -Tail 100; throw "Z3 package build failed. See $log" }
+    $solver = Join-Path $install 'bin/z3.exe'
+    Assert-StaticWindowsRuntime $solver $RustTarget
+    $version = & $solver -version
+    if ($LASTEXITCODE -ne 0 -or $version -notmatch "^Z3 version $([regex]::Escape($Z3Version))( |$)") { throw "Wrong packaged Z3 version: $version" }
+    $query = Join-Path $build 'smoke.smt2'
+    Set-Content -LiteralPath $query -Encoding ASCII -Value '(declare-const x Int) (assert (> x 0)) (check-sat) (assert (< x 0)) (check-sat)'
+    $answers = @(& $solver $query)
+    if ($LASTEXITCODE -ne 0 -or ($answers -join ',') -ne 'sat,unsat') { throw "Z3 solver smoke failed: $answers" }
+    if (Select-String -LiteralPath (Join-Path $build 'build.ninja') -Pattern '(?i)(?:/GL|-flto)(?:\s|$)' -Quiet) { throw 'Portable Z3 archives must not contain compiler-specific LTO objects.' }
+    New-Item -ItemType Directory -Path $package -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $install 'lib'), (Join-Path $install 'include') -Destination $package -Recurse
+    Copy-Item -LiteralPath (Join-Path $source 'LICENSE.txt') -Destination $package
+    $files = @(Get-ChildItem -LiteralPath $package -File -Recurse | ForEach-Object {
+        [ordered]@{ path = $_.FullName.Substring($package.Length + 1).Replace('\', '/'); sha256 = (Get-Sha256 $_.FullName).ToLowerInvariant(); size = $_.Length }
+    })
+    [ordered]@{
+        version = $Z3Version; target = $RustTarget; runtime = 'MT'; configuration = 'Release'; lto = $false
+        sourceUrl = "https://github.com/Z3Prover/z3/archive/refs/tags/z3-$Z3Version.zip"
+        sourceSha256 = $Z3SourceSha256; buildRevision = (& git -C $RepoRoot rev-parse HEAD)
+        cmakeFlags = $flags; solverSmoke = $answers; staticRuntimeAudit = 'passed'; files = $files
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $package 'build.json') -Encoding UTF8
+    $archive = Join-Path $output "z3-$Z3Version-$RustTarget-mt-v$($Z3Pin.packageRevision).zip"
+    if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::CreateFromDirectory($package, $archive, [IO.Compression.CompressionLevel]::Optimal, $false)
+    "$(Get-Sha256 $archive)  $(Split-Path -Leaf $archive)" | Set-Content -LiteralPath "$archive.sha256" -Encoding ASCII
+    Write-Host "==> Z3 package: $archive ($((Get-Item -LiteralPath $archive).Length) bytes)"
+}
+
 function Invoke-VsCargo {
     param(
         [Parameter(Mandatory = $true)] [string] $RustTarget,
@@ -842,6 +901,9 @@ if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-
 }
 
 switch ($Action) {
+    "package-z3" {
+        foreach ($rustTarget in $targets) { Invoke-Z3Package $rustTarget }
+    }
     "check" {
         foreach ($rustTarget in $targets) {
             Invoke-Check $rustTarget

@@ -11,6 +11,10 @@ on:
         description: Build and test static CRT/Z3 packages (may build Z3 from source)
         type: boolean
         default: false
+      publish_z3:
+        description: Build and publish pinned static Z3 dependency packages only
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,7 +37,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      should_run: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true' }}
+      should_run: ${{ !inputs.publish_z3 && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -107,6 +111,100 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats
+
+  z3-package:
+    name: Package pinned Z3 (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_z3
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            rust_target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/z3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and validate static Z3 package
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 package-z3 ${{ matrix.rust_target }}
+      - name: Upload verified package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-z3-${{ matrix.arch }}
+          path: ${{ runner.temp }}/z3/windows-z3-packages/*
+          compression-level: 0
+      - name: Upload dependency build log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-z3-build-log-${{ matrix.arch }}
+          path: package-z3-${{ matrix.rust_target }}.log
+
+  publish-z3:
+    name: Publish pinned Z3 to GHCR
+    needs: z3-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: windows-z3-*
+          merge-multiple: true
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.0
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish versioned packages
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version tasks/windows-z3.json)"
+          revision="$(jq -r .packageRevision tasks/windows-z3.json)"
+          repository="$(jq -r .repository tasks/windows-z3.json)"
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            archive="z3-${version}-${target}-mt-v${revision}.zip"
+            sha256sum --check "${archive}.sha256"
+            ref="${repository}:${version}-${target}-mt-v${revision}"
+            if oras resolve "$ref" >existing.txt 2>resolve-error.txt; then
+              echo "Refusing to replace existing dependency tag: $ref" >&2
+              exit 1
+            elif ! grep -Eqi 'NAME_UNKNOWN|MANIFEST_UNKNOWN|not found' resolve-error.txt; then
+              cat resolve-error.txt >&2
+              exit 1
+            fi
+            oras push "$ref" \
+              --artifact-type application/vnd.nvidia.openshell.z3.v1 \
+              --annotation org.opencontainers.image.source=https://github.com/NVIDIA/OpenShell \
+              --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+              --annotation "org.opencontainers.image.version=${version}" \
+              --annotation org.opencontainers.image.licenses=MIT \
+              "${archive}:application/zip"
+            digest="$(oras resolve "$ref")"
+            printf '%s@%s\n' "$ref" "$digest" | tee -a published-z3.txt
+            printf '%s  %s\n' "$digest" "$ref" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: published-z3-pins
+          path: |
+            published-z3.txt
+            *.sha256
 
   cache-seed:
     name: Seed cache (${{ matrix.arch }})

@@ -1,0 +1,8 @@
+{
+  "version": "5.1.0",
+  "sourceSha256": "e7ab3f8b682d5f55e813f951c7f9bb4fb9a48567ce6143d7adae23027e0e42a0",
+  "repository": "ghcr.io/nvidia/openshell/z3",
+  "artifactType": "application/vnd.nvidia.openshell.z3.v1",
+  "packageRevision": 1,
+  "packages": {}
+}
