@@ -3,8 +3,10 @@
 
 //! Policy DNS answers a sandbox's lookup of an allowed name with a synthetic
 //! address. Clients keep resolved addresses in their own DNS caches (libcurl
-//! for 60 s, the JDK for 30 s), so the address must keep taking new
-//! connections for a while after the lookup.
+//! for 60 s, the JDK for 30 s). The network rules docs promise that a new
+//! connection to a cached address still works after its DNS mapping expires:
+//! OpenShell refreshes the destination, and the address stays the same while
+//! the endpoint policy is unchanged.
 //!
 //! The upstream server runs on the test host ([`host_server_support`]) and
 //! the sandbox reaches it as `host.openshell.internal`.
@@ -23,20 +25,19 @@ const TEST_HOST: &str = "host.openshell.internal";
 /// Policy DNS gives a host alias such as `TEST_HOST` a mapping that expires
 /// exactly 30 s after the lookup (`MAX_MAPPING_TTL` in
 /// `openshell-supervisor-network`), with no grace period. Waiting 33 s
-/// outlasts that mapping by a few seconds, so the test fails while #4674 is
-/// open whatever the timing of the exec calls. The wait starts after the
-/// first connection returns, so the address is older still when the test
-/// reuses it.
+/// outlasts that mapping by a few seconds whatever the timing of the exec
+/// calls, so the second connection has to go through the refresh. The wait
+/// starts after the first connection returns, so the address is older still
+/// when the test reuses it.
 ///
 /// A shorter wait would need a mapping with a shorter lifetime. Other names
 /// take their upstream DNS TTL, but a conformance test can't control the
 /// sandbox's upstream resolver, and the host server is reachable only through
 /// the host alias.
 ///
-/// This wait checks that the address outlasts the current 30 s limit. It
-/// doesn't check a particular longer lifetime, such as the 60 s libcurl
-/// caches for. A unit test with an injected clock should cover the exact
-/// lifetime the fix guarantees.
+/// A longer wait adds nothing: the docs set no limit on how long a cached
+/// address works, and once the mapping has expired every connection takes the
+/// same refresh path.
 const CACHED_ADDRESS_AGE: Duration = Duration::from_secs(33);
 
 /// Resolves `TEST_HOST` the way a client does and prints the synthetic IPv4
