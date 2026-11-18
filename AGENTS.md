@@ -71,7 +71,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
 | `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
 | `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
-| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer) |
+| `.agents/agents/` | Agents | Agent runtimes; see [layout](.agents/agents/README.md) |
 
 ## Public API Conventions
 

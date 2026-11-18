@@ -19,7 +19,6 @@ import os
 import re
 import sys
 import time
-import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,58 +93,20 @@ def session_request(config: AgentConfig, instructions: str, evidence: dict) -> d
     }
 
 
-class ManagedAgents:
-    """SDK transport with retries disabled, including uncertain session creation."""
-
-    def __init__(self, api_key: str):
-        if not api_key.strip():
-            raise ValueError("ANTHROPIC_API_KEY is required for --run")
-        try:
-            import anthropic
-        except ImportError:
-            raise ClassifierError(
-                "Run with uv run --no-project tasks/scripts/managed_label_classifier.py"
-                " to install the pinned anthropic SDK"
-            ) from None
-        self.sdk = anthropic
-        self.client = anthropic.Anthropic(
-            api_key=api_key,
-            max_retries=0,
-            default_headers={"anthropic-version": API_VERSION},
-        )
-
-    def request(self, method: str, path: str, payload: dict | None, timeout: float):
-        route = urllib.parse.urlsplit(path)
-        parts = route.path.strip("/").split("/")
-        sessions = self.client.beta.sessions
-        options = {"timeout": timeout, "betas": [BETA]}
-        try:
-            if method == "POST" and parts == ["sessions"]:
-                result = sessions.create(**payload, **options)
-            elif method == "GET" and len(parts) == 2:
-                result = sessions.retrieve(parts[1], **options)
-            elif method == "GET" and parts[2:] == ["events"]:
-                query = dict(urllib.parse.parse_qsl(route.query))
-                query["limit"] = int(query["limit"])
-                result = sessions.events.list(parts[1], **query, **options)
-            elif method == "POST" and parts[2:] == ["events"]:
-                result = sessions.events.send(parts[1], **payload, **options)
-            elif method == "POST" and parts[2:] == ["archive"]:
-                result = sessions.archive(parts[1], **options)
-            else:
-                raise ValueError("Unsupported Managed Agents operation")
-        except self.sdk.APIStatusError as error:
-            raise ClassifierError(
-                f"Managed Agents returned HTTP {error.status_code}"
-            ) from None
-        except self.sdk.APIError:
-            raise ClassifierError(
-                "Managed Agents request failed; no automatic retry"
-            ) from None
-        result = result.to_dict()
-        if not isinstance(result, dict):
-            raise ClassifierError("Managed Agents returned a non-object response")
-        return result
+def create_client(api_key: str):
+    if not api_key.strip():
+        raise ValueError("ANTHROPIC_API_KEY is required for --run")
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        raise ClassifierError(
+            "Run with uv run --no-project tasks/scripts/managed_label_classifier.py"
+            " to install the pinned anthropic SDK"
+        ) from None
+    return Anthropic(
+        api_key=api_key,
+        default_headers={"anthropic-version": API_VERSION},
+    )
 
 
 def completed_proposal(events: list[dict]) -> dict | None:
@@ -200,8 +161,9 @@ def completed_proposal(events: list[dict]) -> dict | None:
     return None
 
 
-def archive_failed_session(transport, session_id, *, clock, sleep):
+def archive_failed_session(client, session_id, *, clock, sleep):
     deadline = clock() + CLEANUP_TIMEOUT_SECONDS
+    sessions = client.beta.sessions
 
     def remaining():
         seconds = deadline - clock()
@@ -209,22 +171,22 @@ def archive_failed_session(transport, session_id, *, clock, sleep):
             raise ClassifierError("Session cleanup exceeded its deadline")
         return min(seconds, 10)
 
-    transport.request(
-        "POST",
-        f"/sessions/{session_id}/events",
-        {"events": [{"type": "user.interrupt"}]},
-        remaining(),
+    sessions.events.send(
+        session_id,
+        events=[{"type": "user.interrupt"}],
+        timeout=remaining(),
+        betas=[BETA],
     )
     while True:
-        session = transport.request("GET", f"/sessions/{session_id}", None, remaining())
-        if session.get("status") in {"idle", "terminated"}:
+        session = sessions.retrieve(session_id, timeout=remaining(), betas=[BETA])
+        if session.status in {"idle", "terminated"}:
             break
         sleep(min(2, remaining()))
-    transport.request("POST", f"/sessions/{session_id}/archive", {}, remaining())
+    sessions.archive(session_id, timeout=remaining(), betas=[BETA])
 
 
 def classify(
-    transport,
+    client,
     request: dict,
     *,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
@@ -241,8 +203,14 @@ def classify(
     ):
         raise ValueError("timeout and poll interval must be finite and positive")
     deadline = clock() + timeout
-    session = transport.request("POST", "/sessions", request, min(timeout, 30))
-    session_id = session.get("id")
+    sessions = client.beta.sessions
+    try:
+        session = sessions.create(**request, timeout=min(timeout, 30), betas=[BETA])
+    except Exception as error:
+        raise ClassifierError(
+            f"Managed Agents session creation failed ({type(error).__name__})"
+        ) from error
+    session_id = session.id
     if not isinstance(session_id, str) or not re.fullmatch(
         r"sesn_[A-Za-z0-9]+", session_id
     ):
@@ -252,53 +220,37 @@ def classify(
     try:
         while clock() < deadline:
             events = []
-            events_path = f"/sessions/{session_id}/events?order=asc&limit=100"
-            path = events_path
-            pages = set()
-            while path:
-                remaining = deadline - clock()
-                if remaining <= 0:
+            first_page = sessions.events.list(
+                session_id,
+                order="asc",
+                limit=100,
+                timeout=min(deadline - clock(), 30),
+                betas=[BETA],
+            )
+            for page in first_page.iter_pages():
+                if clock() >= deadline:
                     raise ClassifierError("Classifier exceeded the execution deadline")
-                page = transport.request("GET", path, None, min(remaining, 30))
-                batch = page.get("data")
-                if not isinstance(batch, list) or any(
-                    not isinstance(event, dict) for event in batch
-                ):
-                    raise ClassifierError(
-                        "Managed Agents returned an invalid event page"
-                    )
-                events.extend(batch)
+                events.extend(event.to_dict() for event in page.data)
                 if len(events) > 1000:
                     raise ClassifierError("Classifier exceeded the event limit")
-                cursor = page.get("next_page")
-                if cursor is not None and (
-                    not isinstance(cursor, str) or cursor in pages
-                ):
-                    raise ClassifierError(
-                        "Managed Agents returned an invalid pagination cursor"
-                    )
-                if cursor:
-                    pages.add(cursor)
-                path = (
-                    events_path + "&page=" + urllib.parse.quote(cursor, safe="")
-                    if cursor
-                    else None
-                )
             proposal = completed_proposal(events)
             if proposal is not None:
                 return {"session_id": session_id, "proposal": proposal}
             sleep(min(poll_interval, max(0, deadline - clock())))
         raise ClassifierError("Classifier exceeded the execution deadline")
     except (Exception, KeyboardInterrupt) as error:
+        detail = (
+            str(error) if isinstance(error, ClassifierError) else type(error).__name__
+        )
         try:
-            archive_failed_session(transport, session_id, clock=clock, sleep=sleep)
+            archive_failed_session(client, session_id, clock=clock, sleep=sleep)
         except (Exception, KeyboardInterrupt):
             raise ClassifierError(
-                f"Classifier failed in {session_id}: {error}; cleanup unconfirmed; "
+                f"Classifier failed in {session_id}: {detail}; cleanup unconfirmed; "
                 "remote execution may continue; inspect the session"
             ) from error
         raise ClassifierError(
-            f"Classifier failed in {session_id}: {error}; session archived"
+            f"Classifier failed in {session_id}: {detail}; session archived"
         ) from error
 
 
@@ -335,15 +287,11 @@ def main() -> int:
         request = session_request(
             config, args.instructions.read_text(), json.loads(args.evidence.read_text())
         )
-        result = (
-            classify(
-                ManagedAgents(os.environ.get("ANTHROPIC_API_KEY", "")),
-                request,
-                timeout=args.timeout,
-            )
-            if args.run
-            else request
-        )
+        if args.run:
+            with create_client(os.environ.get("ANTHROPIC_API_KEY", "")) as client:
+                result = classify(client, request, timeout=args.timeout)
+        else:
+            result = request
         print(json.dumps(result, indent=2, sort_keys=True))
     except (ClassifierError, ValueError, OSError) as error:
         print(str(error), file=sys.stderr)

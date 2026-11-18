@@ -42,10 +42,12 @@ session. Never include credentials in evidence. `--help` lists the budget and
 deadline defaults. The result contains `session_id` and `proposal`.
 
 The CLI installs its pinned `anthropic` SDK through script metadata. Importing the
-adapter and running offline tests need no SDK. SDK requests disable automatic retries.
+adapter and running offline tests need no SDK. The SDK owns request retries and
+event pagination; the adapter does not retry classifications.
 
 On failure or interruption, cleanup sends `user.interrupt`, waits for idle, and
-archives within a separate 30-second deadline. Unconfirmed cleanup reports the
+archives using a separate 30-second polling deadline. SDK retries can extend
+individual requests beyond that deadline. Unconfirmed cleanup reports the
 session ID and warns that execution may continue. Successful sessions remain for
 review.
 See the [session event API](https://platform.claude.com/docs/en/managed-agents/events-and-streaming).

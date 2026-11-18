@@ -16,9 +16,9 @@ from managed_label_classifier import (
     BETA,
     AgentConfig,
     ClassifierError,
-    ManagedAgents,
     classify,
     completed_proposal,
+    create_client,
     main,
     session_request,
 )
@@ -39,28 +39,37 @@ def proposal_events():
     ]
 
 
-class FakeTransport:
+def sdk_page(events, *following_pages):
+    page = Mock()
+    page.data = [Mock(to_dict=Mock(return_value=value)) for value in events]
+    page.iter_pages.return_value = iter([page, *following_pages])
+    return page
+
+
+class FakeClient:
     def __init__(self, pages):
-        self.pages = iter(pages)
-        self.calls = []
+        self.beta = SimpleNamespace(sessions=Mock())
+        self.sessions = self.beta.sessions
+        self.sessions.create.return_value = SimpleNamespace(id="sesn_test")
+        self.sessions.events.list.side_effect = pages
+        self.sessions.events.send.side_effect = self.interrupt
+        self.sessions.retrieve.side_effect = self.retrieve
+        self.sessions.archive.side_effect = self.archive
         self.running = False
         self.pending_interrupt = False
 
-    def request(self, method, path, payload, timeout):
-        self.calls.append((method, path, payload, timeout))
-        if path == "/sessions/sesn_test/events" and method == "POST":
-            self.pending_interrupt = True
-            return {}
-        if path == "/sessions/sesn_test" and method == "GET":
-            status = "running" if self.running else "idle"
-            if self.pending_interrupt:
-                self.running = False
-            return {"status": status}
-        if path.endswith("/archive") and self.running:
+    def interrupt(self, _session_id, **_options):
+        self.pending_interrupt = True
+
+    def retrieve(self, _session_id, **_options):
+        status = "running" if self.running else "idle"
+        if self.pending_interrupt:
+            self.running = False
+        return SimpleNamespace(status=status)
+
+    def archive(self, _session_id, **_options):
+        if self.running:
             raise ClassifierError("Cannot archive a running session")
-        if method == "POST":
-            return {"id": "sesn_test"} if path == "/sessions" else {}
-        return next(self.pages)
 
 
 class RequestTests(unittest.TestCase):
@@ -165,51 +174,36 @@ class CompletionTests(unittest.TestCase):
 
 class ExecutionTests(unittest.TestCase):
     def test_success_returns_proposal_and_execution_reference(self):
-        transport = FakeTransport([{"data": proposal_events()}])
-        result = classify(transport, {"request": "test"})
+        client = FakeClient([sdk_page(proposal_events())])
+        request = {"title": "test"}
         self.assertEqual(
-            result,
+            classify(client, request),
             {"session_id": "sesn_test", "proposal": {"labels": ["area:build"]}},
         )
-        self.assertEqual(len(transport.calls), 2)
+        client.sessions.create.assert_called_once_with(
+            **request, timeout=30, betas=[BETA]
+        )
+        client.sessions.events.list.assert_called_once()
+        client.sessions.archive.assert_not_called()
 
-    def test_pagination_prevents_mistaking_a_partial_transcript_for_completion(self):
+    def test_sdk_pagination_reads_complete_transcript(self):
         message, done = proposal_events()
-        transport = FakeTransport(
-            [
-                {"data": [message], "next_page": "cursor+1"},
-                {"data": [done], "next_page": None},
-            ]
-        )
-        self.assertEqual(
-            classify(transport, {})["proposal"], {"labels": ["area:build"]}
-        )
-        self.assertIn("page=cursor%2B1", transport.calls[2][1])
+        page = sdk_page([message], sdk_page([done]))
+        client = FakeClient([page])
+        self.assertEqual(classify(client, {})["proposal"], {"labels": ["area:build"]})
+        page.iter_pages.assert_called_once_with()
 
     def test_polling_waits_for_completion(self):
-        transport = FakeTransport(
-            [{"data": proposal_events()[:1]}, {"data": proposal_events()}]
+        client = FakeClient(
+            [sdk_page(proposal_events()[:1]), sdk_page(proposal_events())]
         )
         sleeps = []
-        result = classify(transport, {}, clock=lambda: 0, sleep=sleeps.append)
+        result = classify(client, {}, clock=lambda: 0, sleep=sleeps.append)
         self.assertEqual(result["session_id"], "sesn_test")
         self.assertEqual(sleeps, [2])
 
-    def test_failure_archives_session_and_does_not_create_another(self):
-        transport = FakeTransport([{"data": [event("session.error", "error")]}])
-        with self.assertRaisesRegex(ClassifierError, "sesn_test.*session archived"):
-            classify(transport, {})
-        self.assertEqual(
-            [call[1] for call in transport.calls if call[0] == "POST"],
-            [
-                "/sessions",
-                "/sessions/sesn_test/events",
-                "/sessions/sesn_test/archive",
-            ],
-        )
-
-    def test_malformed_proposal_archives_session_without_retry(self):
-        events = [
+    def test_failed_proposals_are_archived_without_reclassification(self):
+        malformed = [
             event(
                 "agent.message",
                 "message",
@@ -217,201 +211,133 @@ class ExecutionTests(unittest.TestCase):
             ),
             proposal_events()[1],
         ]
-        transport = FakeTransport([{"data": events}])
-        with self.assertRaisesRegex(
-            ClassifierError,
-            "sesn_test: Classifier proposal is not a JSON object; session archived",
-        ):
-            classify(transport, {})
-        self.assertEqual(
-            [(call[0], call[1]) for call in transport.calls],
-            [
-                ("POST", "/sessions"),
-                ("GET", "/sessions/sesn_test/events?order=asc&limit=100"),
-                ("POST", "/sessions/sesn_test/events"),
-                ("GET", "/sessions/sesn_test"),
-                ("POST", "/sessions/sesn_test/archive"),
-            ],
-        )
+        for events, diagnostic in [
+            ([event("session.error", "error")], "session failed"),
+            (malformed, "not a JSON object"),
+        ]:
+            with self.subTest(diagnostic=diagnostic):
+                client = FakeClient([sdk_page(events)])
+                with self.assertRaisesRegex(
+                    ClassifierError, f"sesn_test.*{diagnostic}.*session archived"
+                ):
+                    classify(client, {})
+                client.sessions.create.assert_called_once()
+                client.sessions.events.send.assert_called_once_with(
+                    "sesn_test",
+                    events=[{"type": "user.interrupt"}],
+                    timeout=unittest.mock.ANY,
+                    betas=[BETA],
+                )
+                client.sessions.archive.assert_called_once()
 
-    def test_timeout_archives_session(self):
-        transport = FakeTransport([])
-        transport.running = True
+    def test_timeout_interrupts_running_session_before_archival(self):
+        client = FakeClient([])
+        client.running = True
         ticks = iter([0, 181])
         sleeps = []
         with self.assertRaisesRegex(ClassifierError, "deadline.*session archived"):
-            classify(transport, {}, clock=lambda: next(ticks, 181), sleep=sleeps.append)
-        self.assertFalse(transport.running)
+            classify(client, {}, clock=lambda: next(ticks, 181), sleep=sleeps.append)
+        self.assertFalse(client.running)
         self.assertEqual(sleeps, [2])
-        self.assertEqual(
-            transport.calls[1][2], {"events": [{"type": "user.interrupt"}]}
+        client.sessions.events.send.assert_called_once_with(
+            "sesn_test",
+            events=[{"type": "user.interrupt"}],
+            timeout=10,
+            betas=[BETA],
         )
-        self.assertEqual(transport.calls[-1][1], "/sessions/sesn_test/archive")
+        self.assertEqual(client.sessions.retrieve.call_count, 2)
+        client.sessions.archive.assert_called_once()
 
     def test_keyboard_interrupt_stops_running_session_before_archival(self):
-        transport = FakeTransport([])
-        transport.running = True
-        original = transport.request
-
-        def request(method, path, payload, timeout):
-            if "?" in path:
-                raise KeyboardInterrupt()
-            return original(method, path, payload, timeout)
-
-        transport.request = request
+        client = FakeClient([])
+        client.running = True
+        client.sessions.events.list.side_effect = KeyboardInterrupt()
         with self.assertRaisesRegex(ClassifierError, "sesn_test.*session archived"):
-            classify(transport, {}, sleep=lambda _: None)
-        self.assertFalse(transport.running)
-        self.assertEqual(transport.calls[-1][1], "/sessions/sesn_test/archive")
+            classify(client, {}, sleep=lambda _: None)
+        self.assertFalse(client.running)
+        client.sessions.archive.assert_called_once()
 
     def test_cleanup_deadline_reports_unconfirmed_remote_execution(self):
-        transport = FakeTransport([])
-        original = transport.request
-
-        def request(method, path, payload, timeout):
-            if method == "GET":
-                return {"status": "running"}
-            return original(method, path, payload, timeout)
-
-        transport.request = request
+        client = FakeClient([])
+        client.sessions.retrieve.side_effect = None
+        client.sessions.retrieve.return_value = SimpleNamespace(status="running")
         now = [0]
 
-        def clock():
-            return now[0]
+        def create(**_options):
+            now[0] = 181
+            return SimpleNamespace(id="sesn_test")
 
         def sleep(seconds):
             now[0] += seconds
 
-        def timed_request(method, path, payload, timeout):
-            result = request(method, path, payload, timeout)
-            if path == "/sessions":
-                now[0] = 181
-            return result
-
-        transport.request = timed_request
+        client.sessions.create.side_effect = create
         with self.assertRaisesRegex(
             ClassifierError, "sesn_test.*cleanup unconfirmed.*may continue"
         ):
-            classify(transport, {}, clock=clock, sleep=sleep)
+            classify(client, {}, clock=lambda: now[0], sleep=sleep)
         self.assertEqual(now[0], 211)
-        self.assertFalse(any(call[1].endswith("/archive") for call in transport.calls))
+        client.sessions.archive.assert_not_called()
 
-    def test_pagination_cycles_fail_and_archive(self):
-        transport = FakeTransport(
-            [{"data": [], "next_page": "same"}, {"data": [], "next_page": "same"}]
-        )
-        with self.assertRaisesRegex(ClassifierError, "pagination"):
-            classify(transport, {})
+    def test_event_limit_fails_and_archives(self):
+        client = FakeClient([sdk_page(proposal_events() * 501)])
+        with self.assertRaisesRegex(ClassifierError, "event limit"):
+            classify(client, {})
+        client.sessions.archive.assert_called_once()
+
+    def test_deadline_is_checked_between_sdk_pages(self):
+        client = FakeClient([sdk_page([], sdk_page(proposal_events()))])
+        ticks = iter([0, 0, 0, 0, 181])
+        with self.assertRaisesRegex(ClassifierError, "deadline.*session archived"):
+            classify(client, {}, clock=lambda: next(ticks, 181))
+        client.sessions.archive.assert_called_once()
 
     def test_unconfirmed_archival_reports_session_for_manual_recovery(self):
-        transport = FakeTransport([{"data": [event("session.error", "error")]}])
-        original = transport.request
+        client = FakeClient([sdk_page([event("session.error", "error")])])
+        client.sessions.archive.side_effect = RuntimeError("test-secret")
+        with self.assertRaisesRegex(
+            ClassifierError, "sesn_test.*cleanup unconfirmed"
+        ) as caught:
+            classify(client, {})
+        self.assertNotIn("test-secret", str(caught.exception))
 
-        def request(method, path, payload, timeout):
-            if path.endswith("/archive"):
-                raise ClassifierError("unavailable")
-            return original(method, path, payload, timeout)
+    def test_sdk_failures_preserve_session_reference_without_echoing_response(self):
+        client = FakeClient([])
+        client.sessions.events.list.side_effect = RuntimeError("test-secret")
+        with self.assertRaisesRegex(
+            ClassifierError, "sesn_test.*RuntimeError.*session archived"
+        ) as caught:
+            classify(client, {})
+        self.assertNotIn("test-secret", str(caught.exception))
 
-        transport.request = request
-        with self.assertRaisesRegex(ClassifierError, "sesn_test.*cleanup unconfirmed"):
-            classify(transport, {})
+    def test_creation_failure_is_left_to_sdk_without_application_retry(self):
+        client = FakeClient([])
+        client.sessions.create.side_effect = RuntimeError("test-secret")
+        with self.assertRaisesRegex(
+            ClassifierError, "session creation failed"
+        ) as caught:
+            classify(client, {})
+        client.sessions.create.assert_called_once()
+        client.sessions.events.send.assert_not_called()
+        self.assertNotIn("test-secret", str(caught.exception))
 
     def test_nonfinite_deadlines_are_rejected_before_session_creation(self):
         for timeout in [0, -1, float("nan"), float("inf")]:
-            transport = FakeTransport([])
+            client = FakeClient([])
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
-                classify(transport, {}, timeout=timeout)
-            self.assertEqual(transport.calls, [])
+                classify(client, {}, timeout=timeout)
+            client.sessions.create.assert_not_called()
 
 
-class TransportTests(unittest.TestCase):
-    def setUp(self):
-        class APIError(Exception):
-            pass
-
-        class APIStatusError(APIError):
-            status_code = 403
-
-        self.sdk = SimpleNamespace(
-            Anthropic=Mock(), APIError=APIError, APIStatusError=APIStatusError
-        )
-        with patch.dict("sys.modules", {"anthropic": self.sdk}):
-            self.transport = ManagedAgents("test-secret")
-        self.sessions = self.sdk.Anthropic.return_value.beta.sessions
-
-    def test_sdk_configuration_disables_retries(self):
-        self.sdk.Anthropic.assert_called_once_with(
+class ClientTests(unittest.TestCase):
+    def test_sdk_owns_retry_policy(self):
+        constructor = Mock()
+        sdk = SimpleNamespace(Anthropic=constructor)
+        with patch.dict("sys.modules", {"anthropic": sdk}):
+            self.assertIs(create_client("test-secret"), constructor.return_value)
+        constructor.assert_called_once_with(
             api_key="test-secret",
-            max_retries=0,
             default_headers={"anthropic-version": API_VERSION},
         )
-
-    def test_operations_use_sdk_bindings_and_bounded_timeouts(self):
-        for method, path, payload, operation, arguments, keywords in [
-            (
-                "POST",
-                "/sessions",
-                {"title": "test"},
-                self.sessions.create,
-                (),
-                {"title": "test"},
-            ),
-            (
-                "GET",
-                "/sessions/sesn_test",
-                None,
-                self.sessions.retrieve,
-                ("sesn_test",),
-                {},
-            ),
-            (
-                "GET",
-                "/sessions/sesn_test/events?order=asc&limit=100&page=cursor%2B1",
-                None,
-                self.sessions.events.list,
-                ("sesn_test",),
-                {"order": "asc", "limit": 100, "page": "cursor+1"},
-            ),
-            (
-                "POST",
-                "/sessions/sesn_test/events",
-                {"events": [{"type": "user.interrupt"}]},
-                self.sessions.events.send,
-                ("sesn_test",),
-                {"events": [{"type": "user.interrupt"}]},
-            ),
-            (
-                "POST",
-                "/sessions/sesn_test/archive",
-                {},
-                self.sessions.archive,
-                ("sesn_test",),
-                {},
-            ),
-        ]:
-            with self.subTest(path=path):
-                operation.return_value.to_dict.return_value = {"id": "test"}
-                self.assertEqual(
-                    self.transport.request(method, path, payload, 5), {"id": "test"}
-                )
-                operation.assert_called_once_with(
-                    *arguments, **keywords, timeout=5, betas=[BETA]
-                )
-
-    def test_sdk_failures_are_not_retried_or_echoed(self):
-        for error, message in [
-            (self.sdk.APIStatusError("test-secret"), "HTTP 403"),
-            (self.sdk.APIError("test-secret"), "no automatic retry"),
-        ]:
-            self.sessions.create.reset_mock()
-            self.sessions.create.side_effect = error
-            with (
-                self.subTest(error=error),
-                self.assertRaisesRegex(ClassifierError, message) as caught,
-            ):
-                self.transport.request("POST", "/sessions", {}, 5)
-            self.sessions.create.assert_called_once()
-            self.assertNotIn("test-secret", str(caught.exception))
 
 
 class CliTests(unittest.TestCase):
@@ -437,10 +363,10 @@ class CliTests(unittest.TestCase):
             with (
                 patch("sys.argv", arguments),
                 patch("sys.stdout", new_callable=io.StringIO) as output,
-                patch("managed_label_classifier.ManagedAgents") as transport,
+                patch("managed_label_classifier.create_client") as client,
             ):
                 self.assertEqual(main(), 0)
-                transport.assert_not_called()
+                client.assert_not_called()
                 self.assertEqual(
                     json.loads(output.getvalue())["agent"]["id"], "agent_test"
                 )
