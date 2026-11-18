@@ -177,6 +177,9 @@ pub trait SandboxIdentityProvider: fmt::Debug + Send + Sync {
 
     /// Obtain a JWT-SVID for `audience` whose identity is exactly the stable
     /// SPIFFE ID of `sandbox_id` under `gateway_id`.
+    /// `runtime_identity` is the compute driver's immutable runtime reference
+    /// persisted by the gateway. It must never come from a workload request;
+    /// adapters use it to bind issuance to the attested backing object.
     ///
     /// # Errors
     ///

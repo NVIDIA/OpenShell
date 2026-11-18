@@ -15,7 +15,7 @@ For each acquisition the adapter:
 2. Fetches current gateway X.509-SVID credentials and trust bundles through the
    local CSI Workload API socket.
 3. Connects to the Broker endpoint over mTLS, verifying the agent certificate
-   chain and exact configured SPIFFE URI through `openshell-crypto`.
+   chain and configured exact or cluster-scoped SPIFFE URI policy through `openshell-crypto`.
 4. Requests a JWT-SVID for a `KubernetesObjectReference` containing the Sandbox
    resource type and UID. SPIRE resolves and attests the object and enforces the
    gateway's Kubernetes authorization.
@@ -30,7 +30,9 @@ only bounded classifications; credentials and upstream diagnostics are not logge
 The operator enables SPIRE's experimental Broker endpoint, authorizes the
 gateway SPIFFE ID and `KubernetesObjectReference` over TCP, and configures
 `access_policy = "enforced"`. The agent needs Sandbox lookup and
-SubjectAccessReview permissions; the gateway SPIFFE ID needs
+SubjectAccessReview permissions. UID-only references require cluster-wide
+`get`/`list` access to Sandbox resources for the SPIRE agents; metadata-only
+responses do not narrow Kubernetes RBAC permissions. The gateway SPIFFE ID needs
 `impersonate-via-spire` only for its permitted Sandbox resources. Registrations
 match attested Sandbox UIDs and must reach each selected agent. The configured
 peer policy must authorize the endpoint's agent certificate. Configure exactly

@@ -95,6 +95,43 @@ struct BundlesResponse {
 fn failure(kind: TokenGrantFailureKind) -> TokenGrantFailure {
     TokenGrantFailure::new(kind, TokenGrantStage::WorkloadIdentity)
 }
+
+fn workload_failure(error: spiffe::WorkloadApiError) -> TokenGrantFailure {
+    use spiffe::WorkloadApiError;
+    failure(match error {
+        WorkloadApiError::Endpoint(_) => TokenGrantFailureKind::Configuration,
+        WorkloadApiError::NoIdentityIssued | WorkloadApiError::PermissionDenied(_) => {
+            TokenGrantFailureKind::WorkloadIdentityRejected
+        }
+        WorkloadApiError::Transport(spiffe::transport::TransportError::Status(status)) => {
+            return status_failure(status);
+        }
+        WorkloadApiError::Transport(spiffe::transport::TransportError::Tonic(_)) => {
+            TokenGrantFailureKind::Unavailable
+        }
+        _ => TokenGrantFailureKind::Unclassified,
+    })
+}
+
+fn transport_failure(error: &(dyn std::error::Error + 'static)) -> TokenGrantFailure {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if error.downcast_ref::<rustls::Error>().is_some() {
+            return identity_rejected();
+        }
+        // io::Error does not expose its contained error through source on
+        // every platform. Inspect it explicitly for TLS handshake failures.
+        if let Some(inner) = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            && inner.downcast_ref::<rustls::Error>().is_some()
+        {
+            return identity_rejected();
+        }
+        cause = error.source();
+    }
+    failure(TokenGrantFailureKind::Unavailable)
+}
 fn status_failure(status: tonic::Status) -> TokenGrantFailure {
     failure(match status.code() {
         tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
@@ -158,13 +195,13 @@ async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailu
     let endpoint = format!("unix:{}", config.workload_api_socket_path);
     let workload = spiffe::WorkloadApiClient::connect_to(endpoint)
         .await
-        .map_err(|_| failure(TokenGrantFailureKind::Unavailable))?;
+        .map_err(workload_failure)?;
     // Fetch afresh at every acquisition. Neither client credentials nor trust
     // bundles are pinned across their Workload API rotation.
     let context = workload
         .fetch_x509_context()
         .await
-        .map_err(|_| failure(TokenGrantFailureKind::Unavailable))?;
+        .map_err(workload_failure)?;
     let svid = context.default_svid().ok_or_else(identity_rejected)?;
     let domain = spiffe::TrustDomain::new(
         openshell_spiffe::trust_domain(server_id).ok_or_else(configuration_failure)?,
@@ -226,7 +263,7 @@ async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailu
             }
         }))
         .await
-        .map_err(|_| failure(TokenGrantFailureKind::Unavailable))
+        .map_err(|error| transport_failure(&error))
 }
 
 pub async fn fetch(
@@ -312,6 +349,23 @@ pub async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permanent_identity_failures_are_distinct_from_connection_failures() {
+        assert_eq!(
+            workload_failure(spiffe::WorkloadApiError::NoIdentityIssued).kind(),
+            TokenGrantFailureKind::WorkloadIdentityRejected
+        );
+        let tls = std::io::Error::other(rustls::Error::General("test rejection".into()));
+        assert_eq!(
+            transport_failure(&tls).kind(),
+            TokenGrantFailureKind::WorkloadIdentityRejected
+        );
+        let unavailable = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            transport_failure(&unavailable).kind(),
+            TokenGrantFailureKind::Unavailable
+        );
+    }
     #[test]
     fn only_driver_authenticated_kubernetes_uid_references_are_accepted() {
         for runtime in [
