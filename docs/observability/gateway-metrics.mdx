@@ -15,8 +15,10 @@ to alert on saturation, to follow rollouts, and to choose autoscaling signals.
 ## Enable the Metrics Endpoint
 
 The gateway serves `GET /metrics` in the Prometheus text format on its own
-listener, separate from the API and health ports. When the listener is
-disabled, the gateway records no metrics. Enable it in one of these ways:
+listener, separate from the API and health ports. Metrics can also be pushed
+over OTLP independently of this listener; refer to
+[OTLP Metrics](/how-it-works/gateways/configuration#otlp-metrics).
+Enable the scrape listener in one of these ways:
 
 - In `gateway.toml`, set `metrics_bind_address` under `[openshell.gateway]`,
   for example `metrics_bind_address = "0.0.0.0:9090"`. Refer to
@@ -174,6 +176,8 @@ Supervisor sessions:
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `openshell_server_supervisor_sessions` | Gauge | None | Supervisor control sessions held by this replica. After a rollout settles, the sum across pods equals the number of connected sandboxes. |
+| `openshell_server_supervisor_hosts` | Gauge | None | Shared supervisors whose assignment streams this replica serves. |
+| `openshell_server_supervisor_host_instances_max` | Gauge | None | Most sandbox instances placed on one shared supervisor this replica serves. |
 
 Relays:
 

@@ -151,6 +151,8 @@ def main() -> None:
                 edge("openshell-driver-vault", "sha2"),
                 edge("policy-test-app", "russh"),
                 edge("russh", "aes"),
+                edge("russh", "rsa"),
+                edge("rsa", "hmac"),
                 edge("policy-test-app", "rustls"),
                 edge("rustls", "ring"),
             ],
@@ -182,6 +184,9 @@ def main() -> None:
             root / "direct-dependencies",
             [
                 *facade,
+                edge("policy-test-app", "russh"),
+                edge("russh", "rsa"),
+                edge("rsa", "hmac"),
                 *(edge("policy-test-app", package) for package in direct_packages),
             ],
             direct_packages,

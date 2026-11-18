@@ -22,7 +22,8 @@ const PYTHON: &str = "python3";
 
 /// Requests `/` from `host.openshell.internal` on the port in `argv[1]` and
 /// prints the response. The server listens before the sandbox is created,
-/// and a Ready sandbox's network is up, so the client doesn't retry.
+/// and the network is up before the main process starts, so the client
+/// doesn't retry.
 const CLIENT: &str = r#"
 import socket, sys
 
@@ -45,25 +46,21 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
     let server = HttpRecorder::start(marker.clone()).await?;
     let image = testkit::python_image();
 
-    // The client runs through `sandbox exec` in a Ready sandbox, not as the
-    // main process. A gateway with several replicas (k3s-ha) can refuse to
-    // attach to a main process that already finished with "sandbox is not
-    // ready" when the request reaches a replica that doesn't hold the
-    // sandbox's session.
-    let sandbox = cx
-        .sandbox("hg")
+    // The client runs as the main process. It usually finishes before the CLI
+    // attaches, so on a gateway with several replicas (k3s-ha) this also
+    // covers attaching to a finished main process through a replica that
+    // doesn't hold the sandbox's supervisor session.
+    let client = cx
+        .cli_sandbox("hg")
         .image(image.clone())
-        .policy(policy(server.port))
-        .command(["sh", "-c", "exec sleep infinity"])
-        .create_ready()
-        .await
-        .context(format!("create a sandbox from {image}"))?;
-
-    let client = sandbox
-        .exec([PYTHON, "-c", CLIENT, &server.port.to_string()])
+        .policy_yaml(policy::to_yaml(&policy(server.port))?)
+        .command([PYTHON, "-c", CLIENT, &server.port.to_string()])
+        .run()
         .await?
         .success()
-        .context("run the client in the sandbox")?;
+        .context(format!(
+            "run the client as the main process of a sandbox from {image}"
+        ))?;
     testkit::ensure!(
         client.stdout.contains(&marker),
         "the client did not get the host server's response:\n{}{}",

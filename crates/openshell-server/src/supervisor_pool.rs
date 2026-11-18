@@ -77,6 +77,7 @@ use crate::gateway_ring::GatewayRing;
 use crate::persistence::{
     AtomicWrite, ObjectCursor, ObjectRecord, PersistenceError, Store, WriteCondition,
 };
+use crate::supervisor_spread::SupervisorSpread;
 
 const MEMBER_OBJECT_TYPE: &str = "supervisor_pool_member";
 const OWNER_OBJECT_TYPE: &str = "supervisor_instance_owner";
@@ -182,6 +183,7 @@ pub struct LiveMember {
     pub process_id: String,
     pub runtime_address: String,
     pub leaving: bool,
+    pub gateway_replica: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +393,7 @@ pub struct SupervisorPool {
     /// Keeps the pool's launch material.
     credentials: CredentialRuntime,
     replica_id: String,
+    spread: Arc<SupervisorSpread>,
     member_ttl: Duration,
     /// How often the records of served members are refreshed.
     member_refresh: Duration,
@@ -769,6 +772,7 @@ impl SupervisorPool {
         authority: Arc<SandboxSessionJwtAuthority>,
         credentials: CredentialRuntime,
         replica_id: String,
+        spread: Arc<SupervisorSpread>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -776,6 +780,7 @@ impl SupervisorPool {
             authority,
             credentials,
             replica_id,
+            spread,
             member_ttl: MEMBER_TTL,
             member_refresh: openshell_supervisor_control::pool_timing::MEMBER_REFRESH_INTERVAL,
             unowned_grace: UNOWNED_GRACE,
@@ -1168,6 +1173,7 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
+                gateway_replica: payload.gateway_replica,
             });
         }
         members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
@@ -2130,6 +2136,7 @@ impl SupervisorPool {
         }
         self.remove_withdrawn().await;
         let members = self.live_members().await?;
+        self.spread.observe(&members);
         let ring = ring_of(&members);
         let listed_at = tokio::time::Instant::now();
         // Listed before the owners, so a report row of a term newer than the
@@ -2671,6 +2678,7 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
+                gateway_replica: payload.gateway_replica,
             });
         Ok(takeover_cause(owner, member.as_ref()))
     }
@@ -2868,6 +2876,19 @@ impl SupervisorPool {
             );
         }
         lock(&self.minted).retain(|term, _| current_terms.contains(term));
+        let mut placed: BTreeMap<&str, usize> = served
+            .iter()
+            .map(|(member, _)| (member.as_str(), 0))
+            .collect();
+        for owner in view.owners.values() {
+            if let Some(count) = placed.get_mut(owner.member_id.as_str()) {
+                *count += 1;
+            }
+        }
+        crate::gateway_metrics::record_supervisor_hosts(
+            placed.len(),
+            placed.values().copied().max().unwrap_or(0),
+        );
         Some(view)
     }
 
@@ -3039,6 +3060,7 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
+                Arc::default(),
             );
             let unique = Arc::get_mut(&mut pool).expect("unique");
             unique.unowned_grace = Duration::ZERO;
@@ -3071,6 +3093,7 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
+                Arc::default(),
             )
         }
 
@@ -5519,6 +5542,7 @@ mod tests {
             process_id: process_id.to_string(),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
+            gateway_replica: String::new(),
         };
         assert_eq!(takeover_cause(&owner, None), Some("expired"));
         assert_eq!(
@@ -5543,6 +5567,7 @@ mod tests {
             process_id: format!("p-{id}"),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
+            gateway_replica: String::new(),
         };
         let members = vec![member("m1", false), member("m2", false), member("m3", true)];
         let ring = ring_of(&members);

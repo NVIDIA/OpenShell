@@ -5012,6 +5012,7 @@ pub(super) async fn handle_configure_provider_refresh(
             "refresh token endpoints must be defined by the provider profile, not material",
         ));
     }
+    crate::provider_refresh::validate_oauth_client_material(strategy as i32, &request.material)?;
     // The STS endpoint is always resolved from the region in production. Reject
     // any caller-supplied override so an AWS-signed AssumeRole request cannot be
     // redirected at an arbitrary service (CWE-918). Tests inject a mock endpoint
@@ -8766,6 +8767,35 @@ mod tests {
                 .get("client_secret"),
             Some(&"original-secret".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn configure_refresh_rejects_basic_auth_without_client_secret() {
+        let state = test_server_state().await;
+        let request = ConfigureProviderRefreshRequest {
+            request_id: String::new(),
+            provider: "any".to_string(),
+            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+            material: HashMap::from([
+                ("client_id".to_string(), "client-id".to_string()),
+                ("refresh_token".to_string(), "refresh".to_string()),
+                (
+                    "token_endpoint_auth_method".to_string(),
+                    "client_secret_basic".to_string(),
+                ),
+            ]),
+            secret_material_keys: vec!["refresh_token".to_string()],
+            expiration_time: None,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+        };
+        let status = handle_configure_provider_refresh(&state, authed_request(request))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("requires client_secret"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

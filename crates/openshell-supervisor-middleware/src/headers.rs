@@ -366,23 +366,29 @@ fn is_safe_value(value: &str) -> bool {
 }
 
 fn is_request_protected(name: &str) -> bool {
-    matches!(
-        name,
-        "authorization"
-            | "proxy-authorization"
-            | "proxy-authenticate"
-            | "cookie"
-            | "host"
-            | "content-length"
-            | "transfer-encoding"
-            | "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "upgrade"
-    ) || name.starts_with("x-amz-")
+    is_platform_correlation_header(name)
+        || matches!(
+            name,
+            "authorization"
+                | "proxy-authorization"
+                | "proxy-authenticate"
+                | "cookie"
+                | "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        )
+        || name.starts_with("x-amz-")
         || name.starts_with("x-openshell-credential")
+}
+
+fn is_platform_correlation_header(name: &str) -> bool {
+    name == "x-openshell-request-id"
 }
 
 /// Return whether a response header can carry authentication material and must
@@ -402,7 +408,8 @@ pub fn is_response_credential_header(name: &str) -> bool {
 }
 
 fn is_response_protected(name: &str) -> bool {
-    is_response_credential_header(name)
+    is_platform_correlation_header(name)
+        || is_response_credential_header(name)
         || matches!(
             name,
             "connection"
@@ -486,6 +493,42 @@ mod tests {
                 .to_string()
                 .contains("protected header 'Authorization'")
         );
+    }
+
+    #[test]
+    fn platform_request_id_is_immutable_for_all_http_phases() {
+        for authority in [
+            HeaderAuthority::Request,
+            HeaderAuthority::HookRequest,
+            HeaderAuthority::RequestTrailers,
+            HeaderAuthority::Response,
+            HeaderAuthority::HookResponse,
+            HeaderAuthority::ResponseTrailers,
+        ] {
+            let name = "X-OpenShell-Request-ID";
+            let write_error = apply(
+                authority,
+                &[],
+                &[],
+                &[write(name, "forged", ExistingHeaderAction::Overwrite)],
+            )
+            .expect_err("platform request ID write");
+            assert_eq!(
+                write_error,
+                HeaderMutationError::Protected {
+                    name: name.to_string()
+                }
+            );
+
+            let remove_error = apply(authority, &[], &[], &[remove(name)])
+                .expect_err("platform request ID removal");
+            assert_eq!(
+                remove_error,
+                HeaderMutationError::Protected {
+                    name: name.to_string()
+                }
+            );
+        }
     }
 
     #[test]

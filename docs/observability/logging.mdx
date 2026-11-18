@@ -219,6 +219,7 @@ Common reason phrases emitted by the sandbox include:
 | `resolves to always-blocked address` | An outbound policy endpoint resolved to loopback, link-local, or unspecified. Network policy cannot authorize these destinations, even when they appear in `allowed_ips`; sandbox-local loopback connections do not use this policy path. |
 | `resolves to <ip> which is not in allowed_ips, connection rejected` | The destination resolved to an IP outside the policy's `allowed_ips` allowlist. |
 | `DNS resolution failed for <host>:<port>` | The proxy could not resolve the destination. |
+| `transparent_tcp_mapping_denied` | A transparent connection could not use its synthetic DNS mapping, including an expired mapping whose refresh failed. Check the supervisor diagnostic for the cause; adding an allow rule does not repair a failed DNS refresh. |
 | `port <n> is a blocked control-plane port, connection rejected` | The destination port matches a control-plane port (etcd, Kubernetes API, kubelet) and is always blocked. |
 | `request-target contains an encoded '/' (%2F)` | The L7 HTTP parser rejected an encoded slash. Configure `allow_encoded_slash: true` on a REST endpoint when the upstream requires encoded slashes. |
 | `l7 deny` | An L7 policy rule denied the request. |

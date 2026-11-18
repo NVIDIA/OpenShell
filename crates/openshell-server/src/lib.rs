@@ -54,6 +54,7 @@ mod storage_proto;
 mod supervisor_owner;
 mod supervisor_pool;
 pub mod supervisor_session;
+mod supervisor_spread;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -401,6 +402,9 @@ pub struct ServerState {
     /// alongside `gateway_ring` so a redirect can name a dialable address.
     pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
 
+    /// Which gateway replica serves each shared supervisor, for placing them.
+    pub supervisor_spread: Arc<supervisor_spread::SupervisorSpread>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -677,6 +681,7 @@ impl ServerState {
             service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            supervisor_spread: Arc::default(),
             discovery: grpc::service_discovery::DiscoveryState::default(),
             discovery_watches: Arc::new(tokio::sync::Semaphore::new(32)),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
@@ -702,7 +707,7 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
     if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
         && !endpoint.trim().is_empty()
     {
-        return Some(endpoint.trim().to_string());
+        return Some(bracket_ipv6_host(endpoint.trim()));
     }
 
     let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
@@ -724,6 +729,22 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
         namespace = namespace.trim(),
         port = config.bind_address.port()
     ))
+}
+
+/// The chart renders `$(OPENSHELL_POD_IP)` into the endpoint without brackets.
+fn bracket_ipv6_host(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if host.parse::<std::net::Ipv6Addr>().is_ok() && port.parse::<u16>().is_ok() =>
+        {
+            format!("{scheme}://[{host}]:{port}{path}")
+        }
+        _ => endpoint.to_string(),
+    }
 }
 
 /// Reject a plaintext peer endpoint on a gateway that serves TLS.
@@ -758,6 +779,7 @@ pub(crate) async fn run_server(
     startup: ServerStartupConfig,
     tracing_log_bus: TracingLogBus,
     compute_drivers: ComputeDriverRegistry,
+    metrics_recorder: Option<gateway_metrics::OtlpRecorder>,
 ) -> Result<()> {
     let ServerStartupConfig {
         config,
@@ -1027,6 +1049,7 @@ pub(crate) async fn run_server(
             authority.clone(),
             state.credentials.clone(),
             state.replica_id.clone(),
+            state.supervisor_spread.clone(),
         )
         .start(shutdown_rx.clone());
         spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
@@ -1134,17 +1157,14 @@ pub(crate) async fn run_server(
     // Install the recorder before the endpoint-status startup reconciliation so
     // the lock waits and timeouts recorded there are exported. Its listener
     // binds with the others.
-    let metrics_endpoint = config
-        .metrics_bind_address
-        .map(|metrics_bind_address| {
-            gateway_metrics::install_global_recorder(
-                supervisor_session::RELAY_CAPACITY,
-                store.mutation_lock_connections(),
-            )
-            .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
-        })
-        .transpose()
-        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    let prometheus_handle = gateway_metrics::install_global_recorder(
+        config.metrics_bind_address.is_some(),
+        metrics_recorder,
+        supervisor_session::RELAY_CAPACITY,
+        store.mutation_lock_connections(),
+    )
+    .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    let metrics_endpoint = config.metrics_bind_address.zip(prometheus_handle);
 
     grpc::policy::backfill_legacy_policy_history(&state)
         .await
@@ -1642,10 +1662,11 @@ async fn connect_store(
     let mut delay = DATABASE_CONNECT_RETRY_INITIAL_DELAY;
     let mut waiting = false;
     loop {
-        let attempt = Store::try_connect_with_pool_sizes(
+        let attempt = Store::try_connect_with_database_auth(
             database_url,
             config.database_max_connections,
             config.database_lock_max_connections,
+            config.database_auth,
         );
         let result = if waiting {
             tokio::select! {
@@ -2620,7 +2641,7 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         MetricsTlsHandshakeLogLimiter, MetricsTlsHandshakeLogLimiters, MultiplexService,
         ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listener,
-        classify_initial_bytes, configured_compute_driver, extension_token_ttl,
+        bracket_ipv6_host, classify_initial_bytes, configured_compute_driver, extension_token_ttl,
         is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
         log_metrics_tls_handshake_timeout, metrics_tls_acceptor_or_disable,
         mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
@@ -2732,6 +2753,25 @@ mod tests {
         )
         .expect("failed to write test client key");
         (cert_path, key_path)
+    }
+
+    #[test]
+    fn peer_endpoint_brackets_only_unbracketed_ipv6_hosts() {
+        for (input, expected) in [
+            (
+                "http://fd00:10:244::16:8080",
+                "http://[fd00:10:244::16]:8080",
+            ),
+            ("https://[fd00::5]:8080", "https://[fd00::5]:8080"),
+            ("https://10.0.0.1:8080", "https://10.0.0.1:8080"),
+            (
+                "https://gw-1.peers.ns.svc:8080",
+                "https://gw-1.peers.ns.svc:8080",
+            ),
+        ] {
+            assert_eq!(bracket_ipv6_host(input), expected);
+            assert!(expected.parse::<http::Uri>().is_ok());
+        }
     }
 
     #[test]
