@@ -12,9 +12,10 @@ use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::sandbox_updates_server::{SandboxUpdates, SandboxUpdatesServer};
 use openshell_core::replica_routing;
+use openshell_core::rpc_error::{ErrorDetails, StatusExt};
 use openshell_sdk::{
-    AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
-    RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
+    AuthConfig, ClientConfig, CreateRetryOptions, ExecOptions, ListOptions, OpenShellClient,
+    Refresh, RefreshError, RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
     SandboxTemplateListOptions, ServiceAuthorizationMode, ServiceExposure,
     ServiceStatus as SdkServiceStatus, WatchEvent, WatchOptions,
 };
@@ -51,6 +52,13 @@ struct MockState {
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
+    /// Every `CreateSandbox` request, in call order. Retried creates append one
+    /// entry each so a test can count attempts and inspect each one.
+    create_requests: Mutex<Vec<proto::CreateSandboxRequest>>,
+    /// Number of `CreateSandbox` calls observed.
+    create_calls: AtomicU32,
+    /// Per-call `CreateSandbox` failures; the call after the script succeeds.
+    create_errors: Vec<Status>,
     last_template_create: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
     last_template_get: Mutex<Option<proto::GetSandboxTemplateRequest>>,
     last_template_list: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
@@ -75,9 +83,19 @@ struct MockState {
     get_calls: AtomicU32,
     phase_sequence: Vec<proto::SandboxPhase>,
     get_sandbox_id: Option<String>,
+    /// Per-call `GetSandbox` ids; the last one repeats. Takes precedence over
+    /// `get_sandbox_id`.
+    get_sandbox_ids: Vec<String>,
     get_error: Option<Status>,
+    /// Per-call `GetSandbox` failures keyed by call index; later calls succeed.
+    get_errors: Vec<Status>,
+    /// When set, every `GetSandbox` sleeps this long before answering, so a
+    /// test can hold a poll past the client's retry budget.
+    get_delay: Option<Duration>,
     delete_response: Option<proto::DeleteSandboxResponse>,
     get_returns_not_found: bool,
+    /// When set, `GetSandbox` returns an `Ok` response with no sandbox.
+    get_returns_no_sandbox: bool,
     not_found_after: Option<u32>,
     paginate_list: bool,
     /// When set, `health` rejects any request whose `authorization` header
@@ -361,6 +379,11 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::CreateSandboxRequest>,
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let req = request.into_inner();
+        let call = self.state.create_calls.fetch_add(1, Ordering::SeqCst);
+        self.state.create_requests.lock().await.push(req.clone());
+        if let Some(status) = self.state.create_errors.get(call as usize) {
+            return Err(status.clone());
+        }
         let name = if req.name.is_empty() {
             "generated".to_string()
         } else {
@@ -521,11 +544,20 @@ impl OpenShell for TestOpenShell {
             selected_workspace(&req.workspace_scope).map(ToString::to_string);
         let count = self.state.get_calls.fetch_add(1, Ordering::SeqCst);
 
+        if let Some(delay) = self.state.get_delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(error) = self.state.get_errors.get(count as usize) {
+            return Err(error.clone());
+        }
         if let Some(error) = &self.state.get_error {
             return Err(error.clone());
         }
         if self.state.get_returns_not_found {
             return Err(Status::not_found(format!("sandbox '{name}' not found")));
+        }
+        if self.state.get_returns_no_sandbox {
+            return Ok(Response::new(proto::SandboxResponse::default()));
         }
         if let Some(threshold) = self.state.not_found_after
             && count >= threshold
@@ -542,7 +574,14 @@ impl OpenShell for TestOpenShell {
             .unwrap_or(proto::SandboxPhase::Ready);
 
         let mut sandbox = sandbox_with_phase(&name, phase);
-        if let Some(id) = &self.state.get_sandbox_id {
+        if let Some(id) = self
+            .state
+            .get_sandbox_ids
+            .get(count as usize)
+            .or_else(|| self.state.get_sandbox_ids.last())
+        {
+            sandbox.metadata.as_mut().unwrap().id.clone_from(id);
+        } else if let Some(id) = &self.state.get_sandbox_id {
             sandbox.metadata.as_mut().unwrap().id.clone_from(id);
         }
         let mut response = Response::new(proto::SandboxResponse {
@@ -1358,6 +1397,642 @@ async fn create_sandbox_from_template_passes_template_name() {
     assert_eq!(observed_spec.command, vec!["python", "-m", "agent"]);
     assert!(!observed_spec.tty);
     assert_eq!(observed_spec.policy.unwrap().version, 1);
+}
+
+fn lock_timeout_status(delay: Duration) -> Status {
+    openshell_core::rpc_error::unavailable(
+        openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+        "gateway busy",
+        delay,
+    )
+}
+
+fn already_exists_status(poll_delay: Option<Duration>) -> Status {
+    let mut details = ErrorDetails::new();
+    if let Some(delay) = poll_delay {
+        details.set_retry_info(Some(delay));
+    }
+    Status::with_error_details(
+        tonic::Code::AlreadyExists,
+        "sandbox 'my-box' already exists",
+        details,
+    )
+}
+
+/// Retry options used by the tests: a generous budget and a 1 ms server delay,
+/// so retries stay fast without stubbing the clock.
+fn retry_options() -> CreateRetryOptions {
+    CreateRetryOptions {
+        budget: Duration::from_secs(5),
+    }
+}
+
+fn named_sandbox(name: &str) -> SandboxSpec {
+    SandboxSpec {
+        name: Some(name.to_string()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_retries_a_lock_timeout_then_succeeds() {
+    let state = Arc::new(MockState {
+        create_errors: vec![lock_timeout_status(Duration::from_millis(1))],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap();
+    assert_eq!(sandbox.name, "my-box");
+
+    let requests = state.create_requests.lock().await;
+    assert_eq!(requests.len(), 2, "the create should be retried once");
+    for request in requests.iter() {
+        // A non-empty request_id would engage mutation replay and surface the
+        // recorded failure instead of retrying.
+        assert!(request.request_id.is_empty());
+        assert_eq!(
+            selected_workspace(&request.workspace_scope),
+            Some("default")
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_annotates_budget_exhaustion() {
+    let state = Arc::new(MockState {
+        create_errors: vec![lock_timeout_status(Duration::from_millis(1)); 200],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(
+            named_sandbox("my-box"),
+            CreateRetryOptions {
+                budget: Duration::from_millis(20),
+            },
+        )
+        .await
+        .unwrap_err();
+    let attempts = state.create_requests.lock().await.len();
+    assert!(attempts > 1, "the create should have been retried");
+    assert!(
+        err.mutation_lock_timeout(),
+        "the surfaced failure is the last lock timeout"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!(
+            "create retry stopped after {attempts} create attempts"
+        )),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_rejects_other_transient_failures() {
+    for status in [
+        openshell_core::rpc_error::unavailable(
+            "DATABASE_UNAVAILABLE",
+            "try later",
+            Duration::from_millis(1),
+        ),
+        Status::unavailable("gateway restarting"),
+    ] {
+        let state = Arc::new(MockState {
+            create_errors: vec![status],
+            ..Default::default()
+        });
+        let endpoint = start_mock(state.clone()).await;
+        let client = connect(&endpoint).await;
+
+        let err = client
+            .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+            .await
+            .unwrap_err();
+        assert!(!err.mutation_lock_timeout());
+        assert_eq!(
+            state.create_requests.lock().await.len(),
+            1,
+            "only MUTATION_LOCK_TIMEOUT may be retried"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_waits_for_a_deleting_holder() {
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(Some(Duration::from_millis(1)))],
+        phase_sequence: vec![proto::SandboxPhase::Deleting],
+        get_sandbox_ids: vec!["holder".to_string()],
+        not_found_after: Some(1),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap();
+    assert_eq!(sandbox.name, "my-box");
+
+    let requests = state.create_requests.lock().await;
+    assert_eq!(requests.len(), 2, "the create should be retried once");
+    assert_eq!(
+        selected_workspace(&requests[0].workspace_scope),
+        Some("default")
+    );
+    assert_eq!(
+        *state.last_get_workspace.lock().await,
+        Some("default".to_string()),
+        "the phase poll must use the create's workspace"
+    );
+    assert_eq!(
+        *state.last_get_name.lock().await,
+        Some("my-box".to_string())
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_surfaces_a_live_holder() {
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(None)],
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    assert_eq!(state.create_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_bounds_a_stuck_holder_poll_by_the_budget() {
+    // A GetSandbox that never answers inside the budget must not keep the
+    // retrying create pending: the poll itself is bounded by the remaining
+    // budget, not only the sleeps between polls.
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(Some(Duration::from_millis(1)))],
+        get_delay: Some(Duration::from_millis(500)),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.create_sandbox_with_retry(
+            named_sandbox("my-box"),
+            CreateRetryOptions {
+                budget: Duration::from_millis(20),
+            },
+        ),
+    )
+    .await
+    .expect("a stuck holder poll must not outlive the retry budget")
+    .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    let message = err.to_string();
+    assert!(
+        message.contains("create retry stopped after 1 create attempt"),
+        "the surfaced conflict must carry the budget annotation: {message}"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_surfaces_a_deleting_to_live_flip() {
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(Some(Duration::from_millis(1)))],
+        phase_sequence: vec![proto::SandboxPhase::Deleting, proto::SandboxPhase::Ready],
+        get_sandbox_ids: vec!["holder".to_string()],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    assert_eq!(
+        state.get_calls.load(Ordering::SeqCst),
+        2,
+        "the loop must re-observe the holder after the wait"
+    );
+    assert_eq!(state.create_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_surfaces_a_different_id_holder() {
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(Some(Duration::from_millis(1)))],
+        phase_sequence: vec![proto::SandboxPhase::Deleting],
+        get_sandbox_ids: vec!["holder-a".to_string(), "holder-b".to_string()],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    assert_eq!(
+        state.get_calls.load(Ordering::SeqCst),
+        2,
+        "a changed holder id must stop the poll"
+    );
+    assert_eq!(state.create_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_survives_a_transient_poll_failure() {
+    // UNAVAILABLE says nothing about the holder, so the loop must wait and
+    // poll again instead of discarding the remaining budget. The next read
+    // reports the name free, so the create succeeds.
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(Some(Duration::from_millis(1)))],
+        get_errors: vec![Status::unavailable("database is unavailable")],
+        not_found_after: Some(1),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .expect("a transient poll failure must not end the retry");
+    assert_eq!(sandbox.name, "my-box");
+    assert_eq!(
+        state.create_requests.lock().await.len(),
+        2,
+        "the create should be retried once"
+    );
+    assert_eq!(
+        state.get_calls.load(Ordering::SeqCst),
+        2,
+        "the loop must poll the holder again after the transient failure"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_waits_for_a_provisioning_holder() {
+    // A holder that is still creating is not a live sandbox: its record can be
+    // compensated, so the loop waits and, once the record disappears, resends
+    // the create instead of stopping on a spurious conflict.
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(Some(Duration::from_millis(1)))],
+        phase_sequence: vec![proto::SandboxPhase::Provisioning],
+        get_sandbox_ids: vec!["holder".to_string()],
+        not_found_after: Some(1),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .expect("a provisioning holder must be waited out");
+    assert_eq!(sandbox.name, "my-box");
+    assert_eq!(
+        state.get_calls.load(Ordering::SeqCst),
+        2,
+        "the loop must re-observe the holder after the wait"
+    );
+    assert_eq!(state.create_requests.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_surfaces_a_provisioning_to_live_flip() {
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(Some(Duration::from_millis(1)))],
+        phase_sequence: vec![
+            proto::SandboxPhase::Provisioning,
+            proto::SandboxPhase::Ready,
+        ],
+        get_sandbox_ids: vec!["holder".to_string()],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    assert_eq!(
+        state.get_calls.load(Ordering::SeqCst),
+        2,
+        "the loop must re-observe the holder after the wait"
+    );
+    assert_eq!(
+        state.create_requests.lock().await.len(),
+        1,
+        "a live holder keeps the name"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_surfaces_the_conflict_when_the_poll_fails() {
+    // A non-transient poll failure says nothing about the holder and waiting
+    // cannot resolve it, but the caller must still see the name conflict, not
+    // the unrelated read error.
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(None)],
+        get_error: Some(Status::permission_denied("not allowed to read sandboxes")),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        "already_exists",
+        "the conflict must survive a failed poll: {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("holder status unavailable"),
+        "unexpected message: {message}"
+    );
+    assert!(
+        message.contains("not allowed to read sandboxes"),
+        "the poll failure must be reported: {message}"
+    );
+    assert_eq!(state.create_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_treats_an_empty_holder_response_as_not_found() {
+    // An `Ok` response with the sandbox field unset is the same wire event the
+    // CLI maps to NotFound: the record is gone or invisible, so the create may
+    // be resent instead of stopping on a terminal InvalidConfig.
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(None)],
+        get_returns_no_sandbox: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .expect("an empty holder response must drive a create retry");
+    assert_eq!(sandbox.name, "my-box");
+    assert_eq!(state.create_requests.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_annotates_an_exhausted_cleanup_wait() {
+    // The first attempt loses the lock and retries; the retry then finds the
+    // name held by a deleting sandbox. A one-second poll delay cannot fit in
+    // the remaining budget, so the loop stops and the error names the attempt
+    // count and the lock timeout that started the retries: never a bare name
+    // conflict.
+    let state = Arc::new(MockState {
+        create_errors: vec![
+            lock_timeout_status(Duration::from_millis(1)),
+            already_exists_status(Some(Duration::from_secs(1))),
+        ],
+        phase_sequence: vec![proto::SandboxPhase::Deleting],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(
+            named_sandbox("my-box"),
+            CreateRetryOptions {
+                budget: Duration::from_millis(100),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    let message = err.to_string();
+    assert!(
+        message.contains("create retry stopped after 2 create attempts"),
+        "unexpected message: {message}"
+    );
+    assert!(
+        message.contains("last mutation lock timeout: gateway busy"),
+        "unexpected message: {message}"
+    );
+    assert_eq!(state.create_requests.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_retries_a_missing_holder_up_to_the_cap() {
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(None); 4],
+        get_returns_not_found: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    assert_eq!(
+        state.create_requests.lock().await.len(),
+        4,
+        "NotFound may drive at most three create retries"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_surfaces_an_unnamed_conflict_without_a_phase_poll() {
+    // A generated name has nothing to disambiguate: there is no holder to
+    // observe, so the conflict must surface on the first attempt unannotated.
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(None)],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(SandboxSpec::default(), retry_options())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    let message = err.to_string();
+    assert!(
+        !message.contains("create retry stopped"),
+        "an unnamed conflict is not a retry stop: {message}"
+    );
+    assert_eq!(
+        state.create_requests.lock().await.len(),
+        1,
+        "an unnamed conflict is terminal"
+    );
+    assert_eq!(
+        state.get_calls.load(Ordering::SeqCst),
+        0,
+        "an unnamed conflict must not poll the phase"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_with_retry_stops_a_missing_holder_retry_at_the_deadline() {
+    // A zero budget is spent by the first create round trip, so the
+    // NotFound-driven retry must surface the conflict instead of resending.
+    let state = Arc::new(MockState {
+        create_errors: vec![already_exists_status(None)],
+        get_returns_not_found: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .create_sandbox_with_retry(
+            named_sandbox("my-box"),
+            CreateRetryOptions {
+                budget: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "already_exists");
+    let message = err.to_string();
+    assert!(
+        message.contains("create retry stopped after 1 create attempt"),
+        "unexpected message: {message}"
+    );
+    assert_eq!(
+        state.create_requests.lock().await.len(),
+        1,
+        "an exhausted budget must not resend the create"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_from_template_with_retry_retries_a_lock_timeout() {
+    let state = Arc::new(MockState {
+        create_errors: vec![lock_timeout_status(Duration::from_millis(1))],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .create_sandbox_from_template_with_retry(
+            SandboxTemplateCreateSpec {
+                name: Some("from-template".to_string()),
+                template_name: "python".to_string(),
+                ..Default::default()
+            },
+            retry_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sandbox.name, "from-template");
+
+    let requests = state.create_requests.lock().await;
+    assert_eq!(requests.len(), 2, "the create should be retried once");
+    for request in requests.iter() {
+        assert!(request.request_id.is_empty());
+        assert_eq!(request.workload_template, "python");
+    }
+}
+
+#[tokio::test]
+async fn workspace_scoped_create_with_retry_reuses_the_create_workspace() {
+    // The retried create first loses the lock, then finds the name held by a
+    // sandbox that is being deleted: both the create retry and the phase poll
+    // must stay in the caller's workspace.
+    let state = Arc::new(MockState {
+        create_errors: vec![
+            lock_timeout_status(Duration::from_millis(1)),
+            already_exists_status(Some(Duration::from_millis(1))),
+        ],
+        phase_sequence: vec![proto::SandboxPhase::Deleting],
+        get_sandbox_ids: vec!["holder".to_string()],
+        not_found_after: Some(1),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+    let scoped = client.workspace("production");
+
+    let sandbox = scoped
+        .create_sandbox_with_retry(named_sandbox("my-box"), retry_options())
+        .await
+        .unwrap();
+    assert_eq!(sandbox.name, "my-box");
+
+    let requests = state.create_requests.lock().await;
+    assert_eq!(requests.len(), 3, "two failures, then success");
+    for request in requests.iter() {
+        assert_eq!(
+            selected_workspace(&request.workspace_scope),
+            Some("production")
+        );
+    }
+    assert_eq!(
+        *state.last_get_workspace.lock().await,
+        Some("production".to_string()),
+        "the phase poll must reuse the create's workspace"
+    );
+}
+
+#[tokio::test]
+async fn workspace_scoped_template_create_with_retry_reuses_the_create_workspace() {
+    let state = Arc::new(MockState {
+        create_errors: vec![lock_timeout_status(Duration::from_millis(1))],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+    let scoped = client.workspace("production");
+
+    let sandbox = scoped
+        .create_sandbox_from_template_with_retry(
+            SandboxTemplateCreateSpec {
+                template_name: "python".to_string(),
+                ..Default::default()
+            },
+            retry_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sandbox.name, "generated");
+
+    let requests = state.create_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            selected_workspace(&request.workspace_scope),
+            Some("production")
+        );
+    }
 }
 
 #[tokio::test]

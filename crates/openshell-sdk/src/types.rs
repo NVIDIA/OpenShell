@@ -31,6 +31,27 @@ pub struct ResumeOptions {
     pub restart_if_restore_fails: bool,
 }
 
+/// Options for the retrying sandbox create entry points.
+///
+/// The retrying creates wait out a gateway mutation-lock timeout and an
+/// `AlreadyExists` holder that is still being deleted. They are opt-in:
+/// library callers own their retry policy, so the plain create methods never
+/// retry.
+#[derive(Clone, Copy, Debug)]
+pub struct CreateRetryOptions {
+    /// Wall-clock budget covering retry delays and `AlreadyExists` cleanup
+    /// waits. The first attempt always runs, even with a zero budget.
+    pub budget: Duration,
+}
+
+impl Default for CreateRetryOptions {
+    fn default() -> Self {
+        Self {
+            budget: Duration::from_mins(1),
+        }
+    }
+}
+
 /// A deletion acknowledgement is not necessarily completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -61,6 +82,11 @@ fn deletion_outcomes_preserve_unknown_values() {
     assert_eq!(DeletionOutcome::from(2), DeletionOutcome::Accepted);
     assert_eq!(DeletionOutcome::from(3), DeletionOutcome::AlreadyAbsent);
     assert_eq!(DeletionOutcome::from(99), DeletionOutcome::Unknown(99));
+}
+
+#[test]
+fn create_retry_defaults_to_a_one_minute_budget() {
+    assert_eq!(CreateRetryOptions::default().budget, Duration::from_mins(1));
 }
 
 /// Result for the original target, never a same-name replacement.

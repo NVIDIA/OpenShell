@@ -211,6 +211,19 @@ impl SdkError {
         self.error_details()?.retry_info()?.retry_delay
     }
 
+    /// Whether the gateway rejected a mutation because it lost the lock budget.
+    ///
+    /// The match is exact on
+    /// [`MUTATION_LOCK_TIMEOUT`](openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT)
+    /// over `UNAVAILABLE`, so other transient failures such as
+    /// `DATABASE_UNAVAILABLE` never report `true`. This is not folded into
+    /// [`Self::retryable`], which keeps its auth-only contract; callers opt in
+    /// to mutation retries explicitly.
+    pub fn mutation_lock_timeout(&self) -> bool {
+        self.grpc_status()
+            .is_some_and(openshell_core::rpc_error::is_mutation_lock_timeout)
+    }
+
     /// Stable string code for cross-language binding consumers.
     ///
     /// Returns one of: `invalid_config`, `tls`, `connect`, `auth`, `io`,
@@ -309,5 +322,63 @@ mod tests {
     fn local_errors_have_no_transport_status() {
         assert!(SdkError::invalid_config("local").grpc_status().is_none());
         assert!(SdkError::auth("local").error_details().is_none());
+    }
+
+    fn lock_timeout(delay: Option<std::time::Duration>) -> tonic::Status {
+        let message = "gateway busy";
+        delay.map_or_else(
+            || {
+                tonic::Status::with_error_details(
+                    tonic::Code::Unavailable,
+                    message,
+                    ErrorDetails::with_error_info(
+                        rpc_error::MUTATION_LOCK_TIMEOUT,
+                        rpc_error::ERROR_DOMAIN,
+                        std::collections::HashMap::new(),
+                    ),
+                )
+            },
+            |delay| rpc_error::unavailable(rpc_error::MUTATION_LOCK_TIMEOUT, message, delay),
+        )
+    }
+
+    #[test]
+    fn mutation_lock_timeout_matches_with_or_without_retry_info() {
+        for delay in [Some(std::time::Duration::from_secs(1)), None] {
+            let error = SdkError::from_status(lock_timeout(delay));
+            assert!(
+                error.mutation_lock_timeout(),
+                "lock timeout with delay {delay:?} must match"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_lock_timeout_rejects_other_unavailable_failures() {
+        let database = rpc_error::unavailable(
+            "DATABASE_UNAVAILABLE",
+            "try later",
+            std::time::Duration::from_secs(1),
+        );
+        assert!(!SdkError::from_status(database).mutation_lock_timeout());
+        assert!(
+            !SdkError::from_status(tonic::Status::unavailable("try later")).mutation_lock_timeout()
+        );
+        assert!(
+            !SdkError::from_status(tonic::Status::with_details(
+                tonic::Code::Unavailable,
+                "gateway busy",
+                vec![255].into(),
+            ))
+            .mutation_lock_timeout()
+        );
+    }
+
+    #[test]
+    fn mutation_lock_timeout_is_not_reported_as_retryable() {
+        // `retryable` keeps its auth-only contract even for a lock timeout.
+        let error = SdkError::from_status(lock_timeout(Some(std::time::Duration::from_secs(1))));
+        assert!(error.mutation_lock_timeout());
+        assert!(!error.retryable());
     }
 }
