@@ -10,6 +10,40 @@ release:
   name: openshell
   namespace: gateway
 tests:
+  - it: accepts a cluster-scoped Broker peer prefix
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id_prefix: spiffe://example.org/spire/agent/k8s_psat/cluster
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spiffe-workload-api
+            csi:
+              driver: csi.spiffe.io
+              readOnly: true
+  - it: refuses ambiguous Broker peer policies
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id: spiffe://example.org/agent/node
+          server_spiffe_id_prefix: spiffe://example.org/agent
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix
   - it: issues no extra PKI for the shared supervisor
     template: templates/certgen.yaml
     set:

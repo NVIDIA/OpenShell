@@ -149,6 +149,12 @@ fn reference(runtime: &str) -> Result<WorkloadReference, TokenGrantFailure> {
 }
 
 async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailure> {
+    use openshell_crypto::tls::spiffe::ServerIdentity;
+    let (server_id, identity) = match (&config.server_spiffe_id, &config.server_spiffe_id_prefix) {
+        (Some(id), None) => (id, ServerIdentity::Exact(id.clone())),
+        (None, Some(prefix)) => (prefix, ServerIdentity::PathPrefix(prefix.clone())),
+        _ => return Err(configuration_failure()),
+    };
     let endpoint = format!("unix:{}", config.workload_api_socket_path);
     let workload = spiffe::WorkloadApiClient::connect_to(endpoint)
         .await
@@ -161,8 +167,7 @@ async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailu
         .map_err(|_| failure(TokenGrantFailureKind::Unavailable))?;
     let svid = context.default_svid().ok_or_else(identity_rejected)?;
     let domain = spiffe::TrustDomain::new(
-        openshell_spiffe::trust_domain(&config.server_spiffe_id)
-            .ok_or_else(configuration_failure)?,
+        openshell_spiffe::trust_domain(server_id).ok_or_else(configuration_failure)?,
     )
     .map_err(|_| configuration_failure())?;
     let bundle = context
@@ -186,10 +191,9 @@ async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailu
     let mut tls = openshell_crypto::tls::try_client_builder()
         .map_err(|_| configuration_failure())?
         .dangerous()
-        .with_custom_certificate_verifier(openshell_crypto::tls::spiffe::server_verifier(
-            roots,
-            config.server_spiffe_id.clone(),
-        ))
+        .with_custom_certificate_verifier(
+            openshell_crypto::tls::spiffe::server_verifier_with_identity(roots, identity),
+        )
         .with_client_auth_cert(chain, key)
         .map_err(|_| configuration_failure())?;
     tls.alpn_protocols = vec![b"h2".to_vec()];

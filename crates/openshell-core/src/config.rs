@@ -227,7 +227,10 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
 pub struct SpiffeBrokerConfig {
     pub spiffe_id_prefix: String,
     pub endpoint: String,
-    pub server_spiffe_id: String,
+    #[serde(default)]
+    pub server_spiffe_id: Option<String>,
+    #[serde(default)]
+    pub server_spiffe_id_prefix: Option<String>,
     pub workload_api_socket_path: String,
 }
 
@@ -252,7 +255,18 @@ impl SpiffeBrokerConfig {
                     .into(),
             );
         }
-        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.server_spiffe_id)?;
+        match (&self.server_spiffe_id, &self.server_spiffe_id_prefix) {
+            (Some(id), None) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(id)?;
+            }
+            (None, Some(prefix)) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(prefix)?;
+                if !prefix.trim_start_matches("spiffe://").contains('/') {
+                    return Err("spiffe_broker.server_spiffe_id_prefix requires an agent path, not a whole trust domain".into());
+                }
+            }
+            _ => return Err("spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix".into()),
+        }
         Ok(())
     }
 }
@@ -2101,10 +2115,20 @@ mod tests {
         let mut config = super::SpiffeBrokerConfig {
             spiffe_id_prefix: "spiffe://example.org/openshell".into(),
             endpoint: "https://spire-broker.spire.svc:8443".into(),
-            server_spiffe_id: "spiffe://example.org/spire/agent/node".into(),
+            server_spiffe_id: Some("spiffe://example.org/spire/agent/node".into()),
+            server_spiffe_id_prefix: None,
             workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock".into(),
         };
         config.validate("gw").unwrap();
+        config.server_spiffe_id = None;
+        config.server_spiffe_id_prefix =
+            Some("spiffe://example.org/spire/agent/k8s_psat/cluster".into());
+        config.validate("gw").unwrap();
+        config.server_spiffe_id_prefix = Some("spiffe://example.org".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id = Some("spiffe://example.org/spire/agent/node".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id_prefix = None;
         for endpoint in [
             "http://broker:8443",
             "https://user:password@broker",

@@ -655,14 +655,29 @@ roleRef:
   kind: Role
   name: openshell-e2e-spire-broker
 EOF
-    local node_uid broker_values
-    node_uid="$(kctl get nodes -o jsonpath='{.items[0].metadata.uid}')"
+    kctl apply -f - <<EOF
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: openshell-broker-agents-${SPIRE_NAMESPACE}
+  labels:
+    openshell.ai/e2e-spire-fixture: ${SPIRE_NAMESPACE}
+spec:
+  className: ${SPIRE_NAMESPACE}-spire
+  spiffeID: spiffe://openshell.local/openshell/broker-agents
+  parentID: spiffe://openshell.local/spire/server
+  selectors:
+    - k8s_psat:cluster:openshell-e2e
+    - k8s_psat:agent_ns:${SPIRE_NAMESPACE}
+    - k8s_psat:agent_sa:spire-agent
+EOF
+    local broker_values
     broker_values="${WORKDIR}/spire-broker-values.yaml"
     cat >"${broker_values}" <<EOF
 gatewayConfig:
   openshell.gateway.spiffe_broker:
     endpoint: https://spire-broker.${SPIRE_NAMESPACE}.svc:8443
-    server_spiffe_id: spiffe://openshell.local/spire/agent/k8s_psat/openshell-e2e/${node_uid}
+    server_spiffe_id_prefix: spiffe://openshell.local/spire/agent/k8s_psat/openshell-e2e
 EOF
     helm_values_args+=(--values "${broker_values}")
   fi

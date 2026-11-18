@@ -49,7 +49,6 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 const TEST_HOST: &str = "host.openshell.internal";
 /// Matches `ci/values-spire-broker-stack.yaml`.
 const TRUST_DOMAIN: &str = "openshell.local";
-const SPIRE_CLUSTER: &str = "openshell-e2e";
 /// Matches `ci/values-supervisor-spiffe.yaml`.
 const ID_PREFIX: &str = "spiffe://openshell.local/openshell";
 /// Label on the registration entries this run creates, naming its SPIRE
@@ -591,24 +590,130 @@ async fn gateway_id() -> String {
         .expect("gateway_id in gateway TOML")
 }
 
-/// SPIRE agent ID of the node running the gateway.
-async fn gateway_agent_id() -> String {
-    let node = kubectl(&[
+/// Stable registration parent shared by every eligible Broker agent.
+fn broker_agent_parent_id() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/openshell/broker-agents")
+}
+
+/// Force a fresh production acquisition through each agent. A random Service
+/// connection is insufficient evidence that every backend can authenticate
+/// and issue the same registered identity.
+async fn assert_every_broker_agent(sandbox: &SandboxGuard, port: u16, sandbox_id: &str) {
+    let namespace = spire_fixture();
+    let output = kubectl(&[
         "-n",
-        &release_namespace(),
+        &namespace,
         "get",
         "pods",
         "-l",
-        "app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell",
+        "app.kubernetes.io/name=agent,app.kubernetes.io/instance=spire",
         "-o",
-        "jsonpath={.items[0].spec.nodeName}",
+        "json",
     ])
     .await;
-    let uid = kubectl(&["get", "node", node.trim(), "-o", "jsonpath={.metadata.uid}"]).await;
-    format!(
-        "spiffe://{TRUST_DOMAIN}/spire/agent/k8s_psat/{SPIRE_CLUSTER}/{}",
-        uid.trim()
-    )
+    let pods: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let agents = pods["items"].as_array().unwrap();
+    let minimum = std::env::var("OPENSHELL_E2E_SPIRE_MIN_AGENTS")
+        .unwrap_or_else(|_| "1".into())
+        .parse::<usize>()
+        .unwrap();
+    let nodes: BTreeSet<_> = agents
+        .iter()
+        .map(|pod| pod["spec"]["nodeName"].as_str().unwrap())
+        .collect();
+    assert!(
+        nodes.len() >= minimum,
+        "expected {minimum} Broker nodes, found {nodes:?}"
+    );
+    let original = kubectl(&[
+        "-n",
+        &namespace,
+        "get",
+        "service",
+        "spire-broker",
+        "-o",
+        "json",
+    ])
+    .await;
+    let original: serde_json::Value = serde_json::from_str(&original).unwrap();
+    for pod in agents {
+        let name = pod["metadata"]["name"].as_str().unwrap();
+        let address = pod["status"]["podIP"].as_str().unwrap();
+        kubectl(&[
+            "-n",
+            &namespace,
+            "label",
+            "pod",
+            name,
+            &format!("openshell.ai/broker-target={name}"),
+            "--overwrite",
+        ])
+        .await;
+        let selector =
+            serde_json::json!({"spec": {"selector": {"openshell.ai/broker-target": name}}});
+        kubectl(&[
+            "-n",
+            &namespace,
+            "patch",
+            "service",
+            "spire-broker",
+            "--type=merge",
+            "-p",
+            &selector.to_string(),
+        ])
+        .await;
+        let ready = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let endpoints = kubectl(&[
+                    "-n",
+                    &namespace,
+                    "get",
+                    "endpoints",
+                    "spire-broker",
+                    "-o",
+                    "json",
+                ])
+                .await;
+                let endpoints: serde_json::Value = serde_json::from_str(&endpoints).unwrap();
+                let addresses: Vec<_> = endpoints["subsets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|subset| subset["addresses"].as_array().into_iter().flatten())
+                    .filter_map(|endpoint| endpoint["ip"].as_str())
+                    .collect();
+                if addresses == [address] {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "Broker service did not select {name}");
+        let (ok, output) = cli(&["sandbox", "stop", &sandbox.name]).await;
+        assert!(ok, "{output}");
+        let (ok, output) = cli(&["sandbox", "start", &sandbox.name]).await;
+        assert!(ok, "{output}");
+        call_until(sandbox, port, &format!("SAW:{sandbox_id}")).await;
+        eprintln!(
+            "Broker acquisition succeeded through {name} on {}",
+            pod["spec"]["nodeName"]
+        );
+    }
+    let restore = serde_json::json!([
+        {"op": "replace", "path": "/spec/selector", "value": original["spec"]["selector"]}
+    ]);
+    kubectl(&[
+        "-n",
+        &namespace,
+        "patch",
+        "service",
+        "spire-broker",
+        "--type=json",
+        "-p",
+        &restore.to_string(),
+    ])
+    .await;
 }
 
 fn spire_fixture() -> String {
@@ -1036,7 +1141,7 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     );
     let (mut alpha, mut beta) = (alpha, beta);
     let gateway_id = gateway_id().await;
-    let agent_id = gateway_agent_id().await;
+    let agent_id = broker_agent_parent_id();
     let alpha_id = sandbox_id(&alpha.name).await;
     let beta_id = sandbox_id(&beta.name).await;
 
@@ -1148,6 +1253,7 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     assert_sandbox_holds_no_spiffe_material(&alpha).await;
     assert_sandbox_holds_no_spiffe_material(&beta).await;
 
+    assert_every_broker_agent(&alpha, target.port, &alpha_id).await;
     assert_provider_failover(&alpha, &gateway_id, &tokens, &target).await;
 
     // The fixture's workload X.509-SVID TTL is 30 seconds. Let the

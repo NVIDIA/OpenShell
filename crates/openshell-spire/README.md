@@ -33,7 +33,11 @@ gateway SPIFFE ID and `KubernetesObjectReference` over TCP, and configures
 SubjectAccessReview permissions; the gateway SPIFFE ID needs
 `impersonate-via-spire` only for its permitted Sandbox resources. Registrations
 match attested Sandbox UIDs and must reach each selected agent. The configured
-server SPIFFE ID must match the endpoint's agent certificate.
+peer policy must authorize the endpoint's agent certificate. Configure exactly
+one of `server_spiffe_id` (exact identity) and `server_spiffe_id_prefix`
+(descendants of one cluster-scoped SPIFFE path). Use a node alias as the parent
+of registrations served by multiple agents; the alias does not replace their
+concrete certificate identities.
 
 ## Verification
 
@@ -42,7 +46,8 @@ mise run e2e:kubernetes:shared-supervisor-spiffe
 ```
 
 The test installs pinned SPIRE charts, exercises the full provider exchange,
-checks supervisor takeover and stale-session fencing, and forces acquisition
+forces acquisition through each agent on a three-node cluster, checks supervisor
+takeover and stale-session fencing, and forces acquisition
 after the fixture's 30-second workload X.509-SVID expires. It also checks that
 the gateway Pod passes Restricted Pod Security admission.
 

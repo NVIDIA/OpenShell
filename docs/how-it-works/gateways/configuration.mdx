@@ -1489,7 +1489,7 @@ X.509-SVID over mTLS.
 [openshell.gateway.spiffe_broker]
 spiffe_id_prefix = "spiffe://example.org/openshell"
 endpoint = "https://spire-broker.spire.svc:8443"
-server_spiffe_id = "spiffe://example.org/spire/agent/k8s_psat/cluster/node-uid"
+server_spiffe_id_prefix = "spiffe://example.org/spire/agent/k8s_psat/cluster"
 workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
 ```
 
@@ -1507,8 +1507,17 @@ permitted namespaces.
 Register each sandbox's stable SPIFFE ID against its attested Sandbox resource
 UID. The gateway supplies the UID from its persisted compute-runtime identity;
 workload Pod replacement does not change it. Registrations must reach every
-agent that serves the configured endpoint. `server_spiffe_id` must match that
-endpoint's agent certificate exactly. The installed SPIRE version and operator
+agent that serves the configured endpoint. Use a SPIRE node alias as the
+registration parent to cover agents attested with the intended cluster,
+namespace, and ServiceAccount selectors, including newly added nodes. The
+alias does not change the agents' certificate identities.
+
+Set exactly one peer policy. `server_spiffe_id_prefix` accepts descendants of
+the configured SPIFFE path in the same trust domain. The example accepts all
+node IDs in one attested cluster and rejects sibling cluster paths. For an
+endpoint serving one fixed identity, use `server_spiffe_id` instead. Certificate
+chain verification and the requirement for exactly one URI SAN apply to both
+modes. Do not use a trust-domain-wide peer policy. The installed SPIRE version and operator
 must support the experimental API; this configuration alone does not enable it.
 
 ### MXC

@@ -117,9 +117,12 @@ broker rejects the old bearer. The fixture's 30-second workload X.509-SVIDs
 exercise acquisition after credential rotation. The gateway Pod must pass
 Restricted Pod Security admission. The task owns its SPIRE install and cluster.
 
-The fixture supplies the single agent's exact SPIFFE ID. Multi-agent endpoints
-need matching peer identity configuration and registrations for every selected
-agent. The installed SPIRE version and operator must expose the experimental
+The task creates three nodes (`HELM_K3S_AGENT_COUNT=2` adds two k3d agents) and
+requires three SPIRE agents. Its cluster-scoped `server_spiffe_id_prefix` accepts
+the concrete node identities, and a node alias distributes Sandbox registrations
+to all eligible agents. The test selects each Broker backend in turn and forces
+a new generation's acquisition. Exact-ID mode remains available for a fixed
+endpoint. The installed SPIRE version and operator must expose the experimental
 Broker API. `e2e/kubernetes/spiffe-broker/README.md` describes independent
 protocol and negative authorization checks.
 

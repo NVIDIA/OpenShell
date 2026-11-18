@@ -402,6 +402,7 @@ EOF
   else
     echo "Creating k3d cluster '${CLUSTER_NAME}'..."
     k3d cluster create "${CLUSTER_NAME}" \
+      --agents "${HELM_K3S_AGENT_COUNT:-0}" \
       --wait \
       --kubeconfig-update-default=false \
       --kubeconfig-switch-context=false \

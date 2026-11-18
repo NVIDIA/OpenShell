@@ -10,5 +10,8 @@ Enable the experimental Broker endpoint on SPIRE, allowlist the gateway SPIFFE
 ID and KubernetesObjectReference over TCP, and configure enforced Kubernetes
 SubjectAccessReview authorization (impersonate-via-spire) for Sandbox resources.
 Registrations must match the attested Sandbox resource UID on every selected
-agent. The configured server_spiffe_id must match that endpoint's agent SVID.
+agent, for example through a cluster-scoped SPIRE node alias.
+Use server_spiffe_id_prefix for a Service over agents in one attested cluster,
+or server_spiffe_id for one exact identity. The alias is a registration parent,
+not a replacement for the agent's certificate identity.
 {{- end }}

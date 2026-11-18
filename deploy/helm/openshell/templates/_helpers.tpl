@@ -402,10 +402,19 @@ fullname, so the name never collapses into another release resource's name.
 {{- if not (regexMatch "^(/[A-Za-z0-9_.-]+){2,}$" (get $broker "workload_api_socket_path" | default "")) -}}
 {{- fail "spiffe_broker.workload_api_socket_path must be an absolute UNIX socket path" -}}
 {{- end -}}
-{{- range $field := list "server_spiffe_id" "spiffe_id_prefix" -}}
+{{- $exact := get $broker "server_spiffe_id" | default "" -}}
+{{- $prefix := get $broker "server_spiffe_id_prefix" | default "" -}}
+{{- if eq (empty $exact) (empty $prefix) -}}
+{{- fail "spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix" -}}
+{{- end -}}
+{{- $peerField := ternary "server_spiffe_id" "server_spiffe_id_prefix" (not (empty $exact)) -}}
+{{- range $field := list $peerField "spiffe_id_prefix" -}}
 {{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" (get $broker $field | default "")) -}}
 {{- fail (printf "spiffe_broker.%s must be a SPIFFE ID" $field) -}}
 {{- end -}}
+{{- end -}}
+{{- if and $prefix (not (regexMatch "^spiffe://[^/]+/.+" $prefix)) -}}
+{{- fail "spiffe_broker.server_spiffe_id_prefix requires an agent path" -}}
 {{- end -}}
 {{- end }}
 
