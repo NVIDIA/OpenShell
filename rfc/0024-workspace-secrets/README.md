@@ -432,16 +432,23 @@ secrets exist; the secret type joins the resource kinds that workspace deletion
 checks.
 
 `CreateSecret` must not leave a secret behind in a deleted workspace, even if
-the gateway exits mid-request. It inserts the record as a pending create that
-records the workspace's ID. A pending record is invisible to every read and
-reference, but it blocks workspace deletion. Workspace deletion marks the
-workspace terminating before it scans for blockers, so after the insert the
-create re-reads the workspace. If the workspace is still the active one it
-resolved, the create publishes the record with a version-checked write.
-Otherwise it discards the record and its staged value and fails. A record whose
-create never publishes is discarded by the sweep once it is stale or its
-workspace is gone or replaced, or by the next create of the same name. A later
-workspace with the same name therefore never inherits it.
+the gateway exits mid-request. It reads the workspace's immutable ID before
+checking the caller's membership, so the secret can only be published under the
+instance the caller was authorized against. It then inserts the record as a
+pending create that records that ID. A pending record is invisible to every
+read and reference, but it blocks workspace deletion. Workspace deletion marks
+the workspace terminating before it scans for blockers, so after the insert the
+create re-reads the workspace. If the workspace is still the same active
+instance, the create publishes the record with a version-checked write.
+Otherwise it discards the record and its staged value and fails.
+
+A record whose create never publishes is discarded by the sweep once it is
+stale or its workspace is gone or replaced, or by the next create of the same
+name. A later workspace with the same name therefore never inherits it. Every
+discard first claims the record with the version-checked transition to
+deleting, and only the claimant deletes the value. A create that publishes at
+the same moment therefore wins and keeps its value. A failed workspace lookup
+defers the decision rather than counting as a missing workspace.
 
 Bindings use immutable IDs. Deleting a secret and recreating one with the same
 name therefore never silently rebinds a provider.
