@@ -108,16 +108,6 @@ impl Config {
     }
 }
 
-fn valid_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 63
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-        && label
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
 #[derive(Clone, Default)]
 struct Snapshot {
     routes: BTreeMap<String, SandboxServiceRoute>,
@@ -256,7 +246,7 @@ impl Routes {
             return;
         }
         if result.configuration_admitted
-            && valid_label(&result.workspace)
+            && openshell_core::app_listener::valid_dns_label(&result.workspace)
             && !result.workspace.contains("--")
         {
             for route in &result.service_routes {
@@ -265,7 +255,8 @@ impl Routes {
                     || route.target_port > 65535
                     || !matches!(route.authorization_mode, 0..=2)
                     || (!route.name.is_empty()
-                        && (!valid_label(&route.name) || route.name.contains("--")))
+                        && (!openshell_core::app_listener::valid_dns_label(&route.name)
+                            || route.name.contains("--")))
                 {
                     self.suspend();
                     return;
@@ -276,7 +267,9 @@ impl Routes {
                 }
             }
         }
-        if routes.len() > 1024 || !valid_label(&result.workspace) || result.workspace.contains("--")
+        if routes.len() > 1024
+            || !openshell_core::app_listener::valid_dns_label(&result.workspace)
+            || result.workspace.contains("--")
         {
             self.suspend();
             return;
@@ -461,7 +454,9 @@ impl Registration {
             else {
                 return false;
             };
-            if !valid_label(label) || route.application_hostname.len() > 253 {
+            if !openshell_core::app_listener::valid_dns_label(label)
+                || route.application_hostname.len() > 253
+            {
                 return false;
             }
             names.push(route.application_hostname.clone());
@@ -592,7 +587,7 @@ impl Drop for Handle {
 
 impl Router {
     pub(crate) fn instance(&self, sandbox: &str) -> Result<InstanceListener> {
-        if !valid_label(sandbox) || sandbox.contains("--") {
+        if !openshell_core::app_listener::valid_dns_label(sandbox) || sandbox.contains("--") {
             return Err(miette::miette!(
                 "app listener requires a canonical sandbox name"
             ));

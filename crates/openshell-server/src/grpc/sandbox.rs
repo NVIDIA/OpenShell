@@ -4350,40 +4350,6 @@ async fn run_exec_with_russh(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Refresh explicit access paths while preserving the recorded service URL map.
-pub(super) fn refresh_response_urls(state: &ServerState, response: &mut SandboxResponse) {
-    let Some(sandbox) = response.sandbox.as_ref() else {
-        return;
-    };
-    response.application_service_urls.clear();
-    response.gateway_service_urls.clear();
-    for service in response.service_urls.keys() {
-        let gateway = crate::service_routing::endpoint_url(
-            &state.config,
-            sandbox.object_workspace(),
-            sandbox.object_name(),
-            service,
-        )
-        .unwrap_or_default();
-        let application = state.config.supervisor_app_listener.service_url(
-            sandbox.object_workspace(),
-            sandbox.object_name(),
-            service,
-            state.config.service_routing_discriminator(),
-        );
-        if !gateway.is_empty() {
-            response
-                .gateway_service_urls
-                .insert(service.clone(), gateway);
-        }
-        if let Some(application) = application {
-            response
-                .application_service_urls
-                .insert(service.clone(), application);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

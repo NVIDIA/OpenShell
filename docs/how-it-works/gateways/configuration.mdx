@@ -359,7 +359,7 @@ config_delivery_mode = "poll"
 # service URLs under that domain.
 server_sans                  = ["openshell", "*.dev.openshell.localhost"]
 # Publish gateway service URLs and forward application traffic through the gateway.
-service_routing_enabled      = true
+enable_gateway_service_routing      = true
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
 # Hostname format for exposed sandbox services. "hashed" makes service URLs
@@ -615,24 +615,26 @@ and `https://<workspace>--<sandbox>.<base-domain>/` for the unnamed endpoint.
 The base domain is the first wildcard DNS SAN in `server_sans`; gateways
 without SANs use the built-in `openshell.localhost`.
 
-`service_routing_enabled` defaults to `true`. Set it to `false` to stop publishing
+`enable_gateway_service_routing` defaults to `true`. Set it to `false` to stop publishing
 gateway service URLs and reject gateway-mediated application HTTP requests and
 WebSocket upgrades with `404`. Control-plane APIs, service declarations, direct
 supervisor listeners, and discovery remain available. The setting also accepts
-`--service-routing-enabled=false` or `OPENSHELL_SERVICE_ROUTING_ENABLED=false`,
+`--enable-gateway-service-routing=false` or `OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING=false`,
 with CLI > environment > TOML > default precedence. In Helm, configure the
 canonical gateway table:
 
 ```yaml
 gatewayConfig:
   openshell.gateway:
-    service_routing_enabled: false
+    enable_gateway_service_routing: false
 ```
 
 With gateway routing disabled, `gateway_url` is empty and `gateway_service_urls`
 is empty. A configured application origin supplies the preferred URL; without
-one, preferred URLs are empty. Idempotent retries preserve recorded preferred
-URLs; explicit application/gateway fields reflect the current configuration.
+one, preferred URLs are empty. Idempotent retries preserve all recorded URL fields together. Use service
+Get/List operations to obtain current addresses. Service declarations can still
+be created without either routing path; the CLI explains when no public URL is
+configured.
 
 `service_hostname_format` selects the hostname format for exposed sandbox
 services when multiple gateways share one service base domain behind a single
@@ -665,7 +667,8 @@ unique per gateway, so exact-host ingress rules can route it unambiguously.
 The gateway still accepts requests for legacy composite hostnames while
 hashed format is configured.
 
-Service URLs are recomputed from the current configuration, not persisted.
+Service Get/List URLs are computed from the current configuration. Idempotent
+mutation receipts retain the URLs originally returned.
 Changing the installation name, the hostname format, or both changes every
 hash URL issued before the change; previously issued URLs stop resolving
 until callers request a fresh URL.
@@ -2255,9 +2258,16 @@ base_url = "https://services.example.com"
 tls_secret_name = "openshell-app-tls"
 ```
 
-`base_url` replaces the separate `domain` and `public_url` settings. Remove
-those fields when updating an existing app-listener configuration; the domain is
-now derived from `base_url`.
+`base_url = "https://<domain>"` replaces `domain`. Remove the old key when
+updating an existing app-listener configuration.
+
+Upgrade the gateway, compute driver, and supervisors together. Existing dedicated
+sandbox Pods retain their old supervisor image until replaced. Recreate them
+with the matching supervisor image before relying on discovery or application
+ingress; plan for service interruption during replacement. Older supervisors
+cannot acknowledge the new hostname declarations. New supervisors require the
+driver to supply `OPENSHELL_APP_BASE_URL` and cannot start an enabled listener
+with only the older `OPENSHELL_APP_SERVICE_DOMAIN` variable.
 
 The listener defaults to disabled, with port `8443` and no base URL. Port,
 `base_url`, or driver options alone do not enable it. An enabled listener requires
@@ -2371,10 +2381,10 @@ When configured, service responses return the application address as `url` and
 Create-time exposure returns corresponding preferred, application, and gateway
 URL maps. CLI and SDK callers preserve the application origin, including its
 port, when the gateway is reached through a port-forward. With the listener
-disabled, the existing gateway URL behavior remains. Idempotent retries preserve the
-original `url` and `service_urls` values. The explicit application and gateway
-fields use the current URL configuration. A configured URL does not mean that a
-supervisor installed the route or ingress is ready.
+disabled, the existing gateway URL behavior remains. Idempotent retries preserve
+all originally returned URL fields together. Use service Get/List operations for
+current addresses after a configuration change. A configured URL does not mean
+that a supervisor installed the route or ingress is ready.
 
 Upgrade the CLI alongside the gateway when enabling `base_url`. Older CLI
 versions can replace the public application port with the gateway connection's

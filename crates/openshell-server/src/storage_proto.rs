@@ -224,7 +224,9 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
-    // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
+    // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
+    // public-only messages alongside main's public APIs; durable schemas
+    // and the public/durable overlap remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
         "787222569ef766310085ddd930a7f9b12ac0ff4f76a1f1846b9426659c5a9746";
     const DURABLE_SCHEMA_SHA256: &str =
@@ -774,7 +776,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (365, 31),
+                (367, 31),
                 (102, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

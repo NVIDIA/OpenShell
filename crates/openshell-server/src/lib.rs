@@ -3230,7 +3230,6 @@ mod tests {
             "GET /app HTTP/1.1\r\nHost: default--demo--web.openshell.localhost:{}\r\nConnection: close\r\n\r\n", addr.port()
         )).await;
         assert!(response.starts_with("HTTP/1.1 404"));
-        assert!(response.contains("Gateway service routing is disabled"));
         stop_listener(shutdown, handle).await;
     }
 

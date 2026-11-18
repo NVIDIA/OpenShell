@@ -1750,7 +1750,8 @@ manual schema-v2 migration in the Gateway Configuration reference.
 ## Supervisor application ingress
 
 When `[openshell.supervisor.app_listener]` is explicitly enabled, check its
-`port` and `domain` separately from the gateway API and supervisor runtime ports.
+`port` and `base_url` separately from the gateway API and supervisor runtime ports.
+Derive the domain from the HTTPS `base_url`; do not configure a `domain` key.
 The Kubernetes TLS Secret is configured with `tls_secret_name` under
 `[openshell.drivers.kubernetes.sandbox_runtime.app_listener]`. Disabled listeners
 create no app TLS mount or app port. TLS material is mounted only in supervisors
@@ -1763,6 +1764,14 @@ creates no app Services. Preserve service SNI and Host when using curl's
 NetworkPolicy forwarding; also test from a permitted in-cluster client. Operators
 provide ingress network rules. Running supervisors retain their startup listener
 configuration until restarted.
+
+Gateway, compute-driver, and supervisor images must match. After upgrading from
+the `domain` configuration, replace existing dedicated sandbox Pods with the
+matching supervisor image; a gateway rollout alone does not update them. Old
+supervisors cannot acknowledge the new hostname declarations, so their services
+drop out of discovery. New supervisors require `OPENSHELL_APP_BASE_URL` from the
+driver; `OPENSHELL_APP_SERVICE_DOMAIN` is not a compatibility input. Plan for
+service interruption when replacing dedicated Pods.
 
 Service changes arrive through polling or push configuration. Only admitted
 service declarations are installed. Polling and accepted live push sessions
@@ -1811,7 +1820,7 @@ Watches recheck bearer credentials and membership every second. Allow one refres
 interval for withdrawals; route lease expiry remains independently enforced.
 
 For incorrect public service URLs, inspect
-`[openshell.gateway].service_routing_enabled` first. When false, gateway URL fields
+`[openshell.gateway].enable_gateway_service_routing` first. When false, gateway URL fields
 are empty and gateway application requests return `404`; direct listener and
 discovery behavior is independent. Then inspect
 `[openshell.supervisor.app_listener].base_url`. It is the external HTTPS base origin

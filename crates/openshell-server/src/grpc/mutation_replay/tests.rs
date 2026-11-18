@@ -172,19 +172,19 @@ async fn create_url_maps_follow_independent_routing_flags_and_replays_keep_recor
             assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
             assert_eq!(replay.get_ref().service_urls, original.service_urls);
             assert_eq!(
-                replay.get_ref().gateway_service_urls.len(),
-                if gateway_enabled { 0 } else { 2 }
+                replay.get_ref().gateway_service_urls,
+                original.gateway_service_urls
             );
             assert_eq!(
-                replay.get_ref().application_service_urls.len(),
-                if application_enabled { 0 } else { 2 }
+                replay.get_ref().application_service_urls,
+                original.application_service_urls
             );
         }
     }
 }
 
 #[tokio::test]
-async fn create_replay_preserves_recorded_urls_and_refreshes_explicit_origins() {
+async fn create_replay_preserves_all_recorded_urls_when_origins_change() {
     let (mut state, _directory) = url_replay_state().await;
     let request = CreateSandboxRequest {
         name: "origin-replay".into(),
@@ -220,25 +220,14 @@ async fn create_replay_preserves_recorded_urls_and_refreshes_explicit_origins() 
         replay.get_ref().sandbox.as_ref().unwrap().metadata
     );
     assert_eq!(replay.get_ref().service_urls, original.service_urls);
-    for (service, label) in [
-        ("", "default--origin-replay"),
-        ("web", "default--origin-replay--web"),
-    ] {
-        assert_eq!(
-            replay.get_ref().application_service_urls[service],
-            format!("https://{label}.services.example.com:10443/")
-        );
-        let gateway = url::Url::parse(&replay.get_ref().gateway_service_urls[service]).unwrap();
-        assert_eq!(
-            gateway.host_str(),
-            Some(format!("{label}.gateway.example.com").as_str())
-        );
-        assert_eq!(gateway.port(), Some(12443));
-        assert_ne!(
-            replay.get_ref().gateway_service_urls[service],
-            original.gateway_service_urls[service]
-        );
-    }
+    assert_eq!(
+        replay.get_ref().application_service_urls,
+        original.application_service_urls
+    );
+    assert_eq!(
+        replay.get_ref().gateway_service_urls,
+        original.gateway_service_urls
+    );
 }
 
 #[tokio::test]
@@ -285,18 +274,23 @@ async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disable
     config.supervisor_app_listener.base_url = Some("https://new.example.com:11443".into());
     let replay = run(&state, authed_request(request.clone())).await.unwrap();
     assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
-    assert_eq!(replay.get_ref().endpoint, original.endpoint);
-    assert_eq!(replay.get_ref().url, original.url);
+    assert_eq!(replay.get_ref(), &original);
+    let current = super::super::service::handle_get_service(
+        &state,
+        authed_request(openshell_core::proto::GetServiceRequest {
+            sandbox: "expose-replay".into(),
+            name: "web".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
     assert_eq!(
-        replay.get_ref().application_url,
+        current.url,
         "https://default--expose-replay--web.new.example.com:11443/"
     );
-    let gateway = url::Url::parse(&replay.get_ref().gateway_url).unwrap();
-    assert_eq!(
-        gateway.host_str(),
-        Some("default--expose-replay--web.gateway.example.com")
-    );
-    assert_eq!(gateway.port(), Some(12443));
+    assert_eq!(current.url, current.application_url);
     let config = &mut Arc::get_mut(&mut state).unwrap().config;
     config.supervisor_app_listener.enabled = false;
     config.supervisor_app_listener.base_url = None;
@@ -308,23 +302,14 @@ async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disable
             .unwrap(),
         "true"
     );
-    assert_eq!(without_application.get_ref().url, original.url);
-    assert_eq!(without_application.get_ref().endpoint, original.endpoint);
-    assert!(without_application.get_ref().application_url.is_empty());
-    assert_eq!(
-        without_application.get_ref().gateway_url,
-        replay.get_ref().gateway_url
-    );
+    assert_eq!(without_application.get_ref(), &original);
     Arc::get_mut(&mut state)
         .unwrap()
         .config
         .service_routing
         .enabled = false;
     let without_either_path = run(&state, authed_request(request)).await.unwrap();
-    assert_eq!(without_either_path.get_ref().url, original.url);
-    assert_eq!(without_either_path.get_ref().endpoint, original.endpoint);
-    assert!(without_either_path.get_ref().gateway_url.is_empty());
-    assert!(without_either_path.get_ref().application_url.is_empty());
+    assert_eq!(without_either_path.get_ref(), &original);
 }
 
 #[tokio::test]

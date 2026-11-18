@@ -1376,8 +1376,44 @@ mod tests {
     use openshell_core::config::ServiceHostnameFormat;
 
     #[tokio::test]
+    async fn disabled_gateway_routing_does_not_rebuild_the_hashed_index() {
+        use tower::ServiceExt as _;
+
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.service_routing.enabled = false;
+        inner.config.name = "gateway-a".into();
+        inner.config.service_routing.service_hostname_format = ServiceHostnameFormat::Hashed;
+        inner.service_route_index = Arc::new(ServiceRouteIndex::new(Some("gateway-a".into())));
+
+        for router in [
+            crate::http_router(state.clone()),
+            crate::service_http_router(state.clone()),
+        ] {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/app")
+                        .header(header::HOST, "enh47uqyj7bpyttz.openshell.localhost")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(
+                state
+                    .service_route_index
+                    .last_rebuild
+                    .read()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_gateway_routing_rejects_http_and_websocket_on_both_routers() {
-        use http_body_util::BodyExt as _;
         use tower::ServiceExt as _;
 
         for hashed in [false, true] {
@@ -1423,10 +1459,6 @@ mod tests {
                             .await
                             .unwrap();
                         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-                        assert_eq!(
-                            response.into_body().collect().await.unwrap().to_bytes(),
-                            "Gateway service routing is disabled"
-                        );
                     }
                 }
             }

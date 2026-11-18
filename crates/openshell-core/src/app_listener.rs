@@ -27,23 +27,22 @@ impl Default for AppListenerConfig {
     }
 }
 
-/// Validate a listener endpoint after deriving its domain from the base URL.
+/// Whether a string is a lowercase DNS label, without a hostname suffix.
+pub fn valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 fn validate_listener_endpoint(port: u16, domain: &str) -> Result<(), String> {
     if port < 1024 {
         return Err("supervisor.app_listener.port must be at least 1024".into());
     }
-    if domain.is_empty()
-        || domain.len() > 253
-        || !domain.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-    {
+    if domain.is_empty() || domain.len() > 253 || !domain.split('.').all(valid_dns_label) {
         return Err("app listener domain must be a lowercase DNS name".into());
     }
     Ok(())
@@ -89,15 +88,20 @@ impl AppListenerConfig {
     }
 
     /// Canonical SNI/Host shared by URL publication, configuration and discovery.
+    /// Disabled or invalid listener configurations have no service hostname.
     pub fn service_hostname(
         &self,
         workspace: &str,
         sandbox: &str,
         service: &str,
         discriminator: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let origin = self.parsed_base_url().ok()?;
         let label = service_route_label(discriminator, workspace, sandbox, service);
-        format!("{label}.{}", self.domain())
+        Some(format!("{label}.{}", origin.host_str()?))
     }
 
     /// Configured address only; this does not imply installation or readiness.
@@ -118,7 +122,7 @@ impl AppListenerConfig {
                 sandbox,
                 service,
                 discriminator,
-            )))
+            )?))
             .ok()?;
         Some(origin.into())
     }
@@ -285,11 +289,45 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.domain(), "services.example.com");
         assert_eq!(config.port, 9443);
-        for field in ["domain", "public_url"] {
-            let value = serde_json::json!({field: "services.example.com"});
-            let error = serde_json::from_value::<AppListenerConfig>(value).unwrap_err();
-            assert!(error.to_string().contains(field));
+        let value = serde_json::json!({"domain": "services.example.com"});
+        let error = serde_json::from_value::<AppListenerConfig>(value).unwrap_err();
+        assert!(error.to_string().contains("domain"));
+    }
+
+    #[test]
+    fn service_hostnames_require_an_enabled_valid_origin() {
+        let mut config = AppListenerConfig::default();
+        for base_url in [
+            None,
+            Some("not-a-url"),
+            Some("http://services.example.com"),
+            Some("https://services.example.com"),
+        ] {
+            config.base_url = base_url.map(str::to_string);
+            config.enabled = false;
+            assert!(
+                config
+                    .service_hostname("default", "demo", "web", None)
+                    .is_none()
+            );
+            config.enabled = true;
+            let hostname = config.service_hostname("default", "demo", "web", None);
+            assert_eq!(
+                hostname.as_deref(),
+                (base_url == Some("https://services.example.com"))
+                    .then_some("default--demo--web.services.example.com")
+            );
         }
+    }
+
+    #[test]
+    fn dns_labels_reject_invalid_characters_and_boundaries() {
+        for label in ["", "-web", "web-", "WEB", "web.example", "web_service", "é"] {
+            assert!(!valid_dns_label(label), "{label}");
+        }
+        assert!(valid_dns_label("web-123"));
+        assert!(valid_dns_label(&"a".repeat(63)));
+        assert!(!valid_dns_label(&"a".repeat(64)));
     }
 
     #[test]

@@ -333,8 +333,8 @@ struct RunArgs {
     service_hostname_format: Option<ServiceHostnameFormat>,
 
     /// Publish gateway service URLs and enable gateway-mediated application routing.
-    #[arg(long, env = "OPENSHELL_SERVICE_ROUTING_ENABLED", default_value_t = true, action = ArgAction::Set)]
-    service_routing_enabled: bool,
+    #[arg(long, env = "OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING", default_value_t = true, action = ArgAction::Set)]
+    enable_gateway_service_routing: bool,
 
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[arg(
@@ -673,7 +673,7 @@ fn prepare_server_config_with_drivers(
         )
         .with_server_sans(args.server_sans.clone())
         .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
-        .with_service_routing(args.service_routing_enabled)
+        .with_service_routing(args.enable_gateway_service_routing)
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
     config
@@ -1683,10 +1683,10 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.service_hostname_format = Some(*format);
     }
-    if let Some(enabled) = file.service_routing_enabled
-        && arg_defaulted(matches, "service_routing_enabled")
+    if let Some(enabled) = file.enable_gateway_service_routing
+        && arg_defaulted(matches, "enable_gateway_service_routing")
     {
-        args.service_routing_enabled = enabled;
+        args.enable_gateway_service_routing = enabled;
     }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
@@ -5033,32 +5033,38 @@ enable_loopback_service_http = false
     #[test]
     fn gateway_service_routing_defaults_on_and_honors_config_precedence() {
         Environment::new()
-            .remove("OPENSHELL_SERVICE_ROUTING_ENABLED")
+            .remove("OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING")
             .run(|| {
                 let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
-                assert!(args.service_routing_enabled);
+                assert!(args.enable_gateway_service_routing);
                 assert!(openshell_core::Config::new(None).service_routing.enabled);
-                let file =
-                    config_file_from_toml("[openshell.gateway]\nservice_routing_enabled = false\n");
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nenable_gateway_service_routing = false\n",
+                );
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-                assert!(!args.service_routing_enabled);
-                let (mut args, matches) =
-                    parse_with_args(&["openshell-gateway", "--service-routing-enabled=true"]);
+                assert!(!args.enable_gateway_service_routing);
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-routing=true",
+                ]);
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-                assert!(args.service_routing_enabled);
+                assert!(args.enable_gateway_service_routing);
             });
         Environment::new()
-            .set("OPENSHELL_SERVICE_ROUTING_ENABLED", "true")
+            .set("OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING", "true")
             .run(|| {
-                let file =
-                    config_file_from_toml("[openshell.gateway]\nservice_routing_enabled = false\n");
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nenable_gateway_service_routing = false\n",
+                );
                 let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-                assert!(args.service_routing_enabled);
-                let (mut args, matches) =
-                    parse_with_args(&["openshell-gateway", "--service-routing-enabled=false"]);
+                assert!(args.enable_gateway_service_routing);
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-routing=false",
+                ]);
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-                assert!(!args.service_routing_enabled);
+                assert!(!args.enable_gateway_service_routing);
             });
     }
 
@@ -5074,12 +5080,12 @@ enable_loopback_service_http = false
                 local_tls.path().to_str().unwrap(),
             )
             .remove("OPENSHELL_SERVICE_HOSTNAME_FORMAT")
-            .remove("OPENSHELL_SERVICE_ROUTING_ENABLED")
+            .remove("OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING")
             .run(|| {
                 let config_path = state.path().join("gateway.toml");
                 std::fs::write(
                     &config_path,
-                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\nservice_routing_enabled = false\n",
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\nenable_gateway_service_routing = false\n",
                 )
                 .unwrap();
 

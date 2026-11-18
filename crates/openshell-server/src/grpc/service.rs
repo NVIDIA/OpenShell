@@ -420,20 +420,21 @@ pub(super) async fn configured_app_routes(
     if !state.config.supervisor_app_listener.enabled {
         return Ok(Vec::new());
     }
-    Ok(configured_app_routes_from_endpoints(
+    configured_app_routes_from_endpoints(
         state,
         sandbox,
         app_service_endpoints(state, sandbox).await?,
-    ))
+    )
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn configured_app_routes_from_endpoints(
     state: &ServerState,
     sandbox: &Sandbox,
     endpoints: Vec<ServiceEndpoint>,
-) -> Vec<openshell_core::proto::SandboxServiceRoute> {
+) -> Result<Vec<openshell_core::proto::SandboxServiceRoute>, Status> {
     if !state.config.supervisor_app_listener.enabled {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut service_routes: Vec<_> = endpoints
         .into_iter()
@@ -445,22 +446,30 @@ pub(super) fn configured_app_routes_from_endpoints(
                     .as_ref()
                     .is_none_or(|m| m.deletion_time.is_none())
         })
-        .map(|ep| openshell_core::proto::SandboxServiceRoute {
-            endpoint_id: ep.object_id().to_string(),
-            name: ep.name.clone(),
-            target_port: ep.target_port,
-            authorization_mode: ep.authorization_mode,
-            resource_version: ep.metadata.as_ref().map_or(0, |m| m.resource_version),
-            application_hostname: state.config.supervisor_app_listener.service_hostname(
-                sandbox.object_workspace(),
-                sandbox.object_name(),
-                &ep.name,
-                state.config.service_routing_discriminator(),
-            ),
+        .map(|ep| {
+            Ok(openshell_core::proto::SandboxServiceRoute {
+                endpoint_id: ep.object_id().to_string(),
+                name: ep.name.clone(),
+                target_port: ep.target_port,
+                authorization_mode: ep.authorization_mode,
+                resource_version: ep.metadata.as_ref().map_or(0, |m| m.resource_version),
+                application_hostname: state
+                    .config
+                    .supervisor_app_listener
+                    .service_hostname(
+                        sandbox.object_workspace(),
+                        sandbox.object_name(),
+                        &ep.name,
+                        state.config.service_routing_discriminator(),
+                    )
+                    .ok_or_else(|| {
+                        Status::failed_precondition("application listener hostname unavailable")
+                    })?,
+            })
         })
-        .collect();
+        .collect::<Result<_, Status>>()?;
     service_routes.sort_by(|a, b| a.name.cmp(&b.name));
-    service_routes
+    Ok(service_routes)
 }
 
 async fn app_service_endpoints(
@@ -527,8 +536,8 @@ fn service_endpoint_response(
     response
 }
 
-/// Refresh explicit access paths without changing a replay's recorded URL.
-pub(super) fn refresh_response_urls(state: &ServerState, response: &mut ServiceEndpointResponse) {
+/// Populate explicit access paths from the current configuration.
+fn refresh_response_urls(state: &ServerState, response: &mut ServiceEndpointResponse) {
     let Some(endpoint) = response.endpoint.as_ref() else {
         return;
     };
@@ -584,21 +593,12 @@ fn validate_non_empty_endpoint_name(
             "{field} must not contain '--'"
         )));
     }
-    if !is_dns_label(value) {
+    if !openshell_core::app_listener::valid_dns_label(value) {
         return Err(Status::invalid_argument(format!(
             "{field} must be a lowercase DNS label"
         )));
     }
     Ok(())
-}
-
-fn is_dns_label(value: &str) -> bool {
-    if value.starts_with('-') || value.ends_with('-') {
-        return false;
-    }
-    value
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[cfg(test)]
