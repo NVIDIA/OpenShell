@@ -6,8 +6,9 @@
 //! The relay parses only client-to-server frames. Server-to-client bytes stay
 //! raw passthrough so inspection and rewriting cannot expose response payloads.
 
-use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
+use crate::l7::relay::{L7EvalContext, evaluate_l7_in_scope};
 use crate::l7::{EnforcementMode, L7RequestInfo};
+use crate::metrics::{self, InspectionType, Outcome, Policy, ResultLabel, Scope, Stage, Timer};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::telemetry::egress_emit;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
@@ -1215,6 +1216,89 @@ where
     W: AsyncWrite + Unpin,
     F: Future<Output = ()>,
 {
+    let inspection = if options
+        .inspector
+        .as_ref()
+        .is_some_and(|inspector| inspector.graphql_policy)
+    {
+        InspectionType::Graphql
+    } else {
+        InspectionType::Websocket
+    };
+    let mut metrics = MessageInspection {
+        timer: Some(Timer::new(Stage::Inspection(Scope::Message, inspection))),
+        inspection,
+        outcome: Outcome::Allow,
+    };
+    let result = relay_text_payload_inner(
+        writer,
+        frame,
+        payload,
+        admission,
+        force_reframe,
+        compressed,
+        host,
+        port,
+        options,
+        before_credential_write,
+        &mut metrics,
+    )
+    .await;
+    if let Err(error) = &result {
+        let (outcome, label) = match error.cause {
+            WebSocketTerminationCause::PolicyDenial
+            | WebSocketTerminationCause::MiddlewareDenial => {
+                (Some(Outcome::Deny), ResultLabel::Deny)
+            }
+            WebSocketTerminationCause::PolicyReload
+            | WebSocketTerminationCause::DownstreamDisconnect => (None, ResultLabel::Cancelled),
+            _ => (None, ResultLabel::Error),
+        };
+        metrics.finish(options.policy_name, outcome, label);
+    }
+    result
+}
+
+struct MessageInspection {
+    timer: Option<Timer>,
+    inspection: InspectionType,
+    outcome: Outcome,
+}
+
+impl MessageInspection {
+    fn finish(&mut self, policy: &str, outcome: Option<Outcome>, result: ResultLabel) {
+        if let Some(timer) = self.timer.take() {
+            if let Some(outcome) = outcome {
+                metrics::decision(
+                    Scope::Message,
+                    outcome,
+                    self.inspection,
+                    Policy::from(Some(policy)),
+                );
+            }
+            timer.finish(result);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_text_payload_inner<W, F>(
+    writer: &mut W,
+    frame: &FrameHeader,
+    payload: Vec<u8>,
+    admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
+    force_reframe: bool,
+    compressed: bool,
+    host: &str,
+    port: u16,
+    options: &mut RelayOptions<'_>,
+    before_credential_write: F,
+    metrics: &mut MessageInspection,
+) -> WebSocketRelayResult<()>
+where
+    W: AsyncWrite + Unpin,
+    F: Future<Output = ()>,
+{
     ensure_generation_current(host, port, options)?;
     let message_payload = if compressed {
         decompress_permessage_deflate(&payload).map_err(|error| match error {
@@ -1258,8 +1342,13 @@ where
     // Built-in transport/GraphQL inspection sees the original unresolved
     // message. External transformations run next, then policy is re-evaluated
     // before credential material is introduced.
-    if let Some(inspector) = options.inspector.as_ref() {
-        inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
+    if let Some(inspector) = options.inspector.as_ref()
+        && matches!(
+            inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?,
+            Outcome::Audit
+        )
+    {
+        metrics.outcome = Outcome::Audit;
     }
     ensure_generation_current(host, port, options)?;
 
@@ -1297,11 +1386,26 @@ where
             .invocations
             .iter()
             .any(|invocation| invocation.transformed);
+        if outcome.invocations.iter().any(|invocation| {
+            matches!(
+                invocation.outcome,
+                openshell_supervisor_middleware::WebSocketInvocationOutcome::FailOpen
+            )
+        }) {
+            metrics.outcome = Outcome::FailOpen;
+        }
         text = outcome.payload;
     }
 
-    if middleware_transformed && let Some(inspector) = options.inspector.as_ref() {
-        inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
+    if middleware_transformed
+        && let Some(inspector) = options.inspector.as_ref()
+        && matches!(
+            inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?,
+            Outcome::Audit
+        )
+        && !matches!(metrics.outcome, Outcome::FailOpen)
+    {
+        metrics.outcome = Outcome::Audit;
     }
     ensure_generation_current(host, port, options)?;
 
@@ -1345,6 +1449,11 @@ where
             ))
         })?;
         apply_mask(&mut payload, mask_key);
+        metrics.finish(
+            options.policy_name,
+            Some(metrics.outcome),
+            ResultLabel::Success,
+        );
         return write_text_frame_guarded(
             writer,
             &frame.raw_header,
@@ -1376,6 +1485,11 @@ where
                 error,
             ))
         })?;
+        metrics.finish(
+            options.policy_name,
+            Some(metrics.outcome),
+            ResultLabel::Success,
+        );
         return write_masked_text_frame_guarded(
             writer,
             0x40,
@@ -1387,6 +1501,11 @@ where
         )
         .await;
     }
+    metrics.finish(
+        options.policy_name,
+        Some(metrics.outcome),
+        ResultLabel::Success,
+    );
     write_masked_text_frame_guarded(
         writer,
         0,
@@ -1422,7 +1541,7 @@ fn inspect_websocket_text_message(
     policy_name: &str,
     inspector: &InspectionOptions<'_>,
     text: &str,
-) -> WebSocketRelayResult<()> {
+) -> WebSocketRelayResult<Outcome> {
     if inspector.graphql_policy {
         return inspect_graphql_websocket_message(host, port, policy_name, inspector, text);
     }
@@ -1434,19 +1553,20 @@ fn inspect_websocket_text_message(
         graphql: None,
         jsonrpc: None,
     };
-    let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)
-        .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?;
-    let decision = match (allowed, inspector.enforcement) {
-        (true, _) => "allow",
-        (false, EnforcementMode::Audit) => "audit",
-        (false, EnforcementMode::Enforce) => "deny",
-    };
+    let (allowed, reason) = evaluate_l7_in_scope(
+        Scope::Message,
+        inspector.engine,
+        inspector.ctx,
+        &request_info,
+    )
+    .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?;
+    let decision = Outcome::policy(allowed, inspector.enforcement == EnforcementMode::Enforce);
     emit_websocket_l7_event(
         host,
         port,
         policy_name,
         &request_info,
-        decision,
+        decision.label(),
         &reason,
         None,
     );
@@ -1456,7 +1576,7 @@ fn inspect_websocket_text_message(
             miette!("websocket text message denied by policy"),
         ));
     }
-    Ok(())
+    Ok(decision)
 }
 
 fn inspect_graphql_websocket_message(
@@ -1465,7 +1585,7 @@ fn inspect_graphql_websocket_message(
     policy_name: &str,
     inspector: &InspectionOptions<'_>,
     text: &str,
-) -> WebSocketRelayResult<()> {
+) -> WebSocketRelayResult<Outcome> {
     match classify_graphql_websocket_message(text) {
         GraphqlWebSocketMessage::Control { message_type } => {
             let request_info = L7RequestInfo {
@@ -1484,7 +1604,7 @@ fn inspect_graphql_websocket_message(
                 &format!("GraphQL WebSocket control message {message_type}"),
                 None,
             );
-            Ok(())
+            Ok(Outcome::Allow)
         }
         GraphqlWebSocketMessage::Operation {
             message_type,
@@ -1505,22 +1625,25 @@ fn inspect_graphql_websocket_message(
             let (allowed, reason) = if let Some(reason) = parse_error_reason {
                 (false, reason)
             } else {
-                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)
-                    .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?
+                evaluate_l7_in_scope(
+                    Scope::Message,
+                    inspector.engine,
+                    inspector.ctx,
+                    &request_info,
+                )
+                .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?
             };
-            let decision = match (allowed, inspector.enforcement) {
-                (_, _) if force_deny => "deny",
-                (true, _) => "allow",
-                (false, EnforcementMode::Audit) => "audit",
-                (false, EnforcementMode::Enforce) => "deny",
-            };
+            let decision = Outcome::policy(
+                allowed,
+                force_deny || inspector.enforcement == EnforcementMode::Enforce,
+            );
             let reason = format!("graphql_ws_type={message_type} {reason}");
             emit_websocket_l7_event(
                 host,
                 port,
                 policy_name,
                 &request_info,
-                decision,
+                decision.label(),
                 &reason,
                 Some(&graphql),
             );
@@ -1530,7 +1653,7 @@ fn inspect_graphql_websocket_message(
                     miette!("websocket GraphQL message denied by policy"),
                 ));
             }
-            Ok(())
+            Ok(decision)
         }
     }
 }

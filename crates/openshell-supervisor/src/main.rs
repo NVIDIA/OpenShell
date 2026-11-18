@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
@@ -167,6 +167,14 @@ struct Args {
     /// `http/protobuf`.
     #[arg(long, env = openshell_core::sandbox_env::OTLP_AGENT_PROTOCOL, default_value_t)]
     otlp_agent_protocol: OtlpProtocol,
+
+    /// Collector for this supervisor's egress metrics.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_METRICS_ENDPOINT)]
+    otlp_metrics_endpoint: Option<String>,
+
+    /// OTLP transport for egress metrics.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_METRICS_PROTOCOL, default_value_t)]
+    otlp_metrics_protocol: OtlpProtocol,
 
     /// Name of the gateway that launched this sandbox, for telemetry.
     #[arg(long, env = openshell_core::sandbox_env::GATEWAY_NAME)]
@@ -534,6 +542,28 @@ fn main() -> Result<()> {
             settings.ocsf,
         )
     });
+    let sandbox_assigned = Arc::new(AtomicBool::new(isolation_inputs.is_some()));
+    let metrics = runtime.block_on(async {
+        let auth = isolation_inputs.as_ref().map(|(_, _, auth, _, _)| auth);
+        args.otlp_metrics_endpoint
+            .as_deref()
+            .map(|endpoint| {
+                let assigned = sandbox_assigned.clone();
+                openshell_supervisor::metrics::start(
+                    endpoint,
+                    args.otlp_metrics_protocol,
+                    auth.map(SupervisorAuthBundle::metrics_otlp)
+                        .unwrap_or_default(),
+                    args.gateway_name.as_deref(),
+                    move || u64::from(assigned.load(Ordering::Relaxed)),
+                )
+            })
+            .transpose()
+    });
+    let (metrics_provider, metrics_setup_error) = match metrics {
+        Ok(provider) => (provider, None),
+        Err(error) => (None, Some(error)),
+    };
     let otlp_layer_provider = otlp_provider.clone();
     let ocsf_layer = ocsf_export.as_ref().map(openshell_otel::OcsfOtlp::layer);
 
@@ -592,6 +622,9 @@ fn main() -> Result<()> {
             warn!(%error, "OTLP OCSF export could not be started; continuing without it");
         } else if let Some(endpoint) = &args.otlp_ocsf_endpoint {
             info!(endpoint, protocol = %args.otlp_ocsf_protocol, "OTLP OCSF export enabled");
+        }
+        if let Some(error) = metrics_setup_error {
+            warn!(%error, "OTLP metrics export could not be started");
         }
 
         let workdir = args.workdir.clone();
@@ -733,6 +766,10 @@ fn main() -> Result<()> {
         && let Err(error) = provider.shutdown()
     {
         warn!(%error, "OTLP tracer provider shutdown failed");
+    }
+    if let Some(provider) = metrics_provider.as_ref() {
+        sandbox_assigned.store(false, Ordering::Relaxed);
+        openshell_supervisor::metrics::shutdown(provider);
     }
 
     std::process::exit(exit_code?);
@@ -1223,10 +1260,12 @@ mod tests {
             ssh_host_private_key: None,
             traces_otlp_headers: secret("lane=traces"),
             ocsf_otlp_headers: secret("lane=ocsf"),
+            metrics_otlp_headers: None,
             agent_otlp_headers: secret("lane=agent"),
             otlp_tls: vec![tls("ocsf-ca"), tls("traces-ca")],
             traces_otlp_tls: Some(1),
             ocsf_otlp_tls: Some(0),
+            metrics_otlp_tls: None,
             agent_otlp_tls: None,
         };
 

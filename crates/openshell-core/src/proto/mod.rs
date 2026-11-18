@@ -87,6 +87,17 @@ pub mod supervisor_host {
     pub use super::generated::openshell::supervisor::host::v1;
 }
 
+impl std::fmt::Debug for supervisor_host::v1::HostAccepted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostAccepted")
+            .field("session_id", &self.session_id)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("peer_endpoint", &self.peer_endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
 pub use datamodel::v1::*;
 pub use gateway_interceptor::v1::*;
 pub use middleware::v1::*;

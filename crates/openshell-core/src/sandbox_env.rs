@@ -54,6 +54,11 @@ pub const OTLP_AGENT_ENDPOINT: &str = "OPENSHELL_OTLP_AGENT_ENDPOINT";
 /// gRPC.
 pub const OTLP_AGENT_PROTOCOL: &str = "OPENSHELL_OTLP_AGENT_PROTOCOL";
 
+/// Collector for the supervisor's own egress metrics.
+pub const OTLP_METRICS_ENDPOINT: &str = "OPENSHELL_OTLP_METRICS_ENDPOINT";
+/// Transport to the supervisor metrics collector.
+pub const OTLP_METRICS_PROTOCOL: &str = "OPENSHELL_OTLP_METRICS_PROTOCOL";
+
 /// Name of the gateway that launched the sandbox, reported as
 /// `openshell.gateway.name` on supervisor telemetry.
 pub const GATEWAY_NAME: &str = "OPENSHELL_GATEWAY_NAME";
@@ -109,10 +114,20 @@ impl From<OtlpProtocol> for openshell_otel::Protocol {
 }
 
 /// One OTLP collector that a supervisor exports to.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OtlpExport {
     pub endpoint: String,
     pub protocol: OtlpProtocol,
+}
+
+/// Trusted metrics setup sent to each shared supervisor on its assignment stream.
+#[cfg(feature = "jwt")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SharedSupervisorMetrics {
+    pub collector: OtlpExport,
+    pub gateway_name: String,
+    pub headers: Option<crate::jwt::SecretOtlpHeaders>,
+    pub tls: Option<crate::jwt::OtlpTlsMaterial>,
 }
 
 impl OtlpExport {
@@ -137,13 +152,18 @@ pub struct SupervisorOtlp {
     pub ocsf: Option<OtlpExport>,
     /// Relayed workload traces.
     pub agent: Option<OtlpExport>,
+    /// Supervisor egress metrics.
+    pub metrics: Option<OtlpExport>,
 }
 
 impl SupervisorOtlp {
     /// Whether no export is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.traces.is_none() && self.ocsf.is_none() && self.agent.is_none()
+        self.traces.is_none()
+            && self.ocsf.is_none()
+            && self.agent.is_none()
+            && self.metrics.is_none()
     }
 
     /// The supervisor environment variables for these exports.
@@ -160,7 +180,11 @@ impl SupervisorOtlp {
             .agent
             .iter()
             .flat_map(|export| export.environment(OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL));
-        traces.chain(ocsf).chain(agent).collect()
+        let metrics = self
+            .metrics
+            .iter()
+            .flat_map(|export| export.environment(OTLP_METRICS_ENDPOINT, OTLP_METRICS_PROTOCOL));
+        traces.chain(ocsf).chain(agent).chain(metrics).collect()
     }
 
     /// Applies `rewrite` to every collector endpoint, for drivers whose
@@ -177,6 +201,7 @@ impl SupervisorOtlp {
             traces: map(self.traces),
             ocsf: map(self.ocsf),
             agent: map(self.agent),
+            metrics: map(self.metrics),
         }
     }
 }
@@ -193,6 +218,8 @@ pub const OTLP_OCSF_ENDPOINT_FLAG: &str = "otlp-ocsf-endpoint";
 pub const OTLP_OCSF_PROTOCOL_FLAG: &str = "otlp-ocsf-protocol";
 pub const OTLP_AGENT_ENDPOINT_FLAG: &str = "otlp-agent-endpoint";
 pub const OTLP_AGENT_PROTOCOL_FLAG: &str = "otlp-agent-protocol";
+pub const OTLP_METRICS_ENDPOINT_FLAG: &str = "otlp-metrics-endpoint";
+pub const OTLP_METRICS_PROTOCOL_FLAG: &str = "otlp-metrics-protocol";
 
 /// The OTLP flags every compute driver takes, flattened into its arguments.
 #[cfg(feature = "clap")]
@@ -242,6 +269,14 @@ pub struct SupervisorOtlpArgs {
     /// Transport to the agent trace relay's collector: `grpc` or `http/protobuf`.
     #[arg(long = OTLP_AGENT_PROTOCOL_FLAG, env = OTLP_AGENT_PROTOCOL, default_value_t)]
     pub agent_protocol: OtlpProtocol,
+
+    /// Collector for the supervisors' egress metrics.
+    #[arg(long = OTLP_METRICS_ENDPOINT_FLAG, env = OTLP_METRICS_ENDPOINT)]
+    pub metrics_endpoint: Option<String>,
+
+    /// Transport for supervisor metrics.
+    #[arg(long = OTLP_METRICS_PROTOCOL_FLAG, env = OTLP_METRICS_PROTOCOL, default_value_t)]
+    pub metrics_protocol: OtlpProtocol,
 }
 
 #[cfg(feature = "clap")]
@@ -258,6 +293,7 @@ impl SupervisorOtlpArgs {
             traces: export(&self.endpoint, self.protocol),
             ocsf: export(&self.ocsf_endpoint, self.ocsf_protocol),
             agent: export(&self.agent_endpoint, self.agent_protocol),
+            metrics: export(&self.metrics_endpoint, self.metrics_protocol),
         }
     }
 
@@ -641,6 +677,7 @@ mod tests {
                     endpoint: "http://agents:4318".into(),
                     protocol: OtlpProtocol::HttpProtobuf,
                 }),
+                metrics: None,
             }
         );
         assert_eq!(
@@ -722,6 +759,7 @@ mod tests {
             traces: export("http://traces:4317", OtlpProtocol::Grpc),
             ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
             agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+            metrics: None,
         };
         assert_eq!(
             otlp.environment(),
@@ -748,6 +786,7 @@ mod tests {
             traces: export("http://127.0.0.1:4317"),
             ocsf: None,
             agent: export("http://127.0.0.1:4318"),
+            metrics: None,
         }
         .map_endpoints(|endpoint| endpoint.replace("127.0.0.1", "host.internal"));
         assert_eq!(otlp.traces, export("http://host.internal:4317"));

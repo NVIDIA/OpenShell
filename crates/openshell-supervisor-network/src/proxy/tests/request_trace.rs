@@ -18,6 +18,7 @@ enum Outcome {
     MalformedQueryPolicyDenied,
     AuditDenied,
     UnresolvedCredential,
+    UpstreamConnectFailed,
     UpstreamClosed,
 }
 
@@ -328,8 +329,15 @@ network_policies:
 }
 
 async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>) {
-    let listener = TcpListener::bind((ip, 0)).await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let connect_failed = matches!(outcome, Outcome::UpstreamConnectFailed);
+    let upstream = tokio::net::TcpSocket::new_v4().unwrap();
+    upstream.bind((ip, 0).into()).unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    let listener = if connect_failed {
+        None
+    } else {
+        Some(upstream.listen(128).unwrap())
+    };
     let policy_denied = matches!(
         outcome,
         Outcome::PolicyDenied | Outcome::MalformedQueryPolicyDenied
@@ -437,6 +445,7 @@ network_policies:
                 result
             },
             async {
+                let Some(listener) = &listener else { return };
                 if policy_denied || credential_failure {
                     assert!(
                         tokio::time::timeout(
@@ -481,6 +490,8 @@ network_policies:
         403
     } else if credential_failure {
         500
+    } else if connect_failed {
+        502
     } else {
         200
     });
@@ -497,7 +508,10 @@ network_policies:
     let decision = match outcome {
         Outcome::PolicyDenied | Outcome::MalformedQueryPolicyDenied => "deny",
         Outcome::AuditDenied => "audit",
-        Outcome::Allowed | Outcome::UnresolvedCredential | Outcome::UpstreamClosed => "allow",
+        Outcome::Allowed
+        | Outcome::UnresolvedCredential
+        | Outcome::UpstreamConnectFailed
+        | Outcome::UpstreamClosed => "allow",
     };
     assert!(
         record["message"]
@@ -512,7 +526,11 @@ network_policies:
         assert_eq!(control["http_request"]["url"]["path"], path);
         assert!(control.get("http_response").is_none());
     }
-    if !policy_denied && !credential_failure {
+    if connect_failed {
+        let failure = &records[1];
+        assert_eq!(failure["unmapped"]["egress_result"], "error");
+        assert!(failure["unmapped"].get("egress_outcome").is_none());
+    } else if !policy_denied && !credential_failure {
         let forwarded = &records[1];
         assert!(
             forwarded["message"]
@@ -646,7 +664,9 @@ network_policies:
             matches!(root.status, opentelemetry::trace::Status::Error { .. }),
             matches!(
                 outcome,
-                Outcome::UpstreamClosed | Outcome::UnresolvedCredential
+                Outcome::UpstreamClosed
+                    | Outcome::UpstreamConnectFailed
+                    | Outcome::UnresolvedCredential
             ),
             "a policy refusal is an outcome, not an operational tracing failure"
         );
@@ -692,6 +712,7 @@ async fn inspected_forward_traces_all_outcomes_without_sampling_or_export_depend
         Outcome::PolicyDenied,
         Outcome::AuditDenied,
         Outcome::UnresolvedCredential,
+        Outcome::UpstreamConnectFailed,
         Outcome::UpstreamClosed,
     ] {
         for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {

@@ -729,6 +729,12 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gat
         sandbox_env::OTLP_AGENT_ENDPOINT_FLAG,
         sandbox_env::OTLP_AGENT_PROTOCOL_FLAG,
     );
+    append_otlp_export_args(
+        command,
+        otlp.metrics.as_ref(),
+        sandbox_env::OTLP_METRICS_ENDPOINT_FLAG,
+        sandbox_env::OTLP_METRICS_PROTOCOL_FLAG,
+    );
     if let Some(traces) = otlp_config.and_then(|otlp| otlp.traces.as_ref()) {
         let collector = &traces.collector;
         for (flag, path) in [
@@ -947,6 +953,7 @@ mod tests {
             traces: Some(OtlpTracesConfig { collector }),
             ocsf: None,
             agent: None,
+            supervisor_metrics: None,
         };
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_otlp_args(&mut command, Some(&otlp), "production-us-west");
@@ -985,6 +992,7 @@ mod tests {
                 }),
                 ocsf: None,
                 agent: None,
+                supervisor_metrics: None,
             }),
             "production-us-west",
         );
@@ -1018,6 +1026,7 @@ mod tests {
                 }),
                 ocsf: None,
                 agent: None,
+                supervisor_metrics: None,
             }),
             "production-us-west",
         );
@@ -1054,6 +1063,7 @@ mod tests {
                     schema_version: Some("2.0".into()),
                 }),
                 agent: None,
+                supervisor_metrics: None,
             }),
             "production-us-west",
         );
@@ -1092,6 +1102,7 @@ mod tests {
                         OtlpProtocol::HttpProtobuf,
                     ),
                 }),
+                supervisor_metrics: None,
             }),
             "production-us-west",
         );

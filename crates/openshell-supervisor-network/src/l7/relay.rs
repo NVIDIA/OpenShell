@@ -1444,6 +1444,8 @@ where
         }
         L7Protocol::Graphql => relay_graphql(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
+            use crate::metrics::{self, InspectionType, Outcome, Policy, Scope};
+
             if close_if_stale(engine.generation_guard(), ctx) {
                 return Ok(());
             }
@@ -1451,15 +1453,25 @@ where
             // chain can never inspect this stream: gate it like any other
             // uninspectable protocol.
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            match uninspectable_traffic_gate(&chain) {
+            let outcome = match uninspectable_traffic_gate(&chain) {
                 UninspectableTrafficGate::Deny => {
                     emit_middleware_uninspectable(ctx, "sql passthrough", true);
-                    return Ok(());
+                    Outcome::Deny
                 }
                 UninspectableTrafficGate::BypassWithFinding => {
                     emit_middleware_uninspectable(ctx, "sql passthrough", false);
+                    Outcome::FailOpen
                 }
-                UninspectableTrafficGate::Unrestricted => {}
+                UninspectableTrafficGate::Unrestricted => Outcome::Allow,
+            };
+            metrics::decision(
+                Scope::Connection,
+                outcome,
+                InspectionType::Tcp,
+                Policy::from(Some(ctx.policy_name.as_str())),
+            );
+            if matches!(outcome, Outcome::Deny) {
+                return Ok(());
             }
             // SQL provider is Phase 3 — fall through to passthrough with warning
             {
@@ -1597,6 +1609,7 @@ where
                 .map_err(&capture_error)?;
             return Ok(());
         };
+        correlation.select_inspector(config.protocol, &ctx.policy_name);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -1804,12 +1817,12 @@ where
             return Ok(());
         }
 
-        let decision_str = match (allowed, config.enforcement) {
-            (_, _) if force_deny => "deny",
-            (true, _) => "allow",
-            (false, EnforcementMode::Audit) => "audit",
-            (false, EnforcementMode::Enforce) => "deny",
-        };
+        let admission = crate::metrics::Outcome::policy(
+            allowed,
+            force_deny || config.enforcement == EnforcementMode::Enforce,
+        );
+        correlation.note_admission(admission);
+        let decision_str = admission.label();
         let engine_type = engine_type_for_protocol(config.protocol);
         let protocol_summary =
             l7_protocol_log_summary(graphql_info.as_ref(), jsonrpc_info.as_ref());
@@ -2583,6 +2596,7 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation.select_inspector(config.protocol, &ctx.policy_name);
         let capture_error = |error| correlation.capture_error(error);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation))
@@ -2675,11 +2689,15 @@ where
                 .any(|l| l.to_ascii_lowercase().starts_with("upgrade:"))
         };
 
-        let decision_str = match (allowed, config.enforcement, is_upgrade_request) {
-            (true, _, true) => "allow_upgrade",
-            (true, _, false) => "allow",
-            (false, EnforcementMode::Audit, _) => "audit",
-            (false, EnforcementMode::Enforce, _) => "deny",
+        let admission = crate::metrics::Outcome::policy(
+            allowed,
+            config.enforcement == EnforcementMode::Enforce,
+        );
+        correlation.note_admission(admission);
+        let decision_str = if allowed && is_upgrade_request {
+            "allow_upgrade"
+        } else {
+            admission.label()
         };
 
         // Log every L7 decision as an OCSF HTTP Activity event.
@@ -3139,6 +3157,7 @@ where
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation.select_inspector(config.protocol, &ctx.policy_name);
         let capture_error = |error| correlation.capture_error(error);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
@@ -3237,12 +3256,12 @@ where
             return Ok(());
         }
 
-        let decision_str = match (allowed, config.enforcement) {
-            (_, _) if force_deny => "deny",
-            (true, _) => "allow",
-            (false, EnforcementMode::Audit) => "audit",
-            (false, EnforcementMode::Enforce) => "deny",
-        };
+        let admission = crate::metrics::Outcome::policy(
+            allowed,
+            force_deny || config.enforcement == EnforcementMode::Enforce,
+        );
+        correlation.note_admission(admission);
+        let decision_str = admission.label();
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -3511,6 +3530,7 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation.select_inspector(config.protocol, &ctx.policy_name);
         let capture_error = |error| correlation.capture_error(error);
 
         if !request_authority_matches_endpoint(&req, ctx) {
@@ -3614,12 +3634,12 @@ where
             return Ok(());
         }
 
-        let decision_str = match (allowed, config.enforcement) {
-            (_, _) if force_deny => "deny",
-            (true, _) => "allow",
-            (false, EnforcementMode::Audit) => "audit",
-            (false, EnforcementMode::Enforce) => "deny",
-        };
+        let admission = crate::metrics::Outcome::policy(
+            allowed,
+            force_deny || config.enforcement == EnforcementMode::Enforce,
+        );
+        correlation.note_admission(admission);
+        let decision_str = admission.label();
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -4312,6 +4332,15 @@ fn evaluate_l7_request_once(
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<(bool, String)> {
+    evaluate_l7_in_scope(crate::metrics::Scope::Request, engine, ctx, request)
+}
+
+pub(super) fn evaluate_l7_in_scope(
+    scope: crate::metrics::Scope,
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<(bool, String)> {
     if engine.is_stale() {
         return Err(miette!(
             "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
@@ -4319,7 +4348,18 @@ fn evaluate_l7_request_once(
             engine.current_generation(),
         ));
     }
+    crate::metrics::evaluate(
+        scope,
+        || evaluate_l7_policy(engine, ctx, request),
+        |(allowed, _)| *allowed,
+    )
+}
 
+fn evaluate_l7_policy(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<(bool, String)> {
     let input = l7_request_policy_input(ctx, request);
 
     let mut engine = engine

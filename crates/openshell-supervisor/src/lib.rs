@@ -24,6 +24,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+pub mod metrics;
 mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
@@ -4758,10 +4759,12 @@ mod tests {
             ssh_host_private_key: None,
             traces_otlp_headers: None,
             ocsf_otlp_headers: None,
+            metrics_otlp_headers: None,
             agent_otlp_headers: None,
             otlp_tls: Vec::new(),
             traces_otlp_tls: None,
             ocsf_otlp_tls: None,
+            metrics_otlp_tls: None,
             agent_otlp_tls: None,
         };
         let config = SandboxInstanceConfig {

@@ -94,6 +94,10 @@ message HostAccepted {
   // instances' sessions here so they run on the replica serving this stream.
   // Empty when the replica has no peer endpoint.
   string peer_endpoint = 3;
+  // Optional JSON-encoded OTLP configuration for the host's own metrics.
+  // Includes collector credentials and is sent only over this authenticated
+  // supervisor stream.
+  bytes supervisor_metrics = 4;
 }
 
 // Another gateway replica should serve the host, which dials it at once. The

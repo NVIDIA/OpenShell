@@ -44,6 +44,8 @@ pub(super) struct EndpointDecision {
     pub(super) matched_endpoints: Vec<crate::opa::MatchedEndpoint>,
     /// Whether policy matched the requested hostname exactly (not by glob).
     pub(super) exact_declared_host: bool,
+    /// Whether this snapshot came from a completed evaluator call.
+    policy_evaluated: bool,
 }
 
 impl Default for EndpointDecision {
@@ -55,6 +57,7 @@ impl Default for EndpointDecision {
             policy_configs: Vec::new(),
             matched_endpoints: Vec::new(),
             exact_declared_host: false,
+            policy_evaluated: false,
         }
     }
 }
@@ -65,6 +68,7 @@ impl EndpointDecision {
             policy_configs: authorization.endpoint_configs.clone(),
             matched_endpoints: authorization.matched_endpoints.clone(),
             exact_declared_host: authorization.exact_declared_endpoint_host,
+            policy_evaluated: authorization.policy_evaluated,
             ..Self::default()
         }
     }
@@ -170,6 +174,24 @@ pub(super) struct EgressDecision {
     pub(super) cmdline_paths: Vec<PathBuf>,
 }
 
+impl EgressDecision {
+    pub(super) fn record_admission(
+        &self,
+        scope: crate::metrics::Scope,
+        outcome: crate::metrics::Outcome,
+        inspection_type: crate::metrics::InspectionType,
+    ) {
+        use crate::metrics::Policy;
+
+        let policy = match &self.action {
+            NetworkAction::Allow { matched_policy } => Policy::from(matched_policy.as_deref()),
+            NetworkAction::Deny { .. } if self.endpoint.policy_evaluated => Policy::NoMatch,
+            NetworkAction::Deny { .. } => Policy::Unattributed,
+        };
+        crate::metrics::decision(scope, outcome, inspection_type, policy);
+    }
+}
+
 pub(super) fn connect_span(intent: &EgressIntent) -> tracing::Span {
     tracing::debug_span!(
         "supervisor.egress.connect",
@@ -187,6 +209,7 @@ pub(super) fn dial_span(parent: &tracing::Span) -> tracing::Span {
     tracing::debug_span!(
         parent: parent,
         "supervisor.egress.dial",
+        openshell.egress.result = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
     )
 }
@@ -206,6 +229,7 @@ pub(super) fn traced_authorization<T>(
         "supervisor.egress.authorize",
         openshell.policy.decision = tracing::field::Empty,
         openshell.policy.name = tracing::field::Empty,
+        openshell.egress.result = tracing::field::Empty,
     );
     let result = span.in_scope(|| authorize(intent));
     match &decision(&result).action {

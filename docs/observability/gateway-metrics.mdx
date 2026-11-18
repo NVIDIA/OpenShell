@@ -12,6 +12,56 @@ The gateway exports Prometheus metrics for API requests, database readiness,
 gateway interceptors, the OCSF log file, and multi-replica capacity. Use them
 to alert on saturation, to follow rollouts, and to choose autoscaling signals.
 
+Supervisors push egress metrics to an OTLP collector.
+
+## Supervisor Metrics
+
+Enable [supervisor metrics export](/how-it-works/gateways/configuration#supervisor-metrics-export)
+and configure your collector to forward the metrics to your backend.
+`openshell.gateway.name` and `service.instance.id` are OTLP resource attributes
+for grouping by gateway and supervisor process.
+
+| Metric | Type | Labels | Measures |
+| --- | --- | --- | --- |
+| `openshell_supervisor_egress_decisions_total` | Counter | `scope`, `outcome`, `inspection_type`, `policy` | Final egress admission decisions. |
+| `openshell_supervisor_policy_evaluation_duration_seconds` | Histogram | `scope`, `result` | Policy evaluation, including input construction and engine lock wait. |
+| `openshell_supervisor_request_inspection_duration_seconds` | Histogram | `scope`, `inspection_type`, `result` | Inspection of a request or message before forwarding. |
+| `openshell_supervisor_upstream_connect_duration_seconds` | Histogram | `route`, `result` | New upstream connections, including address fallback and proxy negotiation. |
+| `openshell_supervisor_connections_active` | Gauge | `inspection_type` | Live proxied connections. |
+| `openshell_supervisor_sandboxes_active` | Gauge | | Sandbox assignments held by this supervisor. |
+
+Decision scopes are `connection`, `request`, and `message`. Outcomes are
+`allow`, `deny`, `audit`, and `fail_open`. All histograms use the results
+`success`, `deny`, `error`, `timeout`, and `cancelled`, with explicit duration
+buckets from 0.1 milliseconds to 15 seconds. Upstream routes are `direct` and
+`proxy`. Inspection types are `tcp`, `http`, `rest`, `graphql`, `json-rpc`,
+`mcp`, `websocket`, and `unknown`.
+
+A decision records one outcome. A denial takes precedence over `fail_open`,
+which takes precedence over `audit`. CONNECT allows are counted when the tunnel
+is admitted to relay, after any required TLS handshake. The OCSF CONNECT allow
+records the earlier `200 Connection Established` response.
+
+A supervisor retains the first 16 distinct attributed policy names of up to
+128 bytes for its lifetime. `no_match` means evaluation matched no configured
+policy. `unattributed` means the decision has no available policy name.
+Additional or longer names use `overflow`. A policy name that collides
+with a reserved value is prefixed with `name:`.
+
+In Prometheus, these queries show decisions by outcome and policy and the 95th
+percentile for upstream connects. Adjust the names if your collector renames
+the metrics.
+
+```promql
+sum by (outcome, policy) (rate(openshell_supervisor_egress_decisions_total[5m]))
+```
+
+```promql
+histogram_quantile(0.95, sum by (le, route) (
+  rate(openshell_supervisor_upstream_connect_duration_seconds_bucket[5m])
+))
+```
+
 ## Enable the Metrics Endpoint
 
 The gateway serves `GET /metrics` in the Prometheus text format on its own

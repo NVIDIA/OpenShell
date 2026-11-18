@@ -993,6 +993,7 @@ where
         observer,
         correlation,
         request_span: None,
+        started_forwarding: false,
         track_request_span: live_body.is_none(),
     };
     let upstream = &mut observed_upstream;
@@ -1503,6 +1504,7 @@ struct ObservedUpstream<'a, U> {
     observer: Option<&'a EndpointObserver>,
     correlation: Option<&'a RequestCorrelation>,
     request_span: Option<tracing::Span>,
+    started_forwarding: bool,
     track_request_span: bool,
 }
 
@@ -1542,6 +1544,12 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if !this.started_forwarding && !buf.is_empty() {
+            this.started_forwarding = true;
+            if let Some(correlation) = this.correlation {
+                correlation.finish_inspection(crate::metrics::ResultLabel::Success);
+            }
+        }
         let result = if this.track_request_span {
             let span = this.request_span.get_or_insert_with(|| {
                 this.correlation
@@ -7094,6 +7102,7 @@ mod tests {
                 observer: Some(&observer),
                 correlation: None,
                 request_span: None,
+                started_forwarding: false,
                 track_request_span: true,
             };
             let mut client = Vec::new();
