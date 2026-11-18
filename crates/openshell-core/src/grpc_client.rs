@@ -1742,7 +1742,8 @@ impl SandboxProviderTokenClient {
     /// configuration.
     ///
     /// One deadline bounds waiting for and connecting the channel as well as
-    /// the call, so a failed connection cannot serialize later requests.
+    /// the call. Concurrent initializers may retry a failed connection, but
+    /// waiting for an initializer cannot exceed this request's deadline.
     #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
     pub async fn get_access_token(
         &self,
@@ -1756,8 +1757,10 @@ impl SandboxProviderTokenClient {
         if gateway.credentials().is_revoked() {
             return Err(unavailable());
         }
+        let key = crate::dynamic_credential_key::unscoped_owned_key(credential_key)
+            .ok_or_else(|| gateway_grant_failure(TokenGrantFailureKind::Configuration))?;
         let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
-            credential_key: credential_key.to_string(),
+            credential_key: key,
         });
         if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
             request.metadata_mut().insert("x-request-id", value);
@@ -1936,8 +1939,8 @@ mod token_grant_exchange_tests {
         );
         let started = tokio::time::Instant::now();
         let results: [_; 2] = tokio::join!(
-            client.get_access_token("key", None),
-            client.get_access_token("key", None),
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
         )
         .into();
         for result in results {

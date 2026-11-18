@@ -2907,7 +2907,9 @@ message ProviderEnvironmentSnapshot {
 // Supervisor-only request. Sandbox/workspace are derived from the verified
 // session JWT. No caller-selected identity, endpoint, audience, or scope.
 message GetSandboxProviderAccessTokenRequest {
-  // Endpoint-bound dynamic credential key supplied by gateway configuration.
+  // Opaque endpoint-bound credential key issued in the gateway's provider
+  // configuration. Echo the configured key without supervisor-local revision
+  // or installation decorations. Callers must not construct or parse it.
   string credential_key = 1;
 }
 
