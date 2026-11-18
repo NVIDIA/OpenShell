@@ -35,8 +35,10 @@ What this branch demonstrates, on a local k3d cluster with nested KVM:
    resolver is the boundary's loopback relay (`127.0.0.53`), which
    answers policy-approved names synthetically (non-policy names never
    reach an upstream resolver). Direct egress from the guest is blocked
-   at both the boundary (seccomp broker in sandboxed mode; the nftables
-   relay in root mode) and the pod network (fence).
+   by the pod-network fence; the in-guest mechanisms (seccomp broker in
+   sandboxed mode; nftables relay in root mode) steer traffic through
+   the supervisor's mediation so policy applies — they are functional
+   routing, not a security control.
 5. **Stop/start**: `Halted`/`Once` run-strategy mapping with the VM UID and
    fence UID stable across generations; start re-renders the boundary
    bootstrap for the new generation, re-registers the shared instance
@@ -373,17 +375,20 @@ material); delete it to fully reset.
 - **Root-workload trust model**: the guest is untrusted as soon as an
   agent/sandbox workload executes for the first time. Everything that
   matters is enforced outside the guest: the VM boundary, the egress
-  fence (NetworkPolicy + the nftables relay's fail-closed deny), the
-  supervisor's policy, and guest-reported data marked `data_origin=guest`
-  in OCSF. Nothing in-guest is a trust anchor — root in the guest can
+  fence (NetworkPolicy), the supervisor's policy, and guest-reported
+  data marked `data_origin=guest` in OCSF. Guest configuration — the
+  nftables relay, the seccomp broker's steering, the config-disk
+  eject — is required for networking to function and is never relied
+  on for security: root in the guest can change all of it. Nothing
+  in-guest is a trust anchor — root in the guest can
   change anything, including the base, kernel, and bootloader (writes
   land in the RAM overlay; the containerDisk base is read-only at the
   device level, and every boot starts fresh from the image). There is
   deliberately no dm-verity / verified boot: the in-guest integrity of
   an untrusted guest has no security value under this model.
-- **What the outside boundary relies on**: the fence and the relay's
-  deny are only as good as the CNI's NetworkPolicy enforcement (k3d's
-  built-in flannel + policy layer here), and the boundary channel is
+- **What the outside boundary relies on**: the fence is only as good
+  as the CNI's NetworkPolicy enforcement (k3d's built-in flannel +
+  policy layer here), and the boundary channel is
   only as isolated as the dedicated supervisor topology — root mode
   requires it precisely so a hostile guest cannot reach another
   tenant's supervisor. The P1 boundary-handle check (a fresh boundary

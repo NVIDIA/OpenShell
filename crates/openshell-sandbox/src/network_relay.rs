@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The transparent network relay for privileged (root-workload) sandboxes
-//! (commit 5).
+//! The transparent network relay for privileged (root-workload) sandboxes.
 //!
 //! In sandboxed mode the seccomp broker intercepts `connect(2)` and the
 //! supervisor decides each open over the Mediate control stream. A root
@@ -22,7 +21,9 @@
 //!   stream (policy DNS returns synthetic addresses). Non-loopback UDP/53
 //!   is redirected there too, closing the masquerade dnsmasq bypass.
 //! - All other UDP is dropped (IPv4 and IPv6): QUIC and arbitrary UDP
-//!   datagrams are never relayed — defence in depth matching the fence.
+//!   datagrams are never relayed. This is routing behaviour, not a
+//!   security control — a root workload can delete the ruleset; the
+//!   fence outside the guest is the control.
 //! - IPv6 TCP is redirected the same way (synthetic AAAA answers).
 //!
 //! Fail-closed: a root workload that deletes the ruleset restores direct
@@ -463,7 +464,7 @@ mod tests {
         assert!(text.contains("dnat to 127.0.0.1:15500"), "{text}");
         assert!(
             text.contains("meta l4proto udp drop"),
-            "non-DNS UDP must be dropped (defence in depth): {text}"
+            "non-DNS UDP must be dropped (routing rule; the fence is the security control): {text}"
         );
         assert!(
             text.contains("ip daddr 10.43.0.1 tcp dport 5500 accept"),
