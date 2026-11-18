@@ -61,6 +61,14 @@ const TOPOLOGY_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-topol
 /// Instance route annotation; the key keeps its established `-session` name.
 const INSTANCE_ROUTE_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
 
+/// Fixed listener ports let a remote cluster reach these host fixtures through
+/// an operator-provided reverse tunnel. Local runs keep ephemeral ports.
+fn fixture_port(variable: &str) -> u16 {
+    std::env::var(variable).map_or(0, |value| {
+        value.parse().expect("fixture port must be a u16")
+    })
+}
+
 fn kubectl_command() -> tokio::process::Command {
     shared_supervisor::kubectl_command()
 }
@@ -166,9 +174,10 @@ struct TokenState {
 
 impl TokenService {
     async fn start(stored_token: String) -> Self {
-        let listener = TcpListener::bind(("0.0.0.0", 0))
-            .await
-            .expect("bind token service");
+        let listener =
+            TcpListener::bind(("0.0.0.0", fixture_port("OPENSHELL_E2E_SPIFFE_STS_PORT")))
+                .await
+                .expect("bind token service");
         let port = listener.local_addr().expect("token service address").port();
         let state = Arc::new(Mutex::new(TokenState::default()));
         let (shared, stored) = (state.clone(), Arc::new(stored_token));
@@ -314,9 +323,10 @@ struct Target {
 
 impl Target {
     async fn start() -> Self {
-        let listener = TcpListener::bind(("0.0.0.0", 0))
-            .await
-            .expect("bind protected target");
+        let listener =
+            TcpListener::bind(("0.0.0.0", fixture_port("OPENSHELL_E2E_SPIFFE_TARGET_PORT")))
+                .await
+                .expect("bind protected target");
         let port = listener.local_addr().expect("target address").port();
         let seen_tokens = Arc::new(Mutex::new(HashMap::new()));
         let observed = seen_tokens.clone();

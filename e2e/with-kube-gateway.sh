@@ -800,8 +800,6 @@ cleanup() {
     cleanup_vault_fixture
   fi
 
-  cleanup_spire_fixture
-
   if [ "${JAEGER_FIXTURE_DEPLOYED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
     kctl -n "${NAMESPACE}" delete -f "${JAEGER_FIXTURE_MANIFEST}" \
       --ignore-not-found >/dev/null 2>&1 || true
@@ -863,6 +861,9 @@ cleanup() {
         --ignore-not-found >/dev/null 2>&1 || true
     fi
   fi
+
+  # Remove CSI consumers before uninstalling SPIRE and its CSI driver.
+  cleanup_spire_fixture
 
   if [ "${ENVOY_HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
     if command -v helm >/dev/null 2>&1; then

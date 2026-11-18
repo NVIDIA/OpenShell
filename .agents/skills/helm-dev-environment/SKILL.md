@@ -126,6 +126,13 @@ endpoint. The installed SPIRE version and operator must expose the experimental
 Broker API. `e2e/kubernetes/spiffe-broker/README.md` describes independent
 protocol and negative authorization checks.
 
+For remote clusters, set `OPENSHELL_E2E_HOST_GATEWAY_IP` to a host reachable
+from Pods. Optional `OPENSHELL_E2E_SPIFFE_STS_PORT` and
+`OPENSHELL_E2E_SPIFFE_TARGET_PORT` fix the test's host listener ports so an
+operator can forward them through a reverse tunnel. Keep the tunnel available
+through the test and remove it afterward. Use an explicit kubeconfig and context
+to avoid repository environment defaults targeting a local cluster.
+
 ### Shared supervisor high availability
 
 The shared supervisor is always a pool of `supervisor.replicas` members
