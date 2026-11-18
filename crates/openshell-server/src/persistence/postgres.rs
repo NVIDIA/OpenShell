@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::azure_workload_identity::{self, AzureWorkloadIdentity, CredentialPool};
 use super::mutation_lock::{
     LOCK_CONNECTION_MIN_BUDGET, LockMode, MUTATION_LOCK_POOL_MAX_CONNECTIONS,
     MUTATION_LOCK_TIMEOUT, MUTATION_LOCK_TIMEOUT_SETTING, MutationLockSet,
@@ -21,7 +22,7 @@ use openshell_core::proto::Sandbox;
 use prost::Message;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
+use sqlx::{Connection, Postgres, QueryBuilder, Row};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -47,9 +48,9 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
-    pub(super) pool: PgPool,
+    pub(super) pool: CredentialPool,
     /// Dedicated connections for session-level mutation advisory locks.
-    lock_pool: PgPool,
+    lock_pool: CredentialPool,
     /// How acquisitions and guards use the lock pool's connections.
     lock_usage: Arc<LockPoolUsage>,
 }
@@ -343,19 +344,25 @@ impl PostgresStore {
         max_connections: Option<u32>,
         lock_pool_size: u32,
     ) -> PersistenceResult<Self> {
+        Self::connect_with_identity(url, max_connections, lock_pool_size, None).await
+    }
+
+    pub(super) async fn connect_with_identity(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_pool_size: u32,
+        identity: Option<Arc<AzureWorkloadIdentity>>,
+    ) -> PersistenceResult<Self> {
         let max_connections = max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
         tracing::info!(
             max_connections,
             lock_max_connections = lock_pool_size,
             "sizing Postgres connection pools"
         );
-        let pool = PgPoolOptions::new()
+        let data_options = PgPoolOptions::new()
             .max_connections(max_connections)
-            .acquire_timeout(DATA_POOL_ACQUIRE_TIMEOUT)
-            .connect(url)
-            .await
-            .map_err(|e| map_startup_error(&e))?;
-        let lock_pool = PgPoolOptions::new()
+            .acquire_timeout(DATA_POOL_ACQUIRE_TIMEOUT);
+        let lock_options = PgPoolOptions::new()
             .max_connections(lock_pool_size)
             .min_connections(0)
             // Backstop only; callers bound the acquire by their own deadline.
@@ -380,9 +387,40 @@ impl PostgresStore {
                         .await?;
                     Ok(true)
                 })
-            })
-            .connect_lazy(url)
-            .map_err(|e| map_db_error(&e))?;
+            });
+        let (pool, lock_pool) = if let Some(identity) = identity {
+            let connect = azure_workload_identity::validate_url(url)
+                .map_err(|error| PersistenceError::Config(error.to_string()))?;
+            let replica =
+                std::env::var("OPENSHELL_REPLICA_ID").unwrap_or_else(|_| "gateway".into());
+            let pool = CredentialPool::azure(
+                data_options,
+                connect
+                    .clone()
+                    .application_name(&format!("openshell-data/{replica}")),
+                Arc::clone(&identity),
+            );
+            let lock_pool = CredentialPool::azure(
+                lock_options,
+                connect.application_name(&format!("openshell-lock/{replica}")),
+                identity,
+            );
+            drop(
+                pool.acquire()
+                    .await
+                    .map_err(|error| map_startup_error(&error))?,
+            );
+            (pool, lock_pool)
+        } else {
+            let pool = data_options
+                .connect(url)
+                .await
+                .map_err(|error| map_startup_error(&error))?;
+            let lock_pool = lock_options
+                .connect_lazy(url)
+                .map_err(|error| map_db_error(&error))?;
+            (pool.into(), lock_pool.into())
+        };
 
         Ok(Self {
             pool,
@@ -2532,13 +2570,15 @@ impl PostgresStore {
             pool: PgPoolOptions::new()
                 .max_connections(10)
                 .connect_lazy(url)
-                .expect("build the lazy data pool"),
+                .expect("build the lazy data pool")
+                .into(),
             lock_pool: PgPoolOptions::new()
                 .max_connections(lock_pool_size)
                 .min_connections(0)
                 .acquire_timeout(MUTATION_LOCK_TIMEOUT)
                 .connect_lazy(url)
-                .expect("build the lazy lock pool"),
+                .expect("build the lazy lock pool")
+                .into(),
             lock_usage: Arc::new(LockPoolUsage::new(lock_pool_size)),
         }
     }

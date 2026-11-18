@@ -59,3 +59,50 @@ pub fn admit_port(
     }
     Ok(scope)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingress_admission_validates_envelope_shape() {
+        let explicit = SandboxIngressAdmission {
+            scope: IngressScope::SharedHostLoopback as i32,
+            all_ports: false,
+            ports: vec![8080],
+        };
+        for (admission, expected) in [
+            (
+                SandboxIngressAdmission::default(),
+                Err(
+                    "compute ingress admission is unavailable; recreate the sandbox with an ingress-aware driver",
+                ),
+            ),
+            (
+                SandboxIngressAdmission {
+                    ports: vec![8080, 8080],
+                    ..explicit.clone()
+                },
+                Err("compute ingress ports must be unique and between 1 and 65535"),
+            ),
+            (
+                SandboxIngressAdmission {
+                    all_ports: true,
+                    ..explicit.clone()
+                },
+                Err("invalid compute ingress envelope"),
+            ),
+            (explicit, Ok(IngressScope::SharedHostLoopback)),
+            (
+                SandboxIngressAdmission {
+                    scope: IngressScope::IsolatedLoopback as i32,
+                    all_ports: true,
+                    ports: Vec::new(),
+                },
+                Ok(IngressScope::IsolatedLoopback),
+            ),
+        ] {
+            assert_eq!(validate(&admission), expected, "{admission:?}");
+        }
+    }
+}

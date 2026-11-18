@@ -681,6 +681,66 @@ an image update is pending or retained sandboxes require the private image
 revision protocol. SQLite supports one gateway process only; activation attests
 that the previous process has stopped, not that sharing a SQLite file enables HA.
 
+## Azure PostgreSQL workload identity
+
+Set `database_auth = "azure-workload-identity"` under `[openshell.gateway]` to
+use an AKS projected ServiceAccount token for Azure Database for PostgreSQL.
+The equivalent flag is `--db-auth azure-workload-identity`; the environment
+variable is `OPENSHELL_DB_AUTH`. The default, `default`, preserves SQLite and
+password-based PostgreSQL authentication.
+
+Use a password-free database URL with an explicit mapped PostgreSQL role and
+`sslmode=verify-full`. Configure the PostgreSQL Entra principal for the gateway
+managed identity's object ID and grant it ownership of the OpenShell database
+so it can run migrations. Also grant `USAGE` and `CREATE` on its `public`
+schema; Azure PostgreSQL can retain separate schema ownership after you change
+the database owner. Run this as the Entra administrator connected to the
+OpenShell database, replacing the role name if needed:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO openshell_gateway;
+```
+
+Connect directly to PostgreSQL. Session advisory locks require session affinity
+and cannot use transaction pooling.
+
+For Helm, set the following values and create `openshell-db` with a `uri` key
+containing `postgresql://openshell_gateway@SERVER.postgres.database.azure.com/openshell?sslmode=verify-full`:
+
+```yaml
+workload:
+  kind: deployment
+replicaCount: 2
+serviceAccount:
+  name: openshell
+  annotations:
+    azure.workload.identity/client-id: MANAGED_IDENTITY_CLIENT_ID
+podLabels:
+  azure.workload.identity/use: "true"
+server:
+  externalDbSecret: openshell-db
+gatewayConfig:
+  "openshell.gateway":
+    database_auth: azure-workload-identity
+```
+
+Enable AKS OIDC and workload identity, then federate only the gateway
+ServiceAccount subject with audience `api://AzureADTokenExchange`. The AKS
+webhook supplies `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+`AZURE_FEDERATED_TOKEN_FILE`. Only the public Azure authority is supported.
+Sandbox ServiceAccounts do not need this federation or database credentials.
+
+The gateway caches access tokens until near their reported expiry and rereads
+the projected token file on refresh. Both data and advisory-lock pools obtain
+valid credentials before opening connections. Healthy sessions remain usable
+through token expiry or an Entra outage. Requests can wait for a busy healthy
+session to return, even if token refresh fails or stalls. New physical
+connections still require a valid token; acquisitions fail within the pool
+deadline if neither credential acquisition nor session reuse succeeds. The gateway does not fall back to a
+password, node identity, or Azure CLI credentials. Check the gateway identity,
+federated subject, projected volume, and Entra connectivity when refresh fails;
+never print token files or token responses while diagnosing authentication.
+
 ## Database Pool
 
 `[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving. On Postgres, a caller that gets no connection within 5 seconds fails instead of waiting for the database to answer, usually with a retryable `UNAVAILABLE` error whose reason is `DATABASE_UNAVAILABLE`.

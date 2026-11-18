@@ -2923,7 +2923,7 @@ pub(super) async fn handle_forward_tcp(
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
     // finalized so fast commands can attach without a readiness race.
-    if !sandbox_relay_reachable(state, &sandbox) {
+    if !sandbox_relay_reachable(state, &sandbox).await? {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -3471,11 +3471,19 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
-fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
-    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
-    matches!(phase, Some(SandboxPhase::Ready))
-        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && state.supervisor_sessions.has_session(sandbox.object_id()))
+/// Whether a relay into the sandbox can open: always when `Ready`, and after
+/// the main process exits while its supervisor is connected to any replica.
+async fn sandbox_relay_reachable(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<bool, Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(true),
+        Some(SandboxPhase::Completed | SandboxPhase::Error) => {
+            crate::supervisor_session::supervisor_connected(state, sandbox.object_id()).await
+        }
+        _ => Ok(false),
+    }
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -3494,7 +3502,7 @@ pub(super) async fn handle_create_ssh_session(
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
-    if !sandbox_relay_reachable(state, &sandbox) {
+    if !sandbox_relay_reachable(state, &sandbox).await? {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -4384,29 +4392,74 @@ mod tests {
         GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
     };
 
+    async fn ingress_test_state(
+        modern: bool,
+        admission: Option<openshell_core::proto::SandboxIngressAdmission>,
+    ) -> (
+        Arc<ServerState>,
+        Arc<crate::test_support::FakeComputeDriver>,
+    ) {
+        let driver = Arc::new(
+            crate::test_support::FakeComputeDriver::new().with_ingress_admission(admission),
+        );
+        driver.set_ingress_capability(modern);
+        let mut state = test_server_state().await;
+        let compute = crate::compute::ComputeRuntime::from_driver(
+            "test".into(),
+            driver.clone(),
+            None,
+            state.store.clone(),
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().compute = compute;
+        (state, driver)
+    }
+
     #[tokio::test]
     async fn ingress_admission_rejects_unadmitted_create_ports_before_provisioning() {
-        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
-        use openshell_core::extension_protocol::{
-            COMPUTE_INGRESS_ADMISSION, ExtensionFamily, extension_metadata,
-        };
-        use openshell_core::proto::compute::v1::GetCapabilitiesResponse;
+        use crate::test_support::FakeComputeDriverCall;
         use openshell_core::proto::{IngressScope, SandboxIngressAdmission};
+        use tonic::Code;
 
-        use futures::StreamExt as _;
-        use openshell_core::proto::open_shell_server::OpenShell as _;
-        let directory = tempfile::tempdir().unwrap();
-        let key = directory.path().join("private-key");
-        std::fs::write(&key, b"test-only stable fingerprint material").unwrap();
         let exact = SandboxIngressAdmission {
             scope: IngressScope::SharedHostLoopback as i32,
             ports: vec![8080],
             all_ports: false,
         };
-        for (modern, admission, port, accepted) in [
-            (false, None, 8081, true),
-            (true, None, 8080, false),
-            (true, Some(SandboxIngressAdmission::default()), 8080, false),
+        let denied = Some((Code::FailedPrecondition, "target port was not admitted"));
+        // Exercise each request field's allow/deny wiring. Negotiation and
+        // envelope semantics are shared, so those cases use only plain forwards.
+        for (modern, admission, port, forward, error) in [
+            (true, Some(exact.clone()), 8080, false, None),
+            (true, Some(exact.clone()), 8080, true, None),
+            (true, Some(exact.clone()), 8081, false, denied),
+            (true, Some(exact.clone()), 8081, true, denied),
+            (false, None, 8081, true, None),
+            (
+                true,
+                None,
+                8080,
+                true,
+                Some((
+                    Code::FailedPrecondition,
+                    "omitted negotiated ingress admission",
+                )),
+            ),
+            (
+                true,
+                Some(SandboxIngressAdmission::default()),
+                8080,
+                true,
+                Some((
+                    Code::FailedPrecondition,
+                    "compute ingress admission is unavailable",
+                )),
+            ),
             (
                 true,
                 Some(SandboxIngressAdmission {
@@ -4414,28 +4467,18 @@ mod tests {
                     ..Default::default()
                 }),
                 8080,
-                false,
-            ),
-            (true, Some(exact.clone()), 8081, false),
-            (true, Some(exact.clone()), 8080, true),
-            (true, Some(exact.clone()), 0, false),
-            (
                 true,
-                Some(SandboxIngressAdmission {
-                    ports: vec![8080, 8080],
-                    ..exact.clone()
-                }),
-                8080,
-                false,
+                Some((Code::FailedPrecondition, "does not support sandbox ingress")),
             ),
             (
                 true,
-                Some(SandboxIngressAdmission {
-                    all_ports: true,
-                    ..exact.clone()
-                }),
-                8080,
-                false,
+                Some(exact),
+                0,
+                true,
+                Some((
+                    Code::InvalidArgument,
+                    "forward_ports must be between 1 and 65535",
+                )),
             ),
             (
                 true,
@@ -4446,240 +4489,200 @@ mod tests {
                 }),
                 8081,
                 true,
+                None,
             ),
         ] {
-            for forward in [false, true] {
-                let mut state = test_server_state().await;
-                Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
-                    Some(openshell_core::config::GatewayJwtConfig {
-                        signing_key_path: key.clone(),
-                        public_key_path: directory.path().join("public"),
-                        kid_path: directory.path().join("kid"),
-                        gateway_id: "test".into(),
-                        ttl_secs: None,
-                    });
-                let driver = Arc::new(
-                    FakeComputeDriver::new()
-                        .with_ingress_admission(admission.clone())
-                        .with_capabilities(GetCapabilitiesResponse {
-                            driver_name: "test".into(),
-                            default_image: "test/image".into(),
-                            resource_admission_policy:
-                                openshell_core::resource_admission::DriverAdmissionConfig::default()
-                                    .acknowledgement(),
-                            extension: Some(extension_metadata(
-                                ExtensionFamily::Compute,
-                                "openshell/test",
-                                "test",
-                                if modern {
-                                    vec![COMPUTE_INGRESS_ADMISSION.to_string()]
-                                } else {
-                                    vec![]
-                                },
-                            )),
-                            ..Default::default()
-                        }),
-                );
-                let compute = crate::compute::ComputeRuntime::from_driver(
-                    "test".into(),
-                    driver.clone(),
-                    None,
-                    state.store.clone(),
-                    crate::sandbox_index::SandboxIndex::new(),
-                    crate::sandbox_watch::SandboxWatchBus::new(),
-                    crate::tracing_bus::TracingLogBus::new(),
-                    Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-                )
-                .await
-                .unwrap();
-                Arc::get_mut(&mut state).unwrap().compute = compute;
-                let result = handle_create_sandbox(
-                    &state,
-                    authed_request(CreateSandboxRequest {
-                        name: "ingress".into(),
-                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                        spec: Some(SandboxSpec {
-                            policy: Some(openshell_policy::restrictive_default_policy()),
-                            ..Default::default()
-                        }),
-                        forward_ports: if forward { vec![port] } else { vec![] },
-                        service_exposures: if forward {
-                            vec![]
-                        } else {
-                            vec![SandboxServiceExposure {
-                                target_port: port,
-                                ..Default::default()
-                            }]
-                        },
+            let (state, driver) = ingress_test_state(modern, admission.clone()).await;
+            let result = handle_create_sandbox(
+                &state,
+                authed_request(CreateSandboxRequest {
+                    name: "ingress".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    spec: Some(SandboxSpec {
+                        policy: Some(openshell_policy::restrictive_default_policy()),
                         ..Default::default()
                     }),
-                )
-                .await;
+                    forward_ports: if forward { vec![port] } else { vec![] },
+                    service_exposures: if forward {
+                        vec![]
+                    } else {
+                        vec![SandboxServiceExposure {
+                            target_port: port,
+                            ..Default::default()
+                        }]
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await;
+            if let Some((code, diagnostic)) = error {
+                let status = result.unwrap_err();
+                assert_eq!(status.code(), code, "{status}");
+                assert!(status.message().contains(diagnostic), "{status}");
+            } else {
+                result.unwrap();
+            }
+            let accepted = error.is_none();
+            let provisioned = driver
+                .calls()
+                .iter()
+                .any(|call| matches!(call, FakeComputeDriverCall::CreateSandbox { .. }));
+            assert_eq!(provisioned, accepted);
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", "ingress")
+                .await
+                .unwrap();
+            assert_eq!(stored.is_some(), accepted);
+            if accepted {
+                let sandbox = stored.unwrap();
                 assert_eq!(
-                    result.is_ok(),
-                    accepted,
-                    "modern={modern}, admission={admission:?}, port={port}"
+                    sandbox.status.as_ref().unwrap().ingress_admission,
+                    admission
                 );
-                let provisioned = driver
-                    .calls()
-                    .iter()
-                    .any(|call| matches!(call, FakeComputeDriverCall::CreateSandbox { .. }));
-                assert_eq!(provisioned, accepted);
-                let stored = state
-                    .store
-                    .get_message_by_name::<Sandbox>("default", "ingress")
+                if forward && admission.as_ref().is_some_and(|ingress| !ingress.all_ports) {
+                    let status = super::super::service::expose_service_endpoint(
+                        &state,
+                        "default",
+                        &sandbox,
+                        "unadmitted",
+                        8081,
+                        ServiceAuthorizationMode::Strip,
+                    )
                     .await
-                    .unwrap();
-                assert_eq!(stored.is_some(), accepted);
-                if accepted && modern {
-                    let sandbox = stored.unwrap();
-                    assert_eq!(
-                        sandbox.status.as_ref().unwrap().ingress_admission,
-                        admission
+                    .unwrap_err();
+                    assert_eq!(status.code(), Code::FailedPrecondition);
+                    assert!(status.message().contains("target port was not admitted"));
+                    assert!(
+                        state
+                            .store
+                            .get_message_by_name::<ServiceEndpoint>(
+                                "default",
+                                "ingress--unadmitted"
+                            )
+                            .await
+                            .unwrap()
+                            .is_none()
                     );
-                    if !admission.as_ref().unwrap().all_ports {
-                        assert!(
-                            super::super::service::expose_service_endpoint(
-                                &state,
-                                "default",
-                                &sandbox,
-                                "unadmitted",
-                                8081,
-                                ServiceAuthorizationMode::Strip
-                            )
-                            .await
-                            .is_err()
-                        );
-                        assert!(
-                            state
-                                .store
-                                .get_message_by_name::<ServiceEndpoint>(
-                                    "default",
-                                    "ingress--unadmitted"
-                                )
-                                .await
-                                .unwrap()
-                                .is_none()
-                        );
-                        // A resource created before ingress negotiation has no
-                        // retained evidence. Every current read must expose its
-                        // unavailability without rewriting that legacy record.
-                        let mut legacy = sandbox.clone();
-                        let metadata = legacy.metadata.as_mut().unwrap();
-                        metadata.id = "legacy-ingress".into();
-                        metadata.name = "legacy-ingress".into();
-                        metadata.resource_version = 0;
-                        legacy.set_phase(SandboxPhase::Ready as i32);
-                        legacy.status.as_mut().unwrap().ingress_admission = None;
-                        state.store.put_message(&legacy).await.unwrap();
-                        let get = handle_get_sandbox(
-                            &state,
-                            authed_request(GetSandboxRequest {
-                                name: "legacy-ingress".into(),
-                                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                                    "default",
-                                )),
-                            }),
-                        )
-                        .await
-                        .unwrap()
-                        .into_inner()
-                        .sandbox
-                        .unwrap();
-                        assert!(
-                            openshell_core::ingress::admit_port(
-                                get.status.as_ref().unwrap().ingress_admission.as_ref(),
-                                8080,
-                                false
-                            )
-                            .is_err()
-                        );
-                        let service = crate::grpc::OpenShellService::new(state.clone());
-                        let start = StartSandboxRequest {
-                            name: "legacy-ingress".into(),
-                            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                                "default",
-                            )),
-                            request_id: uuid::Uuid::new_v4().to_string(),
-                        };
-                        for replay in [false, true] {
-                            let started = service
-                                .start_sandbox(authed_request(start.clone()))
-                                .await
-                                .unwrap();
-                            assert_eq!(
-                                started.metadata().contains_key("openshell-replayed"),
-                                replay
-                            );
-                            let descriptor = started
-                                .into_inner()
-                                .sandbox
-                                .unwrap()
-                                .status
-                                .unwrap()
-                                .ingress_admission;
-                            assert!(descriptor.is_some());
-                            assert!(
-                                openshell_core::ingress::admit_port(
-                                    descriptor.as_ref(),
-                                    8080,
-                                    false
-                                )
-                                .is_err()
-                            );
-                        }
-                        let mut stream = handle_watch_sandbox(
-                            &state,
-                            authed_request(WatchSandboxRequest {
-                                sandbox: "legacy-ingress".into(),
-                                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                                    "default",
-                                )),
-                                follow_status: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                        .unwrap()
-                        .into_inner();
-                        for updated in [false, true] {
-                            if updated {
-                                state.sandbox_watch_bus.notify("legacy-ingress");
-                            }
-                            let event = tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
-                                stream.next(),
-                            )
-                            .await
-                            .unwrap()
-                            .unwrap()
-                            .unwrap();
-                            let Some(
-                                openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
-                                    snapshot,
-                                ),
-                            ) = event.payload
-                            else {
-                                panic!("expected status snapshot")
-                            };
-                            assert!(snapshot.status.unwrap().ingress_admission.is_some());
-                        }
-                        assert!(
-                            state
-                                .store
-                                .get_message::<Sandbox>("legacy-ingress")
-                                .await
-                                .unwrap()
-                                .unwrap()
-                                .status
-                                .unwrap()
-                                .ingress_admission
-                                .is_none()
-                        );
-                    }
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ingress_admission_projects_unavailable_legacy_evidence_without_persisting_it() {
+        use futures::StreamExt as _;
+        use openshell_core::proto::SandboxIngressAdmission;
+        use openshell_core::proto::open_shell_server::OpenShell as _;
+
+        let (mut state, _) = ingress_test_state(true, None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("private-key");
+        std::fs::write(&key, b"test-only stable fingerprint material").unwrap();
+        Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+            Some(openshell_core::config::GatewayJwtConfig {
+                signing_key_path: key,
+                public_key_path: directory.path().join("public"),
+                kid_path: directory.path().join("kid"),
+                gateway_id: "test".into(),
+                ttl_secs: None,
+            });
+        let mut legacy = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "legacy-ingress".into(),
+                name: "legacy-ingress".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        legacy.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&legacy).await.unwrap();
+        let retained = state
+            .store
+            .get_message::<Sandbox>("legacy-ingress")
+            .await
+            .unwrap()
+            .unwrap();
+        let get = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "legacy-ingress".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        let unavailable = Some(SandboxIngressAdmission::default());
+        assert_eq!(get.status.unwrap().ingress_admission, unavailable);
+
+        let service = crate::grpc::OpenShellService::new(state.clone());
+        let start = StartSandboxRequest {
+            name: "legacy-ingress".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        for replay in [false, true] {
+            let started = service
+                .start_sandbox(authed_request(start.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                started.metadata().contains_key("openshell-replayed"),
+                replay
+            );
+            assert_eq!(
+                started
+                    .into_inner()
+                    .sandbox
+                    .unwrap()
+                    .status
+                    .unwrap()
+                    .ingress_admission,
+                unavailable
+            );
+        }
+        let mut stream = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: "legacy-ingress".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_status: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        for updated in [false, true] {
+            if updated {
+                state.sandbox_watch_bus.notify("legacy-ingress");
+            }
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(snapshot)) =
+                event.payload
+            else {
+                panic!("expected status snapshot")
+            };
+            assert_eq!(snapshot.status.unwrap().ingress_admission, unavailable);
+        }
+        assert!(openshell_core::ingress::admit_port(unavailable.as_ref(), 8080, false).is_err());
+        assert_eq!(
+            state
+                .store
+                .get_message::<Sandbox>("legacy-ingress")
+                .await
+                .unwrap()
+                .unwrap(),
+            retained
+        );
     }
 
     #[tokio::test]
@@ -8041,6 +8044,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_sandbox_bounds_canonical_mcp_policy_size_for_all_default_spellings() {
+        use openshell_core::rpc_error::StatusExt as _;
+
         let state = test_server_state().await;
         let max_policy_size = super::super::MAX_POLICY_SIZE;
 
@@ -8124,6 +8129,21 @@ mod tests {
                 } else {
                     let error = result.expect_err("oversized canonical policy must be rejected");
                     assert_eq!(error.code(), tonic::Code::InvalidArgument, "{sandbox_name}");
+                    let details = error.get_error_details();
+                    assert_eq!(
+                        details
+                            .bad_request()
+                            .expect("field violation")
+                            .field_violations[0]
+                            .field,
+                        "spec.policy",
+                        "{sandbox_name}"
+                    );
+                    assert_eq!(
+                        details.error_info().expect("error reason").reason,
+                        "INVALID_ARGUMENT",
+                        "{sandbox_name}"
+                    );
                     assert_eq!(
                         error.message(),
                         format!(
@@ -10090,10 +10110,10 @@ mod tests {
                 .supervisor_sessions
                 .finalize_main_process_exit("sandbox-work")
         );
-        assert!(sandbox_relay_reachable(&state, &sandbox));
+        assert!(sandbox_relay_reachable(&state, &sandbox).await.unwrap());
 
         assert!(state.supervisor_sessions.disconnect("sandbox-work"));
-        assert!(!sandbox_relay_reachable(&state, &sandbox));
+        assert!(!sandbox_relay_reachable(&state, &sandbox).await.unwrap());
     }
 
     #[tokio::test]

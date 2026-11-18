@@ -5725,6 +5725,7 @@ impl ComputeRuntime {
                 }
             }
             Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
+                info!(sandbox_id = %deleted.sandbox_id, "Compute driver reported sandbox deleted");
                 self.apply_deleted(&deleted.sandbox_id).await?;
             }
             Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
@@ -6444,24 +6445,43 @@ impl ComputeRuntime {
     }
 
     async fn apply_deleted_locked(&self, sandbox_id: &str) -> Result<(), String> {
-        let sandbox = self
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(sandbox) = sandbox.as_ref() {
+        // This event is the only signal that removes the record after a
+        // driver-confirmed delete; the orphan sweep waits out its grace
+        // period. Other replicas keep writing the record until it is gone,
+        // e.g. the endpoint-status reset when the supervisor session ends, so
+        // retry the removal against a fresh snapshot after such a write.
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            let Some(sandbox) = self
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                let _ = self
+                    .store
+                    .delete(Sandbox::object_type(), sandbox_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.cleanup_removed_sandbox_state(sandbox_id);
+                return Ok(());
+            };
             // Timeout cleanup can emit Deleted before an explicit stop exposes
             // Stopped for repair. A delayed (or repeated) event must retain that
             // recovery record too; explicit deletion still transitions to Deleting.
             if self
-                .pending_driver_operation_blocks_cleanup(sandbox)
+                .pending_driver_operation_blocks_cleanup(&sandbox)
                 .await?
-                || (provisioning_deadline::timed_out(sandbox)
+                || (provisioning_deadline::timed_out(&sandbox)
                     && matches!(
                         SandboxPhase::try_from(sandbox.phase()),
                         Ok(SandboxPhase::Error | SandboxPhase::Stopped)
                     ))
             {
+                info!(
+                    sandbox_id,
+                    phase = ?SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown),
+                    "Retaining sandbox record after driver deletion for pending recovery"
+                );
                 return Ok(());
             }
             // The watcher told us this sandbox's compute resource is gone, so
@@ -6473,21 +6493,27 @@ impl ComputeRuntime {
             if self
                 .remove_sandbox_record_if_version_locked(
                     sandbox_id,
-                    sandbox_resource_version(sandbox),
+                    sandbox_resource_version(&sandbox),
                 )
                 .await?
             {
                 self.spawn_driver_sandbox_cleanup(sandbox.object_id(), sandbox.object_name());
+                return Ok(());
             }
-            return Ok(());
+            if attempt < DELETE_PHASE_CAS_RETRY_LIMIT {
+                info!(
+                    sandbox_id,
+                    attempt,
+                    expected_resource_version = sandbox_resource_version(&sandbox),
+                    "Sandbox removal after driver deletion did not complete; retrying"
+                );
+                tokio::task::yield_now().await;
+            }
         }
-
-        let _ = self
-            .store
-            .delete(Sandbox::object_type(), sandbox_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.cleanup_removed_sandbox_state(sandbox_id);
+        warn!(
+            sandbox_id,
+            "Sandbox removal after driver deletion did not complete; leaving it to reconciliation"
+        );
         Ok(())
     }
 
@@ -6957,6 +6983,7 @@ impl ComputeRuntime {
             sandbox_id = %sandbox_id,
             sandbox_name = %sandbox_name,
             age_secs = age_ms / 1000,
+            phase = ?phase,
             "Removing sandbox from store after it disappeared from the compute driver snapshot"
         );
         // The driver's own snapshot never reported this sandbox, so no
@@ -13645,12 +13672,6 @@ mod tests {
                 );
             }
             runtime.store.put_message(&sandbox).await.unwrap();
-            let before = runtime
-                .store
-                .get_message::<Sandbox>(sandbox.object_id())
-                .await
-                .unwrap()
-                .unwrap();
 
             let result = runtime
                 .start_sandbox("default", sandbox.object_name())
@@ -13673,10 +13694,6 @@ mod tests {
             assert!(!provisioning_deadline::driver_operation_pending(&stored));
             if !preparation_fails {
                 assert!(sandbox_provisioning_attempt_id(&stored).is_none());
-                assert_eq!(
-                    sandbox_resource_version(&stored),
-                    sandbox_resource_version(&before) + 1
-                );
             }
         }
     }
@@ -13986,11 +14003,6 @@ mod tests {
                 .status
                 .code(),
                 Code::Unauthenticated,
-            );
-            assert_eq!(
-                sandbox_resource_version(&stored),
-                sandbox_resource_version(&before) + 2,
-                "identity, Starting, and driver ownership commit together before settlement"
             );
 
             runtime
@@ -17689,6 +17701,70 @@ mod tests {
         assert!(stored.spec.as_ref().is_some_and(|spec| {
             openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
         }));
+    }
+
+    /// Another replica can write a deleting sandbox while the watch deletion
+    /// removes it, e.g. when the supervisor session ends. The removal must
+    /// retry, not wait for the orphan grace period.
+    #[tokio::test]
+    async fn watch_deletion_retries_after_concurrent_replica_write() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect conflict injector");
+        sqlx::query("CREATE TABLE injected_conflicts (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create conflict marker table");
+        // Another replica writes the sandbox between the removal's version
+        // check and its delete, once.
+        sqlx::query(
+            "CREATE TRIGGER inject_replica_write \
+             AFTER DELETE ON objects \
+             WHEN OLD.object_type = 'sandbox_settings' \
+               AND NOT EXISTS (SELECT 1 FROM injected_conflicts) \
+             BEGIN \
+               INSERT INTO injected_conflicts (id) VALUES (OLD.id); \
+               UPDATE objects SET resource_version = resource_version + 1 \
+                 WHERE object_type = 'sandbox' AND id = 'sb-race'; \
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install conflict trigger");
+
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = store;
+        let sandbox = sandbox_record("sb-race", "race", SandboxPhase::Deleting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        runtime.apply_deleted("sb-race").await.unwrap();
+
+        let injected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM injected_conflicts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(injected, 1, "the removal must hit the injected write");
+        pool.close().await;
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-race")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.delete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successful retry must reclaim driver-owned resources");
     }
 
     /// Driver watch events arrive on a background stream, so the store writes

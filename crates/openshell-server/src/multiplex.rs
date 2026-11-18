@@ -545,7 +545,7 @@ where
             if grpc_status_from_response(&response) != "0"
                 || response
                     .headers()
-                    .get("openshell-replayed")
+                    .get(crate::grpc::mutation_replay::REPLAYED_HEADER)
                     .is_some_and(|value| value == "true")
                 || !interceptors.has_post_commit(&intercepted)
             {
@@ -4774,6 +4774,52 @@ mod tests {
                 .unwrap();
 
             assert!(authorization_events(&capture).is_empty());
+        }
+
+        /// Answers every request with a stored result replayed by request ID.
+        #[derive(Clone)]
+        struct ReplayHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for ReplayHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                Box::pin(async move {
+                    let mut response = Response::new(tonic::body::Body::empty());
+                    response.headers_mut().insert(
+                        crate::grpc::mutation_replay::REPLAYED_HEADER,
+                        "true".parse().unwrap(),
+                    );
+                    Ok(response)
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn replayed_mutation_records_a_no_op() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            user_router(ReplayHandler)
+                .call(request_with_id("/openshell.v1.OpenShell/CreateWorkspace"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_mutation(&events[0], "CreateWorkspace", 1);
+            assert_eq!(events[0]["status_id"], 1, "{}", events[0]);
+            assert_eq!(
+                events[0]["status_detail"], "no_op:replayed",
+                "{}",
+                events[0]
+            );
         }
 
         /// Assert that `event` is a gateway mutation record for `operation`.
