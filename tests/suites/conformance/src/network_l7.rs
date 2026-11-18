@@ -29,14 +29,17 @@ async fn rest_rules_allow_get_and_deny_post(cx: &mut Context) -> testkit::Result
         .policy(rest_policy(server.port, "enforce")?)
         .create_ready()
         .await?;
-    for (request, expected) in [
-        (clients::Request::get("/allowed"), 200),
-        (clients::Request::new("POST", "/allowed").body("test"), 403),
+    for (request, (status, error)) in [
+        (clients::Request::get("/allowed"), ALLOWED),
+        (
+            clients::Request::new("POST", "/allowed").body("test"),
+            POLICY_DENIED,
+        ),
     ] {
         let reply = http(&sandbox, TEST_HOST, server.port, &request).await?;
         testkit::ensure!(
-            reply.status() == Some(expected),
-            "expected {expected} for {request:?}; got {reply:?}"
+            reply.status() == Some(status) && error_code(&reply).as_deref() == error,
+            "expected {status} with error {error:?} for {request:?}; got {reply:?}"
         );
     }
     let methods: Vec<String> = server
@@ -127,21 +130,21 @@ async fn graphql_rules_allow_and_deny_operations(cx: &mut Context) -> testkit::R
         .await?;
     let mut expected = Vec::new();
     for path in ["forward", "raw"] {
-        for (key, status) in [
-            ("query_allowed", 200),
-            ("get_query_allowed", 200),
-            ("duplicate_get_denied", 403),
-            ("persisted_get_allowed", 200),
-            ("unregistered_persisted_get_denied", 403),
-            ("chunked_query_allowed", 200),
-            ("unlisted_field_denied", 403),
-            ("mutation_allowed", 200),
-            ("deny_rule_denied", 403),
+        for (key, outcome) in [
+            ("query_allowed", ALLOWED),
+            ("get_query_allowed", ALLOWED),
+            ("duplicate_get_denied", POLICY_DENIED),
+            ("persisted_get_allowed", ALLOWED),
+            ("unregistered_persisted_get_denied", POLICY_DENIED),
+            ("chunked_query_allowed", ALLOWED),
+            ("unlisted_field_denied", POLICY_DENIED),
+            ("mutation_allowed", ALLOWED),
+            ("deny_rule_denied", POLICY_DENIED),
         ] {
-            expected.push((format!("{path}_{key}"), status));
+            expected.push((format!("{path}_{key}"), outcome));
         }
     }
-    expect_statuses(&output, expected)
+    expect_outcomes(&output, expected)
 }
 
 /// JSON-RPC rules allow listed methods whatever their params, deny a
@@ -194,26 +197,26 @@ async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Resu
         .await?;
     let mut expected = Vec::new();
     for path in ["forward", "raw"] {
-        for (key, status) in [
-            ("method_initialize_allowed", 200),
-            ("method_tools_list_allowed", 200),
-            ("method_tools_call_allowed", 200),
-            ("method_tools_call_with_unmatched_params_allowed", 200),
-            ("method_tools_delete_denied", 403),
-            ("unlisted_method_denied", 403),
+        for (key, outcome) in [
+            ("method_initialize_allowed", ALLOWED),
+            ("method_tools_list_allowed", ALLOWED),
+            ("method_tools_call_allowed", ALLOWED),
+            ("method_tools_call_with_unmatched_params_allowed", ALLOWED),
+            ("method_tools_delete_denied", POLICY_DENIED),
+            ("unlisted_method_denied", POLICY_DENIED),
         ] {
-            expected.push((format!("{path}_{key}"), status));
+            expected.push((format!("{path}_{key}"), outcome));
         }
     }
-    for (key, status) in [
-        ("rest_route_allowed", 200),
-        ("forward_batch_all_allowed", 200),
-        ("forward_batch_one_denied", 403),
-        ("forward_invalid_json_denied", 403),
+    for (key, outcome) in [
+        ("rest_route_allowed", ALLOWED),
+        ("forward_batch_all_allowed", ALLOWED),
+        ("forward_batch_one_denied", POLICY_DENIED),
+        ("forward_invalid_json_denied", POLICY_DENIED),
     ] {
-        expected.push((key.to_string(), status));
+        expected.push((key.to_string(), outcome));
     }
-    expect_statuses(&output, expected)
+    expect_outcomes(&output, expected)
 }
 
 /// A JSON-RPC endpoint without `enforcement` audits an unlisted method and
@@ -252,11 +255,14 @@ async fn jsonrpc_default_audit_mode_still_denies_response_frames(
     let output = sandbox
         .run_python(scripts::JSONRPC_AUDIT_CLIENT, &[TEST_HOST, &port(&server)])
         .await?;
-    expect_statuses(
+    expect_outcomes(
         &output,
         [
-            ("forward_unknown_method_audited".to_string(), 200),
-            ("forward_response_frame_hard_denied".to_string(), 403),
+            ("forward_unknown_method_audited".to_string(), ALLOWED),
+            (
+                "forward_response_frame_hard_denied".to_string(),
+                POLICY_DENIED,
+            ),
         ],
     )
 }
@@ -317,34 +323,53 @@ async fn expect_upgrade_refused(sandbox: &Sandbox, port: u16) -> Result {
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
         let reply = http_raw(sandbox, TEST_HOST, port, request.as_bytes()).await?;
-        let received = reply.received_text();
         testkit::ensure!(
             reply.status() == Some(403)
-                && received.contains("unsupported_l7_protocol")
-                && received.contains("REST endpoints"),
+                && error_code(&reply).as_deref() == Some("unsupported_l7_protocol")
+                && reply.received_text().contains("REST endpoints"),
             "expected the upgrade to {target} refused; got {reply:?}"
         );
     }
     Ok(())
 }
 
+/// A response's status and the `error` code in its JSON body, if any.
+type Outcome = (u16, Option<&'static str>);
+
+/// Upstream answered.
+const ALLOWED: Outcome = (200, None);
+
+/// The sandbox denied the request by policy, as documented under "Proxy
+/// Error Responses" in `docs/observability/logging.mdx`.
+const POLICY_DENIED: Outcome = (403, Some("policy_denied"));
+
 /// Fail unless the client's JSON result maps exactly the keys in
-/// `expected` to their statuses.
-fn expect_statuses(
+/// `expected` to their statuses and `error` codes.
+fn expect_outcomes(
     output: &testkit::ExecOutput,
-    expected: impl IntoIterator<Item = (String, u16)>,
+    expected: impl IntoIterator<Item = (String, Outcome)>,
 ) -> Result {
     let result = output.last_json()?;
     let expected: Value = expected
         .into_iter()
-        .map(|(key, status)| (key, json!(status)))
+        .map(|(key, (status, error))| (key, json!({"status": status, "error": error})))
         .collect::<serde_json::Map<_, _>>()
         .into();
     testkit::ensure!(
         result == expected,
-        "unexpected statuses:\nexpected: {expected}\ngot:      {result}"
+        "unexpected outcomes:\nexpected: {expected}\ngot:      {result}"
     );
     Ok(())
+}
+
+/// The `error` code in the JSON body of `reply`'s response, if any.
+pub(crate) fn error_code(reply: &clients::Http) -> Option<String> {
+    let body = &reply.response.as_ref()?.body;
+    let error = serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("error")?
+        .clone();
+    error.as_str().map(str::to_owned)
 }
 
 fn ok_json() -> Response {

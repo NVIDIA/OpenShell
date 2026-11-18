@@ -406,15 +406,25 @@ fn rest_policy(port: u16, method: &str) -> Result<proto::SandboxPolicy> {
 }
 
 /// Send `requests` pipelined in one write, and fail unless the first gets
-/// `200` and the second `403`.
+/// `200` and the second a `403` with `policy_denied`.
 async fn run_pipeline(sandbox: &Sandbox, port: u16, requests: &str) -> Result {
     let reply = http_raw(sandbox, TEST_HOST, port, requests.as_bytes()).await?;
     let received = reply.received_text();
+    let denial_error = received
+        .split_once("HTTP/1.1 403 Forbidden\r\n")
+        .and_then(|(_, denial)| denial.split_once("\r\n\r\n"))
+        .and_then(|(_, body)| {
+            serde_json::Deserializer::from_str(body)
+                .into_iter::<Value>()
+                .next()?
+                .ok()
+        })
+        .and_then(|body| body.get("error")?.as_str().map(str::to_owned));
     testkit::ensure!(
         reply.status() == Some(200)
             && received.matches("HTTP/1.1 ").count() == 2
-            && received.contains("HTTP/1.1 403 Forbidden"),
-        "expected 200 then 403; got {reply:?}"
+            && denial_error.as_deref() == Some("policy_denied"),
+        "expected 200 then 403 with policy_denied; got {reply:?}"
     );
     Ok(())
 }

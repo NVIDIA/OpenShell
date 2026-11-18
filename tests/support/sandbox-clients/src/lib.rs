@@ -78,15 +78,15 @@ pub mod scripts {
         include_str!("../scripts/reload_keep_alive_client.py");
 
     /// Sends GraphQL queries, mutations and persisted queries with urllib and
-    /// raw sockets, and prints each status.
+    /// raw sockets, and prints each status and JSON `error` code.
     pub const GRAPHQL_CLIENT: &str = include_str!("../scripts/graphql_client.py");
 
     /// Sends JSON-RPC calls, batches and invalid JSON with urllib and raw
-    /// sockets, and prints each status.
+    /// sockets, and prints each status and JSON `error` code.
     pub const JSONRPC_CLIENT: &str = include_str!("../scripts/jsonrpc_client.py");
 
     /// Sends an unlisted JSON-RPC method and a response frame, and prints each
-    /// status.
+    /// status and JSON `error` code.
     pub const JSONRPC_AUDIT_CLIENT: &str = include_str!("../scripts/jsonrpc_audit_client.py");
 
     /// Runs an MCP client for each protocol revision it's given, and prints

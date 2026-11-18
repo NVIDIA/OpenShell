@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Sends an unlisted JSON-RPC method and a response frame to HOST:PORT/rpc,
-# and prints each status as JSON.
+# and prints each status and the `error` code of its JSON body as JSON.
 import json
 import sys
 import urllib.error
@@ -10,6 +10,13 @@ import urllib.request
 
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
+
+def outcome(status, body):
+    try:
+        error = json.loads(body).get("error")
+    except (ValueError, AttributeError):
+        error = None
+    return {"status": status, "error": error if isinstance(error, str) else None}
 
 def post_jsonrpc(body):
     encoded = json.dumps(body).encode()
@@ -21,11 +28,9 @@ def post_jsonrpc(body):
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            response.read()
-            return response.status
+            return outcome(response.status, response.read())
     except urllib.error.HTTPError as error:
-        error.read()
-        return error.code
+        return outcome(error.code, error.read())
 
 results = {
     "forward_unknown_method_audited": post_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "unknown/method"}),
