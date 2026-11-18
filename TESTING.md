@@ -22,11 +22,6 @@ tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session 
 tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
-## Performance benchmarks
-
-Run `mise run perf:seccomp` for the native/filtered seccomp broker
-microbenchmark.
-
 ## Rust Tests
 
 Unit tests live inline with `#[cfg(test)] mod tests` blocks. Integration tests
