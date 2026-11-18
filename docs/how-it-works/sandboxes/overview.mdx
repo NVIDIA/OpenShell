@@ -876,6 +876,18 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 </Tip>
 
+### Forward a TCP service through the gateway
+
+Use the gateway's TCP relay to forward a loopback service:
+
+```shell
+openshell forward service my-sandbox --target-host 127.0.0.1 --target-port 8080 --local 0
+```
+
+The target host must be a loopback IP address or `localhost`, and the target
+port must be between 1 and 65535. Invalid targets are rejected before a local
+listener opens.
+
 ## SSH Config
 
 Each sandbox has its own SSH host key. The key stays the same when the

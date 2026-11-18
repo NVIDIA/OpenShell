@@ -44,6 +44,16 @@ import { heldUntilReady, OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, routedStrea
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
+// Match the gateway's loopback-only forward target contract without DNS.
+function normalizeForwardHost(value: string): string {
+  const host = value.trim();
+  if (!host) throw new SdkError('invalid_config', 'tcp target host is required');
+  if (host.toLowerCase() === 'localhost') return '127.0.0.1';
+  if (net.isIPv4(host) && host.startsWith('127.')) return host;
+  if (net.isIPv6(host) && !host.includes('%') && new URL(`http://[${host}]`).hostname === '[::1]') return '::1';
+  throw new SdkError('invalid_config', 'tcp target host must be loopback');
+}
+
 function durationFromSeconds(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) {
     throw new RangeError('timeoutSecs must be a finite, non-negative number');
@@ -1746,8 +1756,11 @@ export class SandboxClient {
   // the `init` (TCP target + token), relay bytes both ways in ~64 KiB chunks,
   // and revoke the token on close. Process-lifetime only.
   async forward(name: string, opts: ForwardOptions): Promise<ForwardHandle> {
-    const targetHost = opts.targetHost ?? '127.0.0.1';
+    const targetHost = normalizeForwardHost(opts.targetHost ?? '127.0.0.1');
     const targetPort = opts.targetPort;
+    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
+      throw new SdkError('invalid_config', 'tcp target port must be between 1 and 65535');
+    }
     const localHost = opts.localHost ?? '127.0.0.1';
     const localPort = opts.localPort ?? 0;
 
