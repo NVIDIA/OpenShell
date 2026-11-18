@@ -3,6 +3,7 @@
 
 //! Opt-in microbenchmarks for the production seccomp network listener.
 
+use std::collections::VecDeque;
 use std::io::{self, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -14,9 +15,9 @@ use crate::linux::workload_launcher;
 use anyhow::{Context as _, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, Socket, Type};
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
-use crate::network_broker::NetworkBroker;
+use crate::network_broker::{NetworkBroker, SOCKET_CAPACITY};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -41,11 +42,15 @@ impl Layer {
 pub enum Protocol {
     TcpConnect,
     TcpStream,
+    SocketChurn,
 }
 
 impl Protocol {
     pub fn selection(value: &str) -> anyhow::Result<Vec<Self>> {
         match value {
+            // Socket churn stays opt-in: it fills the registry bound, so every
+            // filtered operation pays a full /proc reclaim scan and the run
+            // takes minutes instead of seconds.
             "all" => Ok(vec![Self::TcpConnect, Self::TcpStream]),
             _ => Ok(vec![
                 Self::from_str(value, true).map_err(|error| anyhow::anyhow!("{error}"))?,
@@ -93,7 +98,8 @@ pub fn run(options: BenchmarkOptions) -> anyhow::Result<Vec<BenchmarkReport>> {
     let mut filtered_runtime = None;
     for layer in options.layers {
         if matches!(layer, Layer::Filtered) && filtered_runtime.is_none() {
-            let (launcher, listener) = workload_launcher::start()?;
+            let (launcher, listener) =
+                workload_launcher::start(&crate::network_broker::DENIED_SOCKET_OPTIONS)?;
             let broker = NetworkBroker::start_for_test(listener)?;
             broker.confirm_healthy()?;
             filtered_runtime = Some((launcher, broker));
@@ -153,8 +159,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 impl Fixture {
     fn start(protocol: Protocol, _broker: Option<&NetworkBroker>) -> io::Result<Self> {
         match protocol {
-            Protocol::TcpConnect => start_tcp_fixture(false),
             Protocol::TcpStream => start_tcp_fixture(true),
+            // Socket churn never connects; like a connect-only benchmark it
+            // needs the target argument but no echo peer.
+            Protocol::TcpConnect | Protocol::SocketChurn => start_tcp_fixture(false),
         }
     }
 }
@@ -203,7 +211,15 @@ pub fn run_worker(
     let mut threads = Vec::with_capacity(concurrency);
     let mut starters = Vec::with_capacity(concurrency);
     let mut readiness = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
+    // Every worker holds its share of the registry bound open, so the churn
+    // operations run against a full registry without starving a peer. The
+    // division remainder is distributed so the shares sum to exactly the
+    // bound. A zero concurrency (accepted by the hidden worker subcommand)
+    // must not panic.
+    let workers = concurrency.max(1);
+    for index in 0..concurrency {
+        let churn_target =
+            SOCKET_CAPACITY / workers + usize::from(index < SOCKET_CAPACITY % workers);
         let sender = sender.clone();
         let (start_tx, start_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -217,6 +233,7 @@ pub fn run_worker(
                     iterations,
                     warmup,
                     payload_bytes,
+                    churn_target,
                     preparation_deadline,
                 },
                 start_rx,
@@ -250,10 +267,18 @@ pub fn run_worker(
             .context("benchmark worker exited before measurement")?;
     }
     let mut samples = Vec::new();
+    // Hold each worker's churn sockets until after the measurement: dropping
+    // them inside the worker would fold their teardown into `elapsed`, and a
+    // finished worker's stale entries would relax the registry pressure its
+    // surviving peers still measure under.
+    let mut churns = Vec::new();
     for result in receiver {
-        samples.extend(result?);
+        let (worker_samples, worker_churn) = result?;
+        samples.extend(worker_samples);
+        churns.push(worker_churn);
     }
     let elapsed = started.elapsed();
+    drop(churns);
     for worker in threads {
         worker
             .join()
@@ -294,7 +319,7 @@ fn throughput_mbit_per_second(
     seconds: f64,
 ) -> f64 {
     let bytes_per_operation = match protocol {
-        Protocol::TcpConnect => 0,
+        Protocol::TcpConnect | Protocol::SocketChurn => 0,
         Protocol::TcpStream => payload_bytes.saturating_mul(2),
     };
     operations as f64 * bytes_per_operation as f64 * 8.0 / seconds / 1_000_000.0
@@ -305,6 +330,7 @@ impl Protocol {
         match self {
             Self::TcpConnect => "implemented local TCP socket/connect interception",
             Self::TcpStream => "implemented established TCP fast path",
+            Self::SocketChurn => "implemented socket creation at the registry bound",
         }
     }
 }
@@ -316,6 +342,7 @@ struct WorkerOptions {
     iterations: u64,
     warmup: u64,
     payload_bytes: usize,
+    churn_target: usize,
     preparation_deadline: Instant,
 }
 
@@ -323,13 +350,14 @@ fn worker_loop(
     options: WorkerOptions,
     start: mpsc::Receiver<()>,
     ready: mpsc::Sender<Result<(), String>>,
-) -> anyhow::Result<Vec<u64>> {
+) -> anyhow::Result<(Vec<u64>, Option<SocketChurn>)> {
     let WorkerOptions {
         protocol,
         target,
         iterations,
         warmup,
         payload_bytes,
+        churn_target,
         preparation_deadline,
     } = options;
     let prepared = (|| -> anyhow::Result<_> {
@@ -339,16 +367,28 @@ fn worker_loop(
         } else {
             None
         };
+        let mut churn = if matches!(protocol, Protocol::SocketChurn) {
+            Some(churn_sockets(churn_target, preparation_deadline)?)
+        } else {
+            None
+        };
         let mut response = vec![0_u8; payload_bytes];
         for _ in 0..warmup {
             if Instant::now() >= preparation_deadline {
                 bail!("benchmark warmup exceeded preparation deadline");
             }
-            one_operation(protocol, target, &payload, &mut response, tcp.as_mut())?;
+            one_operation(
+                protocol,
+                target,
+                &payload,
+                &mut response,
+                tcp.as_mut(),
+                churn.as_mut(),
+            )?;
         }
-        Ok((payload, response, tcp))
+        Ok((payload, response, tcp, churn))
     })();
-    let (payload, mut response, mut tcp) = match prepared {
+    let (payload, mut response, mut tcp, mut churn) = match prepared {
         Ok(prepared) => {
             ready
                 .send(Ok(()))
@@ -365,10 +405,20 @@ fn worker_loop(
     let mut samples = Vec::with_capacity(usize::try_from(iterations).unwrap_or(0));
     for _ in 0..iterations {
         let started = Instant::now();
-        one_operation(protocol, target, &payload, &mut response, tcp.as_mut())?;
+        one_operation(
+            protocol,
+            target,
+            &payload,
+            &mut response,
+            tcp.as_mut(),
+            churn.as_mut(),
+        )?;
         samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
-    Ok(samples)
+    // Return the held sockets with the samples: the coordinator drops them
+    // after recording `elapsed`, so the teardown never lands in the
+    // measurement (see run_worker).
+    Ok((samples, churn))
 }
 
 fn one_operation(
@@ -377,6 +427,7 @@ fn one_operation(
     payload: &[u8],
     response: &mut [u8],
     tcp: Option<&mut TcpStream>,
+    churn: Option<&mut SocketChurn>,
 ) -> io::Result<()> {
     match protocol {
         Protocol::TcpConnect => {
@@ -387,8 +438,65 @@ fn one_operation(
             stream.write_all(payload)?;
             stream.read_exact(response)?;
         }
+        Protocol::SocketChurn => churn.expect("socket churn initialized").rotate()?,
     }
     Ok(())
+}
+
+/// Sockets held open so every measured operation creates under registry
+/// pressure.
+struct SocketChurn {
+    held: VecDeque<Socket>,
+}
+
+impl SocketChurn {
+    /// Close the oldest held socket and create its replacement.
+    ///
+    /// Closing first leaves a reclaimable entry behind, so the registry stays
+    /// at its bound and the creation must prove it clean before staging
+    /// another entry.
+    fn rotate(&mut self) -> io::Result<()> {
+        self.held.pop_front();
+        self.held.push_back(churn_socket()?);
+        Ok(())
+    }
+}
+
+/// Fill this worker's share of the registry bound.
+///
+/// The fill must reach `target`: the benchmark only measures what it reports
+/// while the registry stays at its bound, so a short fill is an error rather
+/// than a silently under-filled run. An `EMFILE` during the fill means the
+/// benchmark process ran out of descriptors: the broker runs in the same
+/// process and holds one for every staged socket, so the remedy is its
+/// open-file limit, not the registry bound (which the fill never exceeds).
+fn churn_sockets(target: usize, preparation_deadline: Instant) -> io::Result<SocketChurn> {
+    let mut held = VecDeque::with_capacity(target);
+    for _ in 0..target {
+        if Instant::now() >= preparation_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "socket churn fill exceeded the preparation deadline",
+            ));
+        }
+        match churn_socket() {
+            Ok(socket) => held.push_back(socket),
+            Err(error) if error.raw_os_error() == Some(libc::EMFILE) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    if held.len() < target {
+        return Err(io::Error::other(format!(
+            "socket churn filled {} of {target} sockets before the process ran out \
+             of descriptors; raise the open-file limit (ulimit -n) and rerun",
+            held.len()
+        )));
+    }
+    Ok(SocketChurn { held })
+}
+
+fn churn_socket() -> io::Result<Socket> {
+    Socket::new(Domain::IPV4, Type::STREAM, Some(SocketProtocol::TCP))
 }
 
 fn connect(target: SocketAddr) -> io::Result<TcpStream> {
@@ -431,6 +539,12 @@ mod tests {
     fn tcp_stream_counts_request_and_echo_bytes() {
         let throughput = throughput_mbit_per_second(Protocol::TcpStream, 1_000, 64, 1.0);
         assert!((throughput - 1.024).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn socket_churn_never_reports_payload_throughput() {
+        let throughput = throughput_mbit_per_second(Protocol::SocketChurn, 1_000, 64, 1.0);
+        assert!(throughput.abs() < f64::EPSILON);
     }
 
     #[test]

@@ -67,7 +67,14 @@ impl WorkloadLauncher {
 
 /// Start the only workload launcher and return its listener to an unfiltered
 /// sandbox thread.
-pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
+///
+/// `denied_socket_options` is the confinement policy the filter enforces in the
+/// kernel; the caller owns the table because this module installs filters but
+/// does not decide policy.
+pub fn start(
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<(WorkloadLauncher, NotificationListener)> {
+    let denied_socket_options = denied_socket_options.to_vec();
     let (jobs_tx, jobs_rx) = mpsc::sync_channel::<LaunchJob>(64);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let alive = Arc::new(AtomicBool::new(true));
@@ -75,7 +82,7 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
     thread::Builder::new()
         .name("openshell-workload-launcher".to_string())
         .spawn(move || {
-            match install_workload_listener() {
+            match install_workload_listener(&denied_socket_options) {
                 Ok(listener) => {
                     if ready_tx.send(Ok(listener)).is_err() {
                         thread_alive.store(false, Ordering::Release);
@@ -123,7 +130,10 @@ mod tests {
 
     #[test]
     fn one_listener_mediates_launcher_and_inherited_child() {
-        let (launcher, listener) = start().expect("start launcher");
+        // The deny table is the caller's policy; this test only exercises the
+        // launcher plumbing, so any nonempty table installs.
+        let (launcher, listener) =
+            start(&[(libc::SOL_SOCKET, libc::SO_BINDTODEVICE)]).expect("start launcher");
         let executable = std::env::current_exe().expect("test executable");
         let mut child = launcher
             .execute(move || {

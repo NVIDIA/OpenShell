@@ -193,7 +193,13 @@ mod tests {
     fn filtered_worker_cannot_signal_the_sandbox_through_a_tid() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
-            let listener = crate::linux::seccomp_notify::install_workload_listener().unwrap();
+            // Signal mediation is independent of the socket-option policy; the
+            // filter only needs a nonempty deny table to install.
+            let listener = crate::linux::seccomp_notify::install_workload_listener(&[(
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+            )])
+            .unwrap();
             sender.send(listener).unwrap();
             // SAFETY: gettid has no arguments; signal zero checks permission
             // without delivering a signal to the disposable test thread.
