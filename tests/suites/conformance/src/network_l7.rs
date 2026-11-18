@@ -145,8 +145,9 @@ async fn graphql_rules_allow_and_deny_operations(cx: &mut Context) -> testkit::R
 }
 
 /// JSON-RPC rules allow listed methods whatever their params, deny a
-/// deny-rule method, a batch with one denied call, and invalid JSON, through
-/// urllib and raw sockets.
+/// deny-rule method, an unlisted method, a batch with one denied call, and
+/// invalid JSON, through urllib and raw sockets. A REST endpoint on the same
+/// port still allows requests outside the RPC path.
 #[testkit::test]
 async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::serve(jsonrpc_upstream).await?;
@@ -155,6 +156,11 @@ async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Resu
   jsonrpc:
     name: jsonrpc
     endpoints:
+      - host: {TEST_HOST}
+        port: {port}
+        protocol: rest
+        enforcement: enforce
+        access: read-write
       - host: {TEST_HOST}
         port: {port}
         path: /rpc
@@ -194,11 +200,13 @@ async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Resu
             ("method_tools_call_allowed", 200),
             ("method_tools_call_with_unmatched_params_allowed", 200),
             ("method_tools_delete_denied", 403),
+            ("unlisted_method_denied", 403),
         ] {
             expected.push((format!("{path}_{key}"), status));
         }
     }
     for (key, status) in [
+        ("rest_route_allowed", 200),
         ("forward_batch_all_allowed", 200),
         ("forward_batch_one_denied", 403),
         ("forward_invalid_json_denied", 403),
