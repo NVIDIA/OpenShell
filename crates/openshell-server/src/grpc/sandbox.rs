@@ -4353,6 +4353,10 @@ mod tests {
             ..Default::default()
         };
         let encoded = exec_relay_command(&req, "mxc").unwrap();
+        assert!(
+            !encoded.as_bytes().contains(&0),
+            "SSH transport forbids NUL"
+        );
         let payload: SshExecArgv =
             serde_json::from_str(encoded.strip_prefix(ARGV_PREFIX).unwrap()).unwrap();
         assert_eq!(payload.command, req.command);

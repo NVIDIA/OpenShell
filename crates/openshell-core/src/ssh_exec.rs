@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
-/// A leading NUL distinguishes this request from native SSH shell text.
-pub const ARGV_PREFIX: &str = "\0openshell-exec-argv-v1\n";
+/// A leading ASCII record separator distinguishes the frame from native shell text.
+pub const ARGV_PREFIX: &str = "\x1eopenshell-exec-argv-v1\n";
 
 /// The argv, environment, and working directory from an MXC `ExecSandbox` RPC.
 #[derive(serde::Serialize, serde::Deserialize)]
