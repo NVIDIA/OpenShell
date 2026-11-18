@@ -12,16 +12,10 @@
 //! Ported from the `proxy_egress_pipeline` e2e test of IP literals, which
 //! used two support containers on the e2e network instead.
 
-use host_server_support::HttpRecorder;
-use serde_json::Value;
+use host_server_support::{HttpRecorder, TEST_HOST};
+use sandbox_clients_support::{Request, http};
 use testkit::policy;
 use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
-
-/// Sends two GET requests to `argv[1]:argv[2]` and prints their statuses as
-/// one JSON line.
-const STATUS_CLIENT: &str = include_str!("../../../conformance/src/scripts/status_client.py");
-
-const RESOLVE: &str = "import socket; print(socket.gethostbyname('host.openshell.internal'))";
 
 /// Requests reach a server by an IP literal endpoint with `allowed_ips` for
 /// that address, and another by an IP literal endpoint without it.
@@ -37,10 +31,12 @@ async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Resul
         .create_ready()
         .await?;
     let ip = sandbox
-        .exec(["python3", "-c", RESOLVE])
-        .await?
-        .success()
-        .context("resolve host.openshell.internal in the sandbox")?
+        .run_python(
+            "import socket, sys; print(socket.gethostbyname(sys.argv[1]))",
+            &[TEST_HOST],
+        )
+        .await
+        .context(format!("resolve {TEST_HOST} in the sandbox"))?
         .stdout
         .trim()
         .to_string();
@@ -64,33 +60,14 @@ async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Resul
     policy::set(&sandbox, &ip_policy).await?;
 
     for (mode, server) in [("explicit allowed_ips", &explicit), ("implicit", &implicit)] {
-        let output = sandbox
-            .exec([
-                "python3",
-                "-c",
-                STATUS_CLIENT,
-                &ip,
-                &server.port.to_string(),
-            ])
-            .await?
-            .success()
-            .context(format!("run the {mode} client"))?;
-        let result: Value = output
-            .stdout
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str(line.trim()).ok())
-            .ok_or_else(|| {
-                testkit::Error::msg(format!(
-                    "no JSON result from the {mode} client:\n{}\n{}",
-                    output.stdout, output.stderr
-                ))
-            })?;
-        testkit::ensure!(
-            result["first"] == 200 && result["second"] == 200,
-            "{mode} requests to {ip}:{} failed: {result}",
-            server.port
-        );
+        for path in ["/first", "/second"] {
+            let reply = http(&sandbox, &ip, server.port, &Request::get(path)).await?;
+            testkit::ensure!(
+                reply.status() == Some(200),
+                "{mode} request to {ip}:{}{path} failed: {reply:?}",
+                server.port
+            );
+        }
     }
     Ok(())
 }

@@ -3121,7 +3121,7 @@ version = "0.0.0"
 dependencies = [
  "host-server-support",
  "openshell-testkit",
- "serde_json",
+ "sandbox-clients-support",
 ]
 
 [[package]]
@@ -3261,6 +3261,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox-clients-support"
+version = "0.0.0"
+dependencies = [
+ "httparse",
+ "openshell-testkit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

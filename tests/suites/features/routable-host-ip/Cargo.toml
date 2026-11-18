@@ -13,5 +13,5 @@ publish = false
 
 [dependencies]
 host-server-support = { path = "../../../support/host-server" }
+sandbox-clients-support = { path = "../../../support/sandbox-clients" }
 openshell-testkit = { path = "../../../testkit/testkit" }
-serde_json = "1"
