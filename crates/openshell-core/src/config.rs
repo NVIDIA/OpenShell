@@ -250,6 +250,91 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Gateway-owned SPIFFE Broker API issuance for Kubernetes sandbox identities.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpiffeBrokerConfig {
+    pub spiffe_id_prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    /// Connect to the gateway's node IP supplied through the Downward API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_local_port: Option<std::num::NonZeroU16>,
+    #[serde(default)]
+    pub server_spiffe_id: Option<String>,
+    #[serde(default)]
+    pub server_spiffe_id_prefix: Option<String>,
+    pub workload_api_socket_path: String,
+}
+
+impl SpiffeBrokerConfig {
+    /// Resolve the selected transport without making Kubernetes API calls.
+    /// Node-local mode requires the Pod's trusted Downward API node address.
+    pub fn endpoint_for_node(&self, node_ip: Option<&str>) -> Result<String, String> {
+        match (self.endpoint.is_empty(), self.node_local_port) {
+            (false, None) => Ok(self.endpoint.clone()),
+            (true, Some(port)) => {
+                let ip: std::net::IpAddr = node_ip
+                    .ok_or("spiffe_broker.node_local_port requires OPENSHELL_NODE_IP from status.hostIP")?
+                    .parse()
+                    .map_err(|_| "OPENSHELL_NODE_IP must be an IPv4 or IPv6 address")?;
+                Ok(format!("https://{}", SocketAddr::new(ip, port.get())))
+            }
+            _ => Err("spiffe_broker requires exactly one of endpoint and node_local_port".into()),
+        }
+    }
+
+    /// Validate the identity and authenticated transport before use.
+    pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
+        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
+            .sandbox_spiffe_id(gateway_id, "sandbox")?;
+        // Validate the mode independently of the startup environment. The
+        // adapter requires and resolves the actual node IP before serving.
+        let endpoint = self.endpoint_for_node(Some("127.0.0.1"))?;
+        let endpoint = url::Url::parse(&endpoint)
+            .map_err(|_| "spiffe_broker.endpoint must be an HTTPS endpoint")?;
+        let socket = std::path::Path::new(&self.workload_api_socket_path);
+        let valid_socket = socket.is_absolute()
+            && !self.workload_api_socket_path.ends_with('/')
+            && socket.file_name().is_some()
+            && socket
+                .parent()
+                .is_some_and(|parent| parent != std::path::Path::new("/"))
+            && self.workload_api_socket_path.trim() == self.workload_api_socket_path
+            && !self
+                .workload_api_socket_path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."));
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.path() != "/"
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !valid_socket
+        {
+            return Err(
+                "spiffe_broker requires an HTTPS endpoint and absolute Workload API socket path"
+                    .into(),
+            );
+        }
+        match (&self.server_spiffe_id, &self.server_spiffe_id_prefix) {
+            (Some(id), None) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(id)?;
+            }
+            (None, Some(prefix)) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(prefix)?;
+                if !prefix.trim_start_matches("spiffe://").contains('/') {
+                    return Err("spiffe_broker.server_spiffe_id_prefix requires an agent path, not a whole trust domain".into());
+                }
+            }
+            _ => return Err("spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix".into()),
+        }
+        Ok(())
+    }
+}
+
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -326,6 +411,8 @@ pub struct Config {
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
     /// flow (issue #1354).
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
+    pub spiffe_broker: Option<SpiffeBrokerConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -1115,6 +1202,7 @@ impl Config {
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
+            spiffe_broker: None,
             database_url: String::new(),
             database_auth: DatabaseAuthMode::default(),
             database_max_connections: None,
@@ -2096,5 +2184,79 @@ mod tests {
             runtime_image_default(None, "compiled:default".to_string()),
             "compiled:default"
         );
+    }
+    #[test]
+    fn broker_configuration_rejects_ambiguous_transport() {
+        let mut config = super::SpiffeBrokerConfig {
+            spiffe_id_prefix: "spiffe://example.org/openshell".into(),
+            endpoint: "https://spire-broker.spire.svc:8443".into(),
+            node_local_port: None,
+            server_spiffe_id: Some("spiffe://example.org/spire/agent/node".into()),
+            server_spiffe_id_prefix: None,
+            workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock".into(),
+        };
+        config.validate("gw").unwrap();
+        let mut local = config.clone();
+        local.endpoint.clear();
+        local.node_local_port = std::num::NonZeroU16::new(8443);
+        local.validate("gw").unwrap();
+        assert_eq!(
+            local.endpoint_for_node(Some("10.20.0.2")).unwrap(),
+            "https://10.20.0.2:8443"
+        );
+        assert_eq!(
+            local.endpoint_for_node(Some("2001:db8::2")).unwrap(),
+            "https://[2001:db8::2]:8443"
+        );
+        for address in [
+            None,
+            Some(""),
+            Some("agent.example.org"),
+            Some("10.20.0.2:8443"),
+        ] {
+            assert!(local.endpoint_for_node(address).is_err());
+        }
+        local.endpoint.clone_from(&config.endpoint);
+        assert!(local.validate("gw").is_err());
+        local.endpoint.clear();
+        local.node_local_port = None;
+        assert!(local.validate("gw").is_err());
+        let encoded = serde_json::to_value(&config).unwrap();
+        for port in [0, 65536] {
+            let mut invalid = encoded.clone();
+            invalid["node_local_port"] = port.into();
+            assert!(serde_json::from_value::<super::SpiffeBrokerConfig>(invalid).is_err());
+        }
+        config.server_spiffe_id = None;
+        config.server_spiffe_id_prefix =
+            Some("spiffe://example.org/spire/agent/k8s_psat/cluster".into());
+        config.validate("gw").unwrap();
+        config.server_spiffe_id_prefix = Some("spiffe://example.org".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id = Some("spiffe://example.org/spire/agent/node".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id_prefix = None;
+        for endpoint in [
+            "http://broker:8443",
+            "https://user:password@broker",
+            "https://broker/path",
+            "https://broker/?query",
+            "https://broker/#fragment",
+        ] {
+            config.endpoint = endpoint.into();
+            assert!(config.validate("gw").is_err());
+        }
+        config.endpoint = "https://broker:8443".into();
+        for socket in [
+            "tcp:broker:1234",
+            "/",
+            "/agent.sock",
+            "/run/../agent.sock",
+            "/run/spire/",
+            " /run/spire/agent.sock",
+        ] {
+            config.workload_api_socket_path = socket.into();
+            assert!(config.validate("gw").is_err(), "{socket}");
+        }
     }
 }

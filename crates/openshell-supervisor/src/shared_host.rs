@@ -811,7 +811,7 @@ impl SharedHost {
             ssh_socket_path: Some(ssh_socket.to_string_lossy().into_owned()),
             shared_ssh_socket: false,
             // The Kubernetes driver refuses the gateway topology when an
-            // upstream proxy or provider workload identity is configured,
+            // upstream proxy is configured,
             // and it configures no extra CA for dedicated supervisors.
             upstream_proxy_args:
                 openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
@@ -822,9 +822,9 @@ impl SharedHost {
             main_exit_marker: None,
             attach_request_timeout: self.attach_request_timeout,
             trace_context: registration.trace_context,
-            // One process cannot hold a per-sandbox workload identity, so
-            // providers that need one fail closed.
-            provider_workload_api_socket: None,
+            // The gateway owns each sandbox's workload identity and returns
+            // only final provider access tokens.
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::Gateway,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles {
                 ca_certificate: Some(ca_certificate),
                 ca_private_key: Some(ca_private_key),

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# The test supplies external PostgreSQL so the gateway can move across nodes.
+workload:
+  kind: deployment
+server:
+  externalDbSecret: e2e-spiffe-postgres
+supervisor:
+  replicas: 2
+  recoveryTimeoutSeconds: 60
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+  openshell.gateway.spiffe_broker:
+    spiffe_id_prefix: spiffe://openshell.local/openshell
+    node_local_port: 8443
+    server_spiffe_id_prefix: spiffe://openshell.local/spire/agent/k8s_psat/openshell-e2e
+    workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
