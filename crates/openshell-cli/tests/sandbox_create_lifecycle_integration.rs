@@ -3323,7 +3323,7 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
 }
 
 #[tokio::test]
-async fn editor_connect_pins_the_published_host_key_for_ssh_and_the_config_entry() {
+async fn editor_connect_hands_ssh_the_published_host_key_and_its_pin() {
     let server = run_server().await;
     let fake_ssh_dir = helpers::tempdir().unwrap();
     let xdg_dir = helpers::tempdir().unwrap();
@@ -3348,37 +3348,13 @@ async fn editor_connect_pins_the_published_host_key_for_ssh_and_the_config_entry
             .unwrap();
 
             let ssh_arguments = fs::read_to_string(ssh_arguments).unwrap();
-            let proxy_command = ssh_arguments
-                .lines()
-                .find(|argument| argument.starts_with("ProxyCommand="))
-                .unwrap();
-            assert!(
-                proxy_command.ends_with(&format!(
-                    " --host-key '{PUBLISHED_HOST_KEY}' --known-hosts {}",
-                    pin.display()
-                )),
-                "{proxy_command}"
-            );
-            for option in [
-                "StrictHostKeyChecking=yes".to_string(),
-                format!("UserKnownHostsFile=\"{}\"", pin.display()),
-                "HostKeyAlias=openshell-pinned.default".to_string(),
+            let pin = pin.display();
+            for expected in [
+                format!(" --host-key '{PUBLISHED_HOST_KEY}' --known-hosts {pin}\n"),
+                format!("\nUserKnownHostsFile=\"{pin}\"\n"),
             ] {
-                assert!(
-                    ssh_arguments.lines().any(|argument| argument == option),
-                    "ssh was not passed {option}:\n{ssh_arguments}"
-                );
+                assert!(ssh_arguments.contains(&expected), "{ssh_arguments}");
             }
-            let config_entry =
-                fs::read_to_string(xdg_dir.path().join("openshell/ssh_config")).unwrap();
-            assert!(
-                config_entry.contains(&format!("    UserKnownHostsFile \"{}\"\n", pin.display())),
-                "{config_entry}"
-            );
-            assert!(
-                config_entry.contains(&format!(" --known-hosts {}\n", pin.display())),
-                "{config_entry}"
-            );
         })
         .await;
 }

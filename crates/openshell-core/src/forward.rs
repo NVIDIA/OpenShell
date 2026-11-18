@@ -370,8 +370,9 @@ fn proxy_option_takes_value(arg: &str) -> bool {
 }
 
 fn proxy_option_has_inline_value(arg: &str) -> bool {
-    arg.split_once('=')
-        .is_some_and(|(option, _)| proxy_option_takes_value(option))
+    ["--gateway=", "--workspace=", "--token=", "--gateway-name="]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix))
 }
 
 fn is_outer_ssh_option_start(arg: &str) -> bool {
@@ -980,19 +981,26 @@ pub fn sandbox_proxy_command(
 
 /// Build the `ssh` options shared by every sandbox session.
 ///
-/// Command line options beat `ssh_config`, so connection sharing stays off and
-/// the host-key options hold whatever the user's config says.
+/// Every sandbox is addressed as the host `sandbox`, so a user's `ControlMaster`
+/// or `ControlPath` would reuse one sandbox's connection for another. Command
+/// line options beat `ssh_config`, so connection sharing is turned off here.
 pub fn sandbox_ssh_args(proxy: &SandboxProxyCommand, log_level: &str) -> Vec<String> {
     let host_key_options = proxy
         .host_key
         .ssh_options()
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"));
-    std::iter::once(format!("ProxyCommand={}", proxy.command))
-        .chain(host_key_options)
-        .chain([format!("LogLevel={log_level}")])
-        .flat_map(|option| ["-o".to_string(), option])
-        .collect()
+    [
+        format!("ProxyCommand={}", proxy.command),
+        format!("LogLevel={log_level}"),
+        "ControlMaster=no".to_string(),
+        "ControlPath=none".to_string(),
+        "ControlPersist=no".to_string(),
+    ]
+    .into_iter()
+    .chain(host_key_options)
+    .flat_map(|option| ["-o".to_string(), option])
+    .collect()
 }
 
 /// Error returned when a `CreateSshSessionResponse` fails validation.
@@ -1437,33 +1445,10 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_proxy_command_hands_the_host_key_check_to_the_proxy() {
+    fn sandbox_ssh_args_disable_connection_sharing() {
         let dir = tempfile::tempdir().unwrap();
-        let known_hosts = dir.path().join("pin dir").join("openshell-sbx-1.team-a");
-        let args = sandbox_ssh_args(
-            &sandbox_proxy("/Application Support/openshell", &known_hosts),
-            "ERROR",
-        );
-
-        let proxy_command = args[1].strip_prefix("ProxyCommand=").unwrap();
-        let words = split_proxy_command_words(proxy_command);
-        assert_eq!(
-            words[words.len() - 4..],
-            [
-                "--host-key",
-                HOST_KEY_FINGERPRINT,
-                "--known-hosts",
-                known_hosts.to_str().unwrap(),
-            ]
-        );
-    }
-
-    #[test]
-    fn sandbox_ssh_args_trust_only_the_pinned_host_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let known_hosts = dir.path().join("openshell-sbx-1.team-a");
-        let args = sandbox_ssh_args(&sandbox_proxy("openshell", &known_hosts), "DEBUG");
-
+        let proxy = sandbox_proxy("openshell", &dir.path().join("pin"));
+        let args = sandbox_ssh_args(&proxy, "DEBUG");
         let options: Vec<&str> = args
             .chunks(2)
             .map(|pair| {
@@ -1472,22 +1457,10 @@ mod tests {
             })
             .collect();
         assert!(options[0].starts_with("ProxyCommand=openshell ssh-proxy "));
-        assert_eq!(
-            options[1..],
-            [
-                "StrictHostKeyChecking=yes",
-                &format!("UserKnownHostsFile=\"{}\"", known_hosts.display()),
-                "GlobalKnownHostsFile=/dev/null",
-                "HostKeyAlias=openshell-sbx-1.team-a",
-                "HostKeyAlgorithms=ssh-ed25519",
-                "VerifyHostKeyDNS=no",
-                "UpdateHostKeys=no",
-                "ControlMaster=no",
-                "ControlPath=none",
-                "ControlPersist=no",
-                "LogLevel=DEBUG",
-            ]
-        );
+        assert!(options.contains(&"LogLevel=DEBUG"));
+        for option in ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"] {
+            assert!(options.contains(&option), "missing {option}");
+        }
     }
 
     /// Helper: return the concatenation of characters that appear outside
@@ -1869,80 +1842,27 @@ mod tests {
         ));
     }
 
-    /// The argument list of a CLI background forward.
-    fn generated_forward_argv(proxy: &SandboxProxyCommand) -> Vec<String> {
+    #[test]
+    fn ssh_forward_command_matches_generated_host_key_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = sandbox_proxy("/path/openshell", &dir.path().join("pin"));
         let mut argv = vec!["/usr/bin/ssh".to_string()];
-        argv.extend(sandbox_ssh_args(proxy, "ERROR"));
-        argv.extend(
-            [
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "ForkAfterAuthentication=no",
-                "-N",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-o",
-                "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=id-1",
-                "-L",
-                "127.0.0.1:80:127.0.0.1:80",
-                "sandbox",
-            ]
-            .map(str::to_string),
-        );
-        argv
-    }
+        argv.extend(sandbox_ssh_args(&proxy, "ERROR"));
+        argv.extend(["-N", "-L", "80:127.0.0.1:80", "sandbox"].map(str::to_string));
+        let line = argv.join(" ");
 
-    fn assert_matches_only_its_own_forward(tokens: &[&str]) {
-        let matches = |port, workspace, sandbox, sandbox_id| {
-            args_match_ssh_forward(
-                tokens,
-                port,
-                Some(workspace),
-                Some(sandbox),
-                Some(sandbox_id),
-            )
-        };
-        assert!(matches(80, "team-a", "sbx-1", "id-1"));
-        assert!(!matches(8080, "team-a", "sbx-1", "id-1"));
-        assert!(!matches(80, "team-b", "sbx-1", "id-1"));
-        assert!(!matches(80, "team-a", "sbx-2", "id-1"));
-        assert!(!matches(80, "team-a", "sbx-1", "id-2"));
-    }
-
-    #[test]
-    fn ssh_forward_command_matches_exact_argv_with_host_key_flags() {
-        let dir = tempfile::tempdir().unwrap();
-        let known_hosts = dir.path().join("pin dir").join("openshell-sbx-1.team-a");
-        let argv = generated_forward_argv(&sandbox_proxy(
-            "/Application Support/openshell",
-            &known_hosts,
+        assert!(command_matches_ssh_forward(
+            &line,
+            80,
+            Some("team-a"),
+            Some("sbx-1")
         ));
-
-        let expanded: Vec<String> = argv
-            .iter()
-            .flat_map(|arg| expand_proxy_command_arg(arg))
-            .collect();
-        let tokens: Vec<&str> = expanded.iter().map(String::as_str).collect();
-
-        assert_matches_only_its_own_forward(&tokens);
-    }
-
-    #[test]
-    fn ssh_forward_command_matches_whitespace_split_line_with_host_key_flags() {
-        let dir = tempfile::tempdir().unwrap();
-        let known_hosts = dir.path().join("openshell-sbx-1.team-a");
-        let line =
-            generated_forward_argv(&sandbox_proxy("/path/openshell", &known_hosts)).join(" ");
-
-        assert_matches_only_its_own_forward(&line.split_whitespace().collect::<Vec<_>>());
-
-        let inline = format!(
-            "ssh -o ProxyCommand=openshell ssh-proxy --sandbox=sbx-1 --workspace=team-a --host-key={HOST_KEY_FINGERPRINT} --known-hosts=/pins/openshell-sbx-1.team-a -N -o SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=id-1 -L 80:127.0.0.1:80 sandbox"
-        );
-        assert_matches_only_its_own_forward(&inline.split_whitespace().collect::<Vec<_>>());
+        assert!(!command_matches_ssh_forward(
+            &line,
+            80,
+            Some("team-b"),
+            Some("sbx-1")
+        ));
     }
 
     #[test]

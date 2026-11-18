@@ -131,7 +131,7 @@ pub struct TlsMaterials {
 
 /// Resolve the TLS cert directory for a known gateway name.
 fn tls_dir_for_gateway(name: &str) -> Option<PathBuf> {
-    let safe_name = openshell_core::paths::gateway_dir_name(name);
+    let safe_name = sanitize_name(name);
     let base = xdg_config_dir().ok()?.join("openshell").join("gateways");
     Some(base.join(safe_name).join("mtls"))
 }
@@ -158,9 +158,22 @@ fn default_tls_dir(server: &str) -> Option<PathBuf> {
     }
 
     let name = name.unwrap_or_else(|| "openshell".to_string());
-    let safe_name = openshell_core::paths::gateway_dir_name(&name);
+    let safe_name = sanitize_name(&name);
     let base = xdg_config_dir().ok()?.join("openshell").join("gateways");
     Some(base.join(safe_name).join("mtls"))
+}
+
+fn sanitize_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn xdg_config_dir() -> Result<PathBuf> {

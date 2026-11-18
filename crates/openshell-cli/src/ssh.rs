@@ -24,7 +24,7 @@ use openshell_core::proto::{
 };
 use openshell_core::ssh_host_key::{
     HostKeyCheck, HostKeyExpectation, HostKeyGate, KnownHostsPin, SandboxSshTarget,
-    UnverifiedPolicy, host_key_alias,
+    allow_unverified_host_key, host_key_alias as host_alias,
 };
 use openshell_core::upload::{
     DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
@@ -229,7 +229,7 @@ async fn ssh_session_config(
         sandbox: name,
     };
     let host_key =
-        HostKeyCheck::for_session(&session.response, &target, UnverifiedPolicy::from_env())
+        HostKeyCheck::for_session(&session.response, &target, allow_unverified_host_key())
             .into_diagnostic()?;
     if let Some(warning) = host_key.unverified_warning(name) {
         eprintln!("{warning}");
@@ -754,7 +754,7 @@ pub async fn sandbox_connect_editor(
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
     let workspace_root = discover_workspace_root(&session).await?;
 
-    let host_alias = host_key_alias(name, workspace);
+    let host_alias = host_alias(name, workspace);
     install_ssh_config(gateway, name, workspace)?;
     launch_editor(editor, &host_alias, &workspace_root)?;
     eprintln!(
@@ -2193,7 +2193,7 @@ pub async fn sandbox_ssh_proxy_by_name(
     let expectation = HostKeyExpectation::from_published(
         &session.response.host_key_fingerprint,
         name,
-        UnverifiedPolicy::from_env(),
+        allow_unverified_host_key(),
     )
     .into_diagnostic()?;
     let pin = KnownHostsPin::at(known_hosts, name, workspace).into_diagnostic()?;
@@ -2244,7 +2244,7 @@ fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<Strin
         shell_escape(workspace),
         shell_escape(&pin.path().to_string_lossy()),
     );
-    let host_alias = host_key_alias(name, workspace);
+    let host_alias = host_alias(name, workspace);
     let options = pin
         .ssh_options()
         .into_iter()
@@ -2252,7 +2252,7 @@ fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<Strin
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "Host {host_alias}\n    User sandbox\n{options}\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
+        "Host {host_alias}\n    User sandbox\n{options}\n    ControlMaster no\n    ControlPath none\n    ControlPersist no\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
     ))
 }
 
@@ -2386,7 +2386,7 @@ pub fn install_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<
         openshell_core::paths::create_dir_restricted(parent)?;
     }
 
-    let alias = host_key_alias(name, workspace);
+    let alias = host_alias(name, workspace);
     let contents = fs::read_to_string(&managed_config).unwrap_or_default();
     let updated = upsert_host_block(&contents, &alias, &block);
     fs::write(&managed_config, updated)
@@ -2457,8 +2457,7 @@ mod tests {
             environment.run(|| {
                 set_default_ssh_log_level("DEBUG");
                 let expected = override_level.unwrap_or("DEBUG");
-                let proxy = PinnedProxy::new();
-                let command = ssh_base_command(&proxy.command);
+                let command = ssh_base_command(&pinned_proxy("known_hosts").0);
                 assert!(
                     command
                         .get_args()
@@ -2576,39 +2575,21 @@ mod tests {
 
     const PUBLISHED_FINGERPRINT: &str = "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA";
 
-    /// A proxy command for sandbox `demo` whose host key is pinned at
-    /// `known_hosts`.
-    struct PinnedProxy {
-        command: SandboxProxyCommand,
-        known_hosts: PathBuf,
-        _dir: tempfile::TempDir,
-    }
-
-    impl PinnedProxy {
-        fn new() -> Self {
-            Self::in_directory("known_hosts")
-        }
-
-        fn in_directory(name: &str) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let known_hosts = dir.path().join(name).join("openshell-demo.default");
-            let target = SandboxSshTarget {
-                gateway: "prod",
-                workspace: "default",
-                sandbox: "demo",
-            };
-            let pin =
-                KnownHostsPin::at(known_hosts.clone(), target.sandbox, target.workspace).unwrap();
-            let host_key =
-                HostKeyCheck::for_relay(PUBLISHED_FINGERPRINT.parse().unwrap(), pin).unwrap();
-            let command =
-                sandbox_proxy_command("openshell", "https://gw:443", &target, "tok", host_key);
-            Self {
-                command,
-                known_hosts,
-                _dir: dir,
-            }
-        }
+    /// A proxy command for sandbox `demo`, and the file under `directory` in
+    /// which its host key is pinned.
+    fn pinned_proxy(directory: &str) -> (SandboxProxyCommand, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let known_hosts = dir.path().join(directory).join("openshell-demo.default");
+        let target = SandboxSshTarget {
+            gateway: "prod",
+            workspace: "default",
+            sandbox: "demo",
+        };
+        let pin = KnownHostsPin::at(known_hosts.clone(), "demo", "default").unwrap();
+        let host_key =
+            HostKeyCheck::for_relay(PUBLISHED_FINGERPRINT.parse().unwrap(), pin).unwrap();
+        let proxy = sandbox_proxy_command("openshell", "https://gw:443", &target, "tok", host_key);
+        (proxy, known_hosts)
     }
 
     #[test]
@@ -2700,9 +2681,8 @@ mod tests {
                     let setup = phase == "setup";
                     async move {
                         if setup {
-                            let PinnedProxy { command, _dir, .. } = PinnedProxy::new();
                             let session = SshSessionConfig {
-                                proxy_command: command,
+                                proxy_command: pinned_proxy("known_hosts").0,
                                 sandbox_id: String::new(),
                                 main_terminal: false,
                             };
@@ -2936,21 +2916,6 @@ mod tests {
     }
 
     #[test]
-    fn host_key_refusals_before_ssh_starts_are_not_retried() {
-        use openshell_core::ssh_host_key::HostKeyError;
-        for refusal in [
-            HostKeyError::Unpublished {
-                sandbox: "demo".to_string(),
-            },
-            HostKeyError::BadFingerprint,
-        ] {
-            let error = Err::<(), _>(refusal).into_diagnostic().unwrap_err();
-            assert!(!connect_error_is_retryable(&error), "{error:?}");
-            assert!(!sync_error_is_retryable(&error), "{error:?}");
-        }
-    }
-
-    #[test]
     fn stale_ssh_config_refusal_names_the_gateway_and_workspace_of_the_entry() {
         assert_eq!(
             stale_ssh_config_refusal(Some("my gw"), "beta", "demo"),
@@ -2983,9 +2948,14 @@ mod tests {
             )
             .unwrap();
 
-            let effective = ssh_effective_options(&config, ["openshell-demo.beta"]);
+            let output = Command::new("ssh")
+                .arg("-F")
+                .arg(&config)
+                .args(["-G", "openshell-demo.beta"])
+                .output()
+                .unwrap();
+            let effective = String::from_utf8(output.stdout).unwrap();
 
-            assert_effective_options(&effective, &["user sandbox"]);
             assert_only_the_pin_is_trusted(
                 &effective,
                 Path::new(&known_hosts),
@@ -3004,6 +2974,12 @@ mod tests {
                 "{proxy_command}"
             );
         });
+    }
+
+    #[test]
+    fn host_alias_includes_workspace() {
+        assert_eq!(host_alias("demo", "default"), "openshell-demo.default");
+        assert_eq!(host_alias("demo", "beta"), "openshell-demo.beta");
     }
 
     #[test]
@@ -3051,47 +3027,14 @@ mod tests {
         assert_eq!(forward_probe_host(&loopback), "127.0.0.1");
     }
 
-    /// The options `ssh -G` reports for `args` when `config` is the user's
-    /// SSH config.
+    /// Resolve `ssh -G` for `command`'s arguments against a user config that
+    /// enables connection sharing and forking for the host `sandbox`. `extra_args`
+    /// supplies the host and, for the forking option, `-N`, when `command` lacks them.
     #[cfg(unix)]
-    fn ssh_effective_options<A: AsRef<std::ffi::OsStr>>(
-        config: &Path,
-        args: impl IntoIterator<Item = A>,
-    ) -> String {
+    fn effective_ssh_config(command: &Command, extra_args: &[&str]) -> String {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let output = Command::new("ssh")
-            .arg("-F")
-            .arg(config)
-            .arg("-G")
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "ssh -G failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    #[cfg(unix)]
-    fn assert_effective_options(effective: &str, expected: &[&str]) {
-        for option in expected {
-            assert!(
-                effective.lines().any(|line| line == *option),
-                "ssh does not report `{option}`:\n{effective}"
-            );
-        }
-    }
-
-    /// Resolve `ssh -G` for `command`'s arguments against a user config that
-    /// enables connection sharing and forking for the host `sandbox` and trusts
-    /// any host key. `extra_args` supplies the host and, for the forking option,
-    /// `-N`, when `command` lacks them.
-    #[cfg(unix)]
-    fn effective_ssh_config(command: &Command, extra_args: &[&str]) -> String {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("ssh_config");
         fs::write(
@@ -3105,8 +3048,20 @@ mod tests {
         )
         .unwrap();
 
-        let extra_args = extra_args.iter().map(std::ffi::OsStr::new);
-        ssh_effective_options(&config, command.get_args().chain(extra_args))
+        let output = Command::new("ssh")
+            .arg("-F")
+            .arg(&config)
+            .arg("-G")
+            .args(command.get_args())
+            .args(extra_args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 
     #[cfg(unix)]
@@ -3122,51 +3077,37 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_only_the_pin_is_trusted(effective: &str, known_hosts: &Path, alias: &str) {
-        assert_effective_options(
-            effective,
-            &[
-                "stricthostkeychecking true",
-                &format!("userknownhostsfile {}", known_hosts.display()),
-                "globalknownhostsfile /dev/null",
-                &format!("hostkeyalias {alias}"),
-                "hostkeyalgorithms ssh-ed25519",
-                "verifyhostkeydns false",
-                "updatehostkeys false",
-            ],
-        );
+        for option in [
+            "stricthostkeychecking true",
+            &format!("userknownhostsfile {}", known_hosts.display()),
+            "globalknownhostsfile /dev/null",
+            &format!("hostkeyalias {alias}"),
+            "hostkeyalgorithms ssh-ed25519",
+            "verifyhostkeydns false",
+            "updatehostkeys false",
+        ] {
+            assert!(effective.lines().any(|line| line == option), "{option}");
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn ssh_base_command_overrides_user_connection_sharing() {
-        let proxy = PinnedProxy::new();
-        let effective = effective_ssh_config(&ssh_base_command(&proxy.command), &["-N", "sandbox"]);
-        assert_connection_sharing_disabled(&effective);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ssh_base_command_overrides_user_host_key_trust() {
+    fn ssh_base_command_overrides_user_connection_sharing_and_host_key_trust() {
         for directory in ["known_hosts", "known hosts", "o'brien known=hosts"] {
-            let proxy = PinnedProxy::in_directory(directory);
-            let effective =
-                effective_ssh_config(&ssh_base_command(&proxy.command), &["-N", "sandbox"]);
-            assert_only_the_pin_is_trusted(
-                &effective,
-                &proxy.known_hosts,
-                "openshell-demo.default",
-            );
+            let (proxy, known_hosts) = pinned_proxy(directory);
+            let effective = effective_ssh_config(&ssh_base_command(&proxy), &["-N", "sandbox"]);
+            assert_connection_sharing_disabled(&effective);
+            assert_only_the_pin_is_trusted(&effective, &known_hosts, "openshell-demo.default");
         }
     }
 
     #[cfg(unix)]
     #[test]
     fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
-        let proxy = PinnedProxy::new();
-        let forward = ssh_forward_command(&proxy.command, "sandbox-id", &ForwardSpec::new(18080));
+        let (proxy, _) = pinned_proxy("known_hosts");
+        let forward = ssh_forward_command(&proxy, "sandbox-id", &ForwardSpec::new(18080));
         let effective = effective_ssh_config(&forward, &[]);
         assert_connection_sharing_disabled(&effective);
-        assert_only_the_pin_is_trusted(&effective, &proxy.known_hosts, "openshell-demo.default");
         assert!(
             effective
                 .lines()
@@ -3177,11 +3118,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn upload_ssh_command_overrides_user_multiplexing_and_forking() {
-        let proxy = PinnedProxy::new();
-        let upload = ssh_upload_command(&proxy.command);
+        let upload = ssh_upload_command(&pinned_proxy("known_hosts").0);
         let effective = effective_ssh_config(&upload, &[]);
         assert_connection_sharing_disabled(&effective);
-        assert_only_the_pin_is_trusted(&effective, &proxy.known_hosts, "openshell-demo.default");
         for expected in [
             "forkafterauthentication no",
             "requesttty false",

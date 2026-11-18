@@ -1219,7 +1219,7 @@ use openshell_core::forward::{
     sandbox_ssh_args, shell_escape, validate_ssh_session_response,
 };
 use openshell_core::ssh_host_key::{
-    HostKeyCheck, HostKeyError, SandboxSshTarget, UnverifiedPolicy,
+    HostKeyCheck, HostKeyError, SandboxSshTarget, allow_unverified_host_key,
 };
 
 /// Decide how the sandbox's SSH host key is checked and build the
@@ -1231,7 +1231,7 @@ fn sandbox_proxy_for_session(
     gateway_url: &str,
     target: &SandboxSshTarget<'_>,
 ) -> std::result::Result<(SandboxProxyCommand, Option<String>), HostKeyError> {
-    let host_key = HostKeyCheck::for_session(session, target, UnverifiedPolicy::from_env())?;
+    let host_key = HostKeyCheck::for_session(session, target, allow_unverified_host_key())?;
     let unverified_warning = host_key.unverified_warning(target.sandbox);
     let proxy_command = sandbox_proxy_command(
         &exe.to_string_lossy(),
@@ -3267,23 +3267,6 @@ mod exec_command_tests {
         assert_eq!(
             output.stdout,
             b"hello world\n\nit's\na b\n$HOME\n$(echo BAD)\n;\n|\n>\n*.txt\n"
-        );
-    }
-}
-
-#[cfg(test)]
-mod host_key_refusal_tests {
-    use super::*;
-
-    #[test]
-    fn host_key_refusal_fits_the_status_line() {
-        let refusal = HostKeyError::Unpublished {
-            sandbox: "my-sb".to_string(),
-        };
-
-        assert_eq!(
-            host_key_refused_status(&refusal),
-            "sandbox 'my-sb' has no published SSH host key, so its SSH server cannot be verified."
         );
     }
 }

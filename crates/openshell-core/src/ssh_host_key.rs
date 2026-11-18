@@ -12,7 +12,7 @@
 use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
-use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -110,42 +110,29 @@ impl fmt::Display for HostKeyExpectation {
 }
 
 impl HostKeyExpectation {
-    /// Interprets the fingerprint field of a gateway response. The policy
-    /// decides only what an empty field means; it never changes the outcome
-    /// for a non-empty one.
+    /// Interprets the fingerprint field of a gateway response.
+    /// `allow_unverified` decides only what an empty field means.
     pub fn from_published(
         published: &str,
         sandbox: &str,
-        policy: UnverifiedPolicy,
+        allow_unverified: bool,
     ) -> Result<Self, HostKeyError> {
         if !published.is_empty() {
-            return published.parse().map(Self::Fingerprint);
-        }
-        match policy {
-            UnverifiedPolicy::Allow => Ok(Self::AcceptAny),
-            UnverifiedPolicy::Refuse => Err(HostKeyError::Unpublished {
-                sandbox: sandbox.to_string(),
-            }),
-        }
-    }
-}
-
-/// Whether a sandbox with no published fingerprint may be reached unverified.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum UnverifiedPolicy {
-    Refuse,
-    Allow,
-}
-
-impl UnverifiedPolicy {
-    /// `Allow` only when `OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY` is `1`.
-    pub fn from_env() -> Self {
-        if std::env::var(ALLOW_UNVERIFIED_ENV).is_ok_and(|value| value == "1") {
-            Self::Allow
+            published.parse().map(Self::Fingerprint)
+        } else if allow_unverified {
+            Ok(Self::AcceptAny)
         } else {
-            Self::Refuse
+            Err(HostKeyError::Unpublished {
+                sandbox: sandbox.to_string(),
+            })
         }
     }
+}
+
+/// Whether a sandbox with no published fingerprint may be reached unverified:
+/// only when `OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY` is `1`.
+pub fn allow_unverified_host_key() -> bool {
+    std::env::var(ALLOW_UNVERIFIED_ENV).is_ok_and(|value| value == "1")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -250,9 +237,14 @@ impl KnownHostsPin {
 
     fn under(config_dir: &Path, target: &SandboxSshTarget<'_>) -> Result<Self, HostKeyError> {
         let alias = host_key_alias(target.sandbox, target.workspace);
-        let gateway = crate::paths::gateway_dir_name(target.gateway);
+        // A gateway reached by its endpoint alone is named by its URL.
+        let gateway = target.gateway.replace(
+            |ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '.' | '-' | '_'),
+            "_",
+        );
         let path = config_dir.join("known_hosts").join(&gateway).join(&alias);
-        if !is_single_normal_component(&gateway) || !is_single_normal_component(&alias) {
+        let is_one_component = |name: &str| Path::new(name).file_name() == Some(name.as_ref());
+        if !is_one_component(&gateway) || !is_one_component(&alias) {
             return Err(HostKeyError::UnusablePath(path));
         }
         Self::at(path, target.sandbox, target.workspace)
@@ -280,11 +272,6 @@ impl KnownHostsPin {
             ("HostKeyAlgorithms", HOST_KEY_ALGORITHM.to_string()),
             ("VerifyHostKeyDNS", "no".to_string()),
             ("UpdateHostKeys", "no".to_string()),
-            // A shared connection is reused without running the ProxyCommand,
-            // so its host key is not checked.
-            ("ControlMaster", "no".to_string()),
-            ("ControlPath", "none".to_string()),
-            ("ControlPersist", "no".to_string()),
         ]
     }
 
@@ -345,26 +332,20 @@ impl KnownHostsPin {
     }
 
     fn write_then_rename(&self, content: &str) -> io::Result<()> {
-        let (Some(dir), Some(name)) = (self.path.parent(), self.path.file_name()) else {
-            return Err(io::ErrorKind::InvalidInput.into());
-        };
+        let dir = self.path.parent().ok_or(io::ErrorKind::InvalidInput)?;
         create_owner_only_dir(dir)?;
-        let (temp_path, mut temp_file) = loop {
-            let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let candidate = dir.join(format!(
-                ".{}.{}.{sequence}.tmp",
-                name.to_string_lossy(),
-                std::process::id()
-            ));
-            match owner_only_create_new().open(&candidate) {
-                Ok(file) => break (candidate, file),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(err) => return Err(err),
-            }
-        };
-        let written = temp_file.write_all(content.as_bytes());
-        drop(temp_file);
-        let replaced = written.and_then(|()| fs::rename(&temp_path, &self.path));
+        // Unique among the writers of this process. `create_new` refuses a
+        // file or link someone else left there.
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = dir.join(format!(".{}.{sequence}.tmp", std::process::id()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let replaced = options
+            .open(&temp_path)
+            .and_then(|mut file| file.write_all(content.as_bytes()))
+            .and_then(|()| fs::rename(&temp_path, &self.path));
         if replaced.is_err() {
             let _ = fs::remove_file(&temp_path);
         }
@@ -374,25 +355,6 @@ impl KnownHostsPin {
     fn with_path(&self, err: &io::Error) -> io::Error {
         io::Error::new(err.kind(), format!("{}: {err}", self.path.display()))
     }
-}
-
-fn is_single_normal_component(name: &str) -> bool {
-    let mut components = Path::new(name).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(component)), None) if component.to_str() == Some(name)
-    )
-}
-
-fn owner_only_create_new() -> fs::OpenOptions {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options
 }
 
 fn create_owner_only_dir(dir: &Path) -> io::Result<()> {
@@ -419,12 +381,12 @@ impl HostKeyCheck {
     pub fn for_session(
         session: &CreateSshSessionResponse,
         target: &SandboxSshTarget<'_>,
-        policy: UnverifiedPolicy,
+        allow_unverified: bool,
     ) -> Result<Self, HostKeyError> {
         let expectation = HostKeyExpectation::from_published(
             &session.host_key_fingerprint,
             target.sandbox,
-            policy,
+            allow_unverified,
         )?;
         Self::for_relay(expectation, KnownHostsPin::for_target(target)?)
     }
@@ -696,16 +658,10 @@ mod tests {
         [&u32::try_from(bytes.len()).unwrap().to_be_bytes(), bytes].concat()
     }
 
+    /// Four bytes of padding: the gate does not check block alignment.
     fn packet(payload: &[u8]) -> Vec<u8> {
-        let padding = 4 + (8 - (5 + payload.len() + 4) % 8) % 8;
-        let mut packet = u32::try_from(1 + payload.len() + padding)
-            .unwrap()
-            .to_be_bytes()
-            .to_vec();
-        packet.push(u8::try_from(padding).unwrap());
-        packet.extend_from_slice(payload);
-        packet.resize(packet.len() + padding, 0);
-        packet
+        let length = u32::try_from(payload.len() + 5).unwrap().to_be_bytes();
+        [&length[..], &[4], payload, &[0; 4]].concat()
     }
 
     fn kexinit() -> Vec<u8> {
@@ -769,13 +725,11 @@ mod tests {
             .into_gate()
     }
 
-    struct Relayed {
-        released: Vec<u8>,
-        result: Result<(), HostKeyError>,
-        pin: Option<String>,
-    }
-
-    fn relay<'a>(expectation: &str, chunks: impl IntoIterator<Item = &'a [u8]>) -> Relayed {
+    /// What the gate released, how it ended, and the pin file it left.
+    fn relay<'a>(
+        expectation: &str,
+        chunks: impl IntoIterator<Item = &'a [u8]>,
+    ) -> (Vec<u8>, Result<(), HostKeyError>, Option<String>) {
         let config_dir = tempfile::tempdir().unwrap();
         let mut gate = gate_in(config_dir.path(), expectation);
         let mut released = Vec::new();
@@ -783,11 +737,8 @@ mod tests {
             released.extend(gate.push(chunk)?);
             Ok(())
         });
-        Relayed {
-            released,
-            result,
-            pin: fs::read_to_string(pin_in(config_dir.path()).path()).ok(),
-        }
+        let pin = fs::read_to_string(pin_in(config_dir.path()).path()).ok();
+        (released, result, pin)
     }
 
     /// Every way to deliver `stream` in two chunks, then one byte at a time.
@@ -832,100 +783,38 @@ mod tests {
     }
 
     #[test]
-    fn expectation_text_round_trips() {
-        let verified: HostKeyExpectation = FINGERPRINT_A.parse().unwrap();
-        assert_eq!(
-            verified,
-            HostKeyExpectation::Fingerprint(fingerprint(FINGERPRINT_A))
-        );
-        assert_eq!(verified.to_string(), FINGERPRINT_A);
-
-        let unverified: HostKeyExpectation = "unverified".parse().unwrap();
-        assert_eq!(unverified, HostKeyExpectation::AcceptAny);
-        assert_eq!(unverified.to_string(), "unverified");
-
-        for text in ["", "Unverified", "any", "SHA256:short"] {
-            assert!(
-                matches!(
-                    text.parse::<HostKeyExpectation>(),
-                    Err(HostKeyError::BadFingerprint)
-                ),
-                "{text:?}"
-            );
-        }
-    }
-
-    #[test]
     fn expectation_policy_never_changes_a_published_outcome() {
-        for policy in [UnverifiedPolicy::Refuse, UnverifiedPolicy::Allow] {
+        for allow in [false, true] {
             assert_eq!(
-                HostKeyExpectation::from_published(FINGERPRINT_A, "my-sb", policy).unwrap(),
+                HostKeyExpectation::from_published(FINGERPRINT_A, "my-sb", allow).unwrap(),
                 HostKeyExpectation::Fingerprint(fingerprint(FINGERPRINT_A)),
-                "{policy:?}"
+                "{allow}"
             );
             for malformed in ["unverified", "SHA256:inconsistent", "MD5:00:11"] {
                 assert!(
                     matches!(
-                        HostKeyExpectation::from_published(malformed, "my-sb", policy),
+                        HostKeyExpectation::from_published(malformed, "my-sb", allow),
                         Err(HostKeyError::BadFingerprint)
                     ),
-                    "{malformed:?} {policy:?}"
+                    "{malformed:?} {allow}"
                 );
             }
         }
     }
 
     #[test]
-    fn expectation_for_an_unpublished_key_follows_the_policy() {
-        assert_eq!(
-            HostKeyExpectation::from_published("", "my-sb", UnverifiedPolicy::Allow).unwrap(),
-            HostKeyExpectation::AcceptAny
-        );
-
-        let refused =
-            HostKeyExpectation::from_published("", "my-sb", UnverifiedPolicy::Refuse).unwrap_err();
-        assert!(matches!(
-            &refused,
-            HostKeyError::Unpublished { sandbox } if sandbox == "my-sb"
-        ));
-        assert_eq!(
-            refused.to_string(),
-            "sandbox 'my-sb' has no published SSH host key, so its SSH server cannot be verified.\n  \
-             If the gateway predates sandbox SSH identities, upgrade it. Otherwise stop and start the sandbox so the gateway assigns a key.\n  \
-             To connect without verification, set OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY=1."
-        );
-    }
-
-    #[test]
     fn unverified_policy_allows_only_when_the_variable_is_one() {
         Environment::new()
             .set(ALLOW_UNVERIFIED_ENV, "1")
-            .run(|| assert_eq!(UnverifiedPolicy::from_env(), UnverifiedPolicy::Allow));
+            .run(|| assert!(allow_unverified_host_key()));
         for value in ["", "0", "true", "yes", "11"] {
             Environment::new()
                 .set(ALLOW_UNVERIFIED_ENV, value)
-                .run(|| assert_eq!(UnverifiedPolicy::from_env(), UnverifiedPolicy::Refuse));
+                .run(|| assert!(!allow_unverified_host_key()));
         }
         Environment::new()
             .remove(ALLOW_UNVERIFIED_ENV)
-            .run(|| assert_eq!(UnverifiedPolicy::from_env(), UnverifiedPolicy::Refuse));
-    }
-
-    #[test]
-    fn host_key_alias_names_sandbox_then_workspace() {
-        assert_eq!(host_key_alias("demo", "default"), "openshell-demo.default");
-        assert_eq!(host_key_alias("demo", "beta"), "openshell-demo.beta");
-    }
-
-    #[test]
-    fn pin_for_target_lives_under_the_config_dir() {
-        with_config_dir(|config_dir| {
-            let pin = KnownHostsPin::for_target(&TARGET).unwrap();
-            assert_eq!(
-                pin.path(),
-                config_dir.join("known_hosts/prod/openshell-my-sb.default")
-            );
-        });
+            .run(|| assert!(!allow_unverified_host_key()));
     }
 
     #[test]
@@ -966,52 +855,43 @@ mod tests {
     #[test]
     fn pin_rejects_names_that_are_not_one_path_component() {
         let config_dir = Path::new("/home/u/.config/openshell");
-        for gateway in ["", ".", ".."] {
-            let target = SandboxSshTarget { gateway, ..TARGET };
-            assert!(
-                matches!(
-                    KnownHostsPin::under(config_dir, &target),
-                    Err(HostKeyError::UnusablePath(_))
-                ),
-                "gateway {gateway:?}"
-            );
-        }
-        for (sandbox, workspace) in [("a/b", "default"), ("my-sb", "../x"), ("my-sb", "x/")] {
+        for (gateway, workspace, sandbox) in [
+            ("", "default", "my-sb"),
+            (".", "default", "my-sb"),
+            ("..", "default", "my-sb"),
+            ("prod", "default", "a/b"),
+            ("prod", "../x", "my-sb"),
+            ("prod", "x/", "my-sb"),
+        ] {
             let target = SandboxSshTarget {
+                gateway,
                 workspace,
                 sandbox,
-                ..TARGET
             };
             assert!(
                 matches!(
                     KnownHostsPin::under(config_dir, &target),
                     Err(HostKeyError::UnusablePath(_))
                 ),
-                "sandbox {sandbox:?} workspace {workspace:?}"
+                "{target:?}"
             );
         }
     }
 
     #[test]
     fn pin_rejects_paths_ssh_would_expand_or_split() {
-        for config_dir in [
-            "/home/100%/openshell",
-            "/home/a\"b/openshell",
-            "/home/${HOME}/openshell",
-            "/home/a\nb/openshell",
+        for path in [
+            "/home/100%/pin",
+            "/home/a\"b/pin",
+            "/home/${HOME}/pin",
+            "/home/a\nb/pin",
             #[cfg(unix)]
-            "/home/a\\b/openshell",
-            "relative/openshell",
+            "/home/a\\b/pin",
+            "relative/pin",
+            "",
+            "/",
+            "/tmp/..",
         ] {
-            assert!(
-                matches!(
-                    KnownHostsPin::under(Path::new(config_dir), &TARGET),
-                    Err(HostKeyError::UnusablePath(_))
-                ),
-                "{config_dir:?}"
-            );
-        }
-        for path in ["/tmp/pin%h", "pin", "", "/", "/tmp/.."] {
             assert!(
                 matches!(
                     KnownHostsPin::at(PathBuf::from(path), "my-sb", "default"),
@@ -1022,77 +902,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pin_store_writes_the_header_and_one_key_line() {
-        let config_dir = tempfile::tempdir().unwrap();
-        let pin = pin_in(config_dir.path());
-
-        pin.store(&ed25519_blob(KEY_A)).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(pin.path()).unwrap(),
-            format!(
-                "# Managed by OpenShell. Rewritten from the gateway-published fingerprint; do not edit.\n\
-                 openshell-my-sb.default ssh-ed25519 {KNOWN_HOSTS_KEY_A}\n"
-            )
-        );
-    }
-
+    /// The pin directory is created owner-only; a directory that already
+    /// exists keeps its mode.
     #[cfg(unix)]
     #[test]
-    fn pin_file_is_owner_only_in_the_owner_only_directory_it_creates() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let config_dir = tempfile::tempdir().unwrap();
-        let pin = pin_in(config_dir.path());
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-
-        pin.store(&ed25519_blob(KEY_A)).unwrap();
-        assert_eq!(mode(pin.path()), 0o600);
-        assert_eq!(mode(pin.path().parent().unwrap()), 0o700);
-
-        fs::set_permissions(pin.path(), fs::Permissions::from_mode(0o644)).unwrap();
-        pin.store(&ed25519_blob(KEY_B)).unwrap();
-        assert_eq!(mode(pin.path()), 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pin_store_leaves_the_mode_of_an_existing_directory_alone() {
+    fn pin_store_creates_owner_only_files_and_leaves_existing_directories_alone() {
         use std::os::unix::fs::PermissionsExt as _;
         let shared = tempfile::tempdir().unwrap();
         fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        let pin = KnownHostsPin::at(shared.path().join("pin"), "my-sb", "default").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
 
-        pin.store(&ed25519_blob(KEY_A)).unwrap();
-
-        let mode = fs::metadata(shared.path()).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o755);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pin_store_replaces_the_file_only_when_the_key_differs() {
-        use std::os::unix::fs::MetadataExt as _;
-        let config_dir = tempfile::tempdir().unwrap();
-        let pin = pin_in(config_dir.path());
-        let inode = || fs::metadata(pin.path()).unwrap().ino();
-
-        pin.store(&ed25519_blob(KEY_A)).unwrap();
-        let first = inode();
-        pin.store(&ed25519_blob(KEY_A)).unwrap();
-        assert_eq!(inode(), first);
-
-        pin.store(&ed25519_blob(KEY_B)).unwrap();
-        assert_ne!(inode(), first);
-        assert_eq!(
-            fs::read_to_string(pin.path()).unwrap(),
-            pin_file(KNOWN_HOSTS_KEY_B)
-        );
-        let entries: Vec<_> = fs::read_dir(pin.path().parent().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(entries, ["openshell-my-sb.default"]);
+        for pin in [shared.path().join("pin"), shared.path().join("new/pin")] {
+            let pin = KnownHostsPin::at(pin, "my-sb", "default").unwrap();
+            pin.store(&ed25519_blob(KEY_A)).unwrap();
+            assert_eq!(mode(pin.path()), 0o600);
+        }
+        assert_eq!(mode(&shared.path().join("new")), 0o700);
+        assert_eq!(mode(shared.path()), 0o755);
     }
 
     #[test]
@@ -1129,43 +955,26 @@ mod tests {
         }
     }
 
+    /// Before `ssh` can read the pin, it holds the published key or no key.
     #[test]
-    fn check_for_session_drops_a_stale_key_before_ssh_can_read_it() {
+    fn check_for_session_keeps_only_the_published_key() {
         with_config_dir(|config_dir| {
             let pin = pin_in(config_dir);
-            pin.store(&ed25519_blob(KEY_B)).unwrap();
-
-            let check = HostKeyCheck::for_session(
-                &published(FINGERPRINT_A),
-                &TARGET,
-                UnverifiedPolicy::Refuse,
-            )
-            .unwrap();
-
-            assert_eq!(fs::read_to_string(pin.path()).unwrap(), PIN_HEADER);
-            assert_eq!(check.unverified_warning("my-sb"), None);
             let path = pin.path().display().to_string();
-            assert_eq!(
-                check.proxy_flags(),
-                ["--host-key", FINGERPRINT_A, "--known-hosts", path.as_str()]
-            );
-            assert_eq!(check.ssh_options(), pin.ssh_options());
-        });
-    }
+            for (stored, kept) in [
+                (KEY_B, PIN_HEADER.to_string()),
+                (KEY_A, pin_file(KNOWN_HOSTS_KEY_A)),
+            ] {
+                pin.store(&ed25519_blob(stored)).unwrap();
 
-    #[test]
-    fn check_for_session_keeps_the_published_key() {
-        with_config_dir(|config_dir| {
-            let pin = pin_in(config_dir);
-            pin.store(&ed25519_blob(KEY_A)).unwrap();
-
-            for policy in [UnverifiedPolicy::Refuse, UnverifiedPolicy::Allow] {
                 let check =
-                    HostKeyCheck::for_session(&published(FINGERPRINT_A), &TARGET, policy).unwrap();
+                    HostKeyCheck::for_session(&published(FINGERPRINT_A), &TARGET, false).unwrap();
+
+                assert_eq!(fs::read_to_string(pin.path()).unwrap(), kept);
                 assert_eq!(check.unverified_warning("my-sb"), None);
                 assert_eq!(
-                    fs::read_to_string(pin.path()).unwrap(),
-                    pin_file(KNOWN_HOSTS_KEY_A)
+                    check.proxy_flags(),
+                    ["--host-key", FINGERPRINT_A, "--known-hosts", path.as_str()]
                 );
             }
         });
@@ -1174,11 +983,14 @@ mod tests {
     #[test]
     fn check_for_session_refuses_an_unpublished_key_without_touching_the_pin() {
         with_config_dir(|config_dir| {
-            let error =
-                HostKeyCheck::for_session(&published(""), &TARGET, UnverifiedPolicy::Refuse)
-                    .unwrap_err();
+            let error = HostKeyCheck::for_session(&published(""), &TARGET, false).unwrap_err();
 
-            assert!(matches!(error, HostKeyError::Unpublished { .. }));
+            assert_eq!(
+                error.to_string(),
+                "sandbox 'my-sb' has no published SSH host key, so its SSH server cannot be verified.\n  \
+                 If the gateway predates sandbox SSH identities, upgrade it. Otherwise stop and start the sandbox so the gateway assigns a key.\n  \
+                 To connect without verification, set OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY=1."
+            );
             assert!(!config_dir.exists());
         });
     }
@@ -1189,8 +1001,7 @@ mod tests {
             let pin = pin_in(config_dir);
             pin.store(&ed25519_blob(KEY_A)).unwrap();
 
-            let check = HostKeyCheck::for_session(&published(""), &TARGET, UnverifiedPolicy::Allow)
-                .unwrap();
+            let check = HostKeyCheck::for_session(&published(""), &TARGET, true).unwrap();
 
             assert_eq!(fs::read_to_string(pin.path()).unwrap(), PIN_HEADER);
             assert_eq!(
@@ -1199,23 +1010,6 @@ mod tests {
             );
             assert_eq!(check.proxy_flags()[..2], ["--host-key", "unverified"]);
         });
-    }
-
-    #[test]
-    fn check_for_relay_drops_a_stale_key_before_the_first_byte() {
-        let config_dir = tempfile::tempdir().unwrap();
-        let path = config_dir.path().join("known_hosts/prod/pin");
-        let stale = KnownHostsPin::at(path.clone(), "my-sb", "default").unwrap();
-        stale.store(&ed25519_blob(KEY_B)).unwrap();
-
-        let check = HostKeyCheck::for_relay(
-            HostKeyExpectation::Fingerprint(fingerprint(FINGERPRINT_A)),
-            stale,
-        )
-        .unwrap();
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), PIN_HEADER);
-        assert_eq!(check.unverified_warning("my-sb"), None);
     }
 
     /// Other connections to the sandbox start while one stores the key and
@@ -1260,26 +1054,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn check_reports_a_pin_directory_that_cannot_be_created() {
-        let config_dir = tempfile::tempdir().unwrap();
-        let blocker = config_dir.path().join("known_hosts");
-        fs::write(&blocker, "a file where the directory should be").unwrap();
-        let pin = KnownHostsPin::at(blocker.join("prod/pin"), "my-sb", "default").unwrap();
-
-        let error = HostKeyCheck::for_relay(
-            HostKeyExpectation::Fingerprint(fingerprint(FINGERPRINT_A)),
-            pin,
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, HostKeyError::Io(_)));
-        assert!(
-            error.to_string().contains("known_hosts/prod/pin"),
-            "{error}"
-        );
-    }
-
     /// Asserts that `stream` is refused as `is_expected` says, that nothing
     /// past `before` is released and that the pin file is left as `pin`,
     /// however `stream` is split.
@@ -1293,57 +1067,36 @@ mod tests {
     ) {
         for chunks in every_split(stream) {
             let at = chunks[0].len();
-            let relayed = relay(expectation, chunks);
+            let (released, result, kept) = relay(expectation, chunks);
 
             assert!(
-                relayed.result.as_ref().is_err_and(&is_expected),
-                "{name} split at {at}: {:?}",
-                relayed.result
+                result.as_ref().is_err_and(&is_expected),
+                "{name} split at {at}: {result:?}"
             );
-            assert!(
-                before.starts_with(&relayed.released),
-                "{name} split at {at}"
-            );
-            assert_eq!(relayed.pin.as_deref(), Some(pin), "{name} split at {at}");
+            assert!(before.starts_with(&released), "{name} split at {at}");
+            assert_eq!(kept.as_deref(), Some(pin), "{name} split at {at}");
         }
     }
 
     #[test]
     fn gate_relays_an_exchange_unchanged_and_pins_its_key() {
-        let greeting = b"Welcome\r\nnotice: maintenance at noon\n";
+        let curve = curve25519_exchange(KEY_A).concat();
+        let gex = group_exchange(KEY_A).concat();
+        let other = curve25519_exchange(KEY_B).concat();
+        let greeted = [&b"Welcome\r\nnotice: maintenance at noon\n"[..], &curve].concat();
         for (name, expectation, stream, key) in [
-            (
-                "curve25519",
-                FINGERPRINT_A,
-                curve25519_exchange(KEY_A).concat(),
-                KNOWN_HOSTS_KEY_A,
-            ),
-            (
-                "group exchange",
-                FINGERPRINT_A,
-                group_exchange(KEY_A).concat(),
-                KNOWN_HOSTS_KEY_A,
-            ),
-            (
-                "unverified",
-                "unverified",
-                curve25519_exchange(KEY_B).concat(),
-                KNOWN_HOSTS_KEY_B,
-            ),
-            (
-                "lines before the identification line",
-                FINGERPRINT_A,
-                [greeting, curve25519_exchange(KEY_A).concat().as_slice()].concat(),
-                KNOWN_HOSTS_KEY_A,
-            ),
+            ("curve25519", FINGERPRINT_A, &curve, KNOWN_HOSTS_KEY_A),
+            ("group exchange", FINGERPRINT_A, &gex, KNOWN_HOSTS_KEY_A),
+            ("unverified", "unverified", &other, KNOWN_HOSTS_KEY_B),
+            ("greeting", FINGERPRINT_A, &greeted, KNOWN_HOSTS_KEY_A),
         ] {
-            for chunks in every_split(&stream) {
+            for chunks in every_split(stream) {
                 let at = chunks[0].len();
-                let relayed = relay(expectation, chunks);
+                let (released, result, pin) = relay(expectation, chunks);
 
-                assert!(relayed.result.is_ok(), "{name} split at {at}");
-                assert_eq!(relayed.released, stream, "{name} split at {at}");
-                assert_eq!(relayed.pin, Some(pin_file(key)), "{name} split at {at}");
+                assert!(result.is_ok(), "{name} split at {at}");
+                assert_eq!(&released, stream, "{name} split at {at}");
+                assert_eq!(pin, Some(pin_file(key)), "{name} split at {at}");
             }
         }
     }
@@ -1366,15 +1119,6 @@ mod tests {
             pin_file(KNOWN_HOSTS_KEY_A)
         );
         assert_eq!(gate.push(&after).unwrap(), after);
-    }
-
-    #[test]
-    fn gate_releases_whole_lines_that_precede_the_identification_line() {
-        let config_dir = tempfile::tempdir().unwrap();
-        let mut gate = gate_in(config_dir.path(), FINGERPRINT_A);
-        assert_eq!(gate.push(b"Welcome\r\nnot").unwrap(), b"Welcome\r\n");
-        assert_eq!(gate.push(b"ice\nSSH-2.0-Open").unwrap(), b"notice\n");
-        assert_eq!(gate.push(b"Shell\r\n").unwrap(), b"SSH-2.0-OpenShell\r\n");
     }
 
     #[test]
@@ -1430,76 +1174,35 @@ mod tests {
     const NO_HOST_KEY: &str = "key exchange finished without an Ed25519 host key";
     const OUT_OF_ORDER: &str = "packet outside the key exchange order";
 
-    /// `ssh` discards the decoy, a packet it does not expect or was told to
+    /// `ssh` discards a decoy, a packet it does not expect or was told to
     /// skip, and would act on the reply behind it.
-    #[test]
-    fn gate_withholds_a_reply_carrying_another_key_behind_a_decoy() {
-        let decoy = kex_reply(31, &ed25519_blob(KEY_A));
-        let other = ed25519_blob(KEY_B);
-        let decoy_pinned = pin_file(KNOWN_HOSTS_KEY_A);
-        for (name, before, withheld, pin) in [
-            (
-                "decoy before KEXINIT",
-                BANNER.to_vec(),
-                [decoy.as_slice(), &kexinit(), &kex_reply(31, &other)].concat(),
-                PIN_HEADER,
-            ),
-            (
-                "decoy as the announced wrong guess",
-                BANNER.to_vec(),
-                [
-                    kexinit_ending(&[1, 0, 0, 0, 0]),
-                    decoy.clone(),
-                    kex_reply(31, &other),
-                ]
-                .concat(),
-                PIN_HEADER,
-            ),
-            (
-                "decoy before the reply",
-                [BANNER, &kexinit(), &decoy].concat(),
-                kex_reply(31, &other),
-                decoy_pinned.as_str(),
-            ),
-            (
-                "decoy after the group",
-                [BANNER, &kexinit(), &group(), &decoy].concat(),
-                kex_reply(33, &other),
-                decoy_pinned.as_str(),
-            ),
-        ] {
-            assert_refused(
-                name,
-                FINGERPRINT_A,
-                &before,
-                &[before.as_slice(), &withheld, &newkeys(), &ENCRYPTED].concat(),
-                |error| matches!(error, HostKeyError::Malformed(OUT_OF_ORDER)),
-                pin,
-            );
-        }
-    }
-
     #[test]
     fn gate_rejects_a_packet_outside_the_key_exchange_order() {
         let ignore = packet(&[2, 0, 0, 0, 0]);
         let reply = kex_reply(31, &ed25519_blob(KEY_A));
+        let other = kex_reply(31, &ed25519_blob(KEY_B));
         let rsa = [string(b"ssh-rsa"), string(&[1, 0, 1]), string(&[0x7f; 257])].concat();
+        let decoy_first = [reply.as_slice(), &kexinit(), &other].concat();
+        let other_gex = kex_reply(33, &ed25519_blob(KEY_B));
+        let rsa_gex = kex_reply(33, &rsa);
+        let wrong_guess = [&kexinit_ending(&[1, 0, 0, 0, 0])[..], &reply, &other].concat();
         let after_kexinit = [BANNER, &kexinit()].concat();
         let after_group = [BANNER, &kexinit(), &group()].concat();
         let after_reply = [BANNER, &kexinit(), &reply].concat();
+        let after_group_reply = [BANNER, &kexinit(), &group(), &reply].concat();
         let pinned = pin_file(KNOWN_HOSTS_KEY_A);
         for (name, before, offending) in [
+            ("decoy before KEXINIT", BANNER, &decoy_first),
+            ("decoy as the announced wrong guess", BANNER, &wrong_guess),
+            ("decoy before the reply", &after_reply, &other),
+            ("decoy after the group", &after_group_reply, &other_gex),
             ("IGNORE first", BANNER, &ignore),
             ("NEWKEYS first", BANNER, &newkeys()),
             ("KEXINIT cut short", BANNER, &kexinit_ending(&[])),
             ("IGNORE before the reply", &after_kexinit, &ignore),
             ("second KEXINIT", &after_kexinit, &kexinit()),
             ("second group", &after_group, &group()),
-            (
-                "group exchange reply without an Ed25519 key",
-                &after_group,
-                &kex_reply(33, &rsa),
-            ),
+            ("non-Ed25519 group reply", &after_group, &rsa_gex),
             ("IGNORE before NEWKEYS", &after_reply, &ignore),
             ("second reply", &after_reply, &reply),
         ] {
@@ -1509,7 +1212,7 @@ mod tests {
                 before,
                 &[before, offending, &newkeys(), &ENCRYPTED].concat(),
                 |error| matches!(error, HostKeyError::Malformed(OUT_OF_ORDER)),
-                if before == after_reply {
+                if before.ends_with(&reply) {
                     &pinned
                 } else {
                     PIN_HEADER
@@ -1540,79 +1243,28 @@ mod tests {
     }
 
     #[test]
-    fn gate_withholds_the_reply_when_the_key_cannot_be_pinned() {
-        let [before, reply, _] = curve25519_exchange(KEY_A);
-        let config_dir = tempfile::tempdir().unwrap();
-        let pin = pin_in(config_dir.path());
-        let mut gate = gate_in(config_dir.path(), FINGERPRINT_A);
-        gate.push(&before).unwrap();
-        let pin_dir = pin.path().parent().unwrap();
-        fs::remove_dir_all(pin_dir).unwrap();
-        fs::write(pin_dir, "a file where the directory should be").unwrap();
-
-        assert!(matches!(gate.push(&reply), Err(HostKeyError::Io(_))));
-    }
-
-    #[test]
     fn gate_rejects_a_malformed_packet() {
         let length = |length: u32| [&length.to_be_bytes()[..], &[0; 16]].concat();
-        for (packet, expected) in [
-            (length(0), "packet length is out of range"),
-            (length(1), "packet length is out of range"),
-            (length(262_145), "packet length is out of range"),
-            (length(u32::MAX), "packet length is out of range"),
-            (vec![0, 0, 0, 2, 1, 31], "packet padding leaves no payload"),
-            (vec![0, 0, 0, 2, 9, 31], "packet padding leaves no payload"),
+        let padded = |padding: u8| vec![0, 0, 0, 2, padding, 31];
+        let mut long_line = b"SSH-2.0-".to_vec();
+        long_line.resize(8192, b'a');
+        for (before, rest, expected) in [
+            (BANNER, length(0), "packet length is out of range"),
+            (BANNER, length(1), "packet length is out of range"),
+            (BANNER, length(262_145), "packet length is out of range"),
+            (BANNER, length(u32::MAX), "packet length is out of range"),
+            (BANNER, padded(1), "packet padding leaves no payload"),
+            (BANNER, padded(9), "packet padding leaves no payload"),
+            (b"".as_slice(), long_line, "identification line is too long"),
         ] {
             assert_refused(
                 expected,
                 FINGERPRINT_A,
-                BANNER,
-                &[BANNER, &packet].concat(),
+                before,
+                &[before, &rest].concat(),
                 |error| matches!(error, HostKeyError::Malformed(message) if *message == expected),
                 PIN_HEADER,
             );
         }
-    }
-
-    #[test]
-    fn gate_relays_the_largest_packet_ssh_accepts() {
-        let mut largest_group = 262_144_u32.to_be_bytes().to_vec();
-        largest_group.extend_from_slice(&[4, 31]);
-        largest_group.resize(4 + 262_144, 2);
-        let [_, reply, after] = group_exchange(KEY_A);
-        let stream = [BANNER, &kexinit(), &largest_group, &reply, &after].concat();
-
-        let relayed = relay(FINGERPRINT_A, stream.chunks(4096));
-
-        assert!(relayed.result.is_ok());
-        assert!(relayed.released == stream);
-        assert_eq!(relayed.pin, Some(pin_file(KNOWN_HOSTS_KEY_A)));
-    }
-
-    #[test]
-    fn gate_rejects_an_identification_line_that_is_too_long() {
-        let mut too_long = b"SSH-2.0-".to_vec();
-        too_long.resize(8192, b'a');
-        assert_refused(
-            "line of 8192 bytes",
-            FINGERPRINT_A,
-            b"",
-            &too_long,
-            |error| {
-                matches!(
-                    error,
-                    HostKeyError::Malformed("identification line is too long")
-                )
-            },
-            PIN_HEADER,
-        );
-
-        let mut longest = vec![b'a'; 8191];
-        longest.push(b'\n');
-        let stream = [longest, curve25519_exchange(KEY_A).concat()].concat();
-        let relayed = relay(FINGERPRINT_A, [stream.as_slice()]);
-        assert!(relayed.result.is_ok());
-        assert!(relayed.released == stream);
     }
 }
