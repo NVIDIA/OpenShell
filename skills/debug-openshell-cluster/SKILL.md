@@ -1702,7 +1702,7 @@ For a Debian, Ubuntu, or snap gateway that stops before certificate generation o
 daemon startup, validate the selected configuration without starting the service:
 
 ```shell
-openshell-gateway config preflight [[--path PATH] [--config-dir DIR] | -- GATEWAY_ARGS...]
+openshell-gateway config preflight [[--path PATH (alias --config)] [--config-dir DIR] | -- GATEWAY_ARGS...]
 ```
 
 Without a path, preflight validates a nonempty `OPENSHELL_GATEWAY_CONFIG` or an
