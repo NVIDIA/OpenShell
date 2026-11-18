@@ -295,6 +295,7 @@ impl RefreshStateStore for ServerRefreshStore {
         Ok(stored
             .filter(|stored| {
                 stored.object_workspace() == workspace
+                    && stored.create_pending_since.is_none()
                     && stored
                         .metadata
                         .as_ref()

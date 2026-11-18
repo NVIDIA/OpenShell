@@ -228,7 +228,7 @@ mod tests {
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
         "63b70add7015030836537809f373ca161228617dba5a237469c772c3c66a6bb2";
     const DURABLE_SCHEMA_SHA256: &str =
-        "f861dec10c8d4142c9dcad7c34fb2689f9f15ccf496912908113ab9b72baba8c";
+        "9a025fc84af7c71bce42a52a282d1a96a02f8d71319478bcdb0e0c6367305888";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these

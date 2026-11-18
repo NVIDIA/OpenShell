@@ -5736,6 +5736,7 @@ async fn read_workspace_secret(
             .map_err(|e| Status::internal(format!("fetch workspace secret failed: {e}")))?
             .filter(|secret| {
                 secret.object_workspace() == workspace
+                    && secret.create_pending_since.is_none()
                     && secret
                         .metadata
                         .as_ref()
