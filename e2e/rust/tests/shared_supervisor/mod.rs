@@ -86,6 +86,11 @@ async fn node_exec(node: &str, command: &[&str]) -> Result<String, String> {
 /// when neither succeeds. Returns how the container was killed.
 pub async fn kill_abruptly(pod: &str) -> String {
     let namespace = release_namespace();
+    if std::env::var("OPENSHELL_E2E_SUPERVISOR_PROCESS_CONTROL").as_deref() == Ok("1") {
+        kill_with_process_control(&namespace, pod).await;
+        force_delete_supervisor(&namespace, pod).await;
+        return "SIGKILL from the test Pod's process-control sidecar".into();
+    }
     let description = kubectl_json(&["-n", &namespace, "get", "pod", pod, "-o", "json"]).await;
     let node = description["spec"]["nodeName"]
         .as_str()
@@ -153,9 +158,14 @@ pub async fn kill_abruptly(pod: &str) -> String {
             "could not hard-kill supervisor {pod}; a graceful stop proves nothing: {failures:#?}"
         )
     });
+    force_delete_supervisor(&namespace, pod).await;
+    killed
+}
+
+async fn force_delete_supervisor(namespace: &str, pod: &str) {
     kubectl(&[
         "-n",
-        &namespace,
+        namespace,
         "delete",
         "pod",
         pod,
@@ -164,7 +174,89 @@ pub async fn kill_abruptly(pod: &str) -> String {
         "--wait=false",
     ])
     .await;
-    killed
+}
+
+/// An unprivileged test sidecar shares only its Pod's process namespace.
+/// PID 1 is the Pod sandbox, so the same UID can send SIGKILL to the supervisor
+/// without access to the host PID namespace or container runtime socket.
+async fn kill_with_process_control(namespace: &str, pod: &str) {
+    kubectl(&[
+        "-n",
+        namespace,
+        "exec",
+        pod,
+        "-c",
+        "e2e-process-control",
+        "--",
+        "sh",
+        "-ec",
+        r#"for process in /proc/[0-9]*; do
+          if [ "$(cat "$process/comm" 2>/dev/null)" = openshell-super ]; then
+            pid=${process#/proc/}
+            test "$pid" -gt 1
+            kill -KILL "$pid"
+            exit 0
+          fi
+        done
+        echo 'supervisor process not found' >&2
+        exit 1"#,
+    ])
+    .await;
+}
+
+/// Opt-in process control for remote clusters where node-container exec is
+/// unavailable. Apply before creating sandboxes; the default image stays intact.
+pub async fn enable_process_control() {
+    if std::env::var("OPENSHELL_E2E_SUPERVISOR_PROCESS_CONTROL").as_deref() != Ok("1") {
+        return;
+    }
+    let namespace = release_namespace();
+    let deployments = kubectl_json(&[
+        "-n",
+        &namespace,
+        "get",
+        "deployments",
+        "-l",
+        SUPERVISOR_COMPONENT,
+        "-o",
+        "json",
+    ])
+    .await;
+    let [deployment] = deployments["items"]
+        .as_array()
+        .expect("supervisor deployments")
+        .as_slice()
+    else {
+        panic!("expected one supervisor deployment");
+    };
+    let name = deployment["metadata"]["name"].as_str().unwrap();
+    let patch = serde_json::json!({"spec": {"template": {"spec": {
+        "shareProcessNamespace": true,
+        "containers": [{"name": "e2e-process-control", "image": "busybox:1.37.0-musl", "command": ["sleep", "infinity"],
+            "securityContext": {"runAsNonRoot": true, "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL"]}, "seccompProfile": {"type": "RuntimeDefault"}},
+            "resources": {"requests": {"cpu": "10m", "memory": "8Mi"}, "limits": {"cpu": "100m", "memory": "32Mi"}}
+        }]
+    }}}});
+    kubectl(&[
+        "-n",
+        &namespace,
+        "patch",
+        "deployment",
+        name,
+        "--type=strategic",
+        "-p",
+        &patch.to_string(),
+    ])
+    .await;
+    kubectl(&[
+        "-n",
+        &namespace,
+        "rollout",
+        "status",
+        &format!("deployment/{name}"),
+        "--timeout=180s",
+    ])
+    .await;
 }
 
 pub fn release_namespace() -> String {

@@ -605,6 +605,98 @@ fn broker_agent_parent_id() -> String {
     format!("spiffe://{TRUST_DOMAIN}/openshell/broker-agents")
 }
 
+/// Select one backend and wait for endpoint propagation before acquiring.
+async fn select_broker_agent(namespace: &str, pod: &serde_json::Value) {
+    let name = pod["metadata"]["name"].as_str().unwrap();
+    let address = pod["status"]["podIP"].as_str().unwrap();
+    kubectl(&[
+        "-n",
+        namespace,
+        "label",
+        "pod",
+        name,
+        &format!("openshell.ai/broker-target={name}"),
+        "--overwrite",
+    ])
+    .await;
+    let selector = serde_json::json!({"spec": {"selector": {"openshell.ai/broker-target": name}}});
+    kubectl(&[
+        "-n",
+        namespace,
+        "patch",
+        "service",
+        "spire-broker",
+        "--type=merge",
+        "-p",
+        &selector.to_string(),
+    ])
+    .await;
+    let ready = tokio::time::timeout(Duration::from_mins(1), async {
+        loop {
+            let endpoints = kubectl(&[
+                "-n",
+                namespace,
+                "get",
+                "endpoints",
+                "spire-broker",
+                "-o",
+                "json",
+            ])
+            .await;
+            let endpoints: serde_json::Value = serde_json::from_str(&endpoints).unwrap();
+            let addresses: Vec<_> = endpoints["subsets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|subset| subset["addresses"].as_array().into_iter().flatten())
+                .filter_map(|endpoint| endpoint["ip"].as_str())
+                .collect();
+            if addresses == [address] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await;
+    assert!(ready.is_ok(), "Broker service did not select {name}");
+}
+
+async fn replace_broker_agent(namespace: &str, previous: &serde_json::Value) -> serde_json::Value {
+    let name = previous["metadata"]["name"].as_str().unwrap();
+    let node = previous["spec"]["nodeName"].as_str().unwrap();
+    kubectl(&["-n", namespace, "delete", "pod", name, "--wait=true"]).await;
+    kubectl(&[
+        "-n",
+        namespace,
+        "rollout",
+        "status",
+        "daemonset/spire-agent",
+        "--timeout=180s",
+    ])
+    .await;
+    let replacement = kubectl(&[
+        "-n",
+        namespace,
+        "get",
+        "pods",
+        "-l",
+        "app.kubernetes.io/name=agent,app.kubernetes.io/instance=spire",
+        "--field-selector",
+        &format!("spec.nodeName={node}"),
+        "-o",
+        "json",
+    ])
+    .await;
+    let replacement: serde_json::Value = serde_json::from_str(&replacement).unwrap();
+    replacement["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pod| pod["metadata"]["name"].as_str() != Some(name))
+        .expect("replacement SPIRE agent")
+        .clone()
+}
+
 /// Force a fresh production acquisition through each agent. A random Service
 /// connection is insufficient evidence that every backend can authenticate
 /// and issue the same registered identity.
@@ -622,7 +714,7 @@ async fn assert_every_broker_agent(sandbox: &SandboxGuard, port: u16, sandbox_id
     ])
     .await;
     let pods: serde_json::Value = serde_json::from_str(&output).unwrap();
-    let agents = pods["items"].as_array().unwrap();
+    let mut agents = pods["items"].as_array().unwrap().clone();
     let minimum = std::env::var("OPENSHELL_E2E_SPIRE_MIN_AGENTS")
         .unwrap_or_else(|_| "1".into())
         .parse::<usize>()
@@ -646,60 +738,17 @@ async fn assert_every_broker_agent(sandbox: &SandboxGuard, port: u16, sandbox_id
     ])
     .await;
     let original: serde_json::Value = serde_json::from_str(&original).unwrap();
-    for pod in agents {
+    let initial_agents = agents.len();
+    // Replace one agent after the sandbox entries exist. Its replacement must
+    // recover registrations through the alias without operator re-registration.
+    for index in 0..=initial_agents {
+        if index == initial_agents {
+            let replacement = replace_broker_agent(&namespace, agents.last().unwrap()).await;
+            agents.push(replacement);
+        }
+        let pod = &agents[index];
         let name = pod["metadata"]["name"].as_str().unwrap();
-        let address = pod["status"]["podIP"].as_str().unwrap();
-        kubectl(&[
-            "-n",
-            &namespace,
-            "label",
-            "pod",
-            name,
-            &format!("openshell.ai/broker-target={name}"),
-            "--overwrite",
-        ])
-        .await;
-        let selector =
-            serde_json::json!({"spec": {"selector": {"openshell.ai/broker-target": name}}});
-        kubectl(&[
-            "-n",
-            &namespace,
-            "patch",
-            "service",
-            "spire-broker",
-            "--type=merge",
-            "-p",
-            &selector.to_string(),
-        ])
-        .await;
-        let ready = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                let endpoints = kubectl(&[
-                    "-n",
-                    &namespace,
-                    "get",
-                    "endpoints",
-                    "spire-broker",
-                    "-o",
-                    "json",
-                ])
-                .await;
-                let endpoints: serde_json::Value = serde_json::from_str(&endpoints).unwrap();
-                let addresses: Vec<_> = endpoints["subsets"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|subset| subset["addresses"].as_array().into_iter().flatten())
-                    .filter_map(|endpoint| endpoint["ip"].as_str())
-                    .collect();
-                if addresses == [address] {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        })
-        .await;
-        assert!(ready.is_ok(), "Broker service did not select {name}");
+        select_broker_agent(&namespace, pod).await;
         let (ok, output) = cli(&["sandbox", "stop", &sandbox.name]).await;
         assert!(ok, "{output}");
         let (ok, output) = cli(&["sandbox", "start", &sandbox.name]).await;
@@ -1096,18 +1145,20 @@ async fn assert_provider_failover(
 
 async fn create(name: &str, provider: &str) -> SandboxGuard {
     let main = format!("echo spiffe-ready; {COUNTER_MAIN}");
-    SandboxGuard::create_keep_with_args(
-        &["--name", name, "--provider", provider],
-        &["sh", "-c", &main],
-        "spiffe-ready",
-    )
-    .await
-    .unwrap_or_else(|error| panic!("create {name}: {error}"))
+    let driver_config = std::env::var("OPENSHELL_E2E_SPIFFE_DRIVER_CONFIG_JSON").ok();
+    let mut args = vec!["--name", name, "--provider", provider];
+    if let Some(config) = driver_config.as_deref() {
+        args.extend(["--driver-config-json", config]);
+    }
+    SandboxGuard::create_keep_with_args(&args, &["sh", "-c", &main], "spiffe-ready")
+        .await
+        .unwrap_or_else(|error| panic!("create {name}: {error}"))
 }
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
+    shared_supervisor::enable_process_control().await;
     let members = supervisor_pods().await;
     assert!(
         members.len() >= 2,

@@ -121,7 +121,8 @@ The task creates three nodes (`HELM_K3S_AGENT_COUNT=2` adds two k3d agents) and
 requires three SPIRE agents. Its cluster-scoped `server_spiffe_id_prefix` accepts
 the concrete node identities, and a node alias distributes Sandbox registrations
 to all eligible agents. The test selects each Broker backend in turn and forces
-a new generation's acquisition. Exact-ID mode remains available for a fixed
+a new generation's acquisition, then replaces one agent and checks acquisition
+without re-registering the sandbox. Exact-ID mode remains available for a fixed
 endpoint. The installed SPIRE version and operator must expose the experimental
 Broker API. `e2e/kubernetes/spiffe-broker/README.md` describes independent
 protocol and negative authorization checks.
@@ -132,6 +133,16 @@ from Pods. Optional `OPENSHELL_E2E_SPIFFE_STS_PORT` and
 operator can forward them through a reverse tunnel. Keep the tunnel available
 through the test and remove it afterward. Use an explicit kubeconfig and context
 to avoid repository environment defaults targeting a local cluster.
+`OPENSHELL_E2E_SPIFFE_DRIVER_CONFIG_JSON` can pass a driver override to test
+sandbox creation, such as a node selector for a Landlock-capable pool. Enable
+`allow_driver_config` in the test gateway when using this override. GKE COS
+nodes may lack Landlock; use compatible Ubuntu nodes for sandbox workloads.
+For remote abrupt-failover coverage, set
+`OPENSHELL_E2E_SUPERVISOR_PROCESS_CONTROL=1`. Before creating sandboxes, the test
+adds an unprivileged process-control sidecar and enables the supervisor Pod's
+shared process namespace. The sidecar sends SIGKILL to the supervisor as the
+same UID; it needs no host PID namespace, capabilities, or runtime socket.
+The default k3d/kind test continues to kill through the node container runtime.
 
 ### Shared supervisor high availability
 

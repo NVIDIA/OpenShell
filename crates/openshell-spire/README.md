@@ -48,7 +48,8 @@ mise run e2e:kubernetes:shared-supervisor-spiffe
 ```
 
 The test installs pinned SPIRE charts, exercises the full provider exchange,
-forces acquisition through each agent on a three-node cluster, checks supervisor
+forces acquisition through each agent on a three-node cluster and a replacement
+agent without re-registering sandboxes, checks supervisor
 takeover and stale-session fencing, and forces acquisition
 after the fixture's 30-second workload X.509-SVID expires. It also checks that
 the gateway Pod passes Restricted Pod Security admission.
