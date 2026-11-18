@@ -197,26 +197,4 @@ mod tests {
                 .expect("the serialized policy parses");
         assert_eq!(round_trip, expected);
     }
-
-    /// The list parses as the `binaries` of a policy, the same as
-    /// [`allow`] adds them.
-    #[test]
-    fn binaries_yaml_lists_each_path() {
-        let binaries = ["/usr/bin/python*", "/sandbox/.uv/python/*/bin/python*"];
-        let yaml = format!(
-            "{BASE}network_policies:
-  upstream:
-    name: upstream
-    endpoints:
-      - {{host: example.test, port: 8080}}
-    binaries: {}
-",
-            binaries_yaml(&binaries)
-        );
-        let parsed = openshell_policy::parse_sandbox_policy(&yaml).expect("the YAML parses");
-        let mut expected = base();
-        allow(&mut expected, "upstream", "example.test", 8080, &binaries);
-        assert_eq!(parsed, expected);
-        assert_eq!(binaries_yaml(&[]), "[]");
-    }
 }

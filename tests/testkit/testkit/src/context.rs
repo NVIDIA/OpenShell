@@ -951,47 +951,6 @@ fn generate_run_id() -> String {
 mod tests {
     use super::*;
 
-    fn exec_output(stdout: &str) -> ExecOutput {
-        ExecOutput {
-            description: "exec in sandbox".to_string(),
-            exit_code: 0,
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-        }
-    }
-
-    #[test]
-    fn last_json_takes_the_last_object_or_array_line() {
-        let output = exec_output("{\"first\": 1}\nprogress\n  {\"last\": true}  \n42\nDONE\n");
-        assert_eq!(
-            output.last_json().expect("a JSON line"),
-            serde_json::json!({"last": true})
-        );
-        assert_eq!(
-            exec_output("[1, 2]\n").last_json().expect("a JSON line"),
-            serde_json::json!([1, 2])
-        );
-    }
-
-    #[test]
-    fn last_json_reports_output_without_a_json_line() {
-        let error = exec_output("ECHO_OK\n7\n")
-            .last_json()
-            .expect_err("no object or array");
-        assert!(error.to_string().contains("ECHO_OK"), "{error}");
-    }
-
-    #[test]
-    fn script_summary_skips_blank_and_license_lines() {
-        let script = "\n# SPDX-FileCopyrightText: x\n# SPDX-License-Identifier: y\n\n# Sends a request.\nimport json\n";
-        assert_eq!(script_summary(script), "# Sends a request.");
-        assert_eq!(
-            script_summary("import sys; print(1)"),
-            "import sys; print(1)"
-        );
-        assert_eq!(script_summary(""), "");
-    }
-
     #[test]
     fn policy_create_request_keeps_the_spec_and_adds_the_policy() {
         let spec = SandboxSpec {

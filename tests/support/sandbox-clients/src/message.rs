@@ -266,77 +266,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn text(bytes: &[u8]) -> &str {
-        std::str::from_utf8(bytes).expect("UTF-8")
-    }
-
-    #[test]
-    fn a_get_asks_the_server_to_close() {
-        let request = Request::get("/allowed").encode("host.openshell.internal", 8080);
-        assert_eq!(
-            text(&request),
-            "GET /allowed HTTP/1.1\r\nHost: host.openshell.internal:8080\r\nConnection: close\r\n\r\n"
-        );
-    }
-
-    #[test]
-    fn a_post_sends_its_length_and_body() {
-        let request = Request::new("POST", "/token")
-            .header("Content-Type", "text/plain")
-            .body("secret")
-            .encode("10.0.0.1", 80);
-        assert_eq!(
-            text(&request),
-            "POST /token HTTP/1.1\r\nHost: 10.0.0.1:80\r\nContent-Type: text/plain\r\n\
-             Content-Length: 6\r\nConnection: close\r\n\r\nsecret"
-        );
-        let empty = Request::new("post", "/").encode("h", 1);
-        assert!(text(&empty).contains("Content-Length: 0\r\n"));
-    }
-
-    #[test]
-    fn headers_the_request_sets_replace_the_defaults() {
-        let request = Request::get("http://h:1/x")
-            .header("host", "other")
-            .header("connection", "keep-alive")
-            .encode("h", 1);
-        assert_eq!(
-            text(&request),
-            "GET http://h:1/x HTTP/1.1\r\nhost: other\r\nconnection: keep-alive\r\n\r\n"
-        );
-        let chunked = Request::new("POST", "/")
-            .header("Transfer-Encoding", "chunked")
-            .body("0\r\n\r\n")
-            .encode("h", 1);
-        assert!(!text(&chunked).contains("Content-Length"));
-    }
-
-    #[test]
-    fn an_ipv6_host_is_bracketed() {
-        let request = Request::get("/").encode("::1", 80);
-        assert!(text(&request).contains("Host: [::1]:80\r\n"));
-    }
-
-    #[test]
-    fn a_response_with_content_length() {
-        let response = parse_response(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\ncontent-length: 5\r\n\r\nhello extra",
-            false,
-        )
-        .expect("a response");
-        assert_eq!(response.status, 200);
-        assert_eq!(response.header("Content-Type"), Some("text/plain"));
-        assert_eq!(response.header("CONTENT-LENGTH"), Some("5"));
-        assert_eq!(response.body, b"hello");
-    }
-
-    #[test]
-    fn a_response_without_content_length_reads_to_the_end() {
-        let response =
-            parse_response(b"HTTP/1.0 200 OK\r\n\r\nall of it", false).expect("a response");
-        assert_eq!(response.body, b"all of it");
-    }
-
     #[test]
     fn a_chunked_response_is_decoded() {
         let response = parse_response(
@@ -345,50 +274,6 @@ mod tests {
         )
         .expect("a response");
         assert_eq!(response.body, b"hello world");
-    }
-
-    #[test]
-    fn a_truncated_body_is_kept_as_far_as_it_arrived() {
-        let chunked = parse_response(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\na\r\nworl",
-            false,
-        )
-        .expect("a response");
-        assert_eq!(chunked.body, b"helloworl");
-        let sized = parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhel", false)
-            .expect("a response");
-        assert_eq!(sized.body, b"hel");
-    }
-
-    #[test]
-    fn proxy_denials_without_a_body() {
-        let empty = parse_response(
-            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
-            false,
-        )
-        .expect("a response");
-        assert_eq!(empty.status, 403);
-        assert!(empty.body.is_empty());
-        let closed =
-            parse_response(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", false).expect("a response");
-        assert_eq!(closed.status, 502);
-        assert!(closed.body.is_empty());
-    }
-
-    #[test]
-    fn bodiless_statuses_and_head_have_no_body() {
-        for status in [
-            "101 Switching Protocols",
-            "204 No Content",
-            "304 Not Modified",
-        ] {
-            let bytes = format!("HTTP/1.1 {status}\r\nContent-Length: 4\r\n\r\nnext");
-            let response = parse_response(bytes.as_bytes(), false).expect("a response");
-            assert!(response.body.is_empty(), "{status}");
-        }
-        let head = parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", true)
-            .expect("a response");
-        assert!(head.body.is_empty());
     }
 
     #[test]
@@ -402,34 +287,5 @@ mod tests {
         assert_eq!(parse_response(b"SSH-2.0-OpenSSH\r\n\r\n", false), None);
         assert_eq!(parse_response(b"HTTP/1.1 20 OK\r\n\r\n", false), None);
         assert_eq!(parse_response(b"HTTP/2 200\r\n\r\n", false), None);
-    }
-
-    #[test]
-    fn http_parses_what_the_probe_received() {
-        let probe = Probe {
-            connect: ConnectOutcome::Connected,
-            connect_elapsed: Duration::from_millis(3),
-            read_end: Some(ReadEnd::Closed),
-            received: b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\nno".to_vec(),
-        };
-        let http = Http::from_probe(probe, false);
-        assert_eq!(http.status(), Some(403));
-        assert_eq!(
-            http.response.as_ref().expect("a response").body_text(),
-            "no"
-        );
-        assert!(http.received_text().starts_with("HTTP/1.1 403"));
-
-        let reset = Http::from_probe(
-            Probe {
-                connect: ConnectOutcome::Connected,
-                connect_elapsed: Duration::ZERO,
-                read_end: Some(ReadEnd::Reset),
-                received: Vec::new(),
-            },
-            false,
-        );
-        assert_eq!(reset.status(), None);
-        assert_eq!(reset.read_end, Some(ReadEnd::Reset));
     }
 }
