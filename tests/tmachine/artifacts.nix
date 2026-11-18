@@ -87,10 +87,6 @@ let
   # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
   # there until tmachine provides what they need.
   podmanE2eFollowUpBinaries = [
-    # Needs the caller driver-config settings (`allow_driver_config`,
-    # `enable_bind_mounts`), which the tmachine gateway does not enable. Wrapper
-    # lane.
-    "driver_config_volume"
     # The next three self-skip without wrapper-owned gateway metadata (restart
     # and configuration control), so exclude them rather than report false
     # passes. Wrapper lane.

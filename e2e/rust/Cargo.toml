@@ -104,11 +104,6 @@ path = "tests/additional_ca.rs"
 required-features = ["e2e-additional-ca"]
 
 [[test]]
-name = "driver_config_volume"
-path = "tests/driver_config_volume.rs"
-required-features = ["e2e-local-container-driver"]
-
-[[test]]
 name = "gateway_start"
 path = "tests/gateway_start.rs"
 required-features = ["e2e-docker"]
@@ -234,7 +229,6 @@ openshell-crypto = { path = "../../crates/openshell-crypto" }
 openshell-otel-test-support = { path = "../../crates/openshell-otel-test-support" }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace"] }
 base64 = "0.22"
-bollard = "0.20"
 bytes = "1"
 futures-util = "0.3"
 http-body-util = "0.1"

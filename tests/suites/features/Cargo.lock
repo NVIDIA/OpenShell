@@ -858,6 +858,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "driver-config"
+version = "0.0.0"
+dependencies = [
+ "container-engine-support",
+ "openshell-testkit",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

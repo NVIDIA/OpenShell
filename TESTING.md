@@ -350,6 +350,11 @@ can run the suite. The expectations characterize the sandbox's behavior today,
 not a specification, and the `echo-socket` check needs `perl` in the workload
 image, which the default image has.
 
+The `<base>-driver-config` environments let callers pass driver config with
+volume and bind mounts, and turn off resource admission, which blocks bind
+mounts. The driver-config suite (`tests/suites/features/driver-config`) runs
+there on Docker and Podman.
+
 ### Python E2E (`e2e/python/`)
 
 `mise run e2e:python` builds `openshell/e2e-python:dev` from
@@ -572,8 +577,7 @@ nix run .#generate-podman-e2e-ci-tests
 The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
 store. The E2E archive excludes binaries that still depend on wrapper-owned
-gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
-guest setup. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
+gateway controls, SPIFFE fixtures, or other guest setup. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
