@@ -20,6 +20,8 @@
 //! workload and SPIFFE identity while fencing the old credential epoch and
 //! its still-live broker cache entry.
 
+#[path = "kubernetes_shared_supervisor_spiffe/node_local.rs"]
+mod node_local;
 mod shared_supervisor;
 
 use std::collections::{BTreeSet, HashMap};
@@ -1314,7 +1316,11 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     assert_sandbox_holds_no_spiffe_material(&alpha).await;
     assert_sandbox_holds_no_spiffe_material(&beta).await;
 
-    assert_every_broker_agent(&alpha, target.port, &alpha_id).await;
+    if std::env::var("OPENSHELL_E2E_KUBE_SPIRE_NODE_LOCAL").as_deref() == Ok("1") {
+        node_local::exercise(&alpha, target.port, &alpha_id).await;
+    } else {
+        assert_every_broker_agent(&alpha, target.port, &alpha_id).await;
+    }
     assert_provider_failover(&alpha, &gateway_id, &tokens, &target).await;
 
     // The fixture's workload X.509-SVID TTL is 30 seconds. Let the

@@ -146,6 +146,15 @@ The default k3d/kind test continues to kill through the node container runtime.
 
 ### Shared supervisor high availability
 
+`mise run e2e:kubernetes:shared-supervisor-spiffe-node-local` validates direct
+node-local Broker TCP routing. The chart injects `OPENSHELL_NODE_IP` from
+`status.hostIP` for `spiffe_broker.node_local_port`; it creates no Broker Service.
+The task uses an external PostgreSQL fixture and a gateway Deployment, moves
+the gateway across the SPIRE nodes, restricts Broker egress to its current node,
+and forces fresh token acquisition on each node and after local agent replacement.
+The shared-supervisor failover, credential rotation, and identity fencing checks
+also run. Keep gateway/supervisor/sandbox images from the same branch.
+
 The shared supervisor is always a pool of `supervisor.replicas` members
 (default 1), or an HPA-managed pool when `supervisor.autoscaling.enabled=true`.
 `ci/values-supervisor-autoscaling.yaml` enables the memory HPA (default `512Mi`

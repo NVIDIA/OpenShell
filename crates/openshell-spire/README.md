@@ -14,7 +14,7 @@ For each acquisition the adapter:
    identity. Supervisors cannot supply a reference or selectors.
 2. Fetches current gateway X.509-SVID credentials and trust bundles through the
    local CSI Workload API socket.
-3. Connects to the Broker endpoint over mTLS, verifying the agent certificate
+3. Connects to the selected Broker endpoint over mTLS, verifying the agent certificate
    chain and configured exact or cluster-scoped SPIFFE URI policy through `openshell-crypto`.
 4. Requests a JWT-SVID for a `KubernetesObjectReference` containing the Sandbox
    resource type and UID. SPIRE resolves and attests the object and enforces the
@@ -41,10 +41,19 @@ one of `server_spiffe_id` (exact identity) and `server_spiffe_id_prefix`
 of registrations served by multiple agents; the alias does not replace their
 concrete certificate identities.
 
+Set `node_local_port` to connect directly to the gateway's node-local agent.
+The gateway resolves `OPENSHELL_NODE_IP` from the Pod's Downward API at startup;
+missing or invalid addresses fail startup. IPv4 and IPv6 addresses are supported.
+The Broker listener must be reachable on that node address. Alternatively, set
+an explicit HTTPS `endpoint`. These settings are mutually exclusive. Node-local
+mode uses no Broker Service; gateway movement requires registrations on every
+eligible agent, even when the sandbox and supervisor remain on other nodes.
+
 ## Verification
 
 ```shell
 mise run e2e:kubernetes:shared-supervisor-spiffe
+mise run e2e:kubernetes:shared-supervisor-spiffe-node-local
 ```
 
 The test installs pinned SPIRE charts, exercises the full provider exchange,
@@ -53,6 +62,9 @@ agent without re-registering sandboxes, checks supervisor
 takeover and stale-session fencing, and forces acquisition
 after the fixture's 30-second workload X.509-SVID expires. It also checks that
 the gateway Pod passes Restricted Pod Security admission.
+The node-local variant uses external PostgreSQL to move the gateway across
+nodes, restricts Broker egress to its current node, and verifies fresh acquisition
+without a Broker Service, including after its local agent is replaced.
 
 The [`broker_probe` experiment](../../e2e/kubernetes/spiffe-broker/README.md)
 provides independent positive and negative protocol checks.

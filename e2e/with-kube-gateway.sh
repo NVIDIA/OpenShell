@@ -395,8 +395,7 @@ start_gateway_portforward() {
     echo "Starting kubectl port-forward svc/${target_service} ${LOCAL_PORT}:${target_port}..."
   fi
 
-  kctl -n "${target_namespace}" port-forward "svc/${target_service}" \
-    "${LOCAL_PORT}:${target_port}" >"${PORTFORWARD_LOG}" 2>&1 &
+  gateway_portforward_loop "svc/${target_service}" "${LOCAL_PORT}:${target_port}" "${PORTFORWARD_LOG}" "${target_namespace}" &
   PORTFORWARD_PID=$!
 
   while [ "${elapsed}" -lt "${pf_timeout}" ]; do
@@ -587,6 +586,7 @@ deploy_spire_fixture() {
     # UID-only references are resolved by SPIRE, never by a supervisor. The
     # agent needs object lookup and SAR access; the broker's grant is namespace scoped.
     kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+    if [ "${OPENSHELL_E2E_KUBE_SPIRE_NODE_LOCAL:-0}" != "1" ]; then
     kctl apply -f - <<EOF
 apiVersion: v1
 kind: Service
@@ -601,7 +601,9 @@ spec:
     - name: broker
       port: 8443
       targetPort: 8443
----
+EOF
+    fi
+    kctl apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -673,10 +675,20 @@ spec:
 EOF
     local broker_values
     broker_values="${WORKDIR}/spire-broker-values.yaml"
-    cat >"${broker_values}" <<EOF
+    if [ "${OPENSHELL_E2E_KUBE_SPIRE_NODE_LOCAL:-0}" = "1" ]; then
+      cat >"${broker_values}" <<EOF
+gatewayConfig:
+  openshell.gateway.spiffe_broker:
+    node_local_port: 8443
+EOF
+    else
+      cat >"${broker_values}" <<EOF
 gatewayConfig:
   openshell.gateway.spiffe_broker:
     endpoint: https://spire-broker.${SPIRE_NAMESPACE}.svc:8443
+EOF
+    fi
+    cat >>"${broker_values}" <<EOF
     server_spiffe_id_prefix: spiffe://openshell.local/spire/agent/k8s_psat/openshell-e2e
 EOF
     helm_values_args+=(--values "${broker_values}")
@@ -1134,6 +1146,22 @@ openshift_register_route_gateway() {
     "${pki_dir}"
 }
 
+# Preserve the test endpoint when node-local coverage relocates the gateway.
+# The wrapper owns its kubectl child and stops it on cleanup.
+gateway_portforward_loop() (
+  trap - EXIT
+  local target="$1" mapping="$2" log="$3" target_namespace="${4:-${NAMESPACE}}" forward_pid=""
+  trap 'if [ -n "$forward_pid" ]; then kill "$forward_pid" 2>/dev/null || true; wait "$forward_pid" 2>/dev/null || true; fi; exit 0' TERM INT
+  while true; do
+    kubectl --context "${KUBE_CONTEXT}" -n "${target_namespace}" port-forward "$target" "$mapping" >>"$log" 2>&1 &
+    forward_pid=$!
+    wait "$forward_pid" || true
+    forward_pid=""
+    [ "${OPENSHELL_E2E_KUBE_SPIRE_NODE_LOCAL:-0}" = "1" ] || return 0
+    sleep 1
+  done
+)
+
 # Start `kubectl port-forward svc/openshell` for the gRPC endpoint and wait for
 # it to accept TCP. Sets LOCAL_PORT and PORTFORWARD_PID. Prints the port-forward
 # log and returns non-zero on failure. Used for the vanilla-Kubernetes transport
@@ -1141,8 +1169,7 @@ openshift_register_route_gateway() {
 start_grpc_portforward() {
   LOCAL_PORT="$(e2e_pick_port)"
   echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
-    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
+  gateway_portforward_loop "svc/openshell" "${LOCAL_PORT}:8080" "${PORTFORWARD_LOG}" &
   PORTFORWARD_PID=$!
 
   local elapsed=0 timeout=30
@@ -1173,8 +1200,7 @@ start_health_portforward() {
   local workload_ref
   workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
   echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
-    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+  gateway_portforward_loop "${workload_ref}" "${HEALTH_LOCAL_PORT}:health" "${PORTFORWARD_HEALTH_LOG}" &
   PORTFORWARD_HEALTH_PID=$!
 
   local elapsed=0 timeout=30
