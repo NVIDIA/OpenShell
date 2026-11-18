@@ -3991,6 +3991,27 @@ mod linux {
                 Ok(paths) => paths,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
+            // The installed files are complete; publish the same bytes to the
+            // broker before anything can open them. A refused publication
+            // keeps the previously published pair, if any, and fails the
+            // start as the installation would have. A start without CA
+            // material installs no files and no grants, so a pair cached by
+            // an earlier failed start is forgotten before the spawn.
+            match (&requested.ca_cert, &requested.ca_bundle) {
+                (Some(ca_cert), Some(ca_bundle)) => {
+                    if let Err(error) = self
+                        .network_broker
+                        .provider_files()
+                        .publish_ca_trust(ca_cert.as_bytes(), ca_bundle.as_bytes())
+                    {
+                        return guest_error(
+                            BoundaryErrorKind::Process,
+                            format!("publish supervisor CA trust files: {error}"),
+                        );
+                    }
+                }
+                _ => self.network_broker.provider_files().clear_ca_trust(),
+            }
             let mut policy = policy.into();
             let gpu_requested = self
                 .config
@@ -4273,6 +4294,10 @@ mod linux {
                 );
             }
         };
+        // The same pair check the broker's cache applies, before any file is
+        // written: an inconsistent pair is never installed anywhere.
+        crate::ca_trust_files::validate_pair(ca_cert.as_bytes(), ca_bundle.as_bytes())
+            .map_err(|error| format!("invalid supervisor CA material: {error}"))?;
         install_ca_material_at(
             Path::new(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR),
             ca_cert.as_bytes(),
@@ -4343,8 +4368,8 @@ mod linux {
                 ));
             }
         }
-        let ca_path = directory.join("ca.crt");
-        let bundle_path = directory.join("ca-bundle.crt");
+        let ca_path = directory.join(crate::ca_trust_files::CA_CERT_FILE_NAME);
+        let bundle_path = directory.join(crate::ca_trust_files::CA_BUNDLE_FILE_NAME);
         for (path, contents, label) in [
             (&ca_path, ca_cert, "supervisor CA"),
             (&bundle_path, ca_bundle, "supervisor CA bundle"),

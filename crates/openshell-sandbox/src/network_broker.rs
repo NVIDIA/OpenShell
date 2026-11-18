@@ -2519,6 +2519,115 @@ mod tests {
         assert_eq!(detached.unwrap_err().raw_os_error(), Some(libc::ENOENT));
     }
 
+    #[test]
+    fn ca_trust_files_are_served_at_their_canonical_paths_through_the_listener() {
+        use crate::ca_trust_files::{CA_BUNDLE_PATH, CA_CERT_PATH};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const CERT: &str = "-----BEGIN CERTIFICATE-----\nlistener\n-----END CERTIFICATE-----\n";
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start broker");
+        // Before publication the canonical path is continued, so the kernel
+        // answers for whatever is (or is not) installed there.
+        let before = launcher.execute(|| std::fs::read(CA_CERT_PATH)).unwrap();
+        assert!(before.map_or(true, |content| content != CERT.as_bytes()));
+
+        // A bundle well beyond the provider file bound.
+        let bundle = format!("{}{CERT}", "S".repeat(150 * 1024));
+        broker
+            .provider_files()
+            .publish_ca_trust(CERT.as_bytes(), bundle.as_bytes())
+            .unwrap();
+        let served_cert = launcher
+            .execute(|| std::fs::read(CA_CERT_PATH))
+            .unwrap()
+            .expect("canonical certificate open");
+        assert_eq!(served_cert, CERT.as_bytes());
+        let served_bundle = launcher
+            .execute(|| std::fs::read(CA_BUNDLE_PATH))
+            .unwrap()
+            .expect("canonical bundle open");
+        assert_eq!(served_bundle, bundle.as_bytes());
+        // Opens the cache does not serve continue to the kernel, which
+        // answers for the installed file (absent on a test host, so ENOENT;
+        // ENOTDIR for O_DIRECTORY where it exists). None is answered from
+        // the cache, and none is refused by the broker.
+        let kernel_answer = |flags: i32| {
+            launcher
+                .execute(move || {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(flags)
+                        .open(CA_CERT_PATH)
+                })
+                .unwrap()
+        };
+        for (flags, allowed) in [
+            (libc::O_DIRECTORY, &[libc::ENOENT, libc::ENOTDIR][..]),
+            (libc::O_PATH, &[libc::ENOENT][..]),
+        ] {
+            match kernel_answer(flags) {
+                Ok(opened) => assert_ne!(
+                    opened.metadata().unwrap().len(),
+                    CERT.len() as u64,
+                    "flags {flags:#x} must not reach the cached file"
+                ),
+                Err(error) => assert!(
+                    allowed.contains(&error.raw_os_error().unwrap()),
+                    "flags {flags:#x}: {error}"
+                ),
+            }
+        }
+        let write_attempt = launcher
+            .execute(|| std::fs::OpenOptions::new().write(true).open(CA_BUNDLE_PATH))
+            .unwrap()
+            .expect_err("a write-capable open is not served and fails natively");
+        assert!(
+            [libc::ENOENT, libc::EACCES].contains(&write_attempt.raw_os_error().unwrap()),
+            "{write_attempt}"
+        );
+
+        // An alias is not the canonical path: it continues to the kernel and
+        // is never answered from the cache.
+        let alias = format!(
+            "{}/../material/{}",
+            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR,
+            crate::ca_trust_files::CA_CERT_FILE_NAME
+        );
+        let via_alias = launcher.execute(move || std::fs::read(alias)).unwrap();
+        assert!(via_alias.map_or(true, |content| content != CERT.as_bytes()));
+
+        // Provider updates, including detaching everything, leave the trust
+        // files served.
+        broker
+            .provider_files()
+            .replace(HashMap::from([(
+                "/run/openshell/providers/acme/client.toml".to_string(),
+                "version = 1\n".to_string(),
+            )]))
+            .unwrap();
+        broker.provider_files().replace(HashMap::new()).unwrap();
+        let still_served = launcher
+            .execute(|| std::fs::read(CA_CERT_PATH))
+            .unwrap()
+            .expect("certificate open after provider updates");
+        assert_eq!(still_served, CERT.as_bytes());
+
+        // A held descriptor outlives the pair; after an explicit clear the
+        // canonical path continues to the kernel like any other.
+        let mut held = launcher
+            .execute(|| std::fs::File::open(CA_CERT_PATH))
+            .unwrap()
+            .expect("hold the cached certificate");
+        broker.provider_files().clear_ca_trust();
+        let after_clear = launcher.execute(|| std::fs::read(CA_CERT_PATH)).unwrap();
+        assert!(after_clear.map_or(true, |content| content != CERT.as_bytes()));
+        let mut held_content = String::new();
+        io::Read::read_to_string(&mut held, &mut held_content).unwrap();
+        assert_eq!(held_content, CERT);
+    }
+
     /// `openat2` with the given `open_how` fields.
     fn raw_openat2(
         path: &std::ffi::CStr,
@@ -2919,6 +3028,28 @@ mod tests {
         broker.provider_files().replace(HashMap::new()).unwrap();
         let detached = launcher.execute(move || std::fs::read(exposed)).unwrap();
         assert_eq!(detached.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+
+        // Native delivery keeps the installed CA files as the workload's
+        // source: the pair is still checked, but nothing is cached for
+        // injection, since read-only opens never notify.
+        let cert = "-----BEGIN CERTIFICATE-----\nnative\n-----END CERTIFICATE-----\n";
+        broker
+            .provider_files()
+            .publish_ca_trust(cert.as_bytes(), format!("system\n{cert}").as_bytes())
+            .expect("a valid pair is accepted under native delivery");
+        assert!(
+            broker
+                .provider_files()
+                .publish_ca_trust(cert.as_bytes(), b"system only\n")
+                .is_err()
+        );
+        assert!(broker.provider_files().ca_trust().is_none());
+        broker.provider_files().clear_ca_trust();
+        assert_eq!(
+            broker.provider_files().open_mediation(),
+            OpenMediation::WriteCapable,
+            "CA handling adds no open mediation to native delivery"
+        );
         broker.confirm_healthy().expect("broker stays healthy");
     }
 

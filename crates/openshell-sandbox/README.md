@@ -52,13 +52,16 @@ bootstrap selects one of two deliveries before the workload listener exists.
 the broker, which serves a provider path by injecting a read-only descriptor
 for a sealed in-memory file and continues every other open.
 
-Each published file is an immutable revision backed by one in-memory file. The
+Each published file is an immutable revision backed by one sealed in-memory
+file (`linux::sealed_file`, the backing the CA trust files below share). The
 runtime creates that file when the revision is published, not when the
 workload opens it: it writes the content, seals the file against writes,
-growing, shrinking, and further sealing, and keeps only a read-only descriptor
-for it. Each workload open reopens that descriptor through the runtime's own
-`/proc/self/fd`, so every open gets its own read-only open file description
-and file offset, positioned at the start.
+growing, shrinking, and further sealing, confirms every seal is in place, and
+keeps only a read-only descriptor for it. Each workload open reopens that
+descriptor through the runtime's own `/proc/self/fd`, opened once and verified
+to be procfs, so every open gets its own read-only open file description and
+file offset, positioned at the start. The runtime injects that descriptor and
+completes the workload's syscall in one `SECCOMP_ADDFD_FLAG_SEND` operation.
 
 An update prepares every new revision before it replaces the published set in
 one step, so a failed update leaves the previous set in place. A file whose
@@ -73,11 +76,12 @@ denies an open. The runtime holds one descriptor per published file, at most
 64.
 
 The broker classifies each open from an exact copy of the first six bytes of
-its path. Six bytes identify a `/proc/` path and the start of a provider path;
-only those candidates have their whole path read and decided. An open whose
-first six bytes cannot be read, or match neither, continues, and unrelated
-`openat2` calls do not require a copy of their `open_how`. Every continued
-open remains subject to the kernel and Landlock.
+its path. Six bytes identify a `/proc/` path and the shared start of a
+provider path and a CA trust path; only those candidates have their whole path
+read and decided. An open whose first six bytes cannot be read, or match
+neither, continues, and unrelated `openat2` calls do not require a copy of
+their `open_how`. Every continued open remains subject to the kernel and
+Landlock.
 
 **Native** delivery uses a store the driver provisions: one filesystem mounted
 twice into the workload container.
@@ -197,6 +201,33 @@ update. The runtime restores the modes it needs before each update and at
 startup, and each update publishes new inodes. Staged and replaced generations
 have names from the cryptographic random source, so the workload cannot find
 them to `stat`.
+
+## Supervisor CA trust files
+
+The supervisor's public CA certificate and combined trust bundle (system CAs
+plus that certificate) are installed as real `0444` files at
+`/run/openshell-supervisor-ca/material/ca.crt` and `ca-bundle.crt` before the
+workload starts; the child Landlock grants keep the directory readable and the
+TLS environment variables point there. Both are public material, and no
+private key is delivered.
+
+Under virtual delivery the broker also holds the same bytes as one sealed pair,
+and a plain read-only `open` or `openat` of exactly one canonical path receives
+an injected descriptor, the same immutable delivery as a provider file. Every
+other open of those paths continues to the kernel as before: `stat`, `O_PATH`,
+`O_DIRECTORY`, `openat2`, write-capable opens, relative opens, and aliases such
+as a path through `..` all reach the installed files, which remain the
+compatibility source. Under native delivery read-only opens do not notify, so
+the installed files are read directly; the pair is still validated.
+
+The pair is published after installation and before the spawn, replaced only
+as a whole, and never touched by a provider file update; a start without CA
+material clears it. A pair is refused, and nothing changes, if either file is
+empty, exceeds the 1 MiB control frame bound (the CA files have their own
+bound, since a system bundle is often larger than a provider file), or the
+bundle does not contain the certificate.
+
+## Runtime boundary transport
 
 A boundary configured with `RuntimeInitiatedTlsTcp` binds no listener. It dials
 only the driver-provided supervisor addresses, which must be concrete,

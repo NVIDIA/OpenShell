@@ -375,6 +375,20 @@ Common findings:
   workload container has no provider-file volume, no `/run/openshell` mount,
   and no `openshell.ai/provider-files` label. That is the expected state, not
   a fault; debug it as an enforcement-probe or provider-attachment problem.
+  The same default delivery answers workload opens of exactly
+  `/run/openshell-supervisor-ca/material/ca.crt` and `ca-bundle.crt` from a
+  sealed in-memory copy of the installed files, so `fstat` on such an open
+  descriptor reports a memfd inode while `stat` on the path reports the real
+  tmpfs file; both hold the same bytes. A sandbox start refused with
+  `invalid supervisor CA material` means the supervisor sent an empty,
+  oversized, or inconsistent certificate and bundle pair (the bundle must
+  contain the certificate); check the supervisor's TLS output and system CA
+  bundle rather than the workload. A start refused with
+  `publish supervisor CA trust files` is a preparation failure in the workload
+  container and carries the low-level cause: `/proc/self/fd` not on procfs,
+  `memfd_create` or sealing refused, or a descriptor or memory limit reached.
+  Check the runtime's seccomp profile, procfs mount, and the container's file
+  descriptor and memory limits.
   The rest of this entry applies only to a gateway built with the experimental
   `experimental-native-provider-files` Cargo feature of
   `openshell-driver-docker`, which logs
