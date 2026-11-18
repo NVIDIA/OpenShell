@@ -79,10 +79,12 @@ runs native x64 and ARM64 lanes. Windows PR checks are opt-in: add
 `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
-Normal Windows CI retains pinned prebuilt Z3 and its original lint/test workload.
-Manual dispatch exposes `static_runtime` (default `false`) to validate static
-CRT/Z3 builds on both native runner architectures. This opt-in can build Z3
-from source; it uses separate compiler/target cache keys.
+Normal Windows CI uses static CRT and the pinned static Z3 packages from GHCR
+with the existing lint and test workload. It builds Z3 from source only when
+explicitly requested or when the pinned package is unavailable. Manual dispatch
+defaults `static_runtime` to `true`. Set it to `false` to validate legacy shared
+CRT/Z3 builds. Local automation that supplies a shared Z3 library or expects
+`libz3.dll` can set `OPENSHELL_WINDOWS_STATIC_RUNTIME=0`.
 Pushes to `windows` and manual runs on that branch seed the lint/test caches and run dependent
 release binary builds. Those jobs use `continue-on-error: true`, so inspect
 their individual results rather than treating a green workflow as qualification.
