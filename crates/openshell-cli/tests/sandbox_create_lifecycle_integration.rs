@@ -10,28 +10,26 @@ use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::load_last_sandbox;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
     CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
     CreateSshSessionResponse, DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, DeleteSandboxTemplateRequest, DetachSandboxProviderRequest,
-    DetachSandboxProviderResponse, ExchangeProviderSubjectTokenRequest,
-    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxRequest, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
     GpuResourceRequirements, HealthRequest, HealthResponse, ListProvidersRequest,
     ListProvidersResponse, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
     ListSandboxTemplatesRequest, ListSandboxTemplatesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PlatformEvent, Provider, ProviderResponse, ReportEndpointStatusRequest,
-    ReportEndpointStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
-    SandboxCondition, SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus,
-    SandboxStreamEvent, SandboxTemplateResponse, SandboxWorkloadTemplate, ServiceStatus,
-    SettingValue, SupervisorMessage, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event, tcp_forward_frame,
-    tcp_forward_init,
+    ListSandboxesResponse, PlatformEvent, Provider, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
+    SandboxResponse, SandboxStatus, SandboxStreamEvent, SandboxTemplateResponse,
+    SandboxWorkloadTemplate, ServiceStatus, SettingValue, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
+    tcp_forward_frame, tcp_forward_init,
 };
+use openshell_server::test_support::grpc::open_shell_server::{OpenShell, OpenShellServer};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -102,68 +100,12 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
-    async fn get_sandbox_provider_access_token(
+    // The rejected-suspend test checks that this error preserves active forwards.
+    async fn suspend_sandbox(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxProviderAccessTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxProviderAccessTokenResponse>, Status>
-    {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_notify_config_update(
-        &self,
-        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
-    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_report_provider_readiness(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_report_endpoint_status(
-        &self,
-        _request: tonic::Request<ReportEndpointStatusRequest>,
-    ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_get_sandbox_provider_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn begin_rootfs_tar_staging(
-        &self,
-        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
-    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn report_main_process_exit(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn finalize_main_process_exit(
-        &self,
-        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
-    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn get_current_user(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
-    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn health(
@@ -174,13 +116,6 @@ impl OpenShell for TestOpenShell {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
-    }
-
-    async fn get_gateway_info(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
-    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
-        Err(Status::unimplemented("unused"))
     }
 
     async fn create_sandbox(
@@ -251,27 +186,6 @@ impl OpenShell for TestOpenShell {
             sandbox: Some(sandbox),
             ..Default::default()
         }))
-    }
-
-    async fn start_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn suspend_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn resume_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
     }
 
     async fn get_sandbox(
@@ -464,24 +378,6 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
-    async fn get_sandbox_provider_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
-        Err(Status::unimplemented(
-            "provider readiness is not exercised by this mock",
-        ))
-    }
-
-    async fn report_provider_readiness(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
-        Err(Status::unimplemented(
-            "provider installation reports are not exercised by this mock",
-        ))
-    }
-
     async fn get_sandbox_provider_environment(
         &self,
         _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
@@ -549,20 +445,6 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    async fn list_services(
-        &self,
-        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn delete_service(
-        &self,
-        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
@@ -573,25 +455,11 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
-    async fn exchange_provider_subject_token(
-        &self,
-        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
     async fn create_provider(
         &self,
         _request: tonic::Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         Ok(Response::new(ProviderResponse::default()))
-    }
-
-    async fn get_provider_credentials(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
-        Err(Status::unimplemented("not used by this mock"))
     }
 
     async fn get_provider(
@@ -651,66 +519,11 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    async fn import_provider_profiles(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
-    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn update_provider_profiles(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UpdateProviderProfilesRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn lint_provider_profiles(
-        &self,
-        _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
-    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn delete_provider_profile(
-        &self,
-        _request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         Ok(Response::new(ProviderResponse::default()))
-    }
-    async fn get_provider_refresh_status(
-        &self,
-        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn configure_provider_refresh(
-        &self,
-        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
-    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn rotate_provider_credential(
-        &self,
-        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
-    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn delete_provider_refresh(
-        &self,
-        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
-        Err(Status::unimplemented("unused"))
     }
 
     async fn delete_provider(
@@ -722,17 +535,10 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
-    type WatchSandboxStream =
-        tokio_stream::wrappers::ReceiverStream<Result<SandboxStreamEvent, Status>>;
-    type ExecSandboxStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
-    type ConnectSupervisorStream =
-        tokio_stream::wrappers::ReceiverStream<Result<GatewayMessage, Status>>;
-
     async fn watch_sandbox(
         &self,
         request: tonic::Request<WatchSandboxRequest>,
-    ) -> Result<Response<Self::WatchSandboxStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<SandboxStreamEvent>>, Status> {
         let request = request.into_inner();
         let sandbox_id = format!("id-{}", request.sandbox);
         let (tx, rx) = mpsc::channel(4);
@@ -964,199 +770,27 @@ impl OpenShell for TestOpenShell {
                 .await;
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
     }
 
     async fn exec_sandbox(
         &self,
         _request: tonic::Request<ExecSandboxRequest>,
-    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<ExecSandboxEvent>>, Status> {
         let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
     }
-
-    type ExecSandboxInteractiveStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
-    async fn exec_sandbox_interactive(
-        &self,
-        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
-    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn update_config(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_sandbox_policies(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_sandbox_configuration(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_endpoint_status(
-        &self,
-        _request: tonic::Request<ReportEndpointStatusRequest>,
-    ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_logs(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxLogsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn push_sandbox_logs(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PushSandboxLogsRequest>>,
-    ) -> Result<Response<openshell_core::proto::PushSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn submit_policy_analysis(
-        &self,
-        _request: tonic::Request<openshell_core::proto::SubmitPolicyAnalysisRequest>,
-    ) -> Result<Response<openshell_core::proto::SubmitPolicyAnalysisResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_policy(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftPolicyResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn reject_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RejectDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::RejectDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_all_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveAllDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveAllDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn edit_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::EditDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::EditDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn undo_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UndoDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::UndoDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn clear_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ClearDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ClearDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_history(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn issue_sandbox_token(
-        &self,
-        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn refresh_sandbox_token(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn connect_supervisor(
-        &self,
-        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
-    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type RelayStreamStream =
-        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
-
-    async fn relay_stream(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<Response<Self::RelayStreamStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type PeerRelayStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::PeerRelayFrame, Status>,
-    >;
-
-    async fn peer_relay(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PeerRelayFrame>>,
-    ) -> Result<Response<Self::PeerRelayStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<Result<TcpForwardFrame, Status>>;
 
     /// Echo relay: validates the init frame like the gateway does, then sends
     /// every `Data` frame straight back.
     async fn forward_tcp(
         &self,
         request: tonic::Request<tonic::Streaming<TcpForwardFrame>>,
-    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<TcpForwardFrame>>, Status> {
         let mut inbound = request.into_inner();
         let Some(TcpForwardFrame {
             payload: Some(tcp_forward_frame::Payload::Init(init)),
@@ -1200,58 +834,9 @@ impl OpenShell for TestOpenShell {
                 }
             }
         });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
-    }
-
-    async fn create_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_workspaces(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn delete_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn add_workspace_member(
-        &self,
-        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
-    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn remove_workspace_member(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
-    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_workspace_members(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
-    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
     }
 }
 
