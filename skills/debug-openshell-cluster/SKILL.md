@@ -370,12 +370,13 @@ Common findings:
   generations dial host CID 2 over vsock; libkrun forwards to a protected host
   Unix socket, while QEMU uses a per-guest host port. Keep supervisor and runtime
   binaries compatible when creating new generations.
-- Provider files are missing or stale in a Docker sandbox: by default the
-  sandbox delivers provider files virtually by intercepting opens, and the
-  workload container has no provider-file volume, no `/run/openshell` mount,
-  and no `openshell.ai/provider-files` label. That is the expected state, not
-  a fault; debug it as an enforcement-probe or provider-attachment problem.
-  The same default delivery answers workload opens of exactly
+- Provider files are missing or stale in a sandbox: the sandbox runtime
+  delivers provider files by intercepting workload opens beneath
+  `/run/openshell/providers` and injecting a sealed in-memory descriptor. The
+  workload container has no provider-file volume or mount, so a missing mount
+  is not a fault; debug it as an enforcement-probe or provider-attachment
+  problem.
+- The same interception answers workload opens of exactly
   `/run/openshell-supervisor-ca/material/ca.crt` and `ca-bundle.crt` from a
   sealed in-memory copy of the installed files, so `fstat` on such an open
   descriptor reports a memfd inode while `stat` on the path reports the real
@@ -389,33 +390,6 @@ Common findings:
   `memfd_create` or sealing refused, or a descriptor or memory limit reached.
   Check the runtime's seccomp profile, procfs mount, and the container's file
   descriptor and memory limits.
-  The rest of this entry applies only to a gateway built with the experimental
-  `experimental-native-provider-files` Cargo feature of
-  `openshell-driver-docker`, which logs
-  `Experimental native provider-file volumes enabled for new sandboxes` at
-  startup. No gateway config field or environment variable enables it. In such
-  a build, on Docker Engine API 1.45 or newer, each new sandbox has an
-  `openshell-provider-files-<hash>` volume mounted in the workload container at `/.openshell/provider-files`
-  (writable) and, as its `public` subpath, at `/run/openshell` (read-only).
-  Check `docker inspect --format '{{json .Mounts}}' <workload-container>` and
-  the `openshell.ai/provider-files` label. The workload container logs
-  `Provider files delivered from a read-only mount` when the runtime accepted
-  the store. A workload container that exits at startup with
-  `provider file store failed validation` names the check that failed, such as
-  a public mount that is not read-only or not the volume's `public` directory;
-  the runtime does not fall back. Compare the mounts with the expected two, and
-  delete and recreate the sandbox if they differ. A workload container that
-  has both mounts but logs
-  `Provider files delivered virtually: kernel Landlock refuses opens in a replaced generation`
-  runs on a host kernel that failed the runtime's startup capability probe;
-  the store is valid and the sandbox intercepts opens as on an older daemon.
-  This is expected on kernels without the Landlock disconnected-directory
-  change and needs no repair. A provider update refused
-  with `replaced generations it cannot remove` means the runtime could not
-  delete old provider files from the volume. Sandboxes created by a default
-  build, or on an older daemon, have no such mounts and intercept every open
-  instead. Sandboxes created by an experimental build keep their volume and
-  mounts under a default build; delete removes the volume either way.
 - Sandbox startup reports an `isolation control contract` failure: inspect the supervisor and sandbox-runtime image versions and update them together. An older runtime or incompatible isolation capability set fails before workload startup. See the published Sandbox Runtimes documentation for trusted image override precedence.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
@@ -1795,7 +1769,6 @@ verify workload identity/memory survives and new connections reach the replaceme
 Shared serving leases last at most fifteen seconds from issuance, independently
 of configuration renewal; include membership failure detection when measuring a
 partition's stale-owner interval. Storage failures prevent renewal.
-
 
 Application ingress consumers call the separate `openshell.v1.ServiceDiscovery`
 service, rather than `OpenShell`. Discovery snapshots share a one-second cache

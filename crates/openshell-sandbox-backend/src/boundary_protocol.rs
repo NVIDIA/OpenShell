@@ -579,37 +579,6 @@ pub struct BoundaryConfig {
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
-    /// Driver-provisioned storage for provider files the workload opens
-    /// natively.
-    ///
-    /// Absent (the default, and what every bootstrap written before this
-    /// field existed decodes to), the runtime serves provider files
-    /// virtually: it intercepts every workload file open and injects an
-    /// in-memory descriptor. Present, the runtime validates the two mounts,
-    /// publishes provider files there, and stops intercepting read-only
-    /// opens. A declared store that fails validation stops the runtime; it
-    /// does not fall back. A driver that cannot provision a store must
-    /// leave this unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_file_store: Option<ProviderFileStore>,
-}
-
-/// Where the workload reads provider files the runtime writes.
-///
-/// Both paths name the same driver-owned filesystem. The runtime and the
-/// workload share one UID, so file modes cannot separate them; the two mounts
-/// do. See `openshell-sandbox`'s README for the invariants the runtime checks.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderFileStore {
-    /// Writable mount of the whole store, beneath the `/.openshell` hierarchy
-    /// that the mandatory Landlock baseline hides from the workload. It holds
-    /// a `public` directory and a `staging` directory, both owned by the
-    /// workload identity.
-    pub private_root: PathBuf,
-    /// Read-only mount of the store's `public` directory at the path the
-    /// workload reads, the parent of the `providers` directory.
-    pub public_root: PathBuf,
 }
 
 /// Default time a runtime keeps a workload frozen, after losing its
@@ -655,7 +624,6 @@ impl fmt::Debug for BoundaryConfig {
             .field("workload_identity", &self.workload_identity)
             .field("provisioning_evidence", &self.provisioning_evidence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
-            .field("provider_file_store", &self.provider_file_store)
             .finish()
     }
 }

@@ -27,6 +27,7 @@ const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
+#[cfg(any(test, target_arch = "x86_64"))]
 const BPF_JMP_JSET_K: u16 = 0x45;
 const BPF_ALU_AND_K: u16 = 0x54;
 const BPF_RET_K: u16 = 0x06;
@@ -60,20 +61,6 @@ pub(crate) const SETSOCKOPT_FAST_PATH: &[(i32, i32)] = &[
     (libc::SOL_SOCKET, libc::SO_REUSEADDR),
     (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
 ];
-
-/// Which workload file opens reach the notification broker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpenMediation {
-    /// Every `open`, `openat`, and `openat2` notifies. Required while the
-    /// broker serves provider files by descriptor injection.
-    All,
-    /// `open` and `openat` whose scalar flags request read-only access and
-    /// carry no creation, truncation, or temporary-file flag run natively.
-    /// Every other open, and every `openat2` (whose flags live in workload
-    /// memory), still notifies. Only valid when provider files are real files
-    /// the workload can read but not modify.
-    WriteCapable,
-}
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -204,13 +191,6 @@ impl NotificationProbeReport {
     #[must_use]
     pub fn scalar_setsockopt_fast_path(self) -> bool {
         self.features.0 & 8 != 0
-    }
-
-    /// Whether non-mutating read-only `open`/`openat` bypassed notification
-    /// while write-capable, creating, and truncating opens remained mediated.
-    #[must_use]
-    pub fn read_only_open_fast_path(self) -> bool {
-        self.features.0 & 16 != 0
     }
 }
 
@@ -413,20 +393,12 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 /// reconfigure an INET endpoint. Connected `send()`/null-destination
 /// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
 /// natively: the broker binds every INET socket to loopback before injecting
-/// it, and accepted sockets inherit their listener's binding.
+/// it, and accepted sockets inherit their listener's binding. `setsockopt`
+/// allows the [`SETSOCKOPT_FAST_PATH`] pairs in the filter. Every `open`,
+/// `openat`, and `openat2` notifies: the broker serves provider files by
+/// descriptor injection.
 pub fn install_workload_listener() -> io::Result<NotificationListener> {
-    install_workload_listener_with(OpenMediation::All)
-}
-
-/// Install the workload listener with an explicit file-open mediation mode.
-///
-/// `setsockopt` allows the [`SETSOCKOPT_FAST_PATH`] pairs in the filter.
-/// [`OpenMediation::WriteCapable`] additionally lets read-only `open` and
-/// `openat` run natively.
-pub fn install_workload_listener_with(
-    open_mediation: OpenMediation,
-) -> io::Result<NotificationListener> {
-    install_rules(&workload_filter_rules(open_mediation))
+    install_rules(&workload_filter_rules())
 }
 
 /// Qualify the notification ABI, set `no_new_privs` on the calling thread,
@@ -437,7 +409,7 @@ fn install_rules(rules: &[FilterRule]) -> io::Result<NotificationListener> {
     install_notification_filter(rules)
 }
 
-fn workload_filter_rules(open_mediation: OpenMediation) -> Vec<FilterRule> {
+fn workload_filter_rules() -> Vec<FilterRule> {
     #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
     let mut syscalls = vec![
         libc::SYS_socket,
@@ -464,21 +436,6 @@ fn workload_filter_rules(open_mediation: OpenMediation) -> Vec<FilterRule> {
             if syscall == libc::SYS_setsockopt {
                 return FilterRule::ScalarSetsockopt;
             }
-            if open_mediation == OpenMediation::WriteCapable {
-                if syscall == libc::SYS_openat {
-                    return FilterRule::WriteCapableOpen {
-                        syscall,
-                        flags_argument: 2,
-                    };
-                }
-                #[cfg(target_arch = "x86_64")]
-                if syscall == libc::SYS_open {
-                    return FilterRule::WriteCapableOpen {
-                        syscall,
-                        flags_argument: 1,
-                    };
-                }
-            }
             FilterRule::Notify(syscall)
         })
         .collect()
@@ -492,14 +449,12 @@ enum FilterRule {
     Notify(i64),
     /// `setsockopt`, allowing only [`SETSOCKOPT_FAST_PATH`] pairs natively.
     ScalarSetsockopt,
-    /// `open`/`openat`, notifying unless the scalar flags are read-only.
-    WriteCapableOpen { syscall: i64, flags_argument: u32 },
 }
 
 impl FilterRule {
     const fn syscall(self) -> i64 {
         match self {
-            Self::Notify(syscall) | Self::WriteCapableOpen { syscall, .. } => syscall,
+            Self::Notify(syscall) => syscall,
             Self::ScalarSetsockopt => libc::SYS_setsockopt,
         }
     }
@@ -515,9 +470,8 @@ pub fn probe_notification_api() -> io::Result<NotificationProbeReport> {
     probe_addfd_send()?;
     probe_connected_sendto_fast_path()?;
     probe_scalar_setsockopt_fast_path()?;
-    probe_read_only_open_fast_path()?;
     Ok(NotificationProbeReport {
-        features: NotificationProbeFeatures(1 | 2 | 4 | 8 | 16),
+        features: NotificationProbeFeatures(1 | 2 | 4 | 8),
     })
 }
 
@@ -862,110 +816,6 @@ fn probe_scalar_setsockopt_fast_path() -> io::Result<()> {
     Ok(())
 }
 
-/// Raw `openat` of `/` whose flags keep all 64 argument bits.
-fn raw_open_root(flags: u64) -> io::Result<OwnedFd> {
-    // SAFETY: the path is a live NUL-terminated string; a nonnegative result
-    // is one newly owned descriptor.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_openat,
-            libc::AT_FDCWD,
-            c"/".as_ptr(),
-            flags,
-            0_u64,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = RawFd::try_from(result)
-        .map_err(|_| io::Error::other("opened descriptor does not fit RawFd"))?;
-    // SAFETY: the successful open returned one owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn probe_read_only_open_fast_path() -> io::Result<()> {
-    const HIGH_WORD: u64 = 1 << 32;
-    let read_only = unsigned_argument(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
-    let write_only = unsigned_argument(libc::O_WRONLY | libc::O_CLOEXEC);
-    let read_write = unsigned_argument(libc::O_RDWR | libc::O_CLOEXEC);
-    // A read-only access mode that can still create or truncate.
-    let creating = unsigned_argument(libc::O_RDONLY | libc::O_CREAT | libc::O_CLOEXEC);
-    let truncating = unsigned_argument(libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC);
-    let temporary = unsigned_argument(libc::O_RDONLY | libc::O_TMPFILE | libc::O_CLOEXEC);
-
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let launcher = thread::spawn(move || -> io::Result<()> {
-        let listener = install_rules(&[FilterRule::WriteCapableOpen {
-            syscall: libc::SYS_openat,
-            flags_argument: 2,
-        }])?;
-        sender
-            .send(listener)
-            .map_err(|_| io::Error::other("open broker disappeared"))?;
-        // A read-only open runs in the kernel and returns a real descriptor.
-        drop(raw_open_root(read_only)?);
-        // Write-capable, creating, truncating, and temporary-file opens and
-        // unrepresentable flags notify, in order.
-        for (flags, name) in [
-            (creating, "read-only creating open"),
-            (truncating, "read-only truncating open"),
-            (temporary, "read-only temporary-file open"),
-        ] {
-            expect_errno(raw_open_root(flags).map(drop), libc::EACCES, name)?;
-        }
-        expect_errno(
-            raw_open_root(write_only).map(drop),
-            libc::EACCES,
-            "write-only open",
-        )?;
-        expect_errno(
-            raw_open_root(read_write).map(drop),
-            libc::EACCES,
-            "read-write open",
-        )?;
-        expect_errno(
-            raw_open_root(read_only | HIGH_WORD).map(drop),
-            libc::EINVAL,
-            "open flags with a nonzero upper word",
-        )
-    });
-
-    let Ok(listener) = receiver.recv() else {
-        return Err(launcher_failure(launcher, "open"));
-    };
-    for (flags, errno) in [
-        (creating, libc::EACCES),
-        (truncating, libc::EACCES),
-        (temporary, libc::EACCES),
-        (write_only, libc::EACCES),
-        (read_write, libc::EACCES),
-        (read_only | HIGH_WORD, libc::EINVAL),
-    ] {
-        let notification = match receive_probe_notification(&listener) {
-            Ok(notification) => notification,
-            Err(error) => {
-                return Err(match launcher.join() {
-                    Ok(Err(launcher_error)) => launcher_error,
-                    _ => error,
-                });
-            }
-        };
-        if i64::from(notification.syscall) != libc::SYS_openat || notification.args[2] != flags {
-            let _ = listener.respond_errno(notification.id, libc::EIO);
-            let _ = launcher.join();
-            return Err(io::Error::other(
-                "read-only open fast path notified an unexpected call",
-            ));
-        }
-        listener.respond_errno(notification.id, errno)?;
-    }
-    launcher
-        .join()
-        .map_err(|_| io::Error::other("open launcher panicked"))??;
-    Ok(())
-}
-
 /// Recover the real error from a probe launcher that exited before handing its
 /// listener to the broker.
 ///
@@ -1076,13 +926,6 @@ fn build_filter(rules: &[FilterRule]) -> io::Result<Vec<libc::sock_filter>> {
                 append_setsockopt_filter(&mut program)?;
                 continue;
             }
-            FilterRule::WriteCapableOpen {
-                syscall,
-                flags_argument,
-            } => {
-                append_write_capable_open_filter(&mut program, syscall, flags_argument)?;
-                continue;
-            }
         };
         if syscall == libc::SYS_sendto {
             append_sendto_filter(&mut program)?;
@@ -1172,44 +1015,6 @@ fn append_setsockopt_filter(program: &mut Vec<libc::sock_filter>) -> io::Result<
         ]);
     }
     program.push(stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF));
-    Ok(())
-}
-
-/// Flags that make an `open`/`openat` able to change the filesystem.
-///
-/// `O_RDONLY` is zero, so any access-mode bit requests write access (the
-/// kernel also treats the reserved mode 3 as write-capable). `O_CREAT` can
-/// create a file and `O_TRUNC` can truncate one even when the access mode is
-/// read-only. `O_TMPFILE` includes the `O_DIRECTORY` bit, which an ordinary
-/// directory open also sets, so only its own bit counts here.
-const MUTATING_OPEN_FLAGS: libc::c_int =
-    libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC | (libc::O_TMPFILE & !libc::O_DIRECTORY);
-
-/// Allow `open`/`openat` whose scalar flags request read-only access with no
-/// creation, truncation, or temporary-file flag; notify every other open.
-///
-/// The kernel reads the flags as a C `int`. A nonzero upper word notifies so
-/// the broker keeps its existing treatment of an unrepresentable flags
-/// argument.
-fn append_write_capable_open_filter(
-    program: &mut Vec<libc::sock_filter>,
-    syscall: i64,
-    flags_argument: u32,
-) -> io::Result<()> {
-    let syscall = u32::try_from(syscall)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative syscall number"))?;
-    let mutating = u32::try_from(MUTATING_OPEN_FLAGS)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative open flag mask"))?;
-    program.extend([
-        jump(BPF_JMP_JEQ_K, syscall, 0, 7),
-        stmt(BPF_LD_W_ABS, argument_word_offset(flags_argument, 1)),
-        jump(BPF_JMP_JEQ_K, 0, 1, 0),
-        stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
-        stmt(BPF_LD_W_ABS, argument_word_offset(flags_argument, 0)),
-        jump(BPF_JMP_JSET_K, mutating, 0, 1),
-        stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
-        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
-    ]);
     Ok(())
 }
 
@@ -1407,8 +1212,8 @@ mod tests {
     #[test]
     fn workload_filter_allows_only_whitelisted_scalar_setsockopt() {
         const HIGH: u64 = 1 << 32;
-        for mediation in [OpenMediation::All, OpenMediation::WriteCapable] {
-            let program = build_filter(&workload_filter_rules(mediation)).unwrap();
+        {
+            let program = build_filter(&workload_filter_rules()).unwrap();
             let decide = |level: u64, option: u64| {
                 evaluate(
                     &program,
@@ -1479,8 +1284,8 @@ mod tests {
             assert_eq!(program[pc].k, native_audit_arch());
             assert_eq!(program[pc + 1].k, SECCOMP_RET_KILL_PROCESS);
         };
-        for mediation in [OpenMediation::All, OpenMediation::WriteCapable] {
-            let program = build_filter(&workload_filter_rules(mediation)).unwrap();
+        {
+            let program = build_filter(&workload_filter_rules()).unwrap();
             unsupported_arch(&program);
             let decide = |syscall: i64, args: [u64; 6]| evaluate(&program, syscall, args);
             // Mediated syscalls on either side of setsockopt and openat in
@@ -1532,89 +1337,31 @@ mod tests {
     }
 
     #[test]
-    fn open_mediation_selects_which_opens_notify() {
-        const HIGH: u64 = 1 << 32;
-        let all = build_filter(&workload_filter_rules(OpenMediation::All)).unwrap();
-        let write_capable =
-            build_filter(&workload_filter_rules(OpenMediation::WriteCapable)).unwrap();
-        let openat = |program: &[libc::sock_filter], flags: u64| {
-            evaluate(program, libc::SYS_openat, [0, 0x1000, flags, 0, 0, 0])
-        };
+    fn workload_filter_notifies_every_open() {
+        let program = build_filter(&workload_filter_rules()).unwrap();
         for flags in [
             libc::O_RDONLY,
             libc::O_RDONLY | libc::O_CLOEXEC,
             libc::O_RDONLY | libc::O_DIRECTORY,
-            libc::O_RDONLY | libc::O_PATH,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
-        ] {
-            assert_eq!(openat(&all, arg(flags)), SECCOMP_RET_USER_NOTIF);
-            assert_eq!(
-                openat(&write_capable, arg(flags)),
-                SECCOMP_RET_ALLOW,
-                "{flags:#o}"
-            );
-            assert_eq!(
-                openat(&write_capable, arg(flags) | HIGH),
-                SECCOMP_RET_USER_NOTIF,
-                "upper flag word {flags:#o}"
-            );
-        }
-        for flags in [
             libc::O_WRONLY,
-            libc::O_RDWR,
-            libc::O_ACCMODE,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            libc::O_RDWR | libc::O_CLOEXEC,
-            // A read-only access mode can still create or truncate a file.
-            libc::O_RDONLY | libc::O_CREAT,
-            libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-            libc::O_RDONLY | libc::O_TRUNC,
-            libc::O_RDONLY | libc::O_CREAT | libc::O_TRUNC,
-            libc::O_RDONLY | libc::O_TMPFILE,
-            libc::O_RDONLY | (libc::O_TMPFILE & !libc::O_DIRECTORY),
-            libc::O_RDWR | libc::O_TMPFILE,
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
         ] {
-            assert_eq!(openat(&all, arg(flags)), SECCOMP_RET_USER_NOTIF);
             assert_eq!(
-                openat(&write_capable, arg(flags)),
+                evaluate(&program, libc::SYS_openat, [0, 0x1000, arg(flags), 0, 0, 0]),
+                SECCOMP_RET_USER_NOTIF,
+                "{flags:#o}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                evaluate(&program, libc::SYS_open, [0x1000, arg(flags), 0, 0, 0, 0]),
                 SECCOMP_RET_USER_NOTIF,
                 "{flags:#o}"
             );
         }
-        // openat2 carries its flags in workload memory and always notifies.
-        for program in [&all, &write_capable] {
-            assert_eq!(
-                evaluate(program, libc::SYS_openat2, [0, 0x1000, 0x2000, 24, 0, 0]),
-                SECCOMP_RET_USER_NOTIF
-            );
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            let open = |program: &[libc::sock_filter], flags: u64| {
-                evaluate(program, libc::SYS_open, [0x1000, flags, 0, 0, 0, 0])
-            };
-            assert_eq!(open(&all, arg(libc::O_RDONLY)), SECCOMP_RET_USER_NOTIF);
-            assert_eq!(open(&write_capable, arg(libc::O_RDONLY)), SECCOMP_RET_ALLOW);
-            assert_eq!(
-                open(&write_capable, arg(libc::O_WRONLY)),
-                SECCOMP_RET_USER_NOTIF
-            );
-            for flags in [
-                libc::O_RDONLY | libc::O_CREAT,
-                libc::O_RDONLY | libc::O_TRUNC,
-                libc::O_RDONLY | libc::O_TMPFILE,
-            ] {
-                assert_eq!(
-                    open(&write_capable, arg(flags)),
-                    SECCOMP_RET_USER_NOTIF,
-                    "{flags:#o}"
-                );
-            }
-            assert_eq!(
-                open(&write_capable, arg(libc::O_RDONLY) | HIGH),
-                SECCOMP_RET_USER_NOTIF
-            );
-        }
+        assert_eq!(
+            evaluate(&program, libc::SYS_openat2, [0, 0x1000, 0x2000, 24, 0, 0]),
+            SECCOMP_RET_USER_NOTIF
+        );
     }
 
     #[test]
@@ -1631,7 +1378,6 @@ mod tests {
     fn active_notification_probe_passes() {
         let report = probe_notification_api().expect("active notification probe");
         assert!(report.scalar_setsockopt_fast_path());
-        assert!(report.read_only_open_fast_path());
         assert!(report.notification_round_trip());
         assert!(report.addfd_send());
         assert!(report.connected_send_fast_path());

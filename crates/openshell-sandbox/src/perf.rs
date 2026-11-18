@@ -3,16 +3,12 @@
 
 //! Opt-in microbenchmarks for the production seccomp network listener.
 //!
-//! Besides the production broker, two harness-only layers attribute the cost
-//! of a workload file open. Neither exists outside this feature, and neither
-//! adds a switch to the production runtime:
-//!
-//! - `notify-only` installs the production filter and answers every
-//!   notification with "continue" from a loop that reads no workload memory.
-//!   Against `filtered`, it separates the notification round trip from the
-//!   broker's path-prefix copy.
-//! - `native-opens` runs the production broker with native provider-file
-//!   delivery, whose filter leaves read-only opens in the kernel.
+//! Besides the production broker, one harness-only layer attributes the cost
+//! of a workload file open. It exists only under this feature and adds no
+//! switch to the production runtime: `notify-only` installs the production
+//! filter and answers every notification with "continue" from a loop that
+//! reads no workload memory. Against `filtered`, it separates the
+//! notification round trip from the broker's path-prefix copy.
 //!
 //! `--landlock` additionally confines the worker with a Landlock domain, to
 //! show what the filesystem hook adds to an open in any layer.
@@ -51,28 +47,19 @@ pub enum Layer {
     /// Harness only: the production filter answered by a loop that continues
     /// every notification without reading workload memory.
     NotifyOnly,
-    /// The production broker with native provider-file delivery; read-only
-    /// opens do not notify.
-    NativeOpens,
 }
 
 impl Layer {
     /// `all` is the original native/filtered pair, so existing invocations
-    /// keep measuring what they measured. `attribution` adds the layers that
-    /// separate the parts of a file open.
+    /// keep measuring what they measured. `attribution` adds the layer that
+    /// separates the parts of a file open.
     pub fn selection(value: &str) -> anyhow::Result<Vec<Self>> {
         match value {
             "all" => Ok(vec![Self::Native, Self::Filtered]),
-            "attribution" => Ok(vec![
-                Self::Native,
-                Self::NotifyOnly,
-                Self::Filtered,
-                Self::NativeOpens,
-            ]),
+            "attribution" => Ok(vec![Self::Native, Self::NotifyOnly, Self::Filtered]),
             "native" => Ok(vec![Self::Native]),
             "filtered" => Ok(vec![Self::Filtered]),
             "notify-only" => Ok(vec![Self::NotifyOnly]),
-            "native-opens" => Ok(vec![Self::NativeOpens]),
             _ => bail!("unknown layer {value}"),
         }
     }
@@ -219,8 +206,6 @@ struct LayerRuntime {
     launcher: workload_launcher::WorkloadLauncher,
     /// Present when the production broker serves the layer.
     broker: Option<NetworkBroker>,
-    /// Keeps a native provider-file store alive for the layer.
-    _store: Option<tempfile::TempDir>,
 }
 
 impl LayerRuntime {
@@ -247,7 +232,6 @@ impl LayerRuntime {
                 Ok(Some(Self {
                     launcher,
                     broker: Some(broker),
-                    _store: None,
                 }))
             }
             Layer::NotifyOnly => {
@@ -278,25 +262,6 @@ impl LayerRuntime {
                 Ok(Some(Self {
                     launcher,
                     broker: None,
-                    _store: None,
-                }))
-            }
-            Layer::NativeOpens => {
-                let directory = tempfile::tempdir().context("create provider file store")?;
-                let store =
-                    crate::provider_store::NativeStore::open_unmounted_for_test(directory.path())
-                        .context("open provider file store")?;
-                let provider_files = crate::provider_files::ProviderFiles::native_for_test(store);
-                let (launcher, listener) =
-                    workload_launcher::start_with(provider_files.open_mediation())?;
-                prepare(&listener)?;
-                let broker =
-                    NetworkBroker::start_for_test_with_provider_files(listener, provider_files)?;
-                broker.confirm_healthy()?;
-                Ok(Some(Self {
-                    launcher,
-                    broker: Some(broker),
-                    _store: Some(directory),
                 }))
             }
         }
@@ -1082,7 +1047,6 @@ mod tests {
             ("all", "file", 4_096),
             ("attribution", "file", 4_096),
             ("notify-only", "file-open-read", 4_096),
-            ("native-opens", "file-open-read", 4_096),
             // Only file operations open one.
             ("filtered", "all", 4_096),
             ("filtered", "tcp-connect", 4_096),

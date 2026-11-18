@@ -6,17 +6,15 @@
 //!
 //! The runtime installs both as real read-only files beneath
 //! `SUPERVISOR_CA_RUNTIME_DIR` before the workload starts, and the child
-//! Landlock grants keep that directory readable. Under virtual provider-file
-//! delivery every workload open already notifies the broker, and a plain
-//! read-only `open` or `openat` of exactly one of the two canonical paths is
-//! answered from this cache with the same immutable, sealed delivery a
-//! provider file receives. Every other open of those paths continues to the
-//! kernel, as it did before the cache existed.
+//! Landlock grants keep that directory readable. Every workload open already
+//! notifies the broker, and a plain read-only `open` or `openat` of exactly
+//! one of the two canonical paths is answered from this cache with the same
+//! immutable, sealed delivery a provider file receives. Every other open of
+//! those paths continues to the kernel, as it did before the cache existed.
 //!
 //! The installed files remain the compatibility source: `stat` and other
 //! metadata checks, `O_PATH` and `O_DIRECTORY` opens, `openat2`, relative
-//! opens, aliases such as a path through `..`, and native provider-file
-//! delivery (which does not mediate read-only opens) all reach them. The
+//! opens, and aliases such as a path through `..` all reach them. The
 //! standard TLS environment variables and the image's system trust store are
 //! untouched, and no private key is ever here: both files are public
 //! material the supervisor already sends the workload.

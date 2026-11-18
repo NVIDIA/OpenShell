@@ -3,12 +3,11 @@
 
 """Tests for the supervisor CA trust files a default sandbox receives.
 
-Verifies, through the default delivery path, that the workload finds the
-supervisor CA certificate and the combined trust bundle where the TLS
-environment variables point, that metadata checks, O_PATH and O_DIRECTORY
-opens, relative opens, and canonical opens keep their native results, and
-that Python's TLS stack loads the bundle as a trust store containing the
-supervisor CA.
+Verifies that the workload finds the supervisor CA certificate and the
+combined trust bundle where the TLS environment variables point, that metadata
+checks, O_PATH and O_DIRECTORY opens, relative opens, and canonical opens keep
+their native results, and that Python's TLS stack loads the bundle as a trust
+store containing the supervisor CA.
 """
 
 from __future__ import annotations

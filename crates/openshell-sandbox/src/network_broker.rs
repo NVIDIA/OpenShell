@@ -245,35 +245,15 @@ pub struct NetworkBroker {
 
 impl NetworkBroker {
     /// Start the broker for `listener`.
-    ///
-    /// `provider_files` must be the delivery whose
-    /// [`open_mediation`](crate::provider_files::ProviderFiles::open_mediation)
-    /// the listener was installed with.
     pub(crate) fn start(
         listener: NotificationListener,
         protected_control_port: Option<u16>,
-        provider_files: crate::provider_files::ProviderFiles,
     ) -> io::Result<Self> {
         Self::start_configured(
             listener,
             DNS_RELAY_ADDRESS,
             protected_control_port,
             NETWORK_DECISION_TIMEOUT,
-            provider_files,
-        )
-    }
-
-    #[cfg(any(test, feature = "perf-harness"))]
-    pub(crate) fn start_for_test_with_provider_files(
-        listener: NotificationListener,
-        provider_files: crate::provider_files::ProviderFiles,
-    ) -> io::Result<Self> {
-        Self::start_configured(
-            listener,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            None,
-            NETWORK_DECISION_TIMEOUT,
-            provider_files,
         )
     }
 
@@ -312,7 +292,6 @@ impl NetworkBroker {
             dns_address,
             protected_control_port,
             decision_timeout,
-            crate::provider_files::ProviderFiles::default(),
         )
     }
 
@@ -321,8 +300,8 @@ impl NetworkBroker {
         dns_address: SocketAddr,
         protected_control_port: Option<u16>,
         decision_timeout: Duration,
-        provider_files: crate::provider_files::ProviderFiles,
     ) -> io::Result<Self> {
+        let provider_files = crate::provider_files::ProviderFiles::default();
         let listener = Arc::new(listener);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
@@ -2912,143 +2891,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(scratch.path().join("created")).unwrap(),
             "created"
-        );
-        broker.confirm_healthy().expect("broker stays healthy");
-    }
-
-    #[test]
-    fn native_provider_files_are_real_files_read_without_notification() {
-        use crate::linux::seccomp_notify::OpenMediation;
-        use crate::provider_files::ProviderFiles;
-        use crate::provider_store::NativeStore;
-        use std::os::unix::fs::MetadataExt as _;
-
-        let directory = tempfile::tempdir().unwrap();
-        let store = NativeStore::open_unmounted_for_test(directory.path()).unwrap();
-        let provider_files = ProviderFiles::native_for_test(store);
-        assert_eq!(provider_files.open_mediation(), OpenMediation::WriteCapable);
-        let (launcher, listener) =
-            crate::linux::workload_launcher::start_with(provider_files.open_mediation())
-                .expect("start workload launcher");
-        let broker = NetworkBroker::start_for_test_with_provider_files(listener, provider_files)
-            .expect("start broker");
-        // The workload reads through the store's public directory, which a
-        // driver mounts read-only at /run/openshell.
-        let path = "/run/openshell/providers/acme/client.toml".to_string();
-        let exposed = directory.path().join("public/providers/acme/client.toml");
-        let store_device = std::fs::metadata(directory.path()).unwrap().dev();
-
-        broker
-            .provider_files()
-            .replace(HashMap::from([(path.clone(), "version = 1\n".into())]))
-            .unwrap();
-        let (first, device) = launcher
-            .execute({
-                let exposed = exposed.clone();
-                move || -> io::Result<(String, u64)> {
-                    let mut file = std::fs::File::open(exposed)?;
-                    let device = file.metadata()?.dev();
-                    let mut content = String::new();
-                    io::Read::read_to_string(&mut file, &mut content)?;
-                    Ok((content, device))
-                }
-            })
-            .unwrap()
-            .expect("native open");
-        assert_eq!(first, "version = 1\n");
-        assert_eq!(device, store_device, "a real file, not an injected memfd");
-        let mut old_descriptor = launcher
-            .execute({
-                let exposed = exposed.clone();
-                move || std::fs::File::open(exposed)
-            })
-            .unwrap()
-            .expect("open old version");
-
-        // The provider path itself is no longer served by injection: under
-        // native delivery it is whatever the mount shows, and this test has
-        // no mount there.
-        let unserved = launcher
-            .execute({
-                let path = path.clone();
-                move || std::fs::read(path)
-            })
-            .unwrap();
-        assert!(unserved.is_err(), "native delivery must not inject a memfd");
-
-        broker
-            .provider_files()
-            .replace(HashMap::from([(path, "version = 2\n".into())]))
-            .unwrap();
-        let mut old_content = String::new();
-        io::Read::read_to_string(&mut old_descriptor, &mut old_content).unwrap();
-        assert_eq!(old_content, "version = 1\n");
-        let second = launcher
-            .execute({
-                let exposed = exposed.clone();
-                move || std::fs::read_to_string(exposed)
-            })
-            .unwrap()
-            .expect("second open");
-        assert_eq!(second, "version = 2\n");
-
-        // Mediated opens still reach the broker and are continued: a
-        // write-capable open and openat2 both work on an ordinary file.
-        let scratch = directory.path().join("scratch");
-        let written = launcher
-            .execute({
-                move || -> io::Result<String> {
-                    std::fs::write(&scratch, "written")?;
-                    let path = std::ffi::CString::new(scratch.to_str().unwrap()).unwrap();
-                    let how = [libc::O_CLOEXEC as u64, 0, 0];
-                    let fd = unsafe {
-                        libc::syscall(
-                            libc::SYS_openat2,
-                            libc::AT_FDCWD,
-                            path.as_ptr(),
-                            how.as_ptr(),
-                            24_usize,
-                        )
-                    };
-                    if fd < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let mut file = unsafe {
-                        std::fs::File::from_raw_fd(i32::try_from(fd).expect("open fd fits"))
-                    };
-                    let mut content = String::new();
-                    io::Read::read_to_string(&mut file, &mut content)?;
-                    Ok(content)
-                }
-            })
-            .unwrap()
-            .expect("mediated opens continue");
-        assert_eq!(written, "written");
-
-        broker.provider_files().replace(HashMap::new()).unwrap();
-        let detached = launcher.execute(move || std::fs::read(exposed)).unwrap();
-        assert_eq!(detached.unwrap_err().raw_os_error(), Some(libc::ENOENT));
-
-        // Native delivery keeps the installed CA files as the workload's
-        // source: the pair is still checked, but nothing is cached for
-        // injection, since read-only opens never notify.
-        let cert = "-----BEGIN CERTIFICATE-----\nnative\n-----END CERTIFICATE-----\n";
-        broker
-            .provider_files()
-            .publish_ca_trust(cert.as_bytes(), format!("system\n{cert}").as_bytes())
-            .expect("a valid pair is accepted under native delivery");
-        assert!(
-            broker
-                .provider_files()
-                .publish_ca_trust(cert.as_bytes(), b"system only\n")
-                .is_err()
-        );
-        assert!(broker.provider_files().ca_trust().is_none());
-        broker.provider_files().clear_ca_trust();
-        assert_eq!(
-            broker.provider_files().open_mediation(),
-            OpenMediation::WriteCapable,
-            "CA handling adds no open mediation to native delivery"
         );
         broker.confirm_healthy().expect("broker stays healthy");
     }

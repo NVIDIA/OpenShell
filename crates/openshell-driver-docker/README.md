@@ -44,47 +44,6 @@ and sandbox bootstrap material. A second supervisor-only volume carries the
 supervisor JWT and gateway client credentials and is never mounted into the
 workload.
 
-By default the sandbox delivers provider files virtually: it intercepts
-workload opens through seccomp user notification, with Landlock withholding the
-backing files, and the driver adds no provider-file volume, mount, bootstrap
-field, or label. This is the supported path on every daemon.
-
-A native provider-file volume is an experiment, off by default. It is selected
-only at build time, by the `experimental-native-provider-files` Cargo feature
-of this crate; no gateway configuration field or environment variable enables
-it:
-
-```shell
-cargo build -p openshell-gateway \
-  --features openshell-driver-docker/experimental-native-provider-files
-```
-
-In a build with that feature, where the daemon supports volume subpaths (Engine
-API 1.45 or newer), each new
-sandbox also gets a dedicated provider-file volume, mounted twice into the
-workload container: the whole volume, writable, at
-`/.openshell/provider-files`, and its `public` subdirectory, read-only, at
-`/run/openshell`. The sandbox runtime writes provider files through the first
-and the workload reads them through the second without a seccomp notification
-per open. The volume carries no bootstrap key, socket, or supervisor
-credential. See [provider files](../openshell-sandbox/README.md#provider-files)
-for the invariants the runtime checks.
-
-The driver lays the volume out through a staging container that is never
-started, before it stages the sandbox bundle, because Docker resolves the
-subpath whenever it mounts the workload container's volumes. It records the
-store in the sandbox bootstrap as `provider_file_store` and labels the workload
-container `openshell.ai/provider-files=native`. On an older daemon, or one
-that reports no parsable API version, the driver
-creates neither the volume nor the mounts and omits the bootstrap field, and
-the sandbox serves provider files by intercepting opens, as in a default
-build. The driver
-makes this choice before it provisions anything: a sandbox whose bootstrap
-names a store that the runtime cannot validate does not start. A valid store
-on a kernel that fails the runtime's Landlock capability probe is different:
-the sandbox starts and intercepts opens, although the container keeps the
-`native` label and both mounts. See the sandbox README.
-
 The workload uses `network_mode=none`. Its seccomp user-notification broker
 mediates every supported TCP and DNS operation, attributes it to the calling
 binary, and sends the request across the private channel. The supervisor
@@ -142,9 +101,7 @@ traverse every parent and write and enter the workdir; OpenShell does not
 change its ownership or mode.
 
 Image `VOLUME` declarations and user mounts must not cover the workdir, one of
-its parents, the reserved `/.openshell` runtime/channel tree, or, when the
-provider-file volume is mounted, `/.openshell/provider-files` and
-`/run/openshell`. OpenShell asks
+its parents, or the reserved `/.openshell` runtime/channel tree. OpenShell asks
 the kernel to validate access under the final identity, so POSIX ACL and host
 LSM decisions remain authoritative.
 
@@ -160,7 +117,6 @@ LSM decisions remain authoritative.
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Omit `sandbox_pids_limit` to use OpenShell's default. Explicit zero is invalid. |
 | Private named volumes | Separate volumes carry sandbox bootstrap keys, the runtime-initiated Unix socket, and supervisor-only credentials. The supervisor mounts bootstrap keys read-only and only the socket volume writable. |
-| Provider-file volume | Mounted only into the workload container: writable beneath `/.openshell` for the runtime, and its `public` subdirectory read-only at `/run/openshell` for the workload. Experimental: present only in a build with `experimental-native-provider-files` on a daemon with volume subpaths. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
 
@@ -178,16 +134,8 @@ volumes. Start stages a fresh sandbox bootstrap bundle, restarts that workload,
 and creates a new supervisor companion. A durably stopped sandbox stays stopped
 across gateway restarts.
 
-A restarted container keeps the mounts and the saved bootstrap it was created
-with. A sandbox created by a default build, or on a daemon without volume
-subpaths, has no provider-file volume and keeps virtual provider files across
-restarts. A sandbox created by an experimental build keeps its provider-file
-volume and mounts when a default build restarts it. The runtime clears the
-provider-file volume's previous generation each time it starts.
-
-Delete force-removes both containers, the driver-owned runtime volumes
-(including a provider-file volume left by an experimental build, whichever
-build performs the delete), and the host-private runtime descriptor. Missing or altered descriptor and channel resources
+Delete force-removes both containers, the driver-owned runtime volumes, and the
+host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
 
 ## Driver Config Mounts
