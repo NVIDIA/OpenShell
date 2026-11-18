@@ -2148,6 +2148,7 @@ impl PodmanComputeDriver {
                 }
                 return Ok(());
             }
+            let restart_identity = restart_metadata.workload_identity.resolve()?;
             let archives =
                 crate::isolation::bootstrap_archives(crate::isolation::BootstrapArchivesInput {
                     runtime_initiated: restart_metadata.runtime_initiated,
@@ -2158,7 +2159,7 @@ impl PodmanComputeDriver {
                         .config
                         .resolved_host_gateway_ip()
                         .map_err(ComputeDriverError::from)?,
-                    identity: &restart_metadata.workload_identity,
+                    identity: &restart_identity,
                     allow_extra_supplementary_groups:
                         crate::isolation::userns_preserves_host_groups(
                             self.config.userns.as_deref(),
@@ -4470,9 +4471,10 @@ mod tests {
         )
         .unwrap();
         let bundle = serde_json::to_vec(&crate::isolation::RestartMetadata {
+            version: crate::isolation::RESTART_METADATA_VERSION,
             runtime_initiated: false,
             generation: "generation-1".to_string(),
-            workload_identity: identity,
+            workload_identity: (&identity).into(),
             child_env: HashMap::new(),
         })
         .unwrap();

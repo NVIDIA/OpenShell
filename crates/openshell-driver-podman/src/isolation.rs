@@ -181,12 +181,65 @@ pub struct BootstrapArchives {
     pub supervisor: Vec<u8>,
 }
 
+/// Plain-value form of a workload identity as stored in the restart file.
+///
+/// The restart file lives in the supervisor container's volume and survives
+/// gateway upgrades, so it must not depend on the serde encoding of a contract
+/// type. The five fields match the historical encoding. Decoding does not
+/// validate; call [`RestartIdentity::resolve`] (done by
+/// [`restart_metadata_from_slice`]) before using the values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartIdentity {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) supplementary_gids: Vec<u32>,
+    pub(crate) source: String,
+    pub(crate) resource_digest: String,
+}
+
+impl RestartIdentity {
+    pub(crate) fn resolve(&self) -> Result<ResolvedWorkloadIdentity, ComputeDriverError> {
+        ResolvedWorkloadIdentity::new(
+            self.uid,
+            self.gid,
+            self.supplementary_gids.clone(),
+            self.source.clone(),
+            self.resource_digest.clone(),
+        )
+        .map_err(invalid)
+    }
+}
+
+impl From<&ResolvedWorkloadIdentity> for RestartIdentity {
+    fn from(identity: &ResolvedWorkloadIdentity) -> Self {
+        Self {
+            uid: identity.uid,
+            gid: identity.gid,
+            supplementary_gids: identity.supplementary_gids.clone(),
+            source: identity.source.clone(),
+            resource_digest: identity.resource_digest.clone(),
+        }
+    }
+}
+
+/// Current layout of [`RestartMetadata`]. Files written before the field
+/// existed have no `version` and are layout 1. Bump it for a change an older
+/// driver cannot read, and keep reading the versions still in use.
+pub const RESTART_METADATA_VERSION: u32 = 1;
+
+fn legacy_restart_metadata_version() -> u32 {
+    RESTART_METADATA_VERSION
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestartMetadata {
+    #[serde(default = "legacy_restart_metadata_version")]
+    pub(crate) version: u32,
     pub(crate) generation: String,
     #[serde(default)]
     pub(crate) runtime_initiated: bool,
-    pub(crate) workload_identity: ResolvedWorkloadIdentity,
+    pub(crate) workload_identity: RestartIdentity,
     pub(crate) child_env: HashMap<String, String>,
 }
 
@@ -337,9 +390,10 @@ pub fn bootstrap_archives(
         &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
     )?;
     let restart_metadata = RestartMetadata {
+        version: RESTART_METADATA_VERSION,
         runtime_initiated,
         generation: generation.to_string(),
-        workload_identity: identity.clone(),
+        workload_identity: identity.into(),
         child_env,
     };
     supervisor.file(
@@ -365,7 +419,16 @@ pub fn bootstrap_archives(
 }
 
 pub fn restart_metadata_from_slice(bytes: &[u8]) -> Result<RestartMetadata, ComputeDriverError> {
-    serde_json::from_slice(bytes).map_err(invalid)
+    let metadata: RestartMetadata = serde_json::from_slice(bytes).map_err(invalid)?;
+    if metadata.version != RESTART_METADATA_VERSION {
+        return Err(invalid(format!(
+            "unsupported restart metadata version {}",
+            metadata.version
+        )));
+    }
+    // Validate on load so a stored identity cannot bypass the contract rules.
+    metadata.workload_identity.resolve()?;
+    Ok(metadata)
 }
 
 struct Archive<'a> {
@@ -626,7 +689,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(restart_metadata.workload_identity, identity);
+        assert_eq!(restart_metadata.workload_identity, (&identity).into());
         assert_eq!(restart_metadata.child_env, child_env);
         let restart_bytes = serde_json::to_vec(&restart_metadata).unwrap();
         assert!(
@@ -645,5 +708,56 @@ mod tests {
         assert!(!userns_preserves_host_groups(Some("auto")));
         assert!(!userns_preserves_host_groups(Some("private")));
         assert!(!userns_preserves_host_groups(None));
+    }
+
+    // Restart file as written before the identity became a plain-value record.
+    const LEGACY_RESTART_FILE: &str = r#"{"generation":"generation-1","runtime_initiated":true,"workload_identity":{"uid":1000,"gid":1001,"supplementary_gids":[2000],"source":"image","resource_digest":"sha256:image"},"child_env":{"PATH":"/agent/bin"}}"#;
+
+    #[test]
+    fn restart_file_written_by_previous_code_still_parses() {
+        let metadata = restart_metadata_from_slice(LEGACY_RESTART_FILE.as_bytes()).unwrap();
+        assert_eq!(metadata.version, RESTART_METADATA_VERSION);
+        assert_eq!(metadata.generation, "generation-1");
+        assert!(metadata.runtime_initiated);
+        let identity = metadata.workload_identity.resolve().unwrap();
+        assert_eq!(
+            (identity.uid, identity.gid, &identity.supplementary_gids[..]),
+            (1000, 1001, &[2000][..])
+        );
+        assert_eq!(identity.source, "image");
+        assert_eq!(identity.resource_digest, "sha256:image");
+    }
+
+    #[test]
+    fn rewritten_restart_file_differs_only_by_the_version() {
+        let metadata = restart_metadata_from_slice(LEGACY_RESTART_FILE.as_bytes()).unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let mut original: serde_json::Value = serde_json::from_str(LEGACY_RESTART_FILE).unwrap();
+        original["version"] = RESTART_METADATA_VERSION.into();
+        assert_eq!(rewritten, original);
+    }
+
+    #[test]
+    fn restart_file_with_an_unsupported_version_is_rejected() {
+        let file = LEGACY_RESTART_FILE.replacen('{', r#"{"version":2,"#, 1);
+        assert!(restart_metadata_from_slice(file.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn restart_file_with_invalid_identity_is_rejected() {
+        for identity in [
+            r#"{"uid":0,"gid":1001,"supplementary_gids":[],"source":"image","resource_digest":"d"}"#,
+            r#"{"uid":1000,"gid":0,"supplementary_gids":[],"source":"image","resource_digest":"d"}"#,
+            r#"{"uid":1000,"gid":1001,"supplementary_gids":[0],"source":"image","resource_digest":"d"}"#,
+            r#"{"uid":1000,"gid":1001,"supplementary_gids":[],"source":" ","resource_digest":"d"}"#,
+        ] {
+            let file =
+                format!(r#"{{"generation":"g","workload_identity":{identity},"child_env":{{}}}}"#);
+            assert!(
+                restart_metadata_from_slice(file.as_bytes()).is_err(),
+                "{identity}"
+            );
+        }
     }
 }
