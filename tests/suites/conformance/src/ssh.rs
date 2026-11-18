@@ -35,7 +35,11 @@ async fn ssh_host_identity_stable_across_stop_start_and_new_on_recreate(
         cli.gateway().name.is_some(),
         "this test needs a named gateway for `sandbox ssh-config`; set OPENSHELL_GATEWAY"
     );
-    let sandbox = ready_sandbox(cx).await?;
+    let sandbox = cx
+        .sandbox("hk")
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
     let name = sandbox.name().to_string();
     let original = fingerprint(cx, &sandbox).await?;
 
@@ -110,20 +114,17 @@ async fn ssh_host_identity_stable_across_stop_start_and_new_on_recreate(
         .wait_deleted(&name, testkit::DELETE_TIMEOUT, Some(sandbox.id()))
         .await
         .context(format!("wait for sandbox {name} to be deleted"))?;
-    let replacement = ready_sandbox(cx).await?;
+    let replacement = cx
+        .sandbox("hk")
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
     let replaced = fingerprint(cx, &replacement).await?;
     testkit::ensure!(
         replaced != original,
         "a new sandbox named {name} has the deleted one's host key {original}"
     );
     Ok(())
-}
-
-async fn ready_sandbox(cx: &Context) -> testkit::Result<Sandbox> {
-    cx.sandbox("hk")
-        .command(["sleep", "infinity"])
-        .create_ready()
-        .await
 }
 
 /// The sandbox's host key fingerprint, the same in get and list.
