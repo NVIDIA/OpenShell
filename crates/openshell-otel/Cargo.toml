@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-otel"
-description = "Shared OpenTelemetry trace and log export support for OpenShell services"
+description = "Shared OpenTelemetry export support for OpenShell services"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -24,7 +24,7 @@ openshell-ocsf = { path = "../openshell-ocsf", optional = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-http = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true, features = ["gzip-http", "http-proto", "logs"] }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["gzip-http", "http-proto", "logs", "metrics"] }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -39,7 +39,7 @@ zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
-opentelemetry-proto = { workspace = true, features = ["logs"] }
+opentelemetry-proto = { workspace = true, features = ["logs", "metrics"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost = { workspace = true }
 tempfile = "3"

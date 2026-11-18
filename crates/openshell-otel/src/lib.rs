@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared OpenTelemetry trace and log export support for `OpenShell` services.
+//! Shared OpenTelemetry export support for `OpenShell` services.
 //!
 //! The crate has two tiers:
 //!
 //! - Trace-context propagation, always compiled in: W3C `traceparent` /
 //!   `tracestate` extraction and injection for HTTP headers, tonic metadata,
 //!   and process environments.
-//! - The `export` feature (on by default): OTLP tracer providers, tracing
+//! - The `export` feature (on by default): OTLP tracer and meter providers, tracing
 //!   layers, compute-driver and gRPC tracing machinery, and the OCSF log
 //!   bridge. Services that report to a collector keep the default; clients
 //!   that only forward trace context (e.g. the CLI) opt out with
@@ -34,6 +34,8 @@ mod grpc;
 mod headers;
 #[cfg(feature = "export")]
 mod logs;
+#[cfg(feature = "export")]
+mod metrics;
 #[cfg(feature = "export")]
 mod ocsf;
 #[cfg(feature = "export")]

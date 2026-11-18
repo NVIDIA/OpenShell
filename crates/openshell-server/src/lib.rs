@@ -759,6 +759,7 @@ pub(crate) async fn run_server(
     startup: ServerStartupConfig,
     tracing_log_bus: TracingLogBus,
     compute_drivers: ComputeDriverRegistry,
+    metrics_recorder: Option<gateway_metrics::OtlpRecorder>,
 ) -> Result<()> {
     let ServerStartupConfig {
         config,
@@ -1129,17 +1130,14 @@ pub(crate) async fn run_server(
     // Install the recorder before the endpoint-status startup reconciliation so
     // the lock waits and timeouts recorded there are exported. Its listener
     // binds with the others.
-    let metrics_endpoint = config
-        .metrics_bind_address
-        .map(|metrics_bind_address| {
-            gateway_metrics::install_global_recorder(
-                supervisor_session::RELAY_CAPACITY,
-                store.mutation_lock_connections(),
-            )
-            .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
-        })
-        .transpose()
-        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    let prometheus_handle = gateway_metrics::install_global_recorder(
+        config.metrics_bind_address.is_some(),
+        metrics_recorder,
+        supervisor_session::RELAY_CAPACITY,
+        store.mutation_lock_connections(),
+    )
+    .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    let metrics_endpoint = config.metrics_bind_address.zip(prometheus_handle);
 
     grpc::policy::backfill_legacy_policy_history(&state)
         .await

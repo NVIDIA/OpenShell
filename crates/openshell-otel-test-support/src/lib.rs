@@ -74,6 +74,10 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
 };
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    metrics_service_server::{MetricsService, MetricsServiceServer},
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
     trace_service_server::{TraceService, TraceServiceServer},
@@ -141,6 +145,10 @@ pub async fn assert_compute_driver_tracing(
 
 #[derive(Clone, Debug, Default)]
 pub struct ReceivedTraces {
+    /// Raw metric export requests, including resources and aggregation data.
+    pub metric_exports: Vec<ExportMetricsServiceRequest>,
+    /// `authorization` metadata of each metric export request.
+    pub metric_authorizations: Vec<String>,
     pub spans: Vec<Span>,
     /// String bodies of exported log records.
     pub log_bodies: Vec<String>,
@@ -281,6 +289,38 @@ impl LogsService for Collector {
     }
 }
 
+#[tonic::async_trait]
+impl MetricsService for Collector {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+        {
+            let mut received = self
+                .received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(authorization) = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+            {
+                received
+                    .metric_authorizations
+                    .push(authorization.to_string());
+            }
+            let request = request.into_inner();
+            for metrics in &request.resource_metrics {
+                let attributes = received.record_resource(metrics.resource.clone());
+                received.resource_attributes.push(attributes);
+            }
+            received.metric_exports.push(request);
+        }
+        self.exported.notify_one();
+        Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
+    }
+}
+
 /// Loopback OTLP/gRPC server that captures exported spans, logs, and resources.
 pub struct OtlpTestServer {
     endpoint: String,
@@ -353,13 +393,16 @@ impl OtlpTestServer {
         }
         let trace_service = TraceServiceServer::new(collector.clone())
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-        let logs_service = LogsServiceServer::new(collector)
+        let logs_service = LogsServiceServer::new(collector.clone())
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let metrics_service = MetricsServiceServer::new(collector)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             server
                 .add_service(trace_service)
                 .add_service(logs_service)
+                .add_service(metrics_service)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {
