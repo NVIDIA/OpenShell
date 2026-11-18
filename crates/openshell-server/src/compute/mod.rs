@@ -1743,8 +1743,10 @@ impl ComputeRuntime {
             metadata.resource_version = result.resource_version;
         }
         // The parent now owns any staged key, including if this request is
-        // cancelled. Keep the creation guard until its public identity and
-        // protected launch bundle have been committed.
+        // cancelled. Release the creation guard before the SSH identity step:
+        // its per-sandbox lock fences a concurrent delete on its own, and a
+        // guard held across it would cap concurrent creates at the lock pool.
+        drop(mutation_guard);
         let prepared = async {
             if let Some(encoded) = runtime_inputs.launch_authentication {
                 let authentication = serde_json::from_slice(&encoded)
@@ -1764,7 +1766,6 @@ impl ComputeRuntime {
             }
         }
         .await;
-        drop(mutation_guard);
         let launch_authentication = match prepared {
             Ok(authentication) => authentication,
             Err(status) => {
@@ -10366,6 +10367,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn create_releases_its_mutation_guard_before_the_ssh_identity_step() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("test-runtime");
+        let mut runtime = test_runtime(driver.clone()).await;
+        let credentials = configure_test_ssh_credentials(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-guard-release",
+            "guard-release",
+            SandboxPhase::Provisioning,
+        );
+        let (entered, release) = credentials.gate_next_store();
+        let creating = {
+            let runtime = runtime.clone();
+            let sandbox = sandbox.clone();
+            tokio::spawn(async move {
+                runtime
+                    .create_sandbox_authenticated(
+                        sandbox.clone(),
+                        None,
+                        Some(test_launch_authentication(&sandbox)),
+                        false,
+                    )
+                    .await
+            })
+        };
+        entered.await.unwrap();
+
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.mutation_guard(MutationScope::sandbox("default", sandbox.object_id())),
+        )
+        .await
+        .expect("the SSH identity step must not hold the sandbox mutation guard")
+        .unwrap();
+        drop(guard);
+
+        release.send(()).unwrap();
+        let created = creating.await.unwrap().unwrap();
+        assert!(!created.host_key_fingerprint.is_empty());
         assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
     }
 
