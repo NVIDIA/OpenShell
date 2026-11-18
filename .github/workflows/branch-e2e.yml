@@ -247,7 +247,7 @@ jobs:
           set -euo pipefail
           # Retry dependency preparation, then build once.
           nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
-          for family in features drivers/podman; do
+          for family in features drivers/docker drivers/podman; do
             nix run .#openshell-test-runner -- build \
               --family "$family" --out "artifacts/e2e-bundles/${family//\//-}"
           done
@@ -255,6 +255,12 @@ jobs:
         with:
           name: openshell-e2e-bundle-features-x86_64-unknown-linux-musl
           path: artifacts/e2e-bundles/features
+          retention-days: 5
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-e2e-bundle-drivers-docker-x86_64-unknown-linux-musl
+          path: artifacts/e2e-bundles/drivers-docker
           retention-days: 5
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

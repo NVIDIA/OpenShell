@@ -581,9 +581,12 @@ Driver suites live in `tests/suites/drivers/<driver>`, with the package named
 after the driver. Each driver suite is its own workspace with its own lockfile,
 so a change to one driver's tests or dependencies doesn't touch another's. Add
 a new one to the `rust:format`, `rust:format:check` and `rust:lint` tasks, the
-matching lines in `branch-checks.yml`, and `ALIGNED_WORKSPACES`. The Podman
-driver suite (`tests/suites/drivers/podman`) compares OpenShell and direct
-Podman user-namespace mappings.
+matching lines in `branch-checks.yml`, `ALIGNED_WORKSPACES`, and the bundle
+builds in `branch-e2e.yml` and `rust-cache.yml`. The Docker and Podman driver
+suites (`tests/suites/drivers/{docker,podman}`) check what the driver does with
+a sandbox's containers when its workload stops or an ephemeral sandbox
+finishes. The Podman suite also compares OpenShell and direct Podman
+user-namespace mappings.
 Each `fedora-podman-{rootful,rootless}-userns-<mode>` environment configures
 the gateway with one mode (`default`, `auto`, `keep-id` or `private`) and works
 with every installer; CI runs it with `rpm`:

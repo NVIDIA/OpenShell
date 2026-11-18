@@ -10,8 +10,8 @@
 # results. With `prebuilt`, the rows run what the caller built once for the
 # run instead: conformance rows the static `openshell-conformance`, the other
 # rows their family's test bundle. The `family` input selects the rows of one
-# family, including the workspaces under it (drivers selects drivers/podman);
-# leave it empty to run every row.
+# family, including the workspaces under it (drivers selects drivers/docker
+# and drivers/podman); leave it empty to run every row.
 
 name: E2E Suites
 
@@ -111,6 +111,7 @@ jobs:
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"connect-ssh-supervision","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"drivers/docker","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
