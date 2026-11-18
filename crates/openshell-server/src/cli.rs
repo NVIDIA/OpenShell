@@ -483,10 +483,68 @@ fn prepare_server_config_with_drivers(
         None => defaults::complete_local_jwt_config()?,
     };
 
+    let config = assemble_server_config(args, matches, file.as_ref(), gateway_jwt)?;
+
+    if let Some(normalized) = normalized_network_trust.as_ref() {
+        // Use the same resolver as runtime construction, with the explicit
+        // configuration marker but no synthetic/staged artifact. This rejects
+        // remote endpoints and factories that have not opted into trust
+        // propagation before any state is written.
+        let driver_startup = crate::compute::driver_config::DriverStartupContext {
+            file: file.as_ref(),
+            guest_tls: guest_tls.as_ref(),
+            network_trust: None,
+            network_trust_configured: true,
+            gateway_port: config.bind_address.port(),
+            gateway_tls_enabled: config.tls.is_some(),
+            endpoint_overrides: &config.compute_driver_endpoints,
+        };
+        crate::validate_compute_driver_config(
+            compute_drivers,
+            compute_driver.name(),
+            &config.name,
+            config.bind_address,
+            &config.log_level,
+            driver_startup,
+            false,
+        )
+        .map_err(|error| {
+            miette::miette!(
+                "Network supervisor additional destination trust configured: certificate_count={} digest={}: {error}",
+                normalized.certificate_count(),
+                normalized.digest()
+            )
+        })?;
+    }
+    let network_trust = normalized_network_trust
+        .map(crate::network_trust::stage_normalized)
+        .transpose()?;
+
+    Ok(ServerStartupConfig {
+        config,
+        config_file: file,
+        guest_tls,
+        network_trust,
+        compute_driver,
+        legacy_compute_driver_env_seen,
+    })
+}
+
+/// Build the gateway's runtime configuration from the effective arguments and
+/// the configuration file. This has no side effects beyond reading
+/// `OPENSHELL_PROVISIONING_REPAIR_WINDOW_SECONDS`: it creates no directories,
+/// stages no artifacts and probes no drivers, so a failure here is a pure
+/// configuration error.
+fn assemble_server_config(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    file: Option<&ConfigFile>,
+    gateway_jwt: Option<openshell_core::GatewayJwtConfig>,
+) -> Result<openshell_core::Config> {
     let bind = SocketAddr::new(args.bind_address, args.port);
 
     let has_client_ca = args.tls_client_ca.is_some();
-    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, file.as_ref());
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, file);
 
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
@@ -800,49 +858,7 @@ fn prepare_server_config_with_drivers(
     // user-authored config file.
     config.gateway_jwt = gateway_jwt;
 
-    if let Some(normalized) = normalized_network_trust.as_ref() {
-        // Use the same resolver as runtime construction, with the explicit
-        // configuration marker but no synthetic/staged artifact. This rejects
-        // remote endpoints and factories that have not opted into trust
-        // propagation before any state is written.
-        let driver_startup = crate::compute::driver_config::DriverStartupContext {
-            file: file.as_ref(),
-            guest_tls: guest_tls.as_ref(),
-            network_trust: None,
-            network_trust_configured: true,
-            gateway_port: config.bind_address.port(),
-            gateway_tls_enabled: config.tls.is_some(),
-            endpoint_overrides: &config.compute_driver_endpoints,
-        };
-        crate::validate_compute_driver_config(
-            compute_drivers,
-            compute_driver.name(),
-            &config.name,
-            config.bind_address,
-            &config.log_level,
-            driver_startup,
-            false,
-        )
-        .map_err(|error| {
-            miette::miette!(
-                "Network supervisor additional destination trust configured: certificate_count={} digest={}: {error}",
-                normalized.certificate_count(),
-                normalized.digest()
-            )
-        })?;
-    }
-    let network_trust = normalized_network_trust
-        .map(crate::network_trust::stage_normalized)
-        .transpose()?;
-
-    Ok(ServerStartupConfig {
-        config,
-        config_file: file,
-        guest_tls,
-        network_trust,
-        compute_driver,
-        legacy_compute_driver_env_seen,
-    })
+    Ok(config)
 }
 
 const UNAUTHENTICATED_USERS_WARNING: &str = "unauthenticated user access is enabled; only use this for trusted local development or a fully trusted fronting proxy";
