@@ -25,3 +25,4 @@ mod settings;
 mod smoke;
 mod ssh;
 mod templates;
+mod workspaces;

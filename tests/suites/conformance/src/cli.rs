@@ -11,11 +11,6 @@
 use serde_json::Value;
 use testkit::Context;
 
-const PAGE_SIZE: &str = "1000";
-/// More pages than any test gateway should have; stops a repeated token from
-/// looping forever.
-const MAX_PAGES: usize = 1000;
-
 /// Delay before an attached main prints and exits, so the CLI attaches while
 /// the sandbox is Ready. On a multi-replica gateway, attaching after the main
 /// has exited fails unless the request reaches the replica holding the
@@ -226,44 +221,10 @@ async fn wait_unlisted(cx: &Context, name: &str) -> testkit::Result {
     .await
 }
 
-/// The phase of the sandbox in `sandbox list`, if it is listed. Follows every
-/// page.
+/// The phase of the sandbox in `sandbox list`, if it is listed.
 async fn find_listed(cx: &Context, name: &str) -> testkit::Result<Option<String>> {
-    let mut token = String::new();
-    for _ in 0..MAX_PAGES {
-        let page: Value = cx
-            .cli([
-                "sandbox",
-                "list",
-                "--page-size",
-                PAGE_SIZE,
-                "--page-token",
-                &token,
-                "--output",
-                "json",
-            ])
-            .await?
-            .success()?
-            .json()?;
-        if let Some(entry) = page["sandboxes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|entry| entry["name"] == name)
-        {
-            return Ok(Some(
-                entry["phase"].as_str().unwrap_or_default().to_string(),
-            ));
-        }
-        token = page["next_page_token"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if token.is_empty() {
-            return Ok(None);
-        }
-    }
-    Err(testkit::Error::msg(format!(
-        "sandbox list has more than {MAX_PAGES} pages"
-    )))
+    let entry = cx
+        .cli_find_listed(&["sandbox", "list"], "sandboxes", name)
+        .await?;
+    Ok(entry.map(|entry| entry["phase"].as_str().unwrap_or_default().to_string()))
 }
