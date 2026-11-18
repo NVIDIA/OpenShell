@@ -1,26 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Read-only provider files.
+//! Read-only virtual files: provider files and the supervisor CA trust pair.
 //!
-//! Every workload file open notifies the broker, which serves a path beneath
-//! the provider prefix by injecting a read-only descriptor for a sealed
-//! in-memory file and continues every other open.
+//! Neither kind exists on any filesystem. Every workload file open notifies
+//! the broker, which serves a path beneath the provider prefix, or one of the
+//! two canonical CA trust paths, by injecting a read-only descriptor for a
+//! sealed in-memory file, and continues every other open. Every path-based
+//! `stat`, `statx`, and `access` call notifies as well; for a virtual path the
+//! broker writes the result the injected descriptor would report into the
+//! caller's buffer, and continues every other path.
+//!
+//! What a virtual path supports is exactly this: an absolute, canonical path
+//! (no `..`, no trailing slash, no symlink, no relative lookup through a
+//! directory descriptor), opened read-only, and queried through `stat`,
+//! `lstat`, `fstatat`, `statx`, and `access`. The directories above a virtual
+//! file do not exist: `chdir`, `opendir`, and `stat` of the directory are
+//! `ENOENT`, and a relative or aliased path is left to the kernel, which finds
+//! nothing there. A write-capable open is `EACCES`; `O_DIRECTORY` is
+//! `ENOTDIR`; `O_PATH` is `EINVAL`.
 //!
 //! Two things are kept apart. A [`Revision`] is one immutable version of one
 //! file, and a [`Snapshot`] is the complete set a publication replaces at
 //! once; neither knows how bytes reach the workload. What a revision prepares
-//! at publication is its backing, a [`SealedMemfd`], created once when the
-//! revision is published and reopened for each workload open.
+//! at publication is its backing, a [`SealedFile`], created once when the
+//! revision is published and reopened for each workload open. The CA trust
+//! pair from [`crate::ca_trust_files`] shares the backing but is published
+//! separately from, and never removed by, a provider file update.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Write as _};
-use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::io;
+use std::sync::{Arc, RwLock};
 
-use rustix::fs::{Mode, OFlags, SealFlags};
+use rustix::fs::Mode;
 
+use crate::ca_trust_files::{CaTrustFiles, TrustFile};
+use crate::linux::sealed_file::{OwnDescriptors, SealedFile};
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::task_memory;
 
@@ -29,6 +44,22 @@ const PROC_PREFIX: &str = "/proc/";
 const MAX_FILE_BYTES: usize = 65_536;
 pub const MAX_TOTAL_BYTES: usize = 262_144;
 const MAX_PATH_BYTES: usize = 4_096;
+
+/// The flags `fstatat` accepts; `statx` also accepts `AT_STATX_SYNC_TYPE`.
+const STAT_FLAGS: u32 =
+    (libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | libc::AT_EMPTY_PATH) as u32;
+/// `AT_STATX_SYNC_TYPE`: the UAPI mask of the `statx` sync flags, which the
+/// `libc` crate does not expose on every target.
+const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+const STATX_FLAGS: u32 = STAT_FLAGS | AT_STATX_SYNC_TYPE;
+/// `AT_EACCESS`, also absent from `libc` on some targets.
+const AT_EACCESS: u32 = 0x200;
+/// The flags `faccessat2` accepts.
+const ACCESS_FLAGS: u32 = AT_EACCESS | (libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u32;
+/// The `access` modes: `R_OK | W_OK | X_OK`.
+const ACCESS_MODES: u32 = (libc::R_OK | libc::W_OK | libc::X_OK) as u32;
+/// `STATX__RESERVED`: a mask with this bit set is refused.
+const STATX_RESERVED_MASK: u32 = 0x8000_0000;
 
 /// The mode a provider file reports. It keeps the file's metadata private
 /// to the sandbox identity; the seals and the read-only descriptor protect
@@ -71,109 +102,31 @@ fn next_snapshot<Backing>(
         .collect()
 }
 
-/// This process's own descriptor table in procfs.
-///
-/// Opening a descriptor's entry here yields a new open file description of
-/// the same file. The directory is opened once and verified to be procfs, so
-/// a later reopen walks no path.
-struct OwnDescriptors(OwnedFd);
-
-impl OwnDescriptors {
-    fn open() -> io::Result<Self> {
-        let directory = rustix::fs::open(
-            "/proc/self/fd",
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        if rustix::fs::fstatfs(&directory)?.f_type != rustix::fs::PROC_SUPER_MAGIC {
-            return Err(io::Error::other("/proc/self/fd is not on procfs"));
-        }
-        Ok(Self(directory))
-    }
-
-    /// A new read-only open file description of the file `descriptor` refers
-    /// to, positioned at its start. Duplicating `descriptor` instead would
-    /// share one file offset between every holder.
-    fn reopen_read_only(&self, descriptor: impl AsFd) -> io::Result<OwnedFd> {
-        Ok(rustix::fs::openat(
-            &self.0,
-            rustix::path::DecInt::new(descriptor.as_fd().as_raw_fd()),
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY,
-            Mode::empty(),
-        )?)
-    }
+/// The sealed in-memory file behind one provider revision.
+fn prepare_backing(content: &[u8]) -> io::Result<SealedFile> {
+    SealedFile::create(
+        "openshell-provider",
+        FILE_MODE,
+        content,
+        &OwnDescriptors::shared()?,
+    )
 }
 
-/// The sealed in-memory file behind one revision.
-///
-/// The content is written once and sealed against writes, resizing, and
-/// further sealing, so no descriptor of the file, however it was opened, can
-/// change it. The only descriptor kept here is itself read-only: the
-/// writable one `memfd_create` returns is closed before the revision is
-/// published.
-struct SealedMemfd {
-    anchor: OwnedFd,
-    descriptors: Arc<OwnDescriptors>,
-}
-
-impl SealedMemfd {
-    fn create(content: &[u8], descriptors: &Arc<OwnDescriptors>) -> io::Result<Self> {
-        let writable = rustix::fs::memfd_create(
-            "openshell-provider",
-            rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
-        )?;
-        rustix::fs::fchmod(&writable, FILE_MODE)?;
-        let mut writable = File::from(writable);
-        writable.write_all(content)?;
-        rustix::fs::fcntl_add_seals(
-            &writable,
-            SealFlags::SEAL | SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK,
-        )?;
-        let anchor = descriptors.reopen_read_only(&writable)?;
-        Ok(Self {
-            anchor,
-            descriptors: Arc::clone(descriptors),
-        })
-    }
-
-    /// A descriptor for one workload open: its own read-only open file
-    /// description, positioned at the start of the file.
-    fn open(&self) -> io::Result<OwnedFd> {
-        match self.descriptors.reopen_read_only(&self.anchor) {
-            // Every open of a revision shares one file, which the workload
-            // owns as well and may have made unreadable through a descriptor
-            // it holds. Its mode is not what protects the content, so
-            // restore it rather than fail opens until the next revision.
-            Err(error) if error.raw_os_error() == Some(libc::EACCES) => {
-                rustix::fs::fchmod(&self.anchor, FILE_MODE)?;
-                self.descriptors.reopen_read_only(&self.anchor)
-            }
-            opened => opened,
-        }
-    }
-}
-
-/// The published generation of provider files.
+/// The published generation of provider files, and the supervisor trust
+/// files served with them.
 #[derive(Default)]
 struct VirtualFiles {
     /// Replaced as a whole. Open handlers clone the selected revision before
     /// dropping the lock, so an update never waits on a workload open and a
     /// revision outlives its generation for as long as an open uses it.
-    current: RwLock<Arc<Snapshot<SealedMemfd>>>,
-    /// Opened by the first publication that needs it.
-    descriptors: OnceLock<Arc<OwnDescriptors>>,
+    current: RwLock<Arc<Snapshot<SealedFile>>>,
+    /// Published once the CA material is installed, before the workload
+    /// starts. A provider file update does not touch it.
+    ca_trust: CaTrustFiles,
 }
 
 impl VirtualFiles {
-    fn descriptors(&self) -> io::Result<&Arc<OwnDescriptors>> {
-        if let Some(descriptors) = self.descriptors.get() {
-            return Ok(descriptors);
-        }
-        let opened = Arc::new(OwnDescriptors::open()?);
-        Ok(self.descriptors.get_or_init(|| opened))
-    }
-
-    fn snapshot(&self) -> Arc<Snapshot<SealedMemfd>> {
+    fn snapshot(&self) -> Arc<Snapshot<SealedFile>> {
         Arc::clone(
             &self
                 .current
@@ -182,7 +135,7 @@ impl VirtualFiles {
         )
     }
 
-    fn revision(&self, path: &str) -> Option<Arc<Revision<SealedMemfd>>> {
+    fn revision(&self, path: &str) -> Option<Arc<Revision<SealedFile>>> {
         self.current
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -191,9 +144,7 @@ impl VirtualFiles {
     }
 
     fn publish(&self, desired: HashMap<String, String>) -> io::Result<()> {
-        self.publish_with(desired, |content| {
-            SealedMemfd::create(content, self.descriptors()?)
-        })
+        self.publish_with(desired, prepare_backing)
     }
 
     /// Replace the generation with exactly `desired`, or leave it untouched.
@@ -205,7 +156,7 @@ impl VirtualFiles {
     fn publish_with(
         &self,
         desired: HashMap<String, String>,
-        prepare: impl FnMut(&[u8]) -> io::Result<SealedMemfd>,
+        prepare: impl FnMut(&[u8]) -> io::Result<SealedFile>,
     ) -> io::Result<()> {
         let next = Arc::new(next_snapshot(&self.snapshot(), desired, prepare)?);
         let replaced = std::mem::replace(
@@ -253,6 +204,35 @@ impl ProviderFiles {
         self.files.publish(desired)
     }
 
+    /// Publish the supervisor CA certificate and combined trust bundle the
+    /// workload opens at their canonical paths.
+    ///
+    /// Call this after the real files are installed and before the workload
+    /// starts. The pair is cached and plain read-only opens of exactly those
+    /// paths receive a sealed copy. A refused pair fails closed and a
+    /// previously published pair stays as it was.
+    pub(crate) fn publish_ca_trust(&self, ca_cert: &[u8], ca_bundle: &[u8]) -> io::Result<()> {
+        self.files.ca_trust.publish(ca_cert, ca_bundle)
+    }
+
+    /// Forget any published trust pair, so every open of the canonical paths
+    /// continues to the kernel again.
+    ///
+    /// Call this before a workload starts without CA material: a pair cached
+    /// by an earlier, failed start must not outlive the installation it
+    /// mirrored. Independent of provider file updates, which never touch
+    /// the pair.
+    pub(crate) fn clear_ca_trust(&self) {
+        self.files.ca_trust.clear();
+    }
+
+    /// The cached trust pair.
+    #[cfg(test)]
+    pub(crate) fn ca_trust(&self) -> &CaTrustFiles {
+        &self.files.ca_trust
+    }
+
+    /// Answer a workload `open`, `openat`, or `openat2`.
     pub(crate) fn handle_open(
         &self,
         listener: &NotificationListener,
@@ -264,73 +244,319 @@ impl ProviderFiles {
         } else {
             notification.args[0]
         };
-        // Every workload open reaches the listener, and nearly all of them
-        // are ordinary paths the kernel decides. One exact copy of the
-        // path's first six bytes tells those apart from the two kinds of path
-        // served here; an ordinary open costs nothing else, and in
-        // particular no read of an `openat2` argument structure.
-        //
-        // Six bytes are enough. `/proc/` is six bytes, and every provider
-        // path starts with the first six bytes of its prefix and is longer
-        // than that, so both kinds always have six readable bytes. A copy
-        // that fails is an unreadable pointer or a shorter path that ends
-        // before an unmapped page: neither is served here, and the kernel
-        // resolves the path or reports its own EFAULT.
-        //
-        // The copy only classifies. Both served kinds read the whole path
-        // again and decide from that, and neither is ever continued: the
-        // kernel and Landlock authorize every open that is.
+        let file = match self.classify(listener, &notification, path_address)? {
+            Classified::Served(file) => file,
+            Classified::Done => return Ok(()),
+            Classified::Proc => {
+                if handle_thread_comm_open(listener, notification, path_address)? {
+                    return Ok(());
+                }
+                return listener.respond_continue(notification.id);
+            }
+        };
+        inject_read_only(listener, &notification, file.backing())
+    }
+
+    /// Answer a workload path-based `stat`, `statx`, or `access` call.
+    pub(crate) fn handle_metadata(
+        &self,
+        listener: &NotificationListener,
+        notification: Notification,
+    ) -> io::Result<()> {
+        let request = MetadataRequest::parse(&notification)?;
+        let file = match self.classify(listener, &notification, request.path_address())? {
+            Classified::Served(file) => file,
+            Classified::Done => return Ok(()),
+            Classified::Proc => return listener.respond_continue(notification.id),
+        };
+        let backing = file.backing();
+        match request {
+            MetadataRequest::Stat { flags, buffer, .. } => {
+                if flags & !STAT_FLAGS != 0 {
+                    return listener.respond_errno(notification.id, libc::EINVAL);
+                }
+                complete_with_result(listener, &notification, buffer, &backing.stat()?.0)
+            }
+            MetadataRequest::Statx {
+                flags,
+                mask,
+                buffer,
+                ..
+            } => {
+                if flags & !STATX_FLAGS != 0 || mask & STATX_RESERVED_MASK != 0 {
+                    return listener.respond_errno(notification.id, libc::EINVAL);
+                }
+                let sync = flags & AT_STATX_SYNC_TYPE;
+                complete_with_result(
+                    listener,
+                    &notification,
+                    buffer,
+                    &backing.statx(sync, mask)?.0,
+                )
+            }
+            MetadataRequest::Access { mode, flags, .. } => {
+                if mode & !ACCESS_MODES != 0 || flags & !ACCESS_FLAGS != 0 {
+                    return listener.respond_errno(notification.id, libc::EINVAL);
+                }
+                // The file is readable and nothing else, whichever identity
+                // the call checks.
+                if mode & ACCESS_MODES != libc::R_OK as u32 && mode != libc::F_OK as u32 {
+                    return listener.respond_errno(notification.id, libc::EACCES);
+                }
+                listener.respond_value(notification.id, 0)
+            }
+        }
+    }
+
+    /// Decide whether the path at `path_address` is a virtual file.
+    ///
+    /// Every workload open and metadata call reaches the listener, and
+    /// nearly all of them name ordinary paths the kernel decides. One exact
+    /// copy of the path's first six bytes tells those apart from the paths
+    /// served here, at no other cost to an ordinary call. Six bytes are
+    /// enough: `/proc/` is six bytes, and every provider path and both CA
+    /// trust paths share the first six bytes of the provider prefix and are
+    /// longer than that. A copy that fails is an unreadable pointer or a
+    /// shorter path ending before an unmapped page: neither is served, and
+    /// the kernel resolves the path or reports its own EFAULT.
+    ///
+    /// The copy only classifies. A candidate has its whole path read and is
+    /// decided from that copy alone: a published virtual file is served
+    /// whatever the flags, an unpublished path beneath the provider prefix is
+    /// `ENOENT`, and everything else, including an alias of a virtual path,
+    /// continues to the kernel, which finds nothing of ours there.
+    fn classify(
+        &self,
+        listener: &NotificationListener,
+        notification: &Notification,
+        path_address: u64,
+    ) -> io::Result<Classified> {
         let mut start = [0_u8; PROC_PREFIX.len()];
         if task_memory::read_exact(notification.tid, path_address, &mut start).is_err() {
-            return listener.respond_continue(notification.id);
+            listener.respond_continue(notification.id)?;
+            return Ok(Classified::Done);
         }
         if start == PROC_PREFIX.as_bytes() {
-            if handle_thread_comm_open(listener, notification, path_address)? {
-                return Ok(());
-            }
-            return listener.respond_continue(notification.id);
+            return Ok(Classified::Proc);
         }
-        if start != PREFIX.as_bytes()[..PROC_PREFIX.len()] {
-            return listener.respond_continue(notification.id);
-        }
-        // A failed or non-absolute lookup is left to the kernel. In particular,
-        // this preserves its normal EFAULT result for an invalid path pointer.
-        let Ok(path) = read_path(notification.tid, path_address) else {
-            return listener.respond_continue(notification.id);
-        };
-        if !path.starts_with(PREFIX) {
-            return listener.respond_continue(notification.id);
-        }
-        let Some(revision) = self.files.revision(&path) else {
-            return listener.respond_errno(notification.id, libc::ENOENT);
-        };
-        let flags = match open_flags(&notification) {
-            Ok(flags) => flags,
-            Err(error) => {
-                return listener.respond_errno(
-                    notification.id,
-                    error.raw_os_error().unwrap_or(libc::EINVAL),
-                );
-            }
-        };
-        if flags & libc::O_ACCMODE != libc::O_RDONLY
-            || flags
-                & (libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_TMPFILE | libc::O_APPEND)
-                != 0
+        if start == PREFIX.as_bytes()[..PROC_PREFIX.len()]
+            && let Ok(path) = read_path(notification.tid, path_address)
         {
-            return listener.respond_errno(notification.id, libc::EACCES);
+            if let Some(file) = self.files.lookup(&path) {
+                return Ok(Classified::Served(file));
+            }
+            if path.starts_with(PREFIX) {
+                listener.respond_errno(notification.id, libc::ENOENT)?;
+                return Ok(Classified::Done);
+            }
         }
-        if flags & (libc::O_DIRECTORY | libc::O_PATH | libc::O_DIRECT) != 0 {
-            return listener.respond_errno(notification.id, libc::EINVAL);
-        }
-        let file = revision.backing.open()?;
-        listener.add_fd_and_send(
-            notification.id,
-            file.as_raw_fd(),
-            flags & libc::O_CLOEXEC != 0,
-        )?;
-        Ok(())
+        listener.respond_continue(notification.id)?;
+        Ok(Classified::Done)
     }
+}
+
+enum Classified {
+    /// A published virtual file; the caller answers from it.
+    Served(VirtualFile),
+    /// The notification was answered here.
+    Done,
+    /// A `/proc/` path, which only the open handler looks at further.
+    Proc,
+}
+
+/// One published file, held so a concurrent publication cannot close its
+/// backing while it is served.
+enum VirtualFile {
+    Provider(Arc<Revision<SealedFile>>),
+    Trust(TrustFile),
+}
+
+impl VirtualFile {
+    fn backing(&self) -> &SealedFile {
+        match self {
+            Self::Provider(revision) => &revision.backing,
+            Self::Trust(file) => file.backing(),
+        }
+    }
+}
+
+impl VirtualFiles {
+    fn lookup(&self, path: &str) -> Option<VirtualFile> {
+        if path.starts_with(PREFIX) {
+            return self.revision(path).map(VirtualFile::Provider);
+        }
+        self.ca_trust.lookup(path).map(VirtualFile::Trust)
+    }
+}
+
+/// A notified metadata call, with the arguments the broker checks.
+enum MetadataRequest {
+    Stat {
+        path: u64,
+        buffer: u64,
+        flags: u32,
+    },
+    Statx {
+        path: u64,
+        flags: u32,
+        mask: u32,
+        buffer: u64,
+    },
+    Access {
+        path: u64,
+        mode: u32,
+        flags: u32,
+    },
+}
+
+impl MetadataRequest {
+    /// The call's arguments. `int` arguments keep their low 32 bits, as the
+    /// kernel reads them.
+    fn parse(notification: &Notification) -> io::Result<Self> {
+        let args = notification.args;
+        #[allow(clippy::cast_possible_truncation)]
+        let word = |index: usize| args[index] as u32;
+        let syscall = i64::from(notification.syscall);
+        if syscall == libc::SYS_newfstatat {
+            return Ok(Self::Stat {
+                path: args[1],
+                buffer: args[2],
+                flags: word(3),
+            });
+        }
+        if syscall == libc::SYS_statx {
+            return Ok(Self::Statx {
+                path: args[1],
+                flags: word(2),
+                mask: word(3),
+                buffer: args[4],
+            });
+        }
+        if syscall == libc::SYS_faccessat {
+            return Ok(Self::Access {
+                path: args[1],
+                mode: word(2),
+                flags: 0,
+            });
+        }
+        if syscall == libc::SYS_faccessat2 {
+            return Ok(Self::Access {
+                path: args[1],
+                mode: word(2),
+                flags: word(3),
+            });
+        }
+        #[cfg(target_arch = "x86_64")]
+        if syscall == libc::SYS_stat || syscall == libc::SYS_lstat {
+            return Ok(Self::Stat {
+                path: args[0],
+                buffer: args[1],
+                flags: 0,
+            });
+        }
+        #[cfg(target_arch = "x86_64")]
+        if syscall == libc::SYS_access {
+            return Ok(Self::Access {
+                path: args[0],
+                mode: word(1),
+                flags: 0,
+            });
+        }
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    const fn path_address(&self) -> u64 {
+        match self {
+            Self::Stat { path, .. } | Self::Statx { path, .. } | Self::Access { path, .. } => *path,
+        }
+    }
+}
+
+/// Write `result` into the notifying task at `buffer` and complete the
+/// syscall with 0, or fail it with `EFAULT`.
+///
+/// The target is pinned before anything is written: `/proc/<tid>/mem` is
+/// opened and the notification validated afterwards, which proves the pinned
+/// address space is the notifying task's (see
+/// [`task_memory::PinnedMemory`]). The listener's `WAIT_KILLABLE_RECV` keeps
+/// the task in the syscall, so the buffer is still the caller's when the
+/// write lands. A buffer the write cannot reach fails the call with `EFAULT`,
+/// whatever errno the pinned file reports; every response validates the
+/// notification, so a task killed meanwhile is simply no longer answered.
+pub fn complete_with_result(
+    listener: &NotificationListener,
+    notification: &Notification,
+    buffer: u64,
+    result: &[u8],
+) -> io::Result<()> {
+    let outcome = match task_memory::PinnedMemory::open(notification.tid) {
+        Ok(memory) => {
+            // The task may have died between the notification and here: the
+            // pinned memory would then belong to a reused TID. ENOENT means
+            // the notification is gone; any other ioctl failure is an error.
+            match listener.validate_id(notification.id) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            memory.write_exact(buffer, result)
+        }
+        // No such task: its procfs entry is gone (ENOENT) or it is exiting
+        // (ESRCH). The response below reports whether anything is left.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            Err(error)
+        }
+        Err(error) => return Err(error),
+    };
+    let response = match outcome {
+        Ok(()) => listener.respond_value(notification.id, 0),
+        Err(_) => listener.respond_errno(notification.id, libc::EFAULT),
+    };
+    match response {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        other => other,
+    }
+}
+
+/// Complete a workload open of a virtual file, or refuse it.
+///
+/// Only a read-only open is served. An open that asks to create, truncate,
+/// append, or write is `EACCES`, as on a read-only file; `O_DIRECTORY` is
+/// `ENOTDIR`; `O_PATH` and `O_DIRECT` are `EINVAL` (a path-only descriptor
+/// cannot be injected: `SECCOMP_IOCTL_NOTIF_ADDFD` refuses `O_PATH` files).
+/// Nothing here is continued.
+fn inject_read_only(
+    listener: &NotificationListener,
+    notification: &Notification,
+    file: &SealedFile,
+) -> io::Result<()> {
+    let flags = match open_flags(notification) {
+        Ok(flags) => flags,
+        Err(error) => {
+            return listener.respond_errno(
+                notification.id,
+                error.raw_os_error().unwrap_or(libc::EINVAL),
+            );
+        }
+    };
+    let close_on_exec = flags & libc::O_CLOEXEC != 0;
+    // O_TMPFILE includes the O_DIRECTORY bit; a creating open is refused as
+    // one before the directory bit is read.
+    if flags & libc::O_TMPFILE == libc::O_TMPFILE {
+        return listener.respond_errno(notification.id, libc::EACCES);
+    }
+    if flags & libc::O_DIRECTORY != 0 {
+        return listener.respond_errno(notification.id, libc::ENOTDIR);
+    }
+    if flags & libc::O_ACCMODE != libc::O_RDONLY
+        || flags & (libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_APPEND) != 0
+    {
+        return listener.respond_errno(notification.id, libc::EACCES);
+    }
+    if flags & (libc::O_PATH | libc::O_DIRECT) != 0 {
+        return listener.respond_errno(notification.id, libc::EINVAL);
+    }
+    file.inject(listener, notification.id, close_on_exec)
 }
 
 fn safe_component(value: &str) -> bool {
@@ -420,7 +646,7 @@ fn handle_thread_comm_open(
         .open(format!("/proc/{caller_group}/task/{target}/comm"))?;
     listener.add_fd_and_send(
         notification.id,
-        file.as_raw_fd(),
+        std::os::fd::AsRawFd::as_raw_fd(&file),
         flags & libc::O_CLOEXEC != 0,
     )?;
     Ok(true)
@@ -499,12 +725,12 @@ fn open_flags(notification: &Notification) -> io::Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_FILE_BYTES, ProviderFiles, SealedMemfd, VirtualFiles, comm_target};
+    use super::{MAX_FILE_BYTES, ProviderFiles, VirtualFiles, comm_target, prepare_backing};
+    use crate::ca_trust_files::{CA_BUNDLE_PATH, CA_CERT_PATH};
     use std::collections::HashMap;
     use std::fs::File;
-    use std::io::{self, Read as _, Seek as _, SeekFrom};
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::{FileExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::io::{self, Read as _};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -582,93 +808,36 @@ mod tests {
     }
 
     #[test]
-    fn each_open_is_its_own_read_only_description_of_one_sealed_file() {
+    fn ca_trust_files_are_independent_of_provider_file_updates() {
+        const CERT: &str = "-----BEGIN CERTIFICATE-----\nsupervisor\n-----END CERTIFICATE-----\n";
+        let bundle = format!("{}{CERT}", "B".repeat(MAX_FILE_BYTES));
         let provider_files = ProviderFiles::default();
+        let trust = provider_files.ca_trust();
+        assert!(trust.lookup(CA_CERT_PATH).is_none());
         provider_files
-            .replace(files(&[(CONFIG, "0123456789")]))
+            .publish_ca_trust(CERT.as_bytes(), bundle.as_bytes())
             .unwrap();
-        let mut first = open(&provider_files, CONFIG).unwrap();
-        let mut second = open(&provider_files, CONFIG).unwrap();
+        let trust_file = |path: &str| {
+            let file = File::from(trust.lookup(path).unwrap().backing().open().unwrap());
+            (file.metadata().unwrap().len(), file_identity(&file))
+        };
+        let (cert_len, cert_identity) = trust_file(CA_CERT_PATH);
+        let (bundle_len, bundle_identity) = trust_file(CA_BUNDLE_PATH);
+        assert_eq!(cert_len, u64::try_from(CERT.len()).unwrap());
+        assert_eq!(bundle_len, u64::try_from(bundle.len()).unwrap());
 
-        // Both opens are positioned at the start, and neither moves the
-        // other: a duplicated descriptor would share one offset.
-        let mut head = [0_u8; 4];
-        first.read_exact(&mut head).unwrap();
-        assert_eq!(&head, b"0123");
-        let mut whole = String::new();
-        second.read_to_string(&mut whole).unwrap();
-        assert_eq!(whole, "0123456789");
-        let mut rest = String::new();
-        first.read_to_string(&mut rest).unwrap();
-        assert_eq!(rest, "456789");
-        second.seek(SeekFrom::Start(8)).unwrap();
-        assert_eq!(first.stream_position().unwrap(), 10);
-
-        // One file serves every open of a revision.
-        assert_eq!(file_identity(&first), file_identity(&second));
-        for file in [&first, &second] {
-            assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o600);
-            assert_eq!(
-                rustix::fs::fcntl_getfl(file).unwrap() & rustix::fs::OFlags::ACCMODE,
-                rustix::fs::OFlags::RDONLY
-            );
-            let seals = rustix::fs::fcntl_get_seals(file).unwrap();
-            assert!(seals.contains(
-                rustix::fs::SealFlags::SEAL
-                    | rustix::fs::SealFlags::WRITE
-                    | rustix::fs::SealFlags::GROW
-                    | rustix::fs::SealFlags::SHRINK
-            ));
-            assert!(file.write_at(b"changed", 0).is_err());
-            assert!(file.set_len(0).is_err());
-        }
-
-        // The workload owns the file and can reopen its descriptor for
-        // writing. The seals, not the descriptor's access mode, are what
-        // keep the content, and they cannot be lifted.
-        let link = format!("/proc/self/fd/{}", first.as_raw_fd());
-        for options in [
-            std::fs::OpenOptions::new().write(true).clone(),
-            std::fs::OpenOptions::new().read(true).write(true).clone(),
-            std::fs::OpenOptions::new().append(true).clone(),
-        ] {
-            if let Ok(writable) = options.open(&link) {
-                assert!(writable.write_at(b"changed", 0).is_err());
-                assert!(io::Write::write_all(&mut &writable, b"changed").is_err());
-                assert!(writable.set_len(0).is_err());
-                assert!(writable.set_len(1 << 20).is_err());
-            }
-        }
+        provider_files
+            .replace(files(&[(CONFIG, "version = 1\n")]))
+            .unwrap();
+        provider_files.replace(HashMap::new()).unwrap();
+        assert_eq!(trust_file(CA_CERT_PATH).1, cert_identity);
+        assert_eq!(trust_file(CA_BUNDLE_PATH).1, bundle_identity);
         assert!(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&link)
-                .is_err()
+            virtual_files(&provider_files)
+                .revision(CA_CERT_PATH)
+                .is_none()
         );
-        assert_eq!(read(&provider_files, CONFIG).unwrap(), "0123456789");
-
-        // The descriptor the runtime keeps for the revision is read-only too.
-        let revision = virtual_files(&provider_files).revision(CONFIG).unwrap();
-        assert_eq!(
-            rustix::fs::fcntl_getfl(&revision.backing.anchor).unwrap()
-                & rustix::fs::OFlags::ACCMODE,
-            rustix::fs::OFlags::RDONLY
-        );
-    }
-
-    #[test]
-    fn a_cleared_mode_does_not_deny_later_opens() {
-        let provider_files = ProviderFiles::default();
-        provider_files.replace(files(&[(KEY, "key-1")])).unwrap();
-        let held = open(&provider_files, KEY).unwrap();
-        // The workload owns the shared file and can change its mode.
-        held.set_permissions(std::fs::Permissions::from_mode(0o000))
-            .unwrap();
-        assert_eq!(read(&provider_files, KEY).unwrap(), "key-1");
-        // An identical update keeps the revision; it must stay readable.
-        provider_files.replace(files(&[(KEY, "key-1")])).unwrap();
-        assert_eq!(read(&provider_files, KEY).unwrap(), "key-1");
+        assert!(ProviderFiles::validate(&files(&[(CA_BUNDLE_PATH, "x")])).is_err());
     }
 
     #[test]
@@ -797,7 +966,7 @@ mod tests {
                     if prepared == 2 {
                         return Err(io::Error::from_raw_os_error(libc::EMFILE));
                     }
-                    SealedMemfd::create(content, files_state.descriptors()?)
+                    prepare_backing(content)
                 },
             )
             .unwrap_err();

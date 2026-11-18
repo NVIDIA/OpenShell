@@ -78,39 +78,9 @@ pub(crate) fn ocsf_launcher_process() -> openshell_ocsf::Process {
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
-    runtime_read_only: &[PathBuf],
 ) -> Result<Option<sandbox::linux::PreparedSandbox>> {
-    let effective_policy = policy_with_runtime_read_only(policy, runtime_read_only);
-    let prepared = sandbox::linux::prepare_capability_free(&effective_policy, workdir)?;
+    let prepared = sandbox::linux::prepare_capability_free(policy, workdir)?;
     Ok(Some(prepared))
-}
-
-#[cfg(target_os = "linux")]
-fn policy_with_runtime_read_only(
-    policy: &SandboxPolicy,
-    runtime_read_only: &[PathBuf],
-) -> SandboxPolicy {
-    let mut effective_policy = policy.clone();
-    for path in runtime_read_only {
-        if !effective_policy.filesystem.read_only.contains(path) {
-            effective_policy.filesystem.read_only.push(path.clone());
-        }
-    }
-    effective_policy
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn ca_runtime_read_only_paths(ca_paths: Option<&(PathBuf, PathBuf)>) -> Vec<PathBuf> {
-    let Some((certificate, bundle)) = ca_paths else {
-        return Vec::new();
-    };
-    let mut paths = Vec::with_capacity(3);
-    if let Some(directory) = certificate.parent() {
-        paths.push(directory.to_path_buf());
-    }
-    paths.push(certificate.clone());
-    paths.push(bundle.clone());
-    paths
 }
 
 /// Prefix of environment variable names reserved for `OpenShell`.
@@ -611,9 +581,7 @@ impl ProcessHandle {
 
         // Prepare the Landlock ruleset as the workload UID. Inaccessible paths
         // are already unavailable to the child and remain omitted.
-        #[cfg(target_os = "linux")]
-        let runtime_read_only = ca_runtime_read_only_paths(ca_paths);
-        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
+        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root())
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
         let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
@@ -1930,85 +1898,6 @@ mod tests {
                     "kernel-effective validation should honor an enforced LSM denial"
                 );
             }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn runtime_ca_paths_are_added_to_the_effective_read_only_policy() {
-        let mut policy = policy_with_process(ProcessPolicy::default());
-        policy.filesystem.read_only = vec![PathBuf::from("/usr")];
-        let certificate = PathBuf::from(format!(
-            "{}/ca.crt",
-            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR
-        ));
-        let bundle = PathBuf::from(format!(
-            "{}/ca-bundle.crt",
-            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR
-        ));
-
-        let effective = policy_with_runtime_read_only(
-            &policy,
-            &[certificate.clone(), bundle.clone(), certificate.clone()],
-        );
-
-        assert_eq!(policy.filesystem.read_only, vec![PathBuf::from("/usr")]);
-        assert_eq!(
-            effective.filesystem.read_only,
-            vec![PathBuf::from("/usr"), certificate, bundle]
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[allow(unsafe_code)]
-    fn runtime_ca_material_remains_readable_after_landlock_for_non_root_workload() {
-        let root = tempfile::tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let ca_directory = root.path().join("openshell-supervisor-ca");
-        std::fs::create_dir(&ca_directory).unwrap();
-        std::fs::set_permissions(&ca_directory, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let certificate = ca_directory.join("ca.crt");
-        let bundle = ca_directory.join("ca-bundle.crt");
-        let denied = root.path().join("not-authorized");
-        for path in [&certificate, &bundle, &denied] {
-            std::fs::write(path, b"public certificate material").unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        }
-
-        let mut policy = policy_with_process(ProcessPolicy::default());
-        policy.landlock = LandlockPolicy {
-            compatibility: openshell_core::policy::LandlockCompatibility::HardRequirement,
-        };
-        let runtime_paths =
-            ca_runtime_read_only_paths(Some(&(certificate.clone(), bundle.clone())));
-        let Ok(Some(prepared)) = prepare_child_sandbox(&policy, None, &runtime_paths) else {
-            return;
-        };
-
-        match unsafe { fork() }.expect("fork should succeed") {
-            ForkResult::Child => {
-                let dropped = if nix::unistd::geteuid().is_root() {
-                    unsafe {
-                        libc::setgroups(0, std::ptr::null()) == 0
-                            && libc::setgid(42_235) == 0
-                            && libc::setuid(42_234) == 0
-                    }
-                } else {
-                    true
-                };
-                let valid = dropped
-                    && sandbox::linux::enforce(prepared).is_ok()
-                    && std::fs::read(&certificate).is_ok()
-                    && std::fs::read(&bundle).is_ok()
-                    && std::fs::read(&denied).is_err();
-                unsafe { libc::_exit(i32::from(!valid)) };
-            }
-            ForkResult::Parent { child } => assert_eq!(
-                waitpid(child, None).expect("waitpid should succeed"),
-                WaitStatus::Exited(child, 0),
-                "Landlock must preserve non-root access only to admitted public CA material"
-            ),
         }
     }
 

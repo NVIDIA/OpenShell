@@ -17,6 +17,8 @@ pub mod boundary_exec;
 pub mod boundary_io;
 mod boundary_server;
 #[cfg(target_os = "linux")]
+mod ca_trust_files;
+#[cfg(target_os = "linux")]
 pub mod child_env;
 pub mod container_log;
 #[cfg(target_os = "linux")]

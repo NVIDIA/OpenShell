@@ -376,8 +376,21 @@ Common findings:
   workload container has no provider-file volume or mount, so a missing mount
   is not a fault; debug it as an enforcement-probe or provider-attachment
   problem.
+- The same interception serves `/run/openshell-supervisor-ca/material/ca.crt`
+  and `ca-bundle.crt`: opens and `stat`, `statx`, and `access` calls on exactly
+  those paths are answered from a sealed in-memory pair, and no file, mount,
+  or directory exists there (`ls` of the directory is `ENOENT` by design). A
+  sandbox start refused with `publish supervisor CA trust files: ...` carries
+  the cause after the prefix. A `supervisor CA ...` cause (empty, over the
+  trust file bound, or a bundle that does not contain the certificate) means
+  the supervisor sent an invalid pair; check the supervisor's TLS output and
+  system CA bundle rather than the workload. Any other cause is a preparation
+  failure in the workload container: `/proc/self/fd` not on procfs,
+  `memfd_create` or sealing refused, or a descriptor or memory limit reached.
+  Check the runtime's seccomp profile, procfs mount, and the container's file
+  descriptor and memory limits.
 - Sandbox startup reports an `isolation control contract` failure: inspect the supervisor and sandbox-runtime image versions and update them together. An older runtime or incompatible isolation capability set fails before workload startup. See the published Sandbox Runtimes documentation for trusted image override precedence.
-- The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
+- The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` while satisfying the production parent-to-workload-child task-memory read probe through `/proc/<pid>/mem`; the write probe always uses `/proc/<pid>/mem`, and a `cross-child memory write failed` error means the runtime's Yama, LSM, or procfs posture refuses it. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 - Docker or Podman rejects an explicit `cdi_devices` selector: use a CDI qualified name (`<vendor>/<class>=<name>`), not a host-device path. Syntax validation accepts other vendors; it does not establish that the runtime has the device or that its GPU workload is supported. Consult the published GPU selection documentation for request requirements.
 

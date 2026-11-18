@@ -6328,13 +6328,9 @@ fn build_container_create_body_for_image(
             // Podman, Kubernetes, and VM resolvers, send names to policy DNS
             // exactly as written so short names never expand to host domains.
             dns_search: Some(vec![".".to_string()]),
-            tmpfs: Some(HashMap::from([(
-                openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
-                format!(
-                    "rw,noexec,nosuid,nodev,size=1m,uid={},gid={},mode=0755",
-                    workload_identity.uid, workload_identity.gid
-                ),
-            )])),
+            // No writable runtime storage: provider and CA trust files are
+            // served from the sandbox runtime's memory.
+            tmpfs: None,
             sysctls: Some(HashMap::from([(
                 "net.ipv4.ip_unprivileged_port_start".to_string(),
                 "0".to_string(),

@@ -42,39 +42,77 @@ level or option that does not fit a non-negative C `int`, still notifies and
 keeps the broker's `EPERM` and `EINVAL` results. The active qualification
 probe exercises both sides.
 
-## Provider files
+## Virtual files: provider files and supervisor CA trust files
 
-Provider files appear to the workload beneath `/run/openshell/providers`.
-Every workload `open`, `openat`, and `openat2` notifies the broker, which
-serves a provider path by injecting a read-only descriptor for a sealed
-in-memory file and continues every other open.
+Provider files appear to the workload beneath `/run/openshell/providers`, and
+the supervisor's public CA certificate and combined trust bundle at
+`/run/openshell-supervisor-ca/material/ca.crt` and `ca-bundle.crt`, where the
+TLS environment variables point. None of them exists on a filesystem, and no
+driver mounts or Landlock grant is involved. Every workload `open`, `openat`,
+and `openat2` notifies the broker, which serves a published path by injecting
+a read-only descriptor for a sealed in-memory file and continues every other
+open. Every path-based `stat`, `lstat`, `fstatat`, `statx`, and `access` call
+notifies too; for a published path the broker writes the metadata the
+injected descriptor reports into the caller's buffer, and continues every
+other path.
 
-Each published file is an immutable revision backed by one in-memory file. The
-runtime creates that file when the revision is published, not when the
-workload opens it: it writes the content, seals the file against writes,
-growing, shrinking, and further sealing, and keeps only a read-only descriptor
-for it. Each workload open reopens that descriptor through the runtime's own
-`/proc/self/fd`, so every open gets its own read-only open file description
-and file offset, positioned at the start.
+Supported semantics are exactly: an absolute canonical path, read-only opens
+(a write-capable open is `EACCES`, `O_DIRECTORY` is `ENOTDIR`, `O_PATH` and
+`O_DIRECT` are `EINVAL`, `openat2` with a nonzero `mode` or `resolve` is
+`EINVAL`), and the metadata calls above with the kernel's own flag sets. The
+directories do not exist: `chdir`, `opendir`, a relative lookup, and an alias
+through `..` are the kernel's `ENOENT`. A path beneath the provider prefix
+that is not published is `ENOENT`; the CA paths continue to the kernel until
+a pair is published.
 
-An update prepares every new revision before it replaces the published set in
-one step, so a failed update leaves the previous set in place. A file whose
-bytes did not change keeps its revision. Opens after an update see the new
-revisions, descriptors opened earlier keep the bytes they opened, and a
-detached file is `ENOENT` for later opens.
+Each published file is an immutable revision backed by one sealed in-memory
+file (`linux::sealed_file`). The runtime writes the content, seals the file
+against writes, growing, shrinking, and further sealing, and keeps only a
+read-only descriptor. Each workload open reopens that descriptor through the
+runtime's own `/proc/self/fd`, so every open gets its own file offset. An
+update prepares every new revision before it replaces the published set in
+one step; a file whose bytes did not change keeps its revision; descriptors
+opened earlier keep the bytes they opened. The CA pair is published before
+the spawn, replaced only as a whole, never touched by a provider update, and
+cleared by a start without CA material. It is refused if either file is
+empty, exceeds the 1 MiB control frame bound, or the bundle does not contain
+the certificate.
 
-All opens of one revision refer to one file, which the workload owns: it can
-change that file's mode or reopen a descriptor for writing. Neither reaches
-the content, which the seals protect, and the runtime restores the mode if it
-denies an open. The runtime holds one descriptor per published file, at most
-64.
+The broker classifies each call from an exact copy of the first six bytes of
+its path; only `/proc/` paths and candidates for the prefixes above have
+their whole path read.
 
-The broker classifies each open from an exact copy of the first six bytes of
-its path. Six bytes identify a `/proc/` path and the start of a provider path;
-only those candidates have their whole path read and decided. An open whose
-first six bytes cannot be read, or match neither, continues, and unrelated
-`openat2` calls do not require a copy of their `open_how`. Every continued
-open remains subject to the kernel and Landlock.
+### Metadata writes and signal delivery
+
+A `stat` result is delivered by writing into the workload. The broker opens
+`/proc/<tid>/mem`, which binds to one address space, and only then validates
+the notification: a notification stays valid only while its task lives, so a
+valid one proves the pinned space belongs to the notifying task and not to a
+task that reused the number (`process_vm_writev` resolves the number again on
+every call and cannot give that proof). A write that fails for any reason
+fails the call with `EFAULT`; a task killed meanwhile is no longer answered.
+Writes through `/proc/<tid>/mem` use the kernel's `FOLL_FORCE`, which differs
+from a native `stat` in one case: a result buffer in the caller's own
+read-only private copy-on-write memory is written instead of failing with
+`EFAULT`. The kernel refuses forced writes to shared and non-`VM_MAYWRITE`
+mappings, so this reaches only memory the caller could already make writable
+with `mprotect`.
+
+For that write to be safe the workload listener is installed with
+`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19). A task can have only
+one listener, so the flag covers every notified syscall: before the broker
+receives a notification, signals interrupt the syscall as before; once
+received, only a fatal signal ends the wait and a handled signal is delivered
+after the broker responds. A `connect` awaiting the supervisor's network
+admission decision therefore ignores handled `SIGALRM` and `SIGINT` until the
+broker answers or its 30-second decision timeout fails the call; DNS relay
+waits are bounded at 10 seconds. A blocking loopback `connect` is completed by
+the broker with a native `connect` on a duplicate of the socket and waits for
+the kernel's connect timeout, which can exceed 30 seconds. Fatal signals still
+terminate the task. The runtime qualification probe writes into a dumpable child
+through `/proc/<pid>/mem` and fails closed where the posture refuses it.
+
+## Runtime boundary transport
 
 A boundary configured with `RuntimeInitiatedTlsTcp` binds no listener. It dials
 only the driver-provided supervisor addresses, which must be concrete,

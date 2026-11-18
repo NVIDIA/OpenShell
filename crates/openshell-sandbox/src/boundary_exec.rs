@@ -220,9 +220,7 @@ impl LocalBoundaryExec {
         workdir: Option<&str>,
     ) -> Result<Option<crate::sandbox::linux::PreparedSandbox>, BackendError> {
         crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
-        let runtime_read_only =
-            crate::process::ca_runtime_read_only_paths(self.ca_file_paths.as_deref());
-        crate::process::prepare_child_sandbox(&self.policy, workdir, &runtime_read_only)
+        crate::process::prepare_child_sandbox(&self.policy, workdir)
             .map_err(|error| BackendError::Process(error.to_string()))
     }
 
@@ -817,7 +815,10 @@ mod tests {
         std::thread::spawn(move || {
             while let Ok(notification) = listener.receive() {
                 let syscall = i64::from(notification.syscall);
-                if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+                if syscall == libc::SYS_openat
+                    || syscall == libc::SYS_openat2
+                    || crate::linux::seccomp_notify::is_metadata_syscall(syscall)
+                {
                     let _ = listener.respond_continue(notification.id);
                 } else {
                     #[cfg(target_arch = "x86_64")]

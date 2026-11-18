@@ -10,6 +10,7 @@ pub mod child_seccomp;
 pub mod landlock;
 pub mod proc_fd;
 pub mod process_signal;
+pub(crate) mod sealed_file;
 pub mod seccomp_notify;
 pub mod socket_confinement;
 pub mod socket_registry;
