@@ -20,6 +20,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
         binary_pid: Some(42),
         ancestors: vec![PathBuf::from("/usr/bin/sh")],
         cmdline_paths: vec![],
+        binary_match_paths: Vec::new(),
     }
 }
 
