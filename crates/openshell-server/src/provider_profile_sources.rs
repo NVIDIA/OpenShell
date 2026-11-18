@@ -76,6 +76,26 @@ pub trait ProviderProfileSource: Send + Sync + std::fmt::Debug {
         store: &Store,
         workspace: &str,
     ) -> Result<ProviderProfileSnapshot, Status>;
+
+    /// Read one profile without rebuilding unrelated user-managed profiles.
+    async fn snapshot_profile(
+        &self,
+        store: &Store,
+        workspace: &str,
+        id: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let mut snapshot = self.snapshot(store, workspace).await?;
+        if snapshot.profiles.is_empty() && !self.allow_empty() {
+            return Err(Status::failed_precondition(format!(
+                "provider profile source '{}' returned no profiles",
+                self.source_id()
+            )));
+        }
+        snapshot
+            .profiles
+            .retain(|profile| normalize_profile_id(&profile.profile.id).as_deref() == Some(id));
+        Ok(snapshot)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,6 +113,44 @@ impl ProviderProfileSource for UserProviderProfileSource {
 
     fn allow_empty(&self) -> bool {
         true
+    }
+
+    async fn snapshot_profile(
+        &self,
+        store: &Store,
+        workspace: &str,
+        id: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let mut profiles = Vec::with_capacity(2);
+        for (namespace, scope) in [
+            ("", ProfileScope::Platform),
+            (workspace, ProfileScope::Workspace),
+        ] {
+            if namespace.is_empty() && scope == ProfileScope::Workspace {
+                continue;
+            }
+            if let Some(stored) = store
+                .get_message_by_name::<StoredProviderProfile>(namespace, id)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("fetch provider profile failed: {error}"))
+                })?
+            {
+                let version = stored_profile_resource_version(&stored);
+                if let Some(profile) = stored.profile {
+                    let mut profile = profile_response_payload(profile, version);
+                    normalize_provider_profile_mcp_fields(&mut profile);
+                    profiles.push(ScopedSnapshotProfile { scope, profile });
+                }
+            }
+        }
+        let revision = profile_snapshot_revision(
+            &profiles
+                .iter()
+                .map(|entry| entry.profile.clone())
+                .collect::<Vec<_>>(),
+        );
+        Ok(ProviderProfileSnapshot { revision, profiles })
     }
 
     async fn snapshot(
@@ -207,6 +265,8 @@ struct CachedProviderProfileSource {
 struct CachedSnapshot {
     snapshot: ProviderProfileSnapshot,
     fetched_at: Instant,
+    profiles_by_id: BTreeMap<String, Vec<ScopedSnapshotProfile>>,
+    validation: Result<(), Status>,
 }
 
 impl CachedProviderProfileSource {
@@ -219,10 +279,26 @@ impl CachedProviderProfileSource {
     }
 
     /// Fetch a new snapshot. Returns whether its revision differs from the
-    /// cached one; a failure keeps serving the cached snapshot until it ages
-    /// out.
+    /// cached one. Transport failures keep the cache until it ages out;
+    /// invalid snapshots revoke it immediately.
     async fn refresh(&self, store: &Store) -> Result<bool, Status> {
         let snapshot = self.inner.snapshot(store, "").await?;
+        // Validate the complete source once when it changes, not on every
+        // provider-token request. Invalid snapshots revoke cached authorization.
+        let validation = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: self.source_id().to_string(),
+            revision: snapshot.revision.clone(),
+            profiles: snapshot.profiles.clone(),
+            user_managed: self.user_managed(),
+            allow_empty: self.allow_empty(),
+        }])
+        .map(drop);
+        let mut profiles_by_id: BTreeMap<String, Vec<ScopedSnapshotProfile>> = BTreeMap::new();
+        for profile in &snapshot.profiles {
+            if let Some(id) = normalize_profile_id(&profile.profile.id) {
+                profiles_by_id.entry(id).or_default().push(profile.clone());
+            }
+        }
         let changed = self
             .cached
             .load()
@@ -231,8 +307,10 @@ impl CachedProviderProfileSource {
         self.cached.store(Some(Arc::new(CachedSnapshot {
             snapshot,
             fetched_at: Instant::now(),
+            profiles_by_id,
+            validation: validation.clone(),
         })));
-        Ok(changed)
+        validation.map(|()| changed)
     }
 
     fn age(&self) -> Option<Duration> {
@@ -255,6 +333,33 @@ impl ProviderProfileSource for CachedProviderProfileSource {
 
     fn allow_empty(&self) -> bool {
         self.inner.allow_empty()
+    }
+
+    async fn snapshot_profile(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+        id: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let cached = self.cached.load();
+        let cached = cached
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed() <= self.max_age)
+            .ok_or_else(|| {
+                openshell_core::rpc_error::unavailable(
+                    "PROFILE_SOURCE_UNAVAILABLE",
+                    format!(
+                        "provider profile source '{}' has no current snapshot",
+                        self.source_id()
+                    ),
+                    Duration::from_secs(1),
+                )
+            })?;
+        cached.validation.clone()?;
+        Ok(ProviderProfileSnapshot {
+            revision: cached.snapshot.revision.clone(),
+            profiles: cached.profiles_by_id.get(id).cloned().unwrap_or_default(),
+        })
     }
 
     async fn snapshot(
@@ -503,6 +608,29 @@ impl ProviderProfileSources {
             "captured provider profile catalog snapshot"
         );
         Ok(catalog)
+    }
+
+    pub(crate) async fn profile_catalog(
+        &self,
+        store: &Store,
+        workspace: &str,
+        id: &str,
+    ) -> Result<EffectiveProviderProfileCatalog, Status> {
+        let id = normalize_profile_id(id)
+            .ok_or_else(|| Status::failed_precondition("invalid provider profile id"))?;
+        let mut snapshots = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            let snapshot = source.snapshot_profile(store, workspace, &id).await?;
+            snapshots.push(CollectedProviderProfileSnapshot {
+                source_id: source.source_id().to_string(),
+                revision: snapshot.revision,
+                profiles: snapshot.profiles,
+                user_managed: source.user_managed(),
+                // A valid non-empty source may not contain this particular ID.
+                allow_empty: true,
+            });
+        }
+        build_effective_profiles(snapshots)
     }
 
     async fn snapshots(
@@ -919,7 +1047,6 @@ fn format_diagnostic(diagnostic: ProfileValidationDiagnostic) -> String {
     }
 }
 
-#[cfg(test)]
 fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     let mut profiles = profiles.to_vec();
     profiles
@@ -1954,6 +2081,80 @@ mod tests {
         assert_ne!(
             canonical_provider_profile_bytes(&first),
             canonical_provider_profile_bytes(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn point_lookup_preserves_scopes_and_excludes_unrelated_profiles() {
+        let store = crate::persistence::test_store().await;
+        for (id, workspace) in [
+            ("selected", ""),
+            ("selected", "alpha"),
+            ("unrelated", "alpha"),
+            ("beta-only", "beta"),
+        ] {
+            store
+                .put_message(&stored_profile_in_workspace(id, workspace))
+                .await
+                .unwrap();
+        }
+        let sources = ProviderProfileSources::with_default_sources();
+        let full = sources.snapshot_catalog(&store, "alpha").await.unwrap();
+        let selected = sources
+            .profile_catalog(&store, "alpha", "selected")
+            .await
+            .unwrap();
+        for scope in ["", "alpha"] {
+            assert_eq!(
+                selected.get_type_profile_for_scope("selected", scope),
+                full.get_type_profile_for_scope("selected", scope)
+            );
+        }
+        assert_eq!(selected.profiles.len(), 1);
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "beta-only")
+                .await
+                .unwrap()
+                .get_profile("beta-only")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn point_lookup_preserves_source_authority_and_collision_checks() {
+        let store = crate::persistence::test_store().await;
+        store
+            .put_message(&stored_profile_in_workspace("user-only", "alpha"))
+            .await
+            .unwrap();
+        let sources =
+            ProviderProfileSources::from_test_profiles_with_user_source(vec![profile("external")]);
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "user-only")
+                .await
+                .unwrap()
+                .get_profile("user-only")
+                .is_some()
+        );
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "external")
+                .await
+                .unwrap()
+                .get_profile("external")
+                .is_some()
+        );
+        store
+            .put_message(&stored_profile_in_workspace("external", "alpha"))
+            .await
+            .unwrap();
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "external")
+                .await
+                .is_err()
         );
     }
 

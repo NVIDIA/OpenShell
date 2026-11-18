@@ -124,7 +124,7 @@ async fn grant_configuration(
         .ok_or_else(invalid)?;
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(&state.store, sandbox.object_workspace())
+        .profile_catalog(&state.store, sandbox.object_workspace(), &provider.r#type)
         .await
         .map_err(token_grant_dependency_status)?;
     let profile = get_provider_type_profile_for_scope(
