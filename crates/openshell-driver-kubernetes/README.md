@@ -303,7 +303,9 @@ original physical supervisor; restart provisions a fresh generation.
 
 Sandbox creation from a template selects a ready spare from that template's
 current pool revision in the same workspace. Its rendered Pod shape and child environment must match exactly;
-non-matching requests and empty pools use cold creation. A create that loses a
+non-matching requests and empty pools use cold creation. Failures reading pool
+targets, inventory, or journals also allow fenced cold selection; permission,
+request validation, and launch ownership errors remain fatal. A create that loses a
 spare to another sandbox or to retirement tries the next candidate only after
 gateway persistence confirms the outcome. Cold selection commits a launch decision
 that fences delayed warm reservations. An ambiguous failure cannot fall back. The driver writes a

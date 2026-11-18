@@ -1665,7 +1665,10 @@ JWT signing. No capacity is created until a sandbox template sets both
 `desired_service_level.startup.ready_within` and a positive `max_burst`.
 See [Sandbox Templates](/how-it-works/sandboxes/templates) for the CLI configuration.
 A create from that template claims a ready spare with matching Pod configuration
-and environment, or uses cold creation when none is available. Creates without a
+and environment, or uses cold creation when none is available. Temporary pool
+discovery failures also allow cold creation after the gateway confirms that no
+warm claim owns the launch. Permission and claim recovery errors still fail the
+request. Creates without a
 template do not consume template pools. `ready_within` is a requested service level,
 not a guaranteed startup deadline.
 

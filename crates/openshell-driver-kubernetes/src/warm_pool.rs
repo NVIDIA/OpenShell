@@ -352,7 +352,14 @@ impl KubernetesComputeDriver {
             .api
             .list(&ListParams::default().labels(&selector))
             .await
-            .map_err(KubernetesDriverError::from_kube)?;
+            .map_err(|error| match error {
+                // Permission failures require operator action even when this
+                // inventory read is only looking for an optional warm spare.
+                KubeError::Api(ref response) if matches!(response.code, 401 | 403) => {
+                    KubernetesDriverError::Precondition(error.to_string())
+                }
+                error => KubernetesDriverError::from_kube(error),
+            })?;
         objects
             .into_iter()
             .map(|object| {

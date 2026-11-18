@@ -2360,21 +2360,36 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn closed_workload_socket_reports_bad_descriptor() {
+        const CHILD: &str = "OPENSHELL_CLOSED_WORKLOAD_SOCKET_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let socket =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            let fd = socket.as_raw_fd();
+            drop(socket);
+            // SAFETY: listen on a closed descriptor is a valid error probe.
+            assert_eq!(unsafe { libc::listen(fd, 1) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            return;
+        }
+
         let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
         let _broker = NetworkBroker::start_for_test(listener).unwrap();
-        let error = launcher
-            .execute(|| {
-                let socket =
-                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-                        .unwrap();
-                let fd = socket.as_raw_fd();
-                drop(socket);
-                // SAFETY: listen on a closed descriptor is a valid error probe.
-                assert_eq!(unsafe { libc::listen(fd, 1) }, -1);
-                io::Error::last_os_error().raw_os_error()
+        let executable = std::env::current_exe().unwrap();
+        // The launcher shares the broker's and other tests' descriptor table.
+        // Probe in a child so their opens cannot reuse the closed socket's FD.
+        let mut child = launcher
+            .execute(move || {
+                std::process::Command::new(executable)
+                    .arg("--exact")
+                    .arg("network_broker::tests::closed_workload_socket_reports_bad_descriptor")
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(CHILD, "1")
+                    .spawn()
             })
+            .unwrap()
             .unwrap();
-        assert_eq!(error, Some(libc::EBADF));
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

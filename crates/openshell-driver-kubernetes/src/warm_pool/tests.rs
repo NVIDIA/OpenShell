@@ -21,6 +21,9 @@ struct State {
     journal: Option<openshell_supervisor_control::warm_pool::WarmPoolSnapshot>,
     public_trust: Option<Value>,
     fail_journal_read: bool,
+    fail_placement: Option<&'static str>,
+    fail_pool_inventory: Option<u16>,
+    claim_on_cold_launch: Option<openshell_supervisor_control::WarmClaimIntent>,
     objects: BTreeMap<String, Value>,
     events: Vec<String>,
     preparations: Vec<PreparationRequest>,
@@ -58,6 +61,14 @@ impl InstancePlacement for Placement {
         lookup: openshell_supervisor_control::WarmClaimLookup,
     ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
         let mut state = self.0.lock().unwrap();
+        if state.fail_placement == Some("cold launch") {
+            return Box::pin(async { Err("cold launch unavailable".into()) });
+        }
+        if let Some(intent) = state.claim_on_cold_launch.take() {
+            state
+                .claims
+                .insert(intent.registration.route.clone(), intent);
+        }
         let intent = state
             .claims
             .values()
@@ -163,10 +174,13 @@ impl InstancePlacement for Placement {
         &self,
         lookup: openshell_supervisor_control::WarmClaimLookup,
     ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
-        let intent = self
-            .0
-            .lock()
-            .unwrap()
+        let state = self.0.lock().unwrap();
+        if state.fail_placement == Some("claim lookup")
+            || (state.fail_placement == Some("claim recovery") && !state.claims.is_empty())
+        {
+            return Box::pin(async { Err("claim lookup unavailable".into()) });
+        }
+        let intent = state
             .claims
             .values()
             .find(|intent| {
@@ -270,6 +284,9 @@ impl InstancePlacement for Placement {
         &self,
         _: Option<String>,
     ) -> PlacementFuture<Vec<openshell_supervisor_control::warm_pool::WarmPoolTarget>> {
+        if self.0.lock().unwrap().fail_placement == Some("targets") {
+            return Box::pin(async { Err("targets unavailable".into()) });
+        }
         let pool = pool_config();
         Box::pin(async move {
             Ok(vec![
@@ -567,6 +584,12 @@ fn fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
                     )
                 }
                 http::Method::GET => {
+                    if path == SANDBOXES
+                        && selector.split(',').any(|clause| clause == POOL_LABEL)
+                        && let Some(code) = state.fail_pool_inventory
+                    {
+                        return Ok::<_, std::convert::Infallible>(error(code));
+                    }
                     if let Some((failed_path, code)) = &state.fail_read
                         && &path == failed_path
                     {
@@ -1299,6 +1322,148 @@ async fn competing_creates_try_another_spare_or_allow_cold_fallback() {
         assert_eq!(state.lock().unwrap().claims.len(), ready);
         assert_eq!(state.lock().unwrap().activated.len(), ready);
     }
+}
+
+#[tokio::test]
+async fn discovery_failures_commit_cold_launch_before_falling_back() {
+    for failure in ["targets", "inventory", "journal", "missing candidate"] {
+        let state = Arc::new(Mutex::new(State::default()));
+        let (driver, request, prepared) = Box::pin(ready_pool(state.clone(), 1)).await;
+        let sandbox = claiming_sandbox(&request, "logical-fallback");
+        {
+            let mut state = state.lock().unwrap();
+            match failure {
+                "targets" => state.fail_placement = Some("targets"),
+                "inventory" => state.fail_pool_inventory = Some(503),
+                "journal" => state.fail_journal_read = true,
+                "missing candidate" => {
+                    state.fail_read =
+                        Some((format!("{SANDBOXES}/{}", prepared[0].resource.name), 404));
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            driver
+                .try_claim_warm_runtime(&sandbox, "openshell")
+                .await
+                .unwrap()
+                .is_none(),
+            "{failure}"
+        );
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.cold_launches.len(), 1);
+            assert_eq!(state.cold_launches[0].sandbox_id, sandbox.id);
+            assert!(state.claims.is_empty());
+            assert!(state.activated.is_empty());
+        }
+        // A delayed selector cannot claim a spare after cold creation is chosen.
+        state.lock().unwrap().fail_read = None;
+        let (api, object, record) = claim_object(&driver, &prepared[0].resource).await;
+        assert!(
+            !driver
+                .claim_warm_object(
+                    &sandbox,
+                    &api,
+                    &object,
+                    &record,
+                    prepared[0].registration.clone(),
+                )
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_fallback_preserves_permission_and_ownership_errors() {
+    for failure in [
+        "inventory unauthorized",
+        "inventory forbidden",
+        "ownership",
+        "claim lookup",
+        "cold launch",
+        "claim recovery",
+    ] {
+        let state = Arc::new(Mutex::new(State::default()));
+        let (driver, request, _) = Box::pin(ready_pool(state.clone(), 1)).await;
+        let sandbox = claiming_sandbox(&request, "logical-fail-closed");
+        {
+            let mut state = state.lock().unwrap();
+            match failure {
+                "inventory unauthorized" => state.fail_pool_inventory = Some(401),
+                "inventory forbidden" => state.fail_pool_inventory = Some(403),
+                "ownership" => state.fail_read = Some((SANDBOXES.into(), 503)),
+                "cold launch" => {
+                    state.fail_journal_read = true;
+                    state.fail_placement = Some(failure);
+                }
+                "claim recovery" => {
+                    state.lose_intent_response = true;
+                    state.fail_placement = Some(failure);
+                }
+                _ => state.fail_placement = Some(failure),
+            }
+        }
+        assert!(
+            driver
+                .try_claim_warm_runtime(&sandbox, "openshell")
+                .await
+                .is_err(),
+            "{failure}"
+        );
+        let state = state.lock().unwrap();
+        assert!(state.cold_launches.is_empty());
+        assert!(state.activated.is_empty());
+        assert_eq!(state.claims.len(), usize::from(failure == "claim recovery"));
+    }
+}
+
+#[tokio::test]
+async fn discovery_fallback_resumes_claim_that_wins_the_cold_launch_fence() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let (driver, request, prepared) = Box::pin(ready_pool(state.clone(), 1)).await;
+    let sandbox = claiming_sandbox(&request, "logical-concurrent-claim");
+    let (api, object, record) = claim_object(&driver, &prepared[0].resource).await;
+    state.lock().unwrap().lose_intent_response = true;
+    assert!(
+        driver
+            .claim_warm_object(
+                &sandbox,
+                &api,
+                &object,
+                &record,
+                prepared[0].registration.clone()
+            )
+            .await
+            .is_err()
+    );
+    {
+        let mut state = state.lock().unwrap();
+        // Publish the competing reservation only when this caller tries to
+        // commit its cold decision, after the initial ownership check.
+        state.claim_on_cold_launch = state.claims.remove(&prepared[0].registration.route);
+        assert!(state.claim_on_cold_launch.is_some());
+        state.fail_placement = Some("targets");
+    }
+    let identity = driver
+        .try_claim_warm_runtime(&sandbox, "openshell")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        identity,
+        kubernetes_runtime_identity(
+            &prepared[0].resource.namespace,
+            &prepared[0].resource.uid,
+            &prepared[0].registration.route
+        )
+    );
+    let state = state.lock().unwrap();
+    assert!(state.cold_launches.is_empty());
+    assert_eq!(state.claims.len(), 1);
+    assert_eq!(state.activated.len(), 1);
 }
 
 #[tokio::test]

@@ -1378,6 +1378,10 @@ workspaces with TLS and JWT signing. No spares exist until a template requests b
 its workload shape, and `warm_pool.enabled` before investigating missing capacity.
 Check gateway logs for `warm template inventory unavailable`,
 `warm pool reconciliation deferred`, and `warm pool operation will be reconciled`.
+`warm pool discovery unavailable; considering cold creation` means a create could
+not read optional pool metadata. The gateway must still commit a cold launch
+decision or resume a concurrent warm claim. Permission and claim recovery errors
+remain fatal; inspect those errors when cold fallback does not succeed.
 Changes to pool limits, effective runtime configuration, or verification keys
 require increasing `warm_pool.revision`; gateway upgrades can change default
 runtime images. Rollbacks also need a higher revision. Compatible spares survive

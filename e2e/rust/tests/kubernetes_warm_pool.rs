@@ -271,7 +271,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
         recovered["metadata"]["annotations"]["openshell.ai/warm-runtime-retiring"].is_null(),
         "healthy spare retired after gateway restart: {recovered}"
     );
-    let mut sandbox = SandboxGuard::create_with_gateway_default(&["--template", "e2e-warm"])
+    let mut sandbox = SandboxGuard::create(&["--template", "e2e-warm"])
         .await
         .expect("claim warm runtime");
     wait_for_sandbox_phase(&sandbox.name, "Ready", Duration::from_mins(2))

@@ -112,7 +112,14 @@ impl KubernetesComputeDriver {
         if !self.config.warm_pool.enabled {
             return Ok(None);
         }
-        let pools = self.template_warm_pools(Some(sandbox.id.clone())).await?;
+        let Some(pools) = optional_pool_discovery(
+            self.template_warm_pools(Some(sandbox.id.clone())).await,
+            sandbox,
+            "targets",
+        )?
+        else {
+            return Ok(None);
+        };
         let pools: Vec<_> = pools
             .into_iter()
             .filter(|pool| pool.workspace == sandbox.workspace && pool.target_size > 0)
@@ -124,12 +131,23 @@ impl KubernetesComputeDriver {
             .warm_runtime_trust()
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let inventory = self.warm_runtime_inventory(&sandbox.workspace).await?;
+        let Some(inventory) = optional_pool_discovery(
+            self.warm_runtime_inventory(&sandbox.workspace).await,
+            sandbox,
+            "inventory",
+        )?
+        else {
+            return Ok(None);
+        };
         for pool in &pools {
-            let Some(snapshot) = supervision
-                .warm_pool_state(&pool.workspace, &pool.name)
-                .await
-                .map_err(KubernetesDriverError::Message)?
+            let Some(Some(snapshot)) = optional_pool_discovery(
+                supervision
+                    .warm_pool_state(&pool.workspace, &pool.name)
+                    .await
+                    .map_err(KubernetesDriverError::Message),
+                sandbox,
+                "journal",
+            )?
             else {
                 continue;
             };
@@ -171,6 +189,7 @@ impl KubernetesComputeDriver {
                     continue;
                 }
                 // Recheck Pod identity, durable preparation, admission and fences.
+                let mut claim_attempted = false;
                 let result = async {
                     if !self.warm_connection_ready(resource).await? {
                         return Ok(None);
@@ -190,6 +209,9 @@ impl KubernetesComputeDriver {
                         .get(&resource.name)
                         .await
                         .map_err(KubernetesDriverError::from_kube)?;
+                    // A failed reservation may have committed. Only a missing
+                    // candidate before this point can skip claim recovery.
+                    claim_attempted = true;
                     if self
                         .claim_warm_object(sandbox, &api, &object, &record, prepared.registration)
                         .await?
@@ -203,6 +225,7 @@ impl KubernetesComputeDriver {
                 match result {
                     Ok(Some(identity)) => return Ok(Some(identity)),
                     Ok(None) => {}
+                    Err(KubernetesDriverError::NotFound) if !claim_attempted => {}
                     Err(error) => {
                         if let Some(intent) = supervision
                             .warm_claim_for_launch(launch_lookup(sandbox)?)
@@ -743,6 +766,23 @@ impl KubernetesComputeDriver {
             .await
             .map_err(KubernetesDriverError::Message)?;
         complete_claim(&api.api, object).await
+    }
+}
+
+/// Optional reads cannot authorize a cold launch: the caller must still resolve
+/// existing claims and commit `choose_cold_launch` before creating resources.
+fn optional_pool_discovery<T>(
+    result: Result<T, KubernetesDriverError>,
+    sandbox: &Sandbox,
+    operation: &str,
+) -> Result<Option<T>, KubernetesDriverError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(KubernetesDriverError::Message(error)) => {
+            warn!(sandbox_id = %sandbox.id, operation, %error, "warm pool discovery unavailable; considering cold creation");
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
