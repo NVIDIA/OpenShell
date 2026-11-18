@@ -1340,6 +1340,10 @@ pub enum ConfigFileError {
     )]
     UnsupportedVersion { version: u32 },
     #[error(
+        "invalid gateway config version; `openshell.version` must be the integer {SCHEMA_VERSION}"
+    )]
+    InvalidVersion,
+    #[error(
         "`{field}` is not allowed in the gateway config file — set the {env} env var or pass {cli} on the command line"
     )]
     SecretInFile {
@@ -1351,6 +1355,18 @@ pub enum ConfigFileError {
     InvalidValue {
         field: &'static str,
         message: &'static str,
+    },
+    /// A deserialization error in the merged configuration that no single file
+    /// explains, such as a required key that no file sets.
+    #[error("invalid merged gateway config ({files}): {detail}")]
+    MergedParse { files: String, detail: String },
+    /// An error from one file of a layered configuration whose own message
+    /// names no file.
+    #[error("gateway config file '{}': {source}", path.display())]
+    InFile {
+        path: PathBuf,
+        #[source]
+        source: Box<Self>,
     },
     #[error("invalid gateway config field `openshell.drivers.{name}`: expected a TOML table")]
     InvalidDriverTable { name: String },
@@ -1375,6 +1391,42 @@ pub enum ConfigFileError {
         path: PathBuf,
         message: String,
     },
+}
+
+impl ConfigFileError {
+    /// Attach `path` unless the error already names a file.
+    fn in_file(self, path: &Path) -> Self {
+        match self {
+            Self::Io { .. }
+            | Self::NonRegular { .. }
+            | Self::Parse { .. }
+            | Self::MergedParse { .. }
+            | Self::InFile { .. } => self,
+            other => Self::InFile {
+                path: path.to_path_buf(),
+                source: Box::new(other),
+            },
+        }
+    }
+
+    /// The file the error names, if any.
+    fn file(&self) -> Option<&Path> {
+        match self {
+            Self::Io { path, .. }
+            | Self::NonRegular { path, .. }
+            | Self::Parse { path, .. }
+            | Self::InFile { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The error without any file attribution.
+    fn root(&self) -> &Self {
+        match self {
+            Self::InFile { source, .. } => source.root(),
+            other => other,
+        }
+    }
 }
 
 const CONFIG_MIGRATION_URL: &str = "https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2";
@@ -1508,21 +1560,28 @@ fn without_quoted_strings(message: &str) -> String {
     result
 }
 
-fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigFileError> {
-    if contents.trim().is_empty() {
-        return Err(ConfigFileError::MissingVersion);
-    }
-    let file: ConfigFile = toml::from_str(contents).map_err(|error| ConfigFileError::Parse {
-        path: path.to_path_buf(),
-        detail: parse_error_detail(contents, &error),
-    })?;
-
+/// Validate a deserialized configuration. Runs once on the merged result.
+fn validate_loaded(file: ConfigFile) -> Result<ConfigFile, ConfigFileError> {
     match file.openshell.version {
         Some(SCHEMA_VERSION) => {}
         Some(version) => return Err(ConfigFileError::UnsupportedVersion { version }),
         None => return Err(ConfigFileError::MissingVersion),
     }
+    validate_shape(&file)?;
+    for driver_name in file.openshell.drivers.keys() {
+        file.isolation_backend(driver_name).map_err(|message| {
+            ConfigFileError::InvalidIsolationBackend {
+                name: driver_name.clone(),
+                message,
+            }
+        })?;
+    }
+    Ok(file)
+}
 
+/// Per-field rules. [`validate_loaded`] adds the rules that relate fields, such
+/// as resolving a driver's isolation backend against registrations.
+fn validate_shape(file: &ConfigFile) -> Result<(), ConfigFileError> {
     if file.openshell.gateway.database_url.is_some() {
         return Err(ConfigFileError::SecretInFile {
             field: "database_url",
@@ -1600,15 +1659,7 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         field: "openshell.supervisor.isolation_backends",
         message,
     })?;
-    for driver_name in file.openshell.drivers.keys() {
-        file.isolation_backend(driver_name).map_err(|message| {
-            ConfigFileError::InvalidIsolationBackend {
-                name: driver_name.clone(),
-                message,
-            }
-        })?;
-    }
-    Ok(file)
+    Ok(())
 }
 
 /// Preserve the v0.1.5 Podman TOML key while routing it through the shared
@@ -1657,32 +1708,12 @@ pub(crate) fn normalize_legacy_podman_ca_bundle(
     Ok(())
 }
 
-fn detected_version(contents: &str) -> String {
-    let Ok(value) = contents.parse::<toml::Value>() else {
-        return "unavailable".to_string();
-    };
-    let Some(openshell) = value.get("openshell") else {
-        return "missing".to_string();
-    };
-    let Some(openshell) = openshell.as_table() else {
-        return "unavailable".to_string();
-    };
-    openshell.get("version").map_or_else(
-        || "missing".to_string(),
-        |version| {
-            version
-                .as_integer()
-                .map_or_else(|| "unavailable".to_string(), |version| version.to_string())
-        },
-    )
-}
-
 fn preflight_error(
     path: &Path,
     detected_version: String,
     source: ConfigFileError,
 ) -> ConfigPreflightError {
-    let category = match &source {
+    let category = match source.root() {
         ConfigFileError::NonRegular { .. } => "non_regular_path",
         ConfigFileError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
             "missing_path"
@@ -1697,7 +1728,10 @@ fn preflight_error(
             "future_version"
         }
         ConfigFileError::UnsupportedVersion { .. } => "unsupported_version",
-        ConfigFileError::Parse { .. }
+        ConfigFileError::InvalidVersion
+        | ConfigFileError::Parse { .. }
+        | ConfigFileError::MergedParse { .. }
+        | ConfigFileError::InFile { .. }
         | ConfigFileError::SecretInFile { .. }
         | ConfigFileError::InvalidValue { .. }
         | ConfigFileError::InvalidDriverTable { .. }
@@ -1712,42 +1746,28 @@ fn preflight_error(
     }
 }
 
-/// Validate a gateway configuration without starting the gateway or writing state.
+/// Validate a single gateway configuration file without starting the gateway
+/// or writing state. This is [`preflight_layered`] with no drop-in configs.
 #[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
 pub fn preflight(path: &Path) -> Result<ConfigFile, ConfigPreflightError> {
-    let contents = read_config_contents(path)
-        .map_err(|source| preflight_error(path, "unavailable".to_string(), source))?;
-    let version = detected_version(&contents);
-    if version == "missing" {
-        return Err(preflight_error(
-            path,
-            version,
-            ConfigFileError::MissingVersion,
-        ));
-    }
-    if let Ok(version_number) = version.parse::<u32>()
-        && version_number != SCHEMA_VERSION
-    {
-        return Err(preflight_error(
-            path,
-            version,
-            ConfigFileError::UnsupportedVersion {
-                version: version_number,
-            },
-        ));
-    }
-    parse_and_validate(path, &contents).map_err(|source| preflight_error(path, version, source))
+    preflight_layered(Some(path), None).map(|layered| layered.file)
 }
 
-/// Load and validate a TOML config file.
+/// Load and validate a single TOML config file. This is [`load_layered`] with
+/// no drop-in configs.
 ///
 /// Configuration files must declare exactly [`SCHEMA_VERSION`]. Running
 /// without a config file still uses CLI, environment, and built-in defaults.
 #[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
 pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
-    let contents = read_config_contents(path)?;
-    parse_and_validate(path, &contents)
+    load_layered(Some(path), None).map(|layered| layered.file)
 }
+
+mod layered;
+
+#[cfg(test)]
+use layered::merge_tables;
+pub use layered::{LayeredConfig, drop_in_paths, load_layered, preflight_layered};
 
 /// Return a driver's table without gateway-level inheritance.
 ///
@@ -1773,6 +1793,19 @@ pub fn driver_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip the file attribution so a test can match the variant.
+    fn without_file(error: ConfigFileError) -> ConfigFileError {
+        match error {
+            ConfigFileError::InFile { source, .. } => without_file(*source),
+            other => other,
+        }
+    }
+
+    /// [`super::load`] with the error's file attribution removed.
+    fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
+        super::load(path).map_err(without_file)
+    }
     use std::io::Write;
 
     #[test]
@@ -3687,5 +3720,520 @@ ssh_gateway_port = 8080
             Some(10),
             "RPM defaults must retain Podman's readiness health check"
         );
+    }
+
+    fn layered_dir(base: &str, drop_ins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("gateway.toml");
+        std::fs::write(&base_path, base).unwrap();
+        let frag_dir = dir.path().join("gateway.d");
+        std::fs::create_dir(&frag_dir).unwrap();
+        for (name, contents) in drop_ins {
+            std::fs::write(frag_dir.join(name), contents).unwrap();
+        }
+        (dir, base_path, frag_dir)
+    }
+
+    const BASE: &str = "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"auto\"\nsocket = \"/a\"\n";
+
+    #[test]
+    fn layered_drop_in_overrides_and_adds_tables() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "10-podman.toml",
+                "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"keep-id\"\n[openshell.drivers.docker]\nx = 1\n",
+            )],
+        );
+        let loaded = load_layered(Some(&base), Some(&frags)).unwrap();
+        let podman = loaded.file.openshell.drivers["podman"].as_table().unwrap();
+        assert_eq!(podman["userns"].as_str(), Some("keep-id"));
+        assert_eq!(
+            podman["socket"].as_str(),
+            Some("/a"),
+            "untouched keys survive"
+        );
+        assert!(loaded.file.openshell.drivers.contains_key("docker"));
+        assert_eq!(loaded.sources.len(), 2);
+    }
+
+    #[test]
+    fn layered_later_drop_in_wins_in_lexical_order() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[
+                (
+                    "20-b.toml",
+                    "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"b\"\n",
+                ),
+                (
+                    "10-a.toml",
+                    "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"a\"\n",
+                ),
+                (
+                    "99.txt",
+                    "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"ignored\"\n",
+                ),
+                (
+                    ".hidden.toml",
+                    "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"ignored\"\n",
+                ),
+            ],
+        );
+        let loaded = load_layered(Some(&base), Some(&frags)).unwrap();
+        let podman = loaded.file.openshell.drivers["podman"].as_table().unwrap();
+        assert_eq!(podman["userns"].as_str(), Some("b"));
+        assert_eq!(loaded.sources.len(), 3);
+    }
+
+    #[test]
+    fn layered_arrays_replace() {
+        let mut base = toml::Table::new();
+        let mut overlay = toml::Table::new();
+        base.insert("a".into(), toml::Value::Array(vec![1.into(), 2.into()]));
+        overlay.insert("a".into(), toml::Value::Array(vec![3.into()]));
+        merge_tables(&mut base, overlay);
+        assert_eq!(base["a"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn layered_unknown_field_names_the_drop_in() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[
+                (
+                    "10-ok.toml",
+                    "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"x\"\n",
+                ),
+                (
+                    "20-bad.toml",
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nnot_a_field = 1\n",
+                ),
+            ],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("20-bad.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_parse_error_names_the_drop_in_and_hides_values() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[("10-bad.toml", "[openshell\nsecret = \"hunter2\"\n")],
+        );
+        let error = load_layered(Some(&base), Some(&frags))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("10-bad.toml"), "{error}");
+        assert!(!error.contains("hunter2"), "{error}");
+    }
+
+    #[test]
+    fn layered_secret_in_drop_in_is_rejected() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "10-db.toml",
+                "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_url = \"postgres://u:p@h/db\"\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(
+            matches!(error.root(), ConfigFileError::SecretInFile { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("10-db.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_every_file_must_declare_the_version() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[("10-p.toml", "[openshell.drivers.podman]\nuserns = \"x\"\n")],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(matches!(error.root(), ConfigFileError::MissingVersion));
+        assert!(error.to_string().contains("10-p.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_unsupported_version_names_the_drop_in() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[("10-old.toml", "[openshell]\nversion = 1\nlegacy = true\n")],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(matches!(
+            error.root(),
+            ConfigFileError::UnsupportedVersion { version: 1 }
+        ));
+        assert!(error.to_string().contains("10-old.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_overridden_bad_value_is_not_an_error_and_a_later_unknown_key_is() {
+        let (_dir, base, frags) = layered_dir(
+            "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = \"bad\"\n",
+            &[
+                (
+                    "10-fix.toml",
+                    "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = 10\n",
+                ),
+                (
+                    "20-bad.toml",
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nnot_a_field = 1\n",
+                ),
+            ],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("20-bad.toml"), "{error}");
+        assert!(!error.to_string().contains("gateway.toml"), "{error}");
+    }
+
+    const TLS_BASE: &str = "[openshell]\nversion = 2\n[openshell.gateway.tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\n";
+
+    #[test]
+    fn layered_partial_nested_table_is_accepted() {
+        let (_dir, base, frags) = layered_dir(
+            TLS_BASE,
+            &[(
+                "10-mtls.toml",
+                "[openshell]\nversion = 2\n[openshell.gateway.tls]\nclient_ca_path = \"/ca\"\n",
+            )],
+        );
+        let loaded = load_layered(Some(&base), Some(&frags)).unwrap();
+        let tls = loaded.file.openshell.gateway.tls.unwrap();
+        assert_eq!(tls.cert_path, PathBuf::from("/c"));
+        assert_eq!(tls.client_ca_path, Some(PathBuf::from("/ca")));
+    }
+
+    #[test]
+    fn layered_unknown_key_in_a_partial_table_names_the_file() {
+        let (_dir, base, frags) = layered_dir(
+            TLS_BASE,
+            &[
+                (
+                    "10-ok.toml",
+                    "[openshell]\nversion = 2\n[openshell.gateway.tls]\nclient_ca_path = \"/ca\"\n",
+                ),
+                (
+                    "20-typo.toml",
+                    "[openshell]\nversion = 2\n[openshell.gateway.tls]\nclient_ca_pth = \"/ca\"\n",
+                ),
+            ],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("20-typo.toml"), "{error}");
+        assert!(!error.to_string().contains("10-ok.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_wrong_type_names_the_file_whose_value_wins() {
+        let (_dir, base, frags) = layered_dir(
+            "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = 5\n",
+            &[(
+                "10-bad.toml",
+                "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = \"many\"\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("10-bad.toml"), "{error}");
+        assert!(!error.to_string().contains("many"), "{error}");
+    }
+
+    #[test]
+    fn layered_missing_required_key_names_the_merged_config() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "10-tls.toml",
+                "[openshell]\nversion = 2\n[openshell.gateway.tls]\nclient_ca_path = \"/ca\"\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("merged"), "{error}");
+        assert!(error.contains("10-tls.toml"), "{error}");
+        assert!(error.contains("gateway.toml"), "{error}");
+        assert!(!error.contains("''"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn layered_symlink_is_followed_only_inside_the_directory() {
+        let (dir, base, frags) = layered_dir(BASE, &[]);
+        let data = frags.join("..data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(
+            data.join("10-link.toml"),
+            "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"linked\"\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("..data/10-link.toml", frags.join("10-link.toml")).unwrap();
+        let loaded = load_layered(Some(&base), Some(&frags)).unwrap();
+        let podman = loaded.file.openshell.drivers["podman"].as_table().unwrap();
+        assert_eq!(podman["userns"].as_str(), Some("linked"));
+
+        let outside = dir.path().join("outside.toml");
+        std::fs::write(&outside, "[openshell]\nversion = 2\n").unwrap();
+        std::os::unix::fs::symlink(&outside, frags.join("20-out.toml")).unwrap();
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(
+            matches!(error, ConfigFileError::NonRegular { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("20-out.toml"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn layered_base_symlink_is_still_rejected() {
+        let (dir, _base, frags) = layered_dir(BASE, &[]);
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, BASE).unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = load_layered(Some(&link), Some(&frags)).unwrap_err();
+        assert!(
+            matches!(error, ConfigFileError::NonRegular { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn layered_semantic_error_names_the_drop_in() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "20-bad.toml",
+                "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = 0\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("20-bad.toml"), "{error}");
+        let preflight = preflight_layered(Some(&base), Some(&frags))
+            .unwrap_err()
+            .to_string();
+        assert!(preflight.contains("20-bad.toml"), "{preflight}");
+        assert!(preflight.contains("detected_version=2"), "{preflight}");
+    }
+
+    #[test]
+    fn layered_cross_file_rules_run_on_the_merged_result_and_name_the_setting_file() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "10-backend.toml",
+                "[openshell]\nversion = 2\n[openshell.drivers.podman]\nisolation_backend = \"agent\"\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(
+            matches!(
+                error.root(),
+                ConfigFileError::InvalidIsolationBackend { .. }
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("10-backend.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_a_non_integer_version_is_rejected_even_when_a_later_file_overrides_it() {
+        let (_dir, base, frags) = layered_dir(
+            "[openshell]\nversion = \"two\"\n",
+            &[("10-ok.toml", "[openshell]\nversion = 2\n")],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(matches!(error.root(), ConfigFileError::InvalidVersion));
+        assert!(error.to_string().contains("gateway.toml"), "{error}");
+
+        let (_dir, base, frags) =
+            layered_dir(BASE, &[("10-bad.toml", "[openshell]\nversion = \"two\"\n")]);
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(matches!(error.root(), ConfigFileError::InvalidVersion));
+        assert!(error.to_string().contains("10-bad.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_a_quoted_version_is_rejected_in_a_drop_in() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[("10-quoted.toml", "[openshell]\nversion = \"2\"\n")],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(matches!(error.root(), ConfigFileError::InvalidVersion));
+        assert!(error.to_string().contains("10-quoted.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_whole_table_error_across_files_names_the_merged_config() {
+        let log =
+            |body: &str| format!("[openshell]\nversion = 2\n[openshell.gateway.ocsf_log]\n{body}");
+        let (_dir, base, frags) = layered_dir(
+            &log("path = 'log'\nrotation = 'never'\nmax_files = 7\n"),
+            &[("10-path.toml", &log("path = 'other'\n"))],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(
+            matches!(error.root(), ConfigFileError::MergedParse { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("max_files requires daily"),
+            "{error}"
+        );
+
+        // One file owns the whole table, so it is named.
+        let (_dir, base, frags) = layered_dir(
+            "[openshell]\nversion = 2\n",
+            &[(
+                "10-log.toml",
+                &log("path = 'log'\nrotation = 'never'\nmax_files = 7\n"),
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("10-log.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_with_no_base_runs_on_the_drop_ins_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("10-a.toml"),
+            "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"auto\"\n",
+        )
+        .unwrap();
+        let loaded = load_layered(None, Some(dir.path())).unwrap();
+        assert_eq!(
+            loaded.file.openshell.drivers["podman"]["userns"].as_str(),
+            Some("auto")
+        );
+        assert_eq!(loaded.sources, vec![dir.path().join("10-a.toml")]);
+
+        // A failure that no single file explains names the directory, not an
+        // empty path.
+        std::fs::write(
+            dir.path().join("10-a.toml"),
+            "[openshell]\nversion = 2\n[openshell.gateway.tls]\nclient_ca_path = \"/ca\"\n",
+        )
+        .unwrap();
+        // Startup lists the drop-in configs that were merged.
+        let startup = load_layered(None, Some(dir.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(startup.contains("10-a.toml"), "{startup}");
+        let error = preflight_layered(None, Some(dir.path())).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains("''"), "{message}");
+    }
+
+    #[test]
+    fn layered_the_drop_in_that_sets_the_bad_value_is_named_when_the_base_sets_a_good_one() {
+        let (_dir, base, frags) = layered_dir(
+            "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = 5\n",
+            &[(
+                "20-bad.toml",
+                "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = 0\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("20-bad.toml"), "{message}");
+        assert!(!message.contains("gateway.toml"), "{message}");
+    }
+
+    #[test]
+    fn layered_an_invalid_driver_table_names_the_drop_in_that_sets_it() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "20-driver.toml",
+                "[openshell]\nversion = 2\n[openshell.drivers]\npodman = 1\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("20-driver.toml"), "{error}");
+    }
+
+    #[test]
+    fn a_single_file_reports_the_line_and_column_of_a_wrong_value() {
+        let (_dir, base, _) = layered_dir(
+            "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = \"secret\"\n",
+            &[],
+        );
+        let message = load_layered(Some(&base), None).unwrap_err().to_string();
+        assert!(message.contains("gateway.toml"), "{message}");
+        assert!(message.contains("line 4, column"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[test]
+    fn a_single_file_missing_a_required_key_names_the_file() {
+        let (_dir, base, _) = layered_dir(
+            "[openshell]\nversion = 2\n[openshell.gateway.tls]\nclient_ca_path = \"/ca\"\n",
+            &[],
+        );
+        let message = load_layered(Some(&base), None).unwrap_err().to_string();
+        assert!(message.contains("gateway.toml"), "{message}");
+        assert!(!message.contains("merged"), "{message}");
+    }
+
+    #[test]
+    fn layered_a_wrong_value_across_files_reports_the_key_path_and_hides_the_value() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "10-bad.toml",
+                "[openshell]\nversion = 2\n[openshell.gateway]\ndatabase_max_connections = \"secret\"\n",
+            )],
+        );
+        let message = load_layered(Some(&base), Some(&frags))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("10-bad.toml"), "{message}");
+        assert!(
+            message.contains("openshell.gateway.database_max_connections"),
+            "{message}"
+        );
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[test]
+    fn layered_an_out_of_range_or_misplaced_version_is_malformed() {
+        for contents in [
+            "[openshell]\nversion = -1\n",
+            "[openshell]\nversion = 4294967296\n",
+            "openshell = 5\n",
+        ] {
+            let (_dir, base, frags) = layered_dir(contents, &[]);
+            let error = preflight_layered(Some(&base), Some(&frags)).unwrap_err();
+            assert_eq!(error.category(), "malformed", "{contents}");
+        }
+        let (_dir, base, _) = layered_dir("[openshell]\nversion = -1\n", &[]);
+        let error = load_layered(Some(&base), None).unwrap_err();
+        assert!(matches!(error.root(), ConfigFileError::InvalidVersion));
+    }
+
+    #[test]
+    fn layered_preflight_keeps_unavailable_for_a_malformed_version() {
+        let (_dir, base, frags) = layered_dir(BASE, &[]);
+        std::fs::write(&base, "[openshell]\nversion = \"two\"\n").unwrap();
+        let error = preflight_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert_eq!(error.detected_version(), "unavailable");
+        assert_eq!(error.category(), "malformed");
+    }
+
+    #[test]
+    fn layered_without_drop_ins_matches_single_file() {
+        let (_dir, base, frags) = layered_dir(BASE, &[]);
+        let layered = load_layered(Some(&base), Some(&frags)).unwrap();
+        let single = load(&base).unwrap();
+        assert_eq!(layered.file.openshell.drivers, single.openshell.drivers);
     }
 }
