@@ -121,7 +121,7 @@ mod tests {
     fn sleeper() -> ChildCommand {
         let mut command = ChildCommand::new("cmd.exe");
         command
-            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
             .stdin(ChildStdio::Null)
             .stdout(ChildStdio::Null)
             .stderr(ChildStdio::Null);
@@ -199,7 +199,7 @@ mod tests {
 
         // Negative control: a process created the ordinary way is not in the job.
         let mut outsider = tokio::process::Command::new("cmd.exe")
-            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
             .kill_on_drop(true)
             .spawn()
             .expect("outsider");
@@ -297,7 +297,11 @@ mod tests {
         let job = GenerationJob::new().expect("job");
         let child = job.spawn(&sleeper()).expect("spawn in job");
         let root = child.id().expect("pid");
-        tokio::time::sleep(Duration::from_millis(700)).await; // let cmd start ping
+        // Let cmd start ping: wait for it, not for a fixed time a loaded host may exceed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child_pids(root).is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let grandchildren = child_pids(root)
             .iter()
             .map(u32::to_string)
@@ -366,17 +370,30 @@ mod tests {
         };
         let mut live: std::collections::VecDeque<(GenerationJob, GenerationChild)> =
             std::collections::VecDeque::new();
-        println!("READY");
+        let mut ready = false;
         loop {
             let job = GenerationJob::new().expect("job");
             let mut command = ChildCommand::new(&exe);
             command
-                .args(["/c", "ping -n 60 127.0.0.1 >nul"])
+                .args(["/d", "/c", "ping -n 60 127.0.0.1 >nul"])
                 .stdin(ChildStdio::Null)
                 .stdout(ChildStdio::Null)
                 .stderr(ChildStdio::Null);
-            if let Ok(child) = job.spawn(&command) {
-                live.push_back((job, child));
+            match job.spawn(&command) {
+                Ok(child) => {
+                    live.push_back((job, child));
+                    if !ready {
+                        // Only now has a generation really been started, so a kill after
+                        // this point can land in a real spawn.
+                        println!("READY");
+                        ready = true;
+                    }
+                }
+                Err(error) => {
+                    // Failing to start would make the test pass without testing anything.
+                    println!("SPAWN_FAILED {error}");
+                    std::process::exit(3);
+                }
             }
             if live.len() > 6 {
                 live.pop_front();
@@ -396,8 +413,10 @@ mod tests {
         // A copy of cmd.exe under a name nothing else has, so survivors are countable.
         let name = format!("mxc-job-stress-{}.exe", std::process::id());
         let exe = std::env::temp_dir().join(&name);
-        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/cmd.exe");
+        let system = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+        )
+        .join("System32/cmd.exe");
         std::fs::copy(system, &exe).expect("copy cmd.exe");
 
         for trial in 0..12u64 {
@@ -412,7 +431,13 @@ mod tests {
                 .spawn()
                 .expect("start stress host");
             let mut lines = BufReader::new(host.stdout.take().unwrap()).lines();
-            while lines.next().expect("host exited early").unwrap() != "READY" {}
+            loop {
+                let line = lines.next().expect("host exited early").unwrap();
+                assert!(!line.starts_with("SPAWN_FAILED"), "{line}");
+                if line == "READY" {
+                    break;
+                }
+            }
             // Different, unrelated delays so the kill lands at different points.
             tokio::time::sleep(Duration::from_millis(40 + (trial * 37) % 260)).await;
             host.kill().expect("hard-kill the host");

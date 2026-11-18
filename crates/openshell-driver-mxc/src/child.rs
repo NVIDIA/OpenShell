@@ -41,7 +41,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::watch;
 use windows::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
@@ -119,9 +120,16 @@ impl ChildCommand {
         self
     }
 
-    /// Append already-encoded arguments to the command line exactly as given.
+    /// Append already-encoded arguments to the command line exactly as given, after the
+    /// quoted ones. Several calls are joined with a space.
     pub(crate) fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
-        self.raw_args = Some(arg.as_ref().to_os_string());
+        match &mut self.raw_args {
+            Some(existing) => {
+                existing.push(" ");
+                existing.push(arg.as_ref());
+            }
+            None => self.raw_args = Some(arg.as_ref().to_os_string()),
+        }
         self
     }
 
@@ -173,13 +181,22 @@ impl Drop for OwnedHandle {
     }
 }
 
+/// How a process ended, as published by its exit-watcher thread.
+#[derive(Clone, Copy)]
+enum Exit {
+    Code(u32),
+    /// The watcher could not wait for the process or read its exit code. Reporting a
+    /// code here would claim a clean exit for a process that may still be running.
+    Unknown,
+}
+
 /// A process started inside its generation's job.
 ///
 /// It is killed when dropped if it is still running.
 pub struct GenerationChild {
     process: Arc<OwnedHandle>,
     pid: u32,
-    exit: watch::Receiver<Option<u32>>,
+    exit: watch::Receiver<Option<Exit>>,
     /// Parent end of the child's standard input, when it was [`ChildStdio::Piped`].
     /// Held open for the child's lifetime so the child does not see end-of-file; the
     /// driver never writes to it.
@@ -237,18 +254,30 @@ impl GenerationChild {
         // SAFETY: the handle is owned by `self.process` and valid.
         match unsafe { TerminateProcess(self.process.0, 1) } {
             Ok(()) => Ok(()),
-            // Lost a race with the process ending by itself.
-            Err(_) if self.exit.borrow().is_some() => Ok(()),
+            // Lost a race with the process ending by itself: `TerminateProcess` then fails
+            // with "access denied", possibly before the watcher thread has published it.
+            Err(_) if self.has_exited() => Ok(()),
             Err(error) => Err(io::Error::from(error)),
         }
+    }
+
+    /// Whether the process has ended, asked of the process itself.
+    fn has_exited(&self) -> bool {
+        // SAFETY: the handle is owned by `self.process` and valid.
+        self.exit.borrow().is_some()
+            || unsafe { WaitForSingleObject(self.process.0, 0) } == WAIT_OBJECT_0
     }
 
     /// Wait for the process to end. Safe to cancel and to call again.
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         loop {
-            let code = *self.exit.borrow();
-            if let Some(code) = code {
-                return Ok(ExitStatus::from_raw(code));
+            let state = *self.exit.borrow();
+            match state {
+                Some(Exit::Code(code)) => return Ok(ExitStatus::from_raw(code)),
+                Some(Exit::Unknown) => {
+                    return Err(io::Error::other("could not read how the process ended"));
+                }
+                None => {}
             }
             self.exit
                 .changed()
@@ -368,15 +397,20 @@ fn build_command_line(command: &ChildCommand, program: &Path) -> io::Result<Vec<
 /// Windows compares environment names case-insensitively.
 fn env_sort_key(name: &OsStr) -> Vec<u16> {
     char::decode_utf16(name.encode_wide())
-        .flat_map(|unit| {
-            unit.map_or_else(
-                |_| Vec::new(),
-                |character| character.to_uppercase().collect::<Vec<_>>(),
-            )
-        })
-        .flat_map(|character| {
-            let mut buffer = [0u16; 2];
-            character.encode_utf16(&mut buffer).to_vec()
+        .flat_map(|unit| match unit {
+            Ok(character) => {
+                // Windows upper-cases one UTF-16 unit at a time and never lengthens a name
+                // ('ß' stays 'ß'), so only a one-to-one mapping counts.
+                let mut upper = character.to_uppercase();
+                let mapped = match (upper.next(), upper.next()) {
+                    (Some(single), None) => single,
+                    _ => character,
+                };
+                let mut buffer = [0u16; 2];
+                mapped.encode_utf16(&mut buffer).to_vec()
+            }
+            // An unpaired surrogate is kept as it is.
+            Err(error) => vec![error.unpaired_surrogate()],
         })
         .collect()
 }
@@ -384,8 +418,29 @@ fn env_sort_key(name: &OsStr) -> Vec<u16> {
 /// The new process's environment: the host's, with `overrides` applied, as the
 /// sorted UTF-16 block `CreateProcessW` requires.
 fn build_env_block(overrides: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
+    build_env_block_from(std::env::vars_os(), overrides)
+}
+
+/// [`build_env_block`] over an explicit host environment, so tests do not depend on the
+/// environment they run in.
+fn build_env_block_from(
+    host: impl IntoIterator<Item = (OsString, OsString)>,
+    overrides: &[(OsString, OsString)],
+) -> io::Result<Vec<u16>> {
+    for (name, _) in overrides {
+        // An empty name or one holding `=` would corrupt the block.
+        if name.is_empty() || name.encode_wide().any(|unit| unit == u16::from(b'=')) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a valid environment variable name",
+                    name.to_string_lossy()
+                ),
+            ));
+        }
+    }
     let mut merged: BTreeMap<Vec<u16>, (OsString, OsString)> = BTreeMap::new();
-    for (name, value) in std::env::vars_os() {
+    for (name, value) in host {
         merged.insert(env_sort_key(&name), (name, value));
     }
     for (name, value) in overrides {
@@ -412,48 +467,58 @@ fn build_env_block(overrides: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
     Ok(block)
 }
 
+/// The directories of `path` a program may be found in: absolute ones only. An empty or
+/// relative entry would search the current directory, which is deliberately not searched.
+fn usable_path_entries(path: &OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|directory| directory.is_absolute())
+        .collect()
+}
+
 /// Find the executable for `program`: as given when it has a directory, otherwise
-/// in the `PATH` directories and then the system directory. The current directory
-/// is deliberately not searched.
-fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
-    let candidates = |base: PathBuf| -> Vec<PathBuf> {
+/// in the `PATH` directories (`path`, or the host's when `None`) and then the system
+/// directory. The current directory is deliberately not searched.
+///
+/// A name without an extension means `NAME.exe`, as it does to Windows: the bare name is
+/// never tried, so an extension-less script of the same name cannot shadow the program.
+fn resolve_program(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
+    let candidate = |base: PathBuf| -> PathBuf {
         if base.extension().is_some() {
-            vec![base]
+            base
         } else {
-            let mut with_exe = base.clone().into_os_string();
+            let mut with_exe = base.into_os_string();
             with_exe.push(".exe");
-            vec![base, PathBuf::from(with_exe)]
+            PathBuf::from(with_exe)
         }
+    };
+    let not_found = || {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("program not found: {}", Path::new(program).display()),
+        )
     };
     let given = Path::new(program);
     if given.is_absolute() || given.components().count() > 1 {
-        return candidates(given.to_path_buf())
-            .into_iter()
-            .find(|candidate| candidate.is_file())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("program not found: {}", given.display()),
-                )
-            });
+        let found = candidate(given.to_path_buf());
+        return if found.is_file() {
+            Ok(found)
+        } else {
+            Err(not_found())
+        };
     }
-    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
+    let mut directories = path
+        .map(OsStr::to_os_string)
+        .or_else(|| std::env::var_os("PATH"))
+        .map(|path| usable_path_entries(&path))
         .unwrap_or_default();
     if let Some(root) = std::env::var_os("SystemRoot") {
         directories.push(PathBuf::from(root).join("System32"));
     }
-    for directory in directories {
-        for candidate in candidates(directory.join(given)) {
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("program not found: {}", given.display()),
-    ))
+    directories
+        .into_iter()
+        .map(|directory| candidate(directory.join(given)))
+        .find(|found| found.is_file())
+        .ok_or_else(not_found)
 }
 
 /// The child-side handle of one standard stream, plus the parent end if piped.
@@ -514,6 +579,24 @@ fn inherit_std(which: STD_HANDLE, write: bool) -> io::Result<OwnedHandle> {
 /// A pipe with an overlapped parent end (usable by tokio) and an inheritable child end.
 /// `child_writes` is true for stdout/stderr, false for stdin.
 fn make_pipe(child_writes: bool) -> io::Result<StdioPair> {
+    // SAFETY: `make_pipe_with` hands over an open, overlapped pipe handle that nothing
+    // else owns or closes.
+    make_pipe_with(child_writes, |raw| unsafe {
+        NamedPipeServer::from_raw_handle(raw)
+    })
+}
+
+/// [`make_pipe`] with the step that registers the server end with tokio supplied by the
+/// caller, so a test can make it fail.
+///
+/// `register` takes ownership of the handle it is given **even when it fails**: tokio
+/// wraps it in an owning pipe before registering it with the reactor and drops that pipe,
+/// closing the handle, if registration fails. This function therefore must not close the
+/// handle again on that path.
+fn make_pipe_with(
+    child_writes: bool,
+    register: impl FnOnce(RawHandle) -> io::Result<NamedPipeServer>,
+) -> io::Result<StdioPair> {
     let name = format!(
         r"\\.\pipe\openshell-mxc-{}-{}-{:016x}",
         std::process::id(),
@@ -562,14 +645,8 @@ fn make_pipe(child_writes: bool) -> io::Result<StdioPair> {
         let client = OwnedHandle(client);
         let raw = server.0.0;
         std::mem::forget(server);
-        // tokio takes ownership of the overlapped server end; on failure it is ours to close.
-        let parent = match NamedPipeServer::from_raw_handle(raw) {
-            Ok(parent) => parent,
-            Err(error) => {
-                let _ = CloseHandle(HANDLE(raw));
-                return Err(error);
-            }
-        };
+        // `register` owns the server end from here on, whether or not it succeeds.
+        let parent = register(raw)?;
         Ok(StdioPair {
             child: client,
             parent: Some(parent),
@@ -597,7 +674,8 @@ fn open_stdio(
 
 /// A `PROC_THREAD_ATTRIBUTE_LIST`, deleted on drop.
 struct AttributeList {
-    buffer: Vec<u8>,
+    /// Eight-byte units, so the list is aligned for pointers as Windows requires.
+    buffer: Vec<u64>,
 }
 
 impl AttributeList {
@@ -605,7 +683,7 @@ impl AttributeList {
         let mut size = 0usize;
         // SAFETY: the first call only reports the size needed; failure is expected.
         let _ = unsafe { InitializeProcThreadAttributeList(None, count, None, &raw mut size) };
-        let mut buffer = vec![0u8; size];
+        let mut buffer = vec![0u64; size.div_ceil(size_of::<u64>())];
         let list = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
         // SAFETY: `buffer` is `size` bytes, as the first call requested.
         unsafe { InitializeProcThreadAttributeList(Some(list), count, None, &raw mut size) }
@@ -679,7 +757,26 @@ fn create(
     command: &ChildCommand,
     suspended: bool,
 ) -> io::Result<(GenerationChild, OwnedHandle)> {
-    let program = resolve_program(&command.program)?;
+    // The new process's `PATH` decides where its program is looked for, as in std.
+    let path = command
+        .envs
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.as_os_str());
+    let program = resolve_program(&command.program, path)?;
+    if program
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a batch file; start it through cmd.exe /c",
+                program.display()
+            ),
+        ));
+    }
     let mut command_line = build_command_line(command, &program)?;
     let application = to_wide(program.as_os_str())?;
     let environment = build_env_block(&command.envs)?;
@@ -706,8 +803,22 @@ fn create(
     }
     let jobs = [job];
     let mut attributes = AttributeList::new(2)?;
-    attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs)?;
-    attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited)?;
+    attributes
+        .set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("name the sandbox job for process creation: {error}"),
+            )
+        })?;
+    attributes
+        .set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("limit the handles the process inherits: {error}"),
+            )
+        })?;
 
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = u32::try_from(size_of::<STARTUPINFOEXW>()).unwrap_or(0);
@@ -740,10 +851,15 @@ fn create(
         )
     }
     .map_err(|error| {
-        io::Error::other(format!(
-            "create process {} in its sandbox job: {error}",
-            program.display()
-        ))
+        let source = io::Error::from(error);
+        // Keep the kind (not found, access denied, bad image) for callers that match on it.
+        io::Error::new(
+            source.kind(),
+            format!(
+                "create process {} in its sandbox job: {source}",
+                program.display()
+            ),
+        )
     })?;
     drop(attributes);
 
@@ -759,13 +875,17 @@ fn create(
         .name(format!("mxc-wait-{}", info.dwProcessId))
         .spawn(move || {
             // SAFETY: `watched` keeps the process handle valid for the whole wait.
-            let mut code = 0u32;
-            unsafe {
-                if WaitForSingleObject(watched.0, INFINITE) != WAIT_FAILED {
-                    let _ = GetExitCodeProcess(watched.0, &raw mut code);
+            let exit = unsafe {
+                let mut code = 0u32;
+                if WaitForSingleObject(watched.0, INFINITE) == WAIT_OBJECT_0
+                    && GetExitCodeProcess(watched.0, &raw mut code).is_ok()
+                {
+                    Exit::Code(code)
+                } else {
+                    Exit::Unknown
                 }
-            }
-            let _ = sender.send(Some(code));
+            };
+            let _ = sender.send(Some(exit));
         });
     if let Err(error) = spawned {
         // SAFETY: the process handle is valid; end the process nobody can watch.
@@ -790,7 +910,9 @@ mod tests {
     use std::time::Duration;
 
     use tokio::io::AsyncReadExt as _;
-    use windows::Win32::Foundation::{HLOCAL, LocalFree, WAIT_TIMEOUT};
+    use windows::Win32::Foundation::{
+        CompareObjectHandles, GetHandleInformation, HLOCAL, LocalFree, WAIT_TIMEOUT,
+    };
     use windows::Win32::Storage::FileSystem::CREATE_NEW;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
     use windows::Win32::UI::Shell::CommandLineToArgvW;
@@ -895,43 +1017,281 @@ mod tests {
         assert!(build_command_line(&command, &program).is_err());
     }
 
+    /// The entries of an environment block as `NAME=value` strings.
+    fn block_entries(block: &[u16]) -> Vec<String> {
+        block
+            .split(|&unit| unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
+    }
+
+    /// The variable name of an environment entry. A name may itself start with `=`
+    /// (Windows keeps per-drive directories as `=C:=C:\dir`).
+    fn entry_name(entry: &str) -> &str {
+        let search_from = usize::from(entry.starts_with('='));
+        entry[search_from..]
+            .find('=')
+            .map_or(entry, |at| &entry[..at + search_from])
+    }
+
     #[test]
-    fn environment_block_is_sorted_and_applies_overrides() {
+    fn environment_block_merges_host_and_overrides_in_windows_order() {
+        // A synthetic host, so the result does not depend on where the test runs: it
+        // deliberately holds an OPENSHELL_ setting, a drive-directory entry and a
+        // lower-case name.
+        let host = vec![
+            (OsString::from("Path"), OsString::from(r"C:\x")),
+            (
+                OsString::from("OPENSHELL_WXC_EXEC_PATH"),
+                OsString::from(r"C:\mxc\wxc-exec.exe"),
+            ),
+            (OsString::from("=C:"), OsString::from(r"C:\work")),
+            (OsString::from("openshell_b"), OsString::from("0")),
+        ];
         let overrides = vec![
             (OsString::from("Openshell_B"), OsString::from("2")),
             (OsString::from("OPENSHELL_a"), OsString::from("1")),
             // Same name as the first, different case: the later value replaces it.
             (OsString::from("openshell_b"), OsString::from("3")),
         ];
-        let block = build_env_block(&overrides).expect("block");
+
+        let block = build_env_block_from(host, &overrides).expect("block");
+
         assert!(block.ends_with(&[0, 0]), "the block ends with a double NUL");
-        let entries: Vec<String> = block
-            .split(|&unit| unit == 0)
-            .filter(|entry| !entry.is_empty())
-            .map(String::from_utf16_lossy)
-            .collect();
-        let ours: Vec<&String> = entries
-            .iter()
-            .filter(|entry| entry.to_ascii_lowercase().starts_with("openshell_"))
-            .collect();
-        assert_eq!(ours, vec!["OPENSHELL_a=1", "openshell_b=3"]);
-        let keys: Vec<String> = entries
-            .iter()
-            .map(|entry| entry.split('=').next().unwrap_or("").to_uppercase())
-            .collect();
-        let mut sorted = keys.clone();
-        sorted.sort();
+        // Unrelated host entries are kept, overrides win over the host's own value, and
+        // the whole block is in case-insensitive name order.
         assert_eq!(
-            keys, sorted,
+            block_entries(&block),
+            vec![
+                r"=C:=C:\work",
+                "OPENSHELL_a=1",
+                "openshell_b=3",
+                r"OPENSHELL_WXC_EXEC_PATH=C:\mxc\wxc-exec.exe",
+                r"Path=C:\x",
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_block_is_sorted_for_whatever_host_it_runs_on() {
+        // The real host: whatever it holds, the block must be in Windows order and every
+        // host variable must survive.
+        let block = build_env_block(&[]).expect("block");
+        let entries = block_entries(&block);
+        let keys: Vec<Vec<u16>> = entries
+            .iter()
+            .map(|entry| env_sort_key(OsStr::new(entry_name(entry))))
+            .collect();
+        assert!(
+            keys.windows(2).all(|pair| pair[0] <= pair[1]),
             "entries must be sorted by name, case-insensitively"
         );
+        for (name, _) in std::env::vars_os() {
+            let wanted = env_sort_key(&name);
+            assert!(
+                keys.contains(&wanted),
+                "host variable {name:?} is missing from the block"
+            );
+        }
+    }
+
+    /// Whether `handle` is still an open handle of this process.
+    fn handle_is_open(handle: RawHandle) -> bool {
+        let mut flags = 0u32;
+        // SAFETY: a plain query; `flags` outlives the call.
+        unsafe { GetHandleInformation(HANDLE(handle), &raw mut flags) }.is_ok()
+    }
+
+    #[test]
+    fn a_failed_pipe_registration_leaves_the_handle_to_its_new_owner() {
+        // `register` owns the handle even when it fails, so `make_pipe_with` must not
+        // close it again: a second close could hit an unrelated handle that another
+        // thread was given the same value. This registrar fails without closing, which
+        // makes a second close visible.
+        let seen = std::cell::Cell::new(std::ptr::null_mut());
+        let result = make_pipe_with(true, |raw| {
+            seen.set(raw);
+            Err(io::Error::other("registration failed"))
+        });
+        let raw = seen.get();
+        assert!(!raw.is_null(), "the registrar was never reached");
+        let still_open = handle_is_open(raw);
+        // SAFETY: the registrar did not close it, so it is ours to close here.
+        let _ = unsafe { CloseHandle(HANDLE(raw)) };
+
+        assert!(result.is_err(), "the registration error must be returned");
+        assert!(
+            still_open,
+            "make_pipe_with closed a handle it no longer owned"
+        );
+    }
+
+    #[test]
+    fn tokio_closes_the_pipe_handle_itself_when_registration_fails() {
+        // The contract the test above relies on, against the real tokio: from a stopped
+        // runtime the registration fails, and the handle is closed by tokio.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        drop(runtime);
+        let _entered = handle.enter();
+
+        let seen = std::cell::Cell::new(std::ptr::null_mut());
+        let result = make_pipe_with(true, |raw| {
+            seen.set(raw);
+            // SAFETY: `raw` is an open overlapped pipe handle that nothing else owns.
+            unsafe { NamedPipeServer::from_raw_handle(raw) }
+        });
+
+        assert!(
+            result.is_err(),
+            "registering with a stopped runtime must fail"
+        );
+        let raw = seen.get();
+        assert!(!raw.is_null(), "the registrar was never reached");
+        assert!(
+            !handle_is_open(raw),
+            "tokio is expected to have closed the handle it could not register"
+        );
+    }
+
+    #[test]
+    fn raw_arguments_given_twice_are_both_kept() {
+        let program = PathBuf::from(r"C:\x\tool.exe");
+        let mut command = ChildCommand::new(&program);
+        command.raw_arg("first").raw_arg(r#"second "third""#);
+        let line = build_command_line(&command, &program).expect("command line");
+        assert_eq!(
+            String::from_utf16_lossy(&line[..line.len() - 1]),
+            r#""C:\x\tool.exe" first second "third""#
+        );
+    }
+
+    #[test]
+    fn environment_names_that_would_corrupt_the_block_are_rejected() {
+        for bad in ["", "A=B", "=X"] {
+            let overrides = vec![(OsString::from(bad), OsString::from("v"))];
+            let error = build_env_block_from(Vec::new(), &overrides).expect_err(bad);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn environment_names_sort_the_way_windows_compares_them() {
+        // One unit at a time: 'ß' does not become "SS", and a lone surrogate is kept.
+        assert_eq!(env_sort_key(OsStr::new("\u{df}")), vec![0x00DF]);
+        assert_eq!(env_sort_key(OsStr::new("a\u{df}")), vec![0x0041, 0x00DF]);
+        let lone = OsString::from_wide(&[0xD800]);
+        assert_eq!(env_sort_key(&lone), vec![0xD800]);
+    }
+
+    #[test]
+    fn only_absolute_path_entries_are_searched() {
+        let path = OsString::from(r"C:\one;;.;relative\dir;D:\two");
+        assert_eq!(
+            usable_path_entries(&path),
+            vec![PathBuf::from(r"C:\one"), PathBuf::from(r"D:\two")]
+        );
+    }
+
+    #[test]
+    fn a_program_name_without_an_extension_means_its_exe() {
+        let dir = std::env::temp_dir().join(format!("mxc-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A script-like file with the bare name must not shadow the executable.
+        std::fs::write(dir.join("tool"), b"not a program").unwrap();
+        std::fs::write(dir.join("tool.exe"), b"MZ").unwrap();
+        let path = OsString::from(dir.as_os_str());
+
+        let found = resolve_program(OsStr::new("tool"), Some(&path));
+        std::fs::remove_file(dir.join("tool.exe")).unwrap();
+        let only_bare = resolve_program(OsStr::new("tool"), Some(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(found.unwrap(), dir.join("tool.exe"));
+        assert_eq!(only_bare.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn the_new_process_path_decides_where_its_program_is_found() {
+        let dir = std::env::temp_dir().join(format!("mxc-pathenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        std::fs::copy(system, dir.join("mxc-pathenv-tool.exe")).unwrap();
+
+        let job = GenerationJob::new().expect("job");
+        let mut command = quiet("mxc-pathenv-tool", &["/d", "/c", "exit 5"]);
+        command.env("Path", &dir);
+        let mut child = job.spawn(&command).expect("found through the new PATH");
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("exited")
+            .unwrap();
+        drop(child);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(status.code(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn a_batch_file_is_refused_with_a_clear_error() {
+        let batch = std::env::temp_dir().join(format!("mxc-batch-{}.cmd", std::process::id()));
+        std::fs::write(&batch, b"@echo off").unwrap();
+        let job = GenerationJob::new().expect("job");
+        let error = job
+            .spawn(&quiet(batch.to_str().unwrap(), &[]))
+            .err()
+            .expect("must fail");
+        let _ = std::fs::remove_file(&batch);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("batch file"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn killing_a_process_that_has_ended_is_not_an_error_before_the_watcher_reports() {
+        // `TerminateProcess` on a process that has ended fails with "access denied". The
+        // exit watcher publishes the exit a moment later, so `start_kill` must ask the
+        // process itself. A channel nobody publishes on stands in for a watcher that has
+        // not run yet, which makes the moment deterministic.
+        let job = GenerationJob::new().expect("job");
+        let mut child = job
+            .spawn(&quiet("cmd.exe", &["/d", "/c", "exit 0"]))
+            .expect("spawn");
+        let (_unused_sender, never_reports) = watch::channel(None);
+        child.exit = never_reports;
+        // SAFETY: the handle is owned by `child.process` and valid.
+        let ended = unsafe { WaitForSingleObject(child.process.0, 10_000) };
+        assert_eq!(ended, WAIT_OBJECT_0, "the process should have ended");
+
+        child
+            .start_kill()
+            .expect("an ended process is not a kill failure");
+    }
+
+    #[tokio::test]
+    async fn an_exit_the_watcher_could_not_read_is_an_error_not_a_clean_exit() {
+        let job = GenerationJob::new().expect("job");
+        let mut child = job
+            .spawn(&quiet("cmd.exe", &["/d", "/c", "exit 0"]))
+            .expect("spawn");
+        let (_sender, unknown) = watch::channel(Some(Exit::Unknown));
+        child.exit = unknown;
+
+        let result = child.wait().await;
+
+        assert!(result.is_err(), "reported {result:?} for an unknown exit");
     }
 
     #[tokio::test]
     async fn exit_status_is_reported() {
         let job = GenerationJob::new().expect("job");
         let mut child = job
-            .spawn(&quiet("cmd.exe", &["/c", "exit 7"]))
+            .spawn(&quiet("cmd.exe", &["/d", "/c", "exit 7"]))
             .expect("spawn");
         let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
@@ -947,7 +1307,7 @@ mod tests {
         let job = GenerationJob::new().expect("job");
         let mut command = ChildCommand::new("cmd.exe");
         command
-            .args(["/c", "echo out& echo err 1>&2"])
+            .args(["/d", "/c", "echo out& echo err 1>&2"])
             .stdin(ChildStdio::Null)
             .stdout(ChildStdio::Piped)
             .stderr(ChildStdio::Piped);
@@ -971,7 +1331,7 @@ mod tests {
         let job = GenerationJob::new().expect("job");
         let mut command = ChildCommand::new("cmd.exe");
         command
-            .args(["/c", "echo %OPENSHELL_CHILD_TEST%"])
+            .args(["/d", "/c", "echo %OPENSHELL_CHILD_TEST%"])
             .env("OPENSHELL_CHILD_TEST", "value with spaces")
             .stdin(ChildStdio::Null)
             .stdout(ChildStdio::Piped)
@@ -996,7 +1356,10 @@ mod tests {
     async fn kill_ends_the_process_and_wait_reports_it() {
         let job = GenerationJob::new().expect("job");
         let mut child = job
-            .spawn(&quiet("cmd.exe", &["/c", "ping -n 30 127.0.0.1 >nul"]))
+            .spawn(&quiet(
+                "cmd.exe",
+                &["/d", "/c", "ping -n 30 127.0.0.1 >nul"],
+            ))
             .expect("spawn");
         tokio::time::timeout(Duration::from_secs(10), child.kill())
             .await
@@ -1011,7 +1374,10 @@ mod tests {
     async fn dropping_a_child_kills_it() {
         let job = GenerationJob::new().expect("job");
         let child = job
-            .spawn(&quiet("cmd.exe", &["/c", "ping -n 30 127.0.0.1 >nul"]))
+            .spawn(&quiet(
+                "cmd.exe",
+                &["/d", "/c", "ping -n 30 127.0.0.1 >nul"],
+            ))
             .expect("spawn");
         let pid = child.id().unwrap();
         assert!(is_alive(pid));
@@ -1025,9 +1391,8 @@ mod tests {
         panic!("the dropped child is still running");
     }
 
-    /// An inheritable handle with exclusive access: while any other process holds a copy
-    /// the file cannot be deleted.
-    fn open_exclusive_inheritable(path: &Path) -> HANDLE {
+    /// A handle to a scratch file that a child could inherit.
+    fn open_inheritable(path: &Path) -> HANDLE {
         let sa = inheritable();
         let name = to_wide(path.as_os_str()).unwrap();
         // SAFETY: `name` and `sa` outlive the call.
@@ -1045,43 +1410,74 @@ mod tests {
         .expect("create inheritable file")
     }
 
+    /// Whether `child_process` holds a copy of `ours`. An inherited handle keeps its
+    /// value, so duplicate the handle of that value out of the child and check that it is
+    /// the same kernel object (another object that happens to have the same value does not
+    /// count). This looks at that one process only, so processes other tests start at the
+    /// same time cannot affect the answer.
+    fn child_holds_copy_of(child_process: HANDLE, ours: HANDLE) -> bool {
+        let mut copy = HANDLE::default();
+        // SAFETY: both handles are valid; `copy` outlives the call and is closed below.
+        unsafe {
+            if DuplicateHandle(
+                child_process,
+                ours,
+                GetCurrentProcess(),
+                &raw mut copy,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let same = CompareObjectHandles(ours, copy).as_bool();
+            let _ = CloseHandle(copy);
+            same
+        }
+    }
+
     /// Only the standard handles may reach a sandbox process. A handle the host holds
     /// (here an inheritable file handle) must not be inherited, as the host's listening
-    /// socket once was. The control shows the test can detect an inherited handle.
+    /// socket once was. The control shows the check can see an inherited handle.
     #[tokio::test]
     async fn only_the_standard_handles_are_inherited() {
-        let dir = std::env::temp_dir();
-        let pid = std::process::id();
+        let scratch =
+            std::env::temp_dir().join(format!("openshell-inherit-{}.tmp", std::process::id()));
+        let handle = open_inheritable(&scratch);
 
         // Control: the ordinary way of starting a process inherits the handle.
-        let control = dir.join(format!("openshell-inherit-control-{pid}.tmp"));
-        let handle = open_exclusive_inheritable(&control);
-        let mut ordinary = tokio::process::Command::new("cmd.exe")
-            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+        let mut ordinary = tokio::process::Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .expect("ordinary child");
-        // SAFETY: the handle is valid and closed once.
-        unsafe { CloseHandle(handle) }.unwrap();
-        assert!(
-            std::fs::remove_file(&control).is_err(),
-            "control: the ordinary child should still hold the file open"
-        );
+        let ordinary_process = HANDLE(ordinary.raw_handle().expect("process handle"));
+        let control = child_holds_copy_of(ordinary_process, handle);
         let _ = ordinary.kill().await;
-        let _ = ordinary.wait().await;
-        std::fs::remove_file(&control).expect("control file deletable once the child is gone");
 
         // Ours: the same handle is not inherited.
-        let ours = dir.join(format!("openshell-inherit-ours-{pid}.tmp"));
         let job = GenerationJob::new().expect("job");
-        let handle = open_exclusive_inheritable(&ours);
         let child = job
-            .spawn(&quiet("cmd.exe", &["/c", "ping -n 30 127.0.0.1 >nul"]))
+            .spawn(&quiet("ping.exe", &["-n", "30", "127.0.0.1"]))
             .expect("spawn");
+        let ours_process = HANDLE(child.raw_handle().expect("process handle"));
+        let inherited = child_holds_copy_of(ours_process, handle);
+        drop(child);
+
         // SAFETY: the handle is valid and closed once.
         unsafe { CloseHandle(handle) }.unwrap();
-        let deleted = std::fs::remove_file(&ours);
-        drop(child);
-        deleted.expect("a sandbox process must not hold the host's other handles");
+        let _ = std::fs::remove_file(&scratch);
+
+        assert!(
+            control,
+            "control: an ordinary child should inherit the handle"
+        );
+        assert!(
+            !inherited,
+            "a sandbox process must not hold the host's other handles"
+        );
     }
 }
