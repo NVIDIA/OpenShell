@@ -448,15 +448,7 @@ fn prepare_server_config_with_drivers(
     // Load TOML when explicitly requested, or from the default XDG location
     // when that file exists. Missing default config is not an error: runtime
     // defaults and OPENSHELL_* env vars are enough for package-managed starts.
-    let config_path = resolve_config_path(args)?;
-    let mut file: Option<ConfigFile> = if let Some(path) = config_path {
-        Some(config_file::load(&path).map_err(|e| miette::miette!("{e}"))?)
-    } else {
-        None
-    };
-    if let Some(file) = file.as_ref() {
-        merge_file_into_args(args, &file.openshell.gateway, matches);
-    }
+    let mut file = load_config(args, matches, None, ConfigLoad::Startup)?.file;
     let legacy_compute_driver_env_seen = resolve_legacy_driver_selector_env(args)?;
     normalize_compute_driver_socket_args(args)?;
     let compute_driver = compute_drivers
@@ -1123,18 +1115,8 @@ fn run_effective_config_preflight(
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
 ) -> Result<Option<crate::ConfiguredComputeDriver>> {
-    let path = if path_override.is_some() {
-        path_override
-    } else {
-        resolve_config_path(&run)?
-    };
-    let mut file = path
-        .as_ref()
-        .map(|path| config_file::preflight(path).map_err(|error| miette::miette!("{error}")))
-        .transpose()?;
-    if let Some(file) = file.as_ref() {
-        merge_file_into_args(&mut run, &file.openshell.gateway, matches);
-    }
+    let LoadedConfig { path, mut file } =
+        load_config(&mut run, matches, path_override, ConfigLoad::Preflight)?;
 
     let validation = (|| {
         // These argument relationships are shared with daemon startup and
@@ -1433,6 +1415,49 @@ fn validate_preflight_semantics(
         return Err(miette::miette!("gateway listener ports must be distinct"));
     }
     Ok(())
+}
+
+/// How a configuration file is loaded. Preflight reports a failure in its
+/// stable format, while startup reports the full error.
+#[derive(Clone, Copy)]
+enum ConfigLoad {
+    Startup,
+    Preflight,
+}
+
+/// The configuration file a command selected, if any.
+struct LoadedConfig {
+    /// The file that was read, for messages that name it.
+    path: Option<PathBuf>,
+    file: Option<ConfigFile>,
+}
+
+/// Load the configuration file selected by `path_override`, `--config` or the
+/// default location, and fold its gateway section into `args`. Startup and
+/// preflight both go through here so they select and read the same file.
+fn load_config(
+    args: &mut RunArgs,
+    matches: &ArgMatches,
+    path_override: Option<PathBuf>,
+    mode: ConfigLoad,
+) -> Result<LoadedConfig> {
+    let path = match path_override {
+        Some(path) => Some(path),
+        None => resolve_config_path(args)?,
+    };
+    let file = path
+        .as_ref()
+        .map(|path| match mode {
+            ConfigLoad::Startup => config_file::load(path).map_err(|e| miette::miette!("{e}")),
+            ConfigLoad::Preflight => {
+                config_file::preflight(path).map_err(|e| miette::miette!("{e}"))
+            }
+        })
+        .transpose()?;
+    if let Some(file) = file.as_ref() {
+        merge_file_into_args(args, &file.openshell.gateway, matches);
+    }
+    Ok(LoadedConfig { path, file })
 }
 
 fn resolve_config_path(args: &RunArgs) -> Result<Option<PathBuf>> {
