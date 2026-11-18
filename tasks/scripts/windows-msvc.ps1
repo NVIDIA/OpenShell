@@ -533,7 +533,7 @@ function Invoke-Z3Package([string] $RustTarget) {
     $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
     $cmakePath = if ($cmake) { $cmake.Source } else { Join-Path (Split-Path (Split-Path $ninja)) 'CMake/bin/cmake.exe' }
     if (-not (Test-Path -LiteralPath $cmakePath)) { throw 'Install Visual Studio CMake tools to package Z3.' }
-    $build = Join-Path $TargetDir "z3-build/$RustTarget"
+    $build = Join-Path $TargetDir "z3-build/$Z3Version-msvc$($Z3Pin.msvcToolset)-v$($Z3Pin.packageRevision)/$RustTarget"
     $output = Join-Path $TargetDir 'windows-z3-packages'
     $install = Join-Path $build 'install'
     $package = Join-Path $build 'package'
@@ -541,7 +541,7 @@ function Invoke-Z3Package([string] $RustTarget) {
     New-Item -ItemType Directory -Path $build, $output -Force | Out-Null
     if (Test-Path -LiteralPath $package) { Remove-Item -LiteralPath $package -Recurse -Force }
     $flags = @(
-        '-G Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
+        '-G Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_COMPILER=cl.exe', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
         '-DZ3_BUILD_LIBZ3_SHARED=OFF', '-DZ3_BUILD_LIBZ3_MSVC_STATIC=ON',
         '-DZ3_LINK_TIME_OPTIMIZATION=OFF', '-DZ3_BUILD_EXECUTABLE=ON',
         '-DZ3_BUILD_TEST_EXECUTABLES=OFF', '-DZ3_ENABLE_EXAMPLE_TARGETS=OFF',
@@ -550,8 +550,8 @@ function Invoke-Z3Package([string] $RustTarget) {
     $log = Join-Path $LogDir "package-z3-$RustTarget.log"
     $cmd = @(
         "call `"$vsDevCmd`" -arch=$(Get-VsTargetArch $RustTarget) -host_arch=$(Get-HostArch) -vcvars_ver=$($Z3Pin.msvcToolset)",
-        "set VCToolsVersion > `"$toolsetRecord`"",
-        "findstr /b /c:`"VCToolsVersion=$($Z3Pin.msvcToolset).`" `"$toolsetRecord`"",
+        "set VCToolsVersion>`"$toolsetRecord`"",
+        "findstr /i /b /l /c:`"VCToolsVersion=$($Z3Pin.msvcToolset).`" `"$toolsetRecord`"",
         "`"$cmakePath`" -S `"$source`" -B `"$build`" $($flags -join ' ') -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_INSTALL_PREFIX=`"$install`"",
         "`"$cmakePath`" --build `"$build`" --target install --parallel $WindowsBuildJobs"
     ) -join ' && '
