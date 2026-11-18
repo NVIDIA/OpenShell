@@ -92,7 +92,9 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   the same `success()`, `failure()` and `expect_stdout()` as exec output,
   plus `json()`, and `report_text()` for matching a wrapped error report.
   `cx.cli_handle()` returns that CLI for code that can't borrow `cx`, such as
-  a cleanup hook.
+  a cleanup hook. `cx.cli_find_listed(list, collection, name)` finds an entry
+  in a paginated `--output json` listing, following every page; a listing
+  without `collection` is an error.
 - `cx.cli_spawn([...])` to start the CLI and keep it running, for commands
   that stream or read input, such as `sandbox connect`. The `CliChild` it
   returns writes stdin, reads stdout and stderr line by line or all at once,
