@@ -35,19 +35,33 @@ impl VmBackend {
         }
     }
 
-    pub(crate) fn validate_kernel_image(&self, path: &Path) -> Result<(), String> {
-        match self {
-            Self::Libkrun => Err(format!(
+    pub(crate) fn resolve_kernel_image(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<Option<PathBuf>, String> {
+        match (self, path) {
+            (Self::Libkrun, None) => Ok(None),
+            (Self::Libkrun, Some(path)) => Err(format!(
                 "libkrun does not support external kernel images: {}",
                 path.display()
             )),
-            Self::Qemu => validate_qemu_kernel_image(path),
+            (Self::Qemu, path) => resolve_qemu_kernel_image(path).map(Some),
         }
     }
 }
 
-/// Preflight the formats accepted by the `x86_64` QEMU launcher. The VMM still
-/// validates the complete image; runtime admission confirms enforcement.
+fn resolve_qemu_kernel_image(path: Option<&Path>) -> Result<PathBuf, String> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => qemu_runtime_dir()?.join("vmlinux"),
+    };
+    validate_qemu_kernel_image(&path)?;
+    Ok(path)
+}
+
+/// Check the architecture and boot-image header for QEMU direct boot.
+/// An uncompressed Linux ELF kernel also needs a PVH entry note, which QEMU
+/// checks when it loads the image.
 fn validate_qemu_kernel_image(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!(
@@ -138,11 +152,6 @@ pub struct VmLaunchConfig {
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    // Both workload and image-preparation launchers enter here. Reject
-    // incompatible external kernels before touching disks or starting the VMM.
-    if let Some(kernel_image) = &config.kernel_image {
-        config.backend.validate_kernel_image(kernel_image)?;
-    }
     match config.backend {
         VmBackend::Qemu => run_qemu_vm(config),
         VmBackend::Libkrun => run_libkrun_vm(config),
@@ -159,6 +168,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         );
     }
     VmBackend::Qemu.validate_host()?;
+    let kernel = resolve_qemu_kernel_image(config.kernel_image.as_deref())?;
 
     if !config.root_disk.is_file() {
         return Err(format!(
@@ -178,16 +188,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         return Err(format!("image disk not found: {}", image_disk.display()));
     }
 
-    let vmlinux = if let Some(kernel_image) = &config.kernel_image {
-        kernel_image.clone()
-    } else {
-        qemu_runtime_dir()?.join("vmlinux")
-    };
-    if !vmlinux.is_file() {
-        return Err(format!("VM kernel not found: {}", vmlinux.display()));
-    }
-    validate_qemu_kernel_image(&vmlinux)?;
-    let mut qemu_cmd = qemu_command(config, &vmlinux)?;
+    let mut qemu_cmd = qemu_command(config, &kernel)?;
 
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
         return Err(format!("procguard arm failed: {err}"));
@@ -388,12 +389,7 @@ fn procguard_kill_children() {
 }
 
 fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    if let Some(kernel_image) = &config.kernel_image {
-        return Err(format!(
-            "selected kernel image is not supported by this VM backend: {}",
-            kernel_image.display()
-        ));
-    }
+    VmBackend::Libkrun.resolve_kernel_image(config.kernel_image.as_deref())?;
     if !config.root_disk.is_file() {
         return Err(format!(
             "root disk image not found: {}",
@@ -535,10 +531,10 @@ pub fn configured_runtime_dir() -> Result<PathBuf, String> {
 }
 
 fn qemu_runtime_dir() -> Result<PathBuf, String> {
-    configured_runtime_dir().map_err(|_| {
-        "QEMU backend requires OPENSHELL_VM_RUNTIME_DIR to be set (pointing to a directory \
-         containing vmlinux). Set the env var or run `mise run vm:setup`."
-            .to_string()
+    configured_runtime_dir().map_err(|error| {
+        format!(
+            "QEMU requires an external kernel or a vmlinux file in the directory set by {VM_RUNTIME_DIR_ENV}: {error}"
+        )
     })
 }
 
@@ -974,14 +970,17 @@ mod tests {
         elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
         elf[18] = 62; // EM_X86_64.
         std::fs::write(file.path(), &elf).unwrap();
-        VmBackend::Qemu
-            .validate_kernel_image(file.path())
-            .expect("x86_64 ELF header");
+        assert_eq!(
+            VmBackend::Qemu
+                .resolve_kernel_image(Some(file.path()))
+                .expect("x86_64 ELF header"),
+            Some(file.path().to_path_buf())
+        );
         elf[18] = 183; // EM_AARCH64.
         std::fs::write(file.path(), &elf).unwrap();
         assert!(
             VmBackend::Qemu
-                .validate_kernel_image(file.path())
+                .resolve_kernel_image(Some(file.path()))
                 .unwrap_err()
                 .contains("x86_64 ELF")
         );
@@ -993,43 +992,50 @@ mod tests {
         bzimage[0x236] = 1;
         std::fs::write(file.path(), &bzimage).unwrap();
         VmBackend::Qemu
-            .validate_kernel_image(file.path())
+            .resolve_kernel_image(Some(file.path()))
             .expect("x86_64 bzImage header");
         bzimage[0x236] = 0;
         std::fs::write(file.path(), &bzimage).unwrap();
         assert!(
             VmBackend::Qemu
-                .validate_kernel_image(file.path())
+                .resolve_kernel_image(Some(file.path()))
                 .unwrap_err()
                 .contains("bzImage must target x86_64")
         );
         for invalid in [b"".as_slice(), b"\x7fELF", b"not a kernel"] {
             std::fs::write(file.path(), invalid).unwrap();
-            assert!(VmBackend::Qemu.validate_kernel_image(file.path()).is_err());
+            assert!(
+                VmBackend::Qemu
+                    .resolve_kernel_image(Some(file.path()))
+                    .is_err()
+            );
         }
     }
 
     #[test]
-    fn workload_and_preparation_entry_reject_incompatible_kernels_before_disk_setup() {
+    fn launcher_entry_rejects_incompatible_external_kernels_before_disk_setup() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"not a kernel").unwrap();
-        for mode in ["sandbox", "image-prep"] {
-            let mut config = qemu_config();
-            config.kernel_image = Some(file.path().to_path_buf());
-            config.gpu_bdf = None;
-            config.env = vec![format!("OPENSHELL_VM_INIT_MODE={mode}")];
+        let mut config = qemu_config();
+        config.kernel_image = Some(file.path().to_path_buf());
+        config.gpu_bdf = None;
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             assert!(
                 run_vm(&config)
                     .unwrap_err()
                     .contains("unsupported QEMU kernel format")
             );
-            config.backend = VmBackend::Libkrun;
-            assert!(
-                run_vm(&config)
-                    .unwrap_err()
-                    .contains("libkrun does not support external kernel images")
-            );
         }
+        config.backend = VmBackend::Libkrun;
+        assert!(
+            run_vm(&config)
+                .unwrap_err()
+                .contains("libkrun does not support external kernel images")
+        );
+    }
+
+    #[test]
+    fn qemu_launcher_rejects_unix_vsock_port_maps() {
         let mut config = qemu_config();
         config.vsock_port_map = Some(VsockPortMap {
             guest_port: 1234,

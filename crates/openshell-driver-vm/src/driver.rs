@@ -1936,16 +1936,7 @@ impl VmDriver {
             None
         };
 
-        let needs_qemu = is_gpu;
-
-        let mut plan =
-            match self.build_vm_launch_plan(&sandbox.id, needs_qemu, is_gpu, gpu_bdf.clone()) {
-                Ok(plan) => plan,
-                Err(err) => {
-                    self.release_gpu(&sandbox.id);
-                    return Err(err);
-                }
-            };
+        let mut plan = self.build_vm_launch_plan(gpu_bdf.clone());
 
         if let Err(err) = self
             .lifecycle_extensions
@@ -1971,50 +1962,38 @@ impl VmDriver {
             });
         }
 
-        // Resolve and validate the backend from the requirements that
-        // `configure_launch` extensions contributed. After this point the
-        // plan's backend, sizing, and host allocations are final; the
-        // `before_launch` hook below may still mutate
-        // `plan.env` and `plan.guest_init_dropins` and may abort the launch,
-        // but it MUST NOT change `plan.backend`, `plan.required_backends`,
-        // or `plan.required_backend_features` -- those are enforced as a
-        // documented trait contract, not a runtime check.
-        if let Err(err) =
-            self.resolve_launch_plan_backend(&sandbox.id, is_gpu, gpu_bdf.clone(), &mut plan)
-        {
-            self.lifecycle_extensions
-                .after_launch_failed(
-                    &sandbox,
-                    &state_dir,
-                    LaunchAbortReason::BeforeLaunchHookFailed,
-                )
-                .await;
-            self.release_gpu(&sandbox.id);
-            return Err(err);
-        }
-
-        if let Err(err) = Self::validate_launch_plan_backend(is_gpu, &plan).and_then(|()| {
-            plan.backend
-                .validate_host()
-                .map_err(Status::failed_precondition)?;
-            // Extensions can select QEMU after request validation, so check
-            // the selected backend's mount support again before launch.
-            validate_vm_driver_mounts(
-                &driver_config.mounts,
-                &self.config,
-                plan.backend == VmBackend::Qemu,
-            )
-        }) {
-            self.lifecycle_extensions
-                .after_launch_failed(
-                    &sandbox,
-                    &state_dir,
-                    LaunchAbortReason::BeforeLaunchHookFailed,
-                )
-                .await;
-            self.release_gpu(&sandbox.id);
-            return Err(err);
-        }
+        // Resolve extension requirements before before_launch prepares the host.
+        let kernel_image = self
+            .resolve_launch_plan_backend(is_gpu, &mut plan)
+            .and_then(|()| Self::validate_launch_plan_backend(gpu_bdf.as_deref(), &plan))
+            .and_then(|()| {
+                plan.backend
+                    .validate_host()
+                    .map_err(Status::failed_precondition)?;
+                // An extension can select QEMU after request validation.
+                validate_vm_driver_mounts(
+                    &driver_config.mounts,
+                    &self.config,
+                    plan.backend == VmBackend::Qemu,
+                )?;
+                plan.backend
+                    .resolve_kernel_image(plan.kernel_image.as_deref())
+                    .map_err(Status::failed_precondition)
+            });
+        let kernel_image = match kernel_image {
+            Ok(path) => path,
+            Err(err) => {
+                self.lifecycle_extensions
+                    .after_launch_failed(
+                        &sandbox,
+                        &state_dir,
+                        LaunchAbortReason::BeforeLaunchHookFailed,
+                    )
+                    .await;
+                self.release_gpu(&sandbox.id);
+                return Err(err);
+            }
+        };
 
         if let Err(err) = self
             .lifecycle_extensions
@@ -2156,7 +2135,7 @@ impl VmDriver {
         command.arg("--vm-console-output").arg(&console_output);
         command.arg("--vm-vcpus").arg(plan.vcpus.to_string());
         command.arg("--vm-mem-mib").arg(plan.mem_mib.to_string());
-        if let Some(kernel_image) = &plan.kernel_image {
+        if let Some(kernel_image) = &kernel_image {
             command.arg("--vm-kernel-image").arg(kernel_image);
         }
 
@@ -2993,9 +2972,7 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     fn resolve_launch_plan_backend(
         &self,
-        sandbox_id: &str,
         is_gpu: bool,
-        gpu_bdf: Option<String>,
         plan: &mut LaunchPlan,
     ) -> Result<(), Status> {
         if plan.kernel_image.is_some() {
@@ -3029,71 +3006,29 @@ impl VmDriver {
         }
 
         if plan.backend == VmBackend::Qemu {
-            self.configure_qemu_launch_plan(sandbox_id, is_gpu, gpu_bdf, plan)?;
+            if is_gpu {
+                plan.vcpus = self.config.gpu_vcpus;
+                plan.mem_mib = self.config.gpu_mem_mib;
+            }
+            plan.vsock_cid.get_or_insert_with(allocate_vsock_cid);
         }
 
-        Ok(())
-    }
-
-    // Keep the fallible shape used by launch-plan resolution: driver-local
-    // backends may add allocation failures here without changing callers.
-    #[allow(clippy::result_large_err, clippy::unnecessary_wraps)]
-    fn configure_qemu_launch_plan(
-        &self,
-        _sandbox_id: &str,
-        is_gpu: bool,
-        gpu_bdf: Option<String>,
-        plan: &mut LaunchPlan,
-    ) -> Result<(), Status> {
-        plan.backend = VmBackend::Qemu;
-        if is_gpu {
-            plan.vcpus = self.config.gpu_vcpus;
-            plan.mem_mib = self.config.gpu_mem_mib;
-        }
-        if plan.gpu_bdf.is_none() {
-            plan.gpu_bdf = gpu_bdf;
-        }
-        if plan.vsock_cid.is_some() {
-            return Ok(());
-        }
-        plan.vsock_cid = Some(allocate_vsock_cid());
         Ok(())
     }
 
     #[allow(clippy::result_large_err)]
-    fn validate_launch_plan_backend(is_gpu: bool, plan: &LaunchPlan) -> Result<(), Status> {
-        if plan.backend != VmBackend::Qemu && is_gpu {
+    fn validate_launch_plan_backend(
+        assigned_gpu: Option<&str>,
+        plan: &LaunchPlan,
+    ) -> Result<(), Status> {
+        if plan.gpu_bdf.as_deref() != assigned_gpu {
+            return Err(Status::failed_precondition(
+                "VM lifecycle extensions must preserve the driver's GPU assignment",
+            ));
+        }
+        if assigned_gpu.is_some() && plan.backend != VmBackend::Qemu {
             return Err(Status::failed_precondition(
                 "GPU sandbox launch requires the QEMU backend",
-            ));
-        }
-        if plan.gpu_bdf.is_some() && !is_gpu {
-            return Err(Status::failed_precondition(
-                "GPU passthrough requires a GPU sandbox request",
-            ));
-        }
-        if is_gpu && plan.gpu_bdf.is_none() {
-            return Err(Status::failed_precondition(
-                "GPU sandbox launch is missing its assigned GPU device",
-            ));
-        }
-        if plan.required_backends.contains(&VmBackend::Libkrun)
-            && plan.required_backends.contains(&VmBackend::Qemu)
-        {
-            return Err(Status::failed_precondition(
-                "VM lifecycle extensions requested conflicting VM backends",
-            ));
-        }
-        if plan.required_backends.contains(&VmBackend::Libkrun)
-            && plan.backend != VmBackend::Libkrun
-        {
-            return Err(Status::failed_precondition(
-                "VM lifecycle extension requires the libkrun backend",
-            ));
-        }
-        if plan.required_backends.contains(&VmBackend::Qemu) && plan.backend != VmBackend::Qemu {
-            return Err(Status::failed_precondition(
-                "VM lifecycle extension requires the QEMU backend",
             ));
         }
         if let Some(feature) = plan
@@ -3110,55 +3045,34 @@ impl VmDriver {
         if plan
             .required_backend_features
             .contains(&BackendFeature::PciPassthrough)
-            && plan.gpu_bdf.is_none()
+            && assigned_gpu.is_none()
         {
             return Err(Status::failed_precondition(
                 "PCI passthrough requires an assigned GPU device; arbitrary PCI devices are not supported",
             ));
         }
-        if let Some(kernel_image) = &plan.kernel_image {
-            plan.backend
-                .validate_kernel_image(kernel_image)
-                .map_err(Status::failed_precondition)?;
-        }
         Ok(())
     }
 
-    // Keep the fallible shape used by provisioning and lifecycle tests even
-    // though NIC/subnet allocation no longer introduces a failure today.
-    #[allow(clippy::result_large_err, clippy::unnecessary_wraps)]
-    fn build_vm_launch_plan(
-        &self,
-        _sandbox_id: &str,
-        needs_qemu: bool,
-        is_gpu: bool,
-        gpu_bdf: Option<String>,
-    ) -> Result<LaunchPlan, Status> {
-        if !needs_qemu {
-            return Ok(LaunchPlan {
-                backend: VmBackend::Libkrun,
-                vcpus: self.config.vcpus,
-                mem_mib: self.config.mem_mib,
-                required_backends: Vec::new(),
-                required_backend_features: Vec::new(),
-                kernel_profile: None,
-                kernel_image: None,
-                gpu_bdf: None,
-                vsock_cid: None,
-                guest_init_dropins: Vec::new(),
-                env: Vec::new(),
-            });
-        }
-
-        let vsock_cid = allocate_vsock_cid();
-        let (vcpus, mem_mib) = if is_gpu {
-            (self.config.gpu_vcpus, self.config.gpu_mem_mib)
+    fn build_vm_launch_plan(&self, gpu_bdf: Option<String>) -> LaunchPlan {
+        let (backend, vcpus, mem_mib, vsock_cid) = if gpu_bdf.is_some() {
+            (
+                VmBackend::Qemu,
+                self.config.gpu_vcpus,
+                self.config.gpu_mem_mib,
+                Some(allocate_vsock_cid()),
+            )
         } else {
-            (self.config.vcpus, self.config.mem_mib)
+            (
+                VmBackend::Libkrun,
+                self.config.vcpus,
+                self.config.mem_mib,
+                None,
+            )
         };
 
-        Ok(LaunchPlan {
-            backend: VmBackend::Qemu,
+        LaunchPlan {
+            backend,
             vcpus,
             mem_mib,
             required_backends: Vec::new(),
@@ -3166,10 +3080,10 @@ impl VmDriver {
             kernel_profile: None,
             kernel_image: None,
             gpu_bdf,
-            vsock_cid: Some(vsock_cid),
+            vsock_cid,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
-        })
+        }
     }
 
     async fn ensure_provisioning_active(&self, sandbox_id: &str) -> Result<(), Status> {
@@ -9457,9 +9371,7 @@ mod tests {
             id: "sb-post-overlay".to_string(),
             ..Default::default()
         };
-        let mut plan = driver
-            .build_vm_launch_plan(&sandbox.id, false, false, None)
-            .unwrap();
+        let mut plan = driver.build_vm_launch_plan(None);
         let provisioning = tracing::info_span!("vm.provision");
 
         async {
@@ -13644,9 +13556,11 @@ while :; do sleep 0.05; done"#,
     fn empty_registry_keeps_non_gpu_sandbox_on_libkrun() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
 
-        let plan = driver
-            .build_vm_launch_plan("sandbox-x", false, false, None)
-            .expect("plan should build");
+        let mut plan = driver.build_vm_launch_plan(None);
+        driver
+            .resolve_launch_plan_backend(false, &mut plan)
+            .unwrap();
+        VmDriver::validate_launch_plan_backend(None, &plan).unwrap();
 
         assert_eq!(plan.backend, VmBackend::Libkrun);
         assert_eq!(plan.vcpus, 2);
@@ -13666,81 +13580,79 @@ while :; do sleep 0.05; done"#,
     fn gpu_sandbox_uses_qemu_backend_and_gpu_sizing() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
 
-        let plan = driver
-            .build_vm_launch_plan("sandbox-gpu", true, true, Some("0000:01:00.0".to_string()))
-            .expect("gpu plan should build");
+        let assigned = "0000:01:00.0";
+        let mut plan = driver.build_vm_launch_plan(Some(assigned.to_string()));
+        driver.resolve_launch_plan_backend(true, &mut plan).unwrap();
+        VmDriver::validate_launch_plan_backend(Some(assigned), &plan).unwrap();
 
         assert_eq!(plan.backend, VmBackend::Qemu);
         assert_eq!(plan.vcpus, 8);
         assert_eq!(plan.mem_mib, 16384);
-        assert_eq!(plan.gpu_bdf.as_deref(), Some("0000:01:00.0"));
+        assert_eq!(plan.gpu_bdf.as_deref(), Some(assigned));
         assert!(plan.vsock_cid.is_some());
+
+        for replacement in [None, Some("0000:02:00.0".to_string())] {
+            plan.gpu_bdf = replacement;
+            driver.resolve_launch_plan_backend(true, &mut plan).unwrap();
+            let error = VmDriver::validate_launch_plan_backend(Some(assigned), &plan)
+                .expect_err("the launch plan must keep the device reserved by the driver");
+            assert!(error.message().contains("GPU assignment"));
+        }
     }
 
     #[test]
-    fn launch_plan_rejects_external_kernel_on_unsupported_backend() {
-        let mut plan = LaunchPlan {
-            backend: VmBackend::Libkrun,
-            vcpus: 2,
-            mem_mib: 2048,
-            required_backends: Vec::new(),
-            required_backend_features: Vec::new(),
-            kernel_profile: None,
-            kernel_image: Some(PathBuf::from("/tmp/openshell-test-kernel")),
-            gpu_bdf: None,
-            vsock_cid: None,
-            guest_init_dropins: Vec::new(),
-            env: Vec::new(),
-        };
-
-        let err = VmDriver::validate_launch_plan_backend(false, &plan)
-            .expect_err("external kernels require a compatible backend");
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("external kernel images"));
-
-        let base = unique_temp_dir();
-        std::fs::create_dir_all(&base).unwrap();
-        let kernel = base.join("vmlinux");
+    fn external_kernel_selects_cpu_only_qemu_unless_libkrun_is_required() {
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut plan = driver.build_vm_launch_plan(None);
+        let kernel = tempfile::NamedTempFile::new().unwrap();
         let mut header = [0u8; 64];
         header[..6].copy_from_slice(b"\x7fELF\x02\x01");
         header[18] = 62; // EM_X86_64; a header fixture, not a bootable guest.
-        std::fs::write(&kernel, header).unwrap();
-        plan.kernel_image = Some(kernel);
-        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        std::fs::write(kernel.path(), header).unwrap();
+        plan.kernel_image = Some(kernel.path().to_path_buf());
         plan.require_backend(VmBackend::Libkrun);
         driver
-            .resolve_launch_plan_backend("kernel-check", false, None, &mut plan)
+            .resolve_launch_plan_backend(false, &mut plan)
             .unwrap();
         assert_eq!(plan.backend, VmBackend::Libkrun);
-        assert!(VmDriver::validate_launch_plan_backend(false, &plan).is_err());
+        let error = VmDriver::validate_launch_plan_backend(None, &plan)
+            .expect_err("an explicit libkrun requirement rules out external kernels");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("external-kernel-image"));
 
         plan.required_backends.clear();
         driver
-            .resolve_launch_plan_backend("kernel-check", false, None, &mut plan)
+            .resolve_launch_plan_backend(false, &mut plan)
             .unwrap();
         assert_eq!(plan.backend, VmBackend::Qemu);
+        assert_eq!(plan.vcpus, driver.config.vcpus);
+        assert_eq!(plan.mem_mib, driver.config.mem_mib);
         assert!(plan.gpu_bdf.is_none());
         assert!(plan.vsock_cid.is_some());
-        VmDriver::validate_launch_plan_backend(false, &plan)
+        VmDriver::validate_launch_plan_backend(None, &plan)
             .expect("CPU-only external kernel is accepted without PCI passthrough");
-        let _ = std::fs::remove_dir_all(base);
+        assert_eq!(
+            plan.backend
+                .resolve_kernel_image(plan.kernel_image.as_deref())
+                .unwrap()
+                .as_deref(),
+            Some(kernel.path())
+        );
     }
 
     #[test]
     fn backend_feature_requirements_select_qemu_launch_plan() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
-        let mut plan = driver
-            .build_vm_launch_plan("sandbox-vfio", false, false, None)
-            .expect("base plan should build");
+        let mut plan = driver.build_vm_launch_plan(None);
         plan.require_backend_feature(BackendFeature::PciPassthrough);
 
         driver
-            .resolve_launch_plan_backend("sandbox-vfio", false, None, &mut plan)
+            .resolve_launch_plan_backend(false, &mut plan)
             .expect("backend feature should resolve");
 
         assert_eq!(plan.backend, VmBackend::Qemu);
         assert!(plan.vsock_cid.is_some());
-        let error = VmDriver::validate_launch_plan_backend(false, &plan)
+        let error = VmDriver::validate_launch_plan_backend(None, &plan)
             .expect_err("a PCI feature needs an assigned device");
         assert!(error.message().contains("assigned GPU device"));
     }
@@ -13748,30 +13660,27 @@ while :; do sleep 0.05; done"#,
     #[test]
     fn explicit_backend_requirement_selects_qemu_launch_plan() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
-        let mut plan = driver
-            .build_vm_launch_plan("sandbox-qemu", false, false, None)
-            .expect("base plan should build");
+        let mut plan = driver.build_vm_launch_plan(None);
         plan.require_backend(VmBackend::Qemu);
 
         driver
-            .resolve_launch_plan_backend("sandbox-qemu", false, None, &mut plan)
+            .resolve_launch_plan_backend(false, &mut plan)
             .expect("backend requirement should resolve");
 
         assert_eq!(plan.backend, VmBackend::Qemu);
         assert!(plan.vsock_cid.is_some());
-        VmDriver::validate_launch_plan_backend(false, &plan).expect("CPU-only QEMU is supported");
+        VmDriver::validate_launch_plan_backend(None, &plan)
+            .expect("CPU-only QEMU can satisfy the backend requirements");
     }
 
     #[test]
     fn conflicting_backend_requirements_fail_before_allocating_a_cid() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
-        let mut plan = driver
-            .build_vm_launch_plan("conflict", false, false, None)
-            .unwrap();
+        let mut plan = driver.build_vm_launch_plan(None);
         plan.require_backend(VmBackend::Libkrun);
         plan.require_backend(VmBackend::Qemu);
         let error = driver
-            .resolve_launch_plan_backend("conflict", false, None, &mut plan)
+            .resolve_launch_plan_backend(false, &mut plan)
             .expect_err("conflicting runtimes must fail");
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("conflicting VM backends"));
@@ -13781,13 +13690,11 @@ while :; do sleep 0.05; done"#,
     #[test]
     fn guest_init_dropin_feature_does_not_force_qemu() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
-        let mut plan = driver
-            .build_vm_launch_plan("sandbox-init", false, false, None)
-            .expect("base plan should build");
+        let mut plan = driver.build_vm_launch_plan(None);
         plan.require_backend_feature(BackendFeature::GuestInitDropins);
 
         driver
-            .resolve_launch_plan_backend("sandbox-init", false, None, &mut plan)
+            .resolve_launch_plan_backend(false, &mut plan)
             .expect("guest init feature should resolve");
 
         assert_eq!(plan.backend, VmBackend::Libkrun);
@@ -14087,11 +13994,9 @@ while :; do sleep 0.05; done"#,
     #[test]
     fn qemu_launch_plan_uses_vsock_only_with_host_proxy() {
         let driver = test_driver_with_proxy("http://127.0.0.1:8080");
-        let mut plan = driver
-            .build_vm_launch_plan("sandbox-proxy-vsock", true, true, None)
-            .expect("gpu plan should build");
+        let mut plan = driver.build_vm_launch_plan(Some("0000:01:00.0".to_string()));
         driver
-            .resolve_launch_plan_backend("sandbox-proxy-vsock", true, None, &mut plan)
+            .resolve_launch_plan_backend(true, &mut plan)
             .expect("host control can reach a host-loopback proxy");
         assert!(plan.vsock_cid.is_some());
     }

@@ -278,7 +278,7 @@ pub enum ExtensionActivation {
 ///    and allocates backend-specific host resources such as a vsock CID.
 /// 3. [`before_launch`](Self::before_launch) — perform host-side
 ///    side effects with the resolved plan in hand, optionally append
-///    additional guest env via [`LaunchPlan::env`].
+///    guest environment entries or init drop-ins.
 /// 4. The driver spawns the VM launcher process.
 ///
 /// On launch failure or sandbox deletion, the driver invokes
@@ -329,22 +329,13 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
 
     /// Perform host-side preparation with the resolved launch plan.
     ///
-    /// At this point [`LaunchPlan::backend`],
-    /// [`LaunchPlan::required_backends`], and
-    /// [`LaunchPlan::required_backend_features`] are finalized and any
-    /// backend-specific host resources have been
-    /// allocated. This hook is the right place to bind PCI devices, set
-    /// up filesystem state, or otherwise prepare the host.
+    /// The driver has finalized the backend, requirements, kernel, sizing,
+    /// GPU assignment, and vsock CID. Use this hook to bind a reserved PCI
+    /// device, set up filesystem state, or otherwise prepare the host.
     ///
-    /// Implementations MAY append entries to [`LaunchPlan::env`] to
-    /// inject additional guest environment variables, and MAY return an
-    /// error to abort the launch. Implementations MUST NOT change
-    /// [`LaunchPlan::backend`], [`LaunchPlan::required_backends`], or
-    /// [`LaunchPlan::required_backend_features`]; the driver has already
-    /// resolved and validated them and does not repeat those steps after
-    /// this hook.
-    /// The driver-owned [`LaunchPlan::gpu_bdf`] must remain unchanged;
-    /// the registry rejects hooks that clear or replace that assignment.
+    /// Implementations can append entries to [`LaunchPlan::env`] and
+    /// [`LaunchPlan::guest_init_dropins`] or return an error to abort the
+    /// launch. The registry rejects changes to finalized launch fields.
     ///
     /// If this hook performs allocations that must be released on failure
     /// or delete, implement
@@ -599,11 +590,33 @@ impl LifecycleExtensionRegistry {
     ) -> LifecycleResult<()> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let assigned_gpu = plan.gpu_bdf.clone();
+        let backend = plan.backend.clone();
+        let required_backends = plan.required_backends.clone();
+        let required_backend_features = plan.required_backend_features.clone();
+        let kernel_profile = plan.kernel_profile.clone();
+        let kernel_image = plan.kernel_image.clone();
+        let vsock_cid = plan.vsock_cid;
+        let vcpus = plan.vcpus;
+        let mem_mib = plan.mem_mib;
         for ext in self.active_for(sandbox) {
             ext.before_launch(sandbox, state_dir, plan).await?;
             if plan.gpu_bdf != assigned_gpu {
                 return Err(LifecycleError::new(format!(
                     "extension '{}' changed the assigned GPU device in before_launch",
+                    ext.name()
+                )));
+            }
+            if plan.backend != backend
+                || plan.required_backends != required_backends
+                || plan.required_backend_features != required_backend_features
+                || plan.kernel_profile != kernel_profile
+                || plan.kernel_image != kernel_image
+                || plan.vsock_cid != vsock_cid
+                || plan.vcpus != vcpus
+                || plan.mem_mib != mem_mib
+            {
+                return Err(LifecycleError::new(format!(
+                    "extension '{}' changed finalized launch fields in before_launch",
                     ext.name()
                 )));
             }
@@ -907,6 +920,10 @@ mod tests {
                 )));
             }
             plan.env.push(format!("RECORDING_{}=1", self.name));
+            plan.guest_init_dropins.push(GuestInitDropin::new(
+                format!("90-{}.sh", self.name),
+                b"#!/bin/sh\n".to_vec(),
+            ));
             Ok(())
         }
 
@@ -979,13 +996,15 @@ mod tests {
         extension.clone()
     }
 
+    type PlanMutation = fn(&mut LaunchPlan);
+
     #[derive(Debug)]
-    struct GpuMutatingExtension(Option<String>);
+    struct PlanMutatingExtension(PlanMutation);
 
     #[tonic::async_trait]
-    impl LifecycleExtension for GpuMutatingExtension {
+    impl LifecycleExtension for PlanMutatingExtension {
         fn name(&self) -> &'static str {
-            "gpu-mutator"
+            "plan-mutator"
         }
 
         async fn before_launch(
@@ -994,23 +1013,47 @@ mod tests {
             _state_dir: &Path,
             plan: &mut LaunchPlan,
         ) -> LifecycleResult<()> {
-            plan.gpu_bdf.clone_from(&self.0);
+            (self.0)(plan);
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn before_launch_rejects_clearing_or_replacing_the_assigned_gpu() {
-        for replacement in [None, Some("0000:02:00.0".to_string())] {
+    async fn before_launch_rejects_changes_to_finalized_fields() {
+        let mutations: [(&str, PlanMutation); 10] = [
+            ("assigned GPU device", |plan| plan.gpu_bdf = None),
+            ("assigned GPU device", |plan| {
+                plan.gpu_bdf = Some("0000:02:00.0".to_string());
+            }),
+            ("finalized launch fields", |plan| {
+                plan.backend = VmBackend::Libkrun;
+            }),
+            ("finalized launch fields", |plan| {
+                plan.require_backend(VmBackend::Libkrun);
+            }),
+            ("finalized launch fields", |plan| {
+                plan.require_backend_feature(BackendFeature::PciPassthrough);
+            }),
+            ("finalized launch fields", |plan| {
+                plan.kernel_profile = Some("other".into());
+            }),
+            ("finalized launch fields", |plan| {
+                plan.kernel_image = Some("other".into());
+            }),
+            ("finalized launch fields", |plan| plan.vsock_cid = Some(8)),
+            ("finalized launch fields", |plan| plan.vcpus = 4),
+            ("finalized launch fields", |plan| plan.mem_mib = 4096),
+        ];
+        for (message, mutate) in mutations {
             let registry =
-                LifecycleExtensionRegistry::with(vec![Arc::new(GpuMutatingExtension(replacement))]);
+                LifecycleExtensionRegistry::with(vec![Arc::new(PlanMutatingExtension(mutate))]);
             let mut plan = sample_plan(VmBackend::Qemu);
             plan.gpu_bdf = Some("0000:01:00.0".to_string());
             let error = registry
                 .before_launch(&sample_sandbox(), Path::new("/tmp/state"), &mut plan)
                 .await
-                .expect_err("a requested GPU must retain its assignment after hooks");
-            assert!(error.message().contains("changed the assigned GPU device"));
+                .expect_err("finalized launch fields must survive before_launch");
+            assert!(error.message().contains(message));
         }
     }
 
@@ -1132,7 +1175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_launch_runs_each_extension_in_order_and_collects_env() {
+    async fn before_launch_runs_each_extension_in_order_and_collects_guest_inputs() {
         let ext_a = RecordingExtension::new("a");
         let ext_b = RecordingExtension::new("b");
         let registry =
@@ -1146,6 +1189,13 @@ mod tests {
             .expect("before_launch succeeds");
 
         assert_eq!(plan.env, vec!["RECORDING_a=1", "RECORDING_b=1"]);
+        assert_eq!(
+            plan.guest_init_dropins
+                .iter()
+                .map(|dropin| dropin.name.as_str())
+                .collect::<Vec<_>>(),
+            ["90-a.sh", "90-b.sh"]
+        );
         assert_eq!(ext_a.calls(), vec!["a:before_launch"]);
         assert_eq!(ext_b.calls(), vec!["b:before_launch"]);
     }
