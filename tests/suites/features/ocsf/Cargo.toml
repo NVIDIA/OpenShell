@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ocsf"
+description = "Features suite: a container supervisor writes opt-in OCSF JSON audit records to its stderr that conform to the OCSF schema"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+[dependencies]
+container-engine-support = { path = "../../../support/container-engine" }
+openshell-ocsf-validate = { path = "../../../../crates/openshell-ocsf-validate" }
+openshell-testkit = { path = "../../../testkit/testkit" }
+serde_json = "1"
