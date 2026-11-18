@@ -107,7 +107,7 @@ pub fn persistence_error_to_status(
             current_resource_version,
         ),
         PersistenceError::LockTimeout(_) => openshell_core::rpc_error::unavailable(
-            "MUTATION_LOCK_TIMEOUT",
+            openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
             format!("{operation} timed out waiting for a concurrent mutation; retry the request"),
             std::time::Duration::from_secs(1),
         ),

@@ -19,7 +19,8 @@ use tokio::sync::Mutex;
 use tonic::Status;
 
 use crate::credentials::CredentialRuntime;
-use crate::persistence::{PersistenceError, Store};
+use crate::gateway_metrics::{self, LockScope};
+use crate::persistence::{PersistenceError, SshIdentityMutationGuard, Store};
 
 const OBJECT_TYPE: &str = "sandbox_ssh_identity_v1";
 const CANDIDATE_TYPE: &str = "sandbox_ssh_identity_candidate_v1";
@@ -33,6 +34,9 @@ pub struct SshIdentityStore {
     /// once. Weak values let entries disappear after the last step using a
     /// sandbox's mutex completes.
     mutations: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
+    /// Test-only failure for the next identity lock acquisition.
+    #[cfg(test)]
+    lock_failure: Arc<StdMutex<Option<PersistenceError>>>,
 }
 
 #[cfg(test)]
@@ -382,6 +386,89 @@ mod tests {
         assert_eq!(fingerprint, sb.host_key_fingerprint);
         next.delete(&sb).await.unwrap();
     }
+
+    /// Fail the next identity lock acquisition with `error`.
+    fn fail_next_lock(identities: &SshIdentityStore, error: PersistenceError) {
+        *identities
+            .lock_failure
+            .lock()
+            .expect("forced SSH identity lock failure lock poisoned") = Some(error);
+    }
+
+    fn assert_mutation_lock_timeout(status: &Status) {
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        let details = openshell_core::rpc_error::decode_details(status)
+            .expect("a lost lock budget keeps its error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_reports_a_lost_lock_budget_as_retryable() {
+        let identities = fixture().await;
+        fail_next_lock(
+            &identities,
+            PersistenceError::LockTimeout("lock timeout".into()),
+        );
+        let mut sb = sandbox("sandbox-a");
+        let error = identities
+            .prepare(&mut sb, &mut authentication())
+            .await
+            .expect_err("a lost identity lock fails the step");
+        assert_mutation_lock_timeout(&error);
+    }
+
+    #[tokio::test]
+    async fn delete_reports_a_lost_lock_budget_as_retryable() {
+        let identities = fixture().await;
+        let mut sb = sandbox("sandbox-a");
+        identities
+            .prepare(&mut sb, &mut authentication())
+            .await
+            .unwrap();
+        fail_next_lock(
+            &identities,
+            PersistenceError::LockTimeout("lock timeout".into()),
+        );
+        let error = identities
+            .delete(&sb)
+            .await
+            .expect_err("a lost identity lock fails the step");
+        assert_mutation_lock_timeout(&error);
+    }
+
+    #[tokio::test]
+    async fn other_identity_lock_failures_stay_bare_unavailable() {
+        let identities = fixture().await;
+        fail_next_lock(&identities, PersistenceError::Database("gone".into()));
+        let error = identities
+            .delete(&sandbox("sandbox-a"))
+            .await
+            .expect_err("an unavailable database fails the step");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "lock sandbox SSH identity failed");
+        assert!(openshell_core::rpc_error::decode_details(&error).is_none());
+    }
+
+    #[test]
+    fn identity_lock_timeouts_count_in_the_mutation_lock_metric() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let series = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+
+        let _ = identity_lock_status(PersistenceError::LockTimeout("lock timeout".into()));
+
+        assert_eq!(
+            metrics.value(series),
+            Some(1),
+            "a retryable identity lock timeout must count like every other producer"
+        );
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -391,13 +478,54 @@ struct StoredIdentity {
     credential_handle: Vec<u8>,
 }
 
+/// Map an identity lock failure to the status the client sees.
+///
+/// A lost mutation lock budget means the guarded writes never ran, so it is
+/// the one failure a client may retry; every other persistence failure keeps
+/// the bare `UNAVAILABLE` this step has always returned. The timeout counts in
+/// `openshell_server_mutation_lock_timeouts_total` like every other producer of
+/// `MUTATION_LOCK_TIMEOUT`, because clients retry on it.
+fn identity_lock_status(error: PersistenceError) -> Status {
+    if matches!(error, PersistenceError::LockTimeout(_)) {
+        gateway_metrics::record_lock_timeout(LockScope::Sandbox);
+        crate::grpc::persistence_error_to_status(error, "lock sandbox SSH identity")
+    } else {
+        Status::unavailable("lock sandbox SSH identity failed")
+    }
+}
+
 impl SshIdentityStore {
     pub(crate) fn new(store: Arc<Store>, credentials: CredentialRuntime) -> Self {
         Self {
             store,
             credentials,
             mutations: Arc::default(),
+            #[cfg(test)]
+            lock_failure: Arc::default(),
         }
+    }
+
+    /// Acquire the durable per-sandbox identity lock.
+    ///
+    /// A lost mutation lock budget is the one failure a client may retry: the
+    /// guarded writes never ran, so the status carries the shared
+    /// `MUTATION_LOCK_TIMEOUT` reason and delay. Every other persistence
+    /// failure keeps the bare `UNAVAILABLE` this step has always returned.
+    async fn lock_identity(&self, sandbox_id: &str) -> Result<SshIdentityMutationGuard, Status> {
+        #[cfg(test)]
+        let forced_error = self
+            .lock_failure
+            .lock()
+            .expect("forced SSH identity lock failure lock poisoned")
+            .take();
+        #[cfg(test)]
+        if let Some(error) = forced_error {
+            return Err(identity_lock_status(error));
+        }
+        self.store
+            .acquire_ssh_identity_mutation_guard(sandbox_id)
+            .await
+            .map_err(identity_lock_status)
     }
 
     /// The local mutex of one sandbox's SSH identity. Pruning dead entries on
@@ -439,11 +567,7 @@ impl SshIdentityStore {
         let id = sandbox.object_id().to_string();
         let (updated, private_key) = tokio::spawn(async move {
             let _local = identities.mutation_for(&id).lock_owned().await;
-            let _distributed = identities
-                .store
-                .acquire_ssh_identity_mutation_guard(&id)
-                .await
-                .map_err(|_| Status::unavailable("lock sandbox SSH identity failed"))?;
+            let _distributed = identities.lock_identity(&id).await?;
             let mut current = identities
                 .store
                 .get_message::<Sandbox>(&id)
@@ -635,11 +759,7 @@ impl SshIdentityStore {
                 .mutation_for(sandbox.object_id())
                 .lock_owned()
                 .await;
-            let _distributed = identities
-                .store
-                .acquire_ssh_identity_mutation_guard(sandbox.object_id())
-                .await
-                .map_err(|_| Status::unavailable("lock sandbox SSH identity failed"))?;
+            let _distributed = identities.lock_identity(sandbox.object_id()).await?;
             identities.delete_locked(&sandbox).await
         })
         .await
