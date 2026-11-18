@@ -706,6 +706,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn inline_provider_refresh_secrets(
+        &self,
+        _request: tonic::Request<openshell_core::proto::InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<openshell_core::proto::InlineProviderRefreshSecretsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,

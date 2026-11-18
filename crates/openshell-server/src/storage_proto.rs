@@ -226,7 +226,7 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "76d166f76b8aa0abc7d7611b642e5f499b762c746b37f7f183e401cb0ea23685";
+        "2cd18038b7655d784ad2819eabc1d602d2690f887378282921872277d1a91dc6";
     const DURABLE_SCHEMA_SHA256: &str =
         "b6a1de55ca3bdf2ccbf88a32f57e87db84b775c48fcd5f9fcf7811eae8d67c70";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -703,7 +703,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            118 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            119 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -713,7 +713,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            88 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            89 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -723,7 +723,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            85 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            86 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -774,7 +774,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (356, 31),
+                (360, 31),
                 (101, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

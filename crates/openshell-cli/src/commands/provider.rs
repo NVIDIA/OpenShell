@@ -19,12 +19,12 @@ use openshell_core::proto::{
     DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
     DetachSandboxProviderRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRequest, GetSandboxRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxProvidersRequest, Provider, ProviderCredentialRefreshRecoveryAction,
-    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    ProviderCredentialTokenGrantType, ProviderMutationKind, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest,
+    InlineProviderRefreshSecretsRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxProvidersRequest, Provider,
+    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderMutationKind,
+    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    RotateProviderCredentialRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -1291,6 +1291,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (workspace).to_string(),
                 )),
+                material_secrets: HashMap::new(),
             })
             .await
         {
@@ -1964,6 +1965,7 @@ pub struct ProviderRefreshConfigInput<'a> {
     pub material: &'a [String],
     pub secret_material_env: &'a [String],
     pub secret_material_keys: &'a [String],
+    pub material_secrets: &'a [String],
     pub credential_expires_at_ms: Option<i64>,
 }
 
@@ -1989,6 +1991,20 @@ pub async fn provider_refresh_config(
         }
         material.insert(key, value);
     }
+    // Workspace-secret references are secret material too. Listing them in
+    // secret_material_keys makes gateways that predate workspace secrets reject
+    // the request instead of ignoring the references.
+    let material_secrets = parse_key_value_pairs(input.material_secrets, "--material-secret")?;
+    for key in material_secrets.keys() {
+        if material.contains_key(key) {
+            return Err(miette!(
+                "duplicate material key '{key}': supplied via both inline material and --material-secret"
+            ));
+        }
+        if !secret_material_keys.contains(key) {
+            secret_material_keys.push(key.clone());
+        }
+    }
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
@@ -1998,6 +2014,7 @@ pub async fn provider_refresh_config(
             strategy: strategy as i32,
             material,
             secret_material_keys,
+            material_secrets,
             expiration_time: input
                 .credential_expires_at_ms
                 .map(openshell_core::time::timestamp_from_millis)
@@ -2059,6 +2076,37 @@ pub async fn provider_rotate(
             status.provider, status.credential_key, status.status, status.last_error
         );
     }
+    Ok(())
+}
+
+pub async fn provider_refresh_inline_secrets(
+    server: &str,
+    name: &str,
+    credential_key: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let status = client
+        .inline_provider_refresh_secrets(InlineProviderRefreshSecretsRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            provider: name.to_string(),
+            credential_key: credential_key.to_string(),
+            request_id: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .status
+        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
+    println!(
+        "{} Copied workspace secrets into provider-owned material for {} {}",
+        "✓".green().bold(),
+        status.provider,
+        status.credential_key
+    );
     Ok(())
 }
 
@@ -3477,6 +3525,7 @@ binaries: [/usr/bin/curl]
             failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
             provider_error_subtype: "invalid_rapt".to_string(),
             last_error_time: openshell_core::time::timestamp_from_millis(1_767_225_000_000).ok(),
+            material_secrets: HashMap::new(),
         });
 
         assert!(row.contains("my-graph"));

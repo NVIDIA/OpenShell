@@ -45,6 +45,7 @@ const CATALOG: &[(&str, ActivityId)] = &[
     (openshell!("DeleteProviderProfile"), DELETE),
     (openshell!("ConfigureProviderRefresh"), UPDATE),
     (openshell!("DeleteProviderRefresh"), DELETE),
+    (openshell!("InlineProviderRefreshSecrets"), UPDATE),
     (openshell!("RotateProviderCredential"), UPDATE),
     (openshell!("CreateSecret"), CREATE),
     (openshell!("UpdateSecret"), UPDATE),

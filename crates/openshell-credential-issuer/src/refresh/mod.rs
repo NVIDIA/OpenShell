@@ -7,6 +7,7 @@
 #[doc(hidden)]
 pub mod engine;
 pub mod minter;
+pub mod secret_refs;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,6 +91,7 @@ impl From<&RefreshState> for minter::MintRequest {
             scopes: state.scopes.clone(),
             max_lifetime: state.max_lifetime,
             additional_output_keys: state.additional_output_keys.clone(),
+            secret_endpoint_allowlists: Vec::new(),
         }
     }
 }
@@ -112,6 +114,15 @@ pub trait RefreshStateStore: std::fmt::Debug + Send + Sync {
     async fn replace(&self, state: &RefreshState, version: u64) -> Result<Option<u64>, Status>;
     async fn delete(&self, id: &str, version: u64) -> Result<(), Status>;
     async fn acquire(&self, provider_id: &str, key: &str) -> Result<Box<dyn RefreshLease>, Status>;
+    /// The current handle and endpoint constraint of a live workspace secret,
+    /// or `None` when it does not exist or is being deleted.
+    async fn get_workspace_secret(
+        &self,
+        _workspace: &str,
+        _secret_id: &str,
+    ) -> Result<Option<secret_refs::WorkspaceSecretMaterial>, Status> {
+        Ok(None)
+    }
 }
 
 /// Only staged handles (or the existing inline/test fallback) cross this port.

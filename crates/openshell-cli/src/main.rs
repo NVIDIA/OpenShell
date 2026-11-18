@@ -1044,6 +1044,11 @@ enum ProviderRefreshCommands {
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
 
+        /// Secret refresh material supplied by a workspace secret
+        /// (`KEY=SECRET`); `KEY` is auto-marked secret.
+        #[arg(long = "material-secret", value_name = "KEY=SECRET")]
+        material_secrets: Vec<String>,
+
         /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
         #[arg(
             long = "credential-expires-at",
@@ -1068,6 +1073,21 @@ enum ProviderRefreshCommands {
     /// Delete refresh metadata for a provider credential.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+
+    /// Copy referenced workspace secrets into provider-owned refresh material.
+    ///
+    /// Keeps the current grant, including a rotated refresh token. Run it
+    /// before deleting a secret or rolling back workspace secrets.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    InlineSecrets {
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
@@ -4021,6 +4041,7 @@ async fn run_async() -> Result<()> {
                         material,
                         secret_material_env,
                         secret_material_keys,
+                        material_secrets,
                         credential_expires_at,
                     } => {
                         run::provider_refresh_config(
@@ -4032,6 +4053,7 @@ async fn run_async() -> Result<()> {
                                 material: &material,
                                 secret_material_env: &secret_material_env,
                                 secret_material_keys: &secret_material_keys,
+                                material_secrets: &material_secrets,
                                 credential_expires_at_ms: credential_expires_at,
                             },
                             &cli.workspace,
@@ -4057,6 +4079,19 @@ async fn run_async() -> Result<()> {
                         credential_key,
                     } => {
                         run::provider_refresh_delete(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::InlineSecrets {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_inline_secrets(
                             endpoint,
                             &name,
                             &credential_key,

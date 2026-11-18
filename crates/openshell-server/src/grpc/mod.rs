@@ -75,7 +75,8 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, GetSecretRequest,
-    ListSecretsRequest, ListSecretsResponse, SecretResponse, UpdateSecretRequest,
+    InlineProviderRefreshSecretsRequest, InlineProviderRefreshSecretsResponse, ListSecretsRequest,
+    ListSecretsResponse, SecretResponse, UpdateSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -780,6 +781,13 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<RotateProviderCredentialRequest>,
     ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+        mutation_replay::run(&self.state, request).await
+    }
+
+    async fn inline_provider_refresh_secrets(
+        &self,
+        request: Request<InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<InlineProviderRefreshSecretsResponse>, Status> {
         mutation_replay::run(&self.state, request).await
     }
 
@@ -1566,6 +1574,8 @@ pub mod test_support {
 
 #[cfg(test)]
 mod mutation_tests;
+#[cfg(test)]
+mod secret_refresh_tests;
 
 #[cfg(test)]
 mod tests {

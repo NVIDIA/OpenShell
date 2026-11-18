@@ -421,6 +421,18 @@ service OpenShell {
     };
   }
 
+  // Copy each workspace secret referenced by one credential's refresh
+  // configuration into provider-owned refresh material and remove the
+  // references. Other material, including a rotated refresh token, is kept.
+  rpc InlineProviderRefreshSecrets(InlineProviderRefreshSecretsRequest)
+      returns (InlineProviderRefreshSecretsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
+
   // Delete gateway-owned refresh configuration for one provider credential.
   rpc DeleteProviderRefresh(DeleteProviderRefreshRequest)
       returns (DeleteProviderRefreshResponse) {
@@ -2608,6 +2620,8 @@ message ProviderCredentialRefreshStatus {
   // values are not persisted or returned.
   string provider_error_subtype = 12;
   google.protobuf.Timestamp last_error_time = 113;
+  // Material key to the name of the workspace secret that supplies it.
+  map<string, string> material_secrets = 14;
 }
 
 // Provider profile local discovery declaration.
@@ -2637,13 +2651,19 @@ message ConfigureProviderRefreshRequest {
   ProviderCredentialRefreshStrategy strategy = 3;
   map<string, string> material = 4 [(openshell.options.v1.secret) = true];
   // Additional material names the caller requests be stored as secrets. Every
-  // name must be present in material. The server also classifies secrets from
-  // the authoritative provider profile and refresh strategy.
+  // name must be present in material or material_secrets. The server also
+  // classifies secrets from the authoritative provider profile and refresh
+  // strategy.
   repeated string secret_material_keys = 5;
   google.protobuf.Timestamp expiration_time = 106;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 8;
+  // Secret material supplied by a workspace secret in the same workspace: each
+  // key is a material key and each value names a Secret. Every key must also be
+  // listed in secret_material_keys, so gateways that predate workspace secrets
+  // reject the request instead of ignoring this field.
+  map<string, string> material_secrets = 9;
 }
 
 message ConfigureProviderRefreshResponse {
@@ -2661,6 +2681,20 @@ message RotateProviderCredentialRequest {
 }
 
 message RotateProviderCredentialResponse {
+  ProviderCredentialRefreshStatus status = 1;
+}
+
+message InlineProviderRefreshSecretsRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string provider = 2;
+  string credential_key = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
+}
+
+message InlineProviderRefreshSecretsResponse {
   ProviderCredentialRefreshStatus status = 1;
 }
 

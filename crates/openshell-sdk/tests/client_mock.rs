@@ -892,6 +892,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn inline_provider_refresh_secrets(
+        &self,
+        _: tonic::Request<proto::InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<proto::InlineProviderRefreshSecretsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox_config(
         &self,
         _: tonic::Request<proto::GetSandboxConfigRequest>,

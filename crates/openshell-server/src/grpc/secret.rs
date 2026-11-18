@@ -18,6 +18,7 @@ use openshell_core::proto::{
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::endpoint::normalize_token_endpoint;
+use openshell_credential_issuer::refresh::secret_refs;
 use openshell_credential_issuer::{Handles, SecretOwner};
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -29,6 +30,7 @@ use crate::ServerState;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_workspace, selected_workspace_name,
 };
+use crate::compute::MutationScope;
 use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition, current_time_ms,
@@ -36,7 +38,7 @@ use crate::persistence::{
 use crate::storage_proto::StoredWorkspaceSecret;
 
 /// Logical key of the single value each secret stores.
-pub const SECRET_VALUE_KEY: &str = "value";
+pub const SECRET_VALUE_KEY: &str = secret_refs::WORKSPACE_SECRET_VALUE_KEY;
 const MAX_SECRETS_PER_WORKSPACE: u32 = 500;
 const MAX_ALLOWED_ENDPOINTS: usize = 16;
 const MAX_ENDPOINT_LEN: usize = 2048;
@@ -536,6 +538,13 @@ pub(super) async fn handle_delete_secret(
     )
     .await?
     .name;
+    // Configuring refresh holds this lock too, so no new reference can appear
+    // between the dependency check and the tombstone.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire secret mutation lock"))?;
     let stored = state
         .store
         .get_message_by_name::<StoredWorkspaceSecret>(&workspace, &req.name)
@@ -546,11 +555,51 @@ pub(super) async fn handle_delete_secret(
             outcome: super::deletion_outcome(false, req.allow_missing, "secret")?,
         }));
     };
+    if !is_tombstoned(&stored) {
+        let dependents = secret_dependents(&state.store, &workspace, stored.object_id()).await?;
+        if !dependents.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "secret '{}' is referenced by provider refresh configuration: {}",
+                req.name,
+                dependents.join(", ")
+            )));
+        }
+    }
     let tombstoned = tombstone(state, stored).await?;
     finish_deletion(state, tombstoned).await?;
     Ok(Response::new(DeleteSecretResponse {
         outcome: DeletionOutcome::Completed.into(),
     }))
+}
+
+/// Live refresh configurations in a workspace that reference a secret, named
+/// `provider/credential_key`. A malformed binding annotation counts as a
+/// reference so deletion fails closed.
+async fn secret_dependents(
+    store: &Store,
+    workspace: &str,
+    secret_id: &str,
+) -> Result<Vec<String>, Status> {
+    let states = crate::refresh_store::list_refresh_states_in_workspace(store, workspace).await?;
+    let mut dependents: Vec<String> = states
+        .iter()
+        .filter(|state| {
+            state
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.deletion_time.is_none())
+        })
+        .filter(|state| {
+            secret_refs::material_secret_bindings(state.metadata.as_ref())
+                .map_or(true, |bindings| {
+                    bindings.values().any(|binding| binding.id == secret_id)
+                })
+        })
+        .map(|state| format!("{}/{}", state.provider_name, state.credential_key))
+        .collect();
+    dependents.sort();
+    dependents.dedup();
+    Ok(dependents)
 }
 
 /// Mark a secret deleted and queue its value handle for backend deletion. A

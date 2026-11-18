@@ -29,7 +29,8 @@ use openshell_core::proto::{
     WorkspaceSelector,
 };
 use openshell_core::proto::{
-    CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, SecretResponse,
+    CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse,
+    InlineProviderRefreshSecretsRequest, InlineProviderRefreshSecretsResponse, SecretResponse,
     UpdateSecretRequest,
 };
 use openshell_core::{GetResourceVersion, ObjectId};
@@ -934,6 +935,12 @@ refresh_mutation!(
     ConfigureProviderRefreshResponse,
     "ConfigureProviderRefresh",
     provider::handle_configure_provider_refresh
+);
+refresh_mutation!(
+    InlineProviderRefreshSecretsRequest,
+    InlineProviderRefreshSecretsResponse,
+    "InlineProviderRefreshSecrets",
+    provider::handle_inline_provider_refresh_secrets
 );
 refresh_mutation!(
     RotateProviderCredentialRequest,
