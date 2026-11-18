@@ -39,8 +39,10 @@ cannot perform platform-scoped or cross-workspace operations.
 When the gateway enables scope enforcement through `scopes_claim`, the token
 must also contain the scope required by the operation. Common scopes include
 `workspace:read`, `workspace:write`, `sandbox:read`, `sandbox:write`,
-`provider:read`, `provider:write`, `config:read`, and `config:write`.
-`openshell:all` satisfies every scope requirement. For OIDC and scope
+`provider:read`, `provider:write`, `config:read`, `config:write`,
+`secret:read`, and `secret:write`.
+`openshell:all` satisfies every scope requirement except `secret:reveal`,
+which a token must carry explicitly. For OIDC and scope
 configuration, refer to [Gateway Authentication](/how-it-works/gateways/authentication).
 
 The following table summarizes common operations.

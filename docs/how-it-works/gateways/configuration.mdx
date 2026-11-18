@@ -305,6 +305,11 @@ log_level             = "info"
 # Activate only after retiring incompatible gateways and outstanding driver work.
 enable_sandbox_updates = false
 
+# Activate only after every gateway that can serve traffic supports workspace secrets.
+enable_workspace_secrets = false
+# Let operators and OIDC tokens with the secret:reveal scope read secret values.
+enable_secret_reveal = false
+
 # Connection ceiling for the gateway's database pool. Omit to use the backend
 # default: 10 for Postgres, 5 for on-disk SQLite.
 database_max_connections = 10
@@ -680,6 +685,39 @@ This is not an automatic mixed-version migration switch. Do not downgrade while
 an image update is pending or retained sandboxes require the private image
 revision protocol. SQLite supports one gateway process only; activation attests
 that the previous process has stopped, not that sharing a SQLite file enables HA.
+
+## Workspace Secrets
+
+`[openshell.gateway] enable_workspace_secrets` defaults to `false`. It gates
+creating [workspace secrets](/how-it-works/providers/overview#shared-secret-material)
+and referencing them from provider refresh configuration. Reading, updating,
+and deleting existing secrets do not need it, and neither does
+`provider refresh inline-secrets`. The equivalent gateway process flag and
+environment variable are `--enable-workspace-secrets true` and
+`OPENSHELL_ENABLE_WORKSPACE_SECRETS=true`.
+
+Upgrade every gateway before activation. Gateways that predate workspace
+secrets reject requests that reference one, but they can delete a workspace
+that holds secrets. With PostgreSQL, a request is refused while any live
+gateway membership record lacks workspace-secret support. As with sandbox
+updates, that check is not proof that older gateways have stopped; setting the
+flag attests that they are retired.
+
+Before rolling back to a release without workspace secrets:
+
+1. Set `enable_workspace_secrets = false`.
+2. For each credential whose `provider refresh status` lists a secret, run
+   `openshell provider refresh inline-secrets`.
+3. Delete every workspace secret.
+
+`[openshell.gateway] enable_secret_reveal` defaults to `false`. When `true`,
+the `RevealSecret` RPC returns secret values to operators authenticated with
+operator mTLS, and to OIDC workspace admins whose token carries the literal
+`secret:reveal` scope on a gateway with `scopes_claim` set. `openshell:all`
+does not grant it, and the CLI has no reveal command. Every reveal is audited.
+Enable it only for a control-plane service that performs its own OAuth
+authorization-code exchange. The equivalent flag and environment variable are
+`--enable-secret-reveal true` and `OPENSHELL_ENABLE_SECRET_REVEAL=true`.
 
 ## Azure PostgreSQL workload identity
 
