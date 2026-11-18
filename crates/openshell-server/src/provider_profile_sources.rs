@@ -85,12 +85,15 @@ pub trait ProviderProfileSource: Send + Sync + std::fmt::Debug {
         id: &str,
     ) -> Result<ProviderProfileSnapshot, Status> {
         let mut snapshot = self.snapshot(store, workspace).await?;
-        if snapshot.profiles.is_empty() && !self.allow_empty() {
-            return Err(Status::failed_precondition(format!(
-                "provider profile source '{}' returned no profiles",
-                self.source_id()
-            )));
-        }
+        // Uncached sources must still validate their complete contract. Cached
+        // sources validate on refresh and override this with an indexed read.
+        build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: self.source_id().to_string(),
+            revision: snapshot.revision.clone(),
+            profiles: snapshot.profiles.clone(),
+            user_managed: self.user_managed(),
+            allow_empty: self.allow_empty(),
+        }])?;
         snapshot
             .profiles
             .retain(|profile| normalize_profile_id(&profile.profile.id).as_deref() == Some(id));
@@ -2145,6 +2148,16 @@ mod tests {
                 .unwrap()
                 .get_profile("external")
                 .is_some()
+        );
+        let invalid_source = ProviderProfileSources::from_test_profiles_with_user_source(vec![
+            profile("external"),
+            profile(""),
+        ]);
+        assert!(
+            invalid_source
+                .profile_catalog(&store, "alpha", "external")
+                .await
+                .is_err()
         );
         store
             .put_message(&stored_profile_in_workspace("external", "alpha"))
