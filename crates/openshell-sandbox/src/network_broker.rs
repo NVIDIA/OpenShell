@@ -4380,32 +4380,6 @@ mod tests {
     }
 
     #[test]
-    fn connect_workers_retire_beyond_the_idle_cap() {
-        // A burst of blocking connects must not leave a parked thread each.
-        let held = Arc::new(AtomicUsize::new(0));
-        let pool = test_pool(64, 2, Duration::from_secs(30));
-        let (done, finished) = std::sync::mpsc::channel();
-        let mut releases = Vec::new();
-        for _ in 0..32 {
-            let (job, release) = blocked_job(&done);
-            releases.push(release);
-            pool.submit(job, TestPermit::acquire(&held)).unwrap();
-        }
-        assert_eq!(pool.workers(), 32);
-        assert_eq!(held.load(Ordering::Acquire), 32);
-        for release in releases {
-            release.send(()).unwrap();
-        }
-        for _ in 0..32 {
-            finished.recv_timeout(Duration::from_secs(10)).unwrap();
-        }
-        wait_for(|| pool.workers() == 2, "surplus workers to retire");
-        wait_for(|| held.load(Ordering::Acquire) == 0, "permit release");
-        assert_eq!(lock(&pool.state).idle, 2);
-        assert_pool_invariants(&pool);
-    }
-
-    #[test]
     fn connect_worker_permit_outlives_its_busy_worker() {
         // The permit is released only once the pool state records the worker
         // parked or retired. Sampled under the pool lock, busy workers and

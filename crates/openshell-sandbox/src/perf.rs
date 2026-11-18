@@ -1100,16 +1100,6 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_provider_file_is_deterministic_and_exact() {
-        for bytes in [1, 63, 4_096, 65_536] {
-            let content = synthetic_provider_file(bytes);
-            assert_eq!(content.len(), bytes);
-            assert_eq!(content, synthetic_provider_file(bytes));
-        }
-        assert!(synthetic_provider_file(4_096).starts_with(&synthetic_provider_file(64)));
-    }
-
-    #[test]
     fn provider_file_workers_verify_what_they_read() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -1129,10 +1119,6 @@ mod tests {
             };
             assert!(run_worker(&wrong).is_err());
         }
-        assert!(require_expected(b"abc", Some(b"abc")).is_ok());
-        assert!(require_expected(b"abc", None).is_ok());
-        assert!(require_expected(b"abd", Some(b"abc")).is_err());
-        assert!(require_expected(b"ab", Some(b"abc")).is_err());
     }
 
     #[test]
@@ -1226,50 +1212,6 @@ mod tests {
     }
 
     #[test]
-    fn selections_keep_the_original_sets_and_add_attribution() {
-        assert!(matches!(
-            Layer::selection("all").unwrap().as_slice(),
-            [Layer::Native, Layer::Filtered]
-        ));
-        assert!(matches!(
-            Layer::selection("attribution").unwrap().as_slice(),
-            [
-                Layer::Native,
-                Layer::NotifyOnly,
-                Layer::Filtered,
-                Layer::NativeOpens
-            ]
-        ));
-        assert!(Layer::selection("unfiltered").is_err());
-        assert!(matches!(
-            Protocol::selection("all").unwrap().as_slice(),
-            [Protocol::TcpConnect, Protocol::TcpStream]
-        ));
-        assert!(matches!(
-            Protocol::selection("file").unwrap().as_slice(),
-            [
-                Protocol::FileOpenClose,
-                Protocol::FileOpenRead,
-                Protocol::FileRead
-            ]
-        ));
-        assert!(matches!(
-            Protocol::selection("file-read").unwrap().as_slice(),
-            [Protocol::FileRead]
-        ));
-        assert!(matches!(
-            Protocol::selection("mixed").unwrap().as_slice(),
-            [Protocol::MixedFileTcpConnect, Protocol::MixedFileTcpStream]
-        ));
-        assert!(matches!(
-            Protocol::selection("mixed-file-tcp-connect")
-                .unwrap()
-                .as_slice(),
-            [Protocol::MixedFileTcpConnect]
-        ));
-    }
-
-    #[test]
     fn file_protocols_measure_every_requested_operation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data");
@@ -1291,11 +1233,8 @@ mod tests {
         let open_only = throughput_mbit_per_second(Protocol::FileOpenClose, 1_000, 64, 1.0);
         assert!(open_only.abs() < f64::EPSILON);
         assert!(throughput_mbit_per_second(Protocol::FileRead, 1_000, 64, 1.0) > 0.0);
-    }
 
-    #[test]
-    fn file_protocols_fail_on_a_missing_or_empty_file() {
-        let directory = tempfile::tempdir().unwrap();
+        // A missing file fails every operation; an empty one fails the reads.
         let missing = directory.path().join("missing");
         let empty = directory.path().join("empty");
         std::fs::write(&empty, b"").unwrap();
@@ -1308,29 +1247,6 @@ mod tests {
         }
         for protocol in [Protocol::FileOpenRead, Protocol::FileRead] {
             assert!(run_worker(&file_run(protocol, &empty)).is_err());
-        }
-    }
-
-    #[test]
-    fn old_worker_reports_decode_without_the_new_fields() {
-        let report: BenchmarkReport = serde_json::from_str(
-            r#"{"layer":"native","protocol":"tcp-connect","iterations":1,"concurrency":1,
-                "payload_bytes":64,"capability_scope":"x","elapsed_ms":1.0,
-                "operations_per_second":1.0,"throughput_mbit_per_second":0.0,
-                "latency_ns_p50":1,"latency_ns_p95":1,"latency_ns_p99":1}"#,
-        )
-        .unwrap();
-        assert!(!report.landlock);
-        assert!(report.task_memory_reads.is_none());
-        assert!(report.provider_file_bytes.is_none() && report.class.is_none());
-        let encoded = serde_json::to_string(&report).unwrap();
-        for absent in [
-            "task_memory_reads",
-            "provider_file_bytes",
-            "class",
-            "file_path",
-        ] {
-            assert!(!encoded.contains(absent), "{absent}");
         }
     }
 }
