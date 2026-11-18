@@ -104,6 +104,8 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
 | `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
+| `tasks/windows-z3.json` | Pinned Z3 source, package digests, and package compiler baseline. |
+| `tasks/scripts/windows-z3.ps1` | Native HTTPS download, integrity validation, and static dependency caching. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
 Use the code that is already in the repo. Do not generate a parallel Windows
@@ -203,12 +205,12 @@ from this skill.
 | `OPENSHELL_MXC_SKIP_ARM64` | `0` | Set to `1` to skip ARM64 when using `all` tasks. |
 | `OPENSHELL_WINDOWS_BUILD_JOBS` | `CARGO_BUILD_JOBS`, then `4` | Positive Cargo job limit used by the wrapper. |
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
-| `OPENSHELL_WINDOWS_STATIC_RUNTIME` | `0` | Explicit static CRT/Z3 package mode; accepts a supplied `/MT` library or builds pinned source. Normal CI/build defaults remain unchanged. |
+| `OPENSHELL_WINDOWS_STATIC_RUNTIME` | `1` | Static CRT/Z3 by default; reuse the pinned GHCR `/MT` package. Set `0` only for legacy shared builds. |
 | `OPENSHELL_WINDOWS_Z3_SOURCE` | `0` | Explicitly build pinned Z3 source, overriding a library override. |
 | `Z3_SRC_SOURCE_DIR` | unset | Local Z3 5.1.0 source tree; selects source when no library override is supplied. |
-| `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing target-compatible system `libz3.lib` and `libz3.dll`, used instead of the prebuilt download. |
+| `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing a target-compatible static `/MT` `libz3.lib`; legacy shared overrides apply only in explicit shared mode. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
-| `Z3_SYS_Z3_VERSION` | `5.1.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
+| `Z3_SYS_Z3_VERSION` | `5.1.0` | Solver version pinned with source and package digests in `tasks/windows-z3.json`. |
 | `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
 | `RUSTC_WRAPPER` | inherited | The wrapper resolves an available command to an absolute path. If it is unavailable, the wrapper warns and continues without compiler caching. |
 
@@ -307,7 +309,7 @@ jobs in the current mirror push run, or push a new mirrored commit. The binaries
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
-`clang-cl`, and downloads the official prebuilt ARM64 Z3 package.
+`clang-cl`, and downloads the pinned static ARM64 Z3 package from GHCR.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -426,14 +428,11 @@ architecture through Windows system configuration (not an emulated SSH shell),
 caches uploads by SHA256, and runs the unchanged real E2E harness. Results and
 host probes return to `target/windows-remote-results`, including nonzero test
 outcomes. The remote host needs SSH, OpenSSL, and MXC, not a compiler toolchain.
-Package the matching `libz3.dll` from the target-specific Cargo cache alongside
-the gateway: Windows prebuilt Z3 uses an import library, not static linkage.
-The `windows:build:*` tasks now stage the pinned DLL, check PE architecture,
-reject conflicting cache hashes, and verify the copied hash. Local MXC E2E
-requires the adjacent DLL and reports a preflight error if it is missing.
-Use `-Z3DllPath` when discovery is ambiguous. The native Visual C++ runtime
-must be present on the remote host. Verify DLL architecture and the gateway
-loader before E2E; do not count missing-DLL crashes as MXC enforcement failures.
+Default builds embed Z3 and the CRT. The remote helper reads gateway imports
+and includes the matching `libz3.dll` only for shared builds. `-Z3DllPath`
+continues to select a shared DLL when discovery is ambiguous; those builds
+also need the native Visual C++ runtime. Check gateway startup before E2E;
+do not count loader failures as MXC enforcement failures.
 Verify the SSH host key beforehand. Never send the private SSH key or bundle
 the harness signing-key directories. `-SkipBuild` is an explicit stale-artifact
 opt-in, not evidence that artifacts match current sources. See the MXC driver
@@ -597,23 +596,29 @@ JSONL and fail when an expected event is absent or has the wrong OCSF class.
 
 ## Static Windows ZIP packages
 
-Normal Windows tasks and CI retain the pinned upstream prebuilt and CRT defaults.
-Set `OPENSHELL_WINDOWS_STATIC_RUNTIME=1` for explicit static package validation.
-The wrapper loads `.cargo/windows-static.toml` only in this mode, accepts a
-supplied static `/MT` Z3 library, and otherwise builds checksum-pinned 5.1.0
-source. Upstream's pinned Windows archives provide DLL import libraries. Do not
-claim they provide static Z3. Shared overrides remain valid for normal builds;
-static mode rejects them with an actionable error.
+Windows tasks and CI embed the CRT and Z3 by default. The wrapper loads
+`.cargo/windows-static.toml` and downloads the matching static `/MT` package
+from `ghcr.io/nvidia/openshell/z3`. `tasks/windows-z3.json` pins Z3 5.1.0,
+the source checksum, and each target's OCI, archive, and build-manifest digests.
+Native PowerShell performs HTTPS downloads without Docker, ORAS, or GitHub
+credentials. `.cache/windows-z3` is cached separately from Rust outputs.
 
-A genuinely absent pinned prebuilt (HTTP 404) can select source fallback; cached
-prebuilts avoid network probes, and transient network/API errors do not trigger
-a source build. Source trees live outside Cargo pruning in
-`.cache/windows-z3-source`. Preserve Ninja, native Release optimization, and
-scoped stale-generator invalidation for source builds.
+Source compilation occurs only when the package is unavailable or explicitly
+requested. Digest/version/architecture mismatches fail. Preserve Ninja,
+native Release optimization, source caching outside Cargo pruning, and scoped
+stale-generator invalidation. Supplied static `/MT` libraries remain supported.
+`OPENSHELL_WINDOWS_STATIC_RUNTIME=0` selects legacy shared behavior; an inherited
+shared override otherwise produces a warning and selects the pinned package.
 
-Static builds audit all four executables for normal/delayed CRT or Z3 DLL imports
-and remove stale staged Z3 DLLs. The remote helper detects gateway imports and
-packages the DLL only for shared builds; preserve `-Z3DllPath` compatibility.
-The optional GitHub Actions `static_runtime` dispatch input tests/builds both
-architectures with separate static caches. Default PR checks retain their prior
-lint/test workload and prebuilt caches; do not add a default source/release build.
+Static release builds audit all four executables' normal/delayed imports and
+remove stale staged Z3 DLLs. The remote helper packages the DLL only for shared
+builds and preserves `-Z3DllPath` compatibility. The `static_runtime` manual
+workflow input defaults to true. Ordinary PR CI keeps its lint/test workload;
+it does not build Z3 when the pinned package or verified cache is available.
+
+The explicit `publish_z3` Windows MSVC workflow input builds only the two
+native dependency packages and publishes versioned OCI tags. The producer explicitly selects MSVC 14.44 and uses
+Release `/MT` without LTO, audits solver imports, and checks SAT/UNSAT before
+packaging libraries, headers, license, and build metadata. The workflow refuses to
+replace existing tags with different content. Update pins only after verifying public package downloads.
+See [the contributor build options](../../../CONTRIBUTING.md#windows-full-build).

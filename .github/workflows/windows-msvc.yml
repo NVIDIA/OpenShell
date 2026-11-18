@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       static_runtime:
-        description: Build and test static CRT/Z3 packages (may build Z3 from source)
+        description: Embed static CRT/Z3 (disable only for legacy shared builds)
         type: boolean
-        default: false
+        default: true
       publish_z3:
         description: Build and publish pinned static Z3 dependency packages only
         type: boolean
@@ -20,14 +20,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.publish_z3 && 'z3' || 'checks' }}
   cancel-in-progress: true
 
 env:
   # sccache cannot cache incremental Rust compilations, and rust-cache removes
   # incremental artifacts before saving the target directory.
   CARGO_INCREMENTAL: "0"
-  OPENSHELL_WINDOWS_STATIC_RUNTIME: ${{ inputs.static_runtime && '1' || '0' }}
+  OPENSHELL_WINDOWS_STATIC_RUNTIME: ${{ (github.event_name != 'workflow_dispatch' || inputs.static_runtime) && '1' || '0' }}
 
 jobs:
   pr_metadata:
@@ -68,11 +68,16 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc${{ inputs.static_runtime && '-static-v1' || '' }}-${{ matrix.arch }}
+      SCCACHE_GHA_VERSION: windows-msvc${{ (github.event_name != 'workflow_dispatch' || inputs.static_runtime) && '-static-v1' || '' }}-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache pinned Z3 package
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: .cache/windows-z3
+          key: windows-z3-${{ matrix.rust_target }}-${{ hashFiles('tasks/windows-z3.json') }}
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           install: false
@@ -100,10 +105,16 @@ jobs:
           # wrapper; build steps still inherit sccache from the job.
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc${{ inputs.static_runtime && '-static-v3' || '' }}-${{ matrix.arch }}
+          shared-key: windows-msvc${{ (github.event_name != 'workflow_dispatch' || inputs.static_runtime) && '-static-v3' || '' }}-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
+      - name: Test Windows dependency helpers
+        run: |
+          powershell -NoProfile -File tasks/scripts/windows-runtime-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell -NoProfile -File tasks/scripts/windows-z3-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Lint Windows-supported crates
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
@@ -180,21 +191,31 @@ jobs:
           for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
             archive="z3-${version}-${target}-mt-v${revision}.zip"
             sha256sum --check "${archive}.sha256"
+            unzip -p "$archive" build.json | sha256sum > "${archive}.build-manifest.sha256"
             ref="${repository}:${version}-${target}-mt-v${revision}"
-            if oras resolve "$ref" >existing.txt 2>resolve-error.txt; then
-              echo "Refusing to replace existing dependency tag: $ref" >&2
-              exit 1
-            elif ! grep -Eqi 'NAME_UNKNOWN|MANIFEST_UNKNOWN|not found' resolve-error.txt; then
-              cat resolve-error.txt >&2
-              exit 1
+            if existing="$(oras resolve "$ref" 2>resolve-error.txt)"; then
+              read -r archive_sha _ < "${archive}.sha256"
+              oras manifest fetch "${repository}@${existing}" > existing-manifest.json
+              if ! jq -e --arg hash "${archive_sha,,}" \
+                '.artifactType == "application/vnd.nvidia.openshell.z3.v1" and (.layers | length) == 1 and .layers[0].digest == ("sha256:" + $hash)' \
+                existing-manifest.json; then
+                echo "Refusing to replace existing dependency tag: $ref" >&2
+                exit 1
+              fi
+              echo "Reusing the identical published package: $ref"
+            else
+              if ! grep -Eqi 'NAME_UNKNOWN|MANIFEST_UNKNOWN|not found' resolve-error.txt; then
+                cat resolve-error.txt >&2
+                exit 1
+              fi
+              oras push "$ref" \
+                --artifact-type application/vnd.nvidia.openshell.z3.v1 \
+                --annotation org.opencontainers.image.source=https://github.com/NVIDIA/OpenShell \
+                --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+                --annotation "org.opencontainers.image.version=${version}" \
+                --annotation org.opencontainers.image.licenses=MIT \
+                "${archive}:application/zip"
             fi
-            oras push "$ref" \
-              --artifact-type application/vnd.nvidia.openshell.z3.v1 \
-              --annotation org.opencontainers.image.source=https://github.com/NVIDIA/OpenShell \
-              --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
-              --annotation "org.opencontainers.image.version=${version}" \
-              --annotation org.opencontainers.image.licenses=MIT \
-              "${archive}:application/zip"
             digest="$(oras resolve "$ref")"
             printf '%s@%s\n' "$ref" "$digest" | tee -a published-z3.txt
             printf '%s  %s\n' "$digest" "$ref" >> "$GITHUB_STEP_SUMMARY"
@@ -228,11 +249,16 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc${{ inputs.static_runtime && '-static-v1' || '' }}-${{ matrix.arch }}
+      SCCACHE_GHA_VERSION: windows-msvc${{ (github.event_name != 'workflow_dispatch' || inputs.static_runtime) && '-static-v1' || '' }}-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache pinned Z3 package
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: .cache/windows-z3
+          key: windows-z3-${{ matrix.rust_target }}-${{ hashFiles('tasks/windows-z3.json') }}
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           install: false
@@ -254,10 +280,16 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc${{ inputs.static_runtime && '-static-v3' || '' }}-${{ matrix.arch }}
+          shared-key: windows-msvc${{ (github.event_name != 'workflow_dispatch' || inputs.static_runtime) && '-static-v3' || '' }}-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
+      - name: Test Windows dependency helpers
+        run: |
+          powershell -NoProfile -File tasks/scripts/windows-runtime-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell -NoProfile -File tasks/scripts/windows-z3-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Lint Windows-supported crates
         # Keep the seed workload identical to the pull-request workload so the
         # windows-branch cache reflects the same lint and test commands.
@@ -286,11 +318,16 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc${{ inputs.static_runtime && '-static-v1' || '' }}-${{ matrix.arch }}
+      SCCACHE_GHA_VERSION: windows-msvc${{ (github.event_name != 'workflow_dispatch' || inputs.static_runtime) && '-static-v1' || '' }}-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache pinned Z3 package
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: .cache/windows-z3
+          key: windows-z3-${{ matrix.rust_target }}-${{ hashFiles('tasks/windows-z3.json') }}
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           install: false
@@ -309,7 +346,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc${{ inputs.static_runtime && '-static-v3' || '' }}-${{ matrix.arch }}
+          shared-key: windows-msvc${{ (github.event_name != 'workflow_dispatch' || inputs.static_runtime) && '-static-v3' || '' }}-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"

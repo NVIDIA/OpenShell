@@ -141,6 +141,8 @@ public sealed class OpenShellZ3TestException : System.Exception {
     if ($script:cleanCalls.Count -ne 2) { throw 'Cached solver archive without build rules was reused.' }
     $count++
 
+    $script:staticPackage = $null
+    function Resolve-Z3Package([string] $RustTarget) { return $script:staticPackage }
     $Z3Source = $false
     $StaticRuntime = $false
     $env:Z3_SRC_SOURCE_DIR = $null
@@ -172,22 +174,29 @@ public sealed class OpenShellZ3TestException : System.Exception {
     if ($features.WorkspaceFeatures -or $features.FromSource -or $script:sourceDownloads) { throw 'Shared library override no longer works by default.' }
     $count++
     $StaticRuntime = $true
-    $rejected = $false
-    try { Configure-Z3 @('aarch64-pc-windows-msvc') | Out-Null } catch {
-        if ($_.Exception.Message -notmatch 'genuine static') { throw }
-        $rejected = $true
-    }
-    if (-not $rejected -or $script:sourceDownloads) { throw 'Shared override silently replaced for static build.' }
+    $features = Configure-Z3 @('aarch64-pc-windows-msvc')
+    if (-not $features.FromSource -or $env:Z3_LIBRARY_PATH_OVERRIDE -or $script:sourceDownloads -ne 1) { throw 'Legacy shared override defeated the default static package/source selection.' }
     $count++
     Remove-Item -LiteralPath (Join-Path $sourceFixture 'libz3.dll')
+    $env:Z3_LIBRARY_PATH_OVERRIDE = $sourceFixture
+    $env:Z3_SYS_Z3_HEADER = Join-Path $sourceFixture 'z3.h'
     $env:Z3_SRC_SOURCE_DIR = Join-Path $sourceFixture 'source-must-not-be-used'
     $features = Configure-Z3 @('aarch64-pc-windows-msvc')
-    if ($features.WorkspaceFeatures -or $features.FromSource -or $script:sourceDownloads) { throw 'Supplied static library unexpectedly rebuilt source.' }
+    if ($features.WorkspaceFeatures -or $features.FromSource -or $script:sourceDownloads -ne 1) { throw 'Supplied static library unexpectedly rebuilt source.' }
     $count++
     $env:Z3_LIBRARY_PATH_OVERRIDE = $null
     $env:Z3_SRC_SOURCE_DIR = $null
+    $script:staticPackage = Join-Path $sourceFixture 'ghcr-package'
+    New-Item -ItemType Directory -Path (Join-Path $script:staticPackage 'lib'), (Join-Path $script:staticPackage 'include') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $sourceFixture 'libz3.lib') -Destination (Join-Path $script:staticPackage 'lib/libz3.lib')
+    Copy-Item -LiteralPath (Join-Path $sourceFixture 'z3.h') -Destination (Join-Path $script:staticPackage 'include/z3.h')
     $features = Configure-Z3 @('aarch64-pc-windows-msvc')
-    if ($features.WorkspaceFeatures -notmatch 'vendored-z3' -or -not $features.FromSource -or $script:sourceDownloads -ne 1) { throw 'Explicit static package did not prepare pinned source.' }
+    if ($features.WorkspaceFeatures -or $features.FromSource -or $env:Z3_SRC_SOURCE_DIR -or $script:sourceDownloads -ne 1) { throw 'Available static package unexpectedly selected source compilation.' }
+    $count++
+    $script:staticPackage = $null
+    $env:Z3_LIBRARY_PATH_OVERRIDE = $null
+    $features = Configure-Z3 @('aarch64-pc-windows-msvc')
+    if ($features.WorkspaceFeatures -notmatch 'vendored-z3' -or -not $features.FromSource -or $script:sourceDownloads -ne 1) { throw 'Unavailable static package did not reuse pinned source.' }
     $count++
     if ($env:Z3_SRC_SOURCE_DIR.StartsWith($TargetDir, [StringComparison]::OrdinalIgnoreCase)) { throw 'Source cache is inside the pruned Cargo target directory.' }
     $count++

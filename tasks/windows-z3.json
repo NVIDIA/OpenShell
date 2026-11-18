@@ -5,5 +5,18 @@
   "artifactType": "application/vnd.nvidia.openshell.z3.v1",
   "packageRevision": 1,
   "msvcToolset": "14.44",
-  "packages": {}
+  "packages": {
+    "x86_64-pc-windows-msvc": {
+      "tag": "5.1.0-x86_64-pc-windows-msvc-mt-v1",
+      "manifestDigest": "sha256:70e411597fb978cd712c61d3bd06e5425a8c01001c78fc6681614a89b8a15726",
+      "archiveSha256": "6d3fbe95d930d92e7832e95d82b9c5bbaf33eb6c419dc50853e33ec543674a5e",
+      "buildManifestSha256": "cbb0923d2c5f1bc6d92b669f78c8a73c43147da44e1926cc9d01083565c8828f"
+    },
+    "aarch64-pc-windows-msvc": {
+      "tag": "5.1.0-aarch64-pc-windows-msvc-mt-v1",
+      "manifestDigest": "sha256:8dd68a756527fe9b94e987646a5f2c67c5703761560c24bb2ddd9e5ea7031387",
+      "archiveSha256": "8401565ff92a9b247bfa39688202eb2ff479ecaeef684a6848bd3bc5b5e63f6a",
+      "buildManifestSha256": "2989fa30c2e9379c6964adba23107016097cebd271c74fa3cce3cf726efeb419"
+    }
+  }
 }
