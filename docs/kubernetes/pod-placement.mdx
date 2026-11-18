@@ -28,18 +28,25 @@ Kubernetes Pod fields.
 
 The Kubernetes driver defaults to `preferred` workload/supervisor anti-affinity.
 Set `pod_anti_affinity` in the gateway configuration to `required` or `off` to
-change it. Preferred mode permits colocation when capacity is limited, including
-a single-node cluster. Node selectors and tolerations are opt-in; the default
-policy needs no node-pool labels, taints, or dedicated nodes:
+change it. Preferred mode favors placing workloads and supervisors on separate
+nodes:
 
 ```mermaid
 flowchart LR
-    subgraph single["One eligible node: preferred mode"]
+    subgraph infrastructure["Node A"]
         gateway["Gateway"]
         supervisor["Shared supervisor"]
+    end
+    subgraph sandboxes["Node B"]
         workload["Sandbox workloads"]
     end
 ```
+
+When only one eligible node is available, preferred mode allows workloads and
+supervisors to run on that node together. Node selectors and tolerations are
+opt-in; the default policy needs no node-pool labels, taints, or dedicated nodes.
+The gateway is shown on node A for illustration; this policy does not constrain
+its placement.
 
 To require workload/supervisor node separation, configure gateway TOML:
 
