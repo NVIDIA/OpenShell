@@ -3,7 +3,7 @@
 
 [package]
 name = "sandbox-clients-support"
-description = "Clients that tests run in a sandbox, and typed probes for their results"
+description = "Network clients that tests run in a sandbox, and typed probes for their results"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"

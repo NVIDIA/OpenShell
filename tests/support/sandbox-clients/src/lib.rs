@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Clients that tests run inside a sandbox, and typed results for them.
+//! Network clients that tests run inside a sandbox, and typed results for
+//! them. Each runs in the sandbox, so the sandbox policy applies to it. File
+//! system or system-call probes belong in a sibling crate.
+//!
+//! See "Writing a sandbox client" in `tests/testkit/README.md` for the
+//! contract a client script follows.
 //!
 //! The clients run in a sandbox created from [`testkit::python_image`], with a
 //! policy that lets [`testkit::PYTHON_BINARIES`] reach the target:

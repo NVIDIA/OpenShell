@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Runs inside the sandbox, so the sandbox policy applies to its connection.
+# It follows the contract in tests/testkit/README.md ("Writing a sandbox
+# client"): standard library only, input from argv, one JSON line out, and
+# parsing in Rust (src/probe.rs).
+#
 # Connects to argv[1]:argv[2], sends the bytes hex-encoded in argv[3] ("-"
 # to only connect), and reads until the connection ends. Prints how each step
 # went as one JSON line; failures to connect or read are results, not errors.

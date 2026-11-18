@@ -804,7 +804,15 @@ impl Sandbox {
             script_summary(script),
             self.name
         );
-        output.success()
+        let missing_python =
+            output.exit_code == 127 || output.stderr.contains("python3: not found");
+        output.success().map_err(|error| {
+            if missing_python {
+                error.context("the sandbox has no python3; create it from testkit::python_image()")
+            } else {
+                error
+            }
+        })
     }
 
     /// The sandbox's policy revisions, from `policy list --output json`.

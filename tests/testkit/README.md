@@ -142,6 +142,27 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `poll_until` for waiting on other state, and `with_deadline(what, timeout,
   future)` for a step that must finish sooner than its own timeout.
 
+## Writing a sandbox client
+
+A test that checks what a sandbox can reach runs its client inside the
+sandbox, because the sandbox policy applies only to processes there. A client
+script:
+
+- uses only Python's standard library, and runs with `sandbox.run_python(script,
+  args)` in a sandbox from `testkit::python_image()`;
+- takes its input as arguments;
+- prints its result as one JSON line, which the test reads with
+  `output.last_json()`. A refused connection or a failed read is a result,
+  not a crash: the script exits non-zero only on a bug;
+- leaves parsing and assertions to Rust.
+
+A script only one test uses can stay beside that test, as a `const` or an
+`include_str!`. Move it to `tests/support/sandbox-clients/scripts/`, with a
+constant in its `scripts` module, once a second test or suite needs it, so no
+suite reads another workspace's files. If its result has a fixed shape, add a
+typed probe there too, like `connect` and `http`. `sandbox-clients` holds
+network clients; put file-system or system-call probes in a sibling crate.
+
 ## Running against a gateway
 
 Tests find the gateway the same way the `openshell` CLI does:
