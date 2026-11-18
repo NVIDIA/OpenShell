@@ -422,6 +422,12 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run monitoring:check` | Check and render the monitoring mixin            |
 | `mise run clean`     | Clean build artifacts                                   |
 
+## TypeScript SDK contributions
+
+Open TypeScript SDK PRs in [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript), including dependency and security updates. Core's `sdk/typescript/` is frozen at `v0.1.9`. Branch Checks rejects added or modified files there; deletions remain allowed for removal. Core proto changes need no TypeScript bindings here because the standalone SDK generates bindings from its pinned release.
+
+Core retains its TypeScript SDK files and release publisher until the publishing cutover. Core's aggregate checks no longer build, format, lint, or test the SDK. `proto:lint` uses the core-owned Buf tool.
+
 ## Project Structure
 
 | Path            | Purpose                                       |
@@ -430,7 +436,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
-| `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
+| `sdk/typescript/` | TypeScript SDK (frozen, development moved to ai-openshell/sdk-typescript) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |

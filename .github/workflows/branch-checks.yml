@@ -726,35 +726,32 @@ jobs:
       - name: Lint
         run: mise run markdown:lint
 
-  sdk-typescript:
-    name: TypeScript SDK
+  typescript-sdk-freeze:
+    name: TypeScript SDK Freeze
     needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    if: needs.pr_metadata.outputs.should_run == 'true' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Check TypeScript SDK
-        run: mise run sdk:ts:ci
-
-      # Exercise the full release publish path (version stamp, dist-tag,
-      # prepublishOnly, tarball) without uploading. Uses the off-tag dev
-      # version, which validates the prerelease dist-tag branch too.
-      - name: Verify publishable artifact (dry-run)
+      - name: Reject changes to the TypeScript SDK
         env:
-          OPENSHELL_NPM_PUBLISH_ARGS: --dry-run
+          BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
         run: |
-          OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
-            mise run sdk:ts:publish
+          set -euo pipefail
+          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- sdk/typescript)
+          if [ -z "$changed" ]; then
+            echo "No added or changed TypeScript SDK files."
+            exit 0
+          fi
+          echo "::error title=TypeScript SDK moved::Open TypeScript SDK changes at https://github.com/ai-openshell/sdk-typescript. Drop sdk/typescript changes from this PR. Core proto changes need no TypeScript bindings here; sdk-typescript generates them from core releases."
+          echo "Changed TypeScript SDK files:"
+          echo "$changed"
+          exit 1
 
   install-script:
     name: install.sh

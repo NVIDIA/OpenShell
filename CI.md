@@ -17,6 +17,12 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### TypeScript SDK freeze
+
+The `TypeScript SDK Freeze` job rejects additions and modifications under `sdk/typescript/` on PR mirror pushes. It permits deletions for removal and skips merge groups, matching the Python freeze check. A failure blocks the required `OpenShell / Branch Checks` status and directs SDK PRs to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no TypeScript bindings here.
+
+The freeze replaces the `TypeScript SDK` build and publish dry-run job. Core's aggregate checks no longer run SDK tasks, and `proto:lint` uses the core-owned Buf tool. Core retains release publication until the separate publishing cutover.
+
 ### Monitoring dashboards
 
 `Monitoring Mixin` runs in Branch Checks when files under
