@@ -178,8 +178,6 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
-    // Sandbox provider-token brokering adds one public RPC and its request and
-    // response messages; the durable and public/durable overlap stay unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
         "711a31c11baa7547d967a9a46d0932d92f08121d4195b6f29fb192d7c1ec25a7";
     const DURABLE_SCHEMA_SHA256: &str =

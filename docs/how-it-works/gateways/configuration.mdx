@@ -1605,7 +1605,7 @@ chain verification and the requirement for exactly one URI SAN apply to both
 modes. Do not use a trust-domain-wide peer policy. The installed SPIRE version and operator
 must support the experimental API; this configuration alone does not enable it.
 
-If grants fail after rescheduling or adding nodes, check that the Service's
+If grants fail after rescheduling or adding nodes, check that the eligible
 agents match the peer prefix and node alias, and that Sandbox registrations
 have reached each agent. Identity or configuration rejections require fixing
 registration, trust, or authorization; connection failures can be retried.

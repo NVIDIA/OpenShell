@@ -21,8 +21,8 @@ use tonic::{
     transport::{Channel, Endpoint},
 };
 
-// Wire fields from spiffe/spiffe standards/brokerapi.proto. This probe uses
-// only the JWT profile and KubernetesObjectReference, never PID references.
+// JWT profile and KubernetesObjectReference fields from
+// spiffe/spiffe standards/brokerapi.proto.
 #[derive(Clone, PartialEq, Message)]
 struct AnyReference {
     #[prost(string, tag = "1")]

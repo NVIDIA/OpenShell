@@ -49,8 +49,7 @@ spec:
         - host.docker.internal
         - host.openshell.internal
   {{- end }}
-  {{- $podSecurity := deepCopy (.Values.podSecurityContext | default dict) }}
-  {{- with $podSecurity }}
+  {{- with .Values.podSecurityContext }}
   securityContext:
     {{- toYaml . | nindent 4 }}
   {{- end }}

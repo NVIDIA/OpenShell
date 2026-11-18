@@ -15,16 +15,6 @@ use rustls::{
 use std::sync::Arc;
 use x509_parser::{extensions::GeneralName, prelude::FromDer};
 
-/// Verify a server's chain, validity, and exact SPIFFE URI SAN using the
-/// selected crypto backend.
-///
-/// DNS names are not used for SPIFFE authentication. Revocation checking is
-/// not enabled; deployments rely on short-lived SVIDs.
-#[must_use]
-pub fn server_verifier(roots: RootCertStore, expected: String) -> Arc<dyn ServerCertVerifier> {
-    server_verifier_with_identity(roots, ServerIdentity::Exact(expected))
-}
-
 /// Authorized SPIFFE server identities. Prefixes authorize descendants of one
 /// SPIFFE path, never sibling paths or another trust domain.
 #[derive(Clone, Debug)]
@@ -71,6 +61,9 @@ fn spiffe_path(uri: &str) -> Option<(&str, &str)> {
 }
 
 /// Verify the chain and one URI SAN against the configured identity policy.
+///
+/// DNS names are not used for SPIFFE authentication. Revocation checking is
+/// not enabled; deployments rely on short-lived SVIDs.
 #[must_use]
 pub fn server_verifier_with_identity(
     roots: RootCertStore,

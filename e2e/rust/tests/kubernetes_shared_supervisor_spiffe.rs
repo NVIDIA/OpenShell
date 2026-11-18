@@ -3,22 +3,10 @@
 
 #![cfg(feature = "e2e-kubernetes-shared-supervisor-spiffe")]
 
-//! Sandbox identities issued by the SPIFFE Broker API to the gateway for a shared supervisor.
+//! Gateway-owned SPIFFE identities and RFC 8693 provider tokens for shared supervisors.
 //!
-//! The wrapper installs SPIRE (`ci/values-spire-broker-stack.yaml`) and
-//! the gateway topology with the SPIFFE Broker API
-//! (`ci/values-supervisor-spiffe.yaml`). This test registers
-//! sandbox identities as an operator would, with `ClusterStaticEntry`
-//! resources, and drives the existing RFC 8693 provider exchange: the gateway
-//! exchanges the stored subject token with its own SVID for the sandbox's
-//! SPIFFE ID, then exchanges that intermediate token with the sandbox's
-//! sandbox SVID. The supervisor receives only the final access token.
-//! The token service is a host fixture reached
-//! through a selectorless Service, and it hands out tokens that name the
-//! identity they were issued to.
-//! A two-member pool also verifies that abrupt owner loss preserves the
-//! workload and SPIFFE identity while fencing the old credential epoch and
-//! its still-live broker cache entry.
+//! Covers sandbox isolation, multi-node agent routing and replacement, credential
+//! rotation, and supervisor failover with stale-session fencing against real SPIRE.
 
 #[path = "kubernetes_shared_supervisor_spiffe/node_local.rs"]
 mod node_local;
@@ -60,7 +48,7 @@ const STS_SERVICE: &str = "openshell-e2e-sts";
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
 const TOPOLOGY_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-topology";
-/// Instance route annotation; the key keeps its established `-session` name.
+/// Sandbox instance route annotation.
 const INSTANCE_ROUTE_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
 
 /// Fixed listener ports let a remote cluster reach these host fixtures through
@@ -1212,8 +1200,6 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     // act as, and never falls back to its own.
     assert_eq!(call(&alpha, target.port).await, "DENIED");
     assert!(tokens.exchanges().is_empty());
-
-    // Each sandbox exchanges under its own stable SPIFFE ID.
 
     let pods = kubectl(&[
         "-n",

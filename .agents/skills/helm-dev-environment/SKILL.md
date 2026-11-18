@@ -124,8 +124,7 @@ to all eligible agents. The test selects each Broker backend in turn and forces
 a new generation's acquisition, then replaces one agent and checks acquisition
 without re-registering the sandbox. Exact-ID mode remains available for a fixed
 endpoint. The installed SPIRE version and operator must expose the experimental
-Broker API. `e2e/kubernetes/spiffe-broker/README.md` describes independent
-protocol and negative authorization checks.
+Broker API.
 
 For remote clusters, set `OPENSHELL_E2E_HOST_GATEWAY_IP` to a host reachable
 from Pods. Optional `OPENSHELL_E2E_SPIFFE_STS_PORT` and

@@ -65,6 +65,3 @@ the gateway Pod passes Restricted Pod Security admission.
 The node-local variant uses external PostgreSQL to move the gateway across
 nodes, restricts Broker egress to its current node, and verifies fresh acquisition
 without a Broker Service, including after its local agent is replaced.
-
-The [`broker_probe` experiment](../../e2e/kubernetes/spiffe-broker/README.md)
-provides independent positive and negative protocol checks.
