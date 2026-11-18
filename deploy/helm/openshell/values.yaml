@@ -39,6 +39,8 @@ gateway:
     tag: ""
     # -- Gateway image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Gateway listener IP. Use `::` for IPv6.
+  listenAddress: 0.0.0.0
 
 # Trusted workload-side runtime image.
 sandboxRuntime:
@@ -69,6 +71,8 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Shared supervisor listener IP. Use `::` for IPv6.
+  listenAddress: 0.0.0.0
   # -- Shared supervisor pool members, used only when gatewayConfig selects
   # supervisor_topology = "gateway". The gateway always coordinates the shared
   # supervisor as a high-availability pool: when a member fails or leaves,

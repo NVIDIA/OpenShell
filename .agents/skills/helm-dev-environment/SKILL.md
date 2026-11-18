@@ -447,8 +447,19 @@ Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
 Set `OPENSHELL_E2E_KUBE_TEST=kubernetes_image_update` to scope the Rust suite to
 combined image, command, environment, and metadata updates with retained sandbox,
 SSH, and PVC identities. The next start verifies the new argv and environment. This target is
-included in both existing Agent Sandbox API-version lanes; unlike the Python
-Docker suite, it exercises the driver that supports image updates.
+included in both existing Agent Sandbox API-version lanes. Docker separately
+supports image-only updates on stopped, opt-in persistent `/sandbox` workspaces;
+this Kubernetes lane does not qualify that path. Docker requires locally cached
+images, a matching numeric target `USER UID:GID`, and no image-declared volumes.
+Do not treat a skipped Docker lane as live image-replacement coverage.
+
+The separate `docker-updates` testkit suite qualifies the full Docker path
+through an owned mTLS gateway, including SSH exec, image replacement, restart,
+credential-publication repair and deletion. Follow
+`tests/suites/features/docker-updates/README.md`; the wrapper's
+`OPENSHELL_E2E_DOCKER_IMAGE_UPDATES=1` opts in only its fresh gateway and refuses
+an existing endpoint. On Docker Desktop without host networking, select the
+documented bridge override rather than changing engine settings.
 
 Image updates default to disabled outside test fixtures. The e2e wrapper opts
 in only for a fresh gateway fixture that it owns; set

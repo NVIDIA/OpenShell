@@ -13,6 +13,21 @@ setting a policy when you create a sandbox to changing it while the sandbox
 runs, confirming that the change took effect, and rolling it back. Run
 `openshell policy --help` for every command and option.
 
+## Check a Policy File Offline
+
+Run `openshell policy lint policy.yaml` before applying an authored policy.
+It validates the file locally and exits nonzero for an invalid policy. No
+gateway or sandbox is required. Schema and conversion errors stop validation;
+after parsing, safety, credential-binding, ambiguity and built-in middleware
+errors are reported together.
+
+A successful lint uses this CLI version's validation rules. It does not check
+attached providers, registered external middleware, image identity, or driver
+requirements, and does not establish that the sandbox will start. To validate
+an exported policy for reuse, export the authored policy with
+`openshell policy get my-sandbox --base`; `--full` includes reserved provider
+entries.
+
 ## Create a Sandbox with a Policy
 
 Pass a policy file when you create a sandbox. Filesystem, Landlock, and process

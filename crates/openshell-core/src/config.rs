@@ -13,6 +13,35 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Database credential source. The default preserves URL/SQLite behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseAuthMode {
+    #[default]
+    Default,
+    AzureWorkloadIdentity,
+}
+
+impl fmt::Display for DatabaseAuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::AzureWorkloadIdentity => "azure-workload-identity",
+        })
+    }
+}
+
+impl FromStr for DatabaseAuthMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "azure-workload-identity" => Ok(Self::AzureWorkloadIdentity),
+            _ => Err("database authentication must be default or azure-workload-identity"),
+        }
+    }
+}
+
 // ── Public default constants ────────────────────────────────────────────
 //
 // Canonical source for default values used across multiple crates.
@@ -300,6 +329,9 @@ pub struct Config {
 
     /// Database URL for persistence.
     pub database_url: String,
+
+    /// Explicit database identity mode; independent of provider credentials.
+    pub database_auth: DatabaseAuthMode,
 
     /// Connection ceiling for the persistence pool.
     ///
@@ -1084,6 +1116,7 @@ impl Config {
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
+            database_auth: DatabaseAuthMode::default(),
             database_max_connections: None,
             database_lock_max_connections: None,
             compute_driver: None,
@@ -1141,6 +1174,13 @@ impl Config {
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
+        self
+    }
+
+    /// Select database credentials independently of the connection URL.
+    #[must_use]
+    pub fn with_database_auth(mut self, mode: DatabaseAuthMode) -> Self {
+        self.database_auth = mode;
         self
     }
 

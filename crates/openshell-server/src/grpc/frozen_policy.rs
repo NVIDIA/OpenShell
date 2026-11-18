@@ -3,7 +3,9 @@
 
 //! Additive creation and inspection APIs for gateway-owned policy freezing.
 
-use super::{OpenShellService, extract_principal, mutation_replay, policy, sandbox};
+use super::{
+    OpenShellService, extract_principal, mutation_audit, mutation_replay, policy, sandbox,
+};
 use crate::ServerState;
 use crate::auth::workspace_authz::{MinWorkspaceRole, selected_workspace_name};
 use openshell_core::ObjectId;
@@ -41,7 +43,14 @@ impl openshell_core::proto::frozen_sandbox_policies_server::FrozenSandboxPolicie
         &self,
         request: Request<CreateFrozenSandboxRequest>,
     ) -> Result<Response<FrozenSandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_policy(

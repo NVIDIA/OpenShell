@@ -46,7 +46,7 @@ Common labels
 helm.sh/chart: {{ include "openshell.chart" . }}
 {{ include "openshell.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | replace "+" "_" | trunc 63 | trimAll "-_." | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
@@ -594,6 +594,10 @@ default to enabled; an explicit false must not be replaced by that default.
 {{- $enabled = $metrics.enabled -}}
 {{- end -}}
 {{- if $enabled -}}true{{- end -}}
+{{- end }}
+
+{{- define "openshell.listenHost" -}}
+{{- if contains ":" . -}}[{{ . }}]{{- else -}}{{ . }}{{- end -}}
 {{- end }}
 
 {{/*

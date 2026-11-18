@@ -1536,16 +1536,16 @@ mod tests {
             use rsa::pkcs1::EncodeRsaPrivateKey as _;
             use rsa::traits::PublicKeyParts as _;
 
-            let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
-                .expect("generate RSA test key");
+            let private =
+                rsa::PrivateKey::new(&mut rand_ssh::rng(), 2048).expect("generate RSA test key");
             let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
             Self {
                 private_pem: private
                     .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
                     .expect("encode RSA private key as PEM")
                     .to_string(),
-                modulus_b64: b64.encode(private.n().to_bytes_be()),
-                exponent_b64: b64.encode(private.e().to_bytes_be()),
+                modulus_b64: b64.encode(private.n().to_be_bytes_trimmed_vartime()),
+                exponent_b64: b64.encode(private.e().to_be_bytes_trimmed_vartime()),
             }
         }
     }
@@ -1898,11 +1898,11 @@ mod tests {
                 RsaFixture::Secondary => RSA_TEST_KEY_PEM_SECONDARY,
             };
             let private_key =
-                rsa::RsaPrivateKey::from_pkcs8_pem(pem).expect("valid static test RSA key");
+                rsa::PrivateKey::from_pkcs8_pem(pem).expect("valid static test RSA key");
             let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
             let public_key = private_key.to_public_key();
-            let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-            let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+            let n = URL_SAFE_NO_PAD.encode(public_key.n().to_be_bytes_trimmed_vartime());
+            let e = URL_SAFE_NO_PAD.encode(public_key.e().to_be_bytes_trimmed_vartime());
             let mut jwk = serde_json::json!({
                 "kty": "RSA",
                 "kid": kid,

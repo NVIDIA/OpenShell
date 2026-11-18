@@ -19,6 +19,7 @@ macro_rules! openshell {
 
 const CATALOG: &[(&str, ActivityId)] = &[
     (openshell!("CreateSandbox"), CREATE),
+    ("/openshell.v1.FrozenSandboxPolicies/CreateSandbox", CREATE),
     (openshell!("DeleteSandbox"), DELETE),
     (openshell!("StopSandbox"), UPDATE),
     (openshell!("StartSandbox"), UPDATE),
@@ -47,6 +48,10 @@ const CATALOG: &[(&str, ActivityId)] = &[
     (openshell!("DeleteProviderRefresh"), DELETE),
     (openshell!("RotateProviderCredential"), UPDATE),
     (openshell!("UpdateConfig"), UPDATE),
+    (
+        "/openshell.v1.FrozenSandboxPolicies/UpdateGlobalConfig",
+        UPDATE,
+    ),
     (openshell!("ApproveDraftChunk"), UPDATE),
     (openshell!("ApproveAllDraftChunks"), UPDATE),
     (openshell!("RejectDraftChunk"), UPDATE),
