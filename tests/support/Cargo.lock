@@ -3183,6 +3183,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-clients-support"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
