@@ -23,8 +23,8 @@ enum Command {
     Setup {
         environment: String,
     },
-    /// Print the key of the environment's setup layer, or `none` when it has
-    /// no setup playbooks, without starting a VM.
+    /// Print the hash that names the environment's setup layer, without
+    /// starting a VM.
     LayerKey {
         environment: String,
     },
@@ -58,8 +58,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::LayerKey { environment } => {
             let (machine, environment) = find_environment(&config, &environment)?;
-            let key = setup_layer_key(&machine, &environment)?;
-            println!("{}", key.as_deref().unwrap_or("none"));
+            println!("{}", setup_layer_key(&machine, &environment)?);
         }
         Command::Install {
             environment,

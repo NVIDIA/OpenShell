@@ -64,8 +64,8 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
 
-      # The hash tmachine names the environment's setup layer after, or `none`
-      # when the environment has no setup layer. See e2e-suites.yml.
+      # The hash tmachine names the environment's setup layer after. See
+      # e2e-suites.yml.
       - name: Compute the tmachine setup layer key
         id: layer-key
         env:
@@ -79,7 +79,6 @@ jobs:
       # Only the setup layers: install layers under disks/install hold this
       # commit's build, so no later run could use them.
       - name: Cache tmachine disks
-        if: steps.layer-key.outputs.key != 'none'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cache/tmachine/disks/setup/*.qcow2
