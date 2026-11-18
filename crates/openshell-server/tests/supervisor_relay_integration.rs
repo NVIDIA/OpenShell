@@ -477,6 +477,13 @@ impl OpenShell for RelayGateway {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn reveal_secret(
+        &self,
+        _: tonic::Request<openshell_core::proto::RevealSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::RevealSecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn inline_provider_refresh_secrets(
         &self,
         _: tonic::Request<openshell_core::proto::InlineProviderRefreshSecretsRequest>,

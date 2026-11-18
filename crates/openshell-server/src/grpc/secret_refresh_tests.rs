@@ -44,7 +44,8 @@ async fn enabled_state() -> Arc<ServerState> {
     Arc::get_mut(&mut state)
         .expect("test state is not shared yet")
         .config
-        .enable_workspace_secrets = true;
+        .workspace_secrets
+        .enabled = true;
     state
 }
 
@@ -452,7 +453,8 @@ async fn references_require_activation() {
     Arc::get_mut(&mut state)
         .expect("test state is not shared")
         .config
-        .enable_workspace_secrets = false;
+        .workspace_secrets
+        .enabled = false;
     let err = configure(
         &state,
         configure_request(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials),

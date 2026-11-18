@@ -892,6 +892,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn reveal_secret(
+        &self,
+        _: tonic::Request<proto::RevealSecretRequest>,
+    ) -> Result<Response<proto::RevealSecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn inline_provider_refresh_secrets(
         &self,
         _: tonic::Request<proto::InlineProviderRefreshSecretsRequest>,

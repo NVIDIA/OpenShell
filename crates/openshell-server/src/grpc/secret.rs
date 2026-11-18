@@ -13,8 +13,8 @@ use std::sync::Arc;
 use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta};
 use openshell_core::proto::{
     CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, DeletionOutcome,
-    GetSecretRequest, ListSecretsRequest, ListSecretsResponse, Secret, SecretResponse,
-    UpdateSecretRequest,
+    GetSecretRequest, ListSecretsRequest, ListSecretsResponse, RevealSecretRequest,
+    RevealSecretResponse, Secret, SecretResponse, UpdateSecretRequest,
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::endpoint::normalize_token_endpoint;
@@ -27,6 +27,8 @@ use tracing::warn;
 use super::validation::validate_dns1123_label;
 use super::{MAX_MAP_VALUE_LEN, MAX_NAME_LEN};
 use crate::ServerState;
+use crate::auth::identity::IdentityProvider;
+use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_workspace, selected_workspace_name,
 };
@@ -88,7 +90,7 @@ fn labels_json(stored: &StoredWorkspaceSecret) -> Result<Option<String>, Status>
 /// Reject secret creation and new references unless the operator activated
 /// workspace secrets and no observable live gateway lacks support for them.
 pub async fn ensure_workspace_secrets_active(state: &ServerState) -> Result<(), Status> {
-    if !state.config.enable_workspace_secrets {
+    if !state.config.workspace_secrets.enabled {
         return Err(Status::failed_precondition(
             "workspace secrets are not enabled; set enable_workspace_secrets after every gateway supports them",
         ));
@@ -189,7 +191,7 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), Status> {
 
 async fn authorized_workspace(
     state: &ServerState,
-    request_principal: &crate::auth::principal::Principal,
+    request_principal: &Principal,
     workspace_scope: Option<&openshell_core::proto::WorkspaceSelector>,
     role: MinWorkspaceRole,
 ) -> Result<super::workspace::ResolvedWorkspace, Status> {
@@ -572,6 +574,88 @@ pub(super) async fn handle_delete_secret(
     }))
 }
 
+/// The only scope that authorizes `RevealSecret`. `openshell:all` does not
+/// imply it.
+const REVEAL_SCOPE: &str = "secret:reveal";
+
+/// Fail closed regardless of how the gateway authenticates users: middleware
+/// skips scope checks when `scopes_claim` is unset and treats an empty admin
+/// role as platform admin, so neither may grant a reveal here.
+fn ensure_reveal_principal(state: &ServerState, principal: &Principal) -> Result<(), Status> {
+    match principal {
+        Principal::Operator(_) => Ok(()),
+        Principal::User(user) => {
+            let enforces_scopes = state
+                .config
+                .oidc
+                .as_ref()
+                .is_some_and(|oidc| !oidc.scopes_claim.is_empty());
+            if user.identity.provider == IdentityProvider::Oidc
+                && enforces_scopes
+                && user
+                    .identity
+                    .scopes
+                    .iter()
+                    .any(|scope| scope == REVEAL_SCOPE)
+            {
+                Ok(())
+            } else {
+                Err(Status::permission_denied(format!(
+                    "revealing a secret requires an operator, or an OIDC token with the literal '{REVEAL_SCOPE}' scope on a gateway that enforces scopes"
+                )))
+            }
+        }
+        _ => Err(Status::permission_denied(
+            "this principal may not reveal secrets",
+        )),
+    }
+}
+
+pub(super) async fn handle_reveal_secret(
+    state: &Arc<ServerState>,
+    request: Request<RevealSecretRequest>,
+) -> Result<Response<RevealSecretResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if !state.config.workspace_secrets.reveal_enabled {
+        return Err(Status::failed_precondition(
+            "secret reveal is not enabled; set enable_secret_reveal for control-plane callers",
+        ));
+    }
+    ensure_reveal_principal(state, &principal)?;
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let workspace = authorized_workspace(
+        state,
+        &principal,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::Admin,
+    )
+    .await?
+    .name;
+    let stored = get_live_secret(&state.store, &workspace, &req.name)
+        .await?
+        .ok_or_else(|| Status::not_found("secret not found"))?;
+    let handle = stored
+        .value_handle
+        .clone()
+        .ok_or_else(|| Status::not_found("secret not found"))?;
+    let resolved = state
+        .credentials
+        .resolve_secrets(owner(&stored), &value_handles(handle), 0)
+        .await?;
+    let value = resolved
+        .values
+        .get(SECRET_VALUE_KEY)
+        .cloned()
+        .ok_or_else(|| Status::unavailable("secret value could not be read"))?;
+    Ok(Response::new(RevealSecretResponse {
+        value,
+        value_update_time: stored.value_update_time,
+    }))
+}
+
 /// Live refresh configurations in a workspace that reference a secret, named
 /// `provider/credential_key`. A malformed binding annotation counts as a
 /// reference so deletion fails closed.
@@ -744,7 +828,8 @@ mod tests {
         Arc::get_mut(&mut state)
             .expect("test state is not shared yet")
             .config
-            .enable_workspace_secrets = true;
+            .workspace_secrets
+            .enabled = true;
         state
     }
 
@@ -1011,5 +1096,116 @@ mod tests {
         assert_eq!(sweep_workspace_secrets(&state).await.unwrap(), 1);
         assert!(stored(&state, "acme").await.is_none());
         assert!(resolve_value(&state, &tombstoned, &handle).await.is_err());
+    }
+
+    fn oidc_config(scopes_claim: &str) -> openshell_core::OidcConfig {
+        openshell_core::OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            ca_bundle: None,
+            dangerously_allow_insecure_http: false,
+            jwks_allowed_origins: Vec::new(),
+            audience: "openshell".to_string(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "roles".to_string(),
+            admin_role: String::new(),
+            user_role: String::new(),
+            scopes_claim: scopes_claim.to_string(),
+        }
+    }
+
+    async fn reveal_state(scopes_claim: Option<&str>) -> Arc<ServerState> {
+        let mut state = enabled_state().await;
+        create(&state, "acme", "the-value").await;
+        let config = &mut Arc::get_mut(&mut state)
+            .expect("test state is not shared yet")
+            .config;
+        config.workspace_secrets.reveal_enabled = true;
+        config.oidc = scopes_claim.map(oidc_config);
+        state
+    }
+
+    fn user(provider: IdentityProvider, scopes: &[&str]) -> Principal {
+        Principal::User(crate::auth::principal::UserPrincipal {
+            identity: crate::auth::identity::Identity {
+                subject: "occ".to_string(),
+                display_name: None,
+                roles: vec!["openshell-admin".to_string()],
+                scopes: scopes.iter().map(ToString::to_string).collect(),
+                provider,
+            },
+        })
+    }
+
+    async fn reveal(state: &Arc<ServerState>, principal: Principal) -> Result<String, Status> {
+        let mut request = Request::new(RevealSecretRequest {
+            workspace_scope: Some(workspace_selector("default".to_string())),
+            name: "acme".to_string(),
+        });
+        request.extensions_mut().insert(principal);
+        handle_reveal_secret(state, request)
+            .await
+            .map(|response| response.into_inner().value)
+    }
+
+    #[tokio::test]
+    async fn reveal_is_disabled_by_default() {
+        let state = enabled_state().await;
+        create(&state, "acme", "the-value").await;
+        let err = reveal(&state, user(IdentityProvider::Oidc, &[REVEAL_SCOPE]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn reveal_requires_the_literal_scope_on_a_scope_enforcing_gateway() {
+        let state = reveal_state(Some("scope")).await;
+        assert_eq!(
+            reveal(&state, user(IdentityProvider::Oidc, &[REVEAL_SCOPE]))
+                .await
+                .unwrap(),
+            "the-value"
+        );
+        for principal in [
+            user(IdentityProvider::Oidc, &["openshell:all"]),
+            user(IdentityProvider::Oidc, &["secret:read", "secret:write"]),
+            user(IdentityProvider::Mtls, &[REVEAL_SCOPE]),
+            user(IdentityProvider::LocalDev, &[REVEAL_SCOPE]),
+        ] {
+            assert_eq!(
+                reveal(&state, principal).await.unwrap_err().code(),
+                Code::PermissionDenied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_fails_closed_when_scopes_are_not_enforced() {
+        for scopes_claim in [None, Some("")] {
+            let state = reveal_state(scopes_claim).await;
+            assert_eq!(
+                reveal(&state, user(IdentityProvider::Oidc, &[REVEAL_SCOPE]))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::PermissionDenied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn operators_may_reveal() {
+        let state = reveal_state(None).await;
+        let operator = Principal::Operator(crate::auth::principal::OperatorPrincipal {
+            identity: crate::auth::identity::Identity {
+                subject: "operator".to_string(),
+                display_name: None,
+                roles: vec!["operator".to_string()],
+                scopes: Vec::new(),
+                provider: IdentityProvider::Mtls,
+            },
+            certificate_sha256: "00".to_string(),
+        });
+        assert_eq!(reveal(&state, operator).await.unwrap(), "the-value");
     }
 }

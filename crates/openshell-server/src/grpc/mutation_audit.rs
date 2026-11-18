@@ -130,6 +130,10 @@ impl Audited for SandboxTemplateResponse {
     }
 }
 
+/// Records who read which secret. The named target comes from the request;
+/// the response carries the value and contributes nothing to the record.
+impl Audited for openshell_core::proto::RevealSecretResponse {}
+
 impl Audited for SecretResponse {
     fn produced(&self) -> Vec<Produced<'_>> {
         stored(

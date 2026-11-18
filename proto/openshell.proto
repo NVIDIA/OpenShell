@@ -509,6 +509,19 @@ service OpenShell {
     };
   }
 
+  // Return a workspace secret's plaintext value to a control-plane caller.
+  // Disabled unless the gateway sets enable_secret_reveal. Callers must be an
+  // operator, or an OIDC workspace admin whose token carries the literal
+  // secret:reveal scope on a gateway that enforces scopes; openshell:all does
+  // not satisfy it. Every call is audited.
+  rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:reveal"
+      workspace_role: "admin"
+    };
+  }
+
   // Get sandbox settings by id (called by users, and by supervisors at startup
   // and in their poll loop). A supervisor whose session pushes configuration
   // receives later updates over ConnectSupervisor and stops polling.
@@ -2951,6 +2964,18 @@ message ListSecretsResponse {
 
 message DeleteSecretResponse {
   DeletionOutcome outcome = 1;
+}
+
+message RevealSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+}
+
+message RevealSecretResponse {
+  string value = 1 [(openshell.options.v1.secret) = true];
+  // Last time the value was written.
+  google.protobuf.Timestamp value_update_time = 2;
 }
 
 // Get sandbox provider environment request.

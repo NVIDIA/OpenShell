@@ -309,10 +309,8 @@ pub struct Config {
     /// Disabled by default; not a license to run mixed-version writers.
     pub enable_sandbox_updates: bool,
 
-    /// Operator activation for creating workspace secrets and referencing them
-    /// from provider refresh configuration. Enable only after every gateway
-    /// that can serve traffic supports workspace secrets. Disabled by default.
-    pub enable_workspace_secrets: bool,
+    /// Workspace secret activation and reveal settings.
+    pub workspace_secrets: WorkspaceSecretsConfig,
 
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
@@ -568,6 +566,19 @@ pub struct MetricsTlsConfig {
     /// Whether metrics clients must present a certificate trusted by
     /// [`Self::client_ca_path`].
     pub require_client_auth: bool,
+}
+
+/// Workspace secret settings. Both default to off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSecretsConfig {
+    /// Operator activation for creating workspace secrets and referencing them
+    /// from provider refresh configuration. Enable only after every gateway
+    /// that can serve traffic supports workspace secrets.
+    pub enabled: bool,
+    /// Allow `RevealSecret` to return values to operators and to OIDC tokens
+    /// holding the literal `secret:reveal` scope. Enable only for a
+    /// control-plane service that needs it.
+    pub reveal_enabled: bool,
 }
 
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
@@ -1116,7 +1127,7 @@ impl Config {
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
             enable_sandbox_updates: false,
-            enable_workspace_secrets: false,
+            workspace_secrets: WorkspaceSecretsConfig::default(),
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),

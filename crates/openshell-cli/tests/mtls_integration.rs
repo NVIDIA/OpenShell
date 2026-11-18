@@ -418,6 +418,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn reveal_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RevealSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::RevealSecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn inline_provider_refresh_secrets(
         &self,
         _request: tonic::Request<openshell_core::proto::InlineProviderRefreshSecretsRequest>,

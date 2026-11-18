@@ -76,7 +76,8 @@ use openshell_core::proto::{
 use openshell_core::proto::{
     CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, GetSecretRequest,
     InlineProviderRefreshSecretsRequest, InlineProviderRefreshSecretsResponse, ListSecretsRequest,
-    ListSecretsResponse, SecretResponse, UpdateSecretRequest,
+    ListSecretsResponse, RevealSecretRequest, RevealSecretResponse, SecretResponse,
+    UpdateSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -892,6 +893,20 @@ impl OpenShell for OpenShellService {
             )
         };
         mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn reveal_secret(
+        &self,
+        request: Request<RevealSecretRequest>,
+    ) -> Result<Response<RevealSecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, secret::handle_reveal_secret(&self.state, request)).await
     }
 
     // --- Config / Policy ---

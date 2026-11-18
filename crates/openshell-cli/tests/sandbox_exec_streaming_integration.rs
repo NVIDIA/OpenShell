@@ -266,6 +266,7 @@ mock_gateway! {
         list_secrets(proto::ListSecretsRequest) -> proto::ListSecretsResponse;
         update_secret(proto::UpdateSecretRequest) -> proto::SecretResponse;
         delete_secret(proto::DeleteSecretRequest) -> proto::DeleteSecretResponse;
+        reveal_secret(proto::RevealSecretRequest) -> proto::RevealSecretResponse;
         inline_provider_refresh_secrets(proto::InlineProviderRefreshSecretsRequest) -> proto::InlineProviderRefreshSecretsResponse;
         get_sandbox_config(proto::GetSandboxConfigRequest) -> proto::GetSandboxConfigResponse;
         get_gateway_config(proto::GetGatewayConfigRequest) -> proto::GetGatewayConfigResponse;

@@ -356,6 +356,10 @@ struct RunArgs {
     /// them. See the workspace secrets activation guidance.
     #[arg(long, env = "OPENSHELL_ENABLE_WORKSPACE_SECRETS", default_value_t = false, action = ArgAction::Set)]
     enable_workspace_secrets: bool,
+
+    /// Allow `RevealSecret` for operators and OIDC tokens with the `secret:reveal` scope.
+    #[arg(long, env = "OPENSHELL_ENABLE_SECRET_REVEAL", default_value_t = false, action = ArgAction::Set)]
+    enable_secret_reveal: bool,
 }
 
 pub fn command() -> Command {
@@ -664,7 +668,8 @@ fn prepare_server_config_with_drivers(
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
 
     config.enable_sandbox_updates = args.enable_sandbox_updates;
-    config.enable_workspace_secrets = args.enable_workspace_secrets;
+    config.workspace_secrets.enabled = args.enable_workspace_secrets;
+    config.workspace_secrets.reveal_enabled = args.enable_secret_reveal;
 
     config.supervisor_app_listener = file
         .as_ref()
@@ -1623,6 +1628,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_workspace_secrets")
     {
         args.enable_workspace_secrets = enabled;
+    }
+    if let Some(enabled) = file.enable_secret_reveal
+        && arg_defaulted(matches, "enable_secret_reveal")
+    {
+        args.enable_secret_reveal = enabled;
     }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
