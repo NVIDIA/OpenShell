@@ -1062,13 +1062,9 @@ mod linux {
                     }
                 }
                 _ = discovery.tick(), if spares.pooled => {
-                    // A warm runtime stays on its reserved supervisor until
-                    // assigned. Connection failure still redials, but waiting
-                    // for a claim does not probe other pool members.
-                    if runtime.authenticator.is_assigned() {
-                        discover_route_owner(&pool, &mut spares, &server_config, &runtime, &active_connections)
-                            .await;
-                    }
+                    // The gateway can transfer ownership before the first authenticated request.
+                    discover_route_owner(&pool, &mut spares, &server_config, &runtime, &active_connections)
+                        .await;
                 }
                 () = tokio::time::sleep_until(retry_at), if waiting => {}
             }
@@ -7335,7 +7331,7 @@ mod linux {
                 let route = new_route_handle();
                 let supervisor =
                     RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).expect("bind supervisor");
-                let _registration = supervisor
+                let registration = supervisor
                     .register(&route, &client_tls)
                     .expect("supervisor hosts route");
                 if pooled {
@@ -7354,11 +7350,13 @@ mod linux {
                     .expect("bind service");
                 let service_address = service.local_addr().expect("service address");
                 let dialed = Arc::new(AtomicUsize::new(0));
-                let target = supervisor.local_addr();
+                let (service_target, current_target) =
+                    tokio::sync::watch::channel(supervisor.local_addr());
                 let counter = dialed.clone();
                 let forwarding = process_runtime.spawn(async move {
                     while let Ok((mut inbound, _)) = service.accept().await {
                         counter.fetch_add(1, Ordering::SeqCst);
+                        let target = *current_target.borrow();
                         tokio::spawn(async move {
                             if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
                                 let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
@@ -7378,10 +7376,39 @@ mod linux {
                     Duration::from_millis(100),
                 ));
                 std::thread::sleep(Duration::from_millis(1200));
+                if pooled && !assigned {
+                    // The original member keeps its parked TLS connection after losing
+                    // the gateway stream. New Service dials reach its replacement.
+                    assert!(registration.has_parked_connection());
+                    let replacement = RuntimeRouter::bind(
+                        (
+                            "127.0.0.2".parse::<std::net::IpAddr>().unwrap(),
+                            supervisor.local_addr().port(),
+                        )
+                            .into(),
+                    )
+                    .unwrap();
+                    replacement.set_directory(
+                        Some(replacement.local_addr()),
+                        std::collections::HashMap::new(),
+                    );
+                    let next = replacement.register(&route, &client_tls).unwrap();
+                    service_target.send_replace(replacement.local_addr());
+                    process_runtime.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while !next.has_parked_connection() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await
+                        .expect("replacement gets a TLS connection before first authentication");
+                    });
+                    assert!(registration.has_parked_connection());
+                }
                 let connections = dialed.load(Ordering::SeqCst);
                 control.abort();
                 forwarding.abort();
-                if pooled && assigned {
+                if pooled {
                     assert!(
                         connections > 1,
                         "a pool runtime must run discovery rounds: {connections} connections"

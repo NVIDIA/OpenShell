@@ -327,10 +327,11 @@ retirement tombstone. Recovery never falls back to workspace Secret reads. Retir
 fences delayed writers before collecting their credential material. Restart uses
 a new generation and updates the Pod's pair label; the original physical CR name remains unchanged.
 
-Development deployments using the earlier Secret-backed claim format must finish
-pending claims with that gateway before upgrading. The driver rejects those
-references explicitly; it does not read legacy claim Secrets or discard a
-potentially activated workload.
+Development deployments using Secret-backed claims or the earlier
+`openshell.ai/warm-claim-intent` annotation must finish in-flight launches
+before upgrading. New gateways store launch decisions under
+`internal.openshell.ai/warm-claim-intent` and treat the earlier annotation as
+caller metadata. Legacy Secret-backed claims require the gateway that wrote them.
 
 The focused gateway-backed claim E2E uses fresh branch images and checks physical
 Pod reuse, gateway restart recovery before and after claiming, refill, exec,

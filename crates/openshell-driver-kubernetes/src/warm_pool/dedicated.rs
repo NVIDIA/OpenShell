@@ -87,9 +87,10 @@ pub(in crate::driver) fn configure_dedicated_pod(
 ) {
     let spec = pod.spec.as_mut().expect("supervisor spec");
     let container = &mut spec.containers[0];
+    let health_port = if port == 5502 { 5503 } else { 5502 };
     container.startup_probe = Some(k8s_openapi::api::core::v1::Probe {
         tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
-            port: IntOrString::Int(5502),
+            port: IntOrString::Int(health_port),
             ..Default::default()
         }),
         period_seconds: Some(1),
@@ -102,7 +103,7 @@ pub(in crate::driver) fn configure_dedicated_pod(
         .expect("supervisor command")
         .extend([
             "--warm-health-port".into(),
-            "5502".into(),
+            health_port.to_string(),
             "--warm-prepared-file".into(),
             format!("{PREPARED_DIR}/{PREPARED_KEY}"),
             "--runtime-listen".into(),
@@ -144,6 +145,23 @@ pub(in crate::driver) fn validate_dedicated_pod(
 ) -> Result<(), KubernetesDriverError> {
     let mut actual = serde_json::to_value(stored).map_err(record_error)?;
     let mut expected_spec = serde_json::to_value(expected).map_err(record_error)?;
+    // Earlier gateways propagated the reconciler's trace into a prepared Pod.
+    // Ignore only those literal carrier values on a tracing-enabled supervisor.
+    if let Some(env) = actual
+        .pointer_mut("/spec/containers/0/env")
+        .and_then(serde_json::Value::as_array_mut)
+        && env
+            .iter()
+            .any(|v| v["name"] == openshell_core::sandbox_env::OTLP_ENDPOINT)
+    {
+        env.retain(|v| {
+            !matches!(
+                v["name"].as_str(),
+                Some(openshell_otel::TRACEPARENT_ENV | openshell_otel::TRACESTATE_ENV)
+            ) || !v["value"].is_string()
+                || v.get("valueFrom").is_some()
+        });
+    }
     // Gate removal is the only mutation performed after preparation. Kubernetes
     // may default omitted fields, but supplied container and security fields bind.
     actual["spec"]

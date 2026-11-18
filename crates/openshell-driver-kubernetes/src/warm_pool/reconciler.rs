@@ -241,6 +241,10 @@ impl KubernetesComputeDriver {
             .warm_pool_state(&pool.workspace, &pool.name)
             .await
             .map_err(KubernetesDriverError::Message)?;
+        if snapshot.is_none() && pool.revision == u64::MAX {
+            // Another replica finished this drain after target discovery.
+            return Ok(WarmPoolReport::default());
+        }
         if snapshot
             .as_ref()
             .is_some_and(|s| s.state.revision > pool.revision)
@@ -262,13 +266,9 @@ impl KubernetesComputeDriver {
             Err(error) => Err(invalid(&error.to_string())),
         };
         let mut inventory = self.warm_runtime_inventory(&pool.workspace).await?;
-        let reserved = self
-            .recover_pending_warm_claims(&pool.workspace, &inventory)
+        let recovering = self
+            .recover_pending_warm_claims(&pool.workspace, &pool.name, &mut inventory)
             .await?;
-        // A gateway reservation owns the physical runtime before CR labels do.
-        for resource in &mut inventory {
-            resource.claimed |= reserved.contains(&resource.session_id);
-        }
         let inventory: Vec<_> = inventory
             .into_iter()
             .filter(|resource| resource.pool_id == pool.name)
@@ -392,8 +392,14 @@ impl KubernetesComputeDriver {
             prepare,
         );
         report.suspended = suspended;
+        let finish_drain = pool.revision == u64::MAX
+            && state.entries.is_empty()
+            && actions.is_empty()
+            && !recovering
+            && inventory.iter().all(|resource| resource.claimed);
         if !supervision
             .update_warm_pool(WarmPoolUpdate {
+                finish_drain,
                 workspace: pool.workspace.clone(),
                 pool_id: pool.name.clone(),
                 expected_version,
@@ -493,6 +499,7 @@ impl KubernetesComputeDriver {
                 .retain(|entry| entry.session_id != action.entry.session_id || !entry.retiring);
             supervision
                 .update_warm_pool(WarmPoolUpdate {
+                    finish_drain: false,
                     workspace: pool.workspace.clone(),
                     pool_id: pool.name.clone(),
                     expected_version: Some(snapshot.resource_version),

@@ -11,7 +11,7 @@ use openshell_supervisor_control::{
     WarmClaimInventory, WarmClaimLookup, WarmClaimReservation,
 };
 
-const CLAIM_LINK: &str = "openshell.ai/warm-claim-intent";
+const CLAIM_LINK: &str = "internal.openshell.ai/warm-claim-intent";
 
 #[derive(Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1221,9 +1221,9 @@ impl SupervisorPool {
             }
             Err(error) => return Err(format!("claim prepared runtime: {error}")),
         };
-        lock(&self.materials).insert(assignment.route.clone(), assignment.clone());
         self.registrations.notify(&assignment.route);
         if let Some(activated_owner) = activated_owner {
+            lock(&self.materials).insert(assignment.route.clone(), assignment.clone());
             self.placed(
                 assignment,
                 OwnerRecord {

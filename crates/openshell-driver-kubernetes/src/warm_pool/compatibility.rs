@@ -39,10 +39,6 @@ impl KubernetesComputeDriver {
                     bundle.digest(),
                 )
             });
-            let mut telemetry = self.config.supervisor_otlp.environment();
-            if let Some(name) = &self.config.supervisor_gateway_name {
-                telemetry.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
-            }
             let pod = self.render_sandbox_runtime_supervisor(
                 &namespace,
                 &names,
@@ -59,7 +55,6 @@ impl KubernetesComputeDriver {
                 network_ca
                     .as_ref()
                     .map(|(name, digest)| (name.as_str(), *digest)),
-                &telemetry,
             )?;
             serde_json::json!({
                 "dedicated": pod.spec,

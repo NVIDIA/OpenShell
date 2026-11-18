@@ -40,6 +40,9 @@ fn validate_trust(trust: &WarmRuntimeTrust) -> Result<(), KubernetesDriverError>
     .map_err(|_| invalid("invalid warm runtime gateway verification bundle"))
 }
 
+#[path = "warm_pool/quantity.rs"]
+mod quantity;
+
 #[path = "warm_pool/compatibility.rs"]
 mod compatibility;
 
@@ -669,9 +672,7 @@ impl KubernetesComputeDriver {
             || current_control.uid != control_policy.uid
             || current_control.resource_version != control_policy.resource_version
         {
-            return Err(invalid(
-                "warm runtime network fence changed during preparation",
-            ));
+            return Err(KubernetesDriverError::StalePreparation);
         }
         let current_namespace = Api::<Namespace>::all(self.client.clone())
             .get(&resource.namespace)
@@ -842,10 +843,8 @@ fn validate_pod(
     }
     let actual = serde_json::to_value(pod).map_err(record_error)?;
     for key in ["containers", "initContainers"] {
-        if let Some(path) = shape_difference(
-            &record.shape["spec"]["podTemplate"]["spec"][key],
-            &actual["spec"][key],
-        ) {
+        let expected = &record.shape["spec"]["podTemplate"]["spec"][key];
+        if let Some(path) = shape_difference(expected, &actual["spec"][key], &mut vec![key]) {
             return Err(invalid(&format!(
                 "warm Pod containers changed after admission at {key}{path}"
             )));
@@ -1038,10 +1037,14 @@ fn canonicalize_environment(value: &mut serde_json::Value) {
 }
 
 fn requested_shape_matches(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
-    shape_difference(expected, actual).is_none()
+    shape_difference(expected, actual, &mut Vec::new()).is_none()
 }
 
-fn shape_difference(expected: &serde_json::Value, actual: &serde_json::Value) -> Option<String> {
+fn shape_difference<'a>(
+    expected: &'a serde_json::Value,
+    actual: &serde_json::Value,
+    fields: &mut Vec<&'a str>,
+) -> Option<String> {
     match (expected, actual) {
         (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
             expected.iter().find_map(|(key, value)| {
@@ -1055,7 +1058,12 @@ fn shape_difference(expected: &serde_json::Value, actual: &serde_json::Value) ->
                             || (key == "value" && value.as_str() == Some(""));
                         (!omitted).then(String::new)
                     },
-                    |actual| shape_difference(value, actual),
+                    |actual| {
+                        fields.push(key);
+                        let difference = shape_difference(value, actual, fields);
+                        fields.pop();
+                        difference
+                    },
                 );
                 difference.map(|suffix| format!("/{key}{suffix}"))
             })
@@ -1069,8 +1077,24 @@ fn shape_difference(expected: &serde_json::Value, actual: &serde_json::Value) ->
                 .zip(actual)
                 .enumerate()
                 .find_map(|(index, (expected, actual))| {
-                    shape_difference(expected, actual).map(|suffix| format!("/{index}{suffix}"))
+                    shape_difference(expected, actual, fields)
+                        .map(|suffix| format!("/{index}{suffix}"))
                 })
+        }
+        (left, right)
+            if left != right
+                && matches!(
+                    fields.as_slice(),
+                    [
+                        ..,
+                        "containers" | "initContainers",
+                        "resources",
+                        "requests" | "limits",
+                        _
+                    ]
+                ) =>
+        {
+            (!quantity::equivalent(left, right)).then(String::new)
         }
         _ => (expected != actual).then(String::new),
     }

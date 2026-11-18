@@ -237,6 +237,12 @@ impl KubernetesComputeDriver {
                                 .await
                                 .map(Some);
                         }
+                        if !claim_attempted
+                            && matches!(error, KubernetesDriverError::StalePreparation)
+                        {
+                            self.retire_warm_runtime(resource).await?;
+                            continue;
+                        }
                         if supervision
                             .pending_warm_claims(&resource.workspace)
                             .await
@@ -337,21 +343,29 @@ impl KubernetesComputeDriver {
     }
 
     /// Recover gateway reservations even when no CR carries the logical ID yet.
-    /// Return their sessions so pool maintenance excludes them from spare capacity.
+    /// Mark reserved resources as claimed. Keep the drain scheduled while recovery
+    /// could still need this pool's inventory, including after an ambiguous delete.
     pub(super) async fn recover_pending_warm_claims(
         &self,
         workspace: &str,
-        resources: &[WarmRuntimeResource],
-    ) -> Result<std::collections::BTreeSet<SandboxSessionId>, KubernetesDriverError> {
+        pool_id: &str,
+        resources: &mut [WarmRuntimeResource],
+    ) -> Result<bool, KubernetesDriverError> {
         let claims = self
             .warm_supervision()?
             .pending_warm_claims(workspace)
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let mut reserved = std::collections::BTreeSet::new();
+        let mut recovering = false;
         for pending in claims.pending {
             let session = pending.intent.registration.runtime_descriptor.session_id;
-            reserved.insert(session);
+            if let Some(resource) = resources.iter_mut().find(|r| r.session_id == session) {
+                resource.claimed = true;
+                recovering |= resource.pool_id == pool_id;
+            } else {
+                // Missing inventory cannot identify the pool of an unresolved reservation.
+                recovering = true;
+            }
             let Ok(_guard) = self
                 .lifecycle_gates
                 .gate_for(&pending.sandbox.id)
@@ -373,9 +387,10 @@ impl KubernetesComputeDriver {
                     && retired.generation.as_str() == resource.session_id.to_string()
             }) {
                 self.retire_warm_runtime(resource).await?;
+                recovering |= resource.pool_id == pool_id;
             }
         }
-        Ok(reserved)
+        Ok(recovering)
     }
 
     async fn validate_claim_retry(

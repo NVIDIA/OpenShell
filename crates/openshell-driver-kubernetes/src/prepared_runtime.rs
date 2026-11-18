@@ -83,9 +83,7 @@ impl PreparedRuntimeBootstrap {
             let expected =
                 provision(registration.runtime_descriptor.tls.clone()).map_err(backend_error)?;
             if self.request(&expected)?.registration != registration {
-                return Err(invalid(
-                    "prepared bootstrap no longer matches observed runtime coordinates",
-                ));
+                return Err(KubernetesDriverError::StalePreparation);
             }
             return Ok(registration);
         }

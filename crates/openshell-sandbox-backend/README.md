@@ -99,9 +99,9 @@ The runtime's physical coordinates must still match the protected bootstrap.
 Assignment does not start a workload: attach, policy installation, confirmation,
 and start retain their existing checks.
 
-An unassigned routed runtime keeps its authenticated spare connection idle and
-does not probe pool members while awaiting assignment. Connection failures still
-trigger transport recovery. Once assigned, normal owner discovery resumes.
+An unassigned routed runtime keeps its authenticated spare connection idle.
+In a shared supervisor pool, bounded owner discovery continues while the runtime
+awaits assignment so a replacement supervisor can authenticate on its own connection.
 There is no runtime-to-gateway connection in this flow.
 
 ## Supervisor takeover

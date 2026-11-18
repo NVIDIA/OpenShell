@@ -1421,7 +1421,8 @@ Recovery discovers these reservations from gateway storage. Cancellation after
 launch termination, provisioning timeout, or physical runtime loss fences
 activation and cleans up the reserved runtime; it does not start a second runtime
 for the same launch. Dedicated warm pairs have a separate
-supervisor Pod: its startup probe on port 5502 records TLS authentication, while
+supervisor Pod: its startup probe records TLS authentication on port 5502 (5503 when the
+boundary uses 5502), while
 normal readiness on port 5501 remains false until claim. Check the original Pod UID,
 container running/startup state and restart count, gateway TLS trust, and the
 pending `RegisterSupervisor` stream when a dedicated claim stalls. Claims arrive

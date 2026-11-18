@@ -480,6 +480,8 @@ impl VerifiedControlPolicy {
 pub enum KubernetesDriverError {
     #[error("sandbox already exists")]
     AlreadyExists,
+    #[error("prepared bootstrap no longer matches observed runtime coordinates")]
+    StalePreparation,
     #[error("sandbox not found")]
     NotFound,
     #[error("{0}")]
@@ -587,6 +589,7 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
         match err {
             KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
             KubernetesDriverError::NotFound => Self::NotFound,
+            KubernetesDriverError::StalePreparation => Self::Precondition(err.to_string()),
             KubernetesDriverError::InvalidArgument(m) => Self::InvalidArgument(m),
             KubernetesDriverError::Precondition(m) => Self::Precondition(m),
             KubernetesDriverError::Message(m) => Self::Message(m),
@@ -1107,12 +1110,11 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
-    /// Environment that lets a supervisor export spans, joining the current
-    /// trace, OCSF events, and relayed workload traces, identifying the
-    /// gateway that launched it.
-    fn supervisor_otlp_environment(&self) -> Vec<(&'static str, String)> {
+    /// Prepared Pods are rendered across requests. Only a cold launch inherits
+    /// the provisioning span; exporter settings and gateway identity apply to both.
+    fn supervisor_otlp_environment(&self, inherit_trace: bool) -> Vec<(&'static str, String)> {
         let mut environment = self.config.supervisor_otlp.environment();
-        if self.config.supervisor_otlp.traces.is_some() {
+        if inherit_trace && self.config.supervisor_otlp.traces.is_some() {
             environment.extend(openshell_otel::current_trace_context_environment());
         }
         if let Some(name) = &self.config.supervisor_gateway_name {
@@ -3607,7 +3609,6 @@ impl KubernetesComputeDriver {
         upstream_proxy_ca_bundle_staged: bool,
         warm: bool,
         network_additional_ca: Option<(&str, &str)>,
-        tracing_environment: &[(&str, String)],
     ) -> Result<Pod, KubernetesDriverError> {
         let mut pod = crate::sandbox_runtime::with_runtime_class(
             crate::app_listener::configure_supervisor_pod(
@@ -3644,7 +3645,7 @@ impl KubernetesComputeDriver {
                     ),
                     network_additional_ca,
                     owner,
-                    tracing_environment,
+                    &self.supervisor_otlp_environment(!warm),
                     self.config.sandbox_attach_request_timeout_seconds,
                 )
                 .map_err(KubernetesDriverError::Message)?,
@@ -3700,7 +3701,6 @@ impl KubernetesComputeDriver {
             network_additional_ca
                 .as_ref()
                 .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
-            &self.supervisor_otlp_environment(),
         )?;
         let stored = match pods.create(&PostParams::default(), &pod).await {
             Ok(stored) => stored,
@@ -9420,7 +9420,7 @@ mod tests {
                 supervisor_otlp,
                 ..Default::default()
             })
-            .supervisor_otlp_environment()
+            .supervisor_otlp_environment(true)
         };
         let names = |supervisor_otlp| {
             environment(supervisor_otlp)
@@ -9484,7 +9484,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            driver.supervisor_otlp_environment(),
+            driver.supervisor_otlp_environment(true),
             [(
                 openshell_core::sandbox_env::GATEWAY_NAME,
                 "prod-west".to_string()
@@ -10122,7 +10122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_annotation_propagates_the_active_w3c_trace_context() {
+    async fn provisioning_trace_propagates_to_sandbox_annotations_and_cold_supervisors() {
         use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -10137,6 +10137,22 @@ mod tests {
         let annotations = tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!("kubernetes.provision");
             let _entered = span.enter();
+            let mut driver =
+                KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+            driver.config.supervisor_otlp.traces = Some(openshell_core::sandbox_env::OtlpExport {
+                endpoint: "http://traces:4317".into(),
+                protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
+            });
+            assert!(
+                driver
+                    .supervisor_otlp_environment(true)
+                    .iter()
+                    .any(|(name, _)| *name == openshell_otel::TRACEPARENT_ENV)
+            );
+            assert_eq!(
+                driver.supervisor_otlp_environment(false),
+                driver.config.supervisor_otlp.environment()
+            );
             let mut annotations = BTreeMap::new();
             add_trace_context_annotation(&mut annotations);
             annotations

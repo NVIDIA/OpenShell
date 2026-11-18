@@ -80,6 +80,8 @@ pub struct WarmPoolSnapshot {
 pub struct WarmPoolUpdate {
     pub workspace: String,
     pub pool_id: String,
+    /// The deleted template has no remaining inventory, claims or retirement work.
+    pub finish_drain: bool,
     /// None means create only, never overwrite an existing journal.
     pub expected_version: Option<u64>,
     pub state: WarmPoolState,

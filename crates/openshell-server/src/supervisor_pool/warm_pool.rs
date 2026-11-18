@@ -335,6 +335,31 @@ impl SupervisorPool {
         if current.as_ref().map(|snapshot| snapshot.resource_version) != update.expected_version {
             return Ok(false);
         }
+        if update.finish_drain {
+            let version = update
+                .expected_version
+                .ok_or("missing journal for drain completion")?;
+            if !update.pool_id.starts_with("tpl-")
+                || update.state.revision != u64::MAX
+                || !update.state.entries.is_empty()
+                || update
+                    .state
+                    .policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.target_size != 0)
+            {
+                return Err("cannot remove a live warm-pool journal".into());
+            }
+            return match self.store.delete_if(OBJECT_TYPE, &id, version).await {
+                Ok(deleted) => Ok(deleted),
+                Err(PersistenceError::Conflict { .. }) => Ok(false),
+                Err(error) => Err(error.to_string()),
+            };
+        }
+        if current.is_none() && update.state.revision == u64::MAX {
+            // A delayed target lookup cannot recreate a completed drain.
+            return Ok(false);
+        }
         if let Some(current) = current
             && (current.state.revision > update.state.revision
                 || (current.state.revision == update.state.revision
@@ -454,6 +479,7 @@ mod tests {
 
     fn update() -> WarmPoolUpdate {
         WarmPoolUpdate {
+            finish_drain: false,
             workspace: "team".into(),
             pool_id: "agents".into(),
             expected_version: None,
@@ -626,6 +652,42 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let original = "tpl-original-template";
+        let snapshot = restarted
+            .warm_pool_state("team", original)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut drain = WarmPoolUpdate {
+            expected_version: Some(snapshot.resource_version),
+            pool_id: original.into(),
+            state: snapshot.state,
+            ..update()
+        };
+        drain.state.revision = u64::MAX;
+        drain.state.policy = Some(openshell_supervisor_control::warm_pool::WarmPoolPolicy {
+            target_size: 0,
+            max_size: 1,
+            max_age_secs: 600,
+            preparation_timeout_secs: 30,
+        });
+        drain.finish_drain = true;
+        assert!(restarted.update_warm_pool(drain.clone()).await.is_err());
+        drain.state.entries.clear();
+        assert!(restarted.update_warm_pool(drain.clone()).await.unwrap());
+        assert!(
+            restarted
+                .warm_pool_state("team", original)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drain.finish_drain = false;
+        drain.expected_version = None;
+        assert!(!restarted.update_warm_pool(drain).await.unwrap());
+        let targets = restarted.warm_pool_targets(None).await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pool_id, "tpl-replacement-template");
     }
 
     #[tokio::test]

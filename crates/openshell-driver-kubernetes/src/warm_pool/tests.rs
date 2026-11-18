@@ -324,10 +324,12 @@ impl InstancePlacement for Placement {
             == update.expected_version;
         if changed {
             state.events.push("journal".into());
-            state.journal = Some(openshell_supervisor_control::warm_pool::WarmPoolSnapshot {
-                resource_version: update.expected_version.unwrap_or(0) + 1,
-                state: update.state,
-            });
+            state.journal = (!update.finish_drain).then_some(
+                openshell_supervisor_control::warm_pool::WarmPoolSnapshot {
+                    resource_version: update.expected_version.unwrap_or(0) + 1,
+                    state: update.state,
+                },
+            );
         }
         Box::pin(async move { Ok(changed) })
     }
@@ -836,10 +838,12 @@ impl InstancePlacement for ApiTestPlacement {
         let changed =
             journal.as_ref().map(|snapshot| snapshot.resource_version) == update.expected_version;
         if changed {
-            *journal = Some(openshell_supervisor_control::warm_pool::WarmPoolSnapshot {
-                resource_version: update.expected_version.unwrap_or(0) + 1,
-                state: update.state,
-            });
+            *journal = (!update.finish_drain).then_some(
+                openshell_supervisor_control::warm_pool::WarmPoolSnapshot {
+                    resource_version: update.expected_version.unwrap_or(0) + 1,
+                    state: update.state,
+                },
+            );
         }
         Box::pin(async move { Ok(changed) })
     }
@@ -912,6 +916,16 @@ async fn warm_runtime_resources_on_kubernetes() {
         .install_placement(placement.clone());
     let mut request = request();
     request.workspace = "default".into();
+    request.spec.template = Some(SandboxTemplate {
+        image: config.default_image.clone(),
+        resources: Some(
+            openshell_core::proto::compute::v1::DriverResourceRequirements {
+                cpu_request: "0.5".into(),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    });
     request.trust.gateway_id.clone_from(&config.gateway_id);
     let key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).unwrap();
     request.trust.verification_keys[0].public_key_pem = key.public_key_pem().into_bytes();
@@ -931,6 +945,21 @@ async fn warm_runtime_resources_on_kubernetes() {
             .map_err(KubernetesDriverError::from_kube)?;
         assert!(!has_gate(&pod));
         assert_eq!(pod.metadata.uid, prepared.resource.pod_uid);
+        assert!(
+            pod.spec
+                .as_ref()
+                .unwrap()
+                .containers
+                .iter()
+                .any(|container| {
+                    container
+                        .resources
+                        .as_ref()
+                        .and_then(|r| r.requests.as_ref())
+                        .and_then(|requests| requests.get("cpu"))
+                        .is_some_and(|cpu| cpu.0 == "500m")
+                })
+        );
         let secret = Api::<Secret>::namespaced(client.clone(), &namespace)
             .get(
                 &SandboxRuntimeNames::for_generation(
@@ -1026,7 +1055,7 @@ async fn warm_runtime_resources_on_kubernetes() {
         driver.config.sandbox_runtime_image = "unused-during-drain:v2".into();
         assert!(driver.reconcile_warm_pool(&pool).await?.suspended);
         pool.target_size = 0;
-        tokio::time::timeout(Duration::from_mins(1), async {
+        Box::pin(tokio::time::timeout(Duration::from_mins(1), async {
             loop {
                 for entry in &mut placement
                     .journal
@@ -1054,7 +1083,7 @@ async fn warm_runtime_resources_on_kubernetes() {
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-        })
+        }))
         .await
         .expect("the reconciler must finish the pool drain");
         assert!(
@@ -1490,6 +1519,57 @@ async fn ambiguous_claim_failure_never_selects_another_spare() {
 }
 
 #[tokio::test]
+async fn changed_control_policy_version_retires_the_spare_before_launch_selection_continues() {
+    for ready in [1, 2] {
+        let state = Arc::new(Mutex::new(State::default()));
+        let (driver, request, prepared) = Box::pin(ready_pool(state.clone(), ready)).await;
+        let first = &prepared[0];
+        let (_, _, record) = claim_object(&driver, &first.resource).await;
+        let policy_name = record.control_policy_name(false);
+        {
+            let mut state = state.lock().unwrap();
+            let policy = state
+                .objects
+                .values_mut()
+                .find(|object| {
+                    object["kind"] == "NetworkPolicy" && object["metadata"]["name"] == policy_name
+                })
+                .unwrap();
+            policy["metadata"]["annotations"]["example.com/review"] = json!("approved");
+            policy["metadata"]["resourceVersion"] = json!("updated");
+        }
+        let sandbox = claiming_sandbox(&request, "stale-policy");
+        let selected = driver
+            .try_claim_warm_runtime(&sandbox, "openshell")
+            .await
+            .unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.retired.contains_key(&first.registration.route));
+        assert!(!state.claims.contains_key(&first.registration.route));
+        assert_eq!(selected.is_some(), ready == 2);
+        assert_eq!(state.cold_launches.len(), usize::from(ready == 1));
+    }
+}
+
+#[test]
+fn container_shape_compares_resource_values_and_preserves_other_fields() {
+    let expected = json!({"containers": [{"image": "1", "resources": {
+        "requests": {"cpu": 0.5, "memory": "1.5Gi"},
+        "limits": {"cpu": "1e0", "memory": "9007199254740993"}
+    }}]});
+    let mut actual = expected.clone();
+    let resources = &mut actual["containers"][0]["resources"];
+    resources["requests"] = json!({"cpu": "500m", "memory": "1536Mi"});
+    resources["limits"]["cpu"] = json!("1000m");
+    assert!(requested_shape_matches(&expected, &actual));
+    actual["containers"][0]["image"] = json!("1000m");
+    assert!(!requested_shape_matches(&expected, &actual));
+    actual["containers"][0]["image"] = json!("1");
+    actual["containers"][0]["resources"]["limits"]["memory"] = json!("9007199254740992");
+    assert!(!requested_shape_matches(&expected, &actual));
+}
+
+#[tokio::test]
 async fn retirement_winner_tries_another_spare_or_commits_cold_creation() {
     for ready in [1, 2] {
         let state = Arc::new(Mutex::new(State::default()));
@@ -1665,14 +1745,33 @@ async fn gateway_reservation_blocks_retirement_and_recovers_without_a_create_ret
         } else {
             fixture(state.clone())
         };
-        restarted
-            .recover_pending_warm_claims(
-                &request.workspace,
-                std::slice::from_ref(&prepared.resource),
-            )
-            .await
-            .unwrap();
+        let mut drain = pool_config();
+        drain.name.clone_from(&request.pool_id);
+        drain.revision = u64::MAX;
+        drain.target_size = 0;
+        state.lock().unwrap().journal =
+            Some(openshell_supervisor_control::warm_pool::WarmPoolSnapshot {
+                resource_version: 1,
+                state: openshell_supervisor_control::warm_pool::WarmPoolState {
+                    revision: 1,
+                    fingerprint: "a".repeat(64),
+                    policy: None,
+                    entries: Vec::new(),
+                },
+            });
+        let guard = restarted
+            .lifecycle_gates
+            .gate_for(&sandbox.id)
+            .lock_owned()
+            .await;
+        restarted.reconcile_warm_pool(&drain).await.unwrap();
+        assert!(state.lock().unwrap().journal.is_some());
+        assert!(state.lock().unwrap().activated.is_empty());
+        drop(guard);
+        restarted.reconcile_warm_pool(&drain).await.unwrap();
         assert_eq!(state.lock().unwrap().activated.len(), 1);
+        restarted.reconcile_warm_pool(&drain).await.unwrap();
+        assert!(state.lock().unwrap().journal.is_none());
         let current = api.api.get(&prepared.resource.name).await.unwrap();
         assert!(!claim_pending(&current));
         assert_eq!(sandbox_id_from_object(&current).unwrap(), sandbox.id);
@@ -1705,7 +1804,8 @@ async fn recovery_cancels_a_missing_pod_then_collects_the_reserved_cr() {
         driver
             .recover_pending_warm_claims(
                 &request.workspace,
-                std::slice::from_ref(&prepared.resource),
+                &request.pool_id,
+                &mut [prepared.resource.clone()],
             )
             .await
             .unwrap();
@@ -2381,10 +2481,36 @@ fn dedicated_fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
     driver
 }
 
+#[test]
+fn dedicated_validation_accepts_a_previous_reconcilers_literal_trace_context() {
+    let expected: Pod = serde_json::from_value(json!({"spec": {"containers": [{
+        "name": "supervisor", "env": [{"name": openshell_core::sandbox_env::OTLP_ENDPOINT, "value": "http://traces:4317"}]
+    }]}})).unwrap();
+    let mut stored = expected.clone();
+    let trace = k8s_openapi::api::core::v1::EnvVar {
+        name: openshell_otel::TRACEPARENT_ENV.into(),
+        value: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+        ..Default::default()
+    };
+    stored.spec.as_mut().unwrap().containers[0]
+        .env
+        .as_mut()
+        .unwrap()
+        .push(trace);
+    validate_dedicated_pod(&stored, &expected).unwrap();
+    stored.spec.as_mut().unwrap().containers[0]
+        .env
+        .as_mut()
+        .unwrap()[0]
+        .value = Some("http://changed:4317".into());
+    assert!(validate_dedicated_pod(&stored, &expected).is_err());
+}
+
 #[tokio::test]
 async fn dedicated_warm_claim_persists_credentials_without_projecting_or_replacing_pods() {
     let state = Arc::new(Mutex::new(State::default()));
-    let driver = dedicated_fixture(state.clone());
+    let mut driver = dedicated_fixture(state.clone());
+    driver.config.sandbox_runtime.boundary_port = 5502;
     let request = request();
     let prepared = driver.prepare_warm_runtime(&request).await.unwrap();
     let (api, object, record) = claim_object(&driver, &prepared.resource).await;
@@ -2394,7 +2520,14 @@ async fn dedicated_warm_claim_persists_credentials_without_projecting_or_replaci
     assert_eq!(before["spec"]["volumes"][0]["secret"]["optional"], false);
     assert_eq!(
         before["spec"]["containers"][0]["startupProbe"]["tcpSocket"]["port"],
-        5502
+        5503
+    );
+    assert!(
+        before["spec"]["containers"][0]["command"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|args| args[0] == "--warm-health-port" && args[1] == "5503")
     );
     assert!(
         !state

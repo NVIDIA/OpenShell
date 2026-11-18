@@ -92,6 +92,7 @@ async fn authorize_preparation(fixture: &Fixture, request: &PreparationRequest) 
     });
     assert!(
         pool.update_warm_pool(WarmPoolUpdate {
+            finish_drain: false,
             workspace: request.workspace.clone(),
             pool_id: request.pool_id.clone(),
             expected_version,
@@ -1289,6 +1290,8 @@ async fn dedicated_registration_watcher_observes_remote_activation_and_local_ret
         .activate_runtime(activation(&prepared, "sandbox-a"))
         .await
         .unwrap();
+    assert!(lock(&remote.materials).is_empty());
+    assert!(lock(&pool.materials).is_empty());
     assert!(subscription.changed().now_or_never().is_none());
     pool.registrations.observe(&pool.store).await.unwrap();
     subscription.changed().await.unwrap();
@@ -1703,6 +1706,54 @@ async fn warm_claim_collection_and_retirement_fence_delayed_intent_publication()
 }
 
 #[tokio::test]
+async fn caller_annotation_cannot_block_or_replace_a_launch_decision() {
+    let (_, pool, prepared) = setup().await;
+    let intent = claim_intent(&prepared, "sandbox-a");
+    let lookup = claim_lookup(&intent);
+    let mut sandbox = pool
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    sandbox.metadata.as_mut().unwrap().annotations.insert(
+        "openshell.ai/warm-claim-intent".into(),
+        "caller text".into(),
+    );
+    pool.store.put_message(&sandbox).await.unwrap();
+    assert!(
+        pool.warm_claim_for_launch(lookup.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    pool.reserve_warm_claim("default", intent).await.unwrap();
+    let mut sandbox = pool
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    openshell_core::sandbox_update::apply_configuration(
+        &mut sandbox,
+        None,
+        None,
+        None,
+        Some(&openshell_core::proto::SandboxMapUpdate::default()),
+    );
+    pool.store.put_message(&sandbox).await.unwrap();
+    assert_eq!(
+        pool.warm_claim_for_launch(lookup)
+            .await
+            .unwrap()
+            .unwrap()
+            .registration
+            .route,
+        prepared.registration.route
+    );
+}
+
+#[tokio::test]
 async fn one_logical_launch_selects_one_intent_before_either_cr_is_bound() {
     let (fixture, first, prepared) = setup().await;
     let other = preparation(&fixture, "rt-another-prepared-0123456789").await;
@@ -1758,6 +1809,7 @@ async fn remove_preparation_intent(pool: &SupervisorPool, prepared: &Preparation
         .retain(|entry| entry.session_id != prepared.registration.runtime_descriptor.session_id);
     assert!(
         pool.update_warm_pool(WarmPoolUpdate {
+            finish_drain: false,
             workspace: prepared.workspace.clone(),
             pool_id: prepared.pool_id.clone(),
             expected_version: Some(snapshot.resource_version),
