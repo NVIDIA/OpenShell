@@ -4,27 +4,59 @@
 # An environment overrides gateway settings by writing the tables to change,
 # such as `[openshell.drivers.podman]`, to
 # /etc/openshell-test/gateway-overrides.toml before the installer runs (for
-# example playbooks/drivers/podman/userns.yaml). Apply them to
-# `openshell_gateway_merge_target` without replacing the file; see
-# files/merge-gateway-toml.py.
+# example playbooks/drivers/podman/userns.yaml). The file declares
+# `[openshell] version = 2` like any gateway configuration. Install it as a
+# drop-in config in the `gateway.d` directory next to
+# `openshell_gateway_merge_target`; the gateway merges it over the base file
+# without that file being edited.
 #
-# `openshell_gateway_merge_default` is a default configuration to start from
-# when the target doesn't exist yet, and `openshell_gateway_merge_user` is who
-# owns the target.
+# The base file need not exist: a drop-in config alone is a complete
+# configuration. `openshell_gateway_merge_user` owns the files.
 ---
 - name: Check for environment gateway overrides
   ansible.builtin.stat:
     path: /etc/openshell-test/gateway-overrides.toml
   register: openshell_gateway_overrides
 
-- name: Apply environment gateway overrides
+- name: Read environment gateway overrides
+  become: true
+  ansible.builtin.slurp:
+    src: /etc/openshell-test/gateway-overrides.toml
+  register: openshell_gateway_overrides_content
+  when: openshell_gateway_overrides.stat.exists
+
+# A drop-in config without its own version fails gateway startup, so fail here
+# with a message that names the file.
+- name: Require the overrides to declare the schema version
+  ansible.builtin.assert:
+    that:
+      - openshell_gateway_overrides_content.content | b64decode is regex('^\s*version\s*=\s*2\s*$', multiline=True)
+    fail_msg: /etc/openshell-test/gateway-overrides.toml must declare `[openshell]` and `version = 2`
+  when: openshell_gateway_overrides.stat.exists
+
+- name: Create the gateway drop-in directory
   become: true
   become_user: "{{ openshell_gateway_merge_user | default('root') }}"
-  ansible.builtin.script:
-    cmd: >-
-      merge-gateway-toml.py {{ openshell_gateway_merge_target }}
-      /etc/openshell-test/gateway-overrides.toml
-      {{ '--default ' ~ openshell_gateway_merge_default
-         if openshell_gateway_merge_default | default('') else '' }}
-    executable: /usr/bin/python3
+  ansible.builtin.file:
+    path: "{{ openshell_gateway_merge_target | dirname }}/gateway.d"
+    state: directory
+    mode: "0755"
   when: openshell_gateway_overrides.stat.exists
+
+- name: Install environment gateway overrides as a drop-in
+  become: true
+  become_user: "{{ openshell_gateway_merge_user | default('root') }}"
+  ansible.builtin.copy:
+    src: /etc/openshell-test/gateway-overrides.toml
+    remote_src: true
+    dest: "{{ openshell_gateway_merge_target | dirname }}/gateway.d/90-test-overrides.toml"
+    mode: "0644"
+  when: openshell_gateway_overrides.stat.exists
+
+- name: Remove stale environment gateway overrides
+  become: true
+  become_user: "{{ openshell_gateway_merge_user | default('root') }}"
+  ansible.builtin.file:
+    path: "{{ openshell_gateway_merge_target | dirname }}/gateway.d/90-test-overrides.toml"
+    state: absent
+  when: not openshell_gateway_overrides.stat.exists

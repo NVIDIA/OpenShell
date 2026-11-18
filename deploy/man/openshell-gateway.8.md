@@ -14,7 +14,7 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
-**openshell-gateway** **config preflight** [**--path** *PATH* | **--** *GATEWAY_ARGS*...]
+**openshell-gateway** **config preflight** [[**--path** *PATH* (alias **--config**)] [**--config-dir** *DIR*] | **--** *GATEWAY_ARGS*...]
 
 # DESCRIPTION
 
@@ -163,17 +163,28 @@ Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
 
+**--config-dir** *DIR*
+:   Directory of **\*.toml** drop-in configs merged over the **--config**
+    file. Drop-in configs apply in lexical order and a later drop-in config wins. Each file must declare **version = 2**; a drop-in config may set only some keys of a table. Tables
+    merge key by key; scalars and arrays replace. Defaults to **gateway.d**
+    next to the config file when that directory exists. An empty value turns
+    drop-in configs off.
+    Environment: **OPENSHELL_GATEWAY_CONFIG_DIR**.
+
 # CONFIGURATION PREFLIGHT
 
 Validate a gateway configuration before starting the daemon:
 
-    openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
+    openshell-gateway config preflight [[--path PATH (alias --config)] [--config-dir DIR] | -- GATEWAY_ARGS...]
 
 With no path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG. If that
 variable is unset, it optionally validates an auto-discovered XDG config. The
 absence of either config still validates the effective daemon arguments. An explicit missing path, legacy schema-v1
 file, invalid TOML, symlink, or nonregular file fails with a nonzero status.
-Preflight merges file and environment values and applies read-only startup checks
+Preflight merges the selected file with the drop-in configs from **--config-dir**
+or the **gateway.d** directory beside it, prints the files it merged, and fails
+on the same errors as startup. It also merges environment values and applies
+read-only startup checks
 for selector and socket normalization, registered compute-driver configuration,
 rate limits, TLS and mTLS, interceptors, and middleware. When a selected file
 omits the selector, it validates configured tables for auto-detectable drivers

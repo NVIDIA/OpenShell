@@ -1702,11 +1702,13 @@ For a Debian, Ubuntu, or snap gateway that stops before certificate generation o
 daemon startup, validate the selected configuration without starting the service:
 
 ```shell
-openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
+openshell-gateway config preflight [[--path PATH (alias --config)] [--config-dir DIR] | -- GATEWAY_ARGS...]
 ```
 
 Without a path, preflight validates a nonempty `OPENSHELL_GATEWAY_CONFIG` or an
-auto-discovered XDG config; no config succeeds. An explicit missing path, legacy
+auto-discovered XDG config; no config succeeds. It also merges the drop-in configs
+in `--config-dir`, or in a `gateway.d` directory beside the config, and prints the
+files it merged. An explicit missing path, legacy
 schema-v1 file, malformed TOML, symlink, or nonregular file fails before gateway
 startup. It also applies read-only effective-config checks for driver selection
 and configuration, sockets, rate limits, TLS, interceptors, and supervisor

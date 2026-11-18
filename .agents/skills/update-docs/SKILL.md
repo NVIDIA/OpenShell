@@ -54,7 +54,7 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 | `crates/openshell-cli/` (sandbox commands) | `docs/how-it-works/sandboxes/overview.mdx` |
 | `crates/openshell-cli/` (provider commands) | `docs/how-it-works/providers/overview.mdx` |
 | `crates/openshell-cli/` (new top-level command) | May need a new page or `docs/reference/` entry |
-| `crates/openshell-server/src/config_file.rs` or gateway TOML parsing | `docs/how-it-works/gateways/configuration.mdx` |
+| `crates/openshell-server/src/config_file/` or gateway TOML parsing | `docs/how-it-works/gateways/configuration.mdx` |
 | `crates/openshell-server/src/cli.rs` gateway config merge/default behavior | `docs/how-it-works/gateways/configuration.mdx` |
 | `crates/openshell-driver-*/` config structs or driver defaults | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx` |
 | `deploy/helm/openshell/templates/gateway-config.yaml` | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx`, Helm docs if values change |

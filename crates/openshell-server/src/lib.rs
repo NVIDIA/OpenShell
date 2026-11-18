@@ -315,6 +315,8 @@ use tracing_bus::TracingLogBus;
 pub(crate) struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
+    /// Files merged into `config_file`, base first, then drop-in configs.
+    pub config_sources: Vec<PathBuf>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub network_trust: Option<NetworkSupervisorTrustBundle>,
     pub compute_driver: ComputeDriverSelection,
@@ -763,6 +765,7 @@ pub(crate) async fn run_server(
     let ServerStartupConfig {
         config,
         config_file,
+        config_sources: _,
         guest_tls,
         network_trust,
         compute_driver,
