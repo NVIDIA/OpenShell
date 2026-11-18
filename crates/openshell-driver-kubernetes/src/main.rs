@@ -333,6 +333,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            runtime: openshell_driver_kubernetes::KubernetesRuntimeMode::default(),
+            kubevirt: openshell_driver_kubernetes::KubeVirtConfig::default(),
         },
         shutdown_rx,
         None,

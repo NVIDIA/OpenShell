@@ -161,7 +161,110 @@ impl KubernetesSandboxRuntimeConfig {
     }
 }
 
-/// How workspaces map to Kubernetes namespaces.
+/// Runtime substrate the Kubernetes driver provisions sandboxes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KubernetesRuntimeMode {
+    /// Provision sandboxes as `agents.x-k8s.io` Sandbox CRs reconciled into
+    /// pods by the upstream Agent Sandbox controller (default, production
+    /// path).
+    #[default]
+    Pod,
+    /// Provision sandboxes as `kubevirt.io/v1` `VirtualMachine` objects
+    /// reconciled by the `KubeVirt` controller (proof of concept).
+    #[serde(rename = "kubevirt", alias = "kube-virt")]
+    KubeVirt,
+}
+
+impl std::fmt::Display for KubernetesRuntimeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pod => f.write_str("pod"),
+            Self::KubeVirt => f.write_str("kubevirt"),
+        }
+    }
+}
+
+/// How the guest workload runs.
+///
+/// The sandboxed default (unprivileged, Landlock + seccomp enforced by
+/// the in-guest boundary) or the privileged "root VM" class (root
+/// workload, no in-guest enforcement — the boundary is demoted to an
+/// authenticated agent; the fence, the supervisor's policy, and per-boot
+/// trusted code are the boundary). The privileged class requires the
+/// dedicated supervisor topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KubeVirtWorkloadMode {
+    /// The default: the workload runs as the provisioned sandbox uid with
+    /// Landlock and seccomp enforced by the in-guest boundary.
+    #[default]
+    Sandboxed,
+    /// The privileged VM class: the workload runs as root, in-guest
+    /// enforcement is removed (the boundary becomes an authenticated
+    /// agent), and the security boundary is everything outside the guest.
+    Root,
+}
+
+impl std::fmt::Display for KubeVirtWorkloadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sandboxed => f.write_str("sandboxed"),
+            Self::Root => f.write_str("root"),
+        }
+    }
+}
+
+impl KubeVirtWorkloadMode {
+    /// The claim value carried in the boundary config and descriptor.
+    pub fn claim(&self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandboxed",
+            Self::Root => "root",
+        }
+    }
+}
+
+/// `KubeVirt` runtime mode settings (proof of concept).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubeVirtConfig {
+    /// containerDisk image providing the bootable guest filesystem. The image
+    /// must contain a Linux guest with the static `openshell-sandbox`
+    /// supervisor and an init that consumes the driver-rendered bootstrap
+    /// Secret (cloudInitNoCloud transport). Not an arbitrary sandbox OCI
+    /// image — see `e2e/kubevirt/` for the purpose-built image build.
+    pub guest_image: String,
+    /// Kubernetes `imagePullPolicy` for the guest containerDisk.
+    /// Empty string omits the field, using the Kubernetes default.
+    pub guest_image_pull_policy: String,
+    /// vCPU cores allocated to each guest.
+    pub cpu_cores: u32,
+    /// Guest memory request, e.g. `"1Gi"`.
+    pub memory: String,
+    /// Attach a per-sandbox PVC at `/sandbox` so the workspace survives
+    /// stop/start (mirrors the pod path's PVC-backed workspace).
+    pub workspace_pvc: bool,
+    /// How the guest workload runs: "sandboxed" (the default —
+    /// unprivileged, Landlock + seccomp) or "root" (the privileged VM
+    /// class — root workload, no in-guest enforcement, dedicated
+    /// supervisor topology required).
+    pub workload: KubeVirtWorkloadMode,
+}
+
+impl Default for KubeVirtConfig {
+    fn default() -> Self {
+        Self {
+            guest_image: String::new(),
+            guest_image_pull_policy: String::new(),
+            cpu_cores: 1,
+            workload: KubeVirtWorkloadMode::default(),
+            memory: "1Gi".to_string(),
+            workspace_pvc: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceMode {
@@ -464,6 +567,12 @@ pub struct KubernetesComputeConfig {
     /// When empty and `sandbox_uid` is set, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+    /// Runtime substrate the driver provisions sandboxes on. Defaults to
+    /// `pod` (Agent Sandbox CRs). `kubevirt` creates `KubeVirt`
+    /// `VirtualMachine` objects directly (proof of concept).
+    pub runtime: KubernetesRuntimeMode,
+    /// `KubeVirt` settings, used only when `runtime = "kubevirt"`.
+    pub kubevirt: KubeVirtConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -550,6 +659,8 @@ impl Default for KubernetesComputeConfig {
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
+            runtime: KubernetesRuntimeMode::default(),
+            kubevirt: KubeVirtConfig::default(),
         }
     }
 }
@@ -565,7 +676,8 @@ impl KubernetesComputeConfig {
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
-        self.validate_allowed_pod_labels()
+        self.validate_allowed_pod_labels()?;
+        self.validate_kubevirt_config()
     }
 
     fn validate_bootstrap_windows(&self) -> Result<(), String> {
@@ -672,6 +784,71 @@ impl KubernetesComputeConfig {
         validate_provider_spiffe_workload_api_socket_path_value(
             &self.provider_spiffe_workload_api_socket_path,
         )
+    }
+
+    /// Validate the `KubeVirt` runtime mode configuration (`PoC` constraints).
+    ///
+    /// The `KubeVirt` runtime supports the same supervisor topologies as the
+    /// pod path: the default is a dedicated supervisor Pod per sandbox
+    /// (`supervisor_topology` unset), and `supervisor_topology = "gateway"`
+    /// places each generation on the gateway's shared supervisor. Which
+    /// objects the driver provisions differs per topology, but the topology
+    /// rules themselves (`gateway` requires `shared_supervisor`; `workspace`
+    /// is not implemented) are enforced by [`Self::validate_supervisor_topology`]
+    /// for both runtimes, so they are not repeated here.
+    ///
+    /// `grpc_endpoint` is required for the dedicated topology — its
+    /// supervisor Pod must reach the gateway, exactly as the pod path's
+    /// supervisor Pods do — but not for the shared topology, whose guest
+    /// never learns the gateway endpoint (the boundary resolves the shared
+    /// supervisor's Service through the API). Any scheme is accepted: a
+    /// dedicated supervisor carries client TLS material, so an `https://`
+    /// endpoint (the TLS demo's shape) is as valid as an `http://` one.
+    pub fn validate_kubevirt_config(&self) -> Result<(), String> {
+        if self.runtime != KubernetesRuntimeMode::KubeVirt {
+            return Ok(());
+        }
+        if self.supervisor_topology.is_none() && self.grpc_endpoint.trim().is_empty() {
+            return Err(
+                "kubevirt runtime with a dedicated supervisor Pod requires grpc_endpoint: the \
+                 supervisor Pod must be able to reach the gateway"
+                    .to_string(),
+            );
+        }
+        if self.kubevirt.guest_image.trim().is_empty() {
+            return Err(
+                "kubevirt runtime requires kubevirt.guest_image to be set to a bootable \
+                 containerDisk image"
+                    .to_string(),
+            );
+        }
+        if self.kubevirt.cpu_cores == 0 {
+            return Err("kubevirt.cpu_cores must be at least 1".to_string());
+        }
+        if self.kubevirt.memory.trim().is_empty() {
+            return Err("kubevirt.memory must be set (e.g. \"1Gi\")".to_string());
+        }
+        if self.workspace_mode != WorkspaceMode::Shared {
+            return Err(format!(
+                "kubevirt runtime (PoC) supports only the shared workspace mode; \
+                 configured mode is {}",
+                self.workspace_mode
+            ));
+        }
+        // The privileged root-workload class requires the dedicated
+        // supervisor: a shared supervisor would let a parser bug reached by
+        // a hostile root guest cross tenants.
+        if self.kubevirt.workload == KubeVirtWorkloadMode::Root
+            && self.supervisor_topology.is_some()
+        {
+            return Err(
+                "kubevirt workload = \"root\" requires the dedicated supervisor topology \
+                 (supervisor_topology unset); the gateway-shared supervisor is not \
+                 supported for privileged VMs"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
@@ -1168,8 +1345,9 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use std::collections::BTreeMap as HashMap;
+    use BTreeMap as HashMap;
 
     #[test]
     fn app_endpoint_configuration_has_one_port_source_and_explicit_enablement() {
