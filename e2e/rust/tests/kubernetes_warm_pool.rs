@@ -181,6 +181,18 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
             .find(|pod| pod["metadata"]["uid"] == uid)
             .unwrap();
         assert_eq!(supervisor["status"]["containerStatuses"][0]["ready"], false);
+        let logs = kubectl(&[
+            "-n",
+            workspace_namespace,
+            "logs",
+            supervisor["metadata"]["name"].as_str().unwrap(),
+        ])
+        .await;
+        assert!(
+            logs.contains("Waiting for warm supervisor claim"),
+            "unclaimed supervisor must emit bootstrap diagnostics: {logs}"
+        );
+        assert!(!logs.contains("Starting sandbox supervision"));
         let name = supervisor["spec"]["volumes"]
             .as_array()
             .unwrap()
@@ -306,6 +318,18 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
                 let status = &supervisor["status"]["containerStatuses"][0];
                 assert_eq!(status["restartCount"], 0);
                 if status["ready"] == true {
+                    let logs = kubectl(&[
+                        "-n",
+                        workspace_namespace,
+                        "logs",
+                        supervisor["metadata"]["name"].as_str().unwrap(),
+                    ])
+                    .await;
+                    assert!(
+                        logs.contains("Warm supervisor registration interrupted; retrying"),
+                        "gateway restart must produce a visible registration retry: {logs}"
+                    );
+                    assert_eq!(logs.matches("Starting sandbox supervision").count(), 1);
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;

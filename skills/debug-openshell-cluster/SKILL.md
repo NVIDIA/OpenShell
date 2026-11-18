@@ -1417,7 +1417,11 @@ supervisor Pod: its startup probe on port 5502 records TLS authentication, while
 normal readiness on port 5501 remains false until claim. Check the original Pod UID,
 container running/startup state and restart count, gateway TLS trust, and the
 pending `RegisterSupervisor` stream when a dedicated claim stalls. Claims arrive
-over that stream; they do not require a new Secret projection. A shared observer
+over that stream; they do not require a new Secret projection. Before assignment,
+the supervisor Pod logs `Waiting for warm supervisor claim` and
+`Warm supervisor registration interrupted; retrying`, including the status code
+and retry delay. These diagnostics stay in the Pod logs and optional log files;
+sandbox log forwarding begins after claim. A shared observer
 on each gateway replica checks pending assignment versions; `warm supervisor
 registration observation failed; retrying` indicates a gateway storage failure,
 with retries backing off to ten seconds. Each replica permits 4096 pending

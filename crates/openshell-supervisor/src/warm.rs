@@ -81,6 +81,7 @@ pub async fn wait_for_claim(
         .ok_or_else(|| miette::miette!("warm supervisor requires a gateway endpoint"))?;
     let token_path =
         std::env::var(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE).into_diagnostic()?;
+    tracing::info!(route = %prepared.route, "Waiting for warm supervisor claim");
     park_until_claim(
         args,
         prepared,
@@ -140,10 +141,16 @@ async fn register(endpoint: &str, token_path: &Path) -> Result<Vec<u8>> {
                         | tonic::Code::ResourceExhausted
                 ) =>
             {
+                tracing::warn!(
+                    code = ?status.code(),
+                    retry_delay_ms = delay.as_millis(),
+                    "Warm supervisor registration interrupted; retrying"
+                );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(10));
             }
-            Err(_) => {
+            Err(status) => {
+                tracing::warn!(code = ?status.code(), "Gateway refused warm supervisor registration");
                 return Err(miette::miette!(
                     "gateway refused warm supervisor registration"
                 ));

@@ -510,7 +510,26 @@ fn main() -> Result<()> {
                 "warm preparation requires a dedicated isolation supervisor"
             ));
         }
-        Some(runtime.block_on(warm::wait_for_claim(&mut args))?)
+        // Claim credentials are needed to build the final export layers. Use a
+        // scoped subscriber for the wait, then install the normal subscriber
+        // once the sandbox identity and credentials are available.
+        let console_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+        let (layers, _guards, file_available) = logging::layers(
+            std::io::stderr(),
+            Path::new("/var/log"),
+            console_filter,
+            Arc::new(AtomicBool::new(false)),
+        );
+        Some(tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(layers),
+            || {
+                if !file_available {
+                    warn!("Could not open /var/log for log rotation; using stderr-only logging");
+                }
+                runtime.block_on(warm::wait_for_claim(&mut args))
+            },
+        )?)
     } else {
         None
     };
