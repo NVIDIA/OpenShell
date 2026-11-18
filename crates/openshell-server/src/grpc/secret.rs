@@ -270,6 +270,12 @@ pub(super) async fn handle_create_secret(
 ) -> Result<Response<SecretResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
+    // Read the workspace instance before checking membership, so the secret is
+    // published only under the instance the caller was authorized against. A
+    // replacement after this read fails the check after the insert. Report the
+    // lookup only after authorization, so non-members learn nothing.
+    let requested = selected_workspace_name(req.workspace_scope.as_ref())?.to_string();
+    let instance = active_workspace_instance(&state.store, &requested).await;
     let workspace = authorized_workspace(
         state,
         &principal,
@@ -278,6 +284,14 @@ pub(super) async fn handle_create_secret(
     )
     .await?
     .ensure_active()?;
+    let workspace_id = match instance? {
+        Some(id) if workspace == requested => id,
+        _ => {
+            return Err(Status::failed_precondition(format!(
+                "workspace '{workspace}' is being deleted"
+            )));
+        }
+    };
     validate_name(&req.name)?;
     validate_value(&req.value)?;
     validate_description(&req.description)?;
@@ -292,7 +306,6 @@ pub(super) async fn handle_create_secret(
         .transpose()?;
     ensure_workspace_secrets_active(state).await?;
     ensure_credential_storage(state)?;
-    let workspace_id = active_workspace_id(&state.store, &workspace).await?;
     clear_stale_record(state, &workspace, &workspace_id, &req.name).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -363,7 +376,9 @@ pub(super) async fn handle_create_secret(
         .await
         .is_ok_and(|current| current == workspace_id);
     if !still_active {
-        discard_record(state, stored).await;
+        if let Err(err) = discard_pending_create(state, stored).await {
+            warn!(error = %err, "workspace secret cleanup will be retried");
+        }
         return Err(Status::failed_precondition(format!(
             "workspace '{workspace}' was deleted while the secret was being created"
         )));
@@ -384,16 +399,17 @@ pub(super) async fn handle_create_secret(
         .await;
     let published = match published {
         Ok(published) => published,
+        // The sweep claimed the record first; it owns the cleanup.
+        Err(PersistenceError::Conflict { .. }) => {
+            return Err(Status::aborted(
+                "secret creation was interrupted by workspace cleanup; retry",
+            ));
+        }
         Err(err) => {
-            // The sweep may already have discarded a record whose workspace
-            // went away; discarding again is harmless.
-            discard_record(state, stored).await;
-            return Err(match err {
-                PersistenceError::Conflict { .. } => {
-                    Status::aborted("secret creation was interrupted by workspace cleanup; retry")
-                }
-                err => Status::internal(format!("publish secret failed: {err}")),
-            });
+            if let Err(cleanup) = discard_pending_create(state, stored).await {
+                warn!(error = %cleanup, "workspace secret cleanup will be retried");
+            }
+            return Err(Status::internal(format!("publish secret failed: {err}")));
         }
     };
     if let Some(metadata) = stored.metadata.as_mut() {
@@ -421,13 +437,20 @@ async fn clear_stale_record(
     let Some(existing) = existing else {
         return Ok(());
     };
-    if is_pending_create(&existing) {
+    if is_pending_create(&existing) && !is_tombstoned(&existing) {
         if existing.workspace_id == workspace_id && !pending_create_is_stale(&existing) {
             return Err(Status::failed_precondition(format!(
                 "secret '{name}' is being created; retry later"
             )));
         }
-        discard_record(state, existing).await;
+        // If the earlier create published first, the insert below reports
+        // that the name is taken.
+        discard_pending_create(state, existing).await.map_err(|err| {
+            Status::failed_precondition(format!(
+                "secret '{name}' has an abandoned create that could not be cleaned up ({}); retry later",
+                err.message()
+            ))
+        })?;
         return Ok(());
     }
     if !is_tombstoned(&existing) {
@@ -463,45 +486,44 @@ fn is_live(stored: &StoredWorkspaceSecret) -> bool {
     !is_pending_create(stored) && !is_tombstoned(stored)
 }
 
-/// Best-effort removal of a record that never became, or no longer is, a
-/// usable secret: its backend handles, then the row. Failures are left to the
-/// sweep.
-async fn discard_record(state: &ServerState, stored: StoredWorkspaceSecret) {
-    let mut handles: Vec<CredentialHandle> = stored.pending_handle_deletions.clone();
-    handles.extend(stored.value_handle.clone());
-    for handle in handles {
-        if let Err(err) = state
-            .credentials
-            .delete_secrets(owner(&stored), &value_handles(handle))
-            .await
-        {
-            warn!(secret_id = %stored.object_id(), error = %err, "workspace secret cleanup will be retried");
-            return;
-        }
-    }
-    if let Err(err) = state
-        .store
-        .delete_if(
-            StoredWorkspaceSecret::object_type(),
-            stored.object_id(),
-            stored.get_resource_version(),
-        )
-        .await
-    {
-        warn!(secret_id = %stored.object_id(), error = %err, "failed to remove discarded workspace secret");
-    }
+/// Remove a create that never published. The record is first claimed with
+/// the version-checked transition to deleting, so a create that publishes
+/// concurrently wins and keeps its value. Only the claimant deletes the value.
+/// Returns whether this caller claimed the record. A claimant whose cleanup
+/// fails leaves a tombstone that the sweep finishes.
+async fn discard_pending_create(
+    state: &ServerState,
+    stored: StoredWorkspaceSecret,
+) -> Result<bool, Status> {
+    let claimed = match tombstone(state, stored).await {
+        Ok(claimed) => claimed,
+        Err(err) if err.code() == tonic::Code::Aborted => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    finish_deletion(state, claimed).await?;
+    Ok(true)
 }
 
-/// ID of the named workspace while it is active.
-async fn active_workspace_id(store: &Store, workspace: &str) -> Result<String, Status> {
+/// ID of the named workspace while it is active, or `None` when it is missing
+/// or being deleted. A store error is returned, never reported as absence.
+async fn active_workspace_instance(
+    store: &Store,
+    workspace: &str,
+) -> Result<Option<String>, Status> {
     let record: Option<openshell_core::proto::Workspace> = store
         .get_message_by_name("", workspace)
         .await
         .map_err(|e| Status::internal(format!("fetch workspace failed: {e}")))?;
-    record
+    Ok(record
         .and_then(|record| record.metadata)
         .filter(|metadata| metadata.deletion_time.is_none())
-        .map(|metadata| metadata.id)
+        .map(|metadata| metadata.id))
+}
+
+/// ID of the named workspace while it is active.
+async fn active_workspace_id(store: &Store, workspace: &str) -> Result<String, Status> {
+    active_workspace_instance(store, workspace)
+        .await?
         .ok_or_else(|| {
             Status::failed_precondition(format!("workspace '{workspace}' is being deleted"))
         })
@@ -961,13 +983,30 @@ pub async fn sweep_workspace_secrets(state: &ServerState) -> Result<usize, Statu
     }
 }
 
-/// Whether a pending create can no longer publish: it is stale, or its
-/// workspace is gone or is a different workspace with the same name.
-async fn abandoned_create(state: &ServerState, stored: &StoredWorkspaceSecret) -> bool {
-    pending_create_is_stale(stored)
-        || active_workspace_id(&state.store, stored.object_workspace())
-            .await
-            .map_or(true, |current| current != stored.workspace_id)
+/// What the sweep does with a create that has not published.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingFate {
+    /// It may still publish.
+    Keep,
+    /// It can no longer publish: it is stale, or its workspace is gone or is
+    /// a different workspace with the same name.
+    Discard,
+    /// The workspace could not be read; decide on a later sweep.
+    Defer,
+}
+
+fn pending_fate(
+    stored: &StoredWorkspaceSecret,
+    workspace: Result<Option<String>, Status>,
+) -> PendingFate {
+    if pending_create_is_stale(stored) {
+        return PendingFate::Discard;
+    }
+    match workspace {
+        Err(_) => PendingFate::Defer,
+        Ok(Some(current)) if current == stored.workspace_id => PendingFate::Keep,
+        Ok(_) => PendingFate::Discard,
+    }
 }
 
 async fn sweep_page(
@@ -982,10 +1021,23 @@ async fn sweep_page(
             .metadata
             .get_or_insert_with(ObjectMeta::default)
             .resource_version = record.resource_version;
-        if is_pending_create(&stored) {
-            if abandoned_create(state, &stored).await {
-                discard_record(state, stored).await;
-                finished += 1;
+        // A claimed pending create is a tombstone; finish it below.
+        if is_pending_create(&stored) && !is_tombstoned(&stored) {
+            let workspace = if pending_create_is_stale(&stored) {
+                Ok(None)
+            } else {
+                active_workspace_instance(&state.store, stored.object_workspace()).await
+            };
+            match pending_fate(&stored, workspace) {
+                PendingFate::Keep => {}
+                PendingFate::Defer => {
+                    warn!("workspace lookup failed; pending secret cleanup deferred");
+                }
+                PendingFate::Discard => match discard_pending_create(state, stored).await {
+                    Ok(true) => finished += 1,
+                    Ok(false) => {}
+                    Err(err) => warn!(error = %err, "workspace secret cleanup will be retried"),
+                },
             }
             continue;
         }
@@ -1739,5 +1791,106 @@ mod tests {
             .get_message_by_name::<StoredWorkspaceSecret>(workspace, name)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_that_loses_to_publication_keeps_the_value() {
+        let state = enabled_state().await;
+        let workspace_id = create_workspace(&state, "team").await;
+        crashed_create(&state, "team", &workspace_id, current_time_ms()).await;
+        // The sweep read this snapshot and judged the record abandoned...
+        let snapshot = stored_in(&state, "team", "acme").await.unwrap();
+        // ...and then the creator published.
+        let mut published = snapshot.clone();
+        published.create_pending_since = None;
+        state
+            .store
+            .put_if(
+                StoredWorkspaceSecret::object_type(),
+                published.object_id(),
+                published.object_name(),
+                "team",
+                &published.encode_to_vec(),
+                None,
+                WriteCondition::MatchResourceVersion(snapshot.get_resource_version()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !discard_pending_create(&state, snapshot).await.unwrap(),
+            "the claim loses to the publication"
+        );
+        let live = get_live_secret(&state.store, "team", "acme")
+            .await
+            .unwrap()
+            .expect("the published secret survives");
+        let handle = live.value_handle.clone().unwrap();
+        assert_eq!(
+            resolve_value(&state, &live, &handle).await.unwrap(),
+            "orphaned",
+            "its value was not deleted"
+        );
+    }
+
+    #[test]
+    fn pending_fate_defers_when_the_workspace_cannot_be_read() {
+        let fresh = StoredWorkspaceSecret {
+            workspace_id: "ws-1".to_string(),
+            create_pending_since: openshell_core::time::timestamp_from_millis(current_time_ms())
+                .ok(),
+            ..Default::default()
+        };
+        assert_eq!(
+            pending_fate(&fresh, Err(Status::unavailable("database down"))),
+            PendingFate::Defer
+        );
+        assert_eq!(
+            pending_fate(&fresh, Ok(Some("ws-1".into()))),
+            PendingFate::Keep
+        );
+        assert_eq!(
+            pending_fate(&fresh, Ok(Some("ws-2".into()))),
+            PendingFate::Discard
+        );
+        assert_eq!(pending_fate(&fresh, Ok(None)), PendingFate::Discard);
+
+        let stale = StoredWorkspaceSecret {
+            create_pending_since: openshell_core::time::timestamp_from_millis(
+                current_time_ms() - PENDING_CREATE_TIMEOUT_MS - 1,
+            )
+            .ok(),
+            ..fresh
+        };
+        assert_eq!(
+            pending_fate(&stale, Err(Status::unavailable("database down"))),
+            PendingFate::Discard,
+            "staleness does not depend on the workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_never_publishes_into_a_replacement_workspace() {
+        let state = enabled_state().await;
+        create_workspace(&state, "team").await;
+        let baseline = state.credentials.stored_credential_count();
+
+        let (entered, release) = state.credentials.gate_next_store();
+        let creator = Arc::clone(&state);
+        let create = tokio::spawn(async move {
+            let mut request = create_request("acme", "value");
+            request.workspace_scope = Some(workspace_selector("team".to_string()));
+            handle_create_secret(&creator, authed_request(request)).await
+        });
+        entered.await.unwrap();
+        // Replace the workspace the create was authorized against.
+        delete_workspace(&state, "team").await.unwrap();
+        create_workspace(&state, "team").await;
+        release.send(()).unwrap();
+
+        let err = create.await.unwrap().unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(stored_in(&state, "team", "acme").await.is_none());
+        assert_eq!(state.credentials.stored_credential_count(), baseline);
     }
 }
