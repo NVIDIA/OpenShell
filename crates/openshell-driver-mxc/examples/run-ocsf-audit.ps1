@@ -357,13 +357,16 @@ gateway_id = 'mxc-ocsf-audit'
 
   $cmdExe = Join-Path $env:SystemRoot "System32\cmd.exe"
   if (-not (Test-Path $cmdExe -PathType Leaf)) { throw "cmd.exe not found at '$cmdExe'" }
-  $helloPathCommand = $helloPath.Replace('\', '/')
   New-Item -ItemType Directory -Force $ShareDir | Out-Null
-  $batch = Join-Path $ShareDir 'audit-workload.cmd'
-  Set-Content -LiteralPath $batch -Encoding ASCII -Value ('@echo hello from openshell ocsf audit > "{0}"' -f $helloPathCommand)
+  # Run the workload inline, writing hello.txt relative to its working directory
+  # (the share), so the command needs no path and works when -ShareDir contains
+  # spaces. A batch file the host writes into the share before the sandbox starts
+  # cannot be run by the sandbox (Windows reports a sharing violation), which made
+  # this script report "audit workload did not produce its artifact" even when
+  # the audit trail was complete.
   $driverConfig = @{
     mxc = @{
-      command = @($cmdExe, '/d', '/c', $batch)
+      command = @($cmdExe, '/d', '/c', 'echo hello from openshell ocsf audit 1> hello.txt')
       cwd = $shareDirPolicy
     }
   } | ConvertTo-Json -Compress -Depth 4
