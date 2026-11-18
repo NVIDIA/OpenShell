@@ -223,11 +223,13 @@ For x86-64 and ARM64 Windows MSVC builds from the `windows` branch, use one of t
 Normal Windows builds and CI keep this prebuilt default and the existing CRT
 linkage. If the pinned release asset is absent (HTTP 404), the wrapper falls
 back to checksum-pinned Z3 5.1.0 source. Cached prebuilts are reused without
-an availability request; other download errors fail without starting a source
-build. To request source explicitly, set `OPENSHELL_WINDOWS_Z3_SOURCE=1`.
+an availability request. Inconclusive availability probes leave downloading
+and errors to the original `z3-sys` path, without starting a source build.
+To request source explicitly, set `OPENSHELL_WINDOWS_Z3_SOURCE=1`.
 `Z3_SRC_SOURCE_DIR` can supply a local 5.1.0 source tree.
 
-For ZIP packages that embed Z3 and the CRT in all four executables, opt in:
+For ZIP packages that embed Z3 in the gateway and the CRT in all four
+executables, opt in:
 
 ```powershell
 $env:OPENSHELL_WINDOWS_STATIC_RUNTIME='1'

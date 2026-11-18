@@ -103,6 +103,7 @@ public sealed class OpenShellZ3TestException : System.Exception {
     function Invoke-WebRequest([switch] $UseBasicParsing, [string] $Uri, [string] $OutFile, [string] $Method, [int] $TimeoutSec) {
         if ($Method -eq 'Head') {
             $script:headCalls += $Uri
+            if ($script:headStatus -eq 0) { throw [IO.IOException]::new('Transport unavailable') }
             if ($script:headStatus -ne 200) { throw [OpenShellZ3TestException]::new($script:headStatus) }
         } else {
             $script:sourceDownloads++
@@ -155,9 +156,11 @@ public sealed class OpenShellZ3TestException : System.Exception {
     $script:headStatus = 500
     if (-not (Test-PinnedZ3Available 'aarch64-pc-windows-msvc') -or $script:headCalls.Count -ne 2) { throw 'Cached prebuilt was not reused offline.' }
     $count++
-    $rejected = $false
-    try { Test-PinnedZ3Available 'x86_64-pc-windows-msvc' | Out-Null } catch { $rejected = $true }
-    if (-not $rejected -or $script:sourceDownloads) { throw 'Transient prebuilt failure unexpectedly built source.' }
+    $features = Configure-Z3 @('x86_64-pc-windows-msvc')
+    if ($features.FromSource -or $features.WorkspaceFeatures -notmatch 'prebuilt-z3' -or $script:sourceDownloads) { throw 'Inconclusive HEAD changed the original prebuilt path.' }
+    $count++
+    $script:headStatus = 0
+    if (-not (Test-PinnedZ3Available 'x86_64-pc-windows-msvc')) { throw 'Transport failure disabled the original downloader or offline non-Z3 commands.' }
     $count++
 
     $env:Z3_LIBRARY_PATH_OVERRIDE = $sourceFixture

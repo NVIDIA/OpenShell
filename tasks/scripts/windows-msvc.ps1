@@ -420,9 +420,12 @@ function Test-PinnedZ3Available([string] $RustTarget) {
         Invoke-WebRequest -UseBasicParsing -Method Head -Uri $url -TimeoutSec 30 | Out-Null
         return $true
     } catch {
-        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $false }
-        # A transient network/API error must not unexpectedly start a long build.
-        throw
+        $response = $_.Exception.PSObject.Properties['Response']
+        if ($response -and $response.Value -and [int]$response.Value.StatusCode -eq 404) { return $false }
+        # Keep the original z3-sys download/error handling for inconclusive
+        # probes. HEAD may be blocked even when GET works, and commands whose
+        # Cargo graph does not use Z3 must still work offline.
+        return $true
     }
 }
 
