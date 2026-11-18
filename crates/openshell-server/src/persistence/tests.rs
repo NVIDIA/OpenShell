@@ -10,6 +10,84 @@ use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
 use std::collections::HashMap as StdHashMap;
 
+async fn object_stamps_are_batched_and_scoped(store: &Store) {
+    let names: Vec<_> = (0..=super::OBJECT_STAMPS_BATCH_SIZE)
+        .map(|index| format!("route-{index}"))
+        .collect();
+    for name in &names {
+        store
+            .put("watched", name, name, "workspace-a", b"payload", None)
+            .await
+            .unwrap();
+    }
+    store
+        .put(
+            "watched",
+            "other-workspace",
+            &names[0],
+            "workspace-b",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "other-type",
+            "other-type-id",
+            &names[0],
+            "workspace-a",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .put_if(
+            "watched",
+            &names[0],
+            &names[0],
+            "workspace-a",
+            b"updated",
+            None,
+            super::WriteCondition::Unconditional,
+        )
+        .await
+        .unwrap();
+    let mut requested = names.clone();
+    requested.extend(["missing".into(), "' OR 1=1 --".into(), names[0].clone()]);
+    let stamps = store
+        .object_stamps("watched", "workspace-a", &requested)
+        .await
+        .unwrap();
+    assert_eq!(stamps.len(), names.len());
+    assert_eq!(stamps[&names[0]].id, names[0]);
+    assert_eq!(stamps[&names[0]].resource_version, 2);
+    assert_eq!(stamps[names.last().unwrap()].resource_version, 1);
+    assert!(
+        store
+            .object_stamps("watched", "workspace-a", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_object_stamps_are_batched_and_scoped() {
+    object_stamps_are_batched_and_scoped(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_object_stamps_are_batched_and_scoped() {
+    let schema = super::test_postgres::TestSchema::create("object_stamps").await;
+    let store = schema.connect_store().await;
+    object_stamps_are_batched_and_scoped(&store).await;
+    store.close().await;
+    schema.drop_schema().await;
+}
+
 /// A failed store call must be visible as a failure in the trace, not as a
 /// span that merely happened to return nothing.
 #[tokio::test]

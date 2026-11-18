@@ -72,6 +72,7 @@ use uuid::Uuid;
 mod prepared;
 #[cfg(test)]
 mod prepared_tests;
+mod registration_watch;
 mod warm_pool;
 
 use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
@@ -413,7 +414,7 @@ enum Reconciled {
 /// One gateway replica's view and maintenance of the pool.
 pub struct SupervisorPool {
     dedicated: bool,
-    pub(crate) claim_changed: tokio::sync::Notify,
+    pub(crate) registrations: Arc<registration_watch::RegistrationWatch>,
     store: Arc<Store>,
     controller: SupervisorHostController,
     authority: Arc<SandboxSessionJwtAuthority>,
@@ -832,7 +833,7 @@ impl SupervisorPool {
     ) -> Arc<Self> {
         Arc::new(Self {
             dedicated: false,
-            claim_changed: tokio::sync::Notify::new(),
+            registrations: Arc::default(),
             store,
             controller,
             authority,
@@ -983,7 +984,10 @@ impl SupervisorPool {
     pub fn start(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         self.controller
             .install_placement(Arc::new(PoolPlacement(self.clone())));
-        if !self.dedicated {
+        if self.dedicated {
+            self.registrations
+                .start(self.store.clone(), shutdown.clone());
+        } else {
             self.start_membership_heartbeat(shutdown.clone());
         }
         let pool = self.clone();

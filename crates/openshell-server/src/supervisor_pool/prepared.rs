@@ -566,6 +566,15 @@ impl SupervisorPool {
         &self,
         expected: &openshell_core::proto::compute::v1::SupervisorRegistrationIdentity,
     ) -> Result<Option<Vec<u8>>, tonic::Status> {
+        self.check_dedicated_registration(expected)
+            .await
+            .map(|(_, material)| material)
+    }
+
+    pub(crate) async fn check_dedicated_registration(
+        &self,
+        expected: &openshell_core::proto::compute::v1::SupervisorRegistrationIdentity,
+    ) -> Result<(crate::persistence::ObjectStamp, Option<Vec<u8>>), tonic::Status> {
         let refused =
             || tonic::Status::permission_denied("physical supervisor has no current claim");
         let record = self
@@ -574,6 +583,10 @@ impl SupervisorPool {
             .map_err(|_| tonic::Status::unavailable("cannot read supervisor assignment"))?
             .ok_or_else(refused)?;
         let payload = &record.payload;
+        let stamp = crate::persistence::ObjectStamp {
+            id: assignment_object_id(&payload.route, &payload.writer),
+            resource_version: record.resource_version,
+        };
         if !self.dedicated
             || !payload.dedicated
             || payload.phase != RecordPhase::Published
@@ -612,7 +625,7 @@ impl SupervisorPool {
             return Err(refused());
         }
         if payload.prepared {
-            return Ok(None);
+            return Ok((stamp, None));
         }
         let registration =
             SandboxInstanceRegistration::from_assignment(&assignment).map_err(|_| refused())?;
@@ -648,7 +661,7 @@ impl SupervisorPool {
         crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated)
             .await
             .map_err(|_| refused())?;
-        Ok(Some(material))
+        Ok((stamp, Some(material)))
     }
 
     pub(super) async fn prepared_runtimes(
@@ -881,7 +894,10 @@ impl SupervisorPool {
                     )
                     .await
                 {
-                    Ok(_) => return Ok(PreparationRelease::Released),
+                    Ok(_) => {
+                        self.registrations.notify(&retirement.route);
+                        return Ok(PreparationRelease::Released);
+                    }
                     Err(
                         PersistenceError::UniqueViolation { .. }
                         | PersistenceError::Conflict { .. },
@@ -1198,7 +1214,7 @@ impl SupervisorPool {
             Err(error) => return Err(format!("claim prepared runtime: {error}")),
         };
         lock(&self.materials).insert(assignment.route.clone(), assignment.clone());
-        self.claim_changed.notify_waiters();
+        self.registrations.notify(&assignment.route);
         if let Some(activated_owner) = activated_owner {
             self.placed(
                 assignment,
@@ -1304,6 +1320,7 @@ impl SupervisorPool {
         }
         match self.store.write_atomically(&writes).await {
             Ok(_) => {
+                self.registrations.notify(&record.payload.route);
                 lock(&self.materials).remove(&record.payload.route);
                 if collect {
                     self.discard_candidate(&candidate, &record.payload).await;

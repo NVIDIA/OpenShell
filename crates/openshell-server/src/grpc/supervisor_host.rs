@@ -68,14 +68,17 @@ impl SupervisorHost for SupervisorHostService {
             .clone()
             .ok_or_else(|| Status::failed_precondition("dedicated warm pooling is disabled"))?;
         let state = self.state.clone();
+        // Subscribe before reading: a concurrent claim must be seen either by
+        // validation or by this subscription. Reconnects replace the old stream.
+        let mut registration = pool.registrations.subscribe(&expected.route)?;
+        let cancelled = registration.cancelled();
         tracing::info!(route = %expected.route, "dedicated supervisor registration pending");
         let mut shutdown = state.supervisor_sessions.subscribe_shutdown();
         let wait = async move {
             loop {
-                let changed = pool.claim_changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                if pool.dedicated_registration(&expected).await?.is_some() {
+                let (stamp, material) = pool.check_dedicated_registration(&expected).await?;
+                registration.baseline(stamp);
+                if material.is_some() {
                     // The original Pod/CR binding must still exist at delivery.
                     // Re-reading also fences replaced Pods and namespace retirement.
                     let observed = state
@@ -97,18 +100,15 @@ impl SupervisorHost for SupervisorHostService {
                     tracing::info!(route = %expected.route, "dedicated supervisor claim delivered");
                     return Ok(RegisterSupervisorResponse { launch_material });
                 }
-                tokio::select! {
-                    () = &mut changed => {},
-                    // Other replicas commit to the same durable store. This is
-                    // server-side observation, not a registration retry.
-                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
-                }
+                registration.changed().await?;
             }
         };
         let outbound = futures::stream::once(async move {
             tokio::select! {
-                result = wait => result,
+                biased;
+                () = cancelled => Err(Status::unavailable("supervisor registration replaced or gateway is shutting down")),
                 _ = shutdown.wait_for(|stopping| *stopping) => Err(Status::unavailable("gateway is shutting down")),
+                result = wait => result,
             }
         });
         Ok(Response::new(Box::pin(outbound)))

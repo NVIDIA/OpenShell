@@ -1447,6 +1447,45 @@ WHERE object_type = $1 AND workspace = $2 AND name = $3
         Ok(row.map(row_to_object_record))
     }
 
+    pub(super) async fn object_stamps(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        names: &[String],
+    ) -> PersistenceResult<std::collections::HashMap<String, super::ObjectStamp>> {
+        let mut stamps = std::collections::HashMap::new();
+        for batch in names.chunks(super::OBJECT_STAMPS_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "SELECT name, id, resource_version FROM objects WHERE object_type = ",
+            );
+            query
+                .push_bind(object_type)
+                .push(" AND workspace = ")
+                .push_bind(workspace);
+            query.push(" AND name IN (");
+            let mut separated = query.separated(", ");
+            for name in batch {
+                separated.push_bind(name);
+            }
+            separated.push_unseparated(")");
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            for row in rows {
+                stamps.insert(
+                    row.get("name"),
+                    super::ObjectStamp {
+                        id: row.get("id"),
+                        resource_version: row.get::<i64, _>("resource_version").cast_unsigned(),
+                    },
+                );
+            }
+        }
+        Ok(stamps)
+    }
+
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
         let result = sqlx::query("DELETE FROM objects WHERE object_type = $1 AND id = $2")
             .bind(object_type)

@@ -1685,6 +1685,9 @@ preparation_timeout_secs = 300
 
 The target count is the template's `max_burst`, capped by `max_size`. Pending and
 deleting spares count against this per-template maximum (1–256).
+Each gateway replica accepts up to 4096 pending dedicated supervisor registrations
+across templates and workspaces. Supervisors retry with backoff when that limit is
+reached.
 `max_age_secs` accepts 60–86400 seconds; `preparation_timeout_secs` accepts
 30–3600 seconds and must not exceed the maximum age. Increase `revision` when
 changing these limits or the effective runtime configuration, including runtime

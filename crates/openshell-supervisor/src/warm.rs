@@ -137,6 +137,7 @@ async fn register(endpoint: &str, token_path: &Path) -> Result<Vec<u8>> {
                         | tonic::Code::Cancelled
                         | tonic::Code::DeadlineExceeded
                         | tonic::Code::Unauthenticated
+                        | tonic::Code::ResourceExhausted
                 ) =>
             {
                 tokio::time::sleep(delay).await;

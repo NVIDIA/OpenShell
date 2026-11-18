@@ -156,7 +156,15 @@ replica, independent of which replica runs the compute driver's watch:
   dedicated supervisor Pod UID. Its deferred `RegisterSupervisor` stream returns
   the committed launch material after rechecking that physical binding and the
   current sandbox identity and credentials. Bootstrap principals may only register;
-  they cannot call sandbox or shared-host APIs. Cleanup retires ended generations without
+  they cannot call sandbox or shared-host APIs. One observer per replica checks
+  row IDs and versions for subscribed routes in batches of 256, normally once per
+  second, backing off to ten seconds on store errors. Local commits notify only
+  the affected route. Unchanged preparations require no further credential reads.
+  Each replica admits up to 4096 registrations; a reconnect replaces the old
+  local stream for its route, and disconnect removes the subscription. Excess
+  registrations retry with backoff. Notifications only trigger revalidation;
+  physical authentication and durable claim checks still precede delivery.
+  Cleanup retires ended generations without
   running shared membership reconciliation.
 
 - **Observations.** The replica serving an owner records what the owner reports

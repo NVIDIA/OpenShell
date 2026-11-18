@@ -1128,15 +1128,14 @@ async fn dedicated_registration_is_pending_until_commit_and_recovers_the_same_la
             .unwrap()
             .is_none()
     );
-    let changed = pool.claim_changed.notified();
-    tokio::pin!(changed);
-    changed.as_mut().enable();
+    let mut subscription = pool.registrations.subscribe(&identity.route).unwrap();
     let canonical = pool
         .activate_runtime(activation(&prepared, "sandbox-a"))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), changed)
+    tokio::time::timeout(Duration::from_secs(1), subscription.changed())
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(
         pool.dedicated_registration(&identity)
@@ -1201,6 +1200,69 @@ async fn dedicated_registration_rejects_retirement_and_credential_epoch_changes(
         .await
         .unwrap();
     assert!(pool.dedicated_registration(&identity).await.is_err());
+}
+
+#[tokio::test]
+async fn dedicated_registration_watcher_observes_remote_activation_and_local_retirement() {
+    use futures::FutureExt as _;
+
+    let (fixture, pool, prepared) = dedicated_setup().await;
+    let identity = registration_identity(&prepared);
+    let mut other = preparation("rt-unaffected-0123456789");
+    other
+        .registration
+        .runtime_descriptor
+        .resource_claims
+        .insert(
+            "kubernetes.supervisor_pod_uid".into(),
+            "other-supervisor".into(),
+        );
+    pool.prepare_runtime(other.clone()).await.unwrap();
+    let mut subscription = pool.registrations.subscribe(&identity.route).unwrap();
+    let mut unaffected = pool
+        .registrations
+        .subscribe(&other.registration.route)
+        .unwrap();
+    let (stamp, pending) = pool.check_dedicated_registration(&identity).await.unwrap();
+    assert!(pending.is_none());
+    subscription.baseline(stamp);
+    let (stamp, _) = pool
+        .check_dedicated_registration(&registration_identity(&other))
+        .await
+        .unwrap();
+    unaffected.baseline(stamp);
+    for _ in 0..3 {
+        pool.registrations.observe(&pool.store).await.unwrap();
+        assert!(subscription.changed().now_or_never().is_none());
+        assert!(unaffected.changed().now_or_never().is_none());
+    }
+    let mut remote = fixture.replica("remote");
+    Arc::get_mut(&mut remote).unwrap().dedicated = true;
+    let claimed = remote
+        .activate_runtime(activation(&prepared, "sandbox-a"))
+        .await
+        .unwrap();
+    assert!(subscription.changed().now_or_never().is_none());
+    pool.registrations.observe(&pool.store).await.unwrap();
+    subscription.changed().await.unwrap();
+    assert!(unaffected.changed().now_or_never().is_none());
+    assert_eq!(
+        pool.dedicated_registration(&identity)
+            .await
+            .unwrap()
+            .unwrap(),
+        claimed.launch_material
+    );
+
+    let remaining = inventory(&pool).await;
+    assert_eq!(remaining.registration.route, other.registration.route);
+    pool.release_preparation(remaining.revision).await.unwrap();
+    unaffected.changed().await.unwrap();
+    assert!(
+        pool.dedicated_registration(&registration_identity(&other))
+            .await
+            .is_err()
+    );
 }
 
 fn claim_intent(

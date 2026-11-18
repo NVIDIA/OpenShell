@@ -1414,7 +1414,12 @@ supervisor Pod: its startup probe on port 5502 records TLS authentication, while
 normal readiness on port 5501 remains false until claim. Check the original Pod UID,
 container running/startup state and restart count, gateway TLS trust, and the
 pending `RegisterSupervisor` stream when a dedicated claim stalls. Claims arrive
-over that stream; they do not require a new Secret projection. The bootstrap ServiceAccount token authenticates
+over that stream; they do not require a new Secret projection. A shared observer
+on each gateway replica checks pending assignment versions; `warm supervisor
+registration observation failed; retrying` indicates a gateway storage failure,
+with retries backing off to ten seconds. Each replica permits 4096 pending
+registrations; excess registrations retry, and a reconnect replaces the previous
+local stream for the same physical route. The bootstrap ServiceAccount token authenticates
 the original physical Pod, and the gateway rechecks the binding before delivery.
 Before claim, losing an authenticated runtime connection terminates the dedicated
 supervisor. A terminated or restarted supervisor makes its spare ineligible;
