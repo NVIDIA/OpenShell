@@ -131,9 +131,8 @@ async fn auto_created_provider_credential_available_in_sandbox(
                 &provider,
                 "--auto-providers",
                 "--",
-                "sh",
-                "-c",
-                "exec sleep infinity",
+                "sleep",
+                "infinity",
             ],
         )
         .await?
