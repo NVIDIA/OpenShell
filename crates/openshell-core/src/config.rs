@@ -575,9 +575,8 @@ pub struct WorkspaceSecretsConfig {
     /// from provider refresh configuration. Enable only after every gateway
     /// that can serve traffic supports workspace secrets.
     pub enabled: bool,
-    /// Allow `RevealSecret` to return values to operators and to OIDC tokens
-    /// holding the literal `secret:reveal` scope. Enable only for a
-    /// control-plane service that needs it.
+    /// Allow `RevealSecret` to return values to mTLS operators. Enable only
+    /// for a control-plane service that needs it.
     pub reveal_enabled: bool,
 }
 

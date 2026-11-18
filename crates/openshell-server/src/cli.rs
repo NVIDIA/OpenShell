@@ -357,7 +357,7 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_ENABLE_WORKSPACE_SECRETS", default_value_t = false, action = ArgAction::Set)]
     enable_workspace_secrets: bool,
 
-    /// Allow `RevealSecret` for operators and OIDC tokens with the `secret:reveal` scope.
+    /// Allow `RevealSecret` to return workspace secret values to mTLS operators.
     #[arg(long, env = "OPENSHELL_ENABLE_SECRET_REVEAL", default_value_t = false, action = ArgAction::Set)]
     enable_secret_reveal: bool,
 }

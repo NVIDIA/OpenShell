@@ -27,7 +27,6 @@ use tracing::warn;
 use super::validation::validate_dns1123_label;
 use super::{MAX_MAP_VALUE_LEN, MAX_NAME_LEN};
 use crate::ServerState;
-use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_workspace, selected_workspace_name,
@@ -650,52 +649,15 @@ pub(super) async fn handle_delete_secret(
     }))
 }
 
-/// The only scope that authorizes `RevealSecret`. `openshell:all` does not
-/// imply it.
-const REVEAL_SCOPE: &str = "secret:reveal";
-
-/// Fail closed regardless of how the gateway authenticates users: middleware
-/// skips scope checks when `scopes_claim` is unset and treats an empty admin
-/// role as platform admin, so neither may grant a reveal here.
-fn ensure_reveal_principal(state: &ServerState, principal: &Principal) -> Result<(), Status> {
-    match principal {
-        Principal::Operator(_) => Ok(()),
-        Principal::User(user) => {
-            let enforces_scopes = state
-                .config
-                .oidc
-                .as_ref()
-                .is_some_and(|oidc| !oidc.scopes_claim.is_empty());
-            if user.identity.provider == IdentityProvider::Oidc
-                && enforces_scopes
-                && user
-                    .identity
-                    .scopes
-                    .iter()
-                    .any(|scope| scope == REVEAL_SCOPE)
-            {
-                Ok(())
-            } else {
-                Err(Status::permission_denied(format!(
-                    "revealing a secret requires an operator, or an OIDC token with the literal '{REVEAL_SCOPE}' scope on a gateway that enforces scopes"
-                )))
-            }
-        }
-        _ => Err(Status::permission_denied(
-            "this principal may not reveal secrets",
-        )),
-    }
-}
-
 pub(super) async fn handle_reveal_secret(
     state: &Arc<ServerState>,
     request: Request<RevealSecretRequest>,
 ) -> Result<Response<RevealSecretResponse>, Status> {
+    // Only a verified mTLS operator may reveal. Check it before anything else,
+    // so other callers cannot learn whether reveal is enabled.
+    crate::auth::guard::require_operator(&request)?;
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    // Authorize before revealing anything about gateway configuration, so a
-    // caller who may not reveal cannot learn whether reveal is enabled.
-    ensure_reveal_principal(state, &principal)?;
     let workspace = authorized_workspace(
         state,
         &principal,
@@ -917,6 +879,7 @@ async fn sweep_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::IdentityProvider;
     use crate::grpc::test_support::{authed_request, test_server_state};
     use openshell_core::proto::{SecretLabels, workspace_selector};
     use tonic::Code;
@@ -1247,6 +1210,19 @@ mod tests {
             .map(|response| response.into_inner().value)
     }
 
+    fn operator() -> Principal {
+        Principal::Operator(crate::auth::principal::OperatorPrincipal {
+            identity: crate::auth::identity::Identity {
+                subject: "operator".to_string(),
+                display_name: None,
+                roles: vec!["operator".to_string()],
+                scopes: Vec::new(),
+                provider: IdentityProvider::Mtls,
+            },
+            certificate_sha256: "00".to_string(),
+        })
+    }
+
     #[tokio::test]
     async fn reveal_is_disabled_by_default() {
         let mut state = reveal_state(Some("scope")).await;
@@ -1255,9 +1231,7 @@ mod tests {
             .config
             .workspace_secrets
             .reveal_enabled = false;
-        let err = reveal(&state, user(IdentityProvider::Oidc, &[REVEAL_SCOPE]))
-            .await
-            .unwrap_err();
+        let err = reveal(&state, operator()).await.unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
         // A caller who may not reveal learns nothing about the setting.
         let err = reveal(&state, user(IdentityProvider::Oidc, &["openshell:all"]))
@@ -1267,55 +1241,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reveal_requires_the_literal_scope_on_a_scope_enforcing_gateway() {
+    async fn only_mtls_operators_may_reveal() {
+        // Even a scope-enforcing OIDC gateway grants users no reveal access.
         let state = reveal_state(Some("scope")).await;
-        assert_eq!(
-            reveal(&state, user(IdentityProvider::Oidc, &[REVEAL_SCOPE]))
-                .await
-                .unwrap(),
-            "the-value"
-        );
+        assert_eq!(reveal(&state, operator()).await.unwrap(), "the-value");
         for principal in [
+            user(IdentityProvider::Oidc, &["secret:reveal"]),
             user(IdentityProvider::Oidc, &["openshell:all"]),
-            user(IdentityProvider::Oidc, &["secret:read", "secret:write"]),
-            user(IdentityProvider::Mtls, &[REVEAL_SCOPE]),
-            user(IdentityProvider::LocalDev, &[REVEAL_SCOPE]),
+            user(IdentityProvider::Mtls, &[]),
+            user(IdentityProvider::LocalDev, &[]),
         ] {
             assert_eq!(
                 reveal(&state, principal).await.unwrap_err().code(),
                 Code::PermissionDenied
             );
         }
-    }
-
-    #[tokio::test]
-    async fn reveal_fails_closed_when_scopes_are_not_enforced() {
-        for scopes_claim in [None, Some("")] {
-            let state = reveal_state(scopes_claim).await;
-            assert_eq!(
-                reveal(&state, user(IdentityProvider::Oidc, &[REVEAL_SCOPE]))
-                    .await
-                    .unwrap_err()
-                    .code(),
-                Code::PermissionDenied
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn operators_may_reveal() {
-        let state = reveal_state(None).await;
-        let operator = Principal::Operator(crate::auth::principal::OperatorPrincipal {
-            identity: crate::auth::identity::Identity {
-                subject: "operator".to_string(),
-                display_name: None,
-                roles: vec!["operator".to_string()],
-                scopes: Vec::new(),
-                provider: IdentityProvider::Mtls,
-            },
-            certificate_sha256: "00".to_string(),
-        });
-        assert_eq!(reveal(&state, operator).await.unwrap(), "the-value");
     }
 
     #[tokio::test]

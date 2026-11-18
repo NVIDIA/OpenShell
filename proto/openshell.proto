@@ -510,16 +510,10 @@ service OpenShell {
   }
 
   // Return a workspace secret's plaintext value to a control-plane caller.
-  // Disabled unless the gateway sets enable_secret_reveal. Callers must be an
-  // operator, or an OIDC workspace admin whose token carries the literal
-  // secret:reveal scope on a gateway that enforces scopes; openshell:all does
-  // not satisfy it. Every call is audited.
+  // Disabled unless the gateway sets enable_secret_reveal. Only directly
+  // authenticated mTLS operators may call this method. Every call is audited.
   rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "bearer"
-      scope: "secret:reveal"
-      workspace_role: "admin"
-    };
+    option (openshell.options.v1.authorization) = { auth_mode: "operator" };
   }
 
   // Get sandbox settings by id (called by users, and by supervisors at startup
