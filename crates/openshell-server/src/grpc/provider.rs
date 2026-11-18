@@ -3699,7 +3699,12 @@ async fn bind_material_secrets(
         let secret = super::secret::get_live_secret(&state.store, workspace, name)
             .await?
             .ok_or_else(|| Status::not_found(format!("workspace secret '{name}' not found")))?;
-        if !secret.allowed_endpoints.contains(&endpoint) {
+        let Some(refresh_use) = secret.refresh_use.as_ref() else {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{name}' is not enabled for provider refresh"
+            )));
+        };
+        if !refresh_use.allowed_endpoints.contains(&endpoint) {
             return Err(Status::failed_precondition(format!(
                 "workspace secret '{name}' does not allow token endpoint {endpoint}"
             )));
@@ -5760,7 +5765,11 @@ async fn read_workspace_secret(
                     .remove(secret_refs::WORKSPACE_SECRET_VALUE_KEY)
                     .filter(|value| !value.is_empty())
                 {
-                    return Ok((value, secret.allowed_endpoints));
+                    let allowed_endpoints = secret
+                        .refresh_use
+                        .map(|refresh_use| refresh_use.allowed_endpoints)
+                        .unwrap_or_default();
+                    return Ok((value, allowed_endpoints));
                 }
                 last_error = Some("credential storage returned no value".to_string());
             }

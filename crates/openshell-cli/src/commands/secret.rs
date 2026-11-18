@@ -12,7 +12,7 @@ use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_core::proto::{
     CreateSecretRequest, DeleteSecretRequest, GetSecretRequest, ListSecretsRequest, Secret,
-    SecretLabels, UpdateSecretRequest, workspace_selector,
+    SecretLabels, SecretRefreshUse, UpdateSecretRequest, workspace_selector,
 };
 use std::path::Path;
 
@@ -84,7 +84,11 @@ pub async fn secret_create(
             name: input.name.to_string(),
             description: input.description.to_string(),
             value,
-            allowed_endpoints: input.allowed_endpoints.to_vec(),
+            // Endpoints make the value usable as refresh material; without
+            // them the secret is reveal-only.
+            refresh_use: (!input.allowed_endpoints.is_empty()).then(|| SecretRefreshUse {
+                allowed_endpoints: input.allowed_endpoints.to_vec(),
+            }),
             labels,
             request_id: String::new(),
         })
@@ -185,8 +189,8 @@ pub async fn secret_get(
     }
     println!(
         "  {} {}",
-        "Allowed endpoints:".dimmed(),
-        secret.allowed_endpoints.join(", ")
+        "Refresh endpoints:".dimmed(),
+        refresh_endpoints(&secret)
     );
     println!("  {} {}", "Value updated:".dimmed(), value_updated(&secret));
     if is_deleting(&secret) {
@@ -256,7 +260,7 @@ pub async fn secret_list(
         "NAME".bold(),
         "STATUS".bold(),
         "VALUE UPDATED".bold(),
-        "ALLOWED ENDPOINTS".bold(),
+        "REFRESH ENDPOINTS".bold(),
     );
     for secret in &response.secrets {
         println!(
@@ -264,7 +268,7 @@ pub async fn secret_list(
             secret_name(secret),
             status(secret),
             value_updated(secret),
-            secret.allowed_endpoints.join(", ")
+            refresh_endpoints(secret)
         );
     }
     Ok(())
@@ -304,6 +308,14 @@ fn secret_name(secret: &Secret) -> &str {
         .map_or("", |meta| meta.name.as_str())
 }
 
+/// Endpoints a refresh may send the value to, or `reveal-only`.
+fn refresh_endpoints(secret: &Secret) -> String {
+    secret.refresh_use.as_ref().map_or_else(
+        || "reveal-only".to_string(),
+        |refresh_use| refresh_use.allowed_endpoints.join(", "),
+    )
+}
+
 fn is_deleting(secret: &Secret) -> bool {
     secret
         .metadata
@@ -336,7 +348,9 @@ fn secret_to_json(secret: &Secret) -> serde_json::Value {
         "resource_version": meta.resource_version,
         "labels": meta.labels,
         "description": secret.description,
-        "allowed_endpoints": secret.allowed_endpoints,
+        "refresh_use": secret.refresh_use.as_ref().map(|refresh_use| {
+            serde_json::json!({ "allowed_endpoints": refresh_use.allowed_endpoints })
+        }),
         "status": status(secret),
         "value_updated_at": secret
             .value_update_time
@@ -377,6 +391,8 @@ mod tests {
         let json = secret_to_json(&Secret::default());
         assert!(json.get("value").is_none());
         assert_eq!(json["status"], "active");
+        assert!(json["refresh_use"].is_null());
+        assert_eq!(refresh_endpoints(&Secret::default()), "reveal-only");
     }
 
     #[test]

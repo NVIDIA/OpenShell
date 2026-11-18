@@ -1860,6 +1860,24 @@ pM2zFU8SeVkvHKlEuoHaP0s=
     }
 
     #[tokio::test]
+    async fn an_empty_allowlist_allows_no_endpoint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let mut request = secret_bound_refresh_request(
+            format!("{}/token", mock_server.uri()),
+            &mock_server.uri(),
+        );
+        // A reveal-only secret contributes an empty list.
+        request.secret_endpoint_allowlists = vec![Vec::new()];
+        let failure = mint_credential(&request).await.err().unwrap();
+        assert_eq!(failure.failure_code, "secret_endpoint_not_allowed");
+    }
+
+    #[tokio::test]
     async fn aws_sts_refuses_workspace_secret_material() {
         let request = MintRequest {
             strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,

@@ -23,7 +23,7 @@ pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate
 mod workspace_secret {
     include!(concat!(env!("OUT_DIR"), "/openshell.storage.secret.v1.rs"));
 }
-pub(crate) use workspace_secret::StoredWorkspaceSecret;
+pub(crate) use workspace_secret::{StoredSecretRefreshUse, StoredWorkspaceSecret};
 
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
@@ -226,9 +226,9 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f069782f09e8763fdf6041eb7e34ab00b63066d283dc1b16b78584b6d1d7bfef";
+        "63b70add7015030836537809f373ca161228617dba5a237469c772c3c66a6bb2";
     const DURABLE_SCHEMA_SHA256: &str =
-        "b6a1de55ca3bdf2ccbf88a32f57e87db84b775c48fcd5f9fcf7811eae8d67c70";
+        "f861dec10c8d4142c9dcad7c34fb2689f9f15ccf496912908113ab9b72baba8c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -774,8 +774,8 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (362, 31),
-                (101, 22),
+                (363, 31),
+                (102, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,

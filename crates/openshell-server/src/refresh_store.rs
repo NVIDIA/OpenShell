@@ -303,7 +303,12 @@ impl RefreshStateStore for ServerRefreshStore {
             .and_then(|stored| {
                 stored.value_handle.map(|handle| WorkspaceSecretMaterial {
                     handle,
-                    allowed_endpoints: stored.allowed_endpoints,
+                    // A reveal-only secret allows no endpoint, so a mint
+                    // carrying it fails closed. Configure refuses to bind one.
+                    allowed_endpoints: stored
+                        .refresh_use
+                        .map(|refresh_use| refresh_use.allowed_endpoints)
+                        .unwrap_or_default(),
                 })
             }))
     }

@@ -14,7 +14,7 @@ use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta};
 use openshell_core::proto::{
     CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, DeletionOutcome,
     GetSecretRequest, ListSecretsRequest, ListSecretsResponse, RevealSecretRequest,
-    RevealSecretResponse, Secret, SecretResponse, UpdateSecretRequest,
+    RevealSecretResponse, Secret, SecretRefreshUse, SecretResponse, UpdateSecretRequest,
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::endpoint::normalize_token_endpoint;
@@ -37,7 +37,7 @@ use crate::persistence::{
     ObjectCursor, ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition,
     current_time_ms,
 };
-use crate::storage_proto::StoredWorkspaceSecret;
+use crate::storage_proto::{StoredSecretRefreshUse, StoredWorkspaceSecret};
 
 /// Logical key of the single value each secret stores.
 pub const SECRET_VALUE_KEY: &str = secret_refs::WORKSPACE_SECRET_VALUE_KEY;
@@ -58,7 +58,12 @@ pub fn public_secret(stored: &StoredWorkspaceSecret) -> Secret {
     Secret {
         metadata: stored.metadata.clone(),
         description: stored.description.clone(),
-        allowed_endpoints: stored.allowed_endpoints.clone(),
+        refresh_use: stored
+            .refresh_use
+            .as_ref()
+            .map(|refresh_use| SecretRefreshUse {
+                allowed_endpoints: refresh_use.allowed_endpoints.clone(),
+            }),
         value_update_time: stored.value_update_time,
     }
 }
@@ -151,7 +156,7 @@ fn validate_description(description: &str) -> Result<(), Status> {
 fn normalize_allowed_endpoints(endpoints: &[String]) -> Result<Vec<String>, Status> {
     if endpoints.is_empty() {
         return Err(Status::invalid_argument(
-            "allowed_endpoints must name at least one token endpoint",
+            "refresh_use.allowed_endpoints must name at least one token endpoint; omit refresh_use for a reveal-only secret",
         ));
     }
     if endpoints.len() > MAX_ALLOWED_ENDPOINTS {
@@ -277,7 +282,14 @@ pub(super) async fn handle_create_secret(
     validate_value(&req.value)?;
     validate_description(&req.description)?;
     validate_labels(&req.labels)?;
-    let allowed_endpoints = normalize_allowed_endpoints(&req.allowed_endpoints)?;
+    let refresh_use = req
+        .refresh_use
+        .as_ref()
+        .map(|refresh_use| {
+            normalize_allowed_endpoints(&refresh_use.allowed_endpoints)
+                .map(|allowed_endpoints| StoredSecretRefreshUse { allowed_endpoints })
+        })
+        .transpose()?;
     ensure_workspace_secrets_active(state).await?;
     ensure_credential_storage(state)?;
     let workspace_id = active_workspace_id(&state.store, &workspace).await?;
@@ -298,7 +310,7 @@ pub(super) async fn handle_create_secret(
             deletion_time: None,
         }),
         description: req.description,
-        allowed_endpoints,
+        refresh_use,
         value_update_time: now,
         value_handle: Some(handle.clone()),
         pending_handle_deletions: Vec::new(),
@@ -902,7 +914,9 @@ mod tests {
             name: name.to_string(),
             description: "shared OAuth client secret".to_string(),
             value: value.to_string(),
-            allowed_endpoints: vec!["HTTPS://Login.Example.com:443/oauth/token".to_string()],
+            refresh_use: Some(SecretRefreshUse {
+                allowed_endpoints: vec!["HTTPS://Login.Example.com:443/oauth/token".to_string()],
+            }),
             labels: HashMap::from([("team".to_string(), "platform".to_string())]),
             request_id: String::new(),
         }
@@ -961,7 +975,7 @@ mod tests {
         assert_eq!(metadata.workspace, "default");
         assert_ne!(metadata.resource_version, 0);
         assert_eq!(
-            created.allowed_endpoints,
+            created.refresh_use.as_ref().unwrap().allowed_endpoints,
             vec!["https://login.example.com/oauth/token".to_string()]
         );
         let encoded = format!("{created:?}");
@@ -1076,12 +1090,18 @@ mod tests {
         let state = enabled_state().await;
         let cases: [(&str, Mutate); 5] = [
             ("empty value", |req| req.value.clear()),
-            ("no endpoints", |req| req.allowed_endpoints.clear()),
+            ("refresh use without endpoints", |req| {
+                req.refresh_use = Some(SecretRefreshUse::default());
+            }),
             ("non-loopback http", |req| {
-                req.allowed_endpoints = vec!["http://login.example.com/token".to_string()];
+                req.refresh_use = Some(SecretRefreshUse {
+                    allowed_endpoints: vec!["http://login.example.com/token".to_string()],
+                });
             }),
             ("query string", |req| {
-                req.allowed_endpoints = vec!["https://login.example.com/token?a=b".to_string()];
+                req.refresh_use = Some(SecretRefreshUse {
+                    allowed_endpoints: vec!["https://login.example.com/token?a=b".to_string()],
+                });
             }),
             ("invalid name", |req| req.name = "Not_A_Label".to_string()),
         ];
@@ -1390,5 +1410,26 @@ mod tests {
         // Recreating the name finishes the earlier deletion first.
         let recreated = create(&state, "acme", "fresh").await;
         assert!(recreated.metadata.unwrap().deletion_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_secret_without_refresh_use_is_reveal_only() {
+        let state = enabled_state().await;
+        let mut request = create_request("signing-key", "value");
+        request.refresh_use = None;
+        let created = handle_create_secret(&state, authed_request(request))
+            .await
+            .expect("create a reveal-only secret")
+            .into_inner()
+            .secret
+            .unwrap();
+        assert!(created.refresh_use.is_none());
+        assert!(
+            stored(&state, "signing-key")
+                .await
+                .unwrap()
+                .refresh_use
+                .is_none()
+        );
     }
 }

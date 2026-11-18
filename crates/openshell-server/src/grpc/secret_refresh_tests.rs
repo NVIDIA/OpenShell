@@ -14,7 +14,7 @@ use openshell_core::proto::{
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
     ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
-    UpdateSecretRequest, workspace_selector,
+    SecretRefreshUse, UpdateSecretRequest, workspace_selector,
 };
 use openshell_core::{ObjectId, ObjectWorkspace};
 use openshell_credential_issuer::refresh::{CredentialRefresh, secret_refs};
@@ -153,7 +153,9 @@ async fn create_secret(state: &Arc<ServerState>, value: &str, allowed_endpoint: 
             name: "acme".to_string(),
             description: String::new(),
             value: value.to_string(),
-            allowed_endpoints: vec![allowed_endpoint.to_string()],
+            refresh_use: Some(SecretRefreshUse {
+                allowed_endpoints: vec![allowed_endpoint.to_string()],
+            }),
             labels: HashMap::new(),
             request_id: String::new(),
         }),
@@ -645,4 +647,39 @@ async fn stored_refresh_token(state: &Arc<ServerState>) -> Option<String> {
         .await
         .unwrap()
         .remove("refresh_token")
+}
+
+#[tokio::test]
+async fn a_reveal_only_secret_cannot_supply_refresh_material() {
+    let state = enabled_state().await;
+    let token_url = "https://login.example.com/token";
+    import_profile(
+        &state,
+        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+        token_url,
+    )
+    .await;
+    handle_create_secret(
+        &state,
+        authed_request(CreateSecretRequest {
+            workspace_scope: Some(default_workspace()),
+            name: "acme".to_string(),
+            value: "value".to_string(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("create a reveal-only secret");
+    let err = configure(
+        &state,
+        configure_request(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("not enabled for provider refresh"),
+        "{}",
+        err.message()
+    );
 }

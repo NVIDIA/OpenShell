@@ -2866,16 +2866,26 @@ message DeleteProviderProfileResponse {
   DeletionOutcome outcome = 2;
 }
 
-// A workspace-scoped value used only as credential minting material, such as
-// an OAuth client secret shared by many providers. OpenShell never injects a
-// secret into sandboxes and never returns its value from Get or List.
+// A workspace-scoped, non-injectable value. OpenShell never injects a secret
+// into sandboxes and never returns its value from Get or List. A secret with
+// refresh_use may also supply provider refresh material, such as an OAuth
+// client secret shared by many providers; one without it is reveal-only.
 message Secret {
   openshell.datamodel.v1.ObjectMeta metadata = 1;
   string description = 2;
-  // Token endpoints this value may be sent to, normalized. Fixed at creation.
-  repeated string allowed_endpoints = 3;
+  // Present only when the value may be used as provider refresh material.
+  // Fixed at creation.
+  SecretRefreshUse refresh_use = 3;
   // Last time the value was written.
   google.protobuf.Timestamp value_update_time = 4;
+}
+
+// How a secret may be used as provider refresh material.
+message SecretRefreshUse {
+  // Token endpoints the value may be sent to during refresh. Required and
+  // non-empty: absolute https URLs, or http URLs for loopback hosts, compared
+  // exactly after normalization.
+  repeated string allowed_endpoints = 1;
 }
 
 message CreateSecretRequest {
@@ -2885,9 +2895,9 @@ message CreateSecretRequest {
   string description = 3;
   // Required and non-empty.
   string value = 4 [(openshell.options.v1.secret) = true];
-  // Required. Absolute https URLs, or http URLs for loopback hosts. Compared
-  // exactly after normalization. Cannot be changed after creation.
-  repeated string allowed_endpoints = 5;
+  // Set to allow provider refresh to use the value. Omit for a reveal-only
+  // secret. Cannot be changed after creation.
+  SecretRefreshUse refresh_use = 5;
   map<string, string> labels = 6;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.

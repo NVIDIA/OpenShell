@@ -412,6 +412,7 @@ const WORKSPACE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 const SECRET_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell secret create acme-oauth-client --value-env CLIENT_SECRET \\
       --allowed-endpoint https://login.example.com/oauth/token
+  $ openshell secret create signing-key --value-file ./signing-key.pem
   $ openshell secret update acme-oauth-client --value-file ./client-secret
   $ openshell secret list
   $ openshell secret delete acme-oauth-client
@@ -2628,9 +2629,9 @@ enum SecretCommands {
         #[arg(long = "value-file", value_name = "PATH")]
         value_file: Option<PathBuf>,
 
-        /// Token endpoint the value may be sent to. Repeatable; cannot be
-        /// changed after creation.
-        #[arg(long = "allowed-endpoint", value_name = "URL", required = true)]
+        /// Token endpoint provider refresh may send the value to. Repeatable;
+        /// cannot be changed after creation. Omit for a reveal-only secret.
+        #[arg(long = "allowed-endpoint", value_name = "URL")]
         allowed_endpoints: Vec<String>,
 
         /// Human-readable description.
