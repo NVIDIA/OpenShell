@@ -396,9 +396,20 @@ fullname, so the name never collapses into another release resource's name.
 {{/* Validate gateway-owned SPIFFE Broker API settings. */}}
 {{- define "openshell.validateSpiffeBroker" -}}
 {{- $broker := .broker -}}
+{{- $nodeLocal := hasKey $broker "node_local_port" -}}
+{{- if eq $nodeLocal (not (empty (get $broker "endpoint"))) -}}
+{{- fail "spiffe_broker requires exactly one of endpoint and node_local_port" -}}
+{{- end -}}
+{{- if $nodeLocal -}}
+{{- $port := get $broker "node_local_port" -}}
+{{- if or (kindIs "string" $port) (not (regexMatch "^[0-9]+$" (toString $port))) (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail "spiffe_broker.node_local_port must be between 1 and 65535" -}}
+{{- end -}}
+{{- else -}}
 {{- $url := urlParse (get $broker "endpoint" | default "") -}}
 {{- if or (ne $url.scheme "https") (empty $url.host) $url.userinfo $url.query $url.fragment (not (has $url.path (list "" "/"))) -}}
 {{- fail "spiffe_broker.endpoint must be an HTTPS endpoint" -}}
+{{- end -}}
 {{- end -}}
 {{- $socket := get $broker "workload_api_socket_path" | default "" -}}
 {{- if or (not (hasPrefix "/" $socket)) (ne (trim $socket) $socket) (eq (dir $socket) "/") (hasSuffix "/" $socket) (regexMatch "(^|/)\\.\\.?(/|$)" $socket) -}}

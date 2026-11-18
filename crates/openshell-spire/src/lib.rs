@@ -17,17 +17,20 @@ use openshell_spiffe::{SandboxIdentityProvider, SandboxJwtSvid, SandboxSpiffeIdP
 pub struct SpireSandboxIdentity {
     config: SpiffeBrokerConfig,
     prefix: SandboxSpiffeIdPrefix,
+    endpoint: String,
 }
 
 impl SpireSandboxIdentity {
     /// Parse the stable identity prefix; startup also validates the transport.
     ///
     /// # Errors
-    /// Rejects an invalid SPIFFE ID prefix.
+    /// Rejects an invalid SPIFFE ID prefix or missing/invalid node address.
     pub fn new(config: &SpiffeBrokerConfig) -> Result<Self, String> {
         Ok(Self {
             config: config.clone(),
             prefix: SandboxSpiffeIdPrefix::parse(&config.spiffe_id_prefix)?,
+            endpoint: config
+                .endpoint_for_node(std::env::var("OPENSHELL_NODE_IP").ok().as_deref())?,
         })
     }
 }
@@ -47,7 +50,14 @@ impl SandboxIdentityProvider for SpireSandboxIdentity {
             .prefix
             .sandbox_spiffe_id(gateway_id, sandbox_id)
             .map_err(|_| configuration_failure())?;
-        broker::fetch(&self.config, runtime_identity, &expected, audience).await
+        broker::fetch(
+            &self.config,
+            &self.endpoint,
+            runtime_identity,
+            &expected,
+            audience,
+        )
+        .await
     }
 }
 

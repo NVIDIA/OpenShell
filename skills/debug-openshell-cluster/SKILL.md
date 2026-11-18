@@ -973,11 +973,17 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 
 With `gatewayConfig.openshell.gateway.spiffe_broker`, the gateway obtains
 sandbox JWT-SVIDs through the experimental SPIFFE Broker API over mTLS.
-Check the endpoint's exact `server_spiffe_id`, gateway X.509-SVID issuance,
+Check the endpoint's exact `server_spiffe_id` or cluster-scoped
+`server_spiffe_id_prefix`, gateway X.509-SVID issuance,
 the CSI Workload API socket, the SPIRE broker allowlist and reference types,
 and enforced `impersonate-via-spire` access to the Sandbox CR. The agent must
 be able to resolve its persisted UID and find the corresponding registration.
 Supervisors receive final provider access tokens and have no SPIRE material.
+With `node_local_port`, check the gateway's `OPENSHELL_NODE_IP` Downward API
+field (`status.hostIP`) and the local agent's TCP listener and host port/network
+configuration. Broker requests connect directly to that node address; no
+Broker Service is used. Registrations must cover every node where a gateway
+replica may run. Missing or invalid node addresses fail startup.
 
 #### Secure metrics TLS
 

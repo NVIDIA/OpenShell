@@ -226,7 +226,11 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
 #[serde(deny_unknown_fields)]
 pub struct SpiffeBrokerConfig {
     pub spiffe_id_prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint: String,
+    /// Connect to the gateway's node IP supplied through the Downward API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_local_port: Option<std::num::NonZeroU16>,
     #[serde(default)]
     pub server_spiffe_id: Option<String>,
     #[serde(default)]
@@ -235,11 +239,30 @@ pub struct SpiffeBrokerConfig {
 }
 
 impl SpiffeBrokerConfig {
+    /// Resolve the selected transport without making Kubernetes API calls.
+    /// Node-local mode requires the Pod's trusted Downward API node address.
+    pub fn endpoint_for_node(&self, node_ip: Option<&str>) -> Result<String, String> {
+        match (self.endpoint.is_empty(), self.node_local_port) {
+            (false, None) => Ok(self.endpoint.clone()),
+            (true, Some(port)) => {
+                let ip: std::net::IpAddr = node_ip
+                    .ok_or("spiffe_broker.node_local_port requires OPENSHELL_NODE_IP from status.hostIP")?
+                    .parse()
+                    .map_err(|_| "OPENSHELL_NODE_IP must be an IPv4 or IPv6 address")?;
+                Ok(format!("https://{}", SocketAddr::new(ip, port.get())))
+            }
+            _ => Err("spiffe_broker requires exactly one of endpoint and node_local_port".into()),
+        }
+    }
+
     /// Validate the identity and authenticated transport before use.
     pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
         openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
             .sandbox_spiffe_id(gateway_id, "sandbox")?;
-        let endpoint = url::Url::parse(&self.endpoint)
+        // Validate the mode independently of the startup environment. The
+        // adapter requires and resolves the actual node IP before serving.
+        let endpoint = self.endpoint_for_node(Some("127.0.0.1"))?;
+        let endpoint = url::Url::parse(&endpoint)
             .map_err(|_| "spiffe_broker.endpoint must be an HTTPS endpoint")?;
         let socket = std::path::Path::new(&self.workload_api_socket_path);
         let valid_socket = socket.is_absolute()
@@ -2127,11 +2150,43 @@ mod tests {
         let mut config = super::SpiffeBrokerConfig {
             spiffe_id_prefix: "spiffe://example.org/openshell".into(),
             endpoint: "https://spire-broker.spire.svc:8443".into(),
+            node_local_port: None,
             server_spiffe_id: Some("spiffe://example.org/spire/agent/node".into()),
             server_spiffe_id_prefix: None,
             workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock".into(),
         };
         config.validate("gw").unwrap();
+        let mut local = config.clone();
+        local.endpoint.clear();
+        local.node_local_port = std::num::NonZeroU16::new(8443);
+        local.validate("gw").unwrap();
+        assert_eq!(
+            local.endpoint_for_node(Some("10.20.0.2")).unwrap(),
+            "https://10.20.0.2:8443"
+        );
+        assert_eq!(
+            local.endpoint_for_node(Some("2001:db8::2")).unwrap(),
+            "https://[2001:db8::2]:8443"
+        );
+        for address in [
+            None,
+            Some(""),
+            Some("agent.example.org"),
+            Some("10.20.0.2:8443"),
+        ] {
+            assert!(local.endpoint_for_node(address).is_err());
+        }
+        local.endpoint.clone_from(&config.endpoint);
+        assert!(local.validate("gw").is_err());
+        local.endpoint.clear();
+        local.node_local_port = None;
+        assert!(local.validate("gw").is_err());
+        let encoded = serde_json::to_value(&config).unwrap();
+        for port in [0, 65536] {
+            let mut invalid = encoded.clone();
+            invalid["node_local_port"] = port.into();
+            assert!(serde_json::from_value::<super::SpiffeBrokerConfig>(invalid).is_err());
+        }
         config.server_spiffe_id = None;
         config.server_spiffe_id_prefix =
             Some("spiffe://example.org/spire/agent/k8s_psat/cluster".into());

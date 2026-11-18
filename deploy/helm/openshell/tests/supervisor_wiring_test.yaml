@@ -171,3 +171,58 @@ tests:
             csi:
               driver: csi.spiffe.io
               readOnly: true
+  - it: injects the node address for node-local Broker transport
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          node_local_port: 8443
+          server_spiffe_id_prefix: spiffe://example.org/spire/agent/k8s_psat/cluster
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_NODE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+      - notExists:
+          path: spec.template.spec.volumes[*].hostPath
+  - it: rejects ambiguous Broker endpoint selection
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          endpoint: https://broker:8443
+          node_local_port: 8443
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker requires exactly one of endpoint and node_local_port
+  - it: rejects an invalid node-local Broker port
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          node_local_port: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker.node_local_port must be between 1 and 65535
+  - it: rejects a quoted node-local Broker port before gateway startup
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          node_local_port: "8443"
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker.node_local_port must be between 1 and 65535

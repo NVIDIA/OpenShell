@@ -185,15 +185,18 @@ fn reference(runtime: &str) -> Result<WorkloadReference, TokenGrantFailure> {
     })
 }
 
-async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailure> {
+async fn channel(
+    config: &SpiffeBrokerConfig,
+    endpoint: &str,
+) -> Result<Channel, TokenGrantFailure> {
     use openshell_crypto::tls::spiffe::ServerIdentity;
     let (server_id, identity) = match (&config.server_spiffe_id, &config.server_spiffe_id_prefix) {
         (Some(id), None) => (id, ServerIdentity::Exact(id.clone())),
         (None, Some(prefix)) => (prefix, ServerIdentity::PathPrefix(prefix.clone())),
         _ => return Err(configuration_failure()),
     };
-    let endpoint = format!("unix:{}", config.workload_api_socket_path);
-    let workload = spiffe::WorkloadApiClient::connect_to(endpoint)
+    let workload_endpoint = format!("unix:{}", config.workload_api_socket_path);
+    let workload = spiffe::WorkloadApiClient::connect_to(workload_endpoint)
         .await
         .map_err(workload_failure)?;
     // Fetch afresh at every acquisition. Neither client credentials nor trust
@@ -235,10 +238,7 @@ async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailu
         .map_err(|_| configuration_failure())?;
     tls.alpn_protocols = vec![b"h2".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
-    let uri: http::Uri = config
-        .endpoint
-        .parse()
-        .map_err(|_| configuration_failure())?;
+    let uri: http::Uri = endpoint.parse().map_err(|_| configuration_failure())?;
     let host = uri
         .host()
         .ok_or_else(configuration_failure)?
@@ -268,13 +268,14 @@ async fn channel(config: &SpiffeBrokerConfig) -> Result<Channel, TokenGrantFailu
 
 pub async fn fetch(
     config: &SpiffeBrokerConfig,
+    endpoint: &str,
     runtime: &str,
     expected: &str,
     audience: &str,
 ) -> Result<SandboxJwtSvid, TokenGrantFailure> {
     let reference = reference(runtime)?;
     tokio::time::timeout(WORKLOAD_IDENTITY_CALL_TIMEOUT, async {
-        let mut grpc = tonic::client::Grpc::new(channel(config).await?);
+        let mut grpc = tonic::client::Grpc::new(channel(config, endpoint).await?);
         grpc.ready()
             .await
             .map_err(|_| failure(TokenGrantFailureKind::Unavailable))?;

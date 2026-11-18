@@ -1488,10 +1488,23 @@ X.509-SVID over mTLS.
 ```toml
 [openshell.gateway.spiffe_broker]
 spiffe_id_prefix = "spiffe://example.org/openshell"
-endpoint = "https://spire-broker.spire.svc:8443"
+node_local_port = 8443
 server_spiffe_id_prefix = "spiffe://example.org/spire/agent/k8s_psat/cluster"
 workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
 ```
+
+`node_local_port` connects directly to the SPIRE agent on the gateway Pod's
+node. Helm injects `OPENSHELL_NODE_IP` from the Downward API's `status.hostIP`;
+the gateway formats the IPv4 or IPv6 endpoint at startup without Kubernetes API
+calls or additional RBAC. A missing or invalid node IP prevents startup. The
+agent must expose its mTLS Broker listener on that node address through host
+networking or a host port. Broker traffic does not traverse a Kubernetes Service.
+The gateway does not fall back to a remote agent when its local agent is unavailable.
+
+Configure exactly one transport: `node_local_port`, or an explicit HTTPS
+`endpoint` for a fixed address or Service. Outside Helm, node-local deployments
+must supply `OPENSHELL_NODE_IP` themselves. Both modes retain the same mTLS,
+SPIFFE peer verification, broker allowlist, and Kubernetes authorization checks.
 
 Gateway session JWTs with a positive TTL are required.
 When enabling the broker on a gateway that omitted `gateway_jwt.ttl_secs`, set
@@ -1515,7 +1528,9 @@ permitted namespaces.
 Register each sandbox's stable SPIFFE ID against its attested Sandbox resource
 UID. The gateway supplies the UID from its persisted compute-runtime identity;
 workload Pod replacement does not change it. Registrations must reach every
-agent that serves the configured endpoint. Use a SPIRE node alias as the
+eligible agent. In node-local mode this includes every node where a gateway
+replica may run, so gateway rescheduling does not require re-registration.
+Use a SPIRE node alias as the
 registration parent to cover agents attested with the intended cluster,
 namespace, and ServiceAccount selectors, including newly added nodes. The
 alias does not change the agents' certificate identities.

@@ -68,6 +68,12 @@ spec:
         - {{ .Values.server.dbUrl | quote }}
         {{- end }}
       env:
+        {{- if hasKey $broker "node_local_port" }}
+        - name: OPENSHELL_NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        {{- end }}
         - name: OPENSHELL_REPLICA_ID
           valueFrom:
             fieldRef:

@@ -553,7 +553,11 @@ discovery endpoint or its TLS CA.
 For `supervisor_topology: gateway`, configure
 `gatewayConfig.openshell.gateway.spiffe_broker` instead. Only the gateway mounts
 the CSI Workload API socket and obtains stable sandbox identities through the
-Broker API; shared supervisors receive final access tokens. See
+Broker API; shared supervisors receive final access tokens.
+Set `node_local_port: 8443` instead of `endpoint` to use the gateway's local
+agent directly. The chart injects its node address from `status.hostIP`;
+the agent must expose its Broker port on that address. This path needs no
+Broker Service. See
 [gateway configuration](https://docs.nvidia.com/openshell/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api)
 for peer identity policies, multi-node registrations, and authorization.
 
