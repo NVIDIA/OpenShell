@@ -1675,21 +1675,6 @@ pub fn build_isolation_specs(
     workload
         .mounts
         .retain(|mount| !trusted_mount(&mount.destination));
-    workload.mounts.push(Mount {
-        kind: "tmpfs".into(),
-        source: "tmpfs".into(),
-        destination: openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT.into(),
-        options: vec![
-            "rw".into(),
-            "noexec".into(),
-            "nosuid".into(),
-            "nodev".into(),
-            // Libpod's OCI `mounts` API rejects tmpfs uid/gid options. The
-            // unprivileged runtime creates the owned material subdirectory.
-            "mode=0777".into(),
-            "size=1m".into(),
-        ],
-    });
     workload.volumes.push(NamedVolume {
         name: channel.clone(),
         dest: crate::isolation::CHANNEL_ROOT.into(),
@@ -2234,26 +2219,13 @@ mod tests {
                 .iter()
                 .all(|mount| !trusted_mount(&mount.destination))
         );
-        let supervisor_ca_mount = specs
-            .workload
-            .mounts
-            .iter()
-            .find(|mount| {
-                mount.destination == openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT
-            })
-            .expect("workload supervisor CA mount");
-        assert_eq!(supervisor_ca_mount.kind, "tmpfs");
-        assert_eq!(supervisor_ca_mount.source, "tmpfs");
-        for option in ["rw", "noexec", "nosuid", "nodev", "mode=0777", "size=1m"] {
-            assert!(supervisor_ca_mount.options.contains(&option.to_string()));
-        }
-        assert!(
-            specs
-                .workload
-                .mounts
-                .iter()
-                .all(|mount| mount.destination != "/run")
-        );
+        // The CA trust files are virtual: no workload mount carries them.
+        assert!(specs.workload.mounts.iter().all(|mount| {
+            !mount
+                .destination
+                .starts_with(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT)
+                && mount.destination != "/run"
+        }));
         assert_eq!(specs.supervisor.secrets.len(), 1);
         assert_eq!(specs.supervisor.secrets[0].source, "jwt");
         assert_eq!(specs.supervisor.secrets[0].uid, 1000);

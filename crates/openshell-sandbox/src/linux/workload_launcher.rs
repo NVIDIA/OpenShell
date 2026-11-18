@@ -143,10 +143,13 @@ mod tests {
             if syscall == libc::SYS_socket {
                 break notification;
             }
-            if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+            if syscall == libc::SYS_openat
+                || syscall == libc::SYS_openat2
+                || crate::linux::seccomp_notify::is_metadata_syscall(syscall)
+            {
                 listener
                     .respond_continue(notification.id)
-                    .expect("continue ordinary file open");
+                    .expect("continue ordinary file operation");
                 continue;
             }
             #[cfg(target_arch = "x86_64")]

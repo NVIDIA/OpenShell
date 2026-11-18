@@ -1,23 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The supervisor's public CA certificate and combined trust bundle, cached
-//! as sealed in-memory files.
+//! The supervisor's public CA certificate and combined trust bundle, served
+//! as virtual files.
 //!
-//! The runtime installs both as real read-only files beneath
-//! `SUPERVISOR_CA_RUNTIME_DIR` before the workload starts, and the child
-//! Landlock grants keep that directory readable. Every workload open already
-//! notifies the broker, and a plain read-only `open` or `openat` of exactly
-//! one of the two canonical paths is answered from this cache with the same
-//! immutable, sealed delivery a provider file receives. Every other open of
-//! those paths continues to the kernel, as it did before the cache existed.
-//!
-//! The installed files remain the compatibility source: `stat` and other
-//! metadata checks, `O_PATH` and `O_DIRECTORY` opens, `openat2`, relative
-//! opens, and aliases such as a path through `..` all reach them. The
-//! standard TLS environment variables and the image's system trust store are
-//! untouched, and no private key is ever here: both files are public
-//! material the supervisor already sends the workload.
+//! Nothing is written to any filesystem. The broker holds both files as one
+//! sealed in-memory pair and answers every open, `stat`, `statx`, and
+//! `access` of exactly the two canonical paths from it, with the semantics
+//! described in [`crate::provider_files`]; the TLS environment variables
+//! point at those paths. Both files are public material the supervisor
+//! already sends the workload, and no private key is ever here.
 //!
 //! The two files are one generation. A publication prepares both before it
 //! replaces the pair, so a failed update leaves the previous complete pair in
@@ -33,15 +25,16 @@ use openshell_sandbox_backend::boundary_protocol::MAX_CONTROL_FRAME_BYTES;
 
 use crate::linux::sealed_file::{OwnDescriptors, SealedFile};
 
-/// File name of the supervisor's public CA certificate.
-pub const CA_CERT_FILE_NAME: &str = "ca.crt";
-/// File name of the combined trust bundle: the system CAs plus the
-/// supervisor CA.
-pub const CA_BUNDLE_FILE_NAME: &str = "ca-bundle.crt";
 /// Canonical workload path of the supervisor CA certificate.
 pub const CA_CERT_PATH: &str = "/run/openshell-supervisor-ca/material/ca.crt";
 /// Canonical workload path of the combined trust bundle.
 pub const CA_BUNDLE_PATH: &str = "/run/openshell-supervisor-ca/material/ca-bundle.crt";
+
+/// The canonical `(certificate, bundle)` paths the TLS environment names.
+#[must_use]
+pub fn canonical_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    (CA_CERT_PATH.into(), CA_BUNDLE_PATH.into())
+}
 
 /// The most either file may hold.
 ///
@@ -52,7 +45,7 @@ pub const CA_BUNDLE_PATH: &str = "/run/openshell-supervisor-ca/material/ca-bundl
 /// larger than a frame can be published.
 pub const MAX_TRUST_FILE_BYTES: usize = MAX_CONTROL_FRAME_BYTES;
 
-/// The mode the injected files report, the same as the installed files.
+/// The mode the files report: public, read-only.
 const FILE_MODE: Mode = Mode::from_bits_truncate(0o444);
 
 /// Refuse a pair that is not a complete, consistent supervisor trust set.
@@ -191,7 +184,10 @@ impl TrustFile {
 
 #[cfg(test)]
 mod tests {
-    use super::{CA_BUNDLE_PATH, CA_CERT_PATH, CaTrustFiles, MAX_TRUST_FILE_BYTES, validate_pair};
+    use super::{
+        CA_BUNDLE_PATH, CA_CERT_PATH, CaTrustFiles, MAX_TRUST_FILE_BYTES, canonical_paths,
+        validate_pair,
+    };
     use std::fs::File;
     use std::io::{self, Read as _};
     use std::os::unix::fs::MetadataExt as _;
@@ -216,6 +212,13 @@ mod tests {
         let mut content = Vec::new();
         (&file).read_to_end(&mut content).unwrap();
         Some((content, (metadata.dev(), metadata.ino())))
+    }
+
+    #[test]
+    fn canonical_paths_lie_in_the_reserved_runtime_directory() {
+        let (cert, bundle) = canonical_paths();
+        assert!(cert.starts_with(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR));
+        assert!(bundle.starts_with(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR));
     }
 
     #[test]

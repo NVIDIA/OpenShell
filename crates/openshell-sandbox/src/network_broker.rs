@@ -747,6 +747,11 @@ fn dispatch_notification(
     if syscall == libc::SYS_open {
         return queues.provider_files.handle_open(listener, notification);
     }
+    if crate::linux::seccomp_notify::is_metadata_syscall(syscall) {
+        return queues
+            .provider_files
+            .handle_metadata(listener, notification);
+    }
     if matches!(syscall, libc::SYS_kill | libc::SYS_rt_sigqueueinfo) {
         return crate::linux::process_signal::mediate_process_signal(
             listener,
@@ -2501,16 +2506,20 @@ mod tests {
     #[test]
     fn ca_trust_files_are_served_at_their_canonical_paths_through_the_listener() {
         use crate::ca_trust_files::{CA_BUNDLE_PATH, CA_CERT_PATH};
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
         const CERT: &str = "-----BEGIN CERTIFICATE-----\nlistener\n-----END CERTIFICATE-----\n";
 
         let (launcher, listener) =
             crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start broker");
-        // Before publication the canonical path is continued, so the kernel
-        // answers for whatever is (or is not) installed there.
+        // Before publication the canonical path continues to the kernel,
+        // where nothing exists.
         let before = launcher.execute(|| std::fs::read(CA_CERT_PATH)).unwrap();
-        assert!(before.map_or(true, |content| content != CERT.as_bytes()));
+        assert_eq!(before.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        let before = launcher
+            .execute(|| std::fs::metadata(CA_CERT_PATH))
+            .unwrap();
+        assert_eq!(before.unwrap_err().raw_os_error(), Some(libc::ENOENT));
 
         // A bundle well beyond the provider file bound.
         let bundle = format!("{}{CERT}", "S".repeat(150 * 1024));
@@ -2528,11 +2537,41 @@ mod tests {
             .unwrap()
             .expect("canonical bundle open");
         assert_eq!(served_bundle, bundle.as_bytes());
-        // Opens the cache does not serve continue to the kernel, which
-        // answers for the installed file (absent on a test host, so ENOENT;
-        // ENOTDIR for O_DIRECTORY where it exists). None is answered from
-        // the cache, and none is refused by the broker.
-        let kernel_answer = |flags: i32| {
+
+        // What a TLS client checks before opening: the path is a regular
+        // read-only file of the served size, the same file an open yields.
+        let opened = launcher
+            .execute(|| std::fs::File::open(CA_BUNDLE_PATH))
+            .unwrap()
+            .unwrap();
+        let by_path = launcher
+            .execute(|| std::fs::metadata(CA_BUNDLE_PATH))
+            .unwrap()
+            .expect("stat of the canonical bundle");
+        let by_descriptor = opened.metadata().unwrap();
+        assert!(by_path.is_file());
+        assert_eq!(by_path.len(), bundle.len() as u64);
+        assert_eq!(
+            (by_path.dev(), by_path.ino()),
+            (by_descriptor.dev(), by_descriptor.ino())
+        );
+        assert_eq!(by_path.mode() & 0o7777, 0o444);
+        let symlink_stat = launcher
+            .execute(|| std::fs::symlink_metadata(CA_CERT_PATH))
+            .unwrap()
+            .unwrap();
+        assert!(symlink_stat.is_file());
+        let readable = launcher
+            .execute(|| nix::unistd::access(CA_BUNDLE_PATH, nix::unistd::AccessFlags::R_OK))
+            .unwrap();
+        assert!(readable.is_ok());
+        let writable = launcher
+            .execute(|| nix::unistd::access(CA_BUNDLE_PATH, nix::unistd::AccessFlags::W_OK))
+            .unwrap();
+        assert_eq!(writable.unwrap_err(), nix::errno::Errno::EACCES);
+
+        // Every other form of open is decided here, never continued.
+        let open_with = |flags: i32| {
             launcher
                 .execute(move || {
                     std::fs::OpenOptions::new()
@@ -2542,40 +2581,30 @@ mod tests {
                 })
                 .unwrap()
         };
-        for (flags, allowed) in [
-            (libc::O_DIRECTORY, &[libc::ENOENT, libc::ENOTDIR][..]),
-            (libc::O_PATH, &[libc::ENOENT][..]),
-        ] {
-            match kernel_answer(flags) {
-                Ok(opened) => assert_ne!(
-                    opened.metadata().unwrap().len(),
-                    CERT.len() as u64,
-                    "flags {flags:#x} must not reach the cached file"
-                ),
-                Err(error) => assert!(
-                    allowed.contains(&error.raw_os_error().unwrap()),
-                    "flags {flags:#x}: {error}"
-                ),
-            }
-        }
+        assert_eq!(
+            open_with(libc::O_DIRECTORY).unwrap_err().raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        assert_eq!(
+            open_with(libc::O_PATH).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
         let write_attempt = launcher
             .execute(|| std::fs::OpenOptions::new().write(true).open(CA_BUNDLE_PATH))
             .unwrap()
-            .expect_err("a write-capable open is not served and fails natively");
-        assert!(
-            [libc::ENOENT, libc::EACCES].contains(&write_attempt.raw_os_error().unwrap()),
-            "{write_attempt}"
-        );
+            .expect_err("a write-capable open is refused");
+        assert_eq!(write_attempt.raw_os_error(), Some(libc::EACCES));
 
-        // An alias is not the canonical path: it continues to the kernel and
-        // is never answered from the cache.
-        let alias = format!(
-            "{}/../material/{}",
-            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR,
-            crate::ca_trust_files::CA_CERT_FILE_NAME
-        );
-        let via_alias = launcher.execute(move || std::fs::read(alias)).unwrap();
-        assert!(via_alias.map_or(true, |content| content != CERT.as_bytes()));
+        // The directory does not exist, and an alias is not the canonical
+        // path: both continue to the kernel and find nothing.
+        let directory = std::path::Path::new(CA_CERT_PATH).parent().unwrap();
+        for path in [
+            directory.to_path_buf(),
+            directory.join("../material").join("ca.crt"),
+        ] {
+            let result = launcher.execute(move || std::fs::metadata(path)).unwrap();
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        }
 
         // Provider updates, including detaching everything, leave the trust
         // files served.
@@ -2594,14 +2623,18 @@ mod tests {
         assert_eq!(still_served, CERT.as_bytes());
 
         // A held descriptor outlives the pair; after an explicit clear the
-        // canonical path continues to the kernel like any other.
+        // canonical path is gone again.
         let mut held = launcher
             .execute(|| std::fs::File::open(CA_CERT_PATH))
             .unwrap()
             .expect("hold the cached certificate");
         broker.provider_files().clear_ca_trust();
         let after_clear = launcher.execute(|| std::fs::read(CA_CERT_PATH)).unwrap();
-        assert!(after_clear.map_or(true, |content| content != CERT.as_bytes()));
+        assert_eq!(after_clear.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        let after_clear = launcher
+            .execute(|| std::fs::metadata(CA_CERT_PATH))
+            .unwrap();
+        assert_eq!(after_clear.unwrap_err().raw_os_error(), Some(libc::ENOENT));
         let mut held_content = String::new();
         io::Read::read_to_string(&mut held, &mut held_content).unwrap();
         assert_eq!(held_content, CERT);
@@ -2789,11 +2822,11 @@ mod tests {
                     (libc::O_RDONLY | libc::O_CREAT, libc::EACCES),
                     (libc::O_RDONLY | libc::O_TRUNC, libc::EACCES),
                     (libc::O_RDONLY | libc::O_APPEND, libc::EACCES),
-                    // O_TMPFILE includes the O_DIRECTORY bit, so a directory
-                    // open is refused as a creating one.
-                    (libc::O_RDONLY | libc::O_DIRECTORY, libc::EACCES),
+                    (libc::O_RDONLY | libc::O_TMPFILE, libc::EACCES),
+                    (libc::O_RDONLY | libc::O_DIRECTORY, libc::ENOTDIR),
+                    (libc::O_PATH | libc::O_DIRECTORY, libc::ENOTDIR),
                     (libc::O_RDONLY | libc::O_DIRECT, libc::EINVAL),
-                    (libc::O_RDONLY | libc::O_PATH, libc::EINVAL),
+                    (libc::O_PATH, libc::EINVAL),
                 ] {
                     check(
                         errno_of(raw_openat(provider_path.as_ptr(), flags)) == Some(errno),
@@ -2816,9 +2849,109 @@ mod tests {
                 check(
                     errno_of(raw_openat(missing.as_ptr(), libc::O_WRONLY)) == Some(libc::ENOENT)
                         && errno_of(raw_openat2(missing, read_only, 0, 0x08, 24))
+                            == Some(libc::ENOENT)
+                        && errno_of(std::fs::metadata(missing.to_str().unwrap()))
                             == Some(libc::ENOENT),
                     "unpublished provider file",
                 )?;
+
+                // Metadata by path is the injected descriptor's, written
+                // into the caller's buffer; the directory does not exist.
+                let by_path = std::fs::metadata(provider).map_err(|e| e.to_string())?;
+                check(
+                    (by_path.dev(), by_path.ino(), by_path.mode() & 0o7777) == identity(&first)
+                        && by_path.len() == 10
+                        && by_path.is_file(),
+                    "stat by path differs from fstat",
+                )?;
+                check(
+                    errno_of(std::fs::metadata("/run/openshell/providers/acme"))
+                        == Some(libc::ENOENT),
+                    "provider directory exists",
+                )?;
+                let statx = |flags: i32, mask: u32, buffer: *mut u8| -> Option<i32> {
+                    // SAFETY: the path is NUL-terminated; buffer is either a
+                    // live 256-byte region or deliberately invalid.
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_statx,
+                            libc::AT_FDCWD,
+                            provider_path.as_ptr(),
+                            flags,
+                            mask,
+                            buffer,
+                        )
+                    };
+                    (result < 0).then(|| io::Error::last_os_error().raw_os_error().unwrap())
+                };
+                let mut statx_buffer = [0_u64; 32];
+                check(
+                    statx(0, 0x7ff, statx_buffer.as_mut_ptr().cast()).is_none()
+                        && u64::from_ne_bytes(statx_buffer[5].to_ne_bytes()) == 10,
+                    "statx size",
+                )?;
+                check(
+                    statx(0x1_0000, 0x7ff, statx_buffer.as_mut_ptr().cast()) == Some(libc::EINVAL)
+                        && statx(0, 0x8000_0000, statx_buffer.as_mut_ptr().cast())
+                            == Some(libc::EINVAL),
+                    "statx with an unsupported flag or reserved mask bit",
+                )?;
+                // An unwritable result buffer is EFAULT, and the broker
+                // stays healthy.
+                check(
+                    statx(0, 0x7ff, std::ptr::null_mut()) == Some(libc::EFAULT)
+                        && statx(0, 0x7ff, 0x10 as *mut u8) == Some(libc::EFAULT),
+                    "statx into an invalid buffer",
+                )?;
+                let fstatat = |flags: i32| -> Option<i32> {
+                    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                    // SAFETY: path and buffer are live for the call.
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_newfstatat,
+                            libc::AT_FDCWD,
+                            provider_path.as_ptr(),
+                            stat.as_mut_ptr(),
+                            flags,
+                        )
+                    };
+                    (result < 0).then(|| io::Error::last_os_error().raw_os_error().unwrap())
+                };
+                check(
+                    fstatat(libc::AT_SYMLINK_NOFOLLOW).is_none()
+                        && fstatat(0x4000) == Some(libc::EINVAL)
+                        && statx(0x4000, 0x7ff, statx_buffer.as_mut_ptr().cast()).is_none()
+                        && fstatat(0x8000) == Some(libc::EINVAL),
+                    "fstatat and statx flag sets",
+                )?;
+                let access = |mode: i32, flags: i32| -> Option<i32> {
+                    // SAFETY: the path is NUL-terminated.
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_faccessat2,
+                            libc::AT_FDCWD,
+                            provider_path.as_ptr(),
+                            mode,
+                            flags,
+                        )
+                    };
+                    (result < 0).then(|| io::Error::last_os_error().raw_os_error().unwrap())
+                };
+                // (mode, flags, expected errno) for a read-only file.
+                let access_cases: [(i32, i32, Option<i32>); 6] = [
+                    (libc::F_OK, 0, None),
+                    (libc::R_OK, 0x200, None),
+                    (libc::W_OK, 0, Some(libc::EACCES)),
+                    (libc::X_OK, 0, Some(libc::EACCES)),
+                    (0o10, 0, Some(libc::EINVAL)),
+                    (libc::R_OK, 0x8000, Some(libc::EINVAL)),
+                ];
+                for (mode, flags, expected) in access_cases {
+                    check(
+                        access(mode, flags) == expected,
+                        &format!("access mode {mode:#o} flags {flags:#x}"),
+                    )?;
+                }
 
                 // Ordinary opens are the kernel's, with every open_how field.
                 let ordinary = std::ffi::CString::new(ordinary.to_str().unwrap()).unwrap();

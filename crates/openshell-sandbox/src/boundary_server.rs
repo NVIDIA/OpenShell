@@ -3981,17 +3981,12 @@ mod linux {
                     format!("invalid provider files: {error}"),
                 );
             }
-            let ca_file_paths = match install_ca_material(ca_cert, ca_bundle) {
-                Ok(paths) => paths,
-                Err(error) => return guest_error(BoundaryErrorKind::Process, error),
-            };
-            // The installed files are complete; publish the same bytes to the
-            // broker before anything can open them. A refused publication
-            // keeps the previously published pair, if any, and fails the
-            // start as the installation would have. A start without CA
-            // material installs no files and no grants, so a pair cached by
-            // an earlier failed start is forgotten before the spawn.
-            match (&requested.ca_cert, &requested.ca_bundle) {
+            // The CA trust files exist only in the broker: publish the pair
+            // before anything can open it. A refused publication keeps the
+            // previously published pair, if any, and fails the start. A
+            // start without CA material forgets a pair cached by an earlier
+            // failed start before the spawn.
+            let ca_file_paths = match (ca_cert, ca_bundle) {
                 (Some(ca_cert), Some(ca_bundle)) => {
                     if let Err(error) = self
                         .network_broker
@@ -4003,9 +3998,19 @@ mod linux {
                             format!("publish supervisor CA trust files: {error}"),
                         );
                     }
+                    Some(crate::ca_trust_files::canonical_paths())
                 }
-                _ => self.network_broker.provider_files().clear_ca_trust(),
-            }
+                (None, None) => {
+                    self.network_broker.provider_files().clear_ca_trust();
+                    None
+                }
+                _ => {
+                    return guest_error(
+                        BoundaryErrorKind::Process,
+                        "supervisor CA certificate and bundle must be supplied together",
+                    );
+                }
+            };
             let mut policy = policy.into();
             let gpu_requested = self
                 .config
@@ -4273,130 +4278,6 @@ mod linux {
                 .confirm_healthy()
                 .map_err(|error| format!("verify sandbox network broker: {error}"))
         }
-    }
-
-    fn install_ca_material(
-        ca_cert: Option<String>,
-        ca_bundle: Option<String>,
-    ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
-        let (ca_cert, ca_bundle) = match (ca_cert, ca_bundle) {
-            (Some(ca_cert), Some(ca_bundle)) => (ca_cert, ca_bundle),
-            (None, None) => return Ok(None),
-            _ => {
-                return Err(
-                    "supervisor CA certificate and bundle must be supplied together".to_string(),
-                );
-            }
-        };
-        // The same pair check the broker's cache applies, before any file is
-        // written: an inconsistent pair is never installed anywhere.
-        crate::ca_trust_files::validate_pair(ca_cert.as_bytes(), ca_bundle.as_bytes())
-            .map_err(|error| format!("invalid supervisor CA material: {error}"))?;
-        install_ca_material_at(
-            Path::new(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR),
-            ca_cert.as_bytes(),
-            ca_bundle.as_bytes(),
-        )
-    }
-
-    fn install_ca_material_at(
-        directory: &Path,
-        ca_cert: &[u8],
-        ca_bundle: &[u8],
-    ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
-        use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-        let parent = directory
-            .parent()
-            .ok_or_else(|| "supervisor CA directory has no parent".to_string())?;
-        for path in [parent, directory] {
-            match std::fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(format!(
-                        "supervisor CA directory component is a symlink: {}",
-                        path.display()
-                    ));
-                }
-                Ok(metadata) if !metadata.is_dir() => {
-                    return Err(format!(
-                        "supervisor CA directory component is not a directory: {}",
-                        path.display()
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    std::fs::create_dir(path).map_err(|error| {
-                        format!("create supervisor CA directory {}: {error}", path.display())
-                    })?;
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "inspect supervisor CA directory {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-            let current_mode = std::fs::metadata(path)
-                .map_err(|error| {
-                    format!(
-                        "inspect supervisor CA directory permissions {}: {error}",
-                        path.display()
-                    )
-                })?
-                .permissions()
-                .mode();
-            if path == directory {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(
-                    |error| {
-                        format!(
-                            "set supervisor CA directory permissions {}: {error}",
-                            path.display()
-                        )
-                    },
-                )?;
-            } else if current_mode & 0o111 != 0o111 {
-                return Err(format!(
-                    "supervisor CA parent is not traversable by workload identities: {}",
-                    path.display()
-                ));
-            }
-        }
-        let ca_path = directory.join(crate::ca_trust_files::CA_CERT_FILE_NAME);
-        let bundle_path = directory.join(crate::ca_trust_files::CA_BUNDLE_FILE_NAME);
-        for (path, contents, label) in [
-            (&ca_path, ca_cert, "supervisor CA"),
-            (&bundle_path, ca_bundle, "supervisor CA bundle"),
-        ] {
-            let temporary = path.with_extension("tmp");
-            if let Ok(metadata) = std::fs::symlink_metadata(&temporary) {
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(format!(
-                        "refusing unsafe temporary {label} path: {}",
-                        temporary.display()
-                    ));
-                }
-                std::fs::remove_file(&temporary)
-                    .map_err(|error| format!("remove stale temporary {label}: {error}"))?;
-            }
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o444)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&temporary)
-                .map_err(|error| format!("create temporary {label}: {error}"))?;
-            if let Err(error) = file
-                .write_all(contents)
-                .and_then(|()| file.sync_all())
-                .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(0o444)))
-                .and_then(|()| std::fs::rename(&temporary, path))
-            {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(format!("install {label}: {error}"));
-            }
-        }
-        Ok(Some((ca_path, bundle_path)))
     }
 
     type ProcessExit = Result<ExitStatusWire, String>;
@@ -5729,65 +5610,6 @@ mod linux {
             let debug = format!("{config:?}");
             assert!(debug.contains("test-key"));
             assert!(!debug.contains(&verification_key.public_key_pem));
-        }
-
-        #[test]
-        fn installed_supervisor_ca_is_readable_by_a_non_root_workload_identity() {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            let root = tempfile::tempdir().expect("temporary CA root");
-            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-            let directory = root.path().join("openshell-supervisor-ca");
-            let (ca_path, bundle_path) = install_ca_material_at(
-                &directory,
-                b"public test certificate",
-                b"public test bundle",
-            )
-            .expect("install supervisor CA")
-            .expect("CA paths");
-
-            assert_eq!(
-                std::fs::metadata(directory.parent().unwrap())
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o111,
-                0o111,
-                "non-root workload identities must be able to traverse the full path"
-            );
-            assert_eq!(
-                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
-                0o755,
-                "non-root workload identities must be able to traverse the CA directory"
-            );
-            for (path, expected) in [
-                (&ca_path, b"public test certificate".as_slice()),
-                (&bundle_path, b"public test bundle".as_slice()),
-            ] {
-                assert_eq!(
-                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                    0o444,
-                    "public CA material must be readable by the workload"
-                );
-                assert_eq!(std::fs::read(path).unwrap(), expected);
-            }
-        }
-
-        #[test]
-        fn supervisor_ca_install_rejects_a_symlinked_directory() {
-            let root = tempfile::tempdir().expect("temporary CA root");
-            let target = root.path().join("target");
-            std::fs::create_dir(&target).unwrap();
-            let parent = root.path();
-            std::os::unix::fs::symlink(&target, parent.join("openshell-supervisor-ca")).unwrap();
-
-            let error = install_ca_material_at(
-                &parent.join("openshell-supervisor-ca"),
-                b"certificate",
-                b"bundle",
-            )
-            .expect_err("symlinked CA directory must fail closed");
-            assert!(error.contains("symlink"), "unexpected error: {error}");
         }
 
         #[test]

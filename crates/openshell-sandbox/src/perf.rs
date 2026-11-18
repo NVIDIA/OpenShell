@@ -76,6 +76,8 @@ pub enum Protocol {
     FileOpenRead,
     /// Read `payload-bytes` from one descriptor opened before measurement.
     FileRead,
+    /// `stat` a file by path; the broker answers a provider path.
+    FileStat,
     /// `file-open-read` and `tcp-connect` workers running at the same time.
     MixedFileTcpConnect,
     /// `file-open-read` and `tcp-stream` workers running at the same time.
@@ -93,6 +95,7 @@ impl Protocol {
                 Self::FileOpenClose,
                 Self::FileOpenRead,
                 Self::FileRead,
+                Self::FileStat,
             ]),
             _ => Ok(vec![
                 Self::from_str(value, true).map_err(|error| anyhow::anyhow!("{error}"))?,
@@ -418,7 +421,10 @@ impl Fixture {
             Protocol::TcpConnect | Protocol::MixedFileTcpConnect => start_tcp_fixture(false),
             Protocol::TcpStream | Protocol::MixedFileTcpStream => start_tcp_fixture(true),
             // File protocols need no peer; the worker ignores the target.
-            Protocol::FileOpenClose | Protocol::FileOpenRead | Protocol::FileRead => Ok(Self {
+            Protocol::FileOpenClose
+            | Protocol::FileOpenRead
+            | Protocol::FileRead
+            | Protocol::FileStat => Ok(Self {
                 target: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             }),
         }
@@ -716,6 +722,7 @@ fn throughput_mbit_per_second(
         // A mixed protocol is reported per class, never as a whole.
         Protocol::TcpConnect
         | Protocol::FileOpenClose
+        | Protocol::FileStat
         | Protocol::MixedFileTcpConnect
         | Protocol::MixedFileTcpStream => 0,
         Protocol::TcpStream => payload_bytes.saturating_mul(2),
@@ -732,6 +739,7 @@ impl Protocol {
             Self::FileOpenClose => "read-only file open and close",
             Self::FileOpenRead => "read-only file open, one read, and close",
             Self::FileRead => "read on an already-open descriptor; no open is measured",
+            Self::FileStat => "stat by path; no descriptor is created",
             Self::MixedFileTcpConnect | Self::MixedFileTcpStream => {
                 "file opens and TCP operations at the same time"
             }
@@ -760,7 +768,7 @@ impl Protocol {
     const fn is_file(self) -> bool {
         matches!(
             self,
-            Self::FileOpenClose | Self::FileOpenRead | Self::FileRead
+            Self::FileOpenClose | Self::FileOpenRead | Self::FileRead | Self::FileStat
         )
     }
 }
@@ -912,6 +920,16 @@ fn one_operation(
             let read = file.read_at(&mut prepared.response, 0)?;
             require_data(read)?;
             require_expected(&prepared.response[..read], prepared.expected.as_deref())?;
+        }
+        Protocol::FileStat => {
+            let metadata = std::fs::metadata(file_path)?;
+            if let Some(expected) = prepared.expected.as_deref()
+                && metadata.len() < expected.len() as u64
+            {
+                return Err(content_mismatch(
+                    "stat reports a shorter file than expected",
+                ));
+            }
         }
         Protocol::MixedFileTcpConnect | Protocol::MixedFileTcpStream => {
             unreachable!("a mixed protocol runs as its classes")
@@ -1184,6 +1202,7 @@ mod tests {
             Protocol::FileOpenClose,
             Protocol::FileOpenRead,
             Protocol::FileRead,
+            Protocol::FileStat,
         ] {
             let report = one_report(&file_run(protocol, &path));
             // Two threads, 64 iterations each.
@@ -1206,6 +1225,7 @@ mod tests {
             Protocol::FileOpenClose,
             Protocol::FileOpenRead,
             Protocol::FileRead,
+            Protocol::FileStat,
         ] {
             assert!(run_worker(&file_run(protocol, &missing)).is_err());
         }

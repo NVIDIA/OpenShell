@@ -20,6 +20,10 @@ use std::time::Duration;
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
+/// Linux 5.19: once the listener has received a notification, the notifying
+/// task waits for the response in a killable sleep instead of an
+/// interruptible one.
+const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_ulong = 1 << 5;
 
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
@@ -196,11 +200,14 @@ impl NotificationProbeReport {
 
 /// Owned listener returned by `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 ///
-/// The listener is installed without `WAIT_KILLABLE_RECV`, so mediation is the
-/// same on every kernel. A signal can interrupt a notified syscall, which the
-/// kernel then restarts or fails with `EINTR`; broker handlers check the
-/// notification is still live before acting and answer a repeated operation
-/// as the kernel would.
+/// Two kinds of listener exist. [`install_listener`] installs one without
+/// `WAIT_KILLABLE_RECV`: a signal can interrupt a notified syscall at any
+/// time, which the kernel then restarts or fails with `EINTR`, so broker
+/// handlers check the notification is still live before acting and answer a
+/// repeated operation as the kernel would. [`install_workload_listener`]
+/// installs the production listener with `WAIT_KILLABLE_RECV`, because it
+/// writes syscall results into the notifying task's memory; see that
+/// function for what the flag changes.
 pub struct NotificationListener {
     fd: OwnedFd,
 }
@@ -383,11 +390,22 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
         .into_iter()
         .map(FilterRule::Notify)
         .collect::<Vec<_>>();
-    install_rules(&rules)
+    install_rules(&rules, ListenerWait::Interruptible)
 }
 
-/// Install the capability-free workload networking listener on the calling
-/// launcher thread.
+/// Install a listener for exactly `syscalls` with `WAIT_KILLABLE_RECV`, the
+/// production wait mode, so tests can observe that mode in isolation.
+#[cfg(test)]
+pub(crate) fn install_wait_killable_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
+    let rules = syscalls
+        .iter()
+        .map(|syscall| FilterRule::Notify(*syscall))
+        .collect::<Vec<_>>();
+    install_rules(&rules, ListenerWait::KillableOnceReceived)
+}
+
+/// Install the capability-free workload listener on the calling launcher
+/// thread.
 ///
 /// The filter mediates every syscall that can create, select, or materially
 /// reconfigure an INET endpoint. Connected `send()`/null-destination
@@ -395,18 +413,80 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 /// natively: the broker binds every INET socket to loopback before injecting
 /// it, and accepted sockets inherit their listener's binding. `setsockopt`
 /// allows the [`SETSOCKOPT_FAST_PATH`] pairs in the filter. Every `open`,
-/// `openat`, and `openat2` notifies: the broker serves provider files by
-/// descriptor injection.
+/// `openat`, and `openat2` notifies, and so does every path-based metadata
+/// call in [`metadata_syscalls`]: the broker serves provider and CA trust
+/// files by descriptor injection and answers their metadata by writing the
+/// result into the caller's buffer.
+///
+/// That write is why the listener is installed with `WAIT_KILLABLE_RECV`: a
+/// task can have only one listener (a second fails with `EBUSY`), so the
+/// flag covers every notified syscall. Before the broker receives a
+/// notification, signals interrupt the syscall as before. Once received,
+/// only a fatal signal ends the wait; a handled signal is delivered after the
+/// broker responds. A `connect` awaiting the supervisor's network admission
+/// decision therefore ignores handled `SIGALRM` and `SIGINT` until the broker
+/// answers or its 30-second decision timeout fails the call; DNS relay waits
+/// are bounded at 10 seconds. A blocking loopback `connect` is completed by
+/// the broker with a native `libc::connect` on a duplicate of the socket and
+/// waits for the kernel's connect timeout, which can exceed 30 seconds.
+/// Fatal signals still terminate the task throughout. In return, a received
+/// notification ends only by response or death, so a written result can never
+/// land in a stack frame the task has left.
 pub fn install_workload_listener() -> io::Result<NotificationListener> {
-    install_rules(&workload_filter_rules())
+    install_rules(&workload_filter_rules(), ListenerWait::KillableOnceReceived)
+}
+
+/// How a notifying task waits for the broker's response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerWait {
+    /// Any signal interrupts the wait at any time.
+    Interruptible,
+    /// `WAIT_KILLABLE_RECV`: only a fatal signal interrupts the wait once the
+    /// broker has received the notification.
+    KillableOnceReceived,
 }
 
 /// Qualify the notification ABI, set `no_new_privs` on the calling thread,
 /// and install `rules` there.
-fn install_rules(rules: &[FilterRule]) -> io::Result<NotificationListener> {
+fn install_rules(rules: &[FilterRule], wait: ListenerWait) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
-    install_notification_filter(rules)
+    install_notification_filter(rules, wait)
+}
+
+/// The path-based metadata syscalls the workload listener notifies.
+///
+/// `newfstatat`, `statx`, `faccessat`, and `faccessat2`, plus the legacy
+/// `stat`, `lstat`, and `access` entry points on x86-64. Descriptor based
+/// calls (`fstat`, `statx` with an empty path) are not among them: an
+/// injected descriptor answers them in the kernel.
+pub fn metadata_syscalls() -> Vec<i64> {
+    #[allow(unused_mut)] // The legacy entry points exist only on x86-64.
+    let mut syscalls = vec![
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        libc::SYS_faccessat2,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    syscalls.extend([libc::SYS_stat, libc::SYS_lstat, libc::SYS_access]);
+    syscalls
+}
+
+/// Whether `syscall` is one of [`metadata_syscalls`].
+#[must_use]
+pub fn is_metadata_syscall(syscall: i64) -> bool {
+    if matches!(
+        syscall,
+        libc::SYS_newfstatat | libc::SYS_statx | libc::SYS_faccessat | libc::SYS_faccessat2
+    ) {
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if matches!(syscall, libc::SYS_stat | libc::SYS_lstat | libc::SYS_access) {
+        return true;
+    }
+    false
 }
 
 fn workload_filter_rules() -> Vec<FilterRule> {
@@ -430,6 +510,7 @@ fn workload_filter_rules() -> Vec<FilterRule> {
     ];
     #[cfg(target_arch = "x86_64")]
     syscalls.push(libc::SYS_open);
+    syscalls.extend(metadata_syscalls());
     syscalls
         .into_iter()
         .map(|syscall| {
@@ -741,7 +822,7 @@ fn probe_scalar_setsockopt_fast_path() -> io::Result<()> {
 
     let (sender, receiver) = mpsc::sync_channel(1);
     let launcher = thread::spawn(move || -> io::Result<()> {
-        let listener = install_rules(&[FilterRule::ScalarSetsockopt])?;
+        let listener = install_rules(&[FilterRule::ScalarSetsockopt], ListenerWait::Interruptible)?;
         sender
             .send(listener)
             .map_err(|_| io::Error::other("setsockopt broker disappeared"))?;
@@ -863,7 +944,10 @@ fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Not
     listener.receive()
 }
 
-fn install_notification_filter(rules: &[FilterRule]) -> io::Result<NotificationListener> {
+fn install_notification_filter(
+    rules: &[FilterRule],
+    wait: ListenerWait,
+) -> io::Result<NotificationListener> {
     let mut program = build_filter(rules)?;
     let length = u16::try_from(program.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seccomp filter is too large"))?;
@@ -871,7 +955,12 @@ fn install_notification_filter(rules: &[FilterRule]) -> io::Result<NotificationL
         len: length,
         filter: program.as_mut_ptr(),
     };
-    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+    let flags = match wait {
+        ListenerWait::Interruptible => SECCOMP_FILTER_FLAG_NEW_LISTENER,
+        ListenerWait::KillableOnceReceived => {
+            SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+        }
+    };
     // SAFETY: `fprog` points to a live classic-BPF program for the duration of
     // the syscall. The returned nonnegative value is a newly owned FD.
     let result = unsafe {
@@ -883,7 +972,17 @@ fn install_notification_filter(rules: &[FilterRule]) -> io::Result<NotificationL
         )
     };
     if result < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if wait == ListenerWait::KillableOnceReceived && error.raw_os_error() == Some(libc::EINVAL)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "kernel refused SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV ({error}); the sandbox requires Linux 5.19 or newer with user-notification wait-killable support"
+                ),
+            ));
+        }
+        return Err(error);
     }
     let fd = RawFd::try_from(result)
         .map_err(|_| io::Error::other("seccomp listener FD does not fit RawFd"))?;
@@ -1141,6 +1240,7 @@ fn ioctl_ptr(fd: RawFd, request: libc::c_ulong, argument: *mut libc::c_void) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
     use std::process::Command;
 
     use super::*;
@@ -1362,6 +1462,166 @@ mod tests {
             evaluate(&program, libc::SYS_openat2, [0, 0x1000, 0x2000, 24, 0, 0]),
             SECCOMP_RET_USER_NOTIF
         );
+    }
+
+    #[test]
+    fn workload_filter_notifies_every_metadata_syscall() {
+        let program = build_filter(&workload_filter_rules()).unwrap();
+        for syscall in metadata_syscalls() {
+            assert!(is_metadata_syscall(syscall));
+            assert_eq!(
+                evaluate(&program, syscall, [0x1000, 0x2000, 0, 0, 0, 0]),
+                SECCOMP_RET_USER_NOTIF,
+                "{syscall}"
+            );
+        }
+        // Descriptor-based metadata stays in the kernel.
+        assert_eq!(
+            evaluate(&program, libc::SYS_fstat, [3, 0x1000, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
+        );
+        assert!(!is_metadata_syscall(libc::SYS_fstat));
+    }
+
+    const WAIT_KILLABLE_CHILD: &str = "OPENSHELL_WAIT_KILLABLE_CHILD";
+    const WAIT_KILLABLE_MARKER: &CStr = c"/openshell-wait-killable-marker";
+    const CHILD_INTERRUPTED: i32 = 7;
+    static HANDLED_SIGNALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn count_handled_signal(_: libc::c_int) {
+        HANDLED_SIGNALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Child of [`wait_killable_listener_defers_handled_signals_until_the_response`]:
+    /// a notified `faccessat` of the marker path with a `SIGUSR1` handler
+    /// installed, then a second one that is only ever ended by `SIGKILL`.
+    fn wait_killable_child() -> ! {
+        let marker_access = || {
+            // SAFETY: the marker path is a live NUL-terminated string.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_faccessat,
+                    libc::AT_FDCWD,
+                    WAIT_KILLABLE_MARKER.as_ptr(),
+                    libc::F_OK,
+                    0,
+                )
+            };
+            (result, io::Error::last_os_error().raw_os_error())
+        };
+        // SAFETY: a plain handler without SA_RESTART, so an interruptible
+        // wait reports EINTR instead of restarting.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = count_handled_signal as *const () as usize;
+            libc::sigemptyset(std::ptr::addr_of_mut!(action.sa_mask));
+            libc::sigaction(
+                libc::SIGUSR1,
+                std::ptr::addr_of!(action),
+                std::ptr::null_mut(),
+            )
+        };
+        if installed != 0 {
+            std::process::exit(2);
+        }
+        match marker_access() {
+            (-1, Some(libc::EINTR)) => std::process::exit(CHILD_INTERRUPTED),
+            (-1, Some(libc::EACCES))
+                if HANDLED_SIGNALS.load(std::sync::atomic::Ordering::SeqCst) == 1 => {}
+            _ => std::process::exit(3),
+        }
+        let _ = marker_access();
+        std::process::exit(4);
+    }
+
+    /// Run the child under a `faccessat` listener of the given kind and
+    /// report `(notification still valid after SIGUSR1, child exit status)`.
+    fn observe_signal_during_notification(wait_killable: bool) -> (bool, std::process::ExitStatus) {
+        let executable = std::env::current_exe().expect("test executable");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let listener = if wait_killable {
+                install_wait_killable_listener(&[libc::SYS_faccessat])
+            } else {
+                install_listener(&[libc::SYS_faccessat])
+            }
+            .expect("install listener");
+            let child = Command::new(executable)
+                .arg("--exact")
+                .arg("linux::seccomp_notify::tests::wait_killable_listener_defers_handled_signals_until_the_response")
+                .arg("--nocapture")
+                .env(WAIT_KILLABLE_CHILD, "1")
+                .spawn()
+                .expect("spawn child");
+            sender.send((listener, child)).expect("hand over");
+        });
+        let (listener, mut child) = receiver.recv().expect("listener and child");
+        let marker_notification = || {
+            loop {
+                let notification = receive_probe_notification(&listener).expect("notification");
+                let mut path = [0_u8; 32];
+                let marker = WAIT_KILLABLE_MARKER.to_bytes_with_nul();
+                if crate::linux::task_memory::read_exact(
+                    notification.tid,
+                    notification.args[1],
+                    &mut path[..marker.len()],
+                )
+                .is_ok()
+                    && &path[..marker.len()] == marker
+                {
+                    return notification;
+                }
+                listener
+                    .respond_continue(notification.id)
+                    .expect("continue startup access");
+            }
+        };
+
+        let first = marker_notification();
+        // SAFETY: a thread-directed signal to the notifying task.
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_tgkill, child.id(), first.tid, libc::SIGUSR1) },
+            0
+        );
+        thread::sleep(Duration::from_millis(300));
+        let still_valid = listener.validate_id(first.id).is_ok();
+        if still_valid {
+            listener
+                .respond_errno(first.id, libc::EACCES)
+                .expect("answer the first access");
+            let second = marker_notification();
+            child.kill().expect("kill child");
+            let status = child.wait().expect("wait child");
+            assert_eq!(
+                listener.validate_id(second.id).unwrap_err().raw_os_error(),
+                Some(libc::ENOENT),
+                "a killed task ends its notification"
+            );
+            // A result for a dead notification is neither written nor an
+            // error: there is no task left to answer.
+            crate::provider_files::complete_with_result(&listener, &second, 0x1000, &[0; 16])
+                .expect("dead notification completes quietly");
+            return (true, status);
+        }
+        (false, child.wait().expect("wait child"))
+    }
+
+    #[test]
+    fn wait_killable_listener_defers_handled_signals_until_the_response() {
+        use std::os::unix::process::ExitStatusExt as _;
+        if std::env::var_os(WAIT_KILLABLE_CHILD).is_some() {
+            wait_killable_child();
+        }
+        // Production listener: the handled signal waits for the response,
+        // and only SIGKILL ends the second notification.
+        let (still_valid, status) = observe_signal_during_notification(true);
+        assert!(still_valid);
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
+        // Interruptible listener: the same signal ends the notification and
+        // the syscall fails with EINTR.
+        let (still_valid, status) = observe_signal_during_notification(false);
+        assert!(!still_valid);
+        assert_eq!(status.code(), Some(CHILD_INTERRUPTED), "{status}");
     }
 
     #[test]

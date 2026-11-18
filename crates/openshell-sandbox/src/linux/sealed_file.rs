@@ -13,10 +13,14 @@
 //!
 //! This module decides nothing about which workload paths such a file
 //! serves; it is the backing that provider files and the supervisor CA trust
-//! files share.
+//! files share. Its metadata, as the kernel reports it for a descriptor of
+//! the file, is also what the broker reports for the virtual path.
+
+#![allow(unsafe_code)]
 
 use std::fs::File;
 use std::io::{self, Write as _};
+use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
@@ -66,14 +70,42 @@ impl OwnDescriptors {
     /// to, positioned at its start. Duplicating `descriptor` instead would
     /// share one file offset between every holder.
     fn reopen_read_only(&self, descriptor: impl AsFd) -> io::Result<OwnedFd> {
+        self.reopen(descriptor, OFlags::RDONLY | OFlags::NOCTTY)
+    }
+
+    fn reopen(&self, descriptor: impl AsFd, flags: OFlags) -> io::Result<OwnedFd> {
         Ok(rustix::fs::openat(
             &self.0,
             rustix::path::DecInt::new(descriptor.as_fd().as_raw_fd()),
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY,
+            flags | OFlags::CLOEXEC,
             Mode::empty(),
         )?)
     }
 }
+
+/// The size of the native `struct stat` the `stat` family fills: 144 bytes
+/// on x86-64 and 128 bytes on `AArch64`, where the libc layout is the kernel's.
+pub const STAT_SIZE: usize = size_of::<libc::stat>();
+/// The size of `struct statx`, fixed by the UAPI.
+pub const STATX_SIZE: usize = 256;
+
+const _: () = assert!(
+    (cfg!(target_arch = "x86_64") && STAT_SIZE == 144)
+        || (cfg!(target_arch = "aarch64") && STAT_SIZE == 128)
+);
+
+/// A kernel-filled `struct stat`, kept as bytes.
+///
+/// The kernel zero-fills the whole structure before copying it out, so the
+/// bytes carry no padding this process left behind.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct StatBytes(pub [u8; STAT_SIZE]);
+
+/// A kernel-filled `struct statx`, kept as bytes.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct StatxBytes(pub [u8; STATX_SIZE]);
 
 /// One immutable byte sequence, delivered as a read-only file.
 ///
@@ -152,6 +184,48 @@ impl SealedFile {
         Ok(())
     }
 
+    /// The native `struct stat` of the file, exactly what `fstat` reports on
+    /// an injected descriptor.
+    pub(crate) fn stat(&self) -> io::Result<StatBytes> {
+        let mut bytes = StatBytes([0; STAT_SIZE]);
+        // SAFETY: the buffer is a live, 8-byte aligned region of exactly the
+        // native struct stat size, which the kernel fills whole.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_fstat,
+                self.anchor.as_raw_fd(),
+                bytes.0.as_mut_ptr(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(bytes)
+    }
+
+    /// The `struct statx` of the file for `mask`, with `sync_flags` from the
+    /// caller's `AT_STATX_SYNC_TYPE` bits: exactly what `statx` reports on an
+    /// injected descriptor.
+    pub(crate) fn statx(&self, sync_flags: u32, mask: u32) -> io::Result<StatxBytes> {
+        let mut bytes = StatxBytes([0; STATX_SIZE]);
+        // SAFETY: the empty path is NUL-terminated and the buffer is a live,
+        // 8-byte aligned 256-byte region, which the kernel fills whole.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                self.anchor.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | i32::try_from(sync_flags).map_err(io::Error::other)?,
+                mask,
+                bytes.0.as_mut_ptr(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(bytes)
+    }
+
     /// The one descriptor retained for the file.
     #[cfg(test)]
     pub(crate) fn anchor(&self) -> std::os::fd::BorrowedFd<'_> {
@@ -227,6 +301,44 @@ mod tests {
             rustix::fs::fcntl_getfl(file.anchor()).unwrap() & rustix::fs::OFlags::ACCMODE,
             rustix::fs::OFlags::RDONLY
         );
+    }
+
+    #[test]
+    fn metadata_describes_the_same_file_an_open_descriptor_does() {
+        use std::mem::offset_of;
+        let file = sealed(b"0123456789");
+        let opened = File::from(file.open().unwrap());
+        let expected = opened.metadata().unwrap();
+
+        let stat = file.stat().unwrap();
+        let field =
+            |offset: usize| u64::from_ne_bytes(stat.0[offset..offset + 8].try_into().unwrap());
+        assert_eq!(field(offset_of!(libc::stat, st_ino)), expected.ino());
+        assert_eq!(field(offset_of!(libc::stat, st_dev)), expected.dev());
+        let size_offset = offset_of!(libc::stat, st_size);
+        assert_eq!(
+            i64::from_ne_bytes(stat.0[size_offset..size_offset + 8].try_into().unwrap()),
+            10
+        );
+        let mode_offset = offset_of!(libc::stat, st_mode);
+        let mode = u32::from_ne_bytes(stat.0[mode_offset..mode_offset + 4].try_into().unwrap());
+        assert_eq!(mode, expected.mode());
+        assert_eq!(mode & libc::S_IFMT, libc::S_IFREG);
+
+        // statx: mask, mode, inode, and size at their UAPI offsets.
+        let statx = file.statx(0, 0x0000_07ff).unwrap();
+        let word =
+            |offset: usize| u32::from_ne_bytes(statx.0[offset..offset + 4].try_into().unwrap());
+        assert_ne!(word(0) & 0x0000_0200, 0, "STATX_SIZE is reported");
+        assert_eq!(
+            u16::from_ne_bytes(statx.0[28..30].try_into().unwrap()),
+            u16::try_from(expected.mode()).unwrap()
+        );
+        assert_eq!(
+            u64::from_ne_bytes(statx.0[32..40].try_into().unwrap()),
+            expected.ino()
+        );
+        assert_eq!(u64::from_ne_bytes(statx.0[40..48].try_into().unwrap()), 10);
     }
 
     #[test]

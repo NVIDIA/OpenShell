@@ -1,22 +1,32 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Read-only provider files.
+//! Read-only virtual files: provider files and the supervisor CA trust pair.
 //!
-//! Every workload file open notifies the broker, which serves a path beneath
-//! the provider prefix by injecting a read-only descriptor for a sealed
-//! in-memory file and continues every other open.
+//! Neither kind exists on any filesystem. Every workload file open notifies
+//! the broker, which serves a path beneath the provider prefix, or one of the
+//! two canonical CA trust paths, by injecting a read-only descriptor for a
+//! sealed in-memory file, and continues every other open. Every path-based
+//! `stat`, `statx`, and `access` call notifies as well; for a virtual path the
+//! broker writes the result the injected descriptor would report into the
+//! caller's buffer, and continues every other path.
+//!
+//! What a virtual path supports is exactly this: an absolute, canonical path
+//! (no `..`, no trailing slash, no symlink, no relative lookup through a
+//! directory descriptor), opened read-only, and queried through `stat`,
+//! `lstat`, `fstatat`, `statx`, and `access`. The directories above a virtual
+//! file do not exist: `chdir`, `opendir`, and `stat` of the directory are
+//! `ENOENT`, and a relative or aliased path is left to the kernel, which finds
+//! nothing there. A write-capable open is `EACCES`; `O_DIRECTORY` is
+//! `ENOTDIR`; `O_PATH` is `EINVAL`.
 //!
 //! Two things are kept apart. A [`Revision`] is one immutable version of one
 //! file, and a [`Snapshot`] is the complete set a publication replaces at
 //! once; neither knows how bytes reach the workload. What a revision prepares
 //! at publication is its backing, a [`SealedFile`], created once when the
-//! revision is published and reopened for each workload open.
-//!
-//! The same listener also answers opens of the two canonical supervisor CA
-//! trust paths from [`crate::ca_trust_files`], which share the backing but
-//! are published separately from, and never removed by, a provider file
-//! update.
+//! revision is published and reopened for each workload open. The CA trust
+//! pair from [`crate::ca_trust_files`] shares the backing but is published
+//! separately from, and never removed by, a provider file update.
 
 use std::collections::HashMap;
 use std::io;
@@ -24,7 +34,7 @@ use std::sync::{Arc, RwLock};
 
 use rustix::fs::Mode;
 
-use crate::ca_trust_files::CaTrustFiles;
+use crate::ca_trust_files::{CaTrustFiles, TrustFile};
 use crate::linux::sealed_file::{OwnDescriptors, SealedFile};
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::task_memory;
@@ -34,6 +44,22 @@ const PROC_PREFIX: &str = "/proc/";
 const MAX_FILE_BYTES: usize = 65_536;
 pub const MAX_TOTAL_BYTES: usize = 262_144;
 const MAX_PATH_BYTES: usize = 4_096;
+
+/// The flags `fstatat` accepts; `statx` also accepts `AT_STATX_SYNC_TYPE`.
+const STAT_FLAGS: u32 =
+    (libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | libc::AT_EMPTY_PATH) as u32;
+/// `AT_STATX_SYNC_TYPE`: the UAPI mask of the `statx` sync flags, which the
+/// `libc` crate does not expose on every target.
+const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+const STATX_FLAGS: u32 = STAT_FLAGS | AT_STATX_SYNC_TYPE;
+/// `AT_EACCESS`, also absent from `libc` on some targets.
+const AT_EACCESS: u32 = 0x200;
+/// The flags `faccessat2` accepts.
+const ACCESS_FLAGS: u32 = AT_EACCESS | (libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u32;
+/// The `access` modes: `R_OK | W_OK | X_OK`.
+const ACCESS_MODES: u32 = (libc::R_OK | libc::W_OK | libc::X_OK) as u32;
+/// `STATX__RESERVED`: a mask with this bit set is refused.
+const STATX_RESERVED_MASK: u32 = 0x8000_0000;
 
 /// The mode a provider file reports. It keeps the file's metadata private
 /// to the sandbox identity; the seals and the read-only descriptor protect
@@ -206,6 +232,7 @@ impl ProviderFiles {
         &self.files.ca_trust
     }
 
+    /// Answer a workload `open`, `openat`, or `openat2`.
     pub(crate) fn handle_open(
         &self,
         listener: &NotificationListener,
@@ -217,100 +244,287 @@ impl ProviderFiles {
         } else {
             notification.args[0]
         };
-        // Every workload open reaches the listener, and nearly all of them
-        // are ordinary paths the kernel decides. One exact copy of the
-        // path's first six bytes tells those apart from the paths served
-        // here; an ordinary open costs nothing else, and in particular no
-        // read of an `openat2` argument structure.
-        //
-        // Six bytes are enough. `/proc/` is six bytes, and every provider
-        // path and both supervisor CA trust paths start with the first six
-        // bytes of the provider prefix and are longer than that, so every
-        // served kind always has six readable bytes. A copy that fails is an
-        // unreadable pointer or a shorter path that ends before an unmapped
-        // page: neither is served here, and the kernel resolves the path or
-        // reports its own EFAULT.
-        //
-        // The copy only classifies. Every served kind reads the whole path
-        // again and decides from that copy alone. A served open is never
-        // continued; an open that is continued, including a CA trust open
-        // the cache does not serve, is authorized by the kernel and Landlock
-        // exactly as any ordinary open.
+        let file = match self.classify(listener, &notification, path_address)? {
+            Classified::Served(file) => file,
+            Classified::Done => return Ok(()),
+            Classified::Proc => {
+                if handle_thread_comm_open(listener, notification, path_address)? {
+                    return Ok(());
+                }
+                return listener.respond_continue(notification.id);
+            }
+        };
+        inject_read_only(listener, &notification, file.backing())
+    }
+
+    /// Answer a workload path-based `stat`, `statx`, or `access` call.
+    pub(crate) fn handle_metadata(
+        &self,
+        listener: &NotificationListener,
+        notification: Notification,
+    ) -> io::Result<()> {
+        let request = MetadataRequest::parse(&notification)?;
+        let file = match self.classify(listener, &notification, request.path_address())? {
+            Classified::Served(file) => file,
+            Classified::Done => return Ok(()),
+            Classified::Proc => return listener.respond_continue(notification.id),
+        };
+        let backing = file.backing();
+        match request {
+            MetadataRequest::Stat { flags, buffer, .. } => {
+                if flags & !STAT_FLAGS != 0 {
+                    return listener.respond_errno(notification.id, libc::EINVAL);
+                }
+                complete_with_result(listener, &notification, buffer, &backing.stat()?.0)
+            }
+            MetadataRequest::Statx {
+                flags,
+                mask,
+                buffer,
+                ..
+            } => {
+                if flags & !STATX_FLAGS != 0 || mask & STATX_RESERVED_MASK != 0 {
+                    return listener.respond_errno(notification.id, libc::EINVAL);
+                }
+                let sync = flags & AT_STATX_SYNC_TYPE;
+                complete_with_result(
+                    listener,
+                    &notification,
+                    buffer,
+                    &backing.statx(sync, mask)?.0,
+                )
+            }
+            MetadataRequest::Access { mode, flags, .. } => {
+                if mode & !ACCESS_MODES != 0 || flags & !ACCESS_FLAGS != 0 {
+                    return listener.respond_errno(notification.id, libc::EINVAL);
+                }
+                // The file is readable and nothing else, whichever identity
+                // the call checks.
+                if mode & ACCESS_MODES != libc::R_OK as u32 && mode != libc::F_OK as u32 {
+                    return listener.respond_errno(notification.id, libc::EACCES);
+                }
+                listener.respond_value(notification.id, 0)
+            }
+        }
+    }
+
+    /// Decide whether the path at `path_address` is a virtual file.
+    ///
+    /// Every workload open and metadata call reaches the listener, and
+    /// nearly all of them name ordinary paths the kernel decides. One exact
+    /// copy of the path's first six bytes tells those apart from the paths
+    /// served here, at no other cost to an ordinary call. Six bytes are
+    /// enough: `/proc/` is six bytes, and every provider path and both CA
+    /// trust paths share the first six bytes of the provider prefix and are
+    /// longer than that. A copy that fails is an unreadable pointer or a
+    /// shorter path ending before an unmapped page: neither is served, and
+    /// the kernel resolves the path or reports its own EFAULT.
+    ///
+    /// The copy only classifies. A candidate has its whole path read and is
+    /// decided from that copy alone: a published virtual file is served
+    /// whatever the flags, an unpublished path beneath the provider prefix is
+    /// `ENOENT`, and everything else, including an alias of a virtual path,
+    /// continues to the kernel, which finds nothing of ours there.
+    fn classify(
+        &self,
+        listener: &NotificationListener,
+        notification: &Notification,
+        path_address: u64,
+    ) -> io::Result<Classified> {
         let mut start = [0_u8; PROC_PREFIX.len()];
         if task_memory::read_exact(notification.tid, path_address, &mut start).is_err() {
-            return listener.respond_continue(notification.id);
+            listener.respond_continue(notification.id)?;
+            return Ok(Classified::Done);
         }
         if start == PROC_PREFIX.as_bytes() {
-            if handle_thread_comm_open(listener, notification, path_address)? {
-                return Ok(());
+            return Ok(Classified::Proc);
+        }
+        if start == PREFIX.as_bytes()[..PROC_PREFIX.len()]
+            && let Ok(path) = read_path(notification.tid, path_address)
+        {
+            if let Some(file) = self.files.lookup(&path) {
+                return Ok(Classified::Served(file));
             }
-            return listener.respond_continue(notification.id);
+            if path.starts_with(PREFIX) {
+                listener.respond_errno(notification.id, libc::ENOENT)?;
+                return Ok(Classified::Done);
+            }
         }
-        if start != PREFIX.as_bytes()[..PROC_PREFIX.len()] {
-            return listener.respond_continue(notification.id);
-        }
-        // A failed or non-absolute lookup is left to the kernel. In particular,
-        // this preserves its normal EFAULT result for an invalid path pointer.
-        let Ok(path) = read_path(notification.tid, path_address) else {
-            return listener.respond_continue(notification.id);
-        };
-        if path.starts_with(PREFIX) {
-            let Some(revision) = self.files.revision(&path) else {
-                return listener.respond_errno(notification.id, libc::ENOENT);
-            };
-            return inject_read_only(listener, &notification, &revision.backing);
-        }
-        // Exactly a canonical CA trust path with a published pair. Any other
-        // path, including an alias of one or either path before publication,
-        // continues to the kernel, which resolves it against the installed
-        // files under Landlock.
-        if let Some(trust_file) = self.files.ca_trust.lookup(&path) {
-            return inject_plain_read_or_continue(listener, &notification, trust_file.backing());
-        }
-        listener.respond_continue(notification.id)
+        listener.respond_continue(notification.id)?;
+        Ok(Classified::Done)
     }
 }
 
-/// Serve a plain read-only `open` or `openat` of a CA trust file, and leave
-/// every other form of open to the kernel.
+enum Classified {
+    /// A published virtual file; the caller answers from it.
+    Served(VirtualFile),
+    /// The notification was answered here.
+    Done,
+    /// A `/proc/` path, which only the open handler looks at further.
+    Proc,
+}
+
+/// One published file, held so a concurrent publication cannot close its
+/// backing while it is served.
+enum VirtualFile {
+    Provider(Arc<Revision<SealedFile>>),
+    Trust(TrustFile),
+}
+
+impl VirtualFile {
+    fn backing(&self) -> &SealedFile {
+        match self {
+            Self::Provider(revision) => &revision.backing,
+            Self::Trust(file) => file.backing(),
+        }
+    }
+}
+
+impl VirtualFiles {
+    fn lookup(&self, path: &str) -> Option<VirtualFile> {
+        if path.starts_with(PREFIX) {
+            return self.revision(path).map(VirtualFile::Provider);
+        }
+        self.ca_trust.lookup(path).map(VirtualFile::Trust)
+    }
+}
+
+/// A notified metadata call, with the arguments the broker checks.
+enum MetadataRequest {
+    Stat {
+        path: u64,
+        buffer: u64,
+        flags: u32,
+    },
+    Statx {
+        path: u64,
+        flags: u32,
+        mask: u32,
+        buffer: u64,
+    },
+    Access {
+        path: u64,
+        mode: u32,
+        flags: u32,
+    },
+}
+
+impl MetadataRequest {
+    /// The call's arguments. `int` arguments keep their low 32 bits, as the
+    /// kernel reads them.
+    fn parse(notification: &Notification) -> io::Result<Self> {
+        let args = notification.args;
+        #[allow(clippy::cast_possible_truncation)]
+        let word = |index: usize| args[index] as u32;
+        let syscall = i64::from(notification.syscall);
+        if syscall == libc::SYS_newfstatat {
+            return Ok(Self::Stat {
+                path: args[1],
+                buffer: args[2],
+                flags: word(3),
+            });
+        }
+        if syscall == libc::SYS_statx {
+            return Ok(Self::Statx {
+                path: args[1],
+                flags: word(2),
+                mask: word(3),
+                buffer: args[4],
+            });
+        }
+        if syscall == libc::SYS_faccessat {
+            return Ok(Self::Access {
+                path: args[1],
+                mode: word(2),
+                flags: 0,
+            });
+        }
+        if syscall == libc::SYS_faccessat2 {
+            return Ok(Self::Access {
+                path: args[1],
+                mode: word(2),
+                flags: word(3),
+            });
+        }
+        #[cfg(target_arch = "x86_64")]
+        if syscall == libc::SYS_stat || syscall == libc::SYS_lstat {
+            return Ok(Self::Stat {
+                path: args[0],
+                buffer: args[1],
+                flags: 0,
+            });
+        }
+        #[cfg(target_arch = "x86_64")]
+        if syscall == libc::SYS_access {
+            return Ok(Self::Access {
+                path: args[0],
+                mode: word(1),
+                flags: 0,
+            });
+        }
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    const fn path_address(&self) -> u64 {
+        match self {
+            Self::Stat { path, .. } | Self::Statx { path, .. } | Self::Access { path, .. } => *path,
+        }
+    }
+}
+
+/// Write `result` into the notifying task at `buffer` and complete the
+/// syscall with 0, or fail it with `EFAULT`.
 ///
-/// The installed file exists at the same path, so an open the cache does not
-/// serve keeps its native result: a write-capable open fails on the
-/// `0444` file, `O_DIRECTORY` is `ENOTDIR`, `O_PATH` succeeds, and `openat2`
-/// with its own resolution constraints is decided in the kernel without a
-/// copy of its `open_how`. Continuing authorizes nothing: the kernel and
-/// Landlock decide these opens exactly as before the pair was cached.
-fn inject_plain_read_or_continue(
+/// The target is pinned before anything is written: `/proc/<tid>/mem` is
+/// opened and the notification validated afterwards, which proves the pinned
+/// address space is the notifying task's (see
+/// [`task_memory::PinnedMemory`]). The listener's `WAIT_KILLABLE_RECV` keeps
+/// the task in the syscall, so the buffer is still the caller's when the
+/// write lands. A buffer the write cannot reach fails the call with `EFAULT`,
+/// whatever errno the pinned file reports; every response validates the
+/// notification, so a task killed meanwhile is simply no longer answered.
+pub fn complete_with_result(
     listener: &NotificationListener,
     notification: &Notification,
-    file: &SealedFile,
+    buffer: u64,
+    result: &[u8],
 ) -> io::Result<()> {
-    const UNSERVED: i32 = libc::O_CREAT
-        | libc::O_EXCL
-        | libc::O_TRUNC
-        | libc::O_TMPFILE
-        | libc::O_APPEND
-        | libc::O_DIRECTORY
-        | libc::O_PATH
-        | libc::O_DIRECT;
-    if i64::from(notification.syscall) == libc::SYS_openat2 {
-        return listener.respond_continue(notification.id);
-    }
-    let Ok(flags) = open_flags(notification) else {
-        return listener.respond_continue(notification.id);
+    let outcome = match task_memory::PinnedMemory::open(notification.tid) {
+        Ok(memory) => {
+            // The task may have died between the notification and here: the
+            // pinned memory would then belong to a reused TID. ENOENT means
+            // the notification is gone; any other ioctl failure is an error.
+            match listener.validate_id(notification.id) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            memory.write_exact(buffer, result)
+        }
+        // No such task: its procfs entry is gone (ENOENT) or it is exiting
+        // (ESRCH). The response below reports whether anything is left.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            Err(error)
+        }
+        Err(error) => return Err(error),
     };
-    if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & UNSERVED != 0 {
-        return listener.respond_continue(notification.id);
+    let response = match outcome {
+        Ok(()) => listener.respond_value(notification.id, 0),
+        Err(_) => listener.respond_errno(notification.id, libc::EFAULT),
+    };
+    match response {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        other => other,
     }
-    file.inject(listener, notification.id, flags & libc::O_CLOEXEC != 0)
 }
 
-/// Complete a workload open of a sealed file, or refuse it.
+/// Complete a workload open of a virtual file, or refuse it.
 ///
-/// Only a plain read-only open is served. An open that asks to create,
-/// truncate, append, or write is `EACCES`, as it would be on the read-only
-/// installed file; one that asks for a directory, a path-only descriptor, or
-/// direct I/O is `EINVAL`. Nothing here is continued.
+/// Only a read-only open is served. An open that asks to create, truncate,
+/// append, or write is `EACCES`, as on a read-only file; `O_DIRECTORY` is
+/// `ENOTDIR`; `O_PATH` and `O_DIRECT` are `EINVAL` (a path-only descriptor
+/// cannot be injected: `SECCOMP_IOCTL_NOTIF_ADDFD` refuses `O_PATH` files).
+/// Nothing here is continued.
 fn inject_read_only(
     listener: &NotificationListener,
     notification: &Notification,
@@ -325,16 +539,24 @@ fn inject_read_only(
             );
         }
     };
+    let close_on_exec = flags & libc::O_CLOEXEC != 0;
+    // O_TMPFILE includes the O_DIRECTORY bit; a creating open is refused as
+    // one before the directory bit is read.
+    if flags & libc::O_TMPFILE == libc::O_TMPFILE {
+        return listener.respond_errno(notification.id, libc::EACCES);
+    }
+    if flags & libc::O_DIRECTORY != 0 {
+        return listener.respond_errno(notification.id, libc::ENOTDIR);
+    }
     if flags & libc::O_ACCMODE != libc::O_RDONLY
-        || flags & (libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_TMPFILE | libc::O_APPEND)
-            != 0
+        || flags & (libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_APPEND) != 0
     {
         return listener.respond_errno(notification.id, libc::EACCES);
     }
-    if flags & (libc::O_DIRECTORY | libc::O_PATH | libc::O_DIRECT) != 0 {
+    if flags & (libc::O_PATH | libc::O_DIRECT) != 0 {
         return listener.respond_errno(notification.id, libc::EINVAL);
     }
-    file.inject(listener, notification.id, flags & libc::O_CLOEXEC != 0)
+    file.inject(listener, notification.id, close_on_exec)
 }
 
 fn safe_component(value: &str) -> bool {

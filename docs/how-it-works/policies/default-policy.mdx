@@ -81,9 +81,10 @@ appear in the policy views. OpenShell can reject a
 replacement policy that removes filesystem paths, so keep the added paths when
 you replace the complete policy.
 
-The runtime also grants the workload read-only access to the sandbox's TLS CA
-certificates under `/run/openshell-supervisor-ca`. This grant is not saved in
-the sandbox's policy.
+The sandbox's TLS CA certificate and trust bundle appear read-only at
+`/run/openshell-supervisor-ca/material` without a filesystem grant: the
+runtime serves them from memory to opens and `stat` calls on those exact
+paths. The directory itself does not exist.
 
 ### GPU Sandboxes
 
