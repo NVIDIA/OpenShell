@@ -472,7 +472,7 @@ serve(fixture_listener)
     .expect("create local-container sandbox");
 
     let script = format!(
-        r#"import os, socket
+        r#"import os, socket, time
 for key in ('ALL_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'http_proxy', 'https_proxy'):
     os.environ.pop(key, None)
 try:
@@ -486,6 +486,15 @@ assert any(ip.startswith('198.18.') or ip.startswith('198.19.') for ip in synthe
 with socket.create_connection(({host:?}, {port}), timeout=10) as conn:
     conn.sendall(b'probe')
     assert conn.recv(1024) == b'native-tcp-ok:probe'
+# Reconnect using only the cached numeric address after the maximum mapping
+# TTL. Do not perform a client DNS lookup that could republish the mapping.
+cached = next(ip for ip in synthetic if ip.startswith(('198.18.', '198.19.')))
+time.sleep(31)
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as conn:
+    conn.settimeout(10)
+    conn.connect((cached, {port}))
+    conn.sendall(b'expired-cache-probe')
+    assert conn.recv(1024) == b'native-tcp-ok:expired-cache-probe'
 mapped = next('::ffff:' + ip for ip in synthetic if ip.startswith(('198.18.', '198.19.')))
 with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as conn:
     conn.settimeout(10)

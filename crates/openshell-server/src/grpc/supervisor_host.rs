@@ -10,9 +10,12 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use futures::StreamExt as _;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHost;
 use openshell_core::proto::supervisor_host::v1::{HostGatewayMessage, HostMessage};
+use openshell_supervisor_control::controller::redirect;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::ServerState;
@@ -65,10 +68,53 @@ impl SupervisorHost for SupervisorHostService {
         if *shutdown.borrow() {
             return Err(Status::unavailable("gateway is shutting down"));
         }
-        let outbound = controller.attach(identity, request.into_inner()).await?;
-        let outbound = futures::StreamExt::take_until(outbound, async move {
-            let _ = shutdown.wait_for(|shutdown| *shutdown).await;
-        });
+        let state = self.state.clone();
+        let (member_id, outbound) = controller
+            .attach(
+                identity,
+                request.into_inner(),
+                |member_id, accepts_redirect| host_home(&state, member_id, accepts_redirect),
+            )
+            .await?;
+        let handoff = futures::stream::once(async move {
+            let stopping = *state.supervisor_sessions.subscribe_shutdown().borrow();
+            stopping
+                .then(|| host_home(&state, &member_id, true))
+                .flatten()
+                .map(|peer_endpoint| Ok(redirect(peer_endpoint)))
+        })
+        .filter_map(std::future::ready);
+        let outbound = outbound
+            .take_until(async move {
+                let _ = shutdown.wait_for(|shutdown| *shutdown).await;
+            })
+            .chain(handoff);
         Ok(Response::new(Box::pin(outbound)))
     }
+}
+
+/// Peer endpoint of the replica that should serve the shared supervisor
+/// `member_id` when that is not this replica. A stopping replica leaves
+/// itself out.
+fn host_home(state: &ServerState, member_id: &str, accepts_redirect: bool) -> Option<String> {
+    if state.store.is_single_replica() {
+        return None;
+    }
+    let ring = state.gateway_ring.read().ok()?;
+    let ring = if state.gateway_shutting_down.load(Ordering::Acquire) {
+        ring.without(&state.replica_id)
+    } else {
+        ring.clone()
+    };
+    let home =
+        state
+            .supervisor_spread
+            .route(&ring, &state.replica_id, member_id, accepts_redirect)?;
+    state
+        .gateway_peers
+        .read()
+        .ok()?
+        .get(&home)
+        .filter(|endpoint| !endpoint.is_empty())
+        .cloned()
 }

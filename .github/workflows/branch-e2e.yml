@@ -339,7 +339,6 @@ jobs:
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       contents: read
-      packages: read
     uses: ./.github/workflows/deb-package.yml
     with:
       checkout-ref: ${{ github.sha }}

@@ -18,6 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 miette = { workspace = true }
 prost-types = { workspace = true }
+prost = { workspace = true }
 
 [lints]
 workspace = true

@@ -580,6 +580,13 @@ Gateway-managed refresh strategies use these material keys:
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
 
+The two OAuth2 strategies also accept these optional material keys:
+
+| Key | Behavior |
+|---|---|
+| `token_endpoint_auth_method` | `none`, `client_secret_post`, or `client_secret_basic`. The default is `client_secret_post` when `client_secret` is set, otherwise `none`. `client_secret_basic` sends the credentials in an HTTP `Authorization` header and omits them from the request body. |
+| `resource` | An absolute URI without a fragment, sent as the OAuth `resource` indicator ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)). |
+
 ### Additional Outputs
 
 Most refresh strategies mint a single credential. `aws_sts_assume_role` mints three. A refresh declares the extra credentials it co-mints with `additional_outputs`, mapping each strategy-defined output id to a sibling credential whose `env_vars` receive the value:

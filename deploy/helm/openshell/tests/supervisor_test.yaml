@@ -30,6 +30,22 @@ tests:
       - hasDocuments:
           count: 0
         template: templates/supervisor-pdb.yaml
+  - it: brackets an IPv6 listen address
+    template: templates/supervisor.yaml
+    set:
+      supervisor.listenAddress: "::"
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args[4]
+          value: "[::]:5501"
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].args[8]
+          value: "[::]:5500"
+        documentIndex: 0
   - it: deploys the supervisor pool without Kubernetes identity in the gateway namespace
     template: templates/supervisor.yaml
     set:
