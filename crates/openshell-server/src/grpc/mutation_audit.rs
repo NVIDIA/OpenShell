@@ -134,6 +134,8 @@ impl Audited for SandboxTemplateResponse {
 /// the response carries the value and contributes nothing to the record.
 impl Audited for openshell_core::proto::RevealSecretResponse {}
 
+impl Audited for openshell_core::proto::InlineProviderRefreshSecretsResponse {}
+
 impl Audited for SecretResponse {
     fn produced(&self) -> Vec<Produced<'_>> {
         stored(

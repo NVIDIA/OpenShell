@@ -189,6 +189,13 @@ pub async fn secret_get(
         secret.allowed_endpoints.join(", ")
     );
     println!("  {} {}", "Value updated:".dimmed(), value_updated(&secret));
+    if is_deleting(&secret) {
+        println!(
+            "  {} deletion did not finish; rerun `openshell secret delete {}`",
+            "Deleting:".dimmed(),
+            secret_name(&secret)
+        );
+    }
     if let Some(meta) = &secret.metadata
         && !meta.labels.is_empty()
     {
@@ -245,15 +252,17 @@ pub async fn secret_list(
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<name_width$}  {:<20}  {}",
+        "{:<name_width$}  {:<8}  {:<20}  {}",
         "NAME".bold(),
+        "STATUS".bold(),
         "VALUE UPDATED".bold(),
         "ALLOWED ENDPOINTS".bold(),
     );
     for secret in &response.secrets {
         println!(
-            "{:<name_width$}  {:<20}  {}",
+            "{:<name_width$}  {:<8}  {:<20}  {}",
             secret_name(secret),
+            status(secret),
             value_updated(secret),
             secret.allowed_endpoints.join(", ")
         );
@@ -295,6 +304,21 @@ fn secret_name(secret: &Secret) -> &str {
         .map_or("", |meta| meta.name.as_str())
 }
 
+fn is_deleting(secret: &Secret) -> bool {
+    secret
+        .metadata
+        .as_ref()
+        .is_some_and(|meta| meta.deletion_time.is_some())
+}
+
+fn status(secret: &Secret) -> &'static str {
+    if is_deleting(secret) {
+        "deleting"
+    } else {
+        "active"
+    }
+}
+
 fn value_updated(secret: &Secret) -> String {
     secret
         .value_update_time
@@ -313,6 +337,7 @@ fn secret_to_json(secret: &Secret) -> serde_json::Value {
         "labels": meta.labels,
         "description": secret.description,
         "allowed_endpoints": secret.allowed_endpoints,
+        "status": status(secret),
         "value_updated_at": secret
             .value_update_time
             .as_ref()
@@ -351,5 +376,19 @@ mod tests {
     fn json_output_never_carries_a_value_field() {
         let json = secret_to_json(&Secret::default());
         assert!(json.get("value").is_none());
+        assert_eq!(json["status"], "active");
+    }
+
+    #[test]
+    fn unfinished_deletions_are_reported() {
+        let secret = Secret {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                deletion_time: Some(prost_types::Timestamp::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(status(&secret), "deleting");
+        assert_eq!(secret_to_json(&secret)["status"], "deleting");
     }
 }

@@ -789,7 +789,17 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<InlineProviderRefreshSecretsRequest>,
     ) -> Result<Response<InlineProviderRefreshSecretsResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn delete_provider_refresh(

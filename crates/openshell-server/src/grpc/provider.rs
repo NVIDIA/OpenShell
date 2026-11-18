@@ -5643,47 +5643,9 @@ pub(super) async fn handle_inline_provider_refresh_secrets(
     let mut constraints = secret_refs::material_endpoint_constraints(refresh.metadata.as_ref())?;
     let mut values = HashMap::new();
     for (material_key, binding) in &bindings {
-        let secret = state
-            .store
-            .get_message::<crate::storage_proto::StoredWorkspaceSecret>(&binding.id)
-            .await
-            .map_err(|e| Status::internal(format!("fetch workspace secret failed: {e}")))?
-            .filter(|secret| {
-                secret.object_workspace() == workspace
-                    && secret
-                        .metadata
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.deletion_time.is_none())
-            });
-        let Some((secret, handle)) = secret.and_then(|secret| {
-            let handle = secret.value_handle.clone()?;
-            Some((secret, handle))
-        }) else {
-            return Err(Status::failed_precondition(format!(
-                "workspace secret '{}' no longer exists; reconfigure the refresh grant",
-                binding.name
-            )));
-        };
-        let resolved = state
-            .credentials
-            .resolve_secrets(
-                openshell_credential_issuer::SecretOwner::workspace_secret(&workspace, &binding.id),
-                &HashMap::from([(secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(), handle)]),
-                0,
-            )
-            .await?;
-        let value = resolved
-            .values
-            .get(secret_refs::WORKSPACE_SECRET_VALUE_KEY)
-            .cloned()
-            .ok_or_else(|| {
-                Status::unavailable(format!(
-                    "workspace secret '{}' could not be read",
-                    binding.name
-                ))
-            })?;
+        let (value, allowed_endpoints) = read_workspace_secret(state, &workspace, binding).await?;
         values.insert(material_key.clone(), value);
-        constraints.insert(material_key.clone(), secret.allowed_endpoints);
+        constraints.insert(material_key.clone(), allowed_endpoints);
     }
 
     let staging_id = format!(
@@ -5700,7 +5662,18 @@ pub(super) async fn handle_inline_provider_refresh_secrets(
             &HashMap::new(),
         )
         .await?;
-    refresh.secret_material_handles.extend(staged.clone());
+    for (material_key, handle) in &staged {
+        if let Some(previous) = refresh
+            .secret_material_handles
+            .insert(material_key.clone(), handle.clone())
+        {
+            crate::provider_refresh::enqueue_pending_secret_deletion(
+                &mut refresh,
+                material_key,
+                previous,
+            );
+        }
+    }
     let expected_version = {
         let metadata = refresh.metadata.get_or_insert_with(Default::default);
         secret_refs::set_material_secret_bindings(
@@ -5739,6 +5712,66 @@ pub(super) async fn handle_inline_provider_refresh_secrets(
     Ok(Response::new(InlineProviderRefreshSecretsResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(&refresh)),
     }))
+}
+
+/// Read a referenced workspace secret's value and endpoint constraint. A
+/// concurrent `UpdateSecret` can delete the handle read from the record, so a
+/// failed read re-reads the record once, as minting does.
+async fn read_workspace_secret(
+    state: &ServerState,
+    workspace: &str,
+    binding: &secret_refs::MaterialSecretBinding,
+) -> Result<(String, Vec<String>), Status> {
+    let mut last_error = None;
+    for _ in 0..2 {
+        let secret = state
+            .store
+            .get_message::<crate::storage_proto::StoredWorkspaceSecret>(&binding.id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch workspace secret failed: {e}")))?
+            .filter(|secret| {
+                secret.object_workspace() == workspace
+                    && secret
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_time.is_none())
+            });
+        let Some((secret, handle)) = secret.and_then(|secret| {
+            let handle = secret.value_handle.clone()?;
+            Some((secret, handle))
+        }) else {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{}' no longer exists; reconfigure the refresh grant",
+                binding.name
+            )));
+        };
+        match state
+            .credentials
+            .resolve_secrets(
+                openshell_credential_issuer::SecretOwner::workspace_secret(workspace, &binding.id),
+                &HashMap::from([(secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(), handle)]),
+                0,
+            )
+            .await
+        {
+            Ok(mut resolved) => {
+                if let Some(value) = resolved
+                    .values
+                    .remove(secret_refs::WORKSPACE_SECRET_VALUE_KEY)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Ok((value, secret.allowed_endpoints));
+                }
+                last_error = Some("credential storage returned no value".to_string());
+            }
+            Err(err) => last_error = Some(err.message().to_string()),
+        }
+    }
+    Err(Status::unavailable(format!(
+        "workspace secret '{}' could not be read: {}",
+        binding.name,
+        last_error.unwrap_or_default()
+    )))
 }
 
 /// Remove the expiry for each key the refresh still owns — one whose stored

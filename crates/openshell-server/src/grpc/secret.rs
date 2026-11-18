@@ -282,6 +282,7 @@ pub(super) async fn handle_create_secret(
     ensure_workspace_secrets_active(state).await?;
     ensure_credential_storage(state)?;
     let workspace_id = active_workspace_id(&state.store, &workspace).await?;
+    clear_interrupted_deletion(state, &workspace, &req.name).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
@@ -365,6 +366,29 @@ pub(super) async fn handle_create_secret(
     }))
 }
 
+/// Finish a deletion of `name` that an earlier request could not complete, so
+/// its name can be reused. Fails when the earlier deletion still cannot finish.
+async fn clear_interrupted_deletion(
+    state: &ServerState,
+    workspace: &str,
+    name: &str,
+) -> Result<(), Status> {
+    let existing = state
+        .store
+        .get_message_by_name::<StoredWorkspaceSecret>(workspace, name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch secret failed: {e}")))?;
+    let Some(existing) = existing.filter(is_tombstoned) else {
+        return Ok(());
+    };
+    finish_deletion(state, existing).await.map_err(|err| {
+        Status::failed_precondition(format!(
+            "secret '{name}' is still being deleted and cleanup failed ({}); retry later",
+            err.message()
+        ))
+    })
+}
+
 /// ID of the named workspace while it is active.
 async fn active_workspace_id(store: &Store, workspace: &str) -> Result<String, Status> {
     let record: Option<openshell_core::proto::Workspace> = store
@@ -397,8 +421,13 @@ pub(super) async fn handle_get_secret(
     )
     .await?
     .name;
-    let stored = get_live_secret(&state.store, &workspace, &req.name)
-        .await?
+    // A secret whose deletion is unfinished is returned with its deletion
+    // time set, so it is visible while it still holds its name and quota.
+    let stored = state
+        .store
+        .get_message_by_name::<StoredWorkspaceSecret>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch secret failed: {e}")))?
         .ok_or_else(|| Status::not_found("secret not found"))?;
     Ok(Response::new(SecretResponse {
         secret: Some(public_secret(&stored)),
@@ -444,12 +473,9 @@ pub(super) async fn handle_list_secrets(
         .map_err(|e| Status::internal(format!("list secrets failed: {e}")))?;
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
     Ok(Response::new(ListSecretsResponse {
-        secrets: page
-            .messages
-            .iter()
-            .filter(|stored| !is_tombstoned(stored))
-            .map(public_secret)
-            .collect(),
+        // Unfinished deletions stay in the listing, with their deletion time
+        // set, so pages stay full and the secrets stay visible.
+        secrets: page.messages.iter().map(public_secret).collect(),
         next_page_token,
     }))
 }
@@ -481,9 +507,18 @@ pub(super) async fn handle_update_secret(
         validate_labels(&labels.labels)?;
     }
 
-    let current = get_live_secret(&state.store, &workspace, &req.name)
-        .await?
+    let current = state
+        .store
+        .get_message_by_name::<StoredWorkspaceSecret>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch secret failed: {e}")))?
         .ok_or_else(|| Status::not_found("secret not found"))?;
+    if is_tombstoned(&current) {
+        return Err(Status::failed_precondition(format!(
+            "secret '{}' is being deleted",
+            req.name
+        )));
+    }
     let current_version = current.get_resource_version();
     if let Some(expected) = req.expected_resource_version
         && expected != current_version
@@ -658,15 +693,9 @@ pub(super) async fn handle_reveal_secret(
 ) -> Result<Response<RevealSecretResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if !state.config.workspace_secrets.reveal_enabled {
-        return Err(Status::failed_precondition(
-            "secret reveal is not enabled; set enable_secret_reveal for control-plane callers",
-        ));
-    }
+    // Authorize before revealing anything about gateway configuration, so a
+    // caller who may not reveal cannot learn whether reveal is enabled.
     ensure_reveal_principal(state, &principal)?;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
     let workspace = authorized_workspace(
         state,
         &principal,
@@ -675,6 +704,14 @@ pub(super) async fn handle_reveal_secret(
     )
     .await?
     .name;
+    if !state.config.workspace_secrets.reveal_enabled {
+        return Err(Status::failed_precondition(
+            "secret reveal is not enabled; set enable_secret_reveal for control-plane callers",
+        ));
+    }
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
     let stored = get_live_secret(&state.store, &workspace, &req.name)
         .await?
         .ok_or_else(|| Status::not_found("secret not found"))?;
@@ -1212,12 +1249,21 @@ mod tests {
 
     #[tokio::test]
     async fn reveal_is_disabled_by_default() {
-        let state = enabled_state().await;
-        create(&state, "acme", "the-value").await;
+        let mut state = reveal_state(Some("scope")).await;
+        Arc::get_mut(&mut state)
+            .expect("test state is not shared")
+            .config
+            .workspace_secrets
+            .reveal_enabled = false;
         let err = reveal(&state, user(IdentityProvider::Oidc, &[REVEAL_SCOPE]))
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
+        // A caller who may not reveal learns nothing about the setting.
+        let err = reveal(&state, user(IdentityProvider::Oidc, &["openshell:all"]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -1351,5 +1397,58 @@ mod tests {
 
         assert_eq!(sweep_workspace_secrets(&state).await.unwrap(), 1);
         assert!(stored(&state, "zzz-pending").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_deletion_stays_visible_and_frees_its_name_on_recreate() {
+        let state = enabled_state().await;
+        create(&state, "acme", "value").await;
+        let record = stored(&state, "acme").await.unwrap();
+        tombstone(&state, record).await.unwrap();
+
+        let fetched = handle_get_secret(
+            &state,
+            authed_request(GetSecretRequest {
+                workspace_scope: Some(workspace_selector("default".to_string())),
+                name: "acme".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .secret
+        .unwrap();
+        assert!(fetched.metadata.as_ref().unwrap().deletion_time.is_some());
+        let listed = handle_list_secrets(
+            &state,
+            authed_request(ListSecretsRequest {
+                workspace_scope: Some(workspace_selector("default".to_string())),
+                page_size: 1,
+                page_token: String::new(),
+                label_selector: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.secrets.len(), 1, "pages are not shortened");
+
+        let err = handle_update_secret(
+            &state,
+            authed_request(UpdateSecretRequest {
+                workspace_scope: Some(workspace_selector("default".to_string())),
+                name: "acme".to_string(),
+                value: Some("next".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("being deleted"));
+
+        // Recreating the name finishes the earlier deletion first.
+        let recreated = create(&state, "acme", "fresh").await;
+        assert!(recreated.metadata.unwrap().deletion_time.is_none());
     }
 }
