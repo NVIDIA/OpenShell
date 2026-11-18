@@ -706,9 +706,15 @@ flag attests that they are retired.
 Before rolling back to a release without workspace secrets:
 
 1. Set `enable_workspace_secrets = false`.
-2. For each credential whose `provider refresh status` lists a secret, run
-   `openshell provider refresh inline-secrets`.
+2. For each row of `openshell provider refresh status` with a value in the
+   `MATERIAL_SECRETS` column, run `openshell provider refresh inline-secrets`
+   for that provider and credential key. Retry it if a mint is in progress.
 3. Delete every workspace secret.
+
+After the downgrade, the older gateway mints copied values without the
+allowed-endpoint and redirect checks. It still sends them only to the token
+endpoint fixed when refresh was configured, but it follows redirects from that
+endpoint.
 
 `[openshell.gateway] enable_secret_reveal` defaults to `false`. When `true`,
 the `RevealSecret` RPC returns secret values to operators authenticated with

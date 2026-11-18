@@ -207,8 +207,10 @@ records the superseded handle as a pending deletion and then deletes it. A
 failed swap deletes the staged handle. `DeleteSecret` tombstones the record by
 setting its deletion time, deletes the current and pending handles, then
 removes the row. The periodic refresh worker tick also sweeps workspace-secret
-tombstones and pending deletions, so a backend failure is retried rather than
-leaking a handle. The next `UpdateSecret` or `DeleteSecret` also retries them.
+tombstones and pending deletions, paging through every record so healthy
+secrets cannot starve later cleanup. A backend failure is therefore retried
+rather than leaking a handle. The next `UpdateSecret` or `DeleteSecret` also
+retries them.
 
 The CLI adds `openshell secret create|update|get|list|delete`. Values come from
 `--value-env VAR` or `--value-file PATH`, never from a command-line argument.
@@ -386,7 +388,10 @@ conflicts with `ConfigureProviderRefresh`, so a new reference cannot appear
 between the check and the delete. Deleting a provider or its refresh
 configuration removes its references. Workspace deletion is blocked while
 secrets exist; the secret type joins the resource kinds that workspace deletion
-checks.
+checks. Workspace deletion marks the workspace terminating before it scans for
+blockers, so `CreateSecret` re-reads the workspace after its insert. If the
+workspace is no longer the active one it resolved, the create removes its row
+and staged value and fails. Otherwise the deletion's scan finds the secret.
 
 Bindings use immutable IDs. Deleting a secret and recreating one with the same
 name therefore never silently rebinds a provider.
@@ -483,7 +488,12 @@ support, the operator must:
 3. Delete all secrets, which the delete guard now permits.
 
 The rollback documentation states this. `ListSecrets` in each workspace, plus
-refresh status, shows what remains. Rolling back without these steps is
+the referenced secrets that refresh status reports for each credential, shows
+what remains. Inlining refuses while a mint is in progress, because replacing
+the refresh state then would make the mint discard a rotated refresh token.
+After the downgrade, the older minter applies its legacy behavior to the copied
+values: no endpoint constraint and default redirect handling, toward the token
+endpoint fixed at configuration. Rolling back without these steps is
 unsupported. In that case the protections below keep older replicas from
 minting with missing material. They do not protect secrets themselves: an
 older replica can still delete a workspace that holds secrets, as described
