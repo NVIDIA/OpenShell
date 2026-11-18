@@ -5,9 +5,8 @@
 
 # End-to-end test for a sandbox whose policy is written in pure Cedar.
 #
-# Network and filesystem access come from policy.template.cedar. Middleware is
-# configuration, not policy, so it comes from middleware.template.yaml through
-# --middleware. Syscall filtering is not authored policy; the test checks that
+# Network and filesystem access come from policy.template.cedar.
+# Syscall filtering is not authored policy; the test checks that
 # the sandbox's seccomp restrictions still hold when the policy is Cedar.
 #
 # Prereqs: a running gateway (see README.md) and python3 on the host.
@@ -121,15 +120,12 @@ PY
 
 sed -e "s|__HOST__|${UP_HOST}|g" -e "s|__PORT__|${UP_PORT}|g" -e "s|__PREFIX__|${UP_PREFIX}|g" \
     "${SCRIPT_DIR}/policy.template.cedar" > "${TMP_DIR}/policy.cedar"
-sed -e "s|__HOST__|${UP_HOST}|g" \
-    "${SCRIPT_DIR}/middleware.template.yaml" > "${TMP_DIR}/middleware.yaml"
 
 # The CLI rejects this request before provisioning if the gateway does not
 # advertise Cedar support.
 "$OPENSHELL_BIN" sandbox create \
     --name "$SANDBOX" \
     --policy "${TMP_DIR}/policy.cedar" \
-    --middleware "${TMP_DIR}/middleware.yaml" \
     --no-auto-providers \
     --no-tty \
     --detach \
@@ -235,7 +231,6 @@ EOF
 
 if policy_set_output="$("$OPENSHELL_BIN" policy set "$SANDBOX" \
     --policy "${TMP_DIR}/policy-updated.cedar" \
-    --middleware "${TMP_DIR}/middleware.yaml" \
     --wait 2>&1)"; then
     pass "policy set: the sandbox loads an updated Cedar policy"
 else
@@ -243,41 +238,6 @@ else
 fi
 expect_eq "policy set: a newly permitted path reaches upstream" "$(status "" /blocked)" "200"
 expect_eq "policy set: a newly forbidden path is denied" "$(status "" /allowed/ok)" "403"
-
-# ---------------------------------------------------------------------------
-# Middleware: configured with --middleware
-# ---------------------------------------------------------------------------
-
-# The check needs the upstream to echo the request body. A shared public
-# upstream (CEDAR_E2E_UPSTREAM_URL) can be flaky, so a non-2xx response is
-# retried before it is reported as an upstream failure.
-echo_body=""
-echo_status=""
-for attempt in 1 2 3; do
-    echo_response="$(capture_in_sandbox "curl -s --max-time 20 -X POST -H 'Content-Type: text/plain' \
-        --data 'key=sk-abcdefghijklmnopqrstuvwxyz' -w '\n%{http_code}' '${ECHO_URL}/allowed/echo'")"
-    echo_status="${echo_response##*$'\n'}"
-    echo_body="${echo_response%$'\n'*}"
-    if [[ "$echo_status" =~ ^2[0-9][0-9]$ ]]; then
-        break
-    fi
-    echo "upstream ${ECHO_URL} returned HTTP ${echo_status} on attempt ${attempt}/3" >&2
-    sleep 2
-done
-if [[ "$echo_status" =~ ^2[0-9][0-9]$ ]]; then
-    expect_contains "middleware: request body is redacted before upstream" "$echo_body" "[REDACTED]"
-elif [[ "$echo_status" == "403" ]]; then
-    fail "middleware: request body is redacted before upstream" \
-        "OpenShell denied the permitted POST ${ECHO_URL}/allowed/echo: $echo_body"
-else
-    fail "middleware: request body is redacted before upstream" \
-        "the upstream ${ECHO_URL}, not OpenShell, returned HTTP ${echo_status} on 3 attempts; the echo body could not be checked"
-fi
-if [[ "$echo_body" == *"sk-abcdefghijklmnopqrstuvwxyz"* ]]; then
-    fail "middleware: secret never reaches upstream" "$echo_body"
-else
-    pass "middleware: secret never reaches upstream"
-fi
 
 # ---------------------------------------------------------------------------
 # Providers: real attachment, credential injection, denial, and rotation
@@ -359,7 +319,7 @@ when {
 };
 EOF
     if ! "$OPENSHELL_BIN" policy set "$SANDBOX" --policy "${TMP_DIR}/policy-provider.cedar" \
-        --middleware "${TMP_DIR}/middleware.yaml" --wait >/dev/null 2>&1; then
+        --wait >/dev/null 2>&1; then
         fail "providers: activate explicit scoped Cedar permit"
         return
     fi
@@ -514,10 +474,10 @@ expect_contains "logs: a staged audit forbid is logged" "$sandbox_logs" "cedar_a
 policy_view="$("$OPENSHELL_BIN" policy get "$SANDBOX" --full 2>&1 || true)"
 expect_contains "policy get: shows the Cedar policy" "$policy_view" 'Sandbox::Action::"NetworkConnect"'
 policy_json="$("$OPENSHELL_BIN" policy get "$SANDBOX" --full --output json 2>/dev/null || true)"
-if printf '%s' "$policy_json" | python3 -c 'import json,sys; policy=json.load(sys.stdin)["policy"]; assert policy["network_middlewares"]["redact-keys"]["middleware"] == "openshell/regex"'; then
-    pass "policy get: includes middleware alongside Cedar source"
+if printf '%s' "$policy_json" | python3 -c 'import json,sys; policy=json.load(sys.stdin)["policy"]; assert policy["cedar_policy"]["source"] and not policy.get("network_middlewares")'; then
+    pass "policy get: includes Cedar source without middleware"
 else
-    fail "policy get: includes middleware alongside Cedar source" "$policy_json"
+    fail "policy get: includes Cedar source without middleware" "$policy_json"
 fi
 
 echo

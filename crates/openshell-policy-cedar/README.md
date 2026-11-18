@@ -4,10 +4,10 @@
 [Cedar](https://www.cedarpolicy.com/). A policy is either YAML or Cedar for the
 life of a sandbox. Presence of `SandboxPolicy.cedar_policy`, whose source is authored as
 a `.cedar` file, selects Cedar. It is mutually exclusive with
-`network_policies` and filesystem paths. Middleware and endpoint settings are
-configuration rather than policy, so a Cedar sandbox gets them from a separate
-middleware file (`--middleware`), carried in `network_middlewares` and
-`endpoint_settings`.
+`network_policies` and filesystem paths. The CLI accepts Cedar source without a
+separate configuration file. Middleware,
+endpoint settings, and custom process identity are not configurable through the
+CLI for Cedar policies. The runtime API retains the shared configuration fields.
 
 `CedarEngine` validates the policy text in strict mode against the canonical
 schema in `openshell-policy-cedar-schema`. It then derives three artifacts that
@@ -132,8 +132,9 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   generation, commits the Cedar policy, installs provider credentials, and
   publishes the new middleware, so a rejected policy leaves the policy,
   middleware, and credentials on the previous revision. A middleware-only
-  change keeps Cedar's generation, so it does not close inspected tunnels. A
-  rejected revision quarantines or retains the Cedar engine according to
+  API change advances Cedar's generation and closes inspected tunnels; registry
+  reconciliation keeps the generation. A rejected revision quarantines or retains
+  the Cedar engine according to
   `policy_validation_failure_mode`, as for YAML.
 - An `HttpRequest` policy names its endpoint exactly in its scope, or as a
   host glob: exactly one `.`-delimited `resource.host like` and one

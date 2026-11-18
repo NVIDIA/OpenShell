@@ -63,6 +63,18 @@ and all 39 Docker Cedar checks with freshly built gateway, supervisor, CLI, and
 static sandbox binaries. The Docker supervisor image uses the distroless C++
 base to supply `libgcc_s`; production defaults are unchanged.
 
+## CLI configuration scope
+
+The CLI accepts Cedar source through the existing `--policy` option. The new
+`--middleware` option and file-loading helpers are removed, along with their
+E2E fixture. Existing YAML middleware and policy API fields are unchanged.
+Configuration parsing used only by parity tests is behind `test-support`.
+
+Verification: 2,595 policy, networking, and CLI tests pass (four ignored),
+strict Clippy and protobuf compatibility pass, and the updated Docker Cedar
+suite passes all 37 checks with the rebuilt CLI and existing gateway/supervisor
+artifacts. Formatting, Markdown lint, and shell syntax checks pass.
+
 ## Recommendation
 
 Refactor the boundaries before merging. The two Cedar crates are a good start,

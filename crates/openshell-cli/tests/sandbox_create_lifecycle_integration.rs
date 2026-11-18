@@ -4218,18 +4218,14 @@ async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
         "{error}"
     );
     for global in [false, true] {
-        let files = run::PolicyFiles {
-            policy: path,
-            middleware: None,
-        };
         let result = if global {
-            run::sandbox_policy_set_global(&server.endpoint, files, true, false, 1, "default", &tls)
+            run::sandbox_policy_set_global(&server.endpoint, path, true, false, 1, "default", &tls)
                 .await
         } else {
             run::sandbox_policy_set(
                 &server.endpoint,
                 "cedar-legacy",
-                files,
+                path,
                 false,
                 1,
                 "default",

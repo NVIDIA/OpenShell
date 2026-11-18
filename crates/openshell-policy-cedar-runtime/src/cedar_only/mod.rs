@@ -43,7 +43,7 @@
 //! Endpoint settings that are configuration rather than access control
 //! (`tls: skip`, `allow_encoded_slash`, body limits, MCP revisions, and
 //! GraphQL persisted queries) come from `SandboxPolicy.endpoint_settings`,
-//! authored in the middleware file. They are merged into the endpoint
+//! supplied through the policy API. They are merged into the endpoint
 //! configs of connections Cedar allows (see
 //! [`LoadedPolicy::endpoint_configs`]), and hash-only GraphQL persisted
 //! queries are resolved through their registry before Cedar evaluates them,

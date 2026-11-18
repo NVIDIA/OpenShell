@@ -6,7 +6,7 @@
 //! A YAML endpoint carries configuration such as `tls: skip`,
 //! `allow_encoded_slash`, MCP revisions, and the GraphQL persisted-query
 //! registry next to its rules. A Cedar sandbox gets the same configuration
-//! from the `endpoint_settings` section of its middleware file
+//! through the policy API's `endpoint_settings` field
 //! ([`SettingsScenario`]), and its access from the Cedar policy alone. Each
 //! translation keeps the YAML endpoint's settings on a settings entry for
 //! the same host and port. A YAML endpoint `path` that only scopes which
@@ -133,7 +133,7 @@ when {{ context.jsonrpc_method == "tools/call" && context.mcp_tool == "delete_re
     )
 }
 
-/// The middleware file carrying [`mcp_tool_yaml`]'s MCP revisions.
+/// The configuration fixture carrying [`mcp_tool_yaml`]'s MCP revisions.
 fn mcp_settings(versions: &str) -> String {
     format!(
         "endpoint_settings:\n  - host: {MCP_HOST}\n    port: {MCP_PORT}\n    mcp:\n      versions: {versions}\n"

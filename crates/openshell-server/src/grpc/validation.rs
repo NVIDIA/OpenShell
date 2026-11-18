@@ -2545,7 +2545,7 @@ mod tests {
         assert!(result.is_err(), "format flip must be rejected");
     }
 
-    /// A Cedar sandbox's process identity comes from its middleware file, and
+    /// A Cedar sandbox's process identity comes from its policy API fields, and
     /// `policy set` with a different one is rejected as for a YAML policy.
     #[cfg(feature = "cedar")]
     const CONNECT_PYPI: &str = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",

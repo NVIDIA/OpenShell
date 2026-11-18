@@ -39,8 +39,8 @@ message SandboxPolicy {
   // entirely from Cedar: Landlock grants are derived from the Cedar text
   // (plus the supervisor's baseline paths), and `filesystem` is not used.
   // `landlock.compatibility`, `process`, and `network_middlewares` are
-  // still honored; the CLI sets `process` and `network_middlewares` for a
-  // Cedar policy from the middleware file. Rejected at validation if
+  // still honored through the policy API. The CLI accepts Cedar source only.
+  // Rejected at validation if
   // `network_policies` or `filesystem` paths are also set.
   // A sandbox cannot switch between Cedar and YAML after creation, and
   // global policies must be YAML.
@@ -53,8 +53,8 @@ message SandboxPolicy {
   // Rejected in user-submitted policies.
   map<string, NetworkPolicyRule> provider_credential_rules = 8;
   // For Cedar policies only: endpoint settings that are configuration, not
-  // access control, authored in the `endpoint_settings` section of the
-  // middleware file. Each entry selects endpoints by `host` (exact or glob),
+  // access control, supplied through the policy API. Each entry selects
+  // endpoints by `host` (exact or glob),
   // `port`/`ports`, and an optional `path`, and may set only `tls`,
   // `allow_encoded_slash`, `json_rpc_max_body_bytes`,
   // `graphql_max_body_bytes`, `mcp` (`versions`, `strict_tool_names`),

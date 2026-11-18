@@ -456,8 +456,8 @@ struct ProviderScenario<'a> {
 
 /// A scenario whose Cedar sandbox also has endpoint settings.
 ///
-/// `settings` is middleware file text with an `endpoint_settings` section,
-/// parsed and validated as the CLI parses `--middleware`. The YAML policy
+/// `settings` is a configuration fixture with an `endpoint_settings` section,
+/// parsed into the Cedar policy API fields. The YAML policy
 /// carries the same settings on its own endpoints.
 struct SettingsScenario<'a> {
     name: &'a str,
@@ -558,7 +558,7 @@ impl Engines {
 
     fn load_settings(scenario: &SettingsScenario<'_>) -> Self {
         let opa = load_delivered_yaml(scenario.name, scenario.yaml);
-        let file = openshell_policy::parse_middleware_yaml(scenario.settings)
+        let file = openshell_policy::test_support::parse_configuration(scenario.settings)
             .unwrap_or_else(|error| panic!("{}: settings parse: {error:?}", scenario.name));
         let policy = openshell_core::proto::SandboxPolicy {
             cedar_policy: Some(openshell_core::proto::CedarPolicy {

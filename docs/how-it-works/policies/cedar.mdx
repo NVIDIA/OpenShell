@@ -48,60 +48,7 @@ The CLI sends the file's text to the gateway, which validates it and rejects an 
 
 `openshell policy get <name>` prints the Cedar text of a Cedar sandbox's policy.
 
-## Add Middleware and Endpoint Settings
-
-Middleware, endpoint settings, and the process identity are configuration, not access control, so they are supplied separately from the Cedar file in a middleware file. The file has a `network_middlewares` section and an optional `process` section, both in the same format as the sections of a YAML policy, and an `endpoint_settings` section:
-
-```yaml
-network_middlewares:
-  regex-redactor:
-    name: Redact API tokens
-    middleware: openshell/regex
-    order: 10
-    config:
-      mode: redact
-    on_error: fail_closed
-    endpoints:
-      include: ["api.github.com"]
-
-endpoint_settings:
-  - host: gitlab.example.com
-    port: 443
-    path: /api/**
-    allow_encoded_slash: true
-  - host: mcp.example.com
-    port: 443
-    mcp:
-      versions: ["2025-06-18", "2025-11-25"]
-      strict_tool_names: false
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-```
-
-Pass it with `--middleware` when you create the sandbox or set its policy:
-
-```shell
-openshell sandbox create --policy ./policy.cedar --middleware ./middleware.yaml -- claude
-openshell policy set <name> --policy ./policy.cedar --middleware ./middleware.yaml --wait
-```
-
-`openshell policy get <name>` prints these sections after the Cedar text. `process` accepts the same identities as a YAML policy and, like a YAML policy's process section, cannot change on a running sandbox; without it, the compute driver selects the identity. The Landlock compatibility mode of a Cedar sandbox uses its default.
-
-Each `endpoint_settings` entry selects endpoints the way a YAML endpoint does: `host` is an exact host or a host glob, `port` or `ports` lists the ports, and the optional `path` uses the YAML endpoint path syntax. An entry can set these YAML endpoint fields:
-
-| Field | Applies to |
-|---|---|
-| `tls: skip` | Endpoints the Cedar policy does not inspect, such as one whose client pins the server certificate or presents a client certificate, which inspection breaks. An entry that sets it on an endpoint with `HttpRequest` policies is rejected, and a provider's `tls: skip` is ignored there, so the policy still decides each request. Cannot be combined with `path`. |
-| `allow_encoded_slash` | Inspected requests. |
-| `json_rpc.max_body_bytes`, `mcp.max_body_bytes` | JSON-RPC and MCP endpoints. |
-| `mcp.versions`, `mcp.strict_tool_names` | MCP endpoints. Without `mcp.versions`, an MCP endpoint uses the YAML default revision. |
-| `graphql_max_body_bytes`, `persisted_queries`, `graphql_persisted_queries` | GraphQL and GraphQL-over-WebSocket endpoints. |
-
-A setting takes effect only on connections the Cedar policy allows, and a protocol option only where the policy inspects that protocol. Fields that decide access, such as `protocol`, `enforcement`, `access`, `rules`, `deny_rules`, `allowed_ips`, and `binaries`, and credential fields, which providers supply, are rejected. A YAML policy rejects `endpoint_settings`, because its endpoints carry these fields directly. As for a YAML endpoint, middleware with the default `on_error` behavior cannot select an endpoint that `endpoint_settings` sets to `tls: skip`, because OpenShell cannot inspect that traffic.
-
-An entry with a `path` applies to requests whose path it matches, and an entry without one applies to every request. When several entries match, the most specific path wins, as for YAML endpoints sharing a host and port, and a later entry overrides an earlier one for the fields it sets. Two entries cannot select the same host, path, and port. An entry with a `path` takes the protocol and enforcement of the [inspected path](#paths) that matches it, and has no effect where no inspected path matches.
+The CLI does not currently configure middleware, endpoint settings, or a custom process identity for Cedar policies. YAML policies retain their existing configuration sections.
 
 ## Policy Model
 
@@ -303,7 +250,7 @@ when {
 
 Any other way of naming the host, such as an undelimited `like`, a wildcard top-level domain, two hosts joined with `||`, or a glob without a port, is rejected. The request's `NetworkEndpoint` is the actual host and port, so the glob condition decides the request as written. OpenShell denies a connection or request to a host with an empty label, such as `.example.com` or `a..example.com`, because no wildcard host inspects it.
 
-A host matched by an exact endpoint and a wildcard host, or by two wildcard hosts, is inspected with the paths of all of them, and each request is routed to the most specific matching path, as for YAML endpoints sharing a host and port. Two such endpoints must inspect equally specific paths that can match the same request with the same protocol and enforcement, as YAML rejects overlapping endpoints that disagree. Comparing hosts has a fixed work budget, so a policy with hundreds of long, similar wildcard hosts on one port is rejected; wildcard hosts with different last labels are never compared. [Endpoint settings](#add-middleware-and-endpoint-settings) select wildcard-inspected hosts the same way they select any host.
+A host matched by an exact endpoint and a wildcard host, or by two wildcard hosts, is inspected with the paths of all of them, and each request is routed to the most specific matching path, as for YAML endpoints sharing a host and port. Two such endpoints must inspect equally specific paths that can match the same request with the same protocol and enforcement, as YAML rejects overlapping endpoints that disagree. Comparing hosts has a fixed work budget, so a policy with hundreds of long, similar wildcard hosts on one port is rejected; wildcard hosts with different last labels are never compared.
 
 Endpoints are parsed as REST by default. Add `@protocol("json-rpc")`, `@protocol("mcp")`, `@protocol("graphql")`, `@protocol("websocket")`, or `@protocol("websocket-graphql")` to an `HttpRequest` policy to inspect that protocol instead. All policies that declare a protocol for one endpoint path must agree. `@protocol("sql")` is rejected, because OpenShell does not inspect SQL traffic.
 
@@ -378,7 +325,7 @@ When a key repeats, as in `?tag=foo-a&tag=foo-b`, OpenShell evaluates the reques
 
 ### MCP
 
-`mcp_tool` is the tool name of a `tools/call` request. `mcp_method_class` is `available` for a core method of the selected MCP revision, and `extension` for any other method. An MCP endpoint does not allow its receive stream or client response frames by itself, so permit them explicitly. The endpoint accepts the YAML default revision, `2025-11-25`, unless an [endpoint setting](#add-middleware-and-endpoint-settings) lists other revisions.
+`mcp_tool` is the tool name of a `tools/call` request. `mcp_method_class` is `available` for a core method of the selected MCP revision, and `extension` for any other method. An MCP endpoint does not allow its receive stream or client response frames by itself, so permit them explicitly. The endpoint accepts the YAML default revision, `2025-11-25`, unless the policy API supplies other revisions.
 
 ```cedar
 @protocol("mcp")
@@ -407,7 +354,7 @@ when {
 
 ### GraphQL
 
-OpenShell evaluates each operation in a request separately and denies the request if any operation is denied. `graphql_operation_type` is lowercase. A hash-only persisted query, which sends no operation text, is looked up in the endpoint's `graphql_persisted_queries` [endpoint setting](#add-middleware-and-endpoint-settings) by hash, then by saved-query id, and Cedar evaluates the registered operation. OpenShell denies a hash-only query that is not registered, or any hash-only query unless `persisted_queries` is `allow_registered`, as for YAML. Match exact field names with `containsAll` and `containsAny`:
+OpenShell evaluates each operation in a request separately and denies the request if any operation is denied. `graphql_operation_type` is lowercase. Cedar policies created through the CLI do not configure a persisted-query registry, so hash-only persisted queries are denied. The policy API can supply a registry and enable registered queries with `persisted_queries: allow_registered`. Match exact field names with `containsAll` and `containsAny`:
 
 ```cedar
 @protocol("graphql")
@@ -482,7 +429,7 @@ A provider's token grant applies to a request only when Cedar allows the request
 
 A few provider rule forms cannot be expressed in Cedar, and OpenShell compiles them so they withhold tokens rather than grant them: allow rules with `?` in a glob, GraphQL `fields` globs, or an endpoint `path` glob other than `*` or a trailing `/**` grant no token, and deny rules with them withhold tokens more broadly; and a glob with `[`, `{`, or `\` withholds every token. The sandbox logs each such rule when it loads the policy. JSON-RPC requests whose method is not uppercase and hash-only GraphQL persisted queries also get no token.
 
-Use `openshell policy get <name> --full --output json` to inspect the provider credential rules and middleware delivered to the sandbox. `--base` omits provider-derived rules.
+Use `openshell policy get <name> --full --output json` to inspect the provider credential rules delivered to the sandbox. `--base` omits provider-derived rules.
 
 ```cedar
 permit (
@@ -514,5 +461,3 @@ when { context.method == "GET" };
 
 - [Policies Overview](/how-it-works/policies/overview) covers the YAML policy format.
 - [Policy Schema Reference](/how-it-works/policies/schema) lists every YAML field.
-- [Supervisor Middleware Configuration](/extensibility/supervisor-middleware/configure) describes middleware fields and failure behavior.
-- [Policy Schema Reference](/how-it-works/policies/schema) describes the endpoint fields that `endpoint_settings` reuses.

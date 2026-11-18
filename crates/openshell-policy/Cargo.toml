@@ -22,6 +22,8 @@ prost-types = { workspace = true }
 
 [features]
 default = []
+# Configuration fixtures shared with integration tests.
+test-support = []
 # Validates and interprets Cedar-authored policies (`cedar_policy.source`).
 # Without it, any policy with Cedar source fails validation as unsupported.
 # Only the gateway and supervisor enable it, through their own `cedar`

@@ -673,7 +673,7 @@ process:
 /// `ported_phase4` translates `query_api` (query matchers) and
 /// `ported_phase3` translates `graphql_ws` (GraphQL over WebSocket)
 /// separately. The persisted-query registry of `graphql_api` is an endpoint
-/// setting, not policy; `ported_phase2` supplies it with the middleware file.
+/// setting, not policy; `ported_phase2` supplies it through the policy API.
 pub(super) const L7_TEST_CEDAR: &str = r#"
 // rest_api
 permit (principal, action == Sandbox::Action::"NetworkConnect",

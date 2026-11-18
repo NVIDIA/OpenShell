@@ -444,7 +444,6 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
-    pub middleware: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
     pub expose_authorization_mode: ServiceAuthorizationMode,
@@ -476,7 +475,6 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
-            middleware: None,
             forward: None,
             expose: None,
             expose_authorization_mode: ServiceAuthorizationMode::Strip,
@@ -516,7 +514,6 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
-        middleware,
         forward,
         expose,
         expose_authorization_mode,
@@ -575,7 +572,7 @@ pub async fn sandbox_create(
     let effective_tls = tls.clone();
 
     // Keep the early-loaded policy off the provisioning future's stack.
-    let policy = Box::new(load_sandbox_policy_with_middleware(policy, middleware)?);
+    let policy = Box::new(load_sandbox_policy(policy)?);
     require_cedar_gateway_support(&mut client, policy.as_ref().as_ref()).await?;
 
     // Provider profiles are import-only, so the catalog lives on the gateway.
@@ -1559,38 +1556,6 @@ async fn require_cedar_gateway_support(
         }
     }
     Ok(())
-}
-
-/// The files `policy set` reads: a policy file and an optional middleware file.
-#[derive(Debug, Clone, Copy)]
-pub struct PolicyFiles<'a> {
-    /// Path to a YAML or `.cedar` policy file.
-    pub policy: &'a str,
-    /// Path to a middleware file, if any.
-    pub middleware: Option<&'a str>,
-}
-
-impl PolicyFiles<'_> {
-    /// Loads the policy and adds the middleware file, if any.
-    fn load(self) -> Result<SandboxPolicy> {
-        load_sandbox_policy_with_middleware(Some(self.policy), self.middleware)?
-            .ok_or_else(|| miette::miette!("No policy loaded from {}", self.policy))
-    }
-}
-
-/// Loads the policy and adds the middleware from `middleware_path`, if given.
-fn load_sandbox_policy_with_middleware(
-    policy_path: Option<&str>,
-    middleware_path: Option<&str>,
-) -> Result<Option<SandboxPolicy>> {
-    let mut policy = load_sandbox_policy(policy_path)?;
-    if let Some(middleware_path) = middleware_path {
-        let policy = policy.as_mut().ok_or_else(|| {
-            miette::miette!("--middleware requires a policy (--policy or OPENSHELL_SANDBOX_POLICY)")
-        })?;
-        openshell_policy::apply_middleware_file(policy, Path::new(middleware_path))?;
-    }
-    Ok(policy)
 }
 
 /// Sync files to or from a sandbox.
@@ -5468,7 +5433,7 @@ pub async fn sandbox_upload(
 
 pub async fn sandbox_policy_set_global(
     server: &str,
-    files: PolicyFiles<'_>,
+    policy_path: &str,
     yes: bool,
     wait: bool,
     _timeout_secs: u64,
@@ -5483,7 +5448,8 @@ pub async fn sandbox_policy_set_global(
 
     confirm_global_setting_takeover("policy", yes)?;
 
-    let policy = files.load()?;
+    let policy = load_sandbox_policy(Some(policy_path))?
+        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
     let mut client = grpc_client(server, tls).await?;
     require_cedar_gateway_support(&mut client, Some(&policy)).await?;
@@ -5816,13 +5782,14 @@ pub async fn sandbox_setting_delete(
 pub async fn sandbox_policy_set(
     server: &str,
     name: &str,
-    files: PolicyFiles<'_>,
+    policy_path: &str,
     wait: bool,
     timeout_secs: u64,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let policy = files.load()?;
+    let policy = load_sandbox_policy(Some(policy_path))?
+        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
     let mut client = grpc_client(server, tls).await?;
     require_cedar_gateway_support(&mut client, Some(&policy)).await?;

@@ -69,6 +69,7 @@ bundled-ca-roots = ["dep:webpki-roots"]
 cedar = ["openshell-policy/cedar"]
 
 [dev-dependencies]
+openshell-policy = { path = "../openshell-policy", features = ["test-support"] }
 openshell-policy-cedar = { path = "../openshell-policy-cedar" }
 openshell-policy-cedar-runtime = { path = "../openshell-policy-cedar-runtime" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
