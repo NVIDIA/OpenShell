@@ -4086,6 +4086,7 @@ version = "0.0.0"
 dependencies = [
  "openshell-isolation-interface",
  "sha2 0.10.9",
+ "windows",
 ]
 
 [[package]]
