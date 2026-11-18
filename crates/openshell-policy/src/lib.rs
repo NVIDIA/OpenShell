@@ -995,6 +995,26 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
     }
 }
 
+/// The restrictive default policy for a privileged (root-workload) sandbox.
+///
+/// Identical network posture to [`restrictive_default_policy`], but with no
+/// filesystem, Landlock, or process-identity sections: in-guest enforcement
+/// is meaningless against a root workload (the fence and the supervisor's
+/// policy evaluation are the boundary), so the default must not promise
+/// constraints that cannot be enforced. A policy that authors those sections
+/// is rejected by supervisor validation in privileged mode.
+#[must_use]
+pub fn restrictive_default_policy_privileged() -> SandboxPolicy {
+    SandboxPolicy {
+        version: 1,
+        filesystem: None,
+        landlock: None,
+        process: None,
+        network_policies: HashMap::new(),
+        network_middlewares: HashMap::default(),
+    }
+}
+
 /// Fill omitted process identity fields with the legacy `sandbox` defaults.
 ///
 /// Docker and Podman preserve omission so their supervisors can fall back to
