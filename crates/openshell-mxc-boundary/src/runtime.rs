@@ -879,11 +879,13 @@ impl BoundaryRuntime {
         );
         let process_id = format!("{}:main:0", self.config.generation);
         let (program, args) = agent_command(spec.clone());
+        let (args, raw_command_tail) = cmd_verbatim_tail(&program, args);
         let process = match ManagedProcess::spawn(
             process_id.clone(),
             ProcessKindWire::Main,
             program,
             args,
+            raw_command_tail,
             spec.workdir.clone(),
             environment,
         )
@@ -907,10 +909,10 @@ impl BoundaryRuntime {
     }
 
     async fn start_exec(&self, envelope: &RequestEnvelope, spec: ExecSpecWire) -> Response {
-        if spec.shell.is_some() || spec.runtime_helper.is_some() {
+        if spec.runtime_helper.is_some() {
             return guest_error(
                 BoundaryErrorKind::Invalid,
-                "MXC does not support shell exec intent or runtime helpers",
+                "MXC does not support runtime helpers",
             );
         }
         if spec.pty {
@@ -919,6 +921,10 @@ impl BoundaryRuntime {
                 "Windows ConPTY is not enabled for MXC exec",
             );
         }
+        let launch = match windows_launch(spec) {
+            Ok(launch) => launch,
+            Err(error) => return guest_error(BoundaryErrorKind::Invalid, error),
+        };
         {
             let mut requests = lock(&self.exec_requests);
             if !requests.insert(envelope.request_id.clone()) {
@@ -936,16 +942,17 @@ impl BoundaryRuntime {
         let environment = workload_environment(
             &self.config.child_env,
             &lock(&self.provider_environment).1,
-            &spec.env,
+            &launch.env,
             &self.proxy_url,
             lock(&self.ca_paths).as_ref(),
         );
         let process = match ManagedProcess::spawn(
             id.clone(),
             ProcessKindWire::Exec,
-            spec.program,
-            spec.args,
-            spec.workdir,
+            launch.program,
+            launch.args,
+            launch.raw_command_tail,
+            launch.workdir,
             environment,
         )
         .await
@@ -1188,6 +1195,87 @@ fn install_ca_environment(
     }
 }
 
+/// The concrete Windows process an exec request resolves to.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsLaunch {
+    program: String,
+    args: Vec<String>,
+    raw_command_tail: Option<String>,
+    workdir: Option<String>,
+    env: Vec<(String, String)>,
+}
+
+/// Keep argv launches separate from native SSH shell commands. Only a
+/// caller that explicitly selects cmd.exe and supplies its command text can
+/// request cmd.exe evaluation from a structured exec request.
+fn windows_launch(spec: ExecSpecWire) -> Result<WindowsLaunch, &'static str> {
+    let ExecSpecWire {
+        program,
+        args,
+        shell,
+        env,
+        workdir,
+        ..
+    } = spec;
+    if let Some(shell) = shell {
+        let (args, raw_command_tail) = shell.command.map_or_else(
+            || (vec!["/d".to_string(), "/q".to_string()], None),
+            |command| {
+                (
+                    vec!["/d".to_string(), "/s".to_string(), "/c".to_string()],
+                    Some(format!("\"{command}\"")),
+                )
+            },
+        );
+        return Ok(WindowsLaunch {
+            program: "cmd.exe".to_string(),
+            args,
+            raw_command_tail,
+            workdir,
+            env,
+        });
+    }
+
+    if let Some(flag) = cmd_command_flag(&program, &args)
+        && args.len() != flag + 2
+    {
+        return Err("cmd.exe /c or /k requires one argument containing the command text");
+    }
+    let (args, raw_command_tail) = cmd_verbatim_tail(&program, args);
+    Ok(WindowsLaunch {
+        program,
+        args,
+        raw_command_tail,
+        workdir,
+        env,
+    })
+}
+
+fn cmd_command_flag(program: &str, args: &[String]) -> Option<usize> {
+    if !Path::new(program).file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+    }) {
+        return None;
+    }
+    args.iter()
+        .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+}
+
+/// Pass cmd.exe command text verbatim after /c or /k, including its quotes.
+fn cmd_verbatim_tail(program: &str, mut args: Vec<String>) -> (Vec<String>, Option<String>) {
+    let Some(flag) = cmd_command_flag(program, &args) else {
+        return (args, None);
+    };
+    let text = args.split_off(flag + 1).join(" ");
+    if !args[..flag]
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case("/s"))
+    {
+        args.insert(flag, "/s".to_string());
+    }
+    (args, Some(format!("\"{text}\"")))
+}
+
 fn workload_environment(
     child: &HashMap<String, String>,
     providers: &HashMap<String, String>,
@@ -1280,6 +1368,7 @@ impl ManagedProcess {
         kind: ProcessKindWire,
         program: String,
         args: Vec<String>,
+        raw_command_tail: Option<String>,
         workdir: Option<String>,
         environment: HashMap<String, String>,
     ) -> Result<Self, String> {
@@ -1293,6 +1382,11 @@ impl ManagedProcess {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .envs(environment);
+        // cmd.exe parses its own command line, so the text after /c must not be
+        // re-quoted with the C runtime rules that `Command::args` applies.
+        if let Some(tail) = raw_command_tail {
+            command.raw_arg(tail);
+        }
         if let Some(workdir) = workdir.filter(|path| !path.trim().is_empty()) {
             command.current_dir(workdir);
         }
@@ -1696,6 +1790,95 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_sandbox_backend::boundary_protocol::ShellSpecWire;
+
+    fn shell_exec(command: Option<&str>) -> ExecSpecWire {
+        ExecSpecWire {
+            program: String::new(),
+            args: Vec::new(),
+            shell: Some(ShellSpecWire {
+                command: command.map(str::to_string),
+                login: true,
+            }),
+            runtime_helper: None,
+            env: vec![("FROM_REQUEST".to_string(), "1".to_string())],
+            workdir: Some(r"C:\default".to_string()),
+            pty: false,
+        }
+    }
+
+    #[test]
+    fn native_ssh_shell_text_reaches_cmd_unchanged() {
+        let native = r#""C:\Windows\System32\tool.exe" "a b""#;
+        let launch = windows_launch(shell_exec(Some(native))).unwrap();
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.args, vec!["/d", "/s", "/c"]);
+        assert_eq!(launch.raw_command_tail, Some(format!("\"{native}\"")));
+        assert_eq!(launch.workdir.as_deref(), Some(r"C:\default"));
+    }
+
+    #[test]
+    fn shell_without_command_starts_cmd() {
+        let launch = windows_launch(shell_exec(None)).unwrap();
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.args, vec!["/d", "/q"]);
+    }
+
+    fn argv_exec(program: &str, args: &[&str]) -> ExecSpecWire {
+        let mut spec = shell_exec(None);
+        spec.shell = None;
+        spec.program = program.to_string();
+        spec.args = args.iter().map(|arg| (*arg).to_string()).collect();
+        spec
+    }
+
+    #[test]
+    fn argv_exec_preserves_literal_arguments() {
+        let program = r"C:\Program Files\tool.exe";
+        let launch =
+            windows_launch(argv_exec(program, &["a & b", "%VALUE%", "", r"path\"])).unwrap();
+        assert_eq!(launch.program, program);
+        assert_eq!(launch.args, ["a & b", "%VALUE%", "", r"path\"]);
+        assert_eq!(launch.raw_command_tail, None);
+    }
+
+    #[test]
+    fn cmd_argv_requires_explicit_shell_text() {
+        let program = r"C:\Windows\System32\cmd.exe";
+        let text = r#">"C:\dir\out.txt" echo written"#;
+        let launch = windows_launch(argv_exec(program, &["/d", "/c", text])).unwrap();
+        assert_eq!(launch.program, program);
+        assert_eq!(launch.args, ["/d", "/s", "/c"]);
+        assert_eq!(launch.raw_command_tail, Some(format!("\"{text}\"")));
+        assert!(windows_launch(argv_exec(program, &["/c", "echo", "a & b"])).is_err());
+    }
+
+    #[tokio::test]
+    async fn cmd_writes_a_quoted_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("out file.txt");
+        let command = format!(">\"{}\" echo written", path.display());
+        let launch = windows_launch(argv_exec("cmd.exe", &["/d", "/c", &command])).unwrap();
+        let process = ManagedProcess::spawn(
+            "cmd-quoted-path".to_string(),
+            ProcessKindWire::Exec,
+            launch.program,
+            launch.args,
+            launch.raw_command_tail,
+            None,
+            HashMap::new(),
+        )
+        .await
+        .expect("cmd starts");
+        let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
+            .await
+            .expect("process exits");
+        assert!(matches!(status, ExitStatusWire::Exited(0)), "{status:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file written").trim(),
+            "written"
+        );
+    }
 
     #[test]
     fn exec_environment_keeps_proxy_and_ca_with_refreshed_providers() {
@@ -2015,6 +2198,7 @@ mod tests {
                 "echo relay-free launch".to_string(),
             ],
             None,
+            None,
             HashMap::new(),
         )
         .await
@@ -2060,6 +2244,7 @@ mod tests {
                     "/C".into(),
                     "(for /L %i in (1,1,2000) do @echo output-line) & echo last-error 1>&2".into(),
                 ],
+                None,
                 None,
                 HashMap::new(),
             )

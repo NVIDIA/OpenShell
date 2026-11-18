@@ -11,10 +11,8 @@ use miette::Result;
 use openshell_isolation_interface::contract::{
     BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
 };
-#[cfg(unix)]
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
-#[cfg(unix)]
 fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
     openshell_ocsf::ctx::ctx()
 }
@@ -142,7 +140,6 @@ pub async fn start_boundary_access(
 }
 
 /// The optional SSH adapter is the only platform-specific access component.
-#[cfg(unix)]
 async fn start_optional_ssh(
     socket_path: Option<std::path::PathBuf>,
     shared_socket: bool,
@@ -196,24 +193,6 @@ async fn start_optional_ssh(
             }
         }
     }
-}
-
-#[cfg(not(unix))]
-async fn start_optional_ssh(
-    socket_path: Option<std::path::PathBuf>,
-    _shared_socket: bool,
-    _ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    _boundary_exec: Arc<dyn BoundaryExec>,
-    _port_forward: Arc<dyn BoundaryLoopbackConnector>,
-    _main_session: Arc<crate::main_session::MainSession>,
-    _host_key: Option<russh::keys::PrivateKey>,
-) -> Result<Option<tokio::task::JoinHandle<()>>> {
-    if socket_path.is_some() {
-        return Err(miette::miette!(
-            "SSH access sockets are unsupported on this host"
-        ));
-    }
-    Ok(None)
 }
 
 /// Report the canonical process exit until the gateway acknowledges it.
@@ -384,7 +363,7 @@ mod tests {
 
     #[cfg(not(unix))]
     #[tokio::test]
-    async fn explicit_unix_ssh_socket_is_rejected() {
+    async fn in_process_ssh_requires_a_host_key() {
         let boundary = Arc::new(AccessBoundary);
         let result = start_boundary_access(
             None,
@@ -402,9 +381,9 @@ mod tests {
         assert!(
             result
                 .err()
-                .expect("Unix SSH unsupported")
+                .expect("SSH without a host key must be rejected")
                 .to_string()
-                .contains("unsupported")
+                .contains("host key is missing")
         );
     }
 

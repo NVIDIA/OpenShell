@@ -38,6 +38,7 @@
 #   service-forwarding - named HTTP service routing and endpoint deletion.
 #   host-service     - workload reaches an HTTP service on host 127.0.0.1.
 #   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
+#   exec-restart     - opt-in argv, exit status, and restart from Completed and Stopped.
 
 [CmdletBinding()]
 param(
@@ -420,6 +421,64 @@ function Test-HostServiceResult([string]$work, [string]$nonce, [string]$requestL
 
 # Exercise the public gRPC forward path, never dial the workload port directly.
 # The nonce identifies this workload, not an unrelated host-loopback listener.
+function Wait-RuntimePhase([string]$sandboxName, [string]$phase) {
+    $deadline = (Get-Date).AddSeconds(45)
+    do {
+        $result = Invoke-NativeCaptured $cli @('sandbox', 'get', $sandboxName, '-o', 'json') 5
+        if ($result.ExitCode -eq 0) {
+            $state = @($result.Output)[0] | ConvertFrom-Json
+            if ($state.phase -eq $phase) { return $state }
+            if ($state.phase -eq 'Error') { throw "Sandbox entered Error while waiting for $phase" }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    throw "Sandbox did not reach $phase"
+}
+
+function Test-ExecRestart([string]$sandboxName, [string]$workload, [string]$launchLog, [string]$exitFile) {
+    $initial = Wait-RuntimePhase $sandboxName 'Ready'
+    $literal = 'spaces & %PATH% | literal'
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', $workload, '--print-arg', $literal) 15
+    if ($result.ExitCode -ne 0 -or ($result.Output -join '').Trim() -cne $literal) {
+        throw "Exec did not return the original argument: $($result.Output)"
+    }
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', $cmdExe, '/d', '/c', 'exit /b 7') 15
+    if ($result.ExitCode -ne 7) { throw "Exec did not return cmd.exe exit status 7: $($result.Output)" }
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', 'openshell-test-program-not-installed.exe') 15
+    if ($result.ExitCode -ne 1 -or ($result.Output -join '') -notmatch 'openshell:') {
+        throw "Exec did not report a spawn failure and exit status: $($result.Output)"
+    }
+
+    # The first main process exits normally while its supervisor remains alive.
+    Set-Content -LiteralPath $exitFile -Value 'exit'
+    $null = Wait-RuntimePhase $sandboxName 'Completed'
+    Remove-Item -LiteralPath $exitFile -ErrorAction Stop
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'start', $sandboxName) 60
+    if ($result.ExitCode -ne 0) { throw "Start from Completed failed: $($result.Output)" }
+    $restarted = Wait-RuntimePhase $sandboxName 'Ready'
+    if ($restarted.main_process_instance_id -eq $initial.main_process_instance_id) {
+        throw 'Start from Completed reused the old main process'
+    }
+
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'stop', $sandboxName) 30
+    if ($result.ExitCode -ne 0) { throw "Stop failed: $($result.Output)" }
+    $null = Wait-RuntimePhase $sandboxName 'Stopped'
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'start', $sandboxName) 60
+    if ($result.ExitCode -ne 0) { throw "Start from Stopped failed: $($result.Output)" }
+    $started = Wait-RuntimePhase $sandboxName 'Ready'
+    if ($started.main_process_instance_id -eq $restarted.main_process_instance_id) {
+        throw 'Start from Stopped reused the old main process'
+    }
+
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+        $launches = @(Get-Content -LiteralPath $launchLog -ErrorAction SilentlyContinue)
+        if ($launches.Count -eq 3) { return }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    throw "Expected three launches in the retained workspace; found $($launches.Count)"
+}
+
 function Test-Forwarding([string]$sandboxName, [string]$readyFile, [string]$nonce) {
     if (-not (Wait-File $readyFile 30)) { throw "MXC forwarding listener did not report readiness" }
     $targetPort = [int](Get-Content -LiteralPath $readyFile -Raw).Trim()
@@ -796,6 +855,13 @@ try {
     # External connectivity is deliberately opt-in; the default seven scenarios
     # remain runnable without Internet access. Use the same authenticated
     # gateway launch path as every other workload, not a bare driver fixture.
+    if ($Scenario -eq 'exec-restart') {
+        $allScenarios += @{
+            Name = 'exec-restart'; PolicyFile = Join-Path $policyDir 'fs-rw.yaml'
+            SandboxId = 'exec'; Backends = 'process_container'; Kind = 'exec-restart'
+            Description = 'structured argv, exit status, and fresh runtime with a retained workspace'
+        }
+    }
     if ($Scenario -eq 'https-ca') {
         $allScenarios += @{
             Name = 'https-ca'; PolicyFile = Join-Path $policyDir 'https-ca.yaml'
@@ -943,8 +1009,10 @@ try {
                     '--stderr', $sc.ErrorTarget,
                     '--output', $sc.PosTarget, '--write-out', "%output{$($sc.CertificateTarget)}%{certs}\nOpenShell curl exit: %{exitcode}\n",
                     'https://example.com/')
-            } elseif ($sc.Kind -in @("forwarding", "service-forwarding")) {
-                Remove-Item -LiteralPath $sc.ReadyFile -Force -ErrorAction SilentlyContinue
+            } elseif ($sc.Kind -in @("forwarding", "service-forwarding", "exec-restart")) {
+                if ($sc.ReadyFile) {
+                    Remove-Item -LiteralPath $sc.ReadyFile -Force -ErrorAction SilentlyContinue
+                }
                 $forwardNonce = [guid]::NewGuid().ToString('N')
                 $fixture = Join-Path $BinaryDir 'mxc-forwarding-agent.exe'
                 if (-not (Test-Path -LiteralPath $fixture)) {
@@ -957,6 +1025,11 @@ try {
                 Copy-Item -LiteralPath $fixture -Destination $workload -Force
                 $command = @($workload, $sc.ReadyFile, $forwardNonce)
                 if ($sc.Kind -eq "service-forwarding") { $command += 'http' }
+                if ($sc.Kind -eq "exec-restart") {
+                    $launchLog = Join-Path $DemoDir "launches-$runId.txt"
+                    $exitFile = Join-Path $DemoDir "exit-$runId.txt"
+                    $command = @($workload, '--exit-on-file', $launchLog, $exitFile)
+                }
             } else {
                 $command = @($cmdExe, "/c", "exit 0")
             }
@@ -990,7 +1063,7 @@ try {
                     "--policy", [string]$policyUsed,
                     "--driver-config-json", $driverConfig
                 )
-                $createArguments += if ($sc.Kind -eq 'host-service') { '--detach' } else { '--no-tty' }
+                $createArguments += if ($sc.Kind -in @('host-service', 'exec-restart')) { '--detach' } else { '--no-tty' }
                 $createResult = Invoke-NativeCaptured $cli $createArguments
                 $createOut = $createResult.Output
                 $createExitCode = $createResult.ExitCode
@@ -1013,6 +1086,17 @@ try {
                 } catch {
                     Bad "host-service: $($_.Exception.Message)"
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
+                }
+            } elseif ($sc.Kind -eq 'exec-restart') {
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox create failed: $createOutStr" }
+                    Test-ExecRestart $sandboxName $workload $launchLog $exitFile
+                    $reason = 'argv and exit status verified; both starts replaced the main process and retained the workspace'
+                    Ok "exec-restart: $reason"
+                    $results += [pscustomobject]@{ Scenario=$sc.Name; Result='PASS'; Reason=$reason }
+                } catch {
+                    Bad "exec-restart: $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario=$sc.Name; Result='FAIL'; Reason=$_.Exception.Message }
                 }
             } elseif ($sc.Kind -eq 'socket-owner') {
                 try {

@@ -968,15 +968,19 @@ async fn open_target(
     expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(not(unix))]
-    let _ = (ssh_socket_path, expected_ssh_peer_pid);
+    let _ = expected_ssh_peer_pid;
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, port_forward).await,
         Some(relay_open::Target::Ssh(_)) | None => {
             if ssh_socket_path.as_os_str().is_empty() {
                 return Err("SSH access is not configured for this supervisor".into());
             }
+            // The SSH server runs in this process, so there is no peer to
+            // authenticate: the stream never leaves the supervisor.
             #[cfg(not(unix))]
-            return Err("SSH relay targets are unsupported by the Windows supervisor".into());
+            return Ok(Box::new(
+                crate::ssh::connect_in_process(ssh_socket_path).await?,
+            ));
             #[cfg(unix)]
             {
                 let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
