@@ -30,7 +30,9 @@ try {
     $native = Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' PROCESSOR_ARCHITECTURE
     $expected = if ($manifest.target -eq 'aarch64-pc-windows-msvc') { 0xaa64 } else { 0x8664 }
     if (($expected -eq 0xaa64 -and $native -ne 'ARM64') -or ($expected -eq 0x8664 -and $native -ne 'AMD64')) { throw 'Native host architecture changed.' }
-    foreach ($name in @('openshell.exe', 'openshell-gateway.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe', 'mxc-forwarding-agent.exe', 'libz3.dll')) {
+    $names = @('openshell.exe', 'openshell-gateway.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe', 'mxc-forwarding-agent.exe')
+    if (@($manifest.files | Where-Object { $_.path -eq 'bin/libz3.dll' }).Count) { $names += 'libz3.dll' }
+    foreach ($name in $names) {
         if ((Get-PeMachine (Join-Path $repo "bin/$name")) -ne $expected) { throw "Wrong executable architecture: $name" }
     }
     $wxc = $manifest.wxcExecPath

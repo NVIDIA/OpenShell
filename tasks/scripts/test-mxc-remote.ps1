@@ -23,6 +23,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+. (Join-Path $PSScriptRoot 'windows-runtime.ps1')
 if ($HostName -notmatch '^[A-Za-z0-9.-]+$' -or $UserName -notmatch '^[A-Za-z0-9_.-]+$') {
     throw 'Use a hostname/IP and a simple SSH username (or configure an SSH alias).'
 }
@@ -123,7 +124,9 @@ try {
     }
     $examples = 'crates/openshell-driver-mxc/examples'
     $files += @{ source = (Join-Path $BuildDirectory "$target/release/examples/mxc-forwarding-agent.exe"); path = 'bin/mxc-forwarding-agent.exe' }
-    $files += @{ source = (Find-Z3Runtime $BuildDirectory $target $Z3DllPath); path = 'bin/libz3.dll' }
+    if (Test-SharedWindowsZ3 (Join-Path $BuildDirectory "$target/release/openshell-gateway.exe")) {
+        $files += @{ source = (Find-Z3Runtime $BuildDirectory $target $Z3DllPath); path = 'bin/libz3.dll' }
+    }
     foreach ($path in @("$examples/run-mxc-e2e.ps1", "$examples/mxc-gateway.toml", 'tasks/scripts/run-mxc-remote.ps1')) {
         $files += @{ source = (Join-Path $repo $path); path = $path }
     }

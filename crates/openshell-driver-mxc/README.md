@@ -256,11 +256,13 @@ drivers need no UI-specific handling. UI policy itself does not require the
 
 ## Validation
 
-Windows release build tasks stage the pinned, target-matching `libz3.dll` beside
-the gateway and verify its architecture and copied SHA256. Conflicting cached
-DLLs fail the build instead of selecting an arbitrary runtime. Local E2E requires
-this adjacent DLL; rebuild for the native architecture if preflight reports it
-missing.
+Windows build tasks embed the CRT in all four executables and Z3 in the
+gateway by default. They download and cache the pinned Z3 5.1.0 static `/MT`
+package from GHCR, with source fallback when unavailable. Release builds reject
+Z3 or redistributable CRT DLL imports. The resulting executables need neither
+`libz3.dll` nor the Visual C++ redistributable. See
+[Windows build options](../../CONTRIBUTING.md#windows-full-build) for explicit
+source, library, and legacy shared-mode overrides.
 
 ### Remote Windows host
 
@@ -284,11 +286,11 @@ architecture before testing. `-BuildDirectory` selects a dedicated Cargo cache.
 `-SkipBuild` reuses existing artifacts without claiming they match current
 sources. `-Scenario` selects an existing harness scenario.
 
-The package includes `libz3.dll` from the target-specific Cargo build cache.
-Windows prebuilt Z3 uses a dynamic runtime DLL. Supply `-Z3DllPath` if multiple
-different cached versions exist or when using a custom Z3 build. The remote
-host needs the native Visual C++ runtime; the runner validates DLL architecture
-and gateway startup before invoking E2E.
+The remote helper reads gateway imports and includes `libz3.dll` only for
+shared builds. `-Z3DllPath` can select a matching DLL for those builds; their
+runtime host also needs the native Visual C++ runtime. The helper checks DLL
+architecture and gateway startup before E2E. Default static builds omit the DLL.
+The separate MXC executor retains its own prerequisites.
 
 The example gateway explicitly enables caller driver config so tests can submit
 their workload command and directory. MXC does not implement external-resource

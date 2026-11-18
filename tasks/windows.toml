@@ -125,3 +125,12 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 description = "Validate MXC audit fixtures and real seven-event JSONL coverage (requires ETW privileges and native release binaries)"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-audit native"
+["windows:z3:package:x64"]
+description = "Build the pinned static /MT Z3 x64 dependency package"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 package-z3 x86_64-pc-windows-msvc"
+
+["windows:z3:package:arm64"]
+description = "Build the pinned static /MT Z3 ARM64 dependency package"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 package-z3 aarch64-pc-windows-msvc"
