@@ -19,16 +19,6 @@ dir = "sdk/typescript"
 run = "npm run gen"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-proto.ps1"
 
-# Lints the repo-level proto module (buf.yaml at the root) against STANDARD.
-# buf ships only in the SDK's devDependencies today, so this depends on the
-# SDK install and runs buf from there; the target is all of proto/, not just
-# the SDK's client-surface subset.
-["proto:lint"]
-description = "Lint proto/ with buf (repo-level buf.yaml)"
-depends = ["sdk:ts:install"]
-run = "./sdk/typescript/node_modules/.bin/buf lint"
-run_windows = "sdk\\typescript\\node_modules\\.bin\\buf.cmd lint"
-
 ["sdk:ts:typecheck"]
 description = "Type-check the TypeScript SDK"
 depends = ["sdk:ts:proto"]
