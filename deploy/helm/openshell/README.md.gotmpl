@@ -225,12 +225,11 @@ that routes requests to the app listener on the supervisor owning each sandbox:
 ```yaml
 gatewayConfig:
   openshell.gateway:
-    service_routing_enabled: false
+    enable_gateway_service_routing: false
   openshell.supervisor.app_listener:
     enabled: true
     port: 9443
-    domain: services.example.com
-    public_url: https://services.example.com
+    base_url: https://services.example.com
   openshell.drivers.kubernetes.sandbox_runtime.app_listener:
     tls_secret_name: openshell-app-tls
 ```
