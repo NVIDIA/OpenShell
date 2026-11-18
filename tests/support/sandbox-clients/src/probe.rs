@@ -29,8 +29,8 @@ const EACCES: i32 = 13;
 pub enum ConnectOutcome {
     Connected,
     /// The connect failed with `errno`, or none for an error without one,
-    /// such as a name that didn't resolve ([`ConnectOutcome::is_dns_failure`]).
-    /// `error` is Python's description of it.
+    /// such as a name that didn't resolve (`dns`). `error` is Python's
+    /// description of it.
     Failed {
         errno: Option<i32>,
         dns: bool,
@@ -50,11 +50,6 @@ impl ConnectOutcome {
             Self::Failed { errno, .. } => *errno,
             Self::Connected | Self::TimedOut => None,
         }
-    }
-
-    /// Whether the connect failed because the name didn't resolve.
-    pub fn is_dns_failure(&self) -> bool {
-        matches!(self, Self::Failed { dns: true, .. })
     }
 
     /// Whether the connect failed with `EACCES` or `EPERM`, as the sandbox
