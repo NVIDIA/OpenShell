@@ -19,6 +19,7 @@ openshell-bootstrap = { path = "../../../crates/openshell-bootstrap" }
 openshell-core = { path = "../../../crates/openshell-core", default-features = false }
 openshell-crypto = { path = "../../../crates/openshell-crypto" }
 openshell-policy = { path = "../../../crates/openshell-policy" }
+openshell-providers = { path = "../../../crates/openshell-providers" }
 openshell-sdk = { path = "../../../crates/openshell-sdk" }
 openshell-testkit-macros = { path = "../testkit-macros" }
 clap = { version = "4", features = ["derive"] }
@@ -40,6 +41,9 @@ tonic = "0.14"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+prost-types = "0.14"
 
 # A test program, run by `cargo test` and nextest through `testkit::main`'s
 # libtest interface, that checks the program's own subcommands.
