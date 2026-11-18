@@ -4,7 +4,8 @@
 //! Providers attached to a sandbox: files a provider profile serves, and
 //! providers that `sandbox create --provider` creates from local credentials.
 
-use testkit::{Context, ResultExt as _, YamlFile, policy};
+use testkit::policy::{self, Access, Endpoint as _};
+use testkit::{Context, Credential, Profile, ResultExt as _, YamlFile};
 
 /// The example profile that serves `client.toml` from the provider's config.
 const FILES_PROFILE: &str =
@@ -96,7 +97,7 @@ async fn auto_created_provider_credential_available_in_sandbox(
     cx: &mut Context,
 ) -> testkit::Result {
     let provider = cx
-        .import_profile(&auto_create_profile(&cx.name("auto")))
+        .import_profile(&auto_create_profile(&cx.name("auto")).to_yaml()?)
         .await?;
     // The CLI names the provider it creates after the profile.
     let cli = cx.cli_handle();
@@ -176,28 +177,21 @@ async fn expect_project(sandbox: &testkit::Sandbox, path: &str, project: &str) -
 /// A profile `id` whose credential the CLI discovers in [`AUTO_CREATE_ENV`].
 /// Its endpoint makes the gateway inject the credential without a policy
 /// binding; nothing connects to it.
-fn auto_create_profile(id: &str) -> String {
-    format!(
-        "id: {id}
-display_name: E2E Auto-created Provider
-category: other
-credentials:
-  - name: api_key
-    env_vars: [{AUTO_CREATE_ENV}]
-    required: true
-    auth_style: header
-    header_name: x-api-key
-discovery:
-  credentials: [api_key]
-endpoints:
-  - host: api.auto-provider.example
-    port: 443
-    protocol: rest
-    access: read-write
-    enforcement: enforce
-binaries: [/usr/bin/curl]
-"
-    )
+fn auto_create_profile(id: &str) -> Profile {
+    Profile::new(id)
+        .display_name("E2E Auto-created Provider")
+        .credential(
+            Credential::new("api_key")
+                .env_var(AUTO_CREATE_ENV)
+                .required()
+                .auth_style("header")
+                .header_name("x-api-key"),
+        )
+        .discover(["api_key"])
+        .endpoint("api.auto-provider.example", 443, |ep| {
+            ep.rest(Access::ReadWrite).enforce();
+        })
+        .binaries(["/usr/bin/curl"])
 }
 
 /// Whether `value` is the placeholder for the credential in `key`, in the
