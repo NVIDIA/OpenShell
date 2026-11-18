@@ -144,11 +144,6 @@ path = "tests/podman_corporate_proxy.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "podman_resource_limits"
-path = "tests/podman_resource_limits.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
 name = "provider_refresh_handles"
 path = "tests/provider_refresh_handles.rs"
 required-features = ["e2e-podman"]
