@@ -237,7 +237,7 @@ impl NotificationListener {
     ///
     /// Only the opt-in performance harness can request this. Production
     /// listeners keep the default wakeup: the hint was measured and not
-    /// adopted; see `benchmarks/docker/PERFORMANCE-IDEAS.md`.
+    /// adopted.
     #[cfg(feature = "perf-harness")]
     pub fn enable_sync_wakeup(&self) -> io::Result<()> {
         let request = SECCOMP_IOCTL_NOTIF_SET_FLAGS;

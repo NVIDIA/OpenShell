@@ -2107,8 +2107,8 @@ fn build_binds_does_not_expose_host_runtime_material() {
 }
 
 #[test]
-fn volume_subpath_support_follows_the_daemon_api_version() {
-    for (version, supported) in [
+fn provider_file_delivery_follows_the_opt_in_and_the_daemon_api_version() {
+    for (version, subpath_supported) in [
         (Some("1.45"), true),
         (Some("1.52"), true),
         (Some("2.0"), true),
@@ -2122,70 +2122,30 @@ fn volume_subpath_support_follows_the_daemon_api_version() {
     ] {
         assert_eq!(
             docker_supports_volume_subpath(version),
-            supported,
+            subpath_supported,
             "{version:?}"
         );
-    }
-}
-
-#[test]
-fn provider_files_stay_virtual_without_the_build_opt_in() {
-    for version in [
-        Some("1.45"),
-        Some("1.52"),
-        Some("2.0"),
-        Some("1.44"),
-        Some(""),
-        Some("v1.52"),
-        None,
-    ] {
+        // Without the build opt-in, delivery stays virtual on every daemon.
         assert_eq!(
             select_docker_provider_files(version, false),
             DockerProviderFiles::Virtual,
             "{version:?}"
         );
-    }
-}
-
-#[test]
-fn opted_in_provider_files_are_native_only_on_a_supporting_daemon() {
-    for (version, expected) in [
-        (Some("1.45"), DockerProviderFiles::Native),
-        (Some("1.52"), DockerProviderFiles::Native),
-        (Some("2.0"), DockerProviderFiles::Native),
-        (Some("1.44"), DockerProviderFiles::Virtual),
-        (Some("1.9"), DockerProviderFiles::Virtual),
-        (Some(""), DockerProviderFiles::Virtual),
-        (Some("1.x"), DockerProviderFiles::Virtual),
-        (Some("v1.52"), DockerProviderFiles::Virtual),
-        (None, DockerProviderFiles::Virtual),
-    ] {
+        let opted_in = if subpath_supported {
+            DockerProviderFiles::Native
+        } else {
+            DockerProviderFiles::Virtual
+        };
         assert_eq!(
             select_docker_provider_files(version, true),
-            expected,
+            opted_in,
             "{version:?}"
         );
     }
-}
-
-#[test]
-fn the_build_opt_in_follows_the_cargo_feature() {
-    let expected = if cfg!(feature = "experimental-native-provider-files") {
-        DockerProviderFiles::Native
-    } else {
-        DockerProviderFiles::Virtual
-    };
+    // The opt-in is the Cargo feature, nothing else.
     assert_eq!(
-        select_docker_provider_files(Some("1.45"), NATIVE_PROVIDER_FILES_OPT_IN),
-        expected
-    );
-    assert_eq!(
-        select_docker_provider_files(Some("1.44"), NATIVE_PROVIDER_FILES_OPT_IN),
-        DockerProviderFiles::Virtual
-    );
-    assert_eq!(
-        select_docker_provider_files(None, NATIVE_PROVIDER_FILES_OPT_IN),
-        DockerProviderFiles::Virtual
+        NATIVE_PROVIDER_FILES_OPT_IN,
+        cfg!(feature = "experimental-native-provider-files")
     );
 }
 

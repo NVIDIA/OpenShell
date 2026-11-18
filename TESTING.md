@@ -24,9 +24,8 @@ tests/runner/          # openshell-test-runner: runs a test family in a tmachine
 
 ## Performance benchmarks
 
-See [Docker driver performance benchmark](benchmarks/docker/README.md) for the
-paired Docker/OpenShell workload benchmark (`mise run perf:docker`) and the
-native/filtered seccomp broker microbenchmark (`mise run perf:seccomp`).
+Run `mise run perf:seccomp` for the native/filtered seccomp broker
+microbenchmark.
 
 ## Rust Tests
 
