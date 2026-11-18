@@ -25,18 +25,10 @@ use super::img::QemuImage;
 /// `TMACHINE_SSH_PORT` says otherwise.
 const DEFAULT_SSH_PORT: u16 = 2222;
 
-/// How long the QMP power-off request has to be acknowledged. A guest or QEMU
-/// that stops answering must not hang teardown.
-const QMP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a powered-off guest has to exit at teardown before QEMU is
-/// killed.
-const POWER_OFF_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// How long a guest being saved as a cached layer has to power off. A heavily
 /// provisioned guest (Docker, k3s) can take minutes to stop its services, and
-/// a layer that is killed instead is not cached, so this is much longer than
-/// [`POWER_OFF_TIMEOUT`]. It still bounds a guest that never stops.
+/// a layer that is killed instead is not cached. It still bounds a guest that
+/// never stops.
 pub(super) const LAYER_POWER_OFF_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The host port forwarded to the guest's SSH server.
@@ -167,28 +159,6 @@ impl QemuVm {
 
             if response.contains("\"return\"") {
                 return Ok(());
-            }
-        }
-    }
-
-    /// Power the guest off and wait for QEMU to exit. Never panics: a guest
-    /// that can't be powered off cleanly is killed, and the problem is
-    /// logged. Use this when tearing down, where there is nothing left to do
-    /// about a failure.
-    pub(super) async fn power_off_or_kill(mut self) {
-        let shutdown = match tokio::time::timeout(QMP_TIMEOUT, self.shutdown()).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("QMP did not answer within {QMP_TIMEOUT:?}")),
-        };
-        match shutdown {
-            Ok(()) => {
-                if let Err(error) = self.wait(POWER_OFF_TIMEOUT).await {
-                    eprintln!("tmachine: {error:#}");
-                }
-            }
-            Err(error) => {
-                eprintln!("tmachine: could not power off the VM cleanly, killing it: {error:#}");
-                self.kill().await;
             }
         }
     }

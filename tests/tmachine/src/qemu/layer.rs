@@ -12,7 +12,15 @@ use directories::ProjectDirs;
 use super::img::QemuImage;
 use super::vm::{LAYER_POWER_OFF_TIMEOUT, QemuVm};
 
+/// Where setup layers are kept, under tmachine's cache directory. They depend
+/// only on the environment, so CI caches the disks here across commits.
+pub(super) const SETUP_DISKS: &str = "disks";
+/// Where install layers are kept. They hold the build under test, so CI leaves
+/// them out of its cache.
+pub(super) const INSTALL_DISKS: &str = "disks/install";
+
 pub(super) async fn cached_layer(
+    disks: &str,
     base_image: &Path,
     hash: &str,
     use_galaxy: bool,
@@ -20,7 +28,7 @@ pub(super) async fn cached_layer(
     inputs: &BTreeMap<String, PathBuf>,
 ) -> Result<PathBuf> {
     let project_dirs = ProjectDirs::from("com", "nvidia", "tmachine").unwrap();
-    let disks_dir = project_dirs.cache_dir().join("disks");
+    let disks_dir = project_dirs.cache_dir().join(disks);
     std::fs::create_dir_all(&disks_dir).unwrap();
 
     let disk = disks_dir.join(format!("{hash}.qcow2"));
