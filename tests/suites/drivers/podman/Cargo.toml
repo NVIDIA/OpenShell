@@ -4,7 +4,7 @@
 # Each driver suite is its own workspace, with its own lockfile.
 [package]
 name = "podman"
-description = "Drivers suite: Podman driver behavior, such as user namespaces"
+description = "Drivers suite: Podman driver behavior, such as user namespaces and container lifecycle"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
@@ -13,8 +13,10 @@ repository = "https://github.com/NVIDIA/OpenShell"
 publish = false
 
 [dependencies]
+base64 = "0.22"
 container-engine-support = { path = "../../../support/container-engine" }
 openshell-testkit = { path = "../../../testkit/testkit" }
 podman-support = { path = "../../../support/podman" }
+serde_json = "1"
 
 [workspace]
