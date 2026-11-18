@@ -895,14 +895,36 @@ impl MiddlewareServiceState {
     }
 }
 
-async fn call_with_timeout<T>(
+/// Whether a call the service did not process is sent again before `timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unprocessed {
+    Retry,
+    /// For a fail-open binding, which is skipped on its first failure so a
+    /// service that is down does not delay the request.
+    Fail,
+}
+
+async fn call_with_timeout<T, F, Fut>(
     timeout: Duration,
     operation: &'static str,
-    future: impl Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
-) -> std::result::Result<tonic::Response<T>, tonic::Status> {
-    tokio::time::timeout(timeout, future).await.map_err(|_| {
-        tonic::Status::deadline_exceeded(format!("middleware {operation} timed out"))
-    })?
+    unprocessed: Unprocessed,
+    mut call: F,
+) -> std::result::Result<tonic::Response<T>, tonic::Status>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    tokio::time::timeout_at(deadline, async {
+        match unprocessed {
+            Unprocessed::Retry => {
+                openshell_extension_core::call_with_retries(Some(deadline), call).await
+            }
+            Unprocessed::Fail => call().await,
+        }
+    })
+    .await
+    .map_err(|_| tonic::Status::deadline_exceeded(format!("middleware {operation} timed out")))?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1381,16 +1403,20 @@ impl MiddlewareRegistry {
 
         for service in in_process_services {
             let service = MiddlewareDispatch::InProcess(service);
-            let manifest =
-                call_with_timeout(DEFAULT_MIDDLEWARE_TIMEOUT, "Describe", service.describe())
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|error| {
-                        miette!(
-                            "in-process middleware Describe failed: {}",
-                            safe_reason(&error.to_string())
-                        )
-                    })?;
+            let manifest = call_with_timeout(
+                DEFAULT_MIDDLEWARE_TIMEOUT,
+                "Describe",
+                Unprocessed::Retry,
+                || service.describe(),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "in-process middleware Describe failed: {}",
+                    safe_reason(&error.to_string())
+                )
+            })?;
             let source = if manifest.name.trim().is_empty() {
                 "in-process middleware service".to_string()
             } else {
@@ -1474,7 +1500,10 @@ impl MiddlewareRegistry {
                 )
                 .await?,
             );
-            let mut manifest = call_with_timeout(operator_timeout, "Describe", service.describe())
+            let mut manifest =
+                call_with_timeout(operator_timeout, "Describe", Unprocessed::Retry, || {
+                    service.describe()
+                })
                 .await
                 .map(tonic::Response::into_inner)
                 .map_err(|error| {
@@ -1842,15 +1871,20 @@ impl ChainRunner {
             let manifest = state
                 .manifest
                 .get_or_try_init(|| async {
-                    call_with_timeout(state.operator_timeout, "Describe", state.service.describe())
-                        .await
-                        .map(tonic::Response::into_inner)
-                        .map_err(|error| {
-                            miette!(
-                                "middleware Describe failed: {}",
-                                safe_reason(&error.to_string())
-                            )
-                        })
+                    call_with_timeout(
+                        state.operator_timeout,
+                        "Describe",
+                        Unprocessed::Retry,
+                        || state.service.describe(),
+                    )
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| {
+                        miette!(
+                            "middleware Describe failed: {}",
+                            safe_reason(&error.to_string())
+                        )
+                    })
                 })
                 .await?;
             manifests.push((Arc::clone(state), manifest.clone()));
@@ -2031,7 +2065,8 @@ impl ChainRunner {
         let response = call_with_timeout(
             state.operator_timeout,
             "ValidateConfig",
-            state.service.validate_config(middleware_name, &config),
+            Unprocessed::Retry,
+            || state.service.validate_config(middleware_name, &config),
         )
         .await
         .map(tonic::Response::into_inner)
@@ -2263,7 +2298,11 @@ impl ChainRunner {
             let mut result = match call_with_timeout(
                 entry.timeout.min(remaining),
                 "EvaluateHttpRequest",
-                service.service.evaluate_http_request(request),
+                match entry.on_error() {
+                    OnError::FailClosed => Unprocessed::Retry,
+                    OnError::FailOpen => Unprocessed::Fail,
+                },
+                || service.service.evaluate_http_request(request),
             )
             .await
             {
@@ -6897,5 +6936,39 @@ mod tests {
             ]
         );
         drop(held);
+    }
+
+    /// A service that refuses connections is tried again until the timeout,
+    /// and the transport failure is reported in place of a timeout. With
+    /// retries off the first failure is returned.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_service_is_retried_until_the_timeout_unless_retries_are_off() {
+        for (unprocessed, retried) in [(Unprocessed::Retry, true), (Unprocessed::Fail, false)] {
+            let mut attempts = 0;
+            let started = tokio::time::Instant::now();
+            let status = call_with_timeout(
+                DEFAULT_MIDDLEWARE_TIMEOUT,
+                "EvaluateHttpRequest",
+                unprocessed,
+                || {
+                    attempts += 1;
+                    async {
+                        Err::<tonic::Response<()>, _>(tonic::Status::from_error(Box::new(
+                            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+                        )))
+                    }
+                },
+            )
+            .await
+            .expect_err("the service is unreachable");
+            assert_ne!(status.code(), tonic::Code::DeadlineExceeded, "{status}");
+            assert_eq!(attempts > 1, retried);
+            assert_eq!(
+                started.elapsed() > DEFAULT_MIDDLEWARE_TIMEOUT / 2,
+                retried,
+                "{:?}",
+                started.elapsed()
+            );
+        }
     }
 }

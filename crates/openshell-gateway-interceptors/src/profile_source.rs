@@ -10,6 +10,7 @@ use openshell_core::proto::ProviderProfile;
 use openshell_core::proto::gateway_interceptor::v1::{
     ProviderProfileSnapshotRequest, gateway_interceptor_client::GatewayInterceptorClient,
 };
+use openshell_extension_core::call_with_retries;
 use prost::Message as _;
 use sha2::Digest as _;
 use tonic::Request;
@@ -51,10 +52,17 @@ impl GatewayInterceptorProfileSource {
     }
 
     pub async fn snapshot(&self) -> Result<ProviderProfileSourceSnapshot> {
-        let mut client = self.client.clone();
-        let response = tokio::time::timeout(
-            self.timeout,
-            client.snapshot_provider_profiles(Request::new(ProviderProfileSnapshotRequest {})),
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let response = tokio::time::timeout_at(
+            deadline,
+            call_with_retries(Some(deadline), || {
+                let mut client = self.client.clone();
+                async move {
+                    client
+                        .snapshot_provider_profiles(Request::new(ProviderProfileSnapshotRequest {}))
+                        .await
+                }
+            }),
         )
         .await
         .map_err(|_| {

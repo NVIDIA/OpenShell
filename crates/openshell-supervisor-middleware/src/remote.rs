@@ -275,12 +275,16 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
 mod tests {
     use futures::StreamExt;
     use openshell_core::proto::middleware::v1::http_hooks_server::{HttpHooks, HttpHooksServer};
+    use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
+        SupervisorMiddleware, SupervisorMiddlewareServer,
+    };
     use openshell_core::proto::{
         HttpContinue, HttpPreflightResult, HttpRequestHookPreflight, HttpRequestHookResult,
         HttpResponseHookPreflight, HttpResponseHookResult, SupervisorMiddlewarePhase,
         http_preflight_result, http_request_hook_event, http_request_hook_result,
         http_response_hook_event, http_response_hook_result,
     };
+    use openshell_extension_core::call_with_retries;
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, oneshot};
     use tokio_stream::wrappers::TcpListenerStream;
@@ -465,5 +469,232 @@ mod tests {
         drop((requests, responses, client));
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server task");
+    }
+
+    struct CountingMiddleware {
+        handled: Arc<std::sync::atomic::AtomicUsize>,
+        /// With a receiver, a request call reports its arrival and is never
+        /// answered.
+        received: Option<mpsc::UnboundedSender<()>>,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for CountingMiddleware {
+        type EvaluateWebSocketSessionStream = WebSocketResponseStream;
+
+        async fn describe(
+            &self,
+            _request: Request<MiddlewareDescribeRequest>,
+        ) -> std::result::Result<Response<MiddlewareManifest>, Status> {
+            Ok(Response::new(MiddlewareManifest::default()))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<Response<ValidateConfigResponse>, Status> {
+            Ok(Response::new(ValidateConfigResponse::default()))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<Response<HttpRequestResult>, Status> {
+            self.handled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(received) = &self.received {
+                let _ = received.send(());
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(Response::new(HttpRequestResult::default()))
+        }
+
+        async fn evaluate_web_socket_session(
+            &self,
+            _request: Request<tonic::Streaming<WebSocketSessionEvent>>,
+        ) -> std::result::Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+    }
+
+    /// Serves connections accepted from `listener` until the returned sender
+    /// fires, then drains. The listener stays open, so the next server takes
+    /// over the connections that arrive meanwhile, as an instance that
+    /// inherits the listening socket does.
+    fn serve_counting_middleware(
+        listener: Arc<TcpListener>,
+        handled: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            let accepted = listener.accept().await.map(|(stream, _)| stream);
+            Some((accepted, listener))
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(SupervisorMiddlewareServer::new(CountingMiddleware {
+                    handled,
+                    received: None,
+                }))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve");
+        });
+        (shutdown_tx, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unary_calls_are_answered_once_across_service_hand_overs() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let handled = Arc::new(AtomicUsize::new(0));
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+        let address = listener.local_addr().expect("address");
+        let (mut shutdown, mut server) =
+            serve_counting_middleware(listener.clone(), handled.clone());
+        let client = RemoteMiddlewareService::connect(
+            "test/restart",
+            &format!("http://{address}"),
+            &[],
+            None,
+        )
+        .await
+        .expect("connect");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let client = client.clone();
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    let mut answered = 0_usize;
+                    while !stop.load(Ordering::SeqCst) {
+                        call_with_retries(None, || {
+                            client.evaluate_http_request(Request::new(
+                                HttpRequestEvaluation::default(),
+                            ))
+                        })
+                        .await
+                        .expect("call answered across a hand-over");
+                        answered += 1;
+                    }
+                    answered
+                })
+            })
+            .collect();
+
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let (next_shutdown, next_server) =
+                serve_counting_middleware(listener.clone(), handled.clone());
+            shutdown.send(()).expect("server running");
+            server.await.expect("server drained");
+            (shutdown, server) = (next_shutdown, next_server);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        stop.store(true, Ordering::SeqCst);
+
+        let mut answered = 0;
+        for caller in callers {
+            answered += caller.await.expect("caller");
+        }
+        assert!(answered > 0);
+        assert_eq!(
+            answered,
+            handled.load(Ordering::SeqCst),
+            "every call reached a handler exactly once"
+        );
+    }
+
+    /// A call the service received is not sent again when its connection is
+    /// reset, although another connection is accepted straight away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_the_service_received_is_not_sent_again_after_a_reset() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let handled = Arc::new(AtomicUsize::new(0));
+        let (received_tx, mut received) = mpsc::unbounded_channel();
+        let backend = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let backend_address = backend.local_addr().expect("address");
+        let server = tokio::spawn({
+            let handled = handled.clone();
+            async move {
+                Server::builder()
+                    .add_service(SupervisorMiddlewareServer::new(CountingMiddleware {
+                        handled,
+                        received: Some(received_tx),
+                    }))
+                    .serve_with_incoming(TcpListenerStream::new(backend))
+                    .await
+                    .expect("serve");
+            }
+        });
+
+        // The client reaches the service through a relay, so the test can
+        // reset an established connection while the relay keeps accepting.
+        let relay = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = relay.local_addr().expect("address");
+        let (connections_tx, mut connections) = mpsc::unbounded_channel();
+        let relay = tokio::spawn(async move {
+            loop {
+                let (mut client_side, _) = relay.accept().await.expect("accept");
+                let (reset_tx, reset_rx) = oneshot::channel::<()>();
+                let _ = connections_tx.send(reset_tx);
+                tokio::spawn(async move {
+                    let mut service_side =
+                        openshell_core::net::connect_tcp_nodelay_best_effort(backend_address)
+                            .await
+                            .expect("connect to service");
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut client_side, &mut service_side) => {}
+                        _ = reset_rx => {
+                            // Closing with unread data and no linger sends RST.
+                            client_side.set_zero_linger().expect("linger");
+                        }
+                    }
+                });
+            }
+        });
+
+        let client =
+            RemoteMiddlewareService::connect("test/reset", &format!("http://{address}"), &[], None)
+                .await
+                .expect("connect");
+        let call = tokio::spawn(async move {
+            call_with_retries(None, || {
+                client.evaluate_http_request(Request::new(HttpRequestEvaluation::default()))
+            })
+            .await
+        });
+
+        received
+            .recv()
+            .await
+            .expect("the service received the call");
+        connections
+            .recv()
+            .await
+            .expect("relayed connection")
+            .send(())
+            .expect("reset the connection");
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("the call ends")
+            .expect("caller")
+            .expect_err("the call fails");
+        assert_ne!(status.code(), tonic::Code::Ok);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            1,
+            "the call reached a handler once: {status:?}"
+        );
+
+        relay.abort();
+        server.abort();
     }
 }

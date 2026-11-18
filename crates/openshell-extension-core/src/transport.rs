@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::error::Error as StdError;
+use std::future::Future;
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,6 +11,7 @@ use std::time::Duration;
 use hyper_util::rt::TokioIo;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tonic::Status;
 #[cfg(unix)]
 use tonic::transport::Uri;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
@@ -17,6 +21,10 @@ use tower::service_fn;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest time a call without a deadline keeps being sent again.
+const UNPROCESSED_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const UNPROCESSED_RETRY_FIRST_PAUSE: Duration = Duration::from_millis(5);
+const UNPROCESSED_RETRY_MAX_PAUSE: Duration = Duration::from_millis(100);
 
 /// Trust policy used to authenticate a remote extension service.
 ///
@@ -134,6 +142,93 @@ pub async fn connect_channel(config: &ExtensionChannelConfig) -> Result<Channel,
         endpoint = endpoint.tls_config(tls).map_err(TransportError::Tls)?;
     }
     endpoint.connect().await.map_err(TransportError::Connect)
+}
+
+/// Returns whether `status` proves the extension service never started
+/// processing the call, so sending it again cannot run it twice.
+///
+/// Three transport outcomes give that proof:
+///
+/// - The connection attempt failed, so no request bytes were sent.
+/// - The request was still queued in the client when the connection closed.
+/// - The service refused the stream: either a graceful `GOAWAY` whose last
+///   stream ID is below this call's stream, or `RST_STREAM(REFUSED_STREAM)`.
+///
+/// Every other failure, including a connection that drops after the request
+/// was sent, leaves the outcome unknown and returns `false`.
+fn call_was_not_processed(status: &Status) -> bool {
+    // An I/O error counts only while connecting. Errors on an established
+    // connection reach the status through `hyper::Error` or `h2::Error`.
+    let mut connecting = true;
+    let mut source = status.source();
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<hyper::Error>() {
+            if error.is_canceled() {
+                return true;
+            }
+            connecting = false;
+        }
+        if let Some(error) = error.downcast_ref::<h2::Error>() {
+            if error.is_remote()
+                && matches!(
+                    (error.is_go_away(), error.reason()),
+                    (true, Some(h2::Reason::NO_ERROR)) | (false, Some(h2::Reason::REFUSED_STREAM))
+                )
+            {
+                return true;
+            }
+            connecting = false;
+        }
+        if let Some(error) = error.downcast_ref::<io::Error>() {
+            return connecting
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::NotFound
+                );
+        }
+        source = error.source();
+    }
+    false
+}
+
+/// Sends a unary extension call, and sends it again while the failure proves
+/// the service never started processing it.
+///
+/// An extension service that restarts or hands over to another instance
+/// closes its connections. Calls caught by that close fail in the transport
+/// without reaching a handler; this sends them again on the next connection.
+/// Failures with an unknown outcome and every answer from the service are
+/// returned as they are.
+///
+/// `call` builds and sends one attempt. No attempt starts after `deadline`,
+/// or after a fixed window when there is none, and the failure of the last
+/// attempt is returned. An attempt still running at `deadline` is the
+/// caller's to cut short.
+pub async fn call_with_retries<T, F, Fut>(
+    deadline: Option<tokio::time::Instant>,
+    mut call: F,
+) -> Result<T, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Status>>,
+{
+    let give_up =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + UNPROCESSED_RETRY_WINDOW);
+    let mut pause = UNPROCESSED_RETRY_FIRST_PAUSE;
+    loop {
+        let status = match call().await {
+            Ok(response) => return Ok(response),
+            Err(status) => status,
+        };
+        if !call_was_not_processed(&status) || tokio::time::Instant::now() + pause > give_up {
+            return Err(status);
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(UNPROCESSED_RETRY_MAX_PAUSE);
+    }
 }
 
 fn validate_config(config: &ExtensionChannelConfig) -> Result<(), TransportError> {
@@ -342,5 +437,124 @@ mod tests {
             connect_channel(&wrong_ca).await,
             Err(TransportError::Connect(_))
         ));
+    }
+
+    /// A failure to connect, as the channel reports it.
+    fn connect_failure(kind: io::ErrorKind) -> Status {
+        Status::from_error(Box::new(io::Error::new(kind, "connect failure")))
+    }
+
+    /// A status the service answered with; it carries no transport error.
+    fn answered(code: tonic::Code) -> Status {
+        Status::new(code, "answered")
+    }
+
+    #[test]
+    fn a_failed_connection_attempt_proves_the_call_was_not_processed() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotFound,
+        ] {
+            assert!(call_was_not_processed(&connect_failure(kind)));
+        }
+        // A certificate the client rejects fails every attempt the same way.
+        assert!(!call_was_not_processed(&connect_failure(
+            io::ErrorKind::InvalidData
+        )));
+    }
+
+    #[test]
+    fn an_answer_from_the_service_is_never_sent_again() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Cancelled,
+            tonic::Code::Internal,
+            tonic::Code::Unknown,
+        ] {
+            assert!(!call_was_not_processed(&answered(code)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unprocessed_call_is_sent_again_until_it_is_answered() {
+        let mut attempts = 0;
+        let answer = call_with_retries(None, || {
+            attempts += 1;
+            let refused = attempts < 4;
+            async move {
+                if refused {
+                    Err(connect_failure(io::ErrorKind::ConnectionRefused))
+                } else {
+                    Ok("answer")
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(attempts, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_with_an_unknown_outcome_is_sent_once() {
+        for status in [
+            connect_failure(io::ErrorKind::InvalidData),
+            answered(tonic::Code::Unavailable),
+            answered(tonic::Code::PermissionDenied),
+        ] {
+            let code = status.code();
+            let mut status = Some(status);
+            let mut attempts = 0;
+            let result: Result<(), Status> = call_with_retries(None, || {
+                attempts += 1;
+                let status = status.take().expect("one attempt");
+                async move { Err(status) }
+            })
+            .await;
+            assert_eq!(result.unwrap_err().code(), code);
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sending_again_stops_at_the_window() {
+        let started = tokio::time::Instant::now();
+        let result: Result<(), Status> = call_with_retries(None, || async {
+            Err(connect_failure(io::ErrorKind::ConnectionRefused))
+        })
+        .await;
+        assert!(call_was_not_processed(&result.unwrap_err()));
+        let elapsed = started.elapsed();
+        assert!(elapsed <= UNPROCESSED_RETRY_WINDOW);
+        assert!(elapsed + UNPROCESSED_RETRY_MAX_PAUSE > UNPROCESSED_RETRY_WINDOW);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sending_again_stops_at_the_deadline_with_the_transport_failure() {
+        for timeout in [Duration::from_millis(500), Duration::from_secs(20)] {
+            let started = tokio::time::Instant::now();
+            let result: Result<(), Status> = call_with_retries(Some(started + timeout), || async {
+                Err(connect_failure(io::ErrorKind::ConnectionRefused))
+            })
+            .await;
+            let status = result.unwrap_err();
+            assert!(status.to_string().contains("connect failure"), "{status}");
+            let elapsed = started.elapsed();
+            assert!(elapsed <= timeout);
+            assert!(elapsed + UNPROCESSED_RETRY_MAX_PAUSE > timeout);
+        }
+    }
+
+    #[test]
+    fn a_stream_error_this_side_raised_does_not_prove_the_call_was_not_processed() {
+        for reason in [
+            h2::Reason::NO_ERROR,
+            h2::Reason::REFUSED_STREAM,
+            h2::Reason::INTERNAL_ERROR,
+        ] {
+            let status = Status::from_error(Box::new(h2::Error::from(reason)));
+            assert!(!call_was_not_processed(&status), "{reason:?}");
+        }
     }
 }

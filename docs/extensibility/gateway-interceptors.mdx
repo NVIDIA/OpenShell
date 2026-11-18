@@ -138,6 +138,20 @@ Bindings that include `post_commit` must resolve to `fail_open`. The gateway rej
 
 Use `fail_open` only when bypassing an unavailable or invalid interceptor preserves the intended governance boundary.
 
+### Service Restarts
+
+The gateway sends a call again until the configured `timeout` when the transport shows that the service never started processing it:
+
+- The connection attempt failed.
+- The connection closed while the call was still queued in the gateway.
+- The service refused the call while shutting down gracefully.
+
+A call that reached a handler is never sent twice. If the connection drops after the gateway sent a call and before the answer arrives, the outcome is unknown and the call follows the failure policy.
+
+Evaluations for a `fail_open` binding are not sent again: the binding is bypassed on its first failure, so a service that is down does not delay the operation. `Describe` and the provider profile snapshot are sent again for every interceptor.
+
+To replace a fail-closed service without failed operations, start the new instance before the old one stops accepting connections, and have the old instance shut down gracefully. An endpoint that refuses connections until `timeout` fails the operations issued during that time, and the gateway reports the connection failure, not a timeout.
+
 ## Vend Provider Profiles
 
 An interceptor can advertise `provider_profiles = true` in its manifest and implement `SnapshotProviderProfiles`. The RPC returns a `ProviderProfileSnapshot`. Add that interceptor to `provider_profile_sources` to include its profiles in the gateway's effective catalog.

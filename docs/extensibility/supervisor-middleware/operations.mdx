@@ -149,6 +149,14 @@ Denials include the policy entry's `middleware` name and the validated `reason_c
 
 No free-form service error text reaches the sandbox. If evaluation capacity remains full for the chain budget, OpenShell returns `503 Service Unavailable`. A stalled request upload receives `408 Request Timeout` with `error: request_timeout`.
 
+### Service Restarts
+
+A service that restarts or hands over to another instance closes its connections. OpenShell sends a `Describe` or `ValidateConfig` call again until its timeout when the transport shows the service never started processing it: the connection attempt failed, the call was still queued when the connection closed, or the service refused it while shutting down gracefully. A call that reached a handler is never sent twice.
+
+`EvaluateHttpRequestHook` and `EvaluateHttpResponseHook` are streams and are not sent again. A request or response whose stream fails when the service's connection closes fails with `middleware_unavailable`.
+
+To replace a service without failed requests, start the new instance before the old one stops accepting connections, and have the old instance shut down gracefully so open streams finish.
+
 <Accordion title="Legacy HTTP Hooks">
 
 Services without the `http-hooks` capability use `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate`. These RPCs are deprecated for removal in 0.2.0. Legacy requests use a single buffered evaluation. Legacy responses select `HEADERS_ONLY`, `WHOLE_BODY_BYTES`, or `STREAM_BYTES` and use `block_delivery` to stop delivery.
@@ -156,6 +164,8 @@ Services without the `http-hooks` capability use `EvaluateHttpRequest` and `Http
 To migrate, require the `http-hooks` capability, implement the `HttpHooks` RPCs, and use `fail_closed`. Replace request evaluation and `WHOLE_BODY_BYTES` with WHOLE_BODY, `STREAM_BYTES` with DUPLEX, and `HEADERS_ONLY` with `continue_without_body`. Keep `block_delivery` for responses. The gateway and each sandbox supervisor read a service's `Describe` manifest when they connect to it, so after changing the service, restart the gateway, re-apply affected policies, and recreate sandboxes that use the service. Separate selectors from services still using legacy hooks, including `openshell/regex`.
 
 Upgrade the gateway before deploying the service. Recreate sandboxes whose supervisors do not support HTTP hooks. To support both contracts during migration, use separate service registrations.
+
+`EvaluateHttpRequest` for a `fail_closed` entry is sent again when a service restarts, as described in [Service Restarts](#service-restarts). A `fail_open` entry is skipped on its first failure.
 
 </Accordion>
 
