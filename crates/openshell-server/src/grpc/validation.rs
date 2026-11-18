@@ -1052,20 +1052,12 @@ pub(super) fn validate_and_canonicalize_policy(
     })
 }
 
-/// Validate that user-authored policy does not use provider-derived rule keys.
+/// Validate that authored rules do not use provider-derived keys.
 pub(super) fn validate_no_reserved_provider_policy_keys(
     policy: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
-    if let Some(key) = policy
-        .network_policies
-        .keys()
-        .find(|key| openshell_policy::is_provider_rule_name(key))
-    {
-        return Err(Status::invalid_argument(format!(
-            "network_policies key '{key}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
-        )));
-    }
-    Ok(())
+    openshell_policy::validate_authored_rule_names(policy)
+        .map_err(|violations| Status::invalid_argument(violations.join("; ")))
 }
 
 /// Validate that static policy fields (filesystem, landlock, process) haven't changed

@@ -9,10 +9,10 @@ pub use crate::commands::common::{
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
-    confirm_global_setting_takeover, format_epoch_ms, format_setting_value, format_timestamp,
-    format_timestamp_ms, handle_platform_progress_event, is_provisioning_progress_event,
-    non_empty_or, parse_cli_setting_value, parse_duration_to_ms, phase_name,
-    print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
+    confirm_global_setting_takeover, format_epoch_ms, format_optional_epoch_ms,
+    format_setting_value, format_timestamp, handle_platform_progress_event,
+    is_provisioning_progress_event, non_empty_or, parse_cli_setting_value, parse_duration_to_ms,
+    phase_name, print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
     provisioning_blocker_message, provisioning_timeout_message, scrub_git_env, short_hash,
     truncate_status_field,
 };
@@ -5424,6 +5424,42 @@ pub async fn sandbox_upload(
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
 
+pub fn sandbox_policy_lint(policy_path: &str) -> Result<()> {
+    let policy = openshell_policy::parse_sandbox_policy_file(Path::new(policy_path))?;
+    let size = policy.encoded_len();
+    if size > openshell_policy::MAX_AUTHORED_POLICY_SIZE {
+        miette::bail!(
+            "policy serialized size exceeds maximum ({size} > {})",
+            openshell_policy::MAX_AUTHORED_POLICY_SIZE
+        );
+    }
+    let mut violations: Vec<String> = openshell_policy::find_endpoint_ambiguities(&policy)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut middlewares: Vec<_> = policy.network_middlewares.iter().collect();
+    middlewares.sort_by_key(|(name, _)| *name);
+    for (name, middleware) in middlewares {
+        if middleware.middleware.starts_with("openshell/")
+            && let Err(error) = openshell_supervisor_middleware_builtins::validate_config(
+                &middleware.middleware,
+                &middleware.config.clone().unwrap_or_default(),
+            )
+        {
+            violations.push(format!("middleware config '{name}' is invalid: {error}"));
+        }
+    }
+    if let Err(error) = openshell_policy::validate_and_canonicalize_authored_policy(policy) {
+        violations.extend(error);
+    }
+    if !violations.is_empty() {
+        miette::bail!("policy is invalid:\n- {}", violations.join("\n- "));
+    }
+    println!("Policy is valid (offline): {policy_path}");
+    println!("Gateway checks for providers, external middleware, images and drivers are not run.");
+    Ok(())
+}
+
 pub async fn sandbox_policy_set_global(
     server: &str,
     policy_path: &str,
@@ -7072,7 +7108,7 @@ pub async fn sandbox_draft_history(
 
         println!(
             "  {} {} [{}] {}",
-            format_timestamp_ms(proto_timestamp_ms(entry.event_time.as_ref())).dimmed(),
+            format_optional_epoch_ms(proto_timestamp_ms(entry.event_time.as_ref())).dimmed(),
             event_colored,
             entry.chunk_id.get(..8).unwrap_or(&entry.chunk_id),
             entry.description,

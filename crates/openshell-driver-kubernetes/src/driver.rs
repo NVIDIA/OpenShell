@@ -5770,7 +5770,10 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Init | Event::InitDone) => {}
+                        Some(Event::Init) => {}
+                        Some(Event::InitDone) => {
+                            info!(namespace = %namespace, "Kubernetes sandbox watcher listed sandboxes");
+                        }
                         None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
@@ -6202,7 +6205,10 @@ where
                             }
                         }
                     }
-                    Some(Event::Init | Event::InitDone) => {}
+                    Some(Event::Init) => {}
+                    Some(Event::InitDone) => {
+                        info!("Kubernetes sandbox watcher listed sandboxes");
+                    }
                     None => {
                         let _ = tx.send(Err(KubernetesDriverError::Message(
                             "sandbox watcher stream ended unexpectedly".to_string()

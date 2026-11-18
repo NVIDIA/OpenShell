@@ -607,7 +607,7 @@ pub async fn run_networking(
             network_mediation_source,
             mediated_policy_dns
                 .as_ref()
-                .map(|runtime| runtime.store.clone()),
+                .map(|runtime| runtime.service.clone()),
             proxy_listener
                 .as_ref()
                 .map(|proxy| proxy.binary_identity.clone()),
@@ -641,7 +641,7 @@ pub async fn run_networking(
         )?;
         let transparent = crate::proxy::TransparentTcpHandle::start(
             runtime.listeners,
-            dns.store.clone(),
+            dns.service.clone(),
             engine,
             cache,
             entrypoint_pid,

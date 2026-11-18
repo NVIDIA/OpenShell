@@ -13,6 +13,35 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Database credential source. The default preserves URL/SQLite behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseAuthMode {
+    #[default]
+    Default,
+    AzureWorkloadIdentity,
+}
+
+impl fmt::Display for DatabaseAuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::AzureWorkloadIdentity => "azure-workload-identity",
+        })
+    }
+}
+
+impl FromStr for DatabaseAuthMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "azure-workload-identity" => Ok(Self::AzureWorkloadIdentity),
+            _ => Err("database authentication must be default or azure-workload-identity"),
+        }
+    }
+}
+
 // ── Public default constants ────────────────────────────────────────────
 //
 // Canonical source for default values used across multiple crates.
@@ -48,6 +77,19 @@ pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
 /// Default per-sandbox cap for each relay budget (SSH and service forwards).
 pub const DEFAULT_MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
+/// Default durable mutation admissions one caller identity can hold.
+pub const DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER: u32 = 1000;
+
+/// Accepted per-caller admission limits. The ceiling bounds the rows one caller
+/// can retain.
+pub const MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE: std::ops::RangeInclusive<u32> = 1..=1_000_000;
+
+/// Default replay window for successful durable mutation admissions.
+pub const DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS: u32 = 24 * 60 * 60;
+
+/// Accepted replay windows, from one minute to seven days.
+pub const MUTATION_REPLAY_WINDOW_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 60..=604_800;
 
 /// Gateway delivery path for supervisor configuration.
 ///
@@ -288,6 +330,9 @@ pub struct Config {
     /// Database URL for persistence.
     pub database_url: String,
 
+    /// Explicit database identity mode; independent of provider credentials.
+    pub database_auth: DatabaseAuthMode,
+
     /// Connection ceiling for the persistence pool.
     ///
     /// `None` leaves the backend's built-in default in place. The right
@@ -343,6 +388,15 @@ pub struct Config {
     /// supervisor configuration report starts admission repair, which stays
     /// armed until Ready. Must be between 1 and 86400, inclusive.
     pub provisioning_repair_window_seconds: i64,
+
+    /// Durable mutation admissions one caller can hold across every replica
+    /// sharing the database. Replicas must use the same value. Must be within
+    /// [`MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE`].
+    pub mutation_admission_limit_per_caller: u32,
+
+    /// Seconds a successful mutation admission stays replayable. Must be within
+    /// [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
+    pub mutation_replay_window_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -1062,6 +1116,7 @@ impl Config {
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
+            database_auth: DatabaseAuthMode::default(),
             database_max_connections: None,
             database_lock_max_connections: None,
             compute_driver: None,
@@ -1073,6 +1128,8 @@ impl Config {
             max_service_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_seconds: 300,
+            mutation_admission_limit_per_caller: DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER,
+            mutation_replay_window_seconds: DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
@@ -1117,6 +1174,13 @@ impl Config {
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
+        self
+    }
+
+    /// Select database credentials independently of the connection URL.
+    #[must_use]
+    pub fn with_database_auth(mut self, mode: DatabaseAuthMode) -> Self {
+        self.database_auth = mode;
         self
     }
 

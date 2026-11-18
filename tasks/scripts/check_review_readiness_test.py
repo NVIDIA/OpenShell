@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -137,6 +138,48 @@ class PlanningTests(unittest.TestCase):
             ),
             {"alice", "bob", "carol"},
         )
+
+    def test_multiple_area_labels_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"area:runtime", "area:build"})
+        self.assertEqual(
+            str(caught.exception),
+            "This PR has more than one area label: area:build, area:runtime. "
+            "A ready PR needs exactly one; remove the others.",
+        )
+
+    def test_missing_area_label_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"topic:policy"})
+        self.assertEqual(
+            str(caught.exception),
+            "This PR has no area label. A ready PR needs exactly one; add one.",
+        )
+
+    def test_unknown_label_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(
+                CATEGORIES, {"area:runtime", "topic:nope", "topic:zzz"}
+            )
+        self.assertEqual(
+            str(caught.exception),
+            "There are invalid area and topic labels on this PR: topic:nope, "
+            "topic:zzz. Remove them.",
+        )
+
+    def test_single_unknown_label_message(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"area:runtime", "topic:nope"})
+        self.assertEqual(
+            str(caught.exception),
+            "There is an invalid area or topic label on this PR: topic:nope. "
+            "Remove it.",
+        )
+
+    def test_area_count_is_checked_before_unknown_labels(self):
+        with self.assertRaises(routing.LabelRoutingError) as caught:
+            routing.select_reviewers(CATEGORIES, {"area:nope", "area:other"})
+        self.assertIn("more than one area label", str(caught.exception))
 
     def test_requires_one_known_area_and_known_topics(self):
         for labels in (
@@ -417,11 +460,74 @@ class ReconciliationTests(unittest.TestCase):
 
 
 class AcceptedWorkIntegrationTests(unittest.TestCase):
+    def test_accepted_label_event_carries_structured_rationale(self):
+        with (
+            mock.patch.object(
+                routing,
+                "_api",
+                side_effect=[
+                    {**pr(draft=True), "node_id": "PR_node"},
+                    {"node_id": "label_node"},
+                    {
+                        "data": {
+                            "addLabelsToLabelable": {
+                                "labelable": {"__typename": "PullRequest"}
+                            }
+                        }
+                    },
+                ],
+            ) as api,
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "repository_permission", "permission": "admin"},
+            ),
+        ):
+            routing.check_review_readiness(
+                CATEGORIES,
+                REPO,
+                42,
+                apply=True,
+                label_accepted_work=True,
+                maintainers={"maintainer"},
+            )
+        request = api.call_args.kwargs["data"]
+        label = request["variables"]["input"]["labels"][0]
+        self.assertEqual(request["variables"]["input"]["labelableId"], "PR_node")
+        self.assertEqual(label["labelId"], "label_node")
+        self.assertEqual(
+            json.loads(label["rationale"]),
+            {
+                "schema": "openshell-acceptance-v1",
+                "basis": "repository_permission",
+                "permission": "admin",
+            },
+        )
+
+    def test_label_mutation_graphql_error_is_not_silent(self):
+        with (
+            mock.patch.object(
+                routing,
+                "_api",
+                side_effect=[
+                    {"node_id": "label_node"},
+                    {"errors": [{"message": "denied"}]},
+                ],
+            ),
+            self.assertRaisesRegex(ValueError, "Could not apply"),
+        ):
+            routing._add_accepted_label(
+                REPO, {"node_id": "PR_node"}, {"basis": "maintainer"}
+            )
+
     def run_check(self, value, *, accepted=True, apply=True, opened=True):
         with (
-            mock.patch.object(routing, "_api", side_effect=[value, None]) as api,
+            mock.patch.object(routing, "_api", side_effect=[value]) as api,
+            mock.patch.object(routing, "_add_accepted_label") as add_label,
             mock.patch.object(
-                routing, "check_pr_accepted_work", return_value=accepted
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"} if accepted else None,
             ) as check,
             mock.patch.object(
                 routing, "_load_reviewers", return_value=reviewers()
@@ -435,29 +541,29 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
                 label_accepted_work=opened,
                 maintainers={"maintainer"},
             )
+        if (
+            value["state"] == "open"
+            and opened
+            and accepted
+            and apply
+            and not any(label["name"] == "state:accepted" for label in value["labels"])
+        ):
+            add_label.assert_called_once_with(REPO, value, {"basis": "maintainer"})
+        else:
+            add_label.assert_not_called()
         return plan, api, check, load
 
     def test_new_draft_is_labeled_without_requesting_reviewers(self):
         plan, api, check, load = self.run_check(pr(draft=True))
         self.assertEqual(plan, routing.ReviewPlan((), (), True, ("state:accepted",)))
         check.assert_called_once_with(REPO, pr(draft=True), {"maintainer"}, api=api)
-        api.assert_has_calls(
-            [
-                mock.call(PULL),
-                mock.call(
-                    "repos/owner/repo/issues/42/labels",
-                    method="POST",
-                    data={"labels": ["state:accepted"]},
-                ),
-            ]
-        )
-        self.assertEqual(api.call_count, 2)
+        api.assert_called_once_with(PULL)
         load.assert_not_called()
 
     def test_new_ready_pr_can_be_labeled_before_area_classification(self):
         plan, api, _, load = self.run_check(pr())
         self.assertEqual(plan.add_labels, ("state:accepted",))
-        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_count, 1)
         load.assert_not_called()
 
     def test_nonqualifying_pr_is_not_labeled(self):
@@ -496,9 +602,14 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
     def test_labels_and_requests_reviewers_for_a_classified_ready_pr(self):
         with (
             mock.patch.object(
-                routing, "_api", side_effect=[pr("area:build"), None, None]
+                routing, "_api", side_effect=[pr("area:build"), None]
             ) as api,
-            mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
+            mock.patch.object(routing, "_add_accepted_label"),
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"},
+            ),
             mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
         ):
             plan = routing.check_review_readiness(
@@ -522,7 +633,7 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             mock.patch.object(routing, "_api", return_value=pr("area:build")) as api,
             mock.patch.object(
                 routing,
-                "check_pr_accepted_work",
+                "evaluate_pr_accepted_work",
                 side_effect=ValueError("lookup failed"),
             ),
             self.assertRaisesRegex(ValueError, "lookup failed"),
@@ -538,9 +649,12 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
         api.assert_called_once_with(PULL)
 
     def test_real_library_qualifies_a_maintainer_without_permission_reads(self):
-        with mock.patch.object(
-            routing, "_api", side_effect=[pr(author="MAINTAINER", draft=True), None]
-        ) as api:
+        with (
+            mock.patch.object(
+                routing, "_api", side_effect=[pr(author="MAINTAINER", draft=True)]
+            ) as api,
+            mock.patch.object(routing, "_add_accepted_label"),
+        ):
             plan = routing.check_review_readiness(
                 CATEGORIES,
                 REPO,
@@ -551,16 +665,21 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
             )
         assert plan is not None
         self.assertTrue(plan.accepted_work)
-        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_count, 1)
 
     def test_label_result_survives_the_refresh_before_reviewer_removal(self):
         before = pr("area:build", requested=("alice", "dave"))
         after = pr("area:build", "state:accepted", requested=("alice", "dave"))
         with (
             mock.patch.object(
-                routing, "_api", side_effect=[before, None, after, None]
+                routing, "_api", side_effect=[before, after, None]
             ) as api,
-            mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
+            mock.patch.object(routing, "_add_accepted_label"),
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"},
+            ),
             mock.patch.object(
                 routing,
                 "_load_reviewers",
@@ -586,8 +705,13 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
     def test_label_write_failure_does_not_request_reviewers(self):
         error = subprocess.CalledProcessError(1, "gh", stderr="(HTTP 403)")
         with (
-            mock.patch.object(routing, "_api", side_effect=[pr("area:build"), error]),
-            mock.patch.object(routing, "check_pr_accepted_work", return_value=True),
+            mock.patch.object(routing, "_api", side_effect=[pr("area:build")]),
+            mock.patch.object(routing, "_add_accepted_label", side_effect=error),
+            mock.patch.object(
+                routing,
+                "evaluate_pr_accepted_work",
+                return_value={"basis": "maintainer"},
+            ),
             mock.patch.object(routing, "_load_reviewers") as load,
             self.assertRaises(subprocess.CalledProcessError),
         ):
@@ -602,7 +726,123 @@ class AcceptedWorkIntegrationTests(unittest.TestCase):
         load.assert_not_called()
 
 
+class FailureReportTests(unittest.TestCase):
+    GH_COMMAND = (
+        "gh",
+        "api",
+        "repos/o/r/pulls/42/requested_reviewers",
+        "--method",
+        "POST",
+        "--input",
+        "-",
+    )
+
+    def test_escape_data_and_property(self):
+        self.assertEqual(routing._escape_annotation("a%b\r\nc"), "a%25b%0D%0Ac")
+        self.assertEqual(routing._escape_annotation("x:y,z", prop=True), "x%3Ay%2Cz")
+
+    def test_api_failure_includes_method_path_status_and_stderr(self):
+        error = subprocess.CalledProcessError(
+            1,
+            self.GH_COMMAND,
+            stderr="gh: Reviews may only be requested from collaborators. (HTTP 422)\n",
+        )
+        category, message = routing.describe_failure(error)
+        self.assertEqual(category, "GitHub API error")
+        self.assertTrue(
+            message.startswith("Requesting reviewers failed with a GitHub API error"),
+            message,
+        )
+        self.assertIn("POST repos/o/r/pulls/42/requested_reviewers", message)
+        self.assertIn("exit status 1", message)
+        self.assertIn("HTTP 422", message)
+        self.assertNotIn("--input", message)
+
+    def test_api_failure_with_empty_stderr(self):
+        for stderr in (None, "", "  \n"):
+            error = subprocess.CalledProcessError(1, self.GH_COMMAND, stderr=stderr)
+            _, message = routing.describe_failure(error)
+            self.assertNotIn("None", message)
+            self.assertTrue(message.endswith("(exit status 1)"), message)
+
+    def test_get_is_the_default_method(self):
+        error = subprocess.CalledProcessError(
+            1, ["gh", "api", "repos/o/r/pulls/42", "--method", "GET"], stderr="x"
+        )
+        _, message = routing.describe_failure(error)
+        self.assertIn("GET repos/o/r/pulls/42", message)
+
+    def test_api_failure_names_the_action(self):
+        pull = "repos/o/r/pulls/42"
+        cases = (
+            ("POST", f"{pull}/requested_reviewers", "Requesting reviewers"),
+            ("DELETE", f"{pull}/requested_reviewers", "Removing reviewer requests"),
+            ("POST", "repos/o/r/issues/42/labels", "Adding labels"),
+            ("GET", pull, "Reading the PR from GitHub"),
+        )
+        for method, path, action in cases:
+            error = subprocess.CalledProcessError(
+                1, ["gh", "api", path, "--method", method], stderr="x"
+            )
+            with self.subTest(method=method, path=path):
+                _, message = routing.describe_failure(error)
+                self.assertTrue(
+                    message.startswith(f"{action} failed with a GitHub API error"),
+                    message,
+                )
+
+    def test_label_error_category(self):
+        self.assertEqual(
+            routing.describe_failure(routing.LabelRoutingError("x")),
+            ("PR labels", "x"),
+        )
+
+    def test_other_value_error_is_generic(self):
+        text = "PR routing changed; rerun reconciliation"
+        self.assertEqual(routing.describe_failure(ValueError(text)), ("error", text))
+
+    def test_annotation_only_in_actions(self):
+        error = routing.LabelRoutingError("bad 100%\nlabel")
+        actions, local = io.StringIO(), io.StringIO()
+        routing.report_failure(error, stream=actions, env={"GITHUB_ACTIONS": "true"})
+        routing.report_failure(error, stream=local, env={})
+        self.assertEqual(
+            actions.getvalue(),
+            "Review readiness: bad 100%\nlabel\n"
+            "::error title=Review Readiness%3A PR labels::bad 100%25%0Alabel\n",
+        )
+        self.assertEqual(local.getvalue(), "Review readiness: bad 100%\nlabel\n")
+
+    def test_cli_failure_in_actions_prints_annotation(self):
+        errors = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}),
+            mock.patch.object(
+                routing,
+                "check_review_readiness",
+                side_effect=routing.LabelRoutingError("boom"),
+            ),
+            tempfile.TemporaryDirectory() as directory,
+            contextlib.redirect_stderr(errors),
+        ):
+            path = Path(directory) / "REVIEWERS.md"
+            path.write_text(DOCUMENT, encoding="utf-8")
+            result = routing.main(
+                ["--reviewers", str(path), "--repo", REPO, "--pr", "42"]
+            )
+        self.assertEqual(result, 1)
+        self.assertIn(
+            "::error title=Review Readiness%3A PR labels::boom", errors.getvalue()
+        )
+
+
 class CliTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("GITHUB_ACTIONS", None)
+
     def test_emits_plan_and_passes_apply_option(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"

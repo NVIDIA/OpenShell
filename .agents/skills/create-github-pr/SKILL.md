@@ -28,7 +28,8 @@ gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
 ```
 
 Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
-`state:accepted`; keep the issue link and note the missing label. Everyone else
+`state:accepted`; keep the issue link. Do not add access or acceptance evidence
+to the PR description. Everyone else
 must link at least one target-repository issue and have `state:accepted` on each.
 Otherwise, preserve local work and report which issue needs acceptance. A direct
 request, roadmap placement, other labels, or vouch status does not bypass this gate.

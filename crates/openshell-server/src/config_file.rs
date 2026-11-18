@@ -111,6 +111,9 @@ pub struct GatewayFileSection {
     pub log_level: Option<String>,
 
     // ── Database ─────────────────────────────────────────────────────────
+    /// Explicit identity source; connection URL stays environment-only.
+    #[serde(default)]
+    pub database_auth: Option<openshell_core::config::DatabaseAuthMode>,
     /// Connection ceiling for the persistence pool. One shared pool serves
     /// every database-backed RPC, so this is also the gateway's ceiling on
     /// concurrent database work. On Postgres, each replica also opens up to
@@ -159,6 +162,12 @@ pub struct GatewayFileSection {
     /// Admission repair window in seconds, between 1 and 86400.
     #[serde(default)]
     pub provisioning_repair_window_seconds: Option<i64>,
+    /// Durable mutation admissions per caller, between 1 and 1000000.
+    #[serde(default)]
+    pub mutation_admission_limit_per_caller: Option<u32>,
+    /// Mutation replay window in seconds, between 60 and 604800.
+    #[serde(default)]
+    pub mutation_replay_window_seconds: Option<u32>,
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
     pub enable_sandbox_updates: Option<bool>,

@@ -40,7 +40,7 @@ use tonic::{Status, Streaming};
 
 use crate::proto::{
     AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
-    HostMessage, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
+    HostMessage, HostRedirect, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
     SandboxInstanceStatus, SandboxInstanceTakeover, host_gateway_message, host_message,
 };
 
@@ -819,12 +819,16 @@ impl SupervisorHostController {
     }
 
     /// Serve one authenticated host stream. Reads the hello, supersedes any
-    /// session it replaces, and returns the gateway-to-host stream.
+    /// session it replaces, and returns the host's member ID and the
+    /// gateway-to-host stream. `home` sees every member and whether its host
+    /// accepts a redirect; a host that does is redirected, without a session,
+    /// to the peer endpoint `home` names.
     pub async fn attach(
         &self,
         identity: HostIdentity,
         mut inbound: Streaming<HostMessage>,
-    ) -> Result<ReceiverStream<Result<HostGatewayMessage, Status>>, Status> {
+        home: impl FnOnce(&str, bool) -> Option<String>,
+    ) -> Result<(String, ReceiverStream<Result<HostGatewayMessage, Status>>), Status> {
         let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
             Ok(Some(Ok(HostMessage {
                 payload: Some(host_message::Payload::Hello(hello)),
@@ -855,8 +859,17 @@ impl SupervisorHostController {
             return Err(Status::failed_precondition(MISSING_MEMBER));
         };
         validate_member(member).map_err(Status::invalid_argument)?;
-        let heartbeat = POOL_HEARTBEAT_INTERVAL;
+        let member_id = member.member_id.clone();
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let home = home(&member_id, hello.accepts_redirect);
+        if hello.accepts_redirect
+            && let Some(peer_endpoint) = home
+        {
+            tracing::info!(member_id, peer_endpoint, "redirecting supervisor host");
+            let _ = tx.try_send(Ok(redirect(peer_endpoint)));
+            return Ok((member_id, ReceiverStream::new(rx)));
+        }
+        let heartbeat = POOL_HEARTBEAT_INTERVAL;
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
         let peer_endpoint = lock(&self.inner.peer_endpoint).clone();
@@ -879,7 +892,7 @@ impl SupervisorHostController {
                 .await;
             controller.end_session(session_id);
         });
-        Ok(ReceiverStream::new(rx))
+        Ok((member_id, ReceiverStream::new(rx)))
     }
 
     /// Start a session for `hello`, superseding the same member's session. A
@@ -1276,6 +1289,16 @@ const MISSING_MEMBER: &str = "the shared supervisor did not name its pool member
 OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to a stable member ID and \
 OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to an IP reachable from sandbox runtimes";
 
+/// Sends a host to another gateway replica.
+#[must_use]
+pub fn redirect(peer_endpoint: String) -> HostGatewayMessage {
+    HostGatewayMessage {
+        payload: Some(host_gateway_message::Payload::Redirect(HostRedirect {
+            peer_endpoint,
+        })),
+    }
+}
+
 /// Check a pool member's identity, naming the setting that is wrong.
 fn validate_member(member: &PoolMember) -> Result<(), &'static str> {
     let valid = |value: &str| {
@@ -1445,6 +1468,7 @@ mod tests {
                 member_id: member.to_string(),
                 runtime_address: format!("10.0.0.{}:5500", member.len()),
             }),
+            accepts_redirect: false,
         }
     }
 
@@ -1963,6 +1987,7 @@ mod tests {
                     instance_id: "p1".to_string(),
                     connection_epoch: 1,
                     member: None,
+                    accepts_redirect: false,
                 },
             )
             .unwrap_err();
