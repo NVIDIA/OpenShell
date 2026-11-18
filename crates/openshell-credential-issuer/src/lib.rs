@@ -5,6 +5,7 @@
 //! in the gateway; existing driver contracts and durable identities are unchanged.
 
 mod embedded;
+pub mod endpoint;
 mod owner;
 pub mod refresh;
 mod refresh_material;

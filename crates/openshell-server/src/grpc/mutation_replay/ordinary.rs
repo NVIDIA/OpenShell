@@ -28,6 +28,10 @@ use openshell_core::proto::{
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WorkspaceSelector,
 };
+use openshell_core::proto::{
+    CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, SecretResponse,
+    UpdateSecretRequest,
+};
 use openshell_core::{GetResourceVersion, ObjectId};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -41,11 +45,11 @@ use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_workspace, selected_workspace_name,
 };
-use crate::grpc::{policy, provider, sandbox, service};
+use crate::grpc::{policy, provider, sandbox, secret, service};
 use crate::persistence::{ObjectType, SetResourceVersion, Store};
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredProviderProfile,
+    StoredProviderProfile, StoredWorkspaceSecret,
 };
 use crate::{ServerState, config_update_operation};
 
@@ -170,6 +174,9 @@ pub(in crate::grpc) enum Outcome {
         reference: Reference,
         mutation_id: String,
         target_receipts: Vec<ProviderReceiptReference>,
+    },
+    Secret {
+        reference: Reference,
     },
     Service {
         reference: Reference,
@@ -703,6 +710,56 @@ ordinary_deletion!(
             principal,
             req.workspace_scope.as_ref(),
             MinWorkspaceRole::User,
+        )
+        .await
+    }
+);
+fn secret_receipt(response: &Response<SecretResponse>) -> Result<Outcome, Status> {
+    let secret = response.get_ref().secret.as_ref().ok_or_else(uncertain)?;
+    Ok(Outcome::Secret {
+        reference: Reference::new(secret),
+    })
+}
+
+async fn restore_secret(store: &Store, outcome: Outcome) -> Result<SecretResponse, Status> {
+    let Outcome::Secret { reference } = outcome else {
+        return Err(replay_unavailable());
+    };
+    let stored: StoredWorkspaceSecret = reference.restore(store).await?;
+    Ok(SecretResponse {
+        secret: Some(secret::public_secret(&stored)),
+    })
+}
+
+scoped_mutation!(
+    CreateSecretRequest,
+    SecretResponse,
+    "CreateSecret",
+    secret::handle_create_secret,
+    Admin,
+    secret_receipt,
+    restore_secret
+);
+scoped_mutation!(
+    UpdateSecretRequest,
+    SecretResponse,
+    "UpdateSecret",
+    secret::handle_update_secret,
+    Admin,
+    secret_receipt,
+    restore_secret
+);
+ordinary_deletion!(
+    DeleteSecretRequest,
+    DeleteSecretResponse,
+    "DeleteSecret",
+    secret::handle_delete_secret,
+    async |req: &DeleteSecretRequest, state: &ServerState, principal: &Principal| {
+        selected_scope(
+            state,
+            principal,
+            req.workspace_scope.as_ref(),
+            MinWorkspaceRole::Admin,
         )
         .await
     }

@@ -11,10 +11,11 @@ use openshell_core::proto::{
     AddWorkspaceMemberResponse, AttachSandboxProviderResponse, BeginRootfsTarStagingResponse,
     CreateWorkspaceResponse, DeleteProviderProfileResponse, DeleteProviderRefreshResponse,
     DeleteProviderResponse, DeleteSandboxResponse, DeleteSandboxTemplateResponse,
-    DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome, DetachSandboxProviderResponse,
-    ImportProviderProfilesResponse, ProviderProfile, RemoveWorkspaceMemberResponse, Sandbox,
-    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse,
-    UpdateProviderProfilesResponse, WorkspaceSelector, workspace_selector::Selection,
+    DeleteSecretResponse, DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome,
+    DetachSandboxProviderResponse, ImportProviderProfilesResponse, ProviderProfile,
+    RemoveWorkspaceMemberResponse, Sandbox, SandboxResponse, SandboxTemplateResponse,
+    SecretResponse, ServiceEndpointResponse, UpdateProviderProfilesResponse, WorkspaceSelector,
+    workspace_selector::Selection,
 };
 use openshell_ocsf::ResourceDetails;
 use tonic::{Code, Response, Status};
@@ -63,6 +64,7 @@ macro_rules! deletion {
 
 deletion!(
     DeleteSandboxTemplateResponse,
+    DeleteSecretResponse,
     DeleteServiceResponse,
     DeleteProviderResponse,
     DeleteProviderProfileResponse,
@@ -124,6 +126,17 @@ impl Audited for SandboxTemplateResponse {
             self.template
                 .as_ref()
                 .and_then(|template| template.metadata.as_ref()),
+        )
+    }
+}
+
+impl Audited for SecretResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored(
+            "secret",
+            self.secret
+                .as_ref()
+                .and_then(|secret| secret.metadata.as_ref()),
         )
     }
 }

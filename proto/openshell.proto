@@ -450,6 +450,53 @@ service OpenShell {
     };
   }
 
+  // Create a workspace secret. Secrets are credential minting material only:
+  // OpenShell never injects them into sandboxes, and Get and List never
+  // return their values.
+  rpc CreateSecret(CreateSecretRequest) returns (SecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Fetch workspace secret metadata by name. The value is never returned.
+  rpc GetSecret(GetSecretRequest) returns (SecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:read"
+      workspace_role: "user"
+    };
+  }
+
+  // List workspace secret metadata. Values are never returned.
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Replace a workspace secret's value, description, or labels.
+  rpc UpdateSecret(UpdateSecretRequest) returns (SecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Delete a workspace secret by name.
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:write"
+      workspace_role: "admin"
+    };
+  }
+
   // Get sandbox settings by id (called by users, and by supervisors at startup
   // and in their poll loop). A supervisor whose session pushes configuration
   // receives later updates over ConnectSupervisor and stops polling.
@@ -2776,6 +2823,100 @@ message DeleteProviderProfileResponse {
   reserved 1;
   reserved "deleted";
   DeletionOutcome outcome = 2;
+}
+
+// A workspace-scoped value used only as credential minting material, such as
+// an OAuth client secret shared by many providers. OpenShell never injects a
+// secret into sandboxes and never returns its value from Get or List.
+message Secret {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string description = 2;
+  // Token endpoints this value may be sent to, normalized. Fixed at creation.
+  repeated string allowed_endpoints = 3;
+  // Last time the value was written.
+  google.protobuf.Timestamp value_update_time = 4;
+}
+
+message CreateSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  string description = 3;
+  // Required and non-empty.
+  string value = 4 [(openshell.options.v1.secret) = true];
+  // Required. Absolute https URLs, or http URLs for loopback hosts. Compared
+  // exactly after normalization. Cannot be changed after creation.
+  repeated string allowed_endpoints = 5;
+  map<string, string> labels = 6;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 7;
+}
+
+message GetSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+}
+
+message ListSecretsRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // The maximum number of secrets to return. Zero uses 100. Values above 1000
+  // are coerced to 1000; negative values are invalid.
+  int32 page_size = 2;
+  // Token from a previous ListSecrets response. All other request parameters
+  // except page_size must match the request that produced it.
+  string page_token = 3;
+  // Optional label selector in key=value comma-separated form.
+  string label_selector = 4;
+}
+
+// Presence selects replacement, including an explicitly empty map.
+message SecretLabels {
+  map<string, string> labels = 1;
+}
+
+message UpdateSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  // Absent leaves the value unchanged. Present must be non-empty.
+  optional string value = 3 [(openshell.options.v1.secret) = true];
+  // Absent leaves the description unchanged.
+  optional string description = 4;
+  // Absent leaves labels unchanged. Present replaces the full set.
+  SecretLabels labels = 5;
+  // Rejects the update unless it matches the current resource version.
+  optional uint64 expected_resource_version = 6;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 7;
+}
+
+message DeleteSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  // Succeed with ALREADY_ABSENT if the target is missing. Authorization and
+  // parent-workspace checks still apply.
+  bool allow_missing = 3;
+  // Optional nonzero UUID. Same ID and payload replay success for 24 hours.
+  string request_id = 4;
+}
+
+message SecretResponse {
+  Secret secret = 1;
+}
+
+message ListSecretsResponse {
+  repeated Secret secrets = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
+}
+
+message DeleteSecretResponse {
+  DeletionOutcome outcome = 1;
 }
 
 // Get sandbox provider environment request.

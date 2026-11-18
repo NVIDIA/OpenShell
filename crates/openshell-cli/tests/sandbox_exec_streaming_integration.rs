@@ -261,6 +261,11 @@ mock_gateway! {
         delete_provider_refresh(proto::DeleteProviderRefreshRequest) -> proto::DeleteProviderRefreshResponse;
         delete_provider(proto::DeleteProviderRequest) -> proto::DeleteProviderResponse;
         delete_provider_profile(proto::DeleteProviderProfileRequest) -> proto::DeleteProviderProfileResponse;
+        create_secret(proto::CreateSecretRequest) -> proto::SecretResponse;
+        get_secret(proto::GetSecretRequest) -> proto::SecretResponse;
+        list_secrets(proto::ListSecretsRequest) -> proto::ListSecretsResponse;
+        update_secret(proto::UpdateSecretRequest) -> proto::SecretResponse;
+        delete_secret(proto::DeleteSecretRequest) -> proto::DeleteSecretResponse;
         get_sandbox_config(proto::GetSandboxConfigRequest) -> proto::GetSandboxConfigResponse;
         get_gateway_config(proto::GetGatewayConfigRequest) -> proto::GetGatewayConfigResponse;
         update_config(proto::UpdateConfigRequest) -> proto::UpdateConfigResponse;

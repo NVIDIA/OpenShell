@@ -1,0 +1,966 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Workspace secrets: shared, never-injected credential minting material.
+//!
+//! The gateway record holds only non-secret metadata and an opaque credential
+//! storage handle. Values are written through the credential issuer under the
+//! `WorkspaceSecret` owner kind and are never returned by these handlers.
+
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+
+use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta};
+use openshell_core::proto::{
+    CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, DeletionOutcome,
+    GetSecretRequest, ListSecretsRequest, ListSecretsResponse, Secret, SecretResponse,
+    UpdateSecretRequest,
+};
+use openshell_core::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
+use openshell_credential_issuer::endpoint::normalize_token_endpoint;
+use openshell_credential_issuer::{Handles, SecretOwner};
+use prost::Message;
+use tonic::{Request, Response, Status};
+use tracing::warn;
+
+use super::validation::validate_dns1123_label;
+use super::{MAX_MAP_VALUE_LEN, MAX_NAME_LEN};
+use crate::ServerState;
+use crate::auth::workspace_authz::{
+    MinWorkspaceRole, authorize_workspace, selected_workspace_name,
+};
+use crate::pagination::Pagination;
+use crate::persistence::{
+    ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition, current_time_ms,
+};
+use crate::storage_proto::StoredWorkspaceSecret;
+
+/// Logical key of the single value each secret stores.
+pub const SECRET_VALUE_KEY: &str = "value";
+const MAX_SECRETS_PER_WORKSPACE: u32 = 500;
+const MAX_ALLOWED_ENDPOINTS: usize = 16;
+const MAX_ENDPOINT_LEN: usize = 2048;
+const MAX_DESCRIPTION_LEN: usize = 1024;
+const SWEEP_LIMIT: u32 = 1000;
+
+impl ObjectType for StoredWorkspaceSecret {
+    fn object_type() -> &'static str {
+        "workspace_secret"
+    }
+}
+
+/// Project a stored record to its public form. Never carries handles.
+pub fn public_secret(stored: &StoredWorkspaceSecret) -> Secret {
+    Secret {
+        metadata: stored.metadata.clone(),
+        description: stored.description.clone(),
+        allowed_endpoints: stored.allowed_endpoints.clone(),
+        value_update_time: stored.value_update_time,
+    }
+}
+
+fn is_tombstoned(stored: &StoredWorkspaceSecret) -> bool {
+    stored
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
+}
+
+fn owner(stored: &StoredWorkspaceSecret) -> SecretOwner<'_> {
+    SecretOwner::workspace_secret(stored.object_workspace(), stored.object_id())
+}
+
+fn value_handles(handle: CredentialHandle) -> Handles {
+    HashMap::from([(SECRET_VALUE_KEY.to_string(), handle)])
+}
+
+fn labels_json(stored: &StoredWorkspaceSecret) -> Result<Option<String>, Status> {
+    match stored.object_labels() {
+        Some(labels) if !labels.is_empty() => serde_json::to_string(&labels)
+            .map(Some)
+            .map_err(|e| Status::internal(format!("failed to serialize labels: {e}"))),
+        _ => Ok(None),
+    }
+}
+
+/// Reject secret creation and new references unless the operator activated
+/// workspace secrets and no observable live gateway lacks support for them.
+pub async fn ensure_workspace_secrets_active(state: &ServerState) -> Result<(), Status> {
+    if !state.config.enable_workspace_secrets {
+        return Err(Status::failed_precondition(
+            "workspace secrets are not enabled; set enable_workspace_secrets after every gateway supports them",
+        ));
+    }
+    state
+        .store
+        .ensure_workspace_secrets_deployment_compatible()
+        .await
+        .map_err(|err| Status::failed_precondition(err.to_string()))
+}
+
+fn ensure_credential_storage(state: &ServerState) -> Result<(), Status> {
+    if state.credentials.stores_provider_credentials() {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(
+            "workspace secrets require configured credential storage",
+        ))
+    }
+}
+
+fn validate_name(name: &str) -> Result<(), Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "name exceeds maximum length ({} > {MAX_NAME_LEN})",
+            name.len()
+        )));
+    }
+    validate_dns1123_label(name, "name")
+}
+
+fn validate_value(value: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        return Err(Status::invalid_argument("value must not be empty"));
+    }
+    if value.len() > MAX_MAP_VALUE_LEN {
+        return Err(Status::invalid_argument(format!(
+            "value exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_description(description: &str) -> Result<(), Status> {
+    if description.len() > MAX_DESCRIPTION_LEN {
+        return Err(Status::invalid_argument(format!(
+            "description exceeds maximum length ({} > {MAX_DESCRIPTION_LEN})",
+            description.len()
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_allowed_endpoints(endpoints: &[String]) -> Result<Vec<String>, Status> {
+    if endpoints.is_empty() {
+        return Err(Status::invalid_argument(
+            "allowed_endpoints must name at least one token endpoint",
+        ));
+    }
+    if endpoints.len() > MAX_ALLOWED_ENDPOINTS {
+        return Err(Status::invalid_argument(format!(
+            "allowed_endpoints exceeds maximum entries ({} > {MAX_ALLOWED_ENDPOINTS})",
+            endpoints.len()
+        )));
+    }
+    let mut normalized = BTreeSet::new();
+    for endpoint in endpoints {
+        if endpoint.len() > MAX_ENDPOINT_LEN {
+            return Err(Status::invalid_argument(format!(
+                "allowed_endpoints entry exceeds maximum length ({} > {MAX_ENDPOINT_LEN})",
+                endpoint.len()
+            )));
+        }
+        let value = normalize_token_endpoint(endpoint).map_err(|reason| {
+            Status::invalid_argument(format!("allowed_endpoints entry '{endpoint}' {reason}"))
+        })?;
+        normalized.insert(value);
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+/// Validate labels by reusing the shared metadata validator.
+fn validate_labels(labels: &HashMap<String, String>) -> Result<(), Status> {
+    super::validation::validate_object_metadata(
+        Some(&ObjectMeta {
+            id: "validation".to_string(),
+            name: "validation".to_string(),
+            labels: labels.clone(),
+            ..ObjectMeta::default()
+        }),
+        "secret",
+    )
+}
+
+async fn authorized_workspace(
+    state: &ServerState,
+    request_principal: &crate::auth::principal::Principal,
+    workspace_scope: Option<&openshell_core::proto::WorkspaceSelector>,
+    role: MinWorkspaceRole,
+) -> Result<super::workspace::ResolvedWorkspace, Status> {
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        request_principal,
+        selected_workspace_name(workspace_scope)?,
+        role,
+    )
+    .await?;
+    super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace).await
+}
+
+/// Fetch a live (not tombstoned) secret by name.
+pub async fn get_live_secret(
+    store: &Store,
+    workspace: &str,
+    name: &str,
+) -> Result<Option<StoredWorkspaceSecret>, Status> {
+    let stored = store
+        .get_message_by_name::<StoredWorkspaceSecret>(workspace, name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch secret failed: {e}")))?;
+    Ok(stored.filter(|stored| !is_tombstoned(stored)))
+}
+
+async fn stage_value(
+    state: &ServerState,
+    workspace: &str,
+    secret_id: &str,
+    value: &str,
+) -> Result<CredentialHandle, Status> {
+    let values = HashMap::from([(SECRET_VALUE_KEY.to_string(), value.to_string())]);
+    let staging_id = format!("{secret_id}-value-{}", uuid::Uuid::new_v4());
+    let mut handles = state
+        .credentials
+        .store_secrets_with_object_id(
+            SecretOwner::workspace_secret(workspace, secret_id),
+            &staging_id,
+            &values,
+            &HashMap::new(),
+        )
+        .await?;
+    handles
+        .remove(SECRET_VALUE_KEY)
+        .ok_or_else(|| Status::internal("credential storage returned no secret handle"))
+}
+
+async fn discard_staged_value(
+    state: &ServerState,
+    workspace: &str,
+    secret_id: &str,
+    handle: CredentialHandle,
+) {
+    if let Err(err) = state
+        .credentials
+        .delete_secrets(
+            SecretOwner::workspace_secret(workspace, secret_id),
+            &value_handles(handle),
+        )
+        .await
+    {
+        warn!(secret_id, error = %err, "failed to discard staged workspace secret value");
+    }
+}
+
+pub(super) async fn handle_create_secret(
+    state: &Arc<ServerState>,
+    request: Request<CreateSecretRequest>,
+) -> Result<Response<SecretResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let workspace = authorized_workspace(
+        state,
+        &principal,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::Admin,
+    )
+    .await?
+    .ensure_active()?;
+    validate_name(&req.name)?;
+    validate_value(&req.value)?;
+    validate_description(&req.description)?;
+    validate_labels(&req.labels)?;
+    let allowed_endpoints = normalize_allowed_endpoints(&req.allowed_endpoints)?;
+    ensure_workspace_secrets_active(state).await?;
+    ensure_credential_storage(state)?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
+    let handle = stage_value(state, &workspace, &id, &req.value).await?;
+    let mut stored = StoredWorkspaceSecret {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: req.name.clone(),
+            created_time: now,
+            labels: req.labels,
+            resource_version: 0,
+            annotations: HashMap::new(),
+            workspace: workspace.clone(),
+            deletion_time: None,
+        }),
+        description: req.description,
+        allowed_endpoints,
+        value_update_time: now,
+        value_handle: Some(handle.clone()),
+        pending_handle_deletions: Vec::new(),
+    };
+    let labels = labels_json(&stored)?;
+    let write = state
+        .store
+        .create_if_workspace_count_below(
+            StoredWorkspaceSecret::object_type(),
+            stored.object_id(),
+            stored.object_name(),
+            &workspace,
+            &stored.encode_to_vec(),
+            labels.as_deref(),
+            u64::from(MAX_SECRETS_PER_WORKSPACE),
+        )
+        .await;
+    let write = match write {
+        Ok(Some(write)) => write,
+        Ok(None) => {
+            discard_staged_value(state, &workspace, &id, handle).await;
+            return Err(Status::resource_exhausted(format!(
+                "workspace has reached the maximum of {MAX_SECRETS_PER_WORKSPACE} secrets"
+            )));
+        }
+        Err(PersistenceError::UniqueViolation { .. }) => {
+            discard_staged_value(state, &workspace, &id, handle).await;
+            return Err(Status::already_exists("secret already exists"));
+        }
+        Err(err) => {
+            discard_staged_value(state, &workspace, &id, handle).await;
+            return Err(Status::internal(format!("persist secret failed: {err}")));
+        }
+    };
+    if let Some(metadata) = stored.metadata.as_mut() {
+        metadata.resource_version = write.resource_version;
+    }
+    Ok(Response::new(SecretResponse {
+        secret: Some(public_secret(&stored)),
+    }))
+}
+
+pub(super) async fn handle_get_secret(
+    state: &Arc<ServerState>,
+    request: Request<GetSecretRequest>,
+) -> Result<Response<SecretResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let workspace = authorized_workspace(
+        state,
+        &principal,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?
+    .name;
+    let stored = get_live_secret(&state.store, &workspace, &req.name)
+        .await?
+        .ok_or_else(|| Status::not_found("secret not found"))?;
+    Ok(Response::new(SecretResponse {
+        secret: Some(public_secret(&stored)),
+    }))
+}
+
+pub(super) async fn handle_list_secrets(
+    state: &Arc<ServerState>,
+    request: Request<ListSecretsRequest>,
+) -> Result<Response<ListSecretsResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let workspace = authorized_workspace(
+        state,
+        &principal,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?
+    .name;
+    if !req.label_selector.is_empty() {
+        super::validation::validate_label_selector(&req.label_selector)?;
+    }
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListSecrets",
+        &[&workspace, &req.label_selector],
+    )?;
+    let after = pagination.object_cursor()?;
+    let query = if req.label_selector.is_empty() {
+        ObjectListQuery::Workspace(&workspace)
+    } else {
+        ObjectListQuery::WorkspaceSelector {
+            workspace: &workspace,
+            label_selector: &req.label_selector,
+        }
+    };
+    let page = state
+        .store
+        .list_message_page::<StoredWorkspaceSecret>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list secrets failed: {e}")))?;
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListSecretsResponse {
+        secrets: page
+            .messages
+            .iter()
+            .filter(|stored| !is_tombstoned(stored))
+            .map(public_secret)
+            .collect(),
+        next_page_token,
+    }))
+}
+
+pub(super) async fn handle_update_secret(
+    state: &Arc<ServerState>,
+    request: Request<UpdateSecretRequest>,
+) -> Result<Response<SecretResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let workspace = authorized_workspace(
+        state,
+        &principal,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::Admin,
+    )
+    .await?
+    .name;
+    if let Some(value) = req.value.as_deref() {
+        validate_value(value)?;
+    }
+    if let Some(description) = req.description.as_deref() {
+        validate_description(description)?;
+    }
+    if let Some(labels) = req.labels.as_ref() {
+        validate_labels(&labels.labels)?;
+    }
+
+    let current = get_live_secret(&state.store, &workspace, &req.name)
+        .await?
+        .ok_or_else(|| Status::not_found("secret not found"))?;
+    let current_version = current.get_resource_version();
+    if let Some(expected) = req.expected_resource_version
+        && expected != current_version
+    {
+        return Err(Status::failed_precondition(format!(
+            "secret resource version is {current_version}, not {expected}"
+        )));
+    }
+    if req.value.is_none() && req.description.is_none() && req.labels.is_none() {
+        return Ok(Response::new(SecretResponse {
+            secret: Some(public_secret(&current)),
+        }));
+    }
+
+    let mut updated = current.clone();
+    let staged = if let Some(value) = req.value.as_deref() {
+        ensure_credential_storage(state)?;
+        let handle = stage_value(state, &workspace, current.object_id(), value).await?;
+        if let Some(previous) = updated.value_handle.replace(handle.clone()) {
+            updated.pending_handle_deletions.push(previous);
+        }
+        updated.value_update_time =
+            openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
+        Some(handle)
+    } else {
+        None
+    };
+    if let Some(description) = req.description {
+        updated.description = description;
+    }
+    if let (Some(labels), Some(metadata)) = (req.labels, updated.metadata.as_mut()) {
+        metadata.labels = labels.labels;
+    }
+
+    let labels = labels_json(&updated)?;
+    let write = state
+        .store
+        .put_if(
+            StoredWorkspaceSecret::object_type(),
+            updated.object_id(),
+            updated.object_name(),
+            &workspace,
+            &updated.encode_to_vec(),
+            labels.as_deref(),
+            WriteCondition::MatchResourceVersion(current_version),
+        )
+        .await;
+    let write = match write {
+        Ok(write) => write,
+        Err(err) => {
+            if let Some(handle) = staged {
+                discard_staged_value(state, &workspace, current.object_id(), handle).await;
+            }
+            return Err(match err {
+                PersistenceError::Conflict { .. } => {
+                    Status::aborted("secret was concurrently modified; retry the update")
+                }
+                err => Status::internal(format!("persist secret failed: {err}")),
+            });
+        }
+    };
+    if let Some(metadata) = updated.metadata.as_mut() {
+        metadata.resource_version = write.resource_version;
+    }
+    // Delete the superseded value now so a racing mint re-reads the record and
+    // uses the new value. Report the record as it ends up, so the returned
+    // resource version is current.
+    if !updated.pending_handle_deletions.is_empty() {
+        match drain_pending_deletions(state, updated.clone()).await {
+            Ok(drained) => updated = drained,
+            Err(err) => {
+                warn!(error = %err, "workspace secret handle cleanup deferred to the sweep");
+            }
+        }
+    }
+    Ok(Response::new(SecretResponse {
+        secret: Some(public_secret(&updated)),
+    }))
+}
+
+pub(super) async fn handle_delete_secret(
+    state: &Arc<ServerState>,
+    request: Request<DeleteSecretRequest>,
+) -> Result<Response<DeleteSecretResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let workspace = authorized_workspace(
+        state,
+        &principal,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::Admin,
+    )
+    .await?
+    .name;
+    let stored = state
+        .store
+        .get_message_by_name::<StoredWorkspaceSecret>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch secret failed: {e}")))?;
+    let Some(stored) = stored else {
+        return Ok(Response::new(DeleteSecretResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "secret")?,
+        }));
+    };
+    let tombstoned = tombstone(state, stored).await?;
+    finish_deletion(state, tombstoned).await?;
+    Ok(Response::new(DeleteSecretResponse {
+        outcome: DeletionOutcome::Completed.into(),
+    }))
+}
+
+/// Mark a secret deleted and queue its value handle for backend deletion. A
+/// tombstoned secret is invisible to reads and cannot be referenced.
+async fn tombstone(
+    state: &ServerState,
+    mut stored: StoredWorkspaceSecret,
+) -> Result<StoredWorkspaceSecret, Status> {
+    if is_tombstoned(&stored) {
+        return Ok(stored);
+    }
+    let version = stored.get_resource_version();
+    if let Some(metadata) = stored.metadata.as_mut() {
+        metadata.deletion_time =
+            openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
+    }
+    if let Some(handle) = stored.value_handle.take() {
+        stored.pending_handle_deletions.push(handle);
+    }
+    let write = state
+        .store
+        .put_if(
+            StoredWorkspaceSecret::object_type(),
+            stored.object_id(),
+            stored.object_name(),
+            stored.object_workspace(),
+            &stored.encode_to_vec(),
+            labels_json(&stored)?.as_deref(),
+            WriteCondition::MatchResourceVersion(version),
+        )
+        .await
+        .map_err(|err| match err {
+            PersistenceError::Conflict { .. } => {
+                Status::aborted("secret was concurrently modified; retry the delete")
+            }
+            err => Status::internal(format!("tombstone secret failed: {err}")),
+        })?;
+    if let Some(metadata) = stored.metadata.as_mut() {
+        metadata.resource_version = write.resource_version;
+    }
+    Ok(stored)
+}
+
+/// Delete a tombstoned secret's backend handles, then its record.
+async fn finish_deletion(state: &ServerState, stored: StoredWorkspaceSecret) -> Result<(), Status> {
+    let stored = drain_pending_deletions(state, stored).await?;
+    state
+        .store
+        .delete_if(
+            StoredWorkspaceSecret::object_type(),
+            stored.object_id(),
+            stored.get_resource_version(),
+        )
+        .await
+        .map_err(|e| Status::internal(format!("delete secret failed: {e}")))?;
+    Ok(())
+}
+
+/// Delete superseded backend handles, then clear them from the record. A
+/// failure leaves the record unchanged so the sweep retries it.
+async fn drain_pending_deletions(
+    state: &ServerState,
+    mut stored: StoredWorkspaceSecret,
+) -> Result<StoredWorkspaceSecret, Status> {
+    if stored.pending_handle_deletions.is_empty() {
+        return Ok(stored);
+    }
+    for handle in &stored.pending_handle_deletions {
+        state
+            .credentials
+            .delete_secrets(owner(&stored), &value_handles(handle.clone()))
+            .await?;
+    }
+    stored.pending_handle_deletions.clear();
+    let write = state
+        .store
+        .put_if(
+            StoredWorkspaceSecret::object_type(),
+            stored.object_id(),
+            stored.object_name(),
+            stored.object_workspace(),
+            &stored.encode_to_vec(),
+            labels_json(&stored)?.as_deref(),
+            WriteCondition::MatchResourceVersion(stored.get_resource_version()),
+        )
+        .await
+        .map_err(|err| match err {
+            PersistenceError::Conflict { .. } => {
+                Status::aborted("secret was concurrently modified during cleanup")
+            }
+            err => Status::internal(format!("persist secret cleanup failed: {err}")),
+        })?;
+    if let Some(metadata) = stored.metadata.as_mut() {
+        metadata.resource_version = write.resource_version;
+    }
+    Ok(stored)
+}
+
+/// Retry backend deletions and tombstone removal that an earlier request could
+/// not finish. Runs on the gateway's periodic maintenance tick.
+pub async fn sweep_workspace_secrets(state: &ServerState) -> Result<usize, Status> {
+    let records = state
+        .store
+        .list_by_type(StoredWorkspaceSecret::object_type(), SWEEP_LIMIT, 0)
+        .await
+        .map_err(|e| Status::internal(format!("list secrets failed: {e}")))?;
+    let mut finished = 0;
+    for record in records {
+        let mut stored = StoredWorkspaceSecret::decode(record.payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode secret failed: {e}")))?;
+        stored
+            .metadata
+            .get_or_insert_with(ObjectMeta::default)
+            .resource_version = record.resource_version;
+        if !is_tombstoned(&stored) && stored.pending_handle_deletions.is_empty() {
+            continue;
+        }
+        let result = if is_tombstoned(&stored) {
+            finish_deletion(state, stored).await
+        } else {
+            drain_pending_deletions(state, stored).await.map(|_| ())
+        };
+        match result {
+            Ok(()) => finished += 1,
+            Err(err) => warn!(error = %err, "workspace secret cleanup will be retried"),
+        }
+    }
+    Ok(finished)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grpc::test_support::{authed_request, test_server_state};
+    use openshell_core::proto::{SecretLabels, workspace_selector};
+    use tonic::Code;
+
+    type Mutate = fn(&mut CreateSecretRequest);
+
+    async fn enabled_state() -> Arc<ServerState> {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("test state is not shared yet")
+            .config
+            .enable_workspace_secrets = true;
+        state
+    }
+
+    fn create_request(name: &str, value: &str) -> CreateSecretRequest {
+        CreateSecretRequest {
+            workspace_scope: Some(workspace_selector("default".to_string())),
+            name: name.to_string(),
+            description: "shared OAuth client secret".to_string(),
+            value: value.to_string(),
+            allowed_endpoints: vec!["HTTPS://Login.Example.com:443/oauth/token".to_string()],
+            labels: HashMap::from([("team".to_string(), "platform".to_string())]),
+            request_id: String::new(),
+        }
+    }
+
+    async fn create(state: &Arc<ServerState>, name: &str, value: &str) -> Secret {
+        handle_create_secret(state, authed_request(create_request(name, value)))
+            .await
+            .expect("create secret")
+            .into_inner()
+            .secret
+            .expect("secret")
+    }
+
+    async fn stored(state: &Arc<ServerState>, name: &str) -> Option<StoredWorkspaceSecret> {
+        state
+            .store
+            .get_message_by_name::<StoredWorkspaceSecret>("default", name)
+            .await
+            .unwrap()
+    }
+
+    async fn resolve_value(
+        state: &Arc<ServerState>,
+        stored: &StoredWorkspaceSecret,
+        handle: &CredentialHandle,
+    ) -> Result<String, Status> {
+        let resolved = state
+            .credentials
+            .resolve_secrets(owner(stored), &value_handles(handle.clone()), 0)
+            .await?;
+        resolved
+            .values
+            .get(SECRET_VALUE_KEY)
+            .cloned()
+            .ok_or_else(|| Status::not_found("value"))
+    }
+
+    #[tokio::test]
+    async fn create_requires_operator_activation() {
+        let state = test_server_state().await;
+        let err = handle_create_secret(&state, authed_request(create_request("acme", "s3cret")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("enable_workspace_secrets"));
+        assert!(stored(&state, "acme").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_never_returns_the_value_and_rotates_handles() {
+        let state = enabled_state().await;
+        let created = create(&state, "acme", "first-value").await;
+        let metadata = created.metadata.as_ref().unwrap();
+        assert_eq!(metadata.name, "acme");
+        assert_eq!(metadata.workspace, "default");
+        assert_ne!(metadata.resource_version, 0);
+        assert_eq!(
+            created.allowed_endpoints,
+            vec!["https://login.example.com/oauth/token".to_string()]
+        );
+        let encoded = format!("{created:?}");
+        assert!(!encoded.contains("first-value"));
+
+        let record = stored(&state, "acme").await.unwrap();
+        let first_handle = record.value_handle.clone().unwrap();
+        assert_eq!(
+            resolve_value(&state, &record, &first_handle).await.unwrap(),
+            "first-value"
+        );
+
+        let fetched = handle_get_secret(
+            &state,
+            authed_request(GetSecretRequest {
+                workspace_scope: Some(workspace_selector("default".to_string())),
+                name: "acme".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .secret
+        .unwrap();
+        assert_eq!(fetched, created);
+
+        let updated = handle_update_secret(
+            &state,
+            authed_request(UpdateSecretRequest {
+                workspace_scope: Some(workspace_selector("default".to_string())),
+                name: "acme".to_string(),
+                value: Some("second-value".to_string()),
+                description: None,
+                labels: Some(SecretLabels {
+                    labels: HashMap::new(),
+                }),
+                expected_resource_version: Some(metadata.resource_version),
+                request_id: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .secret
+        .unwrap();
+        let record = stored(&state, "acme").await.unwrap();
+        assert_eq!(
+            updated.metadata.as_ref().unwrap().resource_version,
+            record.get_resource_version(),
+            "the response reports the record after handle cleanup"
+        );
+        assert!(record.pending_handle_deletions.is_empty());
+        assert!(updated.metadata.as_ref().unwrap().labels.is_empty());
+        assert_eq!(updated.description, "shared OAuth client secret");
+        let second_handle = record.value_handle.clone().unwrap();
+        assert_ne!(first_handle, second_handle);
+        assert_eq!(
+            resolve_value(&state, &record, &second_handle)
+                .await
+                .unwrap(),
+            "second-value"
+        );
+        assert!(
+            resolve_value(&state, &record, &first_handle).await.is_err(),
+            "the superseded value is deleted from credential storage"
+        );
+
+        let listed = handle_list_secrets(
+            &state,
+            authed_request(ListSecretsRequest {
+                workspace_scope: Some(workspace_selector("default".to_string())),
+                page_size: 0,
+                page_token: String::new(),
+                label_selector: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.secrets, vec![updated]);
+
+        let delete = |allow_missing| {
+            handle_delete_secret(
+                &state,
+                authed_request(DeleteSecretRequest {
+                    workspace_scope: Some(workspace_selector("default".to_string())),
+                    name: "acme".to_string(),
+                    allow_missing,
+                    request_id: String::new(),
+                }),
+            )
+        };
+        assert_eq!(
+            delete(false).await.unwrap().into_inner().outcome(),
+            DeletionOutcome::Completed
+        );
+        assert!(stored(&state, "acme").await.is_none());
+        assert!(
+            resolve_value(&state, &record, &second_handle)
+                .await
+                .is_err()
+        );
+        assert_eq!(delete(false).await.unwrap_err().code(), Code::NotFound);
+        assert_eq!(
+            delete(true).await.unwrap().into_inner().outcome(),
+            DeletionOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_input_before_storing_anything() {
+        let state = enabled_state().await;
+        let cases: [(&str, Mutate); 5] = [
+            ("empty value", |req| req.value.clear()),
+            ("no endpoints", |req| req.allowed_endpoints.clear()),
+            ("non-loopback http", |req| {
+                req.allowed_endpoints = vec!["http://login.example.com/token".to_string()];
+            }),
+            ("query string", |req| {
+                req.allowed_endpoints = vec!["https://login.example.com/token?a=b".to_string()];
+            }),
+            ("invalid name", |req| req.name = "Not_A_Label".to_string()),
+        ];
+        for (case, mutate) in cases {
+            let mut request = create_request("acme", "value");
+            mutate(&mut request);
+            let err = handle_create_secret(&state, authed_request(request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument, "{case}");
+        }
+        assert!(stored(&state, "acme").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_names_are_rejected() {
+        let state = enabled_state().await;
+        create(&state, "acme", "value").await;
+        let err = handle_create_secret(&state, authed_request(create_request("acme", "other")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_stale_versions_and_empty_values() {
+        let state = enabled_state().await;
+        let created = create(&state, "acme", "value").await;
+        let version = created.metadata.unwrap().resource_version;
+        let update = |value: Option<&str>, expected| {
+            handle_update_secret(
+                &state,
+                authed_request(UpdateSecretRequest {
+                    workspace_scope: Some(workspace_selector("default".to_string())),
+                    name: "acme".to_string(),
+                    value: value.map(str::to_string),
+                    description: None,
+                    labels: None,
+                    expected_resource_version: expected,
+                    request_id: String::new(),
+                }),
+            )
+        };
+        let err = update(Some("next"), Some(version + 10)).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        let err = update(Some(""), None).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        let unchanged = update(None, None)
+            .await
+            .unwrap()
+            .into_inner()
+            .secret
+            .unwrap();
+        assert_eq!(unchanged.metadata.unwrap().resource_version, version);
+    }
+
+    #[tokio::test]
+    async fn sweep_finishes_an_interrupted_deletion() {
+        let state = enabled_state().await;
+        create(&state, "acme", "value").await;
+        let record = stored(&state, "acme").await.unwrap();
+        let handle = record.value_handle.clone().unwrap();
+        let tombstoned = tombstone(&state, record).await.unwrap();
+        assert!(tombstoned.value_handle.is_none());
+        assert_eq!(tombstoned.pending_handle_deletions, vec![handle.clone()]);
+
+        // A tombstoned secret is invisible to reads.
+        assert!(
+            get_live_secret(&state.store, "default", "acme")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(sweep_workspace_secrets(&state).await.unwrap(), 1);
+        assert!(stored(&state, "acme").await.is_none());
+        assert!(resolve_value(&state, &tombstoned, &handle).await.is_err());
+    }
+}

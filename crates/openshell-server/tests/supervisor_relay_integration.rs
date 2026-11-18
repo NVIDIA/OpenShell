@@ -441,6 +441,41 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+
+    async fn create_secret(
+        &self,
+        _: tonic::Request<openshell_core::proto::CreateSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_secret(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_secrets(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListSecretsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSecretsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn update_secret(
+        &self,
+        _: tonic::Request<openshell_core::proto::UpdateSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_secret(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn get_provider_refresh_status(
         &self,
         _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,

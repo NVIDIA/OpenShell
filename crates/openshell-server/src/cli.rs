@@ -351,6 +351,11 @@ struct RunArgs {
     /// and settling its outstanding driver operations. See HA upgrade guidance.
     #[arg(long, env = "OPENSHELL_ENABLE_SANDBOX_UPDATES", default_value_t = false, action = ArgAction::Set)]
     enable_sandbox_updates: bool,
+
+    /// Activate workspace secrets only after every gateway that can serve traffic supports
+    /// them. See the workspace secrets activation guidance.
+    #[arg(long, env = "OPENSHELL_ENABLE_WORKSPACE_SECRETS", default_value_t = false, action = ArgAction::Set)]
+    enable_workspace_secrets: bool,
 }
 
 pub fn command() -> Command {
@@ -659,6 +664,7 @@ fn prepare_server_config_with_drivers(
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
 
     config.enable_sandbox_updates = args.enable_sandbox_updates;
+    config.enable_workspace_secrets = args.enable_workspace_secrets;
 
     config.supervisor_app_listener = file
         .as_ref()
@@ -1612,6 +1618,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_sandbox_updates")
     {
         args.enable_sandbox_updates = enabled;
+    }
+    if let Some(enabled) = file.enable_workspace_secrets
+        && arg_defaulted(matches, "enable_workspace_secrets")
+    {
+        args.enable_workspace_secrets = enabled;
     }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")

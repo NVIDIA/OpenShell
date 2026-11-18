@@ -20,6 +20,11 @@ mod sandbox_image {
 }
 pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
 
+mod workspace_secret {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.secret.v1.rs"));
+}
+pub(crate) use workspace_secret::StoredWorkspaceSecret;
+
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
 
@@ -112,6 +117,48 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
     }
 }
 
+impl ObjectId for StoredWorkspaceSecret {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredWorkspaceSecret {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredWorkspaceSecret {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for StoredWorkspaceSecret {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for StoredWorkspaceSecret {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for StoredWorkspaceSecret {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,9 +226,9 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "daa132037ee47c7a46b08dfab9bab379961bc06ff3e9ebbb329809b724f2a4f6";
+        "76d166f76b8aa0abc7d7611b642e5f499b762c746b37f7f183e401cb0ea23685";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "b6a1de55ca3bdf2ccbf88a32f57e87db84b775c48fcd5f9fcf7811eae8d67c70";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -245,6 +292,7 @@ mod tests {
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.storage.image.v1.StoredSandboxImageState",
+        ".openshell.storage.secret.v1.StoredWorkspaceSecret",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -655,7 +703,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            113 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            118 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -665,7 +713,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            88 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -675,7 +723,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            85 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -726,8 +774,8 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (344, 31),
-                (100, 22),
+                (356, 31),
+                (101, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,

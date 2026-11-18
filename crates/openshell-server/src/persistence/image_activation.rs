@@ -11,7 +11,7 @@
 //! an accepted image mutation from a subsequent legacy Start.
 
 use super::{ObjectRecord, PersistenceError, PersistenceResult, Store};
-use crate::gateway_members::{MEMBER_TTL, SANDBOX_UPDATE_PROTOCOL};
+use crate::gateway_members::{MEMBER_TTL, SANDBOX_UPDATE_PROTOCOL, WORKSPACE_SECRETS_PROTOCOL};
 use openshell_core::time::now_ms;
 
 const MEMBER_OBJECT_TYPE: &str = "gateway_member";
@@ -39,14 +39,61 @@ impl Store {
             .await?;
         ensure_live_members_compatible(&records, now_ms())
     }
+
+    /// Reject workspace-secret writes while an observable live gateway lacks
+    /// workspace-secret support. Same contract as image-update admission: the
+    /// caller enforces the default-off activation flag, `SQLite` relies on its
+    /// single-gateway contract, and the snapshot is not a fence.
+    pub async fn ensure_workspace_secrets_deployment_compatible(&self) -> PersistenceResult<()> {
+        let Self::Postgres(_) = self else {
+            return Ok(());
+        };
+        let records = self
+            .list_by_type(MEMBER_OBJECT_TYPE, MEMBER_LIMIT + 1, 0)
+            .await?;
+        ensure_live_members_advertise(&records, now_ms(), &WORKSPACE_SECRETS_CAPABILITY)
+    }
 }
 
+/// A protocol a live gateway must advertise in its membership record.
+struct MemberCapability {
+    field: &'static str,
+    protocol: u32,
+    feature: &'static str,
+    requirement: &'static str,
+    protocol_label: &'static str,
+}
+
+const SANDBOX_UPDATE_CAPABILITY: MemberCapability = MemberCapability {
+    field: "sandbox_update_protocol",
+    protocol: SANDBOX_UPDATE_PROTOCOL,
+    feature: "image-update",
+    requirement: "sandbox updates require",
+    protocol_label: "sandbox-update",
+};
+
+const WORKSPACE_SECRETS_CAPABILITY: MemberCapability = MemberCapability {
+    field: "workspace_secrets_protocol",
+    protocol: WORKSPACE_SECRETS_PROTOCOL,
+    feature: "workspace-secrets",
+    requirement: "workspace secrets require",
+    protocol_label: "workspace-secrets",
+};
+
 fn ensure_live_members_compatible(records: &[ObjectRecord], now: i64) -> PersistenceResult<()> {
+    ensure_live_members_advertise(records, now, &SANDBOX_UPDATE_CAPABILITY)
+}
+
+fn ensure_live_members_advertise(
+    records: &[ObjectRecord],
+    now: i64,
+    capability: &MemberCapability,
+) -> PersistenceResult<()> {
+    let feature = capability.feature;
     if records.len() > MEMBER_LIMIT as usize {
-        return Err(PersistenceError::Config(
-            "cannot establish image-update deployment compatibility: gateway membership listing exceeds its limit"
-                .into(),
-        ));
+        return Err(PersistenceError::Config(format!(
+            "cannot establish {feature} deployment compatibility: gateway membership listing exceeds its limit"
+        )));
     }
     let ttl_ms = i64::try_from(MEMBER_TTL.as_millis()).unwrap_or(i64::MAX);
     for record in records {
@@ -58,20 +105,20 @@ fn ensure_live_members_compatible(records: &[ObjectRecord], now: i64) -> Persist
         }
         let member: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(&record.payload).map_err(|_| {
-                PersistenceError::Config(
-                    "cannot establish image-update deployment compatibility: a live gateway membership record is not a valid JSON object"
-                        .into(),
-                )
+                PersistenceError::Config(format!(
+                    "cannot establish {feature} deployment compatibility: a live gateway membership record is not a valid JSON object"
+                ))
             })?;
         let replica_id = member.get("replica_id").and_then(serde_json::Value::as_str);
         let protocol = member
-            .get("sandbox_update_protocol")
+            .get(capability.field)
             .and_then(serde_json::Value::as_u64);
         if replica_id.is_none_or(|id| id.trim().is_empty())
-            || protocol != Some(u64::from(SANDBOX_UPDATE_PROTOCOL))
+            || protocol != Some(u64::from(capability.protocol))
         {
             return Err(PersistenceError::Config(format!(
-                "sandbox updates require every live gateway membership record to advertise sandbox-update protocol {SANDBOX_UPDATE_PROTOCOL} and a nonempty replica id"
+                "{} every live gateway membership record to advertise {} protocol {} and a nonempty replica id",
+                capability.requirement, capability.protocol_label, capability.protocol
             )));
         }
     }
@@ -199,6 +246,23 @@ mod tests {
             ensure_live_members_compatible(&[record(b"legacy", 100)], 100 + ttl_ms - 1).is_err()
         );
         assert!(ensure_live_members_compatible(&[record(b"legacy", 200)], 100).is_err());
+    }
+
+    #[test]
+    fn workspace_secrets_require_their_own_protocol() {
+        let check = |payload: &[u8]| {
+            ensure_live_members_advertise(
+                &[record(payload, 100)],
+                100,
+                &WORKSPACE_SECRETS_CAPABILITY,
+            )
+        };
+        assert!(check(br#"{"replica_id":"gw-0","workspace_secrets_protocol":1}"#).is_ok());
+        // A gateway that only knows sandbox updates predates workspace secrets.
+        let err = check(br#"{"replica_id":"gw-0","sandbox_update_protocol":1}"#).unwrap_err();
+        assert!(err.to_string().contains("workspace secrets require"));
+        assert!(check(br#"{"replica_id":"gw-0","workspace_secrets_protocol":2}"#).is_err());
+        assert!(check(br#"{"workspace_secrets_protocol":1}"#).is_err());
     }
 
     #[test]

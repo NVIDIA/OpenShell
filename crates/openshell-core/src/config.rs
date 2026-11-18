@@ -309,6 +309,11 @@ pub struct Config {
     /// Disabled by default; not a license to run mixed-version writers.
     pub enable_sandbox_updates: bool,
 
+    /// Operator activation for creating workspace secrets and referencing them
+    /// from provider refresh configuration. Enable only after every gateway
+    /// that can serve traffic supports workspace secrets. Disabled by default.
+    pub enable_workspace_secrets: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -1111,6 +1116,7 @@ impl Config {
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
             enable_sandbox_updates: false,
+            enable_workspace_secrets: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),

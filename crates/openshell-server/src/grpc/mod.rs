@@ -11,6 +11,7 @@ pub mod provider;
 mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
+pub mod secret;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
@@ -71,6 +72,10 @@ use openshell_core::proto::{
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
+};
+use openshell_core::proto::{
+    CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, GetSecretRequest,
+    ListSecretsRequest, ListSecretsResponse, SecretResponse, UpdateSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -818,6 +823,64 @@ impl OpenShell for OpenShellService {
             mutation_audit::scoped(
                 request.workspace_scope.as_ref(),
                 [mutation_audit::requested("provider_profile", &request.id)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    // --- Workspace secrets ---
+
+    async fn create_secret(
+        &self,
+        request: Request<CreateSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn get_secret(
+        &self,
+        request: Request<GetSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        secret::handle_get_secret(&self.state, request).await
+    }
+
+    async fn list_secrets(
+        &self,
+        request: Request<ListSecretsRequest>,
+    ) -> Result<Response<ListSecretsResponse>, Status> {
+        secret::handle_list_secrets(&self.state, request).await
+    }
+
+    async fn update_secret(
+        &self,
+        request: Request<UpdateSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn delete_secret(
+        &self,
+        request: Request<DeleteSecretRequest>,
+    ) -> Result<Response<DeleteSecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
             )
         };
         mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await

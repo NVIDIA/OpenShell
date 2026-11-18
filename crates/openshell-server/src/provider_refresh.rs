@@ -319,6 +319,9 @@ pub fn spawn_refresh_worker(state: Arc<crate::ServerState>, interval: Duration) 
                     warn!(error = %err, "provider credential refresh worker tick failed");
                 }
             }
+            if let Err(err) = crate::grpc::secret::sweep_workspace_secrets(&state).await {
+                warn!(error = %err, "workspace secret cleanup sweep failed");
+            }
         }
     });
 }
