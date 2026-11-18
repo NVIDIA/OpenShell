@@ -190,7 +190,11 @@ message RevealSecretResponse {
 ```
 
 Paging and label-selector semantics match `ListProvidersRequest`, except that
-`all_workspaces` is rejected. Get and List return metadata only. Values are
+`all_workspaces` is rejected. Get and List return metadata only. A secret
+whose deletion has not finished is still returned, with `metadata.deletion_time`
+set, so listing pages stay full and the secret's name and quota use stay
+visible. It cannot be updated, revealed, or referenced, and creating a secret
+with the same name first finishes the earlier deletion. Values are
 bounded by the existing provider map value limit. `allowed_endpoints` cannot be
 updated. Moving a client to a new token endpoint means creating a new secret,
 and only someone who knows the value can do that.
@@ -348,7 +352,8 @@ Failure classification:
 | `RevealSecret` | bearer, plus the handler check below | workspace admin | `secret:reveal` | yes, every call |
 
 `RevealSecret` fails closed in its handler, whatever the gateway's
-authentication mode:
+authentication mode. The handler checks the principal and workspace role first,
+so a caller who may not reveal cannot learn whether reveal is enabled:
 
 - It is disabled unless gateway configuration sets `enable_secret_reveal =
   true`. Deployments without OCC never expose it.

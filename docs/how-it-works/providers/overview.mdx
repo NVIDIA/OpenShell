@@ -370,6 +370,9 @@ These rules apply:
   `openshell provider refresh inline-secrets` to copy the current value into
   the provider's own refresh material first. It keeps the current grant,
   including a rotated refresh token.
+- If credential storage fails during deletion, `openshell secret list` shows
+  the secret as `deleting` until the gateway finishes the cleanup. Rerun
+  `openshell secret delete` to retry it.
 
 `provider refresh status` reports which secrets a credential references. The
 gateway operator must enable workspace secrets with `enable_workspace_secrets`;
