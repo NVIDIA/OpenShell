@@ -141,7 +141,7 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   `resource.port ==` top-level `when` conjunct, in the shapes policy DNS
   accepts. A glob entry inspects every host it matches, as a YAML wildcard
   endpoint with request rules does. `CedarEngine::l7_endpoints` selects a
-  host's entries with `openshell_policy_primitives::host_pattern`, the matcher YAML
+  host's entries with `openshell_core::host_pattern`, the matcher YAML
   endpoints, endpoint settings, and policy DNS use: the exact entry and every
   glob entry the host matches, whose paths are inspected together (the exact
   entry's declaration of a path takes precedence). Entries that can select

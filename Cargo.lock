@@ -4773,13 +4773,14 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "glob",
+ "ipnet",
  "jsonwebtoken",
  "miette",
  "nix 0.29.0",
  "openshell-crypto",
  "openshell-extension-core",
  "openshell-otel",
- "openshell-policy-primitives",
  "openshell-policy-schema",
  "prost",
  "prost-types",
@@ -5232,8 +5233,8 @@ dependencies = [
  "globset",
  "ipnet",
  "miette",
+ "openshell-core",
  "openshell-policy-cedar-schema",
- "openshell-policy-primitives",
  "serde_json",
  "stacker",
  "thiserror 2.0.20",
@@ -5277,14 +5278,6 @@ dependencies = [
  "miette",
  "serde_json",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "openshell-policy-primitives"
-version = "0.0.0"
-dependencies = [
- "glob",
- "ipnet",
 ]
 
 [[package]]

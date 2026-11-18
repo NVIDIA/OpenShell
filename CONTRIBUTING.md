@@ -397,7 +397,6 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/openshell-policy-cedar-adapter/` | Cedar analysis adapted to policy messages for gateway and runtime composition |
 | `crates/openshell-policy-cedar-runtime/` | Cedar implementation of the shared runtime contracts, selected by supervisor composition |
 | `crates/openshell-policy-runtime-interface/` | Shared policy decisions, request metadata, snapshots, and staged reload contracts; no engine implementations |
-| `crates/openshell-policy-primitives/` | Pure host, path, and IP semantics with no protobuf or transport dependencies |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
