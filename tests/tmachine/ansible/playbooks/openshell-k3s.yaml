@@ -66,7 +66,9 @@
     # address must be the one of the node the tests run on. QEMU user
     # networking gives every boot the same guest address (10.0.2.15), so the
     # value stays valid when the disk is reused.
-    # The node can also list an IPv6 address after it, so take the IPv4 one.
+    # A dual-stack node also lists an IPv6 address, first on an IPv6-first
+    # cluster. Take the IPv4 one: the servers tests start for sandboxes to
+    # reach (tests/support/host-server) listen on IPv4 only.
     - name: Discover the K3s node address
       ansible.builtin.command:
         argv:
@@ -133,6 +135,14 @@
         mode: "0600"
         content: "{{ openshell_k3s_helm_values_overlay | default('{}') }}"
 
+    # An environment adapts the chart to its cluster by writing values to
+    # /etc/openshell-test/helm-values.yaml before the installer runs (for
+    # example playbooks/k3s-ipv6.yaml). They apply last.
+    - name: Check for environment Helm values
+      ansible.builtin.stat:
+        path: /etc/openshell-test/helm-values.yaml
+      register: openshell_k3s_environment_values
+
     - name: Install Agent Sandbox
       ansible.builtin.command:
         argv:
@@ -168,20 +178,19 @@
 
     - name: Install OpenShell Helm chart
       ansible.builtin.command:
-        argv:
-          - /usr/local/bin/helm
-          - install
-          - openshell
-          - /var/lib/openshell/artifacts/helm-chart.tgz
-          - --namespace
-          - openshell
-          - --create-namespace
-          - --values
-          - /var/lib/openshell/artifacts/values.yaml
-          - --values
-          - /var/lib/openshell/artifacts/values-overlay.yaml
-          - --wait
-          - --timeout=5m
+        argv: >-
+          {{
+            [
+              '/usr/local/bin/helm', 'install', 'openshell',
+              '/var/lib/openshell/artifacts/helm-chart.tgz',
+              '--namespace', 'openshell', '--create-namespace',
+              '--values', '/var/lib/openshell/artifacts/values.yaml',
+              '--values', '/var/lib/openshell/artifacts/values-overlay.yaml',
+            ]
+            + (['--values', '/etc/openshell-test/helm-values.yaml']
+               if openshell_k3s_environment_values.stat.exists else [])
+            + ['--wait', '--timeout=5m']
+          }}
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
@@ -196,16 +205,26 @@
           - get
           - service
           - openshell
-          - --output=jsonpath={.spec.clusterIP}:{.spec.ports[?(@.name=="grpc")].port}
+          - --output=jsonpath={.spec.clusterIP} {.spec.ports[?(@.name=="grpc")].port}
       register: k3s_gateway_address
       changed_when: false
 
     # Rejects headless Services (ClusterIP "None") and a missing grpc port.
+    # The ClusterIP is IPv6 on a cluster whose primary family is IPv6.
     - name: Require a gateway Service address
       ansible.builtin.assert:
         that:
-          - k3s_gateway_address.stdout is match('^[0-9.]+:[0-9]+$')
+          - k3s_gateway_address.stdout is match('^([0-9.]+|[0-9a-f:]+) [0-9]+$')
         fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
+
+    - name: Record the gateway Service address
+      ansible.builtin.set_fact:
+        k3s_gateway_ip: "{{ k3s_gateway_address.stdout.split()[0] }}"
+        k3s_gateway_port: "{{ k3s_gateway_address.stdout.split()[1] }}"
+        k3s_gateway_authority: >-
+          {{ ('[' ~ k3s_gateway_address.stdout.split()[0] ~ ']')
+             if ':' in k3s_gateway_address.stdout.split()[0]
+             else k3s_gateway_address.stdout.split()[0] }}:{{ k3s_gateway_address.stdout.split()[1] }}
 
     # Deployment readiness doesn't establish that the controller reconciles
     # Sandboxes. This checks the installed cluster; a booted guest restarts the
@@ -218,6 +237,6 @@
   hosts: all
   gather_facts: false
   vars:
-    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_address.stdout }}"
+    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_authority }}"
   roles:
     - openshell_client

@@ -64,7 +64,7 @@
       ansible.builtin.lineinfile:
         path: /etc/hosts
         regexp: '\sopenshell\.openshell\.svc\.cluster\.local$'
-        line: "{{ k3s_gateway_address.stdout.split(':')[0] }} openshell.openshell.svc.cluster.local"
+        line: "{{ k3s_gateway_ip }} openshell.openshell.svc.cluster.local"
 
     - name: Read chart client TLS Secret
       ansible.builtin.command:
@@ -103,4 +103,4 @@
         apply:
           become: false
       vars:
-        openshell_client_gateway_endpoint: "https://openshell.openshell.svc.cluster.local:{{ k3s_gateway_address.stdout.split(':')[1] }}"
+        openshell_client_gateway_endpoint: "https://openshell.openshell.svc.cluster.local:{{ k3s_gateway_port }}"
