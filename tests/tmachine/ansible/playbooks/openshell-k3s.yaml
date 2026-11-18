@@ -137,11 +137,24 @@
 
     # An environment adapts the chart to its cluster by writing values to
     # /etc/openshell-test/helm-values.yaml before the installer runs (for
-    # example playbooks/k3s-ipv6.yaml). They apply last.
-    - name: Check for environment Helm values
-      ansible.builtin.stat:
-        path: /etc/openshell-test/helm-values.yaml
-      register: openshell_k3s_environment_values
+    # example playbooks/k3s-ipv6.yaml). They apply last. Other environments
+    # get an empty file.
+    - name: Create the test configuration directory
+      ansible.builtin.file:
+        path: /etc/openshell-test
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure environment Helm values exist
+      ansible.builtin.copy:
+        dest: /etc/openshell-test/helm-values.yaml
+        content: "{}\n"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Install Agent Sandbox
       ansible.builtin.command:
@@ -178,19 +191,22 @@
 
     - name: Install OpenShell Helm chart
       ansible.builtin.command:
-        argv: >-
-          {{
-            [
-              '/usr/local/bin/helm', 'install', 'openshell',
-              '/var/lib/openshell/artifacts/helm-chart.tgz',
-              '--namespace', 'openshell', '--create-namespace',
-              '--values', '/var/lib/openshell/artifacts/values.yaml',
-              '--values', '/var/lib/openshell/artifacts/values-overlay.yaml',
-            ]
-            + (['--values', '/etc/openshell-test/helm-values.yaml']
-               if openshell_k3s_environment_values.stat.exists else [])
-            + ['--wait', '--timeout=5m']
-          }}
+        argv:
+          - /usr/local/bin/helm
+          - install
+          - openshell
+          - /var/lib/openshell/artifacts/helm-chart.tgz
+          - --namespace
+          - openshell
+          - --create-namespace
+          - --values
+          - /var/lib/openshell/artifacts/values.yaml
+          - --values
+          - /var/lib/openshell/artifacts/values-overlay.yaml
+          - --values
+          - /etc/openshell-test/helm-values.yaml
+          - --wait
+          - --timeout=5m
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
@@ -217,14 +233,16 @@
           - k3s_gateway_address.stdout is match('^([0-9.]+|[0-9a-f:]+) [0-9]+$')
         fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
 
+    # A URL needs brackets around an IPv6 address, for example
+    # http://[fd00:43::a]:8080; without them the port can't be told apart.
     - name: Record the gateway Service address
+      vars:
+        gateway_ip: "{{ k3s_gateway_address.stdout.split()[0] }}"
+        gateway_port: "{{ k3s_gateway_address.stdout.split()[1] }}"
       ansible.builtin.set_fact:
-        k3s_gateway_ip: "{{ k3s_gateway_address.stdout.split()[0] }}"
-        k3s_gateway_port: "{{ k3s_gateway_address.stdout.split()[1] }}"
-        k3s_gateway_authority: >-
-          {{ ('[' ~ k3s_gateway_address.stdout.split()[0] ~ ']')
-             if ':' in k3s_gateway_address.stdout.split()[0]
-             else k3s_gateway_address.stdout.split()[0] }}:{{ k3s_gateway_address.stdout.split()[1] }}
+        k3s_gateway_ip: "{{ gateway_ip }}"
+        k3s_gateway_port: "{{ gateway_port }}"
+        k3s_gateway_authority: "{{ ('[' ~ gateway_ip ~ ']') if ':' in gateway_ip else gateway_ip }}:{{ gateway_port }}"
 
     # Deployment readiness doesn't establish that the controller reconciles
     # Sandboxes. This checks the installed cluster; a booted guest restarts the
