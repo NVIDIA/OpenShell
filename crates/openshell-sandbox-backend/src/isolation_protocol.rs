@@ -92,13 +92,7 @@ pub fn validate_open(
     let descriptor: SandboxRuntimeDescriptor =
         serde_json::from_slice(&request.driver_descriptor)
             .map_err(|_| tonic::Status::invalid_argument("invalid OpenShell runtime descriptor"))?;
-    if descriptor.boundary_id != config.boundary_id
-        || descriptor.generation != config.generation
-        || descriptor.session_id != config.session_id
-        || descriptor.workload_identity != config.workload_identity
-        || descriptor.resource_claims != config.resource_claims
-        || descriptor.provisioning_evidence != config.provisioning_evidence
-    {
+    if !crate::boundary_protocol::descriptor_matches_config(&descriptor, config) {
         return Err(tonic::Status::permission_denied(
             "driver descriptor does not match provisioned boundary",
         ));

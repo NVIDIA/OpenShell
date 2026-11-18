@@ -352,14 +352,28 @@ impl WireMessage for c::BoundaryConfirmation {
         let identity = required(v.identity)?;
         Ok(Self {
             generation: v.generation,
-            identity: c::ResolvedWorkloadIdentity::new(
-                identity.uid,
-                identity.gid,
-                identity.supplementary_gids,
-                identity.source,
-                identity.resource_digest,
-            )
-            .map_err(invalid)?,
+            // The wire-format conversion must accept the privileged (root-
+            // workload) identity: the boundary reports uid 0 by design in
+            // that mode, and the policy check (mode-gated, in
+            // validate_runtime_coordinates) has already run. Using
+            // new() here would refuse every privileged confirmation at
+            // deserialization.
+            identity: if identity.uid == 0 && identity.gid == 0 {
+                c::ResolvedWorkloadIdentity::new_privileged(
+                    identity.source,
+                    identity.resource_digest,
+                )
+                .map_err(invalid)?
+            } else {
+                c::ResolvedWorkloadIdentity::new(
+                    identity.uid,
+                    identity.gid,
+                    identity.supplementary_gids,
+                    identity.source,
+                    identity.resource_digest,
+                )
+                .map_err(invalid)?
+            },
             session_id: parse(&v.session_id)?,
             resource_claims: v.resource_claims,
             provisioning_evidence_digest: parse(&v.provisioning_evidence_digest)?,
