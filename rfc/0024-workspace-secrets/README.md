@@ -24,8 +24,7 @@ Each secret declares, when it is created, the only token endpoints it may be
 sent to. That set never changes, so no one can redirect a secret to a server
 they control by authoring a profile. Values are write-only through the ordinary
 API. A separate `RevealSecret` RPC, off by default, returns the plaintext value
-to an operator or to an OIDC client that holds a dedicated scope. Every reveal
-is audited. Control-plane services such as OCC use it for the OAuth
+only to an operator authenticated with operator mTLS. Every reveal is audited. Control-plane services such as OCC use it for the OAuth
 authorization-code exchange that happens before any provider exists. Sandbox
 delivery and `GetProviderCredentials` never return workspace secrets.
 
@@ -345,30 +344,26 @@ Failure classification:
 |---|---|---|---|---|
 | `CreateSecret`, `UpdateSecret`, `DeleteSecret` | bearer | workspace admin | `secret:write` | yes, naming the secret |
 | `GetSecret`, `ListSecrets` | bearer | workspace user | `secret:read` | no |
-| `RevealSecret` | bearer, plus the handler check below | workspace admin | `secret:reveal` | yes, every call |
+| `RevealSecret` | operator | platform admin (operator) | none | yes, every call |
 
-`RevealSecret` fails closed in its handler, whatever the gateway's
-authentication mode. The handler checks the principal and workspace role first,
-so a caller who may not reveal cannot learn whether reveal is enabled:
+`RevealSecret` uses the same `auth_mode: "operator"` annotation as
+`GetProviderCredentials`, so the authorization middleware rejects every
+non-operator principal before the handler runs. The handler also calls the
+shared operator guard, which requires a verified mTLS certificate with the
+`operator` role, before it reads gateway configuration. A caller who may not
+reveal therefore cannot learn whether reveal is enabled:
 
 - It is disabled unless gateway configuration sets `enable_secret_reveal =
   true`. Deployments without OCC never expose it.
-- `Principal::Operator` (operator mTLS) is accepted. `bearer` methods already
-  admit operators with platform-admin rights, and the audit path already
-  records operator principals. Non-OIDC OCC deployments use this path.
-- `Principal::User` is accepted only when OIDC is configured with scope
-  enforcement enabled, the token carries the literal `secret:reveal` scope, and
-  the caller is a workspace admin. `openshell:all` does not satisfy the check.
-  Unscoped OIDC gateways, user mTLS certificates, and local unauthenticated
-  development modes are rejected. Without this check, middleware skips scope
-  enforcement when `scopes_claim` is empty, and an empty `admin_role` grants
-  platform admin.
-- Every other principal is rejected.
+- Only `Principal::Operator` is accepted, which requires
+  `mtls_auth.operator_enabled`. No user identity can reveal, whatever its roles
+  or scopes: OIDC tokens, including `openshell:all`, user mTLS certificates, and
+  local development identities are all rejected. This keeps the plaintext path
+  off the OIDC authorization model, whose scope and role checks can be relaxed
+  by gateway configuration.
 
-The handler needs the gateway's scope-enforcement setting, which lives in the
-authorization router today, so `ServerState` must expose it. The audit catalog
-test currently requires the catalog to equal the set of `:write`-scoped RPCs. It
-must allow this one audited read.
+The audit catalog test currently requires the catalog to equal the set of
+`:write`-scoped RPCs. It must allow this one audited read.
 
 Workspace secrets stay out of every runtime export path by construction, the
 same way refresh material does today. Sandbox snapshots and
@@ -554,11 +549,10 @@ activation. Reveal has its own default-off setting.
    - rollback: rotate a user's refresh token, disable `enable_workspace_secrets`, inline
      the binding, delete the secret, and verify the provider mints on the
      previous release
-3. **Reveal.** Add `RevealSecret`, `enable_secret_reveal`, the `secret:reveal`
-   scope, the fail-closed handler check, and audited reads. Test denial for
-   `openshell:all`, `secret:read`, non-admin users, unscoped OIDC, user mTLS,
-   local development modes, and the disabled default. Test acceptance for an
-   operator and a scoped OIDC admin.
+3. **Reveal.** Add operator-only `RevealSecret`, `enable_secret_reveal`, and
+   audited reads. Test denial for OIDC users with any scope, user mTLS, local
+   development identities, and the disabled default, and acceptance for an
+   operator.
 4. **Docs and SDKs.** Document workspace secrets, `--material-secret`, and the
    activation, rollback, and reveal settings. Update
    `docs/how-it-works/gateways/configuration.mdx` for `enable_workspace_secrets` and
@@ -577,10 +571,9 @@ activation. Reveal has its own default-off setting.
 ## Risks
 
 - **A new plaintext export path.** `RevealSecret` returns values that were
-  previously gateway-only. Mitigations: off by default, fail-closed principal
-  checks, a scope outside `openshell:all`, workspace admin, an audit record for
-  every call, and no CLI command. A leaked OCC credential still exposes every
-  client secret in its workspace.
+  previously gateway-only. Mitigations: off by default, operator mTLS only, an
+  audit record for every call, and no CLI command. A leaked operator
+  certificate still exposes every workspace secret on the gateway.
 - **Endpoint constraints are brittle.** An authorization server that moves its
   token endpoint breaks every dependent provider until someone creates a new
   secret and reconfigures. That is deliberate, because a mutable allowlist would
@@ -594,9 +587,11 @@ activation. Reveal has its own default-off setting.
   secrets and annotation bindings to versioned references later. Mitigation: the
   owner kind and ID-based binding match RFC 0023's model, so the migration
   changes storage, not the public API.
-- **Authorization special case.** `RevealSecret` checks the principal in its
-  handler instead of relying only on descriptor-driven middleware. Mitigation:
-  the check is one function, and tests cover every authentication mode.
+- **Operator credentials are broad.** An operator certificate is gateway-wide,
+  so an OCC that reveals one workspace's secrets can reveal every workspace's.
+  Mitigation: reveal stays off unless needed, and every call is audited with
+  the workspace and secret named. A workspace-scoped control-plane identity is
+  an open question.
 - **Activation and rollback burden.** Operators must drain older replicas
   before enabling the feature, and must inline references and delete secrets
   before rolling back. Mitigation: activation reuses the sandbox-update pattern
@@ -642,6 +637,16 @@ admin granted it could still redirect a secret. Restricting secrets to platform
 profiles blocks OCE, which authors workspace profiles. Binding the value to the
 endpoints its owner approved closes the path for every caller.
 
+### Allow OIDC clients with a dedicated scope
+
+`RevealSecret` could also accept an OIDC workspace admin whose token carries a
+`secret:reveal` scope that `openshell:all` does not imply. That would let a
+workspace-scoped OCC identity reveal only its own workspace's secrets. It was
+left out to keep the first version narrow: the handler would have to fail
+closed when scope enforcement is disabled, when the admin role is unset, and for
+local development identities, and the scope would be the first exception to
+`openshell:all`. It can be added later without changing the RPC.
+
 ### Typed OAuth client registration
 
 A resource holding `client_id`, `client_secret`, and the token endpoint
@@ -675,6 +680,8 @@ also serves non-OAuth minting material, such as an AWS source key.
   authorization servers need path templates, such as per-tenant token URLs?
 - Should `enable_secret_reveal` be a single gateway setting, or a
   per-workspace policy that platform admins set?
+- Should `RevealSecret` later accept a workspace-scoped OIDC control-plane
+  identity, as described under Alternatives?
 - Should a platform admin be able to correct `allowed_endpoints` in place, for
   example after an authorization server migration, given that platform admins
   are already trusted with operator export?

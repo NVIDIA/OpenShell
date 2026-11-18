@@ -307,7 +307,7 @@ enable_sandbox_updates = false
 
 # Activate only after every gateway that can serve traffic supports workspace secrets.
 enable_workspace_secrets = false
-# Let operators and OIDC tokens with the secret:reveal scope read secret values.
+# Let mTLS operators read workspace secret values.
 enable_secret_reveal = false
 
 # Connection ceiling for the gateway's database pool. Omit to use the backend
@@ -718,9 +718,9 @@ endpoint.
 
 `[openshell.gateway] enable_secret_reveal` defaults to `false`. When `true`,
 the `RevealSecret` RPC returns secret values to operators authenticated with
-operator mTLS, and to OIDC workspace admins whose token carries the literal
-`secret:reveal` scope on a gateway with `scopes_claim` set. `openshell:all`
-does not grant it, and the CLI has no reveal command. Every reveal is audited.
+an operator mTLS certificate, which requires `mtls_auth.operator_enabled`. No
+user identity can call it, whatever its roles or scopes, and the CLI has no
+reveal command. Every reveal is audited.
 Enable it only for a control-plane service that performs its own OAuth
 authorization-code exchange. The equivalent flag and environment variable are
 `--enable-secret-reveal true` and `OPENSHELL_ENABLE_SECRET_REVEAL=true`.
