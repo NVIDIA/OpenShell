@@ -311,9 +311,8 @@ The normal Rust workspace build, check, lint, and test tasks enable the
 `--features experimental` to select it in direct Cargo builds; Cargo's `dev` profile
 does not enable it automatically. Prerelease and stable builds leave it off.
 
-`mise run rust:verify:cedar-off` checks the default gateway and supervisor
-package graphs and builds, YAML policy tests, and Cedar rejection tests without
-`experimental`. Run it when changing policy backend selection or feature wiring.
+CI checks the default gateway and supervisor package graphs and builds, YAML
+policy tests, and Cedar rejection tests without `experimental`.
 Workspace builds select the Cedar runtime member and unify its shared policy
 features, so use per-package checks to verify that Cedar is excluded.
 

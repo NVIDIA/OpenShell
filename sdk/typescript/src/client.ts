@@ -1188,7 +1188,6 @@ export class SandboxClient {
    * Advanced escape hatch: a generated client for every gateway RPC, including
    * surface the curated methods do not wrap yet. Request/response types are the
    * generated wire messages (import them from '@nvidia/openshell-sdk/raw').
-   * Call requireCedarPolicySupport before sending Cedar through this escape hatch.
    */
   readonly raw: Client<typeof OpenShell>;
   /** The shared Connect transport, for building extra clients over the same connection. */
@@ -1211,17 +1210,6 @@ export class SandboxClient {
     return new SandboxClient(buildTransport(options));
   }
 
-  /** Check before sending Cedar through either the curated or raw client. */
-  async requireCedarPolicySupport(policy?: { cedarPolicy?: { source?: string } }): Promise<void> {
-    if (!policy?.cedarPolicy) return;
-    const info = await this.grpc.health({});
-    if (!info.supportedCapabilities.includes('openshell.policy.cedar.v1'))
-      throw new SdkError(
-        'invalid_config',
-        'gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor',
-      );
-  }
-
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
       // Curated fields build the base spec; rawSpec then shallow-overrides at
@@ -1240,7 +1228,6 @@ export class SandboxClient {
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 
-      await this.requireCedarPolicySupport(specInit.policy);
       const resp = await this.grpc.createSandbox({
         workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
@@ -1262,7 +1249,6 @@ export class SandboxClient {
   async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
     if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
     try {
-      await this.requireCedarPolicySupport(spec.policy);
       const resp = await this.grpc.createSandbox({
         workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
@@ -2008,10 +1994,7 @@ export class SandboxClient {
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {
     try {
       await this.get(name, options);
-      const resp = await this.grpc.getSandboxConfig(
-        { ...namedTarget(name, options), supportedCapabilities: ['openshell.policy.cedar.v1'] },
-        requestCallOptions(options),
-      );
+      const resp = await this.grpc.getSandboxConfig({ ...namedTarget(name, options) }, requestCallOptions(options));
       return sandboxConfig(resp);
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -2028,7 +2011,6 @@ export class SandboxClient {
     options?: SetPolicyOptions | null,
   ): Promise<UpdateConfigResult> {
     try {
-      await this.requireCedarPolicySupport(policy);
       const resp = await this.grpc.updateConfig({
         ...sandboxTarget(name, options),
         policy,

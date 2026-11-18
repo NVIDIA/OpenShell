@@ -894,13 +894,11 @@ async fn fetch_sandbox_detail(app: &mut App) {
     // Step 2: Fetch the current live policy (includes updates since creation).
     if found {
         let policy_req = openshell_core::proto::GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
             name: sandbox_name,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 app.selected_sandbox_workspace(),
             )),
+            ..Default::default()
         };
 
         match tokio::time::timeout(
@@ -2903,11 +2901,9 @@ async fn refresh_sandbox_policy(app: &mut App) {
     let workspace = app.selected_sandbox_workspace();
 
     let policy_req = openshell_core::proto::GetSandboxConfigRequest {
-        supported_capabilities: vec![
-            openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-        ],
         name: sandbox_name,
         workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
+        ..Default::default()
     };
 
     match tokio::time::timeout(

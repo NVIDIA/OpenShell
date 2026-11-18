@@ -2540,17 +2540,26 @@ describe('raw escape hatch', () => {
   });
 });
 
-describe('Cedar gateway compatibility', () => {
-  it.each([false, true])('checks support before every Cedar mutation (support=%s)', async (supported) => {
+describe('Cedar gateway errors', () => {
+  it.each([false, true])('uses normal RPC errors without preflight (support=%s)', async (supported) => {
     let mutations = 0;
+    let healthRequests = 0;
+    const mutate = () => {
+      mutations++;
+      if (!supported)
+        throw new ConnectError('this gateway was built without Cedar policy support', Code.FailedPrecondition);
+    };
     const c = client({
-      health: () => ({ supportedCapabilities: supported ? ['openshell.policy.cedar.v1'] : [] }),
+      health: () => {
+        healthRequests++;
+        return {};
+      },
       createSandbox: () => {
-        mutations++;
+        mutate();
         return readySandbox('cedar', 'id');
       },
       updateConfig: () => {
-        mutations++;
+        mutate();
         return {};
       },
     });
@@ -2563,19 +2572,9 @@ describe('Cedar gateway compatibility', () => {
     ];
     for (const call of calls) {
       if (supported) await call();
-      else await expect(call()).rejects.toThrow('Cedar policy support');
+      else await expect(call()).rejects.toThrow('this gateway was built without Cedar policy support');
     }
-    expect(mutations).toBe(supported ? calls.length : 0);
+    expect(mutations).toBe(calls.length);
+    expect(healthRequests).toBe(0);
   });
-});
-
-it('advertises Cedar support when reading sandbox-authenticated configuration', async () => {
-  const c = client({
-    getSandbox: () => readySandbox('cedar', 'id'),
-    getSandboxConfig: (request) => {
-      expect(request.supportedCapabilities).toEqual(['openshell.policy.cedar.v1']);
-      return { policy: { cedarPolicy: { source: 'permit(principal, action, resource);' } } };
-    },
-  });
-  expect((await c.getConfig('cedar')).policy?.cedarPolicy?.source).toContain('permit');
 });
