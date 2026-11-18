@@ -215,8 +215,36 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 
 Gateway-mediated sandbox service routing is disabled by default in this Kubernetes
 chart to avoid an unintended alternate application access path. Control-plane API
-access is unchanged. Configure the supervisor app listener and external ingress
-separately, or explicitly enable gateway forwarding:
+access is unchanged.
+
+For service ingress directly through supervisors, enable
+`[openshell.supervisor.app_listener].enabled` and pair it with an ingress solution
+that routes requests to the app listener on the supervisor owning each sandbox:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    service_routing_enabled: false
+  openshell.supervisor.app_listener:
+    enabled: true
+    port: 9443
+    domain: services.example.com
+    public_url: https://services.example.com
+  openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+    tls_secret_name: openshell-app-tls
+```
+
+Provision `openshell-app-tls` with a certificate for `*.services.example.com`.
+Pair the listener with a TLS-passthrough proxy or a compatible Kubernetes
+ingress/Gateway API integration. The integration consumes service discovery to
+map each advertised hostname to the current owning supervisor's IP and configured
+app-listener port, preserving the application hostname as Host and TLS SNI.
+Configure DNS and NetworkPolicy for that path. Enabling the listener alone does
+not provision DNS or external ingress routes, and the chart does not enable it
+automatically.
+
+To use gateway-mediated service routing instead, explicitly enable forwarding;
+that path does not require the app listener:
 
 ```yaml
 gatewayConfig:

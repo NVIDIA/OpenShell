@@ -632,10 +632,19 @@ gatewayConfig:
     enable_gateway_service_routing: false
 ```
 
-For Kubernetes application ingress, enable and configure the supervisor app
-listener and provision an ingress integration separately. The chart does not
-enable either automatically. If both routing modes are disabled, startup logs
-warn that sandbox service routing is disabled.
+For Kubernetes service ingress directly through supervisors, set
+`[openshell.supervisor.app_listener].enabled = true` and configure the
+[supervisor application listener](#supervisor-application-listener). Pair it with
+an ingress solution, such as a TLS-passthrough proxy or a compatible Kubernetes
+ingress/Gateway API integration, that consumes discovery and routes each
+advertised hostname to the current owning supervisor's app-listener IP and port.
+Preserve the application hostname as Host and TLS SNI. Enabling the listener
+alone does not provision DNS or external ingress routes; the chart does not
+enable either the listener or the ingress integration automatically.
+
+If both routing modes are disabled, startup logs warn that sandbox service
+routing is disabled. Gateway-mediated forwarding does not require the app
+listener.
 
 When upgrading a Helm installation that uses gateway service URLs, explicitly
 set `enable_gateway_service_routing: true` in the canonical table above before the
