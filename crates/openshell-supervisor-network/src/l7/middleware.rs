@@ -1155,6 +1155,9 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
                 admission,
             )
             .await?;
+        if outcome.allowed && outcome.applied.iter().any(|invocation| invocation.failed) {
+            crate::l7::correlation::note_current_fail_open();
+        }
         crate::telemetry::emit_decision(middleware_events(ctx, &req, &outcome), None);
         return Ok(if outcome.allowed {
             MiddlewareApplyResult::Allowed(req)
@@ -1206,6 +1209,9 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
             Some(admission),
         )
         .await?;
+    if outcome.allowed && outcome.applied.iter().any(|invocation| invocation.failed) {
+        crate::l7::correlation::note_current_fail_open();
+    }
     crate::telemetry::emit_decision(middleware_events(ctx, &req, &outcome), None);
     if !outcome.allowed {
         return Ok(MiddlewareApplyResult::Denied {
@@ -1791,6 +1797,9 @@ pub(super) fn request_middleware_events(
     diagnostics: &HttpStageDiagnostics,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let applied = diagnostics.applied();
+    if allowed && applied.iter().any(|invocation| invocation.failed) {
+        crate::l7::correlation::note_current_fail_open();
+    }
     let req = crate::l7::provider::L7Request {
         action: action.to_string(),
         target: target.to_string(),
@@ -2079,6 +2088,7 @@ pub(super) fn resolve_unbuffered_body(
         .iter()
         .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
     if recoverable && all_fail_open {
+        crate::l7::correlation::note_current_fail_open();
         emit_middleware_body_unavailable(ctx, false);
         return MiddlewareApplyResult::Allowed(req);
     }

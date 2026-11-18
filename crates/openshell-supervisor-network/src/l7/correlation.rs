@@ -83,6 +83,12 @@ pub fn record_current_failure(outcome: HttpOutcome, reason: &'static str) {
     }
 }
 
+pub(super) fn note_current_fail_open() {
+    if let Some(scope) = current_request() {
+        scope.note_admission(crate::metrics::Outcome::FailOpen);
+    }
+}
+
 fn enrich_request(event: &mut openshell_ocsf::BaseEventData) {
     let Some(scope) = current_request().filter(|scope| scope.inspected) else {
         return;
@@ -96,6 +102,19 @@ fn enrich_request(event: &mut openshell_ocsf::BaseEventData) {
             .entry("http_event_kind")
             .or_insert_with(|| event_kind.into());
         fields.insert("request_sequence".into(), sequence.into());
+        let finished_inspection = scope
+            .trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(RequestTrace::finished_inspection);
+        if let Some((inspection, result, outcome)) = finished_inspection {
+            fields.insert("egress_inspection_type".into(), inspection.label().into());
+            fields.insert("egress_result".into(), result.label().into());
+            if let Some(outcome) = outcome {
+                fields.insert("egress_outcome".into(), outcome.label().into());
+            }
+        }
     }
 }
 
@@ -137,6 +156,17 @@ impl RequestScope {
             .map_or_else(tracing::Span::none, RequestTrace::span)
     }
 
+    fn note_admission(&self, outcome: crate::metrics::Outcome) {
+        if let Some(trace) = self
+            .trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            trace.note_admission(outcome);
+        }
+    }
+
     fn record_failure(&self, outcome: HttpOutcome, reason: &'static str) {
         if let Some(trace) = self
             .trace
@@ -144,6 +174,9 @@ impl RequestScope {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_mut()
         {
+            if reason == "policy_reloaded" {
+                trace.finish_inspection(crate::metrics::ResultLabel::Cancelled);
+            }
             trace.record_outcome(outcome);
             trace.record_failure_reason(reason);
         }
@@ -257,7 +290,8 @@ impl RequestCorrelation {
     }
 
     fn build(method: &str, raw_header: &[u8], ctx: &L7EvalContext, request_id: String) -> Self {
-        let trace = RequestTrace::new(&request_id, method, &ctx.host, ctx.port, raw_header);
+        let mut trace = RequestTrace::new(&request_id, method, &ctx.host, ctx.port, raw_header);
+        trace.start_inspection(&ctx.policy_name);
         Self::install(RequestScope {
             request_id,
             inspected: true,
@@ -295,6 +329,7 @@ impl RequestCorrelation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_mut()
         {
+            trace.finish_inspection(crate::metrics::ResultLabel::Error);
             trace.record_unclassified_failure();
         }
         let captured = CapturedRequestError {
@@ -312,6 +347,50 @@ impl RequestCorrelation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or_else(tracing::Span::none, |trace| trace.stage(stage))
+    }
+
+    pub(crate) fn select_inspector(&self, protocol: crate::l7::L7Protocol, policy: &str) {
+        if let Some(trace) = self
+            .scope
+            .trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            trace.select_inspector(
+                crate::metrics::InspectionType::from_protocol(protocol),
+                policy,
+            );
+        }
+    }
+
+    pub(crate) fn note_admission(&self, outcome: crate::metrics::Outcome) {
+        self.scope.note_admission(outcome);
+    }
+
+    pub(crate) fn inspection_timer(&self, update: impl FnOnce(&mut crate::metrics::Timer)) {
+        if let Some(timer) = self
+            .scope
+            .trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(RequestTrace::inspection_timer)
+        {
+            update(timer);
+        }
+    }
+
+    pub(crate) fn finish_inspection(&self, result: crate::metrics::ResultLabel) {
+        if let Some(trace) = self
+            .scope
+            .trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            trace.finish_inspection(result);
+        }
     }
 
     /// Record a stage's actual result without exporting its potentially
@@ -430,6 +509,14 @@ impl RequestCorrelation {
         outcome: HttpOutcome,
         reason: Option<&'static str>,
     ) {
+        if matches!(outcome, HttpOutcome::PlatformError) {
+            let result = if matches!(status, 408 | 504) {
+                crate::metrics::ResultLabel::Timeout
+            } else {
+                crate::metrics::ResultLabel::Error
+            };
+            self.finish_inspection(result);
+        }
         self.record_outcome(outcome);
         self.record_response_status(status);
         if let Some(reason) = reason {

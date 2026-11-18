@@ -17,7 +17,7 @@ use openshell_sandbox_backend::test_support as rpc_test;
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::correlation::{HttpOutcome, RequestStage};
 use crate::l7::tls::ProxyTlsState;
-use crate::metrics::{InspectionType, Outcome, Scope};
+use crate::metrics::{ActiveConnection, InspectionType, Outcome, ResultLabel, Scope};
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(test)]
 use crate::policy_dns::SocketTrustedResolver;
@@ -2477,6 +2477,7 @@ where
         correlation.record_rejection(403, HttpOutcome::Denied, None);
         correlation.emit(event);
     } else {
+        decision.record_admission(Scope::Request, Outcome::Deny, InspectionType::Http);
         crate::telemetry::emit_decision([event], Some(connect_span));
     }
 
@@ -5859,6 +5860,7 @@ async fn handle_forward_proxy_inner(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
+            decision.record_admission(Scope::Request, Outcome::Deny, InspectionType::Http);
             crate::telemetry::emit_decision(
                 [build_forward_policy_deny_ocsf_event(
                     workload_addr,
@@ -6156,6 +6158,7 @@ async fn handle_forward_proxy_inner(
             .await?;
             return Ok(());
         };
+        correlation.select_inspector(l7_config.config.protocol, &l7_ctx.policy_name);
         endpoint_observer = crate::l7::EndpointObserver::begin_captured(
             l7_ctx.endpoint_observation_tx.as_ref(),
             &l7_config.config,
@@ -6433,12 +6436,12 @@ async fn handle_forward_proxy_inner(
             |reason| (false, reason),
         );
 
-        let decision_str = match (allowed, l7_config.config.enforcement) {
-            (_, _) if force_deny => "deny",
-            (true, _) => "allow",
-            (false, crate::l7::EnforcementMode::Audit) => "audit",
-            (false, crate::l7::EnforcementMode::Enforce) => "deny",
-        };
+        let admission = Outcome::policy(
+            allowed,
+            force_deny || l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce,
+        );
+        correlation.note_admission(admission);
+        let decision_str = admission.label();
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -6586,6 +6589,7 @@ async fn handle_forward_proxy_inner(
     } else {
         egress::resolve_span(&connect_span)
     };
+    correlation.inspection_timer(crate::metrics::Timer::pause);
     let resolved = validate_destination(DestinationRequest {
         host: &raw_host,
         port,
@@ -6594,6 +6598,7 @@ async fn handle_forward_proxy_inner(
     })
     .instrument(resolve_span.clone())
     .await;
+    correlation.inspection_timer(crate::metrics::Timer::resume);
     if inspected {
         if resolved.is_err() {
             egress::mark_error(&resolve_span);
@@ -7153,7 +7158,11 @@ async fn handle_forward_proxy_inner(
     } else {
         egress::dial_span(&connect_span)
     };
-    let dial_result = connector.connect().instrument(dial_span.clone()).await;
+    correlation.inspection_timer(crate::metrics::Timer::pause);
+    let dial_result = crate::metrics::connect(crate::metrics::Route::Direct, connector.connect())
+        .instrument(dial_span.clone())
+        .await;
+    correlation.inspection_timer(crate::metrics::Timer::resume);
     let mut upstream = match dial_result {
         Ok(s) => {
             if inspected {
@@ -7164,6 +7173,7 @@ async fn handle_forward_proxy_inner(
         Err(e) => {
             egress::mark_error(&dial_span);
             if inspected {
+                correlation.finish_inspection(ResultLabel::from_io_error(&e));
                 dial_span.record(
                     "openshell.request.failure_reason",
                     "upstream_connect_failed",
@@ -7254,6 +7264,15 @@ async fn handle_forward_proxy_inner(
     let signing_region = forward_upgrade_config
         .as_ref()
         .map_or("", |config| config.signing_region.as_str());
+    let inspection = forward_upgrade_config
+        .as_ref()
+        .map_or(InspectionType::Http, |config| {
+            InspectionType::from_protocol(config.protocol)
+        });
+    let _connection = ActiveConnection::new(inspection);
+    if !inspected {
+        decision.record_admission(Scope::Request, Outcome::Allow, InspectionType::Http);
+    }
     let outcome_result = relay_rewritten_forward_request(
         method,
         &upstream_target,

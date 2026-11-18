@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 use opentelemetry::{Context, KeyValue};
@@ -31,12 +31,16 @@ pub fn install(meter: &Meter) {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Scope {
     Connection,
+    Request,
+    Message,
 }
 
 impl Scope {
     fn label(self) -> &'static str {
         match self {
             Self::Connection => "connection",
+            Self::Request => "request",
+            Self::Message => "message",
         }
     }
 }
@@ -94,6 +98,7 @@ impl InspectionType {
 pub(crate) enum Outcome {
     Allow,
     Deny,
+    Audit,
     FailOpen,
 }
 
@@ -102,7 +107,16 @@ impl Outcome {
         match self {
             Self::Allow => "allow",
             Self::Deny => "deny",
+            Self::Audit => "audit",
             Self::FailOpen => "fail_open",
+        }
+    }
+
+    pub(crate) fn policy(allowed: bool, enforce: bool) -> Self {
+        match (allowed, enforce) {
+            (true, _) => Self::Allow,
+            (false, true) => Self::Deny,
+            (false, false) => Self::Audit,
         }
     }
 }
@@ -166,6 +180,7 @@ impl<'a> From<Option<&'a str>> for Policy<'a> {
 struct Metrics {
     decisions: Counter<u64>,
     policy_evaluation: Histogram<f64>,
+    request_inspection: Histogram<f64>,
     upstream_connect: Histogram<f64>,
     policy_names: Mutex<HashSet<Arc<str>>>,
     connections: Arc<[AtomicU64; InspectionType::ALL.len()]>,
@@ -205,6 +220,10 @@ impl Metrics {
             policy_evaluation: histogram(
                 "openshell_supervisor_policy_evaluation_duration_seconds",
                 "Time spent evaluating egress policy.",
+            ),
+            request_inspection: histogram(
+                "openshell_supervisor_request_inspection_duration_seconds",
+                "Time spent inspecting a request or message before forwarding.",
             ),
             upstream_connect: histogram(
                 "openshell_supervisor_upstream_connect_duration_seconds",
@@ -292,6 +311,7 @@ impl Drop for ActiveConnection {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Stage {
     PolicyEvaluation(Scope),
+    Inspection(Scope, InspectionType),
     UpstreamConnect(Route),
 }
 
@@ -330,6 +350,8 @@ pub(crate) fn evaluate<T, E>(
 pub(crate) struct Timer {
     stage: Stage,
     start: Option<(Instant, Context)>,
+    pause: Option<Instant>,
+    excluded: Duration,
 }
 
 impl Timer {
@@ -337,6 +359,8 @@ impl Timer {
         Self {
             stage,
             start: METRICS.get().map(|_| (Instant::now(), Context::current())),
+            pause: None,
+            excluded: Duration::ZERO,
         }
     }
 
@@ -344,11 +368,30 @@ impl Timer {
         self.record(result);
     }
 
+    pub(crate) fn set_stage(&mut self, stage: Stage) {
+        self.stage = stage;
+    }
+
+    pub(crate) fn pause(&mut self) {
+        if self.start.is_some() {
+            self.pause = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn resume(&mut self) {
+        if let Some(paused) = self.pause.take() {
+            self.excluded += paused.elapsed();
+        }
+    }
+
     fn record(&mut self, result: ResultLabel) {
         let (Some(metrics), Some((started, context))) = (METRICS.get(), self.start.take()) else {
             return;
         };
-        let seconds = started.elapsed().as_secs_f64();
+        let ended = self.pause.unwrap_or_else(Instant::now);
+        let seconds = (ended - started)
+            .saturating_sub(self.excluded)
+            .as_secs_f64();
         let _active_context = context.attach();
         let result = KeyValue::new("result", result.label());
         match self.stage {
@@ -357,6 +400,14 @@ impl Timer {
                     .policy_evaluation
                     .record(seconds, &[KeyValue::new("scope", scope.label()), result]);
             }
+            Stage::Inspection(scope, inspection) => metrics.request_inspection.record(
+                seconds,
+                &[
+                    KeyValue::new("scope", scope.label()),
+                    KeyValue::new("inspection_type", inspection.label()),
+                    result,
+                ],
+            ),
             Stage::UpstreamConnect(route) => {
                 metrics
                     .upstream_connect
@@ -409,6 +460,8 @@ mod tests {
 
         let connection = ActiveConnection::new(InspectionType::Unknown);
         Timer::new(Stage::PolicyEvaluation(Scope::Connection)).finish(ResultLabel::Deny);
+        Timer::new(Stage::Inspection(Scope::Request, InspectionType::Rest))
+            .finish(ResultLabel::Success);
         drop(Timer::new(Stage::UpstreamConnect(Route::Proxy)));
         for kind in [
             std::io::ErrorKind::PermissionDenied,
@@ -436,6 +489,10 @@ mod tests {
             (
                 "openshell_supervisor_policy_evaluation_duration_seconds",
                 "deny",
+            ),
+            (
+                "openshell_supervisor_request_inspection_duration_seconds",
+                "success",
             ),
             (
                 "openshell_supervisor_upstream_connect_duration_seconds",
