@@ -5200,6 +5200,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "miette",
  "nix 0.29.0",
  "notify",

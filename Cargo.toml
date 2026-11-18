@@ -79,6 +79,7 @@ tracing-opentelemetry = { version = "0.34", default-features = false, features =
 
 # Metrics
 metrics = "0.24"
+metrics-util = { version = "0.20", default-features = false }
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 
 # Unix/Process

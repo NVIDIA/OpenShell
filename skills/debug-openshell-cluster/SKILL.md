@@ -1640,6 +1640,7 @@ credential failures.
 
 | Symptom | Likely cause | Check |
 |---|---|---|
+| Collector receives no gateway metrics | OTLP metric export is off, or its collector cannot accept metrics | Set `enabled = true` in `[openshell.gateway.otlp.metrics]`, inspect `metrics_endpoint` in the gateway's `OTLP exporting enabled` log, and check exporter errors. Metrics use their table's collector, or inherit the shared collector when no endpoint is set; the Prometheus listener is configured independently. See [OTLP metrics](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#otlp-metrics). |
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Probes get `connection refused` on an IPv6 cluster | Listeners bind `0.0.0.0` by default | Set `gateway.listenAddress=::` and `supervisor.listenAddress=::` |
 | Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable endpoint or one that does not speak the table's `protocol`, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint` and `ocsf_protocol`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |

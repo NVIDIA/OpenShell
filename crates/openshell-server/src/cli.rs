@@ -922,8 +922,15 @@ async fn run_from_args(
         &prepared.compute_driver,
         &prepared.config.compute_driver_endpoints,
     );
-    let (otlp_export, otlp_error) =
+    let (mut otlp_export, otlp_error) =
         crate::otel_tracing::OtlpExport::start(otlp_config, gateway_resource);
+    let (metrics_recorder, metrics_error) = match (otlp_export.as_mut(), otlp_config) {
+        (Some(export), Some(config)) => match export.start_metrics(config, gateway_resource) {
+            Ok(recorder) => (recorder, None),
+            Err(error) => (None, Some(error)),
+        },
+        _ => (None, None),
+    };
     let (tracing_handle, driver_otlp_error) = crate::tracing_setup::install(
         &EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
@@ -990,6 +997,9 @@ async fn run_from_args(
     if has_oidc {
         info!("OIDC authentication enabled");
     }
+    if let Some(error) = metrics_error {
+        error!(%error, "OTLP metrics could not be started; continuing without metric export");
+    }
     if let Some(err) = otlp_error.as_ref().or(driver_otlp_error.as_ref()) {
         error!(
             error = %err,
@@ -1005,6 +1015,7 @@ async fn run_from_args(
             ocsf_protocol = otlp.ocsf_protocol().map(tracing::field::display),
             agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
             agent_protocol = otlp.agent_protocol().map(tracing::field::display),
+            metrics_endpoint = otlp.metrics_endpoint().map(tracing::field::display),
             "OTLP exporting enabled"
         );
     }
@@ -1014,7 +1025,13 @@ async fn run_from_args(
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    let result = Box::pin(run_server(prepared, tracing_log_bus, compute_drivers)).await;
+    let result = Box::pin(run_server(
+        prepared,
+        tracing_log_bus,
+        compute_drivers,
+        metrics_recorder,
+    ))
+    .await;
 
     tracing_handle.shutdown();
 

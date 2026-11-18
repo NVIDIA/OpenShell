@@ -72,7 +72,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
-# OpenTelemetry (OTLP trace and OCSF log export, opt-in via [openshell.gateway.otlp])
+# OpenTelemetry (OTLP export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -80,6 +80,7 @@ tracing-opentelemetry = { workspace = true }
 # Metrics
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+metrics-util = { workspace = true, features = ["registry"] }
 
 # Utilities
 base64 = { workspace = true }
