@@ -51,10 +51,10 @@ helm upgrade openshell \
   --namespace openshell \
   --set 'gatewayConfig.openshell\.gateway\.oidc.issuer=https://your-idp.example.com/realms/openshell' \
   --set 'gatewayConfig.openshell\.gateway\.oidc.audience=openshell-cli' \
-  --set server.tls.clientCaSecretName=""
+  --set gateway.tls.clientCaSecretName=""
 ```
 
-Client certificates are optional at the TLS handshake, so OIDC callers can connect without them. Set `server.tls.clientCaSecretName=""` to disable client-certificate verification entirely. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
+Client certificates are optional at the TLS handshake, so OIDC callers can connect without them. Set `gateway.tls.clientCaSecretName=""` to disable client-certificate verification entirely. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
 
 The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
 
@@ -63,7 +63,7 @@ The `audience` value must match the client ID configured in your identity provid
 | Value | Default | Purpose |
 |---|---|---|
 | `gatewayConfig.openshell.gateway.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
-| `server.oidc.caConfigMapName` | `""` | ConfigMap containing the private issuer CA in `ca.crt`; it augments platform roots for OIDC requests only. |
+| `gateway.oidc.caConfigMapName` | `""` | ConfigMap containing the private issuer CA in `ca.crt`; it augments platform roots for OIDC requests only. |
 | `gatewayConfig.openshell.gateway.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
 | `gatewayConfig.openshell.gateway.oidc.jwks_ttl_secs` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
 | `gatewayConfig.openshell.gateway.oidc.roles_claim` | `realm_access.roles` | Dot-separated path to the roles array in JWT claims. |
@@ -74,7 +74,7 @@ The `audience` value must match the client ID configured in your identity provid
 The issuer must use HTTPS. The gateway rejects discovery and JWKS redirects,
 limits response sizes, requires a JSON media type, and rejects a `jwks_uri` on
 a different origin unless that origin appears in `jwks_allowed_origins`. Use
-`server.oidc.caConfigMapName` for issuers signed by a private CA. The mounted
+`gateway.oidc.caConfigMapName` for issuers signed by a private CA. The mounted
 CA augments platform roots for OIDC requests only; unrelated HTTPS clients
 continue to trust public services.
 
@@ -97,7 +97,7 @@ helm upgrade openshell \
   --namespace openshell \
   --set 'gatewayConfig.openshell\.gateway\.oidc.issuer=https://your-idp.example.com/realms/openshell' \
   --set 'gatewayConfig.openshell\.gateway\.oidc.audience=openshell-cli' \
-  --set server.tls.clientCaSecretName="" \
+  --set gateway.tls.clientCaSecretName="" \
   --set 'gatewayConfig.openshell\.gateway\.oidc.roles_claim=realm_access.roles' \
   --set 'gatewayConfig.openshell\.gateway\.oidc.admin_role=openshell-admin' \
   --set 'gatewayConfig.openshell\.gateway\.oidc.user_role=openshell-user'
@@ -132,7 +132,7 @@ helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.disableTls=true \
+  --set gateway.disableTls=true \
   --set 'gatewayConfig.openshell\.gateway\.auth.allow_unauthenticated_users=true'
 ```
 

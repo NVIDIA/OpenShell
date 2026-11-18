@@ -52,7 +52,7 @@ tests:
       - notExists:
           path: spec.template.spec.securityContext
 
-  - it: derives host aliases from server.hostGatewayIP and not gatewayConfig
+  - it: uses canonical runtime host aliases over the legacy server override
     template: templates/statefulset.yaml
     set:
       server.hostGatewayIP: 10.23.45.67
@@ -62,7 +62,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.hostAliases[0].ip
-          value: 10.23.45.67
+          value: 192.0.2.1
       - contains:
           path: spec.template.spec.hostAliases[0].hostnames
           content: host.openshell.internal

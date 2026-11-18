@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 {{- include "openshell.validateValues" . }}
@@ -13,10 +14,10 @@ spec:
     apiVersion: apps/v1
     kind: {{ ternary "Deployment" "StatefulSet" (eq (include "openshell.workloadKind" .) "deployment") }}
     name: {{ include "openshell.fullname" . }}
-  minReplicas: {{ .Values.autoscaling.minReplicas }}
-  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  minReplicas: {{ .Values.gateway.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.gateway.autoscaling.maxReplicas }}
   metrics:
-    {{- with .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- with .Values.gateway.autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource
       resource:
         name: cpu
@@ -24,7 +25,7 @@ spec:
           type: Utilization
           averageUtilization: {{ . }}
     {{- end }}
-    {{- with .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- with .Values.gateway.autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
@@ -32,10 +33,10 @@ spec:
           type: Utilization
           averageUtilization: {{ . }}
     {{- end }}
-    {{- with .Values.autoscaling.metrics }}
+    {{- with .Values.gateway.autoscaling.metrics }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-  {{- with .Values.autoscaling.behavior }}
+  {{- with .Values.gateway.autoscaling.behavior }}
   behavior:
     {{- toYaml . | nindent 4 }}
   {{- end }}

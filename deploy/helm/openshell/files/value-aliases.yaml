@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Deprecated paths are accepted only before chart 0.2.0.
+replicaCount: gateway.replicaCount
+workload: gateway.workload
+autoscaling: gateway.autoscaling
+nodeSelector: gateway.nodeSelector
+affinity: gateway.affinity
+tolerations: gateway.tolerations
+priorityClassName: gateway.priorityClassName
+topologySpreadConstraints: gateway.topologySpreadConstraints
+resources: gateway.resources
+probes: gateway.probes
+podLifecycle: gateway.podLifecycle
+podAnnotations: gateway.podAnnotations
+podLabels: gateway.podLabels
+podSecurityContext: gateway.podSecurityContext
+securityContext: gateway.securityContext
+serviceAccount: gateway.serviceAccount
+rbac: gateway.rbac
+service: gateway.service
+metrics: gateway.metrics
+credentialDrivers: gateway.credentialDrivers
+server.dataStorageSize: gateway.dataStorageSize
+server.dataStorageClass: gateway.dataStorageClass
+server.externalDbSecret: gateway.externalDbSecret
+server.disableTls: gateway.disableTls
+server.tls: gateway.tls
+server.credentialStorage: gateway.credentialStorage
+server.extraEnv: gateway.extraEnv
+server.extraVolumes: gateway.extraVolumes
+server.extraVolumeMounts: gateway.extraVolumeMounts
+server.dbUrl: gateway.dbUrl
+server.telemetryEnabled: gateway.telemetryEnabled
+server.sandboxJwt.signingSecretName: gateway.sandboxJwt.signingSecretName
+server.sandboxJwt.secretDefaultMode: gateway.sandboxJwt.secretDefaultMode
+server.oidc.caConfigMapName: gateway.oidc.caConfigMapName
+server.providerTokenGrants.spiffe: gateway.providerTokenGrants.spiffe
+server.credentialDrivers.kubernetesSecrets.createNamespace: gateway.credentialDrivers.kubernetesSecrets.createNamespace
+server.credentialDrivers.kubernetesSecrets.rbac: gateway.credentialDrivers.kubernetesSecrets.rbac
+server.credentialDrivers.vault.caConfigMapName: gateway.credentialDrivers.vault.caConfigMapName
+sandboxServiceAccount: sandbox.serviceAccount
+sandboxRuntime: sandbox.runtime
+networkPolicy: sandbox.networkPolicy
+server.sandboxNamespace: sandbox.namespace
+server.sandboxImagePullSecrets: sandbox.imagePullSecrets

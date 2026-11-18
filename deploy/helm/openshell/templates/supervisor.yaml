@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 {{- include "openshell.validateValues" . }}
 {{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $imagePullSecrets := get $kubernetes "image_pull_secrets" | default list -}}
@@ -21,7 +22,7 @@
 {{- end }}
 {{- $endpoint := get $kubernetes "grpc_endpoint" }}
 {{- $endpointUrl := urlParse $endpoint }}
-{{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
+{{- $gatewayTls := and (not .Values.gateway.disableTls) .Values.gateway.tls.clientTlsSecretName }}
 # One supervisor process per replica hosts a sandbox instance for each sandbox
 # generation placed on it. The process dials the gateway over TLS with the
 # supervisor token the gateway mints for it and receives its assignments from
@@ -57,14 +58,25 @@ spec:
       {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- with .Values.supervisor.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
-        {{- include "openshell.supervisorSelectorLabels" . | nindent 8 }}
+        {{- mergeOverwrite (deepCopy (.Values.supervisor.podLabels | default dict)) (include "openshell.supervisorSelectorLabels" . | fromYaml) | toYaml | nindent 8 }}
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: {{ include "openshell.supervisorServiceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.supervisor.serviceAccount.automountServiceAccountToken }}
       enableServiceLinks: false
       # A stopping member announces that it is leaving, and the gateway moves
       # its instances to the remaining members before it exits.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: {{ .Values.supervisor.podLifecycle.terminationGracePeriodSeconds }}
+      {{- if ne .Values.supervisor.imagePullSecrets nil }}
+      {{- $imagePullSecrets = list }}
+      {{- range .Values.supervisor.imagePullSecrets }}
+      {{- $imagePullSecrets = append $imagePullSecrets .name }}
+      {{- end }}
+      {{- end }}
       {{- with ($imagePullSecrets | uniq) }}
       imagePullSecrets:
         {{- range . }}
@@ -78,6 +90,12 @@ spec:
       {{- with .Values.supervisor.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- range $key := list "nodeSelector" "tolerations" "topologySpreadConstraints" "priorityClassName" "schedulerName" }}
+      {{- with get $.Values.supervisor $key }}
+      {{ $key }}:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- end }}
       containers:
         - name: supervisor
@@ -144,16 +162,9 @@ spec:
               containerPort: 5501
               protocol: TCP
           securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: [ALL]
+            {{- toYaml .Values.supervisor.securityContext | nindent 12 }}
           resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              memory: 1Gi
+            {{- toYaml .Values.supervisor.resources | nindent 12 }}
           # Process health only: the health listener accepts and closes probe
           # connections. Each instance's readiness is reported to the gateway
           # over the supervisor's own connection to it.
@@ -197,7 +208,7 @@ spec:
         {{- if $gatewayTls }}
         - name: gateway-ca
           secret:
-            secretName: {{ .Values.server.tls.clientTlsSecretName }}
+            secretName: {{ .Values.gateway.tls.clientTlsSecretName }}
             items:
               - key: ca.crt
                 path: ca.crt

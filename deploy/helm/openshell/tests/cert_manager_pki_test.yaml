@@ -149,7 +149,7 @@ tests:
       certManager.clientCaFromServerTlsSecret: false
     asserts:
       - failedTemplate:
-          errorMessage: "certManager.clientCaFromServerTlsSecret is false but server.tls.clientCaSecretName is still the default (openshell-server-client-ca), which nothing creates when cert-manager owns TLS. Set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls), or set it to empty to disable mTLS client verification."
+          errorMessage: "certManager.clientCaFromServerTlsSecret is false but gateway.tls.clientCaSecretName is still the default (openshell-server-client-ca), which nothing creates when cert-manager owns TLS. Set gateway.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls), or set it to empty to disable mTLS client verification."
 
   - it: client Certificate issuerRef is unaffected by serverIssuerRef
     template: templates/cert-manager-pki.yaml

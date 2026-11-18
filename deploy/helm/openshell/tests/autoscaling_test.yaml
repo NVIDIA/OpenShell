@@ -83,7 +83,7 @@ tests:
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      replicaCount: 3
+      gateway.replicaCount: 3
     asserts:
       - isKind:
           of: Deployment
@@ -95,7 +95,7 @@ tests:
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.targetMemoryUtilizationPercentage: 70
+      gateway.autoscaling.targetMemoryUtilizationPercentage: 70
     asserts:
       - contains:
           path: spec.metrics
@@ -110,11 +110,11 @@ tests:
   - it: renders only custom metrics when utilization targets are disabled
     template: templates/hpa.yaml
     set:
-      workload.kind: deployment
-      server.externalDbSecret: my-pg-secret
-      autoscaling.enabled: true
-      autoscaling.targetCPUUtilizationPercentage: null
-      autoscaling.metrics:
+      gateway.workload.kind: deployment
+      gateway.externalDbSecret: my-pg-secret
+      gateway.autoscaling.enabled: true
+      gateway.autoscaling.targetCPUUtilizationPercentage: null
+      gateway.autoscaling.metrics:
         - type: Pods
           pods:
             metric:
@@ -135,7 +135,7 @@ tests:
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.behavior:
+      gateway.autoscaling.behavior:
         scaleUp:
           stabilizationWindowSeconds: 0
     asserts:
@@ -151,7 +151,7 @@ tests:
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.behavior: null
+      gateway.autoscaling.behavior: null
     asserts:
       - notExists:
           path: spec.behavior
@@ -159,10 +159,10 @@ tests:
   - it: targets a multi-replica StatefulSet with the explicit override
     template: templates/hpa.yaml
     set:
-      server.externalDbSecret: my-pg-secret
-      workload.allowMultiReplicaStatefulSet: true
-      resources.requests.cpu: 100m
-      autoscaling.enabled: true
+      gateway.externalDbSecret: my-pg-secret
+      gateway.workload.allowMultiReplicaStatefulSet: true
+      gateway.resources.requests.cpu: 100m
+      gateway.autoscaling.enabled: true
     asserts:
       - equal:
           path: spec.scaleTargetRef.kind
@@ -171,10 +171,10 @@ tests:
   - it: omits spec.replicas from the StatefulSet when autoscaling is enabled
     template: templates/statefulset.yaml
     set:
-      server.externalDbSecret: my-pg-secret
-      workload.allowMultiReplicaStatefulSet: true
-      resources.requests.cpu: 100m
-      autoscaling.enabled: true
+      gateway.externalDbSecret: my-pg-secret
+      gateway.workload.allowMultiReplicaStatefulSet: true
+      gateway.resources.requests.cpu: 100m
+      gateway.autoscaling.enabled: true
     asserts:
       - notExists:
           path: spec.replicas
@@ -182,7 +182,7 @@ tests:
   - it: treats a missing autoscaling map as disabled
     template: templates/statefulset.yaml
     set:
-      autoscaling: null
+      gateway.autoscaling: null
     asserts:
       - equal:
           path: spec.replicas
@@ -191,73 +191,73 @@ tests:
   - it: fails when autoscaling can exceed one replica on SQLite
     template: templates/statefulset.yaml
     set:
-      autoscaling.enabled: true
-      resources.requests.cpu: 100m
+      gateway.autoscaling.enabled: true
+      gateway.resources.requests.cpu: 100m
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.maxReplicas > 1 requires server.externalDbSecret"
+          errorPattern: "gateway.autoscaling.maxReplicas > 1 requires gateway.externalDbSecret"
 
   - it: fails when autoscaling a StatefulSet without the multi-replica override
     template: templates/statefulset.yaml
     set:
-      autoscaling.enabled: true
-      server.externalDbSecret: my-pg-secret
-      resources.requests.cpu: 100m
+      gateway.autoscaling.enabled: true
+      gateway.externalDbSecret: my-pg-secret
+      gateway.resources.requests.cpu: 100m
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.maxReplicas > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true"
+          errorPattern: "gateway.autoscaling.maxReplicas > 1 with gateway.workload.kind=statefulset requires gateway.workload.allowMultiReplicaStatefulSet=true"
 
   - it: fails when maxReplicas is below minReplicas
     template: templates/statefulset.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.maxReplicas: 1
+      gateway.autoscaling.maxReplicas: 1
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.maxReplicas must be greater than or equal to autoscaling.minReplicas"
+          errorPattern: "gateway.autoscaling.maxReplicas must be greater than or equal to gateway.autoscaling.minReplicas"
 
   - it: fails when minReplicas is below one
     template: templates/statefulset.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.minReplicas: 0
+      gateway.autoscaling.minReplicas: 0
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.minReplicas must be at least 1"
+          errorPattern: "gateway.autoscaling.minReplicas must be at least 1"
 
   - it: fails when no autoscaling metric is configured
     template: templates/statefulset.yaml
     set:
-      workload.kind: deployment
-      server.externalDbSecret: my-pg-secret
-      autoscaling.enabled: true
-      autoscaling.targetCPUUtilizationPercentage: null
+      gateway.workload.kind: deployment
+      gateway.externalDbSecret: my-pg-secret
+      gateway.autoscaling.enabled: true
+      gateway.autoscaling.targetCPUUtilizationPercentage: null
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.enabled requires targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or autoscaling.metrics"
+          errorPattern: "gateway.autoscaling.enabled requires targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or gateway.autoscaling.metrics"
 
   - it: fails when a CPU target has no CPU request
     template: templates/statefulset.yaml
     set:
-      workload.kind: deployment
-      server.externalDbSecret: my-pg-secret
-      autoscaling.enabled: true
+      gateway.workload.kind: deployment
+      gateway.externalDbSecret: my-pg-secret
+      gateway.autoscaling.enabled: true
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
+          errorPattern: "gateway.autoscaling.targetCPUUtilizationPercentage requires a positive gateway.resources.requests.cpu"
 
   - it: fails when a memory target has no memory request
     template: templates/statefulset.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.targetMemoryUtilizationPercentage: 70
-      resources.requests.memory: null
+      gateway.autoscaling.targetMemoryUtilizationPercentage: 70
+      gateway.resources.requests.memory: null
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetMemoryUtilizationPercentage requires a positive resources.requests.memory"
+          errorPattern: "gateway.autoscaling.targetMemoryUtilizationPercentage requires a positive gateway.resources.requests.memory"
 
   # Kubernetes copies a limit only into an unset request, so an explicit zero
   # request stays zero and the HPA cannot compute utilization.
@@ -266,33 +266,33 @@ tests:
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      resources.requests.cpu: 0
-      resources.limits.cpu: "1"
+      gateway.resources.requests.cpu: 0
+      gateway.resources.limits.cpu: "1"
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
+          errorPattern: "gateway.autoscaling.targetCPUUtilizationPercentage requires a positive gateway.resources.requests.cpu"
 
   - it: fails when the memory request is zero even with a memory limit
     template: templates/statefulset.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.targetMemoryUtilizationPercentage: 70
-      resources.requests.memory: 0Mi
-      resources.limits.memory: 1Gi
+      gateway.autoscaling.targetMemoryUtilizationPercentage: 70
+      gateway.resources.requests.memory: 0Mi
+      gateway.resources.limits.memory: 1Gi
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetMemoryUtilizationPercentage requires a positive resources.requests.memory"
+          errorPattern: "gateway.autoscaling.targetMemoryUtilizationPercentage requires a positive gateway.resources.requests.memory"
 
   - it: fails when the CPU request is a zero quantity string
     template: templates/statefulset.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      resources.requests.cpu: 0m
+      gateway.resources.requests.cpu: 0m
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
+          errorPattern: "gateway.autoscaling.targetCPUUtilizationPercentage requires a positive gateway.resources.requests.cpu"
 
   # The chart renders a null request, which Kubernetes stores as zero instead
   # of copying the limit.
@@ -301,42 +301,42 @@ tests:
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      resources.requests.cpu: null
-      resources.limits.cpu: "1"
+      gateway.resources.requests.cpu: null
+      gateway.resources.limits.cpu: "1"
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
+          errorPattern: "gateway.autoscaling.targetCPUUtilizationPercentage requires a positive gateway.resources.requests.cpu"
 
   - it: fails when the CPU request is zero in exponent form
     template: templates/statefulset.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      resources.requests.cpu: "0e3"
+      gateway.resources.requests.cpu: "0e3"
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
+          errorPattern: "gateway.autoscaling.targetCPUUtilizationPercentage requires a positive gateway.resources.requests.cpu"
 
   - it: fails when the memory request is zero in exponent form
     template: templates/statefulset.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
-      autoscaling.targetMemoryUtilizationPercentage: 70
-      resources.requests.memory: "0E+6"
+      gateway.autoscaling.targetMemoryUtilizationPercentage: 70
+      gateway.resources.requests.memory: "0E+6"
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.targetMemoryUtilizationPercentage requires a positive resources.requests.memory"
+          errorPattern: "gateway.autoscaling.targetMemoryUtilizationPercentage requires a positive gateway.resources.requests.memory"
 
   - it: accepts CPU and memory limits in place of requests
     template: templates/hpa.yaml
     set:
-      workload.kind: deployment
-      server.externalDbSecret: my-pg-secret
-      autoscaling.enabled: true
-      autoscaling.targetMemoryUtilizationPercentage: 70
-      resources.limits.cpu: "1"
-      resources.limits.memory: 1Gi
+      gateway.workload.kind: deployment
+      gateway.externalDbSecret: my-pg-secret
+      gateway.autoscaling.enabled: true
+      gateway.autoscaling.targetMemoryUtilizationPercentage: 70
+      gateway.resources.limits.cpu: "1"
+      gateway.resources.limits.memory: 1Gi
     asserts:
       - isKind:
           of: HorizontalPodAutoscaler
@@ -362,25 +362,25 @@ tests:
   - it: explains --reuse-values when the autoscaling defaults are missing
     template: templates/statefulset.yaml
     set:
-      workload.kind: deployment
-      server.externalDbSecret: my-pg-secret
-      resources.requests.cpu: 100m
+      gateway.workload.kind: deployment
+      gateway.externalDbSecret: my-pg-secret
+      gateway.resources.requests.cpu: 100m
       # --reuse-values from a release without autoscaling values leaves only
       # the enabled flag that the upgrade sets.
-      autoscaling.enabled: true
-      autoscaling.minReplicas: null
-      autoscaling.maxReplicas: null
-      autoscaling.targetCPUUtilizationPercentage: null
-      autoscaling.metrics: null
-      autoscaling.behavior: null
+      gateway.autoscaling.enabled: true
+      gateway.autoscaling.minReplicas: null
+      gateway.autoscaling.maxReplicas: null
+      gateway.autoscaling.targetCPUUtilizationPercentage: null
+      gateway.autoscaling.metrics: null
+      gateway.autoscaling.behavior: null
     asserts:
       - failedTemplate:
-          errorPattern: "autoscaling.minReplicas and autoscaling.maxReplicas are not set.*--reset-then-reuse-values"
+          errorPattern: "gateway.autoscaling.minReplicas and gateway.autoscaling.maxReplicas are not set.*--reset-then-reuse-values"
 
   - it: keeps the replicaCount wording when autoscaling is disabled
     template: templates/statefulset.yaml
     set:
-      replicaCount: 2
+      gateway.replicaCount: 2
     asserts:
       - failedTemplate:
-          errorPattern: "replicaCount > 1 requires server.externalDbSecret"
+          errorPattern: "gateway.replicaCount > 1 requires gateway.externalDbSecret"

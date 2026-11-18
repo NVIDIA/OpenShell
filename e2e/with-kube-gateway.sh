@@ -1122,7 +1122,7 @@ BUILD_SUPERVISOR_IMAGE="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
 GLOBAL_HELM_IMAGE_ARGS=(--set-string "global.image.registry=")
 GATEWAY_HELM_IMAGE_ARGS=(--set-string "gateway.image.registry=$(e2e_image_reference_registry "${GATEWAY_IMAGE}")" --set-string "gateway.image.repository=$(e2e_image_reference_repository_path "${GATEWAY_IMAGE}")" --set-string "gateway.image.tag=$(e2e_image_reference_tag "${GATEWAY_IMAGE}")" --set-string "gateway.image.digest=$(e2e_image_reference_digest "${GATEWAY_IMAGE}")")
 SUPERVISOR_HELM_IMAGE_ARGS=(--set-string "supervisor.image.registry=$(e2e_image_reference_registry "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.repository=$(e2e_image_reference_repository_path "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.tag=$(e2e_image_reference_tag "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.digest=$(e2e_image_reference_digest "${SUPERVISOR_IMAGE}")")
-SANDBOX_RUNTIME_HELM_IMAGE_ARGS=(--set-string "sandboxRuntime.image.registry=$(e2e_image_reference_registry "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.repository=$(e2e_image_reference_repository_path "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.tag=$(e2e_image_reference_tag "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.digest=$(e2e_image_reference_digest "${SANDBOX_RUNTIME_IMAGE}")")
+SANDBOX_RUNTIME_HELM_IMAGE_ARGS=(--set-string "sandbox.runtime.image.registry=$(e2e_image_reference_registry "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandbox.runtime.image.repository=$(e2e_image_reference_repository_path "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandbox.runtime.image.tag=$(e2e_image_reference_tag "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandbox.runtime.image.digest=$(e2e_image_reference_digest "${SANDBOX_RUNTIME_IMAGE}")")
 
 # Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
 # running on the developer/CI host (HTTP fixtures bound to 0.0.0.0 plus sibling
@@ -1367,7 +1367,7 @@ fi
 
 helm_extra_args=()
 helm_post_renderer_args=()
-helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+helm_extra_args+=(--set "gateway.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
   helm_extra_args+=(--set "supervisor.network.additionalCaConfigMapName=${ADDITIONAL_CA_SOURCE_CONFIG_MAP}")
@@ -1390,10 +1390,9 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   )
 fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
-  # server.hostGatewayIP owns both the gateway runtime field and sandbox-pod
-  # hostAliases. Exercise the public chart input rather than bypassing it with
-  # a direct gatewayConfig override.
-  helm_extra_args+=(--set-string "server.hostGatewayIP=${HOST_GATEWAY_IP}")
+  # The canonical driver setting owns both the gateway Pod host aliases and
+  # the field passed through to sandbox workloads.
+  helm_extra_args+=(--set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.host_gateway_ip=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
@@ -1568,7 +1567,7 @@ if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   scenario_deploy_external_pg
   run_scenario "External PostgreSQL (externalDbSecret)" external-pg \
     "${helm_extra_args[@]}" \
-    --set server.externalDbSecret=my-pg-credentials
+    --set gateway.externalDbSecret=my-pg-credentials
   scenario_cleanup_external_pg
 
   echo ""

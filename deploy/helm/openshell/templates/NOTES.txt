@@ -1,0 +1,15 @@
+{{/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+SPDX-License-Identifier: Apache-2.0 */}}
+{{- include "openshell.resolveValues" . -}}
+{{- if ._openshellValueWarnings }}
+Your existing values files and --set overrides work with this chart version.
+You can migrate incrementally; complete migration before upgrading to chart 0.2.0.
+Deprecated Helm values are accepted until chart 0.2.0:
+{{ range ._openshellValueWarnings }}
+  - {{ . }}
+{{ end }}
+Explicit canonical values take precedence over legacy aliases.
+Export stored overrides with `helm get values {{ .Release.Name }} -n {{ .Release.Namespace }} -o yaml`,
+migrate the paths, and upgrade with `--reset-values -f migrated-values.yaml`.
+`--reuse-values` retains deprecated paths and will fail starting with chart 0.2.0.
+{{- end }}

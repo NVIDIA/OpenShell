@@ -64,6 +64,7 @@ run = """
   helm dependency build deploy/helm/openshell
   helm unittest deploy/helm/openshell
   helm unittest deploy/helm/openshell-workspace
+  uv run --no-project --with pyyaml python deploy/helm/test-component-values.py
   deploy/helm/test-split-ownership.sh
   deploy/helm/test-gateway-config-parser.sh
   deploy/helm/test-gateway-resource-coherence.sh
@@ -75,6 +76,11 @@ run_windows = "echo Skipping helm:test: Helm validation is not part of the nativ
 description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
 dir = "deploy/helm/openshell"
 run = "skaffold dev"
+
+["helm:test:components:e2e"]
+description = "Create and exec a shared-supervisor sandbox with independent component pod settings and service accounts"
+env = { OPENSHELL_E2E_KUBE_TLS = "1" }
+run = 'OPENSHELL_E2E_KUBE_EXTRA_VALUES="deploy/helm/openshell/ci/values-supervisor.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml:deploy/helm/openshell/ci/values-component-pods.yaml${OPENSHELL_E2E_KUBE_EXTRA_VALUES:+:$OPENSHELL_E2E_KUBE_EXTRA_VALUES}" e2e/with-kube-gateway.sh bash deploy/helm/test-component-pods-e2e.sh'
 
 ["helm:skaffold:run"]
 description = "Run a one-shot Skaffold deploy and register its local plaintext gateway"

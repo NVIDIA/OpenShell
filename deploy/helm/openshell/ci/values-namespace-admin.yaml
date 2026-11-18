@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 # Namespace-admin overlay — renders only namespaced objects.
 #
 # Use this when a cluster-admin applies the gateway ClusterRole and
@@ -20,6 +19,7 @@
 # The gateway ServiceAccount name and release namespace are unchanged, so the
 # pre-created ClusterRoleBinding still matches this release.
 
-rbac:
-  clusterScoped:
-    create: false
+gateway:
+  rbac:
+    clusterScoped:
+      create: false

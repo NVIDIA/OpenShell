@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 {{- if .Values.certManager.enabled }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -42,8 +43,8 @@ spec:
     secretName: {{ .Values.certManager.caSecretName | quote }}
 ---
 {{- $externalServerIssuer := .Values.certManager.serverIssuerRef.name }}
-{{- if and (not .Values.certManager.clientCaFromServerTlsSecret) (eq .Values.server.tls.clientCaSecretName "openshell-server-client-ca") }}
-{{- fail "certManager.clientCaFromServerTlsSecret is false but server.tls.clientCaSecretName is still the default (openshell-server-client-ca), which nothing creates when cert-manager owns TLS. Set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls), or set it to empty to disable mTLS client verification." }}
+{{- if and (not .Values.certManager.clientCaFromServerTlsSecret) (eq .Values.gateway.tls.clientCaSecretName "openshell-server-client-ca") }}
+{{- fail "certManager.clientCaFromServerTlsSecret is false but gateway.tls.clientCaSecretName is still the default (openshell-server-client-ca), which nothing creates when cert-manager owns TLS. Set gateway.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls), or set it to empty to disable mTLS client verification." }}
 {{- end }}
 {{- if $externalServerIssuer }}
 {{- if not .Values.certManager.serverDnsNames }}
@@ -67,7 +68,7 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
-  secretName: {{ .Values.server.tls.certSecretName | quote }}
+  secretName: {{ .Values.gateway.tls.certSecretName | quote }}
   duration: {{ .Values.certManager.certificateDuration | quote }}
   renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
   commonName: {{ include "openshell.fullname" . }}
@@ -139,7 +140,7 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
-  secretName: {{ .Values.server.tls.clientTlsSecretName | quote }}
+  secretName: {{ .Values.gateway.tls.clientTlsSecretName | quote }}
   duration: {{ .Values.certManager.certificateDuration | quote }}
   renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
   commonName: openshell-client

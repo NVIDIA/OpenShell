@@ -104,9 +104,9 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $gateway := get $config "openshell.gateway" | default dict -}}
 {{- if not (hasKey $gateway "name") -}}{{- $_ := set $gateway "name" (get $legacyServer "name" | default (include "openshell.fullname" .)) -}}{{- end -}}
 {{/* The Service and probes own listener ports, so keep runtime listeners aligned. */}}
-{{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.service.port) -}}
-{{- if .Values.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
-{{- if include "openshell.metricsEnabled" . -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
+{{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.gateway.service.port) -}}
+{{- if .Values.gateway.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.gateway.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
+{{- if include "openshell.metricsEnabled" . -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.gateway.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
@@ -149,7 +149,7 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $_ := unset $kubernetesCompat "resource_admission" -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
 {{- if not (hasKey $config "openshell.drivers.kubernetes.managed_ssh_ingress") -}}
-{{- $_ := set $config "openshell.drivers.kubernetes.managed_ssh_ingress" (dict "enabled" .Values.networkPolicy.enabled "gateway_namespace" .Release.Namespace "gateway_pod_selector" (dict "app.kubernetes.io/name" (include "openshell.name" .) "app.kubernetes.io/instance" .Release.Name)) -}}
+{{- $_ := set $config "openshell.drivers.kubernetes.managed_ssh_ingress" (dict "enabled" .Values.sandbox.networkPolicy.enabled "gateway_namespace" .Release.Namespace "gateway_pod_selector" (dict "app.kubernetes.io/name" (include "openshell.name" .) "app.kubernetes.io/instance" .Release.Name)) -}}
 {{- end -}}
 {{- $legacyOidc := get $legacyServer "oidc" | default dict -}}
 {{- $oidcConfig := get $config "openshell.gateway.oidc" | default dict -}}
@@ -265,7 +265,7 @@ source to make sandbox callback hostnames disagree with the pod spec. */}}
 
 {{/* A Vault CA is a Kubernetes resource reference, not a free-form runtime
 path. Derive its mounted path only from the chart-owned ConfigMap reference. */}}
-{{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
+{{- $credentialDrivers := .Values.gateway.credentialDrivers | default dict -}}
 {{- $vaultResources := get $credentialDrivers "vault" | default dict -}}
 {{- $legacyVaultResources := get $legacyCredentialDrivers "vault" | default dict -}}
 {{- $vaultCaConfigMapName := get $vaultResources "caConfigMapName" | default (get $legacyVaultResources "caConfigMapName") -}}
@@ -281,15 +281,15 @@ path. Derive its mounted path only from the chart-owned ConfigMap reference. */}
 {{/* TLS resources, mounts, and their corresponding runtime fields have one
 owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- $gateway := get $config "openshell.gateway" | default dict -}}
-{{- $_ := set $gateway "disable_tls" .Values.server.disableTls -}}
+{{- $_ := set $gateway "disable_tls" .Values.gateway.disableTls -}}
 {{- $_ := set $config "openshell.gateway" $gateway -}}
-{{- if .Values.server.disableTls -}}
+{{- if .Values.gateway.disableTls -}}
 {{- $_ := unset $config "openshell.gateway.tls" -}}
 {{- $_ := unset $kubernetes "client_tls_secret_name" -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetes -}}
 {{- else -}}
-{{- if .Values.server.tls.clientTlsSecretName -}}
-{{- $_ := set $kubernetes "client_tls_secret_name" .Values.server.tls.clientTlsSecretName -}}
+{{- if .Values.gateway.tls.clientTlsSecretName -}}
+{{- $_ := set $kubernetes "client_tls_secret_name" .Values.gateway.tls.clientTlsSecretName -}}
 {{- else -}}
 {{- $_ := unset $kubernetes "client_tls_secret_name" -}}
 {{- end -}}
@@ -331,32 +331,32 @@ operator ConfigMap reference. */}}
 {{- end -}}
 {{/* Metrics TLS is opt-in and deliberately uses a separate configuration
 boundary from the gateway listener so its client CA can stay independent. */}}
-{{- $metrics := .Values.metrics | default dict -}}
+{{- $metrics := .Values.gateway.metrics | default dict -}}
 {{- $metricsTls := get $metrics "tls" | default dict -}}
 {{- if get $metricsTls "enabled" -}}
 {{- if not (include "openshell.metricsEnabled" .) -}}
-{{- fail "metrics.tls.enabled requires metrics.enabled=true" -}}
+{{- fail "gateway.metrics.tls.enabled requires gateway.metrics.enabled=true" -}}
 {{- end -}}
 {{- if and (get $metricsTls "requireClientCert") (not (get $metricsTls "clientCaSecretName")) -}}
-{{- fail "metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName" -}}
+{{- fail "gateway.metrics.tls.requireClientCert requires gateway.metrics.tls.clientCaSecretName" -}}
 {{- end -}}
 {{- $gatewayClientCaSecretName := "" -}}
 {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" -}}
 {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
-{{- $gatewayClientCaSecretName = .Values.server.tls.certSecretName -}}
+{{- $gatewayClientCaSecretName = .Values.gateway.tls.certSecretName -}}
 {{- else -}}
-{{- $gatewayClientCaSecretName = .Values.server.tls.clientCaSecretName -}}
+{{- $gatewayClientCaSecretName = .Values.gateway.tls.clientCaSecretName -}}
 {{- end -}}
 {{- end -}}
 {{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") $gatewayClientCaSecretName) -}}
-{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret" -}}
+{{- fail "gateway.metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret" -}}
 {{- end -}}
 {{/* The sandbox client TLS Secret carries the gateway CA (certgen writes
 ca.crt into it), so trusting it as the metrics client CA would grant sandbox
 workloads scraping access even when its name differs from the client CA
 Secret. */}}
-{{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") .Values.server.tls.clientTlsSecretName) -}}
-{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)" -}}
+{{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") .Values.gateway.tls.clientTlsSecretName) -}}
+{{- fail "gateway.metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (gateway.tls.clientTlsSecretName)" -}}
 {{- end -}}
 {{- $metricsTlsConfig := get $config "openshell.gateway.metrics_tls" | default dict -}}
 {{- $_ := set $metricsTlsConfig "cert_path" "/etc/openshell-metrics/server/tls.crt" -}}

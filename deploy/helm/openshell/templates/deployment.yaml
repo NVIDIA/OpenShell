@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 {{- include "openshell.validateValues" . }}
 {{- if eq (include "openshell.workloadKind" .) "deployment" }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -10,7 +11,7 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
   {{- if ne (include "openshell.autoscalingEnabled" .) "true" }}
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.gateway.replicaCount }}
   {{- end }}
   selector:
     matchLabels:

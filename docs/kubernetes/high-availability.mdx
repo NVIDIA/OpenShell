@@ -28,7 +28,7 @@ An HA gateway deployment requires:
 - PostgreSQL reachable from every gateway pod.
 - A Kubernetes Secret in the OpenShell namespace with the PostgreSQL connection
   URI in a key named `uri`.
-- `workload.kind: deployment`. The default StatefulSet and per-pod SQLite
+- `gateway.workload.kind: deployment`. The default StatefulSet and per-pod SQLite
   database are intended for a single gateway replica.
 - An ingress or load balancer that routes clients to the gateway Service. Refer
   to [Ingress](/kubernetes/ingress) for a Gateway API configuration.
@@ -36,9 +36,9 @@ An HA gateway deployment requires:
   starting or terminating during a rollout. Refer to
   [Size PostgreSQL Connections](#size-postgresql-connections).
 
-The Helm chart rejects `replicaCount` values above `1` unless
-`server.externalDbSecret` is set. It also rejects a multi-replica StatefulSet
-unless `workload.allowMultiReplicaStatefulSet` is explicitly enabled. Use a
+The Helm chart rejects `gateway.replicaCount` values above `1` unless
+`gateway.externalDbSecret` is set. It also rejects a multi-replica StatefulSet
+unless `gateway.workload.allowMultiReplicaStatefulSet` is explicitly enabled. Use a
 Deployment for the standard HA configuration.
 
 ## Create the PostgreSQL Secret
@@ -61,22 +61,19 @@ Keep the Secret in the same namespace as the gateway release.
 Create `values-ha.yaml`:
 
 ```yaml
-replicaCount: 2
-
-workload:
-  kind: deployment
-
-server:
-  externalDbSecret: openshell-postgres
-
-affinity:
-  podAntiAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
+gateway:
+  replicaCount: 2
+  workload:
+    kind: deployment
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
           matchLabels:
             app.kubernetes.io/name: openshell
             app.kubernetes.io/instance: openshell
         topologyKey: kubernetes.io/hostname
+  externalDbSecret: openshell-postgres
 ```
 
 The anti-affinity rule places the two replicas on different nodes. The
@@ -215,7 +212,7 @@ client requests remain routable through peer relay.
 ## Monitor Capacity
 
 Each gateway replica exposes Prometheus metrics on port `9090`
-(`service.metricsPort`). Scrape every gateway pod, not the Service, because
+(`gateway.service.metricsPort`). Scrape every gateway pod, not the Service, because
 these signals describe one replica. Refer to
 [Gateway Metrics](/observability/gateway-metrics) for the full catalog, scrape
 configuration, and access control.
@@ -310,7 +307,7 @@ PostgreSQL and the cluster nodes for the largest replica count.
 
 ### Scale Manually
 
-Change `replicaCount` in `values-ha.yaml`, then apply the release again:
+Change `gateway.replicaCount` in `values-ha.yaml`, then apply the release again:
 
 ```shell
 helm upgrade openshell \
@@ -323,39 +320,39 @@ helm upgrade openshell \
 
 ### Autoscale with a HorizontalPodAutoscaler
 
-Set `autoscaling.enabled` to render an `autoscaling/v2`
+Set `gateway.autoscaling.enabled` to render an `autoscaling/v2`
 HorizontalPodAutoscaler for the gateway Deployment, or for a StatefulSet with
-`workload.allowMultiReplicaStatefulSet`. Add these values to
+`gateway.workload.allowMultiReplicaStatefulSet`. Add these values to
 `values-ha.yaml`:
 
 ```yaml
-resources:
-  requests:
-    cpu: 500m
-    memory: 512Mi
-
-autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 6
-  targetCPUUtilizationPercentage: 70
+gateway:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
 ```
 
 With autoscaling enabled, the chart stops setting `spec.replicas` and ignores
-`replicaCount`. Kubernetes computes CPU and memory utilization against the
-container request, so those targets need a matching `resources.requests`
-entry. A `resources.limits` entry also works, because Kubernetes copies a
-limit into an unset request. The chart rejects an `autoscaling.maxReplicas`
-above `1` without `server.externalDbSecret`. Each scale-down hands the removed
+`gateway.replicaCount`. Kubernetes computes CPU and memory utilization against the
+container request, so those targets need a matching `gateway.resources.requests`
+entry. A `gateway.resources.limits` entry also works, because Kubernetes copies a
+limit into an unset request. The chart rejects an `gateway.autoscaling.maxReplicas`
+above `1` without `gateway.externalDbSecret`. Each scale-down hands the removed
 replica's supervisor sessions to the remaining replicas, so the default behavior removes at most one pod every two minutes
 after a five-minute stabilization window. Override it with
-`autoscaling.behavior`, or set `autoscaling.behavior.scaleDown` to `null` to
+`gateway.autoscaling.behavior`, or set `gateway.autoscaling.behavior.scaleDown` to `null` to
 drop the default. New replicas do not take existing sessions.
 
 <Note>
 A scale-down moves every supervisor session on the removed pod at once, and
 requests through that pod must be retried. To choose when that happens,
-set `autoscaling.behavior.scaleDown.selectPolicy` to `Disabled` so the
+set `gateway.autoscaling.behavior.scaleDown.selectPolicy` to `Disabled` so the
 autoscaler only adds replicas, and remove replicas yourself with
 `kubectl scale` at a quiet time.
 </Note>
@@ -370,7 +367,7 @@ kubectl -n openshell describe hpa openshell
 <Warning>
 Enabling autoscaling on an existing release removes `spec.replicas` from the
 workload in that upgrade. Kubernetes can reset the workload to one replica
-until the HPA scales it back to at least `autoscaling.minReplicas`, which moves
+until the HPA scales it back to at least `gateway.autoscaling.minReplicas`, which moves
 supervisor sessions from the other gateway pods to the remaining replica. Enable autoscaling
 when you install the chart, or during a maintenance window. On an existing
 release, upgrade with `--reset-then-reuse-values`, which needs Helm 3.14 or
@@ -380,15 +377,15 @@ later. With an older Helm, save the values with
 previous chart version's defaults, which lack the autoscaling values,
 including the scale-down `behavior`, when that release predates them. For background, refer to
 [Migrating Deployments and StatefulSets to horizontal autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling).
-Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
-which defaults to 1, so set `replicaCount` to the replica count you want in
+Disabling autoscaling renders `spec.replicas` from `gateway.replicaCount` again,
+which defaults to 1, so set `gateway.replicaCount` to the replica count you want in
 that upgrade.
 </Warning>
 
 ### Autoscale on Custom Metrics
 
 The HPA can also scale on a per-pod metric that a metrics adapter publishes.
-The chart passes `autoscaling.metrics` to the HPA unchanged and does not
+The chart passes `gateway.autoscaling.metrics` to the HPA unchanged and does not
 install Prometheus or an adapter. A custom metric needs these pieces:
 
 - Prometheus scrapes every gateway pod and labels each series with
@@ -396,7 +393,7 @@ install Prometheus or an adapter. A custom metric needs these pieces:
 - A metrics adapter, such as prometheus-adapter, maps those labels to
   Kubernetes resources and publishes a per-pod metric through the
   `custom.metrics.k8s.io` API.
-- `autoscaling.metrics` references that metric as a `Pods` metric with an
+- `gateway.autoscaling.metrics` references that metric as a `Pods` metric with an
   `AverageValue` target.
 
 Scale on signals that fall when you add replicas, such as CPU utilization. Do
@@ -406,19 +403,20 @@ on the replica that owns each session, and peer traffic grows with the replica
 count. Alert on those signals instead.
 
 ```yaml
-autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 6
-  targetCPUUtilizationPercentage: 70
-  metrics:
+gateway:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+    metrics:
     - type: Pods
       pods:
         metric:
           name: <metric-name>
         target:
           type: AverageValue
-          averageValue: "100"
+          averageValue: '100'
 ```
 
 Replace `<metric-name>` with the name your adapter publishes, and set
@@ -448,7 +446,7 @@ once, and an eviction or an autoscaler scale-down during the rollout adds more
 terminating pods. Set PostgreSQL `max_connections` to at least
 `(2 × replicas + surge) × (data + lock connections)`, which leaves one surge
 of margin for those pods, plus headroom for your other clients and
-administration. Use `autoscaling.maxReplicas` as the replica count when
+administration. Use `gateway.autoscaling.maxReplicas` as the replica count when
 autoscaling is enabled. With the defaults, that is
 `(2 × replicas + surge) × 14`:
 
@@ -466,11 +464,11 @@ rollout finish before you start another, because each overlapping rollout adds
 its own terminating pods.
 
 If you run several replicas as a StatefulSet with
-`workload.allowMultiReplicaStatefulSet`, a rollout adds no surge pods. It
+`gateway.workload.allowMultiReplicaStatefulSet`, a rollout adds no surge pods. It
 replaces one pod at a time and creates each replacement only after the old pod
 exits. Set `max_connections` to at least
 `replicas × (data + lock connections)`, 14 per replica with the defaults,
-using `autoscaling.maxReplicas` when autoscaling is enabled, plus headroom for
+using `gateway.autoscaling.maxReplicas` when autoscaling is enabled, plus headroom for
 your other clients and administration.
 
 Raise `database_lock_max_connections` only when mutation lock timeouts on a

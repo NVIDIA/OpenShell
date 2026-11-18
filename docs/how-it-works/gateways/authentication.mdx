@@ -304,7 +304,7 @@ a workspace. For membership commands, refer to
 
 ### Edge JWT (cloud gateways)
 
-For gateways behind a reverse proxy that handles authentication (e.g. Cloudflare Access), the CLI uses a browser-based login flow and routes traffic through a WebSocket tunnel. The tunnel is disabled by default; enable it with `enable_websocket_tunnel = true` under `[openshell.gateway]` (Helm: `server.enableWebsocketTunnel=true`).
+For gateways behind a reverse proxy that handles authentication (e.g. Cloudflare Access), the CLI uses a browser-based login flow and routes traffic through a WebSocket tunnel. The tunnel is disabled by default; enable it with `enable_websocket_tunnel = true` under `[openshell.gateway]` (Helm: `gatewayConfig.openshell\\.gateway.enable_websocket_tunnel=true`).
 
 **Registration flow** (`openshell gateway add https://gateway.example.com`):
 
@@ -354,7 +354,7 @@ Binding `0.0.0.0` on a host machine would expose the callback server to the loca
 ### Plaintext
 
 When a gateway is deployed with `disable_tls = true` (set through Helm as
-`server.disableTls=true`), TLS is disabled entirely. The CLI connects over plain
+`gateway.disableTls=true`), TLS is disabled entirely. The CLI connects over plain
 HTTP/2. This mode is intended for local port-forwarding or gateways behind a
 trusted reverse proxy or tunnel that handles TLS termination externally.
 

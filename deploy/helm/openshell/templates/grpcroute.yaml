@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 {{- if .Values.grpcRoute.enabled }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -30,10 +31,10 @@ spec:
               value: {{ printf "%s-%d" $fullname $i }}
       backendRefs:
         - name: {{ printf "%s-replica-%d" $fullname $i }}
-          port: {{ $.Values.service.port }}
+          port: {{ $.Values.gateway.service.port }}
     {{- end }}
     {{- end }}
     - backendRefs:
         - name: {{ $fullname }}
-          port: {{ .Values.service.port }}
+          port: {{ .Values.gateway.service.port }}
 {{- end }}

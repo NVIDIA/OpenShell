@@ -147,7 +147,7 @@ tests:
       metrics.tls.requireClientCert: true
     asserts:
       - failedTemplate:
-          errorMessage: 'metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName'
+          errorMessage: 'gateway.metrics.tls.requireClientCert requires gateway.metrics.tls.clientCaSecretName'
 
   - it: rejects a metrics client CA that reuses the gateway client CA Secret
     template: templates/statefulset.yaml
@@ -157,7 +157,7 @@ tests:
       metrics.tls.requireClientCert: true
     asserts:
       - failedTemplate:
-          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+          errorMessage: 'gateway.metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
 
   - it: rejects a metrics client CA that reuses a custom gateway client CA Secret
     template: templates/statefulset.yaml
@@ -169,7 +169,7 @@ tests:
       metrics.tls.requireClientCert: true
     asserts:
       - failedTemplate:
-          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+          errorMessage: 'gateway.metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
 
   - it: rejects a metrics client CA that reuses the gateway client TLS Secret
     template: templates/statefulset.yaml
@@ -179,7 +179,7 @@ tests:
       metrics.tls.requireClientCert: true
     asserts:
       - failedTemplate:
-          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)'
+          errorMessage: 'gateway.metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (gateway.tls.clientTlsSecretName)'
 
   - it: rejects a metrics client CA that reuses a custom gateway client TLS Secret
     template: templates/statefulset.yaml
@@ -191,7 +191,7 @@ tests:
       metrics.tls.requireClientCert: true
     asserts:
       - failedTemplate:
-          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)'
+          errorMessage: 'gateway.metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (gateway.tls.clientTlsSecretName)'
 
   - it: rejects metrics TLS when metrics are disabled
     template: templates/statefulset.yaml
@@ -200,7 +200,7 @@ tests:
       metrics.tls.enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: 'metrics.tls.enabled requires metrics.enabled=true'
+          errorMessage: 'gateway.metrics.tls.enabled requires gateway.metrics.enabled=true'
 
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
@@ -1306,7 +1306,7 @@ tests:
       server.tls.clientCaSecretName: null
     asserts:
       - failedTemplate:
-          errorMessage: "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode"
+          errorMessage: "gateway.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode"
 
   - it: configures gateway peer identity and projected peer token
     template: templates/statefulset.yaml
@@ -1444,7 +1444,7 @@ tests:
       replicaCount: 2
     asserts:
       - failedTemplate:
-          errorPattern: "replicaCount > 1 requires server.externalDbSecret"
+          errorPattern: "gateway.replicaCount > 1 requires gateway.externalDbSecret"
 
   - it: renders writable ephemeral XDG state for gateway trust artifacts
     template: templates/statefulset.yaml
@@ -1519,7 +1519,7 @@ tests:
       workload.kind: deployment
     asserts:
       - failedTemplate:
-          errorPattern: "workload.kind=deployment requires server.externalDbSecret"
+          errorPattern: "gateway.workload.kind=deployment requires gateway.externalDbSecret"
 
   - it: fails when multiple replicas use a StatefulSet without an override
     template: templates/statefulset.yaml
@@ -1528,7 +1528,7 @@ tests:
       server.externalDbSecret: my-pg-secret
     asserts:
       - failedTemplate:
-          errorPattern: "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true"
+          errorPattern: "gateway.replicaCount > 1 with gateway.workload.kind=statefulset requires gateway.workload.allowMultiReplicaStatefulSet=true"
 
   - it: allows a multi-replica StatefulSet with an external database and explicit override
     template: templates/statefulset.yaml
@@ -1556,7 +1556,7 @@ tests:
       workload.kind: daemonset
     asserts:
       - failedTemplate:
-          errorPattern: "workload.kind must be one of: statefulset, deployment"
+          errorPattern: "gateway.workload.kind must be one of: statefulset, deployment"
 
   - it: does not pass --db-url in args when externalDbSecret is set
     template: templates/statefulset.yaml

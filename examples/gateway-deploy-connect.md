@@ -16,8 +16,8 @@ Install the gateway into a Kubernetes cluster you manage:
 kubectl create namespace openshell
 helm upgrade --install openshell deploy/helm/openshell \
   --namespace openshell \
-  --set server.disableTls=true \
-  --set service.type=ClusterIP
+  --set gateway.disableTls=true \
+  --set gateway.service.type=ClusterIP
 ```
 
 For local evaluation, forward the service and register the forwarded endpoint:

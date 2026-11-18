@@ -145,7 +145,7 @@ helm upgrade --install openshell \
   --version <version> \
   --namespace openshell \
   --set workspaceResources.enabled=false \
-  --set server.sandboxNamespace=app-a
+  --set sandbox.namespace=app-a
 
 helm upgrade --install openshell-workspace \
   oci://ghcr.io/nvidia/openshell/openshell-workspace \
@@ -158,14 +158,14 @@ helm upgrade --install openshell-workspace \
 The workspace chart does not create the namespace or deploy a gateway. It owns
 only the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy in its
 release namespace. For one pre-provisioned namespace, keep
-`server.drivers.kubernetes.workspaceMode=shared` and set
-`server.sandboxNamespace=app-a`. To map multiple workspaces to separately
+`gatewayConfig.openshell\\.drivers\\.kubernetes.workspace_mode=shared` and set
+`sandbox.namespace=app-a`. To map multiple workspaces to separately
 provisioned namespaces, use `workspaceMode=operator`, configure exactly one of
 `operatorNamespaceLabel` or `operatorNamespaceFile`, and install the workspace
 chart in every allowlisted namespace. In operator mode, the workspace chart
 Role is the gateway's only Secret permission grant in that namespace.
 
-If you enable `server.drivers.kubernetes.allowDriverConfig` on the gateway,
+If you enable `gatewayConfig["openshell.drivers.kubernetes"].allow_driver_config` on the gateway,
 also set `gateway.allowDriverConfig=true` on every workspace release. This
 grants the namespace-scoped PVC metadata read needed to admit caller-selected
 PVC mounts. Leave both values disabled when callers do not need driver config.
@@ -181,9 +181,9 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.credentialDrivers.kubernetesSecrets.enabled=true \
-  --set server.credentialDrivers.kubernetesSecrets.namespace=openshell-credentials \
-  --set server.credentialDrivers.kubernetesSecrets.createNamespace=true
+  --set 'gatewayConfig.openshell\.gateway.credential_drivers[0]=kubernetes-secrets' \
+  --set gatewayConfig.openshell\\.credential_drivers\\.kubernetes-secrets.namespace=openshell-credentials \
+  --set gateway.credentialDrivers.kubernetesSecrets.createNamespace=true
 ```
 
 The driver stores every credential in that namespace, in every workspace mode.
@@ -197,7 +197,7 @@ the full set of options, refer to the
 kubectl -n openshell rollout status statefulset/openshell
 ```
 
-If you set `workload.kind=deployment`, wait on the Deployment instead:
+If you set `gateway.workload.kind=deployment`, wait on the Deployment instead:
 
 ```shell
 kubectl -n openshell rollout status deployment/openshell
@@ -248,7 +248,7 @@ openshell status
 
 To upgrade, rerun `helm upgrade --install` with the new `--version` and the values you installed with. Running sandboxes keep their supervisor and sandbox runtime images until they stop. When a stopped sandbox starts, it takes both images from the upgraded gateway and keeps its workload image and workspace.
 
-If you override images, set `supervisor.image` and `sandboxRuntime.image` to the same release, or set only `global.image.tag`. An incompatible pair fails when a sandbox starts, and the supervisor log shows the cause while the start is in progress:
+If you override images, set `supervisor.image` and `sandbox.runtime.image` to the same release, or set only `global.image.tag`. An incompatible pair fails when a sandbox starts, and the supervisor log shows the cause while the start is in progress:
 
 ```shell
 kubectl -n openshell logs -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/component=supervisor
@@ -299,27 +299,27 @@ The most commonly changed values are:
 |---|---|
 | `global.image.registry` / `global.image.tag` / `global.image.pullPolicy` | Shared registry, tag, and pull policy for the gateway, supervisor, and trusted sandbox runtime. Individual image settings take precedence. |
 | `gateway.image.registry` / `gateway.image.repository` / `gateway.image.tag` / `gateway.image.digest` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
-| `replicaCount` | Number of gateway replicas. Values above `1` require shared PostgreSQL through `server.externalDbSecret`. |
-| `priorityClassName` | Existing Kubernetes PriorityClass for gateway pods. Empty by default. |
-| `topologySpreadConstraints` | Kubernetes topology spread constraints for gateway replicas. Empty by default. Set selectors to match the gateway pod labels. |
-| `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
-| `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
-| `autoscaling.enabled` / `autoscaling.minReplicas` / `autoscaling.maxReplicas` | Render a HorizontalPodAutoscaler instead of a fixed `replicaCount`. Refer to [High Availability](/kubernetes/high-availability#scale-the-gateway). |
-| `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
+| `gateway.replicaCount` | Number of gateway replicas. Values above `1` require shared PostgreSQL through `gateway.externalDbSecret`. |
+| `gateway.priorityClassName` | Existing Kubernetes PriorityClass for gateway pods. Empty by default. |
+| `gateway.topologySpreadConstraints` | Kubernetes topology spread constraints for gateway replicas. Empty by default. Set selectors to match the gateway pod labels. |
+| `gateway.workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `gateway.externalDbSecret`. |
+| `gateway.workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `gateway.workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
+| `gateway.autoscaling.enabled` / `gateway.autoscaling.minReplicas` / `gateway.autoscaling.maxReplicas` | Render a HorizontalPodAutoscaler instead of a fixed `gateway.replicaCount`. Refer to [High Availability](/kubernetes/high-availability#scale-the-gateway). |
+| `sandbox.namespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
-| `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
-| `server.dataStorageSize` | Storage request for the gateway data PVC under `workload.kind=statefulset`. Defaults to `1Gi`. Requires an explicit unit, such as `20Gi`. |
-| `server.dataStorageClass` | `StorageClass` for the gateway data PVC under `workload.kind=statefulset`. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Use a block-backed class, not NFS. |
-| `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
+| `gateway.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
+| `gateway.dataStorageSize` | Storage request for the gateway data PVC under `gateway.workload.kind=statefulset`. Defaults to `1Gi`. Requires an explicit unit, such as `20Gi`. |
+| `gateway.dataStorageClass` | `StorageClass` for the gateway data PVC under `gateway.workload.kind=statefulset`. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Use a block-backed class, not NFS. |
+| `gateway.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
 | `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Default sandbox image used when a sandbox does not specify one. |
-| `sandboxRuntime.image.registry` / `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` / `sandboxRuntime.image.digest` | Trusted workload-side image that provides the `openshell-sandbox` binary. A digest takes precedence over the tag. |
+| `sandbox.runtime.image.registry` / `sandbox.runtime.image.repository` / `sandbox.runtime.image.tag` / `sandbox.runtime.image.digest` | Trusted workload-side image that provides the `openshell-sandbox` binary. A digest takes precedence over the tag. |
 | `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Trusted control-side supervisor image. |
-| `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
-| `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
-| `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
-| `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
-| `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
-| `server.serviceHostnameFormat` | Set to `hashed` to make exposed-service hostnames opaque per-gateway hash labels when multiple gateways share one service base domain behind a single ingress; the hash discriminator is the gateway installation name (`server.name`, defaulting to the release name), which must be unique among those gateways. Empty keeps the readable composite hostnames. Refer to [Ingress](/kubernetes/ingress#multiple-gateways-behind-one-ingress). |
+| `sandbox.imagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
+| `gatewayConfig["openshell.drivers.kubernetes"].grpc_endpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
+| `gateway.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
+| `gatewayConfig["openshell.gateway.auth"].allow_unauthenticated_users` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
+| `gatewayConfig["openshell.gateway"].enable_loopback_service_http` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
+| `gatewayConfig["openshell.gateway"].service_hostname_format` | Set to `hashed` to make exposed-service hostnames opaque per-gateway hash labels when multiple gateways share one service base domain behind a single ingress; the hash discriminator is the gateway installation name (`gatewayConfig["openshell.gateway"].name`, defaulting to the release name), which must be unique among those gateways. Empty keeps the readable composite hostnames. Refer to [Ingress](/kubernetes/ingress#multiple-gateways-behind-one-ingress). |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
@@ -335,7 +335,7 @@ helm upgrade --install openshell \
 ```
 
 <Warning>
-`server.dataStorageSize` and `server.dataStorageClass` feed the gateway StatefulSet's immutable `volumeClaimTemplates`. Set them at install time. Changing them later fails the upgrade and does not move existing data; refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md#data-pvc-storage) for migration steps.
+`gateway.dataStorageSize` and `gateway.dataStorageClass` feed the gateway StatefulSet's immutable `volumeClaimTemplates`. Set them at install time. Changing them later fails the upgrade and does not move existing data; refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md#data-pvc-storage) for migration steps.
 </Warning>
 
 To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret
@@ -351,8 +351,9 @@ kubectl -n openshell create secret docker-registry regcred \
 ```yaml
 server:
   sandboxImage: registry.example.com/team/openshell-sandbox:latest
-  sandboxImagePullSecrets:
-    - name: regcred
+sandbox:
+  imagePullSecrets:
+  - name: regcred
 ```
 
 ## Configure a Corporate Upstream Proxy
@@ -432,15 +433,15 @@ The ClusterRole grants node inspection and token validation:
 | `authentication.k8s.io` | `tokenreviews` | create |
 | `""` | `nodes` | get, list, watch |
 
-To use an existing ServiceAccount instead of creating one, set `serviceAccount.create=false` and supply its name:
+To use an existing ServiceAccount instead of creating one, set `gateway.serviceAccount.create=false` and supply its name:
 
 ```shell
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set serviceAccount.create=false \
-  --set serviceAccount.name=my-existing-sa
+  --set gateway.serviceAccount.create=false \
+  --set gateway.serviceAccount.name=my-existing-sa
 ```
 
 The ServiceAccount must already have the Role and ClusterRole bindings described above.
@@ -463,8 +464,8 @@ helm template openshell \
   --version <version> \
   --namespace openshell \
   -f my-values.yaml \
-  --set rbac.create=true \
-  --set rbac.clusterScoped.create=true \
+  --set gateway.rbac.create=true \
+  --set gateway.rbac.clusterScoped.create=true \
   --set agentSandbox.preflight.enabled=false \
   --show-only templates/clusterrole.yaml \
   --show-only templates/clusterrolebinding.yaml | kubectl apply -f -
@@ -480,19 +481,19 @@ helm upgrade --install openshell \
   --version <version> \
   --namespace openshell \
   -f my-values.yaml \
-  --set rbac.clusterScoped.create=false
+  --set gateway.rbac.clusterScoped.create=false
 ```
 
 The gateway ServiceAccount name and namespace are unchanged by this flag, so
 the pre-created `ClusterRoleBinding` still binds the ServiceAccount the
-namespaced release creates. The same holds with `serviceAccount.create=false`:
-the binding subject follows `serviceAccount.name`, so pass the same values to
+namespaced release creates. The same holds with `gateway.serviceAccount.create=false`:
+the binding subject follows `gateway.serviceAccount.name`, so pass the same values to
 both steps.
 
 #### Migrating an existing release
 
 Helm deletes objects that leave a release manifest, so setting
-`rbac.clusterScoped.create=false` on a release that already owns the
+`gateway.rbac.clusterScoped.create=false` on a release that already owns the
 `ClusterRole` and `ClusterRoleBinding` deletes them. The gateway then loses
 TokenReview until a cluster-admin re-applies them. Hand ownership over first, as
 cluster-admin, so nothing is deleted:
@@ -507,13 +508,13 @@ kubectl annotate clusterrolebinding "openshell-node-reader-<namespace>" \
 The objects then survive the upgrade that sets the flag, and the cluster-admin
 owns them from that point on. Fresh installs need no such step.
 
-`rbac.clusterScoped.create` is independent of the workspace mode. `managed` and
+`gateway.rbac.clusterScoped.create` is independent of the workspace mode. `managed` and
 `operator` modes change what the `ClusterRole` grants, but they never require a
 namespace-admin to apply it. Re-run the cluster-admin step after changing any
 value that affects the `ClusterRole` rules.
 
-Set `rbac.clusterScoped.clusterRoleName` and
-`rbac.clusterScoped.clusterRoleBindingName` when the cluster-admin owns the
+Set `gateway.rbac.clusterScoped.clusterRoleName` and
+`gateway.rbac.clusterScoped.clusterRoleBindingName` when the cluster-admin owns the
 naming.
 
 #### Which flag the installer needs
@@ -522,20 +523,20 @@ In the default `shared` workspace mode the release also creates a namespaced
 sandbox `Role` granting Agent Sandbox (`agents.x-k8s.io`) permissions.
 Kubernetes forbids granting permissions you do not hold, and the built-in
 `admin` ClusterRole does not cover that CRD, so an installer holding only
-`admin` cannot create it. `rbac.clusterScoped.create=false` alone is then not
+`admin` cannot create it. `gateway.rbac.clusterScoped.create=false` alone is then not
 enough, and the install fails with `attempting to grant RBAC permissions not
 currently held`.
 
 | Workspace mode | Installer holds | Use |
 |---|---|---|
-| `shared` | built-in `admin` only | `rbac.create=false`, cluster-admin pre-creates all gateway RBAC |
-| `shared` | `admin` plus the sandbox permissions in the namespace | `rbac.clusterScoped.create=false` |
-| `managed`, `operator` | built-in `admin` only | `rbac.clusterScoped.create=false` |
+| `shared` | built-in `admin` only | `gateway.rbac.create=false`, cluster-admin pre-creates all gateway RBAC |
+| `shared` | `admin` plus the sandbox permissions in the namespace | `gateway.rbac.clusterScoped.create=false` |
+| `managed`, `operator` | built-in `admin` only | `gateway.rbac.clusterScoped.create=false` |
 
 `managed` and `operator` render no namespaced sandbox `Role`, so no extra grant
 is needed there.
 
-With `rbac.create=false`, the cluster-admin applies the namespaced RBAC in the
+With `gateway.rbac.create=false`, the cluster-admin applies the namespaced RBAC in the
 same step by adding it to the render:
 
 ```shell
@@ -544,8 +545,8 @@ helm template openshell \
   --version <version> \
   --namespace openshell \
   -f my-values.yaml \
-  --set rbac.create=true \
-  --set rbac.clusterScoped.create=true \
+  --set gateway.rbac.create=true \
+  --set gateway.rbac.clusterScoped.create=true \
   --set agentSandbox.preflight.enabled=false \
   --show-only templates/clusterrole.yaml \
   --show-only templates/clusterrolebinding.yaml \

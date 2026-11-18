@@ -56,7 +56,7 @@ tests:
       server.disableTls: true
     asserts:
       - failedTemplate:
-          errorMessage: "openshiftRoute.enabled=true requires TLS (server.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS."
+          errorMessage: "openshiftRoute.enabled=true requires TLS (gateway.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS."
 
   - it: fails when external issuer is set but Route host is empty
     set:

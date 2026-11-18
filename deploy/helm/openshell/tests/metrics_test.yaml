@@ -116,7 +116,7 @@ tests:
       metrics.enabled: "false"
     asserts:
       - failedTemplate:
-          errorMessage: metrics.enabled must be a boolean
+          errorMessage: gateway.metrics.enabled must be a boolean
 
   - it: rejects a numeric enablement setting
     template: templates/statefulset.yaml
@@ -124,7 +124,7 @@ tests:
       metrics.enabled: 0
     asserts:
       - failedTemplate:
-          errorMessage: metrics.enabled must be a boolean
+          errorMessage: gateway.metrics.enabled must be a boolean
 
   - it: rejects the legacy zero disable sentinel with migration guidance
     template: templates/statefulset.yaml
@@ -132,7 +132,7 @@ tests:
       service.metricsPort: 0
     asserts:
       - failedTemplate:
-          errorPattern: 'to disable metrics, set metrics.enabled=false and keep a valid service.metricsPort'
+          errorPattern: 'to disable metrics, set gateway.metrics.enabled=false and keep a valid gateway.service.metricsPort'
 
   - it: rejects the legacy boolean disable sentinel with migration guidance
     template: templates/statefulset.yaml
@@ -140,7 +140,7 @@ tests:
       service.metricsPort: false
     asserts:
       - failedTemplate:
-          errorPattern: 'to disable metrics, set metrics.enabled=false and keep a valid service.metricsPort'
+          errorPattern: 'to disable metrics, set gateway.metrics.enabled=false and keep a valid gateway.service.metricsPort'
 
   - it: requires migration of the old port even with explicit disablement
     template: templates/statefulset.yaml
@@ -149,7 +149,7 @@ tests:
       service.metricsPort: 0
     asserts:
       - failedTemplate:
-          errorPattern: 'service.metricsPort must be an integer between 1 and 65535'
+          errorPattern: 'gateway.service.metricsPort must be an integer between 1 and 65535'
 
   - it: permits a retained port collision while metrics are disabled
     template: templates/gateway-config.yaml

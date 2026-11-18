@@ -105,8 +105,8 @@ preserves the qualified prerelease's commit-SHA image tags; those tags do not
 identify the stable rebuild. See [image contents verification](https://docs.nvidia.com/openshell/latest/security/verify-image-contents).
 
 For resource-admission failures, distinguish disabled caller driver config from
-missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
-to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
+missing resource approval. Helm defaults `gatewayConfig["openshell.drivers.kubernetes"].allow_driver_config`
+to false and `gatewayConfig["openshell.drivers.kubernetes"].resource_admission.enabled` to true. Existing PVCs, RuntimeClasses,
 and PriorityClasses need matching administrator-owned labels; namespace
 membership and read-only access do not grant approval. GPU devices and
 operator-selected image-pull Secrets do not need admission labels. In managed
@@ -150,7 +150,7 @@ Gateway configuration requires `[openshell] version = 2`, a singular
 canonical selector is absent; the gateway selects that driver with a warning.
 Empty, invalid, comma-delimited, or conflicting values fail startup. The
 WebSocket tunnel for edge-proxy CLI access is off unless
-`enable_websocket_tunnel = true` (`server.enableWebsocketTunnel` in Helm). Homebrew
+`enable_websocket_tunnel = true` (`gatewayConfig["openshell.gateway"].enable_websocket_tunnel` in Helm). Homebrew
 and RPM package startup migrates only exact package-generated v1 defaults. If
 an upgraded package still reports an unsupported version, inspect the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
 follow the published schema-v2 migration steps and must not be overwritten.
@@ -181,7 +181,7 @@ For a configured Vault credential driver, inspect its endpoint and trust bundle
 before debugging provider resolution. Non-loopback addresses must use HTTPS,
 and the driver never follows redirects. A private CA bundle augments platform
 roots but does not disable hostname verification. With Helm,
-`server.credentialDrivers.vault.caConfigMapName` names a ConfigMap whose
+`gateway.credentialDrivers.vault.caConfigMapName` names a ConfigMap whose
 `ca.crt` key is mounted at `/etc/openshell-tls/vault-ca/ca.crt`:
 
 ```bash
@@ -497,6 +497,16 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 
 ### Step 6: Check Kubernetes Helm Gateways
 
+Deployment values are component-owned under `gateway`, `supervisor`, and
+`sandbox`; application settings stay under top-level `gatewayConfig`. Old
+top-level deployment paths and `server` are compatibility aliases before chart
+`0.2.0` and fail after that boundary. If an upgrade fails on deprecated keys,
+export stored overrides with `helm get values`, migrate them using the published
+[Helm migration guide](https://docs.nvidia.com/openshell/latest/kubernetes/migrate-gateway-config),
+and replace them with `--reset-values -f migrated-values.yaml`. `--reuse-values`
+keeps deprecated keys. Keep `pkiInitJob`, `grpcRoute`, `certManager`, and
+`openshiftRoute` at the top level.
+
 ```bash
 helm -n openshell status openshell
 helm -n openshell get values openshell
@@ -526,7 +536,7 @@ RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
 the global Helm pull policy applies to runtime and supervisor images.
 
 When multiple gateways share one service base domain, confirm each release
-sets `server.serviceHostnameFormat: hashed` and a `server.name` unique among
+sets `gatewayConfig["openshell.gateway"].service_hostname_format: hashed` and a `gatewayConfig["openshell.gateway"].name` unique among
 those gateways — the installation name is the hash discriminator for
 exposed-service hostnames, so a duplicate name silently routes two gateways'
 services to the same hostnames and a rename invalidates every previously
@@ -550,11 +560,11 @@ kubectl -n openshell rollout status <deployment-or-statefulset>/openshell
 kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 ```
 
-`server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
+`gateway.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
 
-Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
-`tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
+Gateway pod scheduling accepts `gateway.nodeSelector`, `gateway.affinity`,
+`gateway.tolerations`, `gateway.priorityClassName`, and `gateway.topologySpreadConstraints` values for
 both StatefulSet and Deployment workloads. The last two default to unset.
 If a gateway pod stays Pending, inspect its scheduling events, confirm the
 named PriorityClass exists (`kubectl get priorityclass`), and check that topology
@@ -651,14 +661,14 @@ When no external credential driver is enabled, the Helm chart uses the
 gateway's default encrypted database credential storage. The chart creates a
 retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and
 stores encrypted credential envelopes in the OpenShell database. For
-`workload.kind=deployment` or multi-replica gateways, confirm
-`server.externalDbSecret` points at a shared database. A render/install error
+`gateway.workload.kind=deployment` or multi-replica gateways, confirm
+`gateway.externalDbSecret` points at a shared database. A render/install error
 mentioning multiple credential drivers means the
 `gatewayConfig.openshell.gateway.credential_drivers` list selected more than
 one external credential backend.
 
 For HA or PostgreSQL-backed installs, also check the external database Secret
-referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
+referenced by `gateway.externalDbSecret` and the PostgreSQL workload when it is
 deployed in-cluster:
 
 ```bash
@@ -890,11 +900,11 @@ kubectl -n openshell describe hpa openshell
 
 The JSONPath filter keeps only pods whose first container is the gateway
 (`openshell-gateway`). It skips certificate hook Job pods, which older charts
-labeled like gateway pods. Helm enables metrics with `metrics.enabled=true`
+labeled like gateway pods. Helm enables metrics with `gateway.metrics.enabled=true`
 (the default). Set it to `false` to omit the listener and its container and
-Service ports. `service.metricsPort` selects the port (default `9090`) and
+Service ports. `gateway.service.metricsPort` selects the port (default `9090`) and
 must remain between 1 and 65535 even when metrics are disabled. Migrate legacy
-port `0` or `false` to `metrics.enabled=false` and a valid port in the same
+port `0` or `false` to `gateway.metrics.enabled=false` and a valid port in the same
 upgrade; those legacy values fail rendering. Metrics TLS requires enablement.
 
 The API server proxy connects to each pod from the control plane. A
@@ -922,11 +932,11 @@ kubectl -n openshell get secret \
   openshell-jwt-keys
 ```
 
-When `server.tls.clientCaSecretName=""`, the chart intentionally omits
+When `gateway.tls.clientCaSecretName=""`, the chart intentionally omits
 `client_ca_path` and the `tls-client-ca` mount, even with built-in PKI or
 cert-manager. That is expected; do not treat a missing `tls-client-ca` pod
 mount as a defect (`openshell-server-client-ca` may still exist from PKI).
-User auth is OIDC or trusted proxy (`server.auth.allowUnauthenticatedUsers=true`);
+User auth is OIDC or trusted proxy (`gatewayConfig.openshell\\.gateway\\.auth.allow_unauthenticated_users=true`);
 supervisor transport still uses `openshell-client-tls`.
 
 In cert-manager installs, `certManager.enabled=true` makes cert-manager own TLS
@@ -967,14 +977,14 @@ hostnames in `certManager.serverDnsNames`, for exactly this reason.
 
 If sandbox supervisors fail their TLS handshake to the gateway with
 `UnknownCA` after configuring `serverIssuerRef`, the most likely cause is
-`server.grpcEndpoint` set to the external hostname.  This forces supervisors
+`gatewayConfig["openshell.drivers.kubernetes"].grpc_endpoint` set to the external hostname.  This forces supervisors
 to connect via the external hostname, receiving the ACME cert (via SNI) which
-they cannot verify against the chart CA.  Remove `server.grpcEndpoint` or set
+they cannot verify against the chart CA.  Remove `gatewayConfig["openshell.drivers.kubernetes"].grpc_endpoint` or set
 it to the internal service name so supervisors receive the internal cert:
 
 ```bash
-helm -n openshell get values openshell | grep -E 'grpcEndpoint|clientCaFromServerTlsSecret|clientCaSecretName|serverIssuerRef|caSecretName'
-# server.grpcEndpoint should be unset or point to internal service name
+helm -n openshell get values openshell | grep -E 'grpcEndpoint|grpc_endpoint|clientCaFromServerTlsSecret|clientCaSecretName|serverIssuerRef|caSecretName'
+# gatewayConfig["openshell.drivers.kubernetes"].grpc_endpoint should be unset or point to the internal service name
 ```
 
 Less commonly, `UnknownCA` can occur if the gateway's client-verification CA
@@ -984,7 +994,7 @@ the chart CA (the same CA that signs the client cert), so its `ca.crt` is
 the right trust anchor. Supervisor Pods project only `ca.crt` from the copied
 Secret; `tls.crt` and `tls.key` are reserved for user clients and must not be
 visible in a sandbox. Only override this if you intentionally mount a
-separate client CA via `server.tls.clientCaSecretName`.  Verify the mounted
+separate client CA via `gateway.tls.clientCaSecretName`.  Verify the mounted
 client CA matches the CA that signed the client certificate:
 
 ```bash
@@ -994,12 +1004,12 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 
 #### Secure metrics TLS
 
-When `metrics.tls.enabled=true`, the dedicated metrics listener uses its own
+When `gateway.metrics.tls.enabled=true`, the dedicated metrics listener uses its own
 TLS configuration and, when requested, an independent scraper client CA. Do
 not use the gateway client CA: sandbox workloads receive gateway client
 credentials, so trusting that CA here would grant them metrics access. The
-chart fails rendering when `metrics.tls.clientCaSecretName` matches
-`server.tls.clientCaSecretName` or `server.tls.clientTlsSecretName`; that
+chart fails rendering when `gateway.metrics.tls.clientCaSecretName` matches
+`gateway.tls.clientCaSecretName` or `gateway.tls.clientTlsSecretName`; that
 check is by name only. Inspect
 the rendered configuration and the read-only Secret mounts before debugging the
 scraper:
@@ -1099,15 +1109,17 @@ platform's SBOM; the binary's glibc compatibility floor is not its runtime versi
 For plaintext local evaluation, confirm the chart has:
 
 ```bash
-helm -n openshell get values openshell | grep -E 'disableTls|grpcEndpoint'
+helm -n openshell get values openshell | grep -E 'disableTls|grpcEndpoint|grpc_endpoint'
 ```
 
 Expected shape:
 
 ```yaml
-server:
+gateway:
   disableTls: true
-  grpcEndpoint: http://openshell.openshell.svc.cluster.local:8080
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    grpc_endpoint: http://openshell.openshell.svc.cluster.local:8080
 ```
 
 Check service exposure:
@@ -1340,7 +1352,7 @@ The default target is `512Mi` average memory per Pod, with two to four members.
 Check `kubectl describe hpa <fullname>-supervisor -n <namespace>` and
 `kubectl top pods -n <namespace> -l app.kubernetes.io/component=supervisor`.
 An unknown memory target or `ScalingActive=False` can mean the resource metrics
-API (usually Metrics Server) is unavailable. The top-level `autoscaling` values
+API (usually Metrics Server) is unavailable. The `gateway.autoscaling` values
 control the gateway HPA separately. Scaling up adds capacity for new sandboxes
 and does not redistribute existing owners; check individual Pod memory as well
 as the average. See the published High Availability guide for configuration
@@ -1352,7 +1364,7 @@ shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
 renders only `[openshell.gateway.supervisor_pool] recovery_timeout_secs` (the
 driver's `shared_supervisor` table carries no pool settings), rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control
-supervisor scheduling; top-level `affinity` applies only to the gateway), gives
+supervisor scheduling; `gateway.affinity` applies only to the gateway), gives
 each member a 60-second grace period to leave,
 and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`
 unless `supervisor.podDisruptionBudget.enabled` is `false` (default `true`).
@@ -1637,20 +1649,20 @@ credential failures.
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
 | CPU-only VM startup reports that read-only `/proc` cannot be removed | Older supervisors can infer GPU requirements from host devices | Check gateway, VM driver, and bundled supervisor versions; use matching updated artifacts. CPU-only VMs do not require read-write `/proc`. |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
-| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>`; if the gateway PVC is unbound because the cluster has no default `StorageClass`, set `server.dataStorageClass` to a valid one, and size the claim with `server.dataStorageSize` |
-| `helm upgrade` fails on a forbidden update to the gateway StatefulSet after changing `server.dataStorageSize` or `server.dataStorageClass` | `volumeClaimTemplates` is immutable on an existing StatefulSet | `kubectl -n openshell delete statefulset openshell --cascade=orphan`, then re-upgrade; the orphaned PVC keeps its original size and class, so grow it with in-place PVC expansion or copy the data to a new claim |
-| Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
+| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>`; if the gateway PVC is unbound because the cluster has no default `StorageClass`, set `gateway.dataStorageClass` to a valid one, and size the claim with `gateway.dataStorageSize` |
+| `helm upgrade` fails on a forbidden update to the gateway StatefulSet after changing `gateway.dataStorageSize` or `gateway.dataStorageClass` | `volumeClaimTemplates` is immutable on an existing StatefulSet | `kubectl -n openshell delete statefulset openshell --cascade=orphan`, then re-upgrade; the orphaned PVC keeps its original size and class, so grow it with in-place PVC expansion or copy the data to a new claim |
+| Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `gatewayConfig["openshell.drivers.kubernetes"].workspace_storage_class` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |
 | RPCs fail after about 5 seconds with `UNAVAILABLE` `DATABASE_UNAVAILABLE` or "database unavailable: pool timed out" | PostgreSQL unreachable or not answering, or every data-pool connection busy | `database health check` warnings and `/readyz` on the gateway, PostgreSQL logs, `database_max_connections` and the connection sizing in the High Availability guide |
 | Kubernetes gateway pod Running but never Ready, logging `database unreachable; retrying` | The gateway started while PostgreSQL was unreachable and waits for it | PostgreSQL pod and Service endpoints, the host and port in the database URL, network policy between the gateway and PostgreSQL |
 | Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | `openshell_server_mutation_lock_errors_total`, PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
-| `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
+| `helm upgrade` fails with an `gateway.autoscaling.*` message | HPA values invalid: missing `gateway.resources.requests` (or `gateway.resources.limits`), `maxReplicas` above 1 without `gateway.externalDbSecret` (or on a StatefulSet without `gateway.workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
 | One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
 | Certificate hook Job stays active after `certgen` exits successfully | An injected sidecar is still running in the hook Pod | Inspect all container statuses. Configure `pkiInitJob.podLabels` or `pkiInitJob.podAnnotations` as required by the injector, then retry the Helm install or upgrade to recreate the hook Pods |
-| Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
-| OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
+| Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `gateway.securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
+| OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `gateway.podSecurityContext`/`gateway.securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `gateway.podSecurityContext: null` and clear `gateway.securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
 | Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not; right after a fresh install the kubelet can take about 90 seconds to project the written token into the already-ready Pod, so launches can be refused for no live pool member until the supervisor logs `gateway accepted the supervisor host`), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal (a refusal or startup failure naming `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` or `_ADVERTISE_IP` means the Pod lacks its member identity; the chart sets them from the Pod name and IP); gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
 | Shared sandbox workloads terminate after a supervisor Pod or node failure (`sandbox-supervisor-recovery-expired`) | One supervisor replica (no member to fail over to), no live pool member took over, or the recovery timeout is shorter than detection plus takeover | `supervisor.replicas` and the `<release>-supervisor` PodDisruptionBudget; gateway `taking over a shared sandbox instance` logs; workload Pod `sandbox-supervisor-*` findings; `supervisor.recoveryTimeoutSeconds`. See "Shared supervisor high availability" in Step 6 |
@@ -1659,7 +1671,7 @@ credential failures.
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
-| Gateway exits during OIDC initialization | Issuer is not HTTPS, discovery redirected, metadata used a non-JSON media type or exceeded its size limit, the configured `ca_bundle` is missing, invalid, non-regular, or larger than 1 MiB, or `jwks_uri` uses an untrusted origin | Use an HTTPS issuer; mount a private CA with `server.oidc.caConfigMapName` and confirm `[openshell.gateway.oidc] ca_bundle` names the mounted regular-file `ca.crt` and is no larger than 1 MiB; keep JWKS on the issuer origin or explicitly add its HTTPS origin to `server.oidc.jwksAllowedOrigins`. The issuer CA augments platform roots for OIDC only. Numeric-loopback HTTP is development-only and also requires `server.oidc.dangerouslyAllowInsecureHttp=true` |
+| Gateway exits during OIDC initialization | Issuer is not HTTPS, discovery redirected, metadata used a non-JSON media type or exceeded its size limit, the configured `ca_bundle` is missing, invalid, non-regular, or larger than 1 MiB, or `jwks_uri` uses an untrusted origin | Use an HTTPS issuer; mount a private CA with `gateway.oidc.caConfigMapName` and confirm `[openshell.gateway.oidc] ca_bundle` names the mounted regular-file `ca.crt` and is no larger than 1 MiB; keep JWKS on the issuer origin or explicitly add its HTTPS origin to `gatewayConfig["openshell.gateway.oidc"].jwks_allowed_origins`. The issuer CA augments platform roots for OIDC only. Numeric-loopback HTTP is development-only and also requires `gatewayConfig.openshell\\.gateway\\.oidc.dangerously_allow_insecure_http=true` |
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |
 | Authenticated interceptor or middleware rejects gateway calls | Private CA or hostname mismatch, expected audience or issuer mismatch, stale/unknown `kid`, or malformed extension token | `tls_ca_cert_path`, registration `audience`, service verifier config and logs; fetch well-known metadata only through the already-trusted gateway TLS endpoint |
 | Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `user` when composition with imported profiles is intended |
@@ -1676,12 +1688,12 @@ credential failures.
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Gateway API CRDs | Install the standard Gateway API CRDs and selected controller, then enable `grpcRoute` before applying the optional ingress resources |
 | A custom GatewayClass does not program the chart-created Gateway, or its proxy Service conflicts with the OpenShell Service | The selected controller is unavailable, or the default `grpcRoute.gateway.name` reuses the OpenShell Service name | Check `kubectl get gatewayclass,gateway,grpcroute -A`; set a distinct Gateway name such as `<fullname>-ingress`. For an existing Gateway, set `gateway.create=false` plus `gateway.name`, `gateway.namespace`, and optional `gateway.sectionName` |
-| HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
-| With `grpcRoute.replicaRouting.enabled=true`, sandbox SSH, forward, or exec still relay through a peer replica | A `<release>-replica-<i>` Service has no endpoint, so Envoy returns `Unavailable` and the CLI retries unrouted | `kubectl -n openshell get endpoints <release>-replica-0 <release>-replica-1`; confirm `workload.kind=statefulset` and the GRPCRoute status is `Accepted`/`ResolvedRefs` |
-| HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
+| HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `gateway.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
+| With `grpcRoute.replicaRouting.enabled=true`, sandbox SSH, forward, or exec still relay through a peer replica | A `<release>-replica-<i>` Service has no endpoint, so Envoy returns `Unavailable` and the CLI retries unrouted | `kubectl -n openshell get endpoints <release>-replica-0 <release>-replica-1`; confirm `gateway.workload.kind=statefulset` and the GRPCRoute status is `Accepted`/`ResolvedRefs` |
+| HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `gatewayConfig["openshell.gateway.oidc"].issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `gatewayConfig.openshell\\.gateway\\.auth.allow_unauthenticated_users=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
-| Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
-| Browser `ERR_BAD_SSL_CLIENT_AUTH_CERT` or gateway logs show client cert verification when OIDC or direct HTTPS is expected | Listener client-CA verification still enabled (`clientCaSecretName` unset or `client_ca_path` in ConfigMap) | Set `server.tls.clientCaSecretName=""`, upgrade chart, confirm ConfigMap omits `client_ca_path` |
+| Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `gatewayConfig["openshell.drivers.kubernetes"].grpc_endpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `gatewayConfig["openshell.drivers.kubernetes"].grpc_endpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
+| Browser `ERR_BAD_SSL_CLIENT_AUTH_CERT` or gateway logs show client cert verification when OIDC or direct HTTPS is expected | Listener client-CA verification still enabled (`clientCaSecretName` unset or `client_ca_path` in ConfigMap) | Set `gateway.tls.clientCaSecretName=""`, upgrade chart, confirm ConfigMap omits `client_ca_path` |
 
 ## Reporting
 

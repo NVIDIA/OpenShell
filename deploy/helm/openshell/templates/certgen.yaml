@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -105,8 +106,8 @@ spec:
             {{- if .Values.certManager.enabled }}
             - --jwt-only
             {{- else }}
-            - --server-secret-name={{ .Values.server.tls.certSecretName }}
-            - --client-secret-name={{ .Values.server.tls.clientTlsSecretName }}
+            - --server-secret-name={{ .Values.gateway.tls.certSecretName }}
+            - --client-secret-name={{ .Values.gateway.tls.clientTlsSecretName }}
             {{- end }}
             - --jwt-secret-name={{ include "openshell.sandboxJwtSecretName" . }}
             {{- if and .Values.pkiInitJob.enabled (not .Values.certManager.enabled) }}
@@ -177,7 +178,7 @@ spec:
             - --jwt-only
             - --jwt-secret-name={{ include "openshell.sandboxJwtSecretName" . }}
             - --backend-ca-configmap-name={{ include "openshell.backendCaConfigMapName" . }}
-            - --backend-ca-source-secret={{ .Values.server.tls.certSecretName }}
+            - --backend-ca-source-secret={{ .Values.gateway.tls.certSecretName }}
             - --backend-ca-poll-timeout-seconds={{ .Values.pkiInitJob.timeoutSeconds }}
             {{- if .Values.pkiInitJob.failOnTimeout }}
             - --backend-ca-fail-on-timeout

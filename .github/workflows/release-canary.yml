@@ -413,9 +413,9 @@ jobs:
           helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
             --version 0.0.0-dev \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
-            --set server.disableTls=true \
-            --set server.auth.allowUnauthenticatedUsers=true \
-            --set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}" \
+            --set gateway.disableTls=true \
+            --set 'gatewayConfig.openshell\.gateway\.auth.allow_unauthenticated_users=true' \
+            --set "gateway.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}" \
             --wait --timeout 5m
 
       - name: Verify gateway pod is Ready

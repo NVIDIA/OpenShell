@@ -1,3 +1,4 @@
+{{- include "openshell.resolveValues" . -}}
 {{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- $supervisorNetwork := .Values.supervisor.network | default dict -}}

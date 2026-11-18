@@ -22,7 +22,7 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
 `OPENSHELL_TELEMETRY_ENABLED=false` through the service environment, and the
-Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
+Kubernetes job installs with `gateway.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
 The workflow sets `OPENSHELL_VERSION=dev` for every `install.sh` job. Positive
@@ -114,8 +114,8 @@ bash e2e/support/install-agent-sandbox.sh
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
   --namespace openshell --create-namespace \
-  --set server.disableTls=true \
-  --set server.telemetryEnabled=false \
+  --set gateway.disableTls=true \
+  --set gateway.telemetryEnabled=false \
   --wait --timeout 5m
 
 kubectl wait --namespace openshell \
@@ -129,7 +129,7 @@ openshell status
 ```
 
 Keep `pkiInitJob.enabled=true` (the chart default), even when
-`server.disableTls=true`. The hook also generates the sandbox JWT signing
+`gateway.disableTls=true`. The hook also generates the sandbox JWT signing
 secret that the gateway pod always mounts.
 
 Swap `0.0.0-dev` for `0.0.0-dev.<sha>` to pin to a specific dev build. Tear down with `kind delete cluster --name release-canary-local`.
