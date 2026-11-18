@@ -699,13 +699,13 @@ enum Commands {
         name: Option<String>,
 
         /// SSH host key the sandbox must present: the fingerprint the gateway
-        /// published, or `unverified`. Required in token mode; name mode asks
-        /// the gateway instead.
+        /// published, or `unverified`. Token mode only; name mode asks the
+        /// gateway instead.
         #[arg(long, requires = "known_hosts", conflicts_with = "name")]
         host_key: Option<HostKeyExpectation>,
 
         /// Known-hosts file in which the verified host key is pinned for `ssh`.
-        /// Required in both modes.
+        /// Without it the host key is not verified.
         #[arg(long)]
         known_hosts: Option<PathBuf>,
     },
@@ -4199,16 +4199,27 @@ async fn run_async() -> Result<()> {
             match (gateway, sandbox, token, server, gateway_name, name) {
                 // Token mode (existing behavior): pre-created session credentials.
                 (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
-                    let (Some(expectation), Some(known_hosts)) = (host_key, known_hosts) else {
-                        eprintln!(
-                            "openshell: this SSH connection was started by an OpenShell client that predates host-key verification and is refused.\n\
-                             Restart that client (the openshell command or openshell term) and connect again."
-                        );
-                        std::process::exit(1);
+                    let host_key = match (host_key, known_hosts) {
+                        (Some(expectation), Some(known_hosts)) => Some(
+                            KnownHostsPin::at(known_hosts, &sandbox, &cli.workspace)
+                                .and_then(|pin| HostKeyCheck::for_relay(expectation, pin))
+                                .map_err(|err| miette::miette!("{err}"))?,
+                        ),
+                        // The `ssh` of such a client accepts any host key.
+                        (None, None) => {
+                            eprintln!(
+                                "openshell: warning: this SSH connection was started by an OpenShell client that predates host-key verification, so the SSH host key is NOT verified.\n\
+                                 Restart that client (the openshell command or openshell term)."
+                            );
+                            None
+                        }
+                        // Nothing would pin a key for the `ssh` that reads the file.
+                        _ => {
+                            return Err(miette::miette!(
+                                "--known-hosts requires --host-key when --token is given"
+                            ));
+                        }
                     };
-                    let host_key = KnownHostsPin::at(known_hosts, &sandbox, &cli.workspace)
-                        .and_then(|pin| HostKeyCheck::for_relay(expectation, pin))
-                        .map_err(|err| miette::miette!("{err}"))?;
                     let mut effective_tls = match gateway_name_opt {
                         Some(ref g) => tls.with_gateway_name(g),
                         None => tls,

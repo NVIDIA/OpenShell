@@ -72,10 +72,6 @@ async fn proxy_exits_with_stdin_open(relay_status: tonic::Status) {
             "repro",
             "--token",
             "test-token",
-            "--host-key",
-            "unverified",
-            "--known-hosts",
-            &config.path().join("known_hosts").display().to_string(),
         ])
         .env("XDG_CONFIG_HOME", config.path())
         .env("OPENSHELL_TELEMETRY_ENABLED", "false")

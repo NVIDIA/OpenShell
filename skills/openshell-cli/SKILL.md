@@ -554,10 +554,10 @@ sandbox, even under the same name, creates a different identity. See the
 for verification behavior and release compatibility.
 
 The CLI, the TUI, and generated SSH config entries verify the host key against
-that fingerprint on every SSH connection they open and fail closed. Each
-refusal (`SSH host key mismatch`, `has no published SSH host key`, `predates
-host-key verification`) prints its fix. The TUI status line shows only the
-first line; run `openshell sandbox connect <name>` to read the rest.
+that fingerprint on every SSH connection they open, and refuse a different key
+with `SSH host key mismatch`. A `NOT verified` warning means the gateway
+published no fingerprint, or the SSH config entry predates host-key
+verification; the warning prints its fix.
 
 For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 

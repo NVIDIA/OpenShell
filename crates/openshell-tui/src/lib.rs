@@ -1218,9 +1218,7 @@ use openshell_core::forward::{
     SandboxProxyCommand, format_gateway_url, resolve_ssh_gateway, sandbox_proxy_command,
     sandbox_ssh_args, shell_escape, validate_ssh_session_response,
 };
-use openshell_core::ssh_host_key::{
-    HostKeyCheck, HostKeyError, SandboxSshTarget, allow_unverified_host_key,
-};
+use openshell_core::ssh_host_key::{HostKeyCheck, HostKeyError, SandboxSshTarget};
 
 /// Decide how the sandbox's SSH host key is checked and build the
 /// `ProxyCommand` that enforces it. The warning is present when the key cannot
@@ -1231,7 +1229,7 @@ fn sandbox_proxy_for_session(
     gateway_url: &str,
     target: &SandboxSshTarget<'_>,
 ) -> std::result::Result<(SandboxProxyCommand, Option<String>), HostKeyError> {
-    let host_key = HostKeyCheck::for_session(session, target, allow_unverified_host_key())?;
+    let host_key = HostKeyCheck::for_session(session, target)?;
     let unverified_warning = host_key.unverified_warning(target.sandbox);
     let proxy_command = sandbox_proxy_command(
         &exe.to_string_lossy(),

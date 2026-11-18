@@ -24,14 +24,15 @@ use crate::proto::CreateSshSessionResponse;
 
 const FINGERPRINT_PREFIX: &str = "SHA256:";
 const UNVERIFIED: &str = "unverified";
-const ALLOW_UNVERIFIED_ENV: &str = "OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY";
 const HOST_KEY_ALGORITHM: &str = "ssh-ed25519";
 const PIN_HEADER: &str =
     "# Managed by OpenShell. Rewritten from the gateway-published fingerprint; do not edit.\n";
 /// `string "ssh-ed25519"`, then the length prefix of the 32-byte key.
 const ED25519_BLOB_PREFIX: &[u8] = b"\0\0\0\x0bssh-ed25519\0\0\0\x20";
 const ED25519_KEY_LEN: usize = 32;
-const MAX_BANNER_LINE_LEN: usize = 8192;
+/// The longest identification line of RFC 4253, with its line ending. Every
+/// `ssh` release reads a line this short whole; older ones split a longer one.
+const MAX_BANNER_LINE_LEN: usize = 255;
 /// The padding length byte plus one payload byte, up to the largest packet
 /// `ssh` accepts.
 const PACKET_LENGTHS: std::ops::RangeInclusive<usize> = 2..=262_144;
@@ -84,7 +85,7 @@ impl HostKeyFingerprint {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HostKeyExpectation {
     Fingerprint(HostKeyFingerprint),
-    /// Only when the gateway published nothing and the user opted in.
+    /// Only when the gateway published nothing.
     AcceptAny,
 }
 
@@ -110,39 +111,19 @@ impl fmt::Display for HostKeyExpectation {
 }
 
 impl HostKeyExpectation {
-    /// Interprets the fingerprint field of a gateway response.
-    /// `allow_unverified` decides only what an empty field means.
-    pub fn from_published(
-        published: &str,
-        sandbox: &str,
-        allow_unverified: bool,
-    ) -> Result<Self, HostKeyError> {
-        if !published.is_empty() {
-            published.parse().map(Self::Fingerprint)
-        } else if allow_unverified {
+    /// Interprets the fingerprint field of a gateway response. A gateway
+    /// that predates sandbox SSH identities leaves it empty.
+    pub fn from_published(published: &str) -> Result<Self, HostKeyError> {
+        if published.is_empty() {
             Ok(Self::AcceptAny)
         } else {
-            Err(HostKeyError::Unpublished {
-                sandbox: sandbox.to_string(),
-            })
+            published.parse().map(Self::Fingerprint)
         }
     }
 }
 
-/// Whether a sandbox with no published fingerprint may be reached unverified:
-/// only when `OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY` is `1`.
-pub fn allow_unverified_host_key() -> bool {
-    std::env::var(ALLOW_UNVERIFIED_ENV).is_ok_and(|value| value == "1")
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum HostKeyError {
-    #[error(
-        "sandbox '{sandbox}' has no published SSH host key, so its SSH server cannot be verified.\n  \
-         If the gateway predates sandbox SSH identities, upgrade it. Otherwise stop and start the sandbox so the gateway assigns a key.\n  \
-         To connect without verification, set {ALLOW_UNVERIFIED_ENV}=1."
-    )]
-    Unpublished { sandbox: String },
     #[error("SSH host key fingerprint is not 'SHA256:' followed by 43 unpadded base64 characters")]
     BadFingerprint,
     #[error(
@@ -165,7 +146,7 @@ pub enum HostKeyError {
     Malformed(&'static str),
     #[error(
         "SSH known-hosts path '{}' cannot be used: it must be absolute, be built from plain gateway, \
-         sandbox and workspace names, and contain no '%', '\"', '\\', \"${{\" or newline",
+         sandbox and workspace names, and contain no '\"', '\\', \"${{\" or newline",
         .0.display()
     )]
     UnusablePath(PathBuf),
@@ -210,12 +191,12 @@ impl KnownHostsPin {
     /// The `ssh-proxy` side: the path the `ssh` invocation or config block
     /// handed over.
     pub fn at(path: PathBuf, sandbox: &str, workspace: &str) -> Result<Self, HostKeyError> {
-        // `ssh` expands `%` tokens and `${VAR}` in both UserKnownHostsFile and
-        // ProxyCommand, a quote or newline would end the value early, and a
-        // backslash escapes the character after it. Where the backslash
-        // separates path components, rejecting it would reject every path.
+        // `ssh` expands `${VAR}` in UserKnownHostsFile and has no escape for
+        // it, a quote or newline would end the value early, and a backslash
+        // escapes the character after it. Where the backslash separates path
+        // components, rejecting it would reject every path.
         let expands_or_breaks = |text: &str| {
-            text.contains(['%', '"', '\n'])
+            text.contains(['"', '\n'])
                 || text.contains("${")
                 || (MAIN_SEPARATOR != '\\' && text.contains('\\'))
         };
@@ -258,6 +239,12 @@ impl KnownHostsPin {
         &self.path
     }
 
+    /// The path as `ssh` must be given it in `UserKnownHostsFile` and inside
+    /// a `ProxyCommand`: it expands `%` tokens in both, and `%%` is a `%`.
+    pub fn ssh_path(&self) -> String {
+        self.path.display().to_string().replace('%', "%%")
+    }
+
     /// The options of every sandbox SSH connection that decide which host key
     /// it trusts, in the order they are passed. Rendered as `-o key=value` on
     /// a command line and as `key value` lines in a config block.
@@ -266,7 +253,7 @@ impl KnownHostsPin {
             ("StrictHostKeyChecking", "yes".to_string()),
             // Quoted, so that no `ssh` release splits the path at whitespace,
             // `=` or an apostrophe.
-            ("UserKnownHostsFile", format!("\"{}\"", self.path.display())),
+            ("UserKnownHostsFile", format!("\"{}\"", self.ssh_path())),
             ("GlobalKnownHostsFile", "/dev/null".to_string()),
             ("HostKeyAlias", self.alias()),
             ("HostKeyAlgorithms", HOST_KEY_ALGORITHM.to_string()),
@@ -381,13 +368,8 @@ impl HostKeyCheck {
     pub fn for_session(
         session: &CreateSshSessionResponse,
         target: &SandboxSshTarget<'_>,
-        allow_unverified: bool,
     ) -> Result<Self, HostKeyError> {
-        let expectation = HostKeyExpectation::from_published(
-            &session.host_key_fingerprint,
-            target.sandbox,
-            allow_unverified,
-        )?;
+        let expectation = HostKeyExpectation::from_published(&session.host_key_fingerprint)?;
         Self::for_relay(expectation, KnownHostsPin::for_target(target)?)
     }
 
@@ -407,7 +389,8 @@ impl HostKeyCheck {
     pub fn unverified_warning(&self, sandbox: &str) -> Option<String> {
         matches!(self.expectation, HostKeyExpectation::AcceptAny).then(|| {
             format!(
-                "warning: SSH host key of sandbox '{sandbox}' is NOT verified (the gateway published no fingerprint)"
+                "warning: SSH host key of sandbox '{sandbox}' is NOT verified: the gateway published no fingerprint. \
+                 Upgrade a gateway that predates sandbox SSH identities; otherwise stop and start the sandbox."
             )
         })
     }
@@ -416,13 +399,14 @@ impl HostKeyCheck {
         self.pin.ssh_options()
     }
 
-    /// `["--host-key", <expectation>, "--known-hosts", <path>]`
+    /// `["--host-key", <expectation>, "--known-hosts", <path>]`, for a
+    /// `ProxyCommand`.
     pub(crate) fn proxy_flags(&self) -> [String; 4] {
         [
             "--host-key".to_string(),
             self.expectation.to_string(),
             "--known-hosts".to_string(),
-            self.pin.path.display().to_string(),
+            self.pin.ssh_path(),
         ]
     }
 
@@ -467,7 +451,8 @@ impl HostKeyCheck {
             (GatePhase::KexInit, MSG_KEXINIT, _) if first_kex_packet_follows(fields) == Some(0) => {
                 Ok(GatePhase::GroupOrReply)
             }
-            (GatePhase::GroupOrReply | GatePhase::Reply, _, Some(blob)) => {
+            (GatePhase::GroupOrReply, MSG_KEX_REPLY, Some(blob))
+            | (GatePhase::Reply, MSG_KEX_GEX_REPLY, Some(blob)) => {
                 self.admit(blob)?;
                 Ok(GatePhase::NewKeys)
             }
@@ -782,39 +767,27 @@ mod tests {
         }
     }
 
+    /// Only an empty field means that nothing was published. A malformed one
+    /// is refused, also when it spells `unverified`.
     #[test]
-    fn expectation_policy_never_changes_a_published_outcome() {
-        for allow in [false, true] {
-            assert_eq!(
-                HostKeyExpectation::from_published(FINGERPRINT_A, "my-sb", allow).unwrap(),
-                HostKeyExpectation::Fingerprint(fingerprint(FINGERPRINT_A)),
-                "{allow}"
+    fn expectation_verifies_a_published_fingerprint_and_refuses_a_malformed_one() {
+        assert_eq!(
+            HostKeyExpectation::from_published(FINGERPRINT_A).unwrap(),
+            HostKeyExpectation::Fingerprint(fingerprint(FINGERPRINT_A)),
+        );
+        assert_eq!(
+            HostKeyExpectation::from_published("").unwrap(),
+            HostKeyExpectation::AcceptAny,
+        );
+        for malformed in ["unverified", "SHA256:inconsistent", "MD5:00:11"] {
+            assert!(
+                matches!(
+                    HostKeyExpectation::from_published(malformed),
+                    Err(HostKeyError::BadFingerprint)
+                ),
+                "{malformed:?}"
             );
-            for malformed in ["unverified", "SHA256:inconsistent", "MD5:00:11"] {
-                assert!(
-                    matches!(
-                        HostKeyExpectation::from_published(malformed, "my-sb", allow),
-                        Err(HostKeyError::BadFingerprint)
-                    ),
-                    "{malformed:?} {allow}"
-                );
-            }
         }
-    }
-
-    #[test]
-    fn unverified_policy_allows_only_when_the_variable_is_one() {
-        Environment::new()
-            .set(ALLOW_UNVERIFIED_ENV, "1")
-            .run(|| assert!(allow_unverified_host_key()));
-        for value in ["", "0", "true", "yes", "11"] {
-            Environment::new()
-                .set(ALLOW_UNVERIFIED_ENV, value)
-                .run(|| assert!(!allow_unverified_host_key()));
-        }
-        Environment::new()
-            .remove(ALLOW_UNVERIFIED_ENV)
-            .run(|| assert!(!allow_unverified_host_key()));
     }
 
     #[test]
@@ -881,7 +854,6 @@ mod tests {
     #[test]
     fn pin_rejects_paths_ssh_would_expand_or_split() {
         for path in [
-            "/home/100%/pin",
             "/home/a\"b/pin",
             "/home/${HOME}/pin",
             "/home/a\nb/pin",
@@ -967,8 +939,7 @@ mod tests {
             ] {
                 pin.store(&ed25519_blob(stored)).unwrap();
 
-                let check =
-                    HostKeyCheck::for_session(&published(FINGERPRINT_A), &TARGET, false).unwrap();
+                let check = HostKeyCheck::for_session(&published(FINGERPRINT_A), &TARGET).unwrap();
 
                 assert_eq!(fs::read_to_string(pin.path()).unwrap(), kept);
                 assert_eq!(check.unverified_warning("my-sb"), None);
@@ -981,32 +952,18 @@ mod tests {
     }
 
     #[test]
-    fn check_for_session_refuses_an_unpublished_key_without_touching_the_pin() {
-        with_config_dir(|config_dir| {
-            let error = HostKeyCheck::for_session(&published(""), &TARGET, false).unwrap_err();
-
-            assert_eq!(
-                error.to_string(),
-                "sandbox 'my-sb' has no published SSH host key, so its SSH server cannot be verified.\n  \
-                 If the gateway predates sandbox SSH identities, upgrade it. Otherwise stop and start the sandbox so the gateway assigns a key.\n  \
-                 To connect without verification, set OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY=1."
-            );
-            assert!(!config_dir.exists());
-        });
-    }
-
-    #[test]
     fn check_for_session_never_trusts_a_cached_pin_when_unverified() {
         with_config_dir(|config_dir| {
             let pin = pin_in(config_dir);
             pin.store(&ed25519_blob(KEY_A)).unwrap();
 
-            let check = HostKeyCheck::for_session(&published(""), &TARGET, true).unwrap();
+            let check = HostKeyCheck::for_session(&published(""), &TARGET).unwrap();
 
             assert_eq!(fs::read_to_string(pin.path()).unwrap(), PIN_HEADER);
             assert_eq!(
                 check.unverified_warning("my-sb").unwrap(),
-                "warning: SSH host key of sandbox 'my-sb' is NOT verified (the gateway published no fingerprint)"
+                "warning: SSH host key of sandbox 'my-sb' is NOT verified: the gateway published no fingerprint. \
+                 Upgrade a gateway that predates sandbox SSH identities; otherwise stop and start the sandbox."
             );
             assert_eq!(check.proxy_flags()[..2], ["--host-key", "unverified"]);
         });
@@ -1183,13 +1140,14 @@ mod tests {
         let other = kex_reply(31, &ed25519_blob(KEY_B));
         let rsa = [string(b"ssh-rsa"), string(&[1, 0, 1]), string(&[0x7f; 257])].concat();
         let decoy_first = [reply.as_slice(), &kexinit(), &other].concat();
+        let reply_gex = kex_reply(33, &ed25519_blob(KEY_A));
         let other_gex = kex_reply(33, &ed25519_blob(KEY_B));
         let rsa_gex = kex_reply(33, &rsa);
         let wrong_guess = [&kexinit_ending(&[1, 0, 0, 0, 0])[..], &reply, &other].concat();
         let after_kexinit = [BANNER, &kexinit()].concat();
         let after_group = [BANNER, &kexinit(), &group()].concat();
         let after_reply = [BANNER, &kexinit(), &reply].concat();
-        let after_group_reply = [BANNER, &kexinit(), &group(), &reply].concat();
+        let after_group_reply = [BANNER, &kexinit(), &group(), &reply_gex].concat();
         let pinned = pin_file(KNOWN_HOSTS_KEY_A);
         for (name, before, offending) in [
             ("decoy before KEXINIT", BANNER, &decoy_first),
@@ -1202,6 +1160,12 @@ mod tests {
             ("IGNORE before the reply", &after_kexinit, &ignore),
             ("second KEXINIT", &after_kexinit, &kexinit()),
             ("second group", &after_group, &group()),
+            (
+                "group exchange reply without a group",
+                &after_kexinit,
+                &reply_gex,
+            ),
+            ("plain reply after a group", &after_group, &reply),
             ("non-Ed25519 group reply", &after_group, &rsa_gex),
             ("IGNORE before NEWKEYS", &after_reply, &ignore),
             ("second reply", &after_reply, &reply),
@@ -1212,7 +1176,7 @@ mod tests {
                 before,
                 &[before, offending, &newkeys(), &ENCRYPTED].concat(),
                 |error| matches!(error, HostKeyError::Malformed(OUT_OF_ORDER)),
-                if before.ends_with(&reply) {
+                if before.ends_with(&reply) || before.ends_with(&reply_gex) {
                     &pinned
                 } else {
                     PIN_HEADER
@@ -1247,7 +1211,7 @@ mod tests {
         let length = |length: u32| [&length.to_be_bytes()[..], &[0; 16]].concat();
         let padded = |padding: u8| vec![0, 0, 0, 2, padding, 31];
         let mut long_line = b"SSH-2.0-".to_vec();
-        long_line.resize(8192, b'a');
+        long_line.resize(255, b'a');
         for (before, rest, expected) in [
             (BANNER, length(0), "packet length is out of range"),
             (BANNER, length(1), "packet length is out of range"),

@@ -24,7 +24,7 @@ use openshell_core::proto::{
 };
 use openshell_core::ssh_host_key::{
     HostKeyCheck, HostKeyExpectation, HostKeyGate, KnownHostsPin, SandboxSshTarget,
-    allow_unverified_host_key, host_key_alias as host_alias,
+    host_key_alias as host_alias,
 };
 use openshell_core::upload::{
     DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
@@ -228,9 +228,7 @@ async fn ssh_session_config(
         workspace,
         sandbox: name,
     };
-    let host_key =
-        HostKeyCheck::for_session(&session.response, &target, allow_unverified_host_key())
-            .into_diagnostic()?;
+    let host_key = HostKeyCheck::for_session(&session.response, &target).into_diagnostic()?;
     if let Some(warning) = host_key.unverified_warning(name) {
         eprintln!("{warning}");
     }
@@ -1996,14 +1994,15 @@ async fn sandbox_sync_down_directory(
     stream_sandbox_tar(session, tar_cmd, dest_path).await
 }
 
-/// Run the SSH proxy, connecting stdin/stdout to the gateway.
+/// Run the SSH proxy, connecting stdin/stdout to the gateway. Without
+/// `host_key`, the sandbox's host key is not checked.
 pub async fn sandbox_ssh_proxy(
     gateway_url: &str,
     sandbox_name: &str,
     workspace: &str,
     token: &str,
     tls: &TlsOptions,
-    host_key: HostKeyCheck,
+    host_key: Option<HostKeyCheck>,
 ) -> Result<()> {
     let server = grpc_server_from_ssh_gateway_url(gateway_url)?;
     let mut client = grpc_client(&server, tls).await?;
@@ -2024,7 +2023,7 @@ pub async fn sandbox_ssh_proxy(
         workspace,
         token,
         replica.as_ref(),
-        host_key.into_gate(),
+        host_key.map(HostKeyCheck::into_gate),
     )
     .await
 }
@@ -2035,7 +2034,7 @@ async fn relay_ssh_proxy(
     workspace: &str,
     token: &str,
     replica: Option<&AsciiMetadataValue>,
-    mut gate: HostKeyGate,
+    mut gate: Option<HostKeyGate>,
 ) -> Result<()> {
     let init = TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
@@ -2103,12 +2102,17 @@ async fn relay_ssh_proxy(
             else {
                 continue;
             };
-            let data = gate.push(&data).unwrap_or_else(|refusal| {
-                // Printed rather than returned: ssh passes this text to the user
-                // as is, and a returned error would be reformatted as a report.
-                eprintln!("openshell: {refusal}");
-                std::process::exit(1)
-            });
+            let data = match gate.as_mut().map(|gate| gate.push(&data)) {
+                None => data,
+                Some(Ok(released)) => released,
+                Some(Err(refusal)) => {
+                    // Printed rather than returned: ssh passes this text to the
+                    // user as is, and a returned error would be reformatted as
+                    // a report.
+                    eprintln!("openshell: {refusal}");
+                    std::process::exit(1)
+                }
+            };
             if data.is_empty() {
                 continue;
             }
@@ -2171,9 +2175,9 @@ fn grpc_server_from_ssh_gateway_url(gateway_url: &str) -> Result<String> {
 /// creates a fresh session on every invocation.
 ///
 /// `known_hosts` is the pin file the config entry also names as its
-/// `UserKnownHostsFile`. An entry without it tells `ssh` to accept any host
-/// key, so it is refused. `gateway_name` is the gateway the entry names, when
-/// it names one.
+/// `UserKnownHostsFile`. An entry without it predates host-key verification
+/// and tells `ssh` to accept any host key: it keeps working, with a warning.
+/// `gateway_name` is the gateway the entry names, when it names one.
 pub async fn sandbox_ssh_proxy_by_name(
     server: &str,
     gateway_name: Option<&str>,
@@ -2182,25 +2186,24 @@ pub async fn sandbox_ssh_proxy_by_name(
     workspace: &str,
     known_hosts: Option<PathBuf>,
 ) -> Result<()> {
-    let Some(known_hosts) = known_hosts else {
+    let session = create_ssh_session(server, name, tls, workspace, None).await?;
+    let gate = if let Some(known_hosts) = known_hosts {
+        let expectation =
+            HostKeyExpectation::from_published(&session.response.host_key_fingerprint)
+                .into_diagnostic()?;
+        let pin = KnownHostsPin::at(known_hosts, name, workspace).into_diagnostic()?;
+        let host_key = HostKeyCheck::for_relay(expectation, pin).into_diagnostic()?;
+        if let Some(warning) = host_key.unverified_warning(name) {
+            eprintln!("{warning}");
+        }
+        Some(host_key.into_gate())
+    } else {
         eprintln!(
             "{}",
-            stale_ssh_config_refusal(gateway_name, workspace, name)
+            stale_ssh_config_warning(gateway_name, workspace, name)
         );
-        std::process::exit(1);
+        None
     };
-    let session = create_ssh_session(server, name, tls, workspace, None).await?;
-    let expectation = HostKeyExpectation::from_published(
-        &session.response.host_key_fingerprint,
-        name,
-        allow_unverified_host_key(),
-    )
-    .into_diagnostic()?;
-    let pin = KnownHostsPin::at(known_hosts, name, workspace).into_diagnostic()?;
-    let host_key = HostKeyCheck::for_relay(expectation, pin).into_diagnostic()?;
-    if let Some(warning) = host_key.unverified_warning(name) {
-        eprintln!("{warning}");
-    }
     let server = grpc_server_from_ssh_gateway_url(&session.gateway_url)?;
     let client = grpc_client(&server, tls).await?;
     relay_ssh_proxy(
@@ -2209,19 +2212,19 @@ pub async fn sandbox_ssh_proxy_by_name(
         workspace,
         &session.response.token,
         session.replica.as_ref(),
-        host_key.into_gate(),
+        gate,
     )
     .await
 }
 
-fn stale_ssh_config_refusal(gateway: Option<&str>, workspace: &str, sandbox: &str) -> String {
+fn stale_ssh_config_warning(gateway: Option<&str>, workspace: &str, sandbox: &str) -> String {
     let gateway = gateway.map_or_else(String::new, |gateway| {
         format!(" -g {}", shell_escape(gateway))
     });
     let openshell = format!("openshell{gateway} --workspace {}", shell_escape(workspace));
     let name = shell_escape(sandbox);
     format!(
-        "openshell: this SSH config entry for sandbox '{sandbox}' (workspace '{workspace}') predates host-key verification and is refused.\n\
+        "openshell: warning: this SSH config entry for sandbox '{sandbox}' (workspace '{workspace}') predates host-key verification, so the SSH host key is NOT verified.\n\
          Regenerate it: {openshell} sandbox connect {name} --editor vscode\n\
          Or replace the entry with the output of: {openshell} sandbox ssh-config {name}"
     )
@@ -2242,7 +2245,7 @@ fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<Strin
         shell_escape(gateway),
         shell_escape(name),
         shell_escape(workspace),
-        shell_escape(&pin.path().to_string_lossy()),
+        shell_escape(&pin.ssh_path()),
     );
     let host_alias = host_alias(name, workspace);
     let options = pin
@@ -2916,10 +2919,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_ssh_config_refusal_names_the_gateway_and_workspace_of_the_entry() {
+    fn stale_ssh_config_warning_names_the_gateway_and_workspace_of_the_entry() {
         assert_eq!(
-            stale_ssh_config_refusal(Some("my gw"), "beta", "demo"),
-            "openshell: this SSH config entry for sandbox 'demo' (workspace 'beta') predates host-key verification and is refused.\n\
+            stale_ssh_config_warning(Some("my gw"), "beta", "demo"),
+            "openshell: warning: this SSH config entry for sandbox 'demo' (workspace 'beta') predates host-key verification, so the SSH host key is NOT verified.\n\
              Regenerate it: openshell -g 'my gw' --workspace beta sandbox connect demo --editor vscode\n\
              Or replace the entry with the output of: openshell -g 'my gw' --workspace beta sandbox ssh-config demo"
         );
@@ -3093,7 +3096,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ssh_base_command_overrides_user_connection_sharing_and_host_key_trust() {
-        for directory in ["known_hosts", "known hosts", "o'brien known=hosts"] {
+        for directory in [
+            "known_hosts",
+            "known hosts",
+            "o'brien known=hosts",
+            "100% #1",
+        ] {
             let (proxy, known_hosts) = pinned_proxy(directory);
             let effective = effective_ssh_config(&ssh_base_command(&proxy), &["-N", "sandbox"]);
             assert_connection_sharing_disabled(&effective);

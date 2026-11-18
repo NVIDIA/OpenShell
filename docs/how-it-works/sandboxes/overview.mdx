@@ -902,12 +902,10 @@ key against this fingerprint on every SSH connection they open. When the SSH
 server presents a different key, they stop before authentication and report
 `SSH host key mismatch`.
 
-They refuse a sandbox that has no published fingerprint. If the gateway
-predates sandbox SSH identities, upgrade it. Otherwise stop and start the
-sandbox so the gateway assigns it a key. To connect without verification, set
-`OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY=1`. OpenShell then prints a warning
-on every such connection. For an editor, set the variable in the editor's
-environment.
+They cannot verify a sandbox that has no published fingerprint. They connect
+and print a warning on every such connection. If the gateway predates sandbox
+SSH identities, upgrade it. Otherwise stop and start the sandbox so the
+gateway assigns it a key.
 
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
 
@@ -917,10 +915,10 @@ openshell sandbox ssh-config my-sandbox
 
 Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sandbox connect` for automatic setup.
 
-OpenShell refuses connections through SSH config entries that an earlier
-release generated, because those entries accept any host key. Replace each
-pasted entry with new `openshell sandbox ssh-config` output, or use `--editor`
-on `sandbox connect` again for that sandbox.
+SSH config entries that an earlier release generated accept any host key.
+They keep working and print a warning on every connection. Replace each pasted
+entry with new `openshell sandbox ssh-config` output, or use `--editor` on
+`sandbox connect` again for that sandbox.
 
 ## Transfer Files
 
