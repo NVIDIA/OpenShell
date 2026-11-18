@@ -11,21 +11,31 @@
 use std::time::Duration;
 
 use container_engine_support::Engine;
+use host_server_support::{HttpRecorder, TEST_HOST};
+use sandbox_clients_support::{Request, connect, http};
+use testkit::policy;
+use testkit::sdk::raw::proto;
 use testkit::sdk::raw::proto::setting_value::Value as SettingValue;
-use testkit::{Context, Error, Poll, ResultExt as _};
+use testkit::{Context, Error, PYTHON_BINARIES, Poll, ResultExt as _};
 
 const JSON_SETTING: &str = "ocsf_json_enabled";
 const JSON_MARKER: &str = " OCSF-JSON ";
-/// A TCP connection to an endpoint the default policy doesn't allow.
-const DENIED_CONNECT: &str = "echo > /dev/tcp/1.1.1.1/443 || true";
+/// An endpoint the policy doesn't allow, for a Network Activity denial.
+const DENIED_HOST: &str = "1.1.1.1";
+const DENIED_PORT: u16 = 443;
+/// Classes the traffic must produce: Network Activity for the denied
+/// connect, HTTP Activity for the denied POST, and SSH Activity for the exec
+/// sessions that run the clients.
+const REQUIRED_CLASSES: [u64; 3] = [4001, 4002, 4007];
 /// How long the setting may take to reach the supervisor, which polls for it.
 const JSON_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// OCSF JSON is opt-in. With `ocsf_json_enabled`, the supervisor writes each
 /// event as one ` OCSF-JSON <record>` line on stderr, never stdout, next to the
-/// shorthand line. Records conform to the OCSF schema and name the sandbox's
-/// container and image. The logs the gateway collects keep only the
-/// shorthand.
+/// shorthand line. Denied TCP, a POST the L7 policy denies, and the exec
+/// sessions produce Network, HTTP and SSH Activity records. Every record
+/// conforms to the OCSF schema and names the sandbox's container and image.
+/// The logs the gateway collects keep only the shorthand.
 #[testkit::test]
 async fn network_events_are_json_on_supervisor_stderr_only(cx: &mut Context) -> testkit::Result {
     let driver = cx.compute_driver().await?;
@@ -34,11 +44,14 @@ async fn network_events_are_json_on_supervisor_stderr_only(cx: &mut Context) -> 
         "this suite needs a Docker or Podman gateway; the gateway uses {driver}"
     );
     let engine = Engine::from_env()?;
-    let image = testkit::base_image();
+    let server = HttpRecorder::start("ocsf").await?;
+    let allowed = l7_policy(server.port)?;
+    let image = testkit::python_image();
     let sandbox = cx
         .sandbox("oc")
         .image(&image)
         .command(["sleep", "infinity"])
+        .policy(allowed)
         .create_ready()
         .await?;
     let supervisor = engine
@@ -57,12 +70,18 @@ async fn network_events_are_json_on_supervisor_stderr_only(cx: &mut Context) -> 
     sandbox
         .set_setting(JSON_SETTING, SettingValue::BoolValue(true))
         .await?;
+    let post = Request::new("POST", "/allowed").body("x");
     let (logs, records) = testkit::poll_until(
-        "a JSON network denial on the supervisor's stderr",
+        "JSON Network, HTTP and SSH Activity on the supervisor's stderr",
         JSON_TIMEOUT,
         Duration::from_secs(1),
         async || {
-            sandbox.exec(["bash", "-c", DENIED_CONNECT]).await?;
+            connect(&sandbox, DENIED_HOST, DENIED_PORT).await?;
+            let denied = http(&sandbox, TEST_HOST, server.port, &post).await?;
+            testkit::ensure!(
+                denied.status() == Some(403),
+                "the L7 policy did not deny the POST: {denied:?}"
+            );
             let logs = engine.logs(&supervisor).await?;
             testkit::ensure!(
                 !logs.stdout.contains(JSON_MARKER),
@@ -70,11 +89,20 @@ async fn network_events_are_json_on_supervisor_stderr_only(cx: &mut Context) -> 
                 logs.stdout
             );
             let records = json_records(&logs.stderr)?;
-            Ok(if records.iter().any(is_denied_443) {
-                Poll::Ready((logs, records))
-            } else {
-                Poll::Pending(format!("stderr:\n{}", logs.stderr))
-            })
+            let missing: Vec<u64> = REQUIRED_CLASSES
+                .into_iter()
+                .filter(|class| !records.iter().any(|record| record["class_uid"] == *class))
+                .collect();
+            Ok(
+                if missing.is_empty() && records.iter().any(is_denied_connect) {
+                    Poll::Ready((logs, records))
+                } else {
+                    Poll::Pending(format!(
+                        "missing classes {missing:?}; stderr:\n{}",
+                        logs.stderr
+                    ))
+                },
+            )
         },
     )
     .await?;
@@ -99,6 +127,28 @@ async fn network_events_are_json_on_supervisor_stderr_only(cx: &mut Context) -> 
     Ok(())
 }
 
+/// Lets the image's Python reach the server on `port` with an enforced L7
+/// rule that allows only `GET /allowed`, so a POST is an HTTP Activity denial.
+fn l7_policy(port: u16) -> testkit::Result<proto::SandboxPolicy> {
+    policy::base_with(&format!(
+        r"network_policies:
+  ocsf_l7:
+    name: ocsf_l7
+    endpoints:
+      - host: {TEST_HOST}
+        port: {port}
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /allowed
+    binaries: {binaries}
+",
+        binaries = policy::binaries_yaml(PYTHON_BINARIES),
+    ))
+}
+
 /// The JSON records in `stderr`, one per ` OCSF-JSON ` line. Each must be a
 /// whole JSON object with no terminal escapes.
 fn json_records(stderr: &str) -> testkit::Result<Vec<serde_json::Value>> {
@@ -115,9 +165,9 @@ fn json_records(stderr: &str) -> testkit::Result<Vec<serde_json::Value>> {
         .collect()
 }
 
-fn is_denied_443(record: &serde_json::Value) -> bool {
+fn is_denied_connect(record: &serde_json::Value) -> bool {
     record["class_uid"] == 4001
-        && record["dst_endpoint"]["port"] == 443
+        && record["dst_endpoint"]["port"] == DENIED_PORT
         && record["action"] == "Denied"
 }
 
@@ -136,6 +186,10 @@ fn check_record(
             .as_str()
             .is_some_and(|uid| !uid.is_empty()),
         "metadata.uid is empty"
+    );
+    testkit::ensure!(
+        record.get("container").is_none(),
+        "the container is at the top level, not under device"
     );
     let container = &record["device"]["container"];
     testkit::ensure!(

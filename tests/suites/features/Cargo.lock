@@ -2499,8 +2499,10 @@ name = "ocsf"
 version = "0.0.0"
 dependencies = [
  "container-engine-support",
+ "host-server-support",
  "openshell-ocsf-validate",
  "openshell-testkit",
+ "sandbox-clients-support",
  "serde_json",
 ]
 
