@@ -1,20 +1,16 @@
 ---
 authors:
   - "@mrunalp"
-state: draft
+state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/5563
   - https://github.com/NVIDIA/OpenShell/issues/5663
   - https://github.com/NVIDIA/OpenShell/issues/896
   - https://github.com/NVIDIA/OpenShell/pull/5139
+  - https://github.com/NVIDIA/OpenShell/pull/5699
 ---
 
-# RFC NNNN - Workspace Secrets
-
-<!--
-RFC number pending maintainer assignment on #5563. Rename the folder and
-title once it is assigned.
--->
+# RFC 0024 - Workspace Secrets
 
 ## Summary
 
