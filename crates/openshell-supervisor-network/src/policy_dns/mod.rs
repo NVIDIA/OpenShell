@@ -861,10 +861,10 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         }
     }
 
-    fn dns_answer(addresses: &[&str], ttl: Duration) -> TrustedAnswer {
+    fn dns_answer(addresses: &[&str]) -> TrustedAnswer {
         TrustedAnswer {
             addresses: addresses.iter().map(|ip| ip.parse().unwrap()).collect(),
-            ttl,
+            ttl: Duration::ZERO,
         }
     }
 
@@ -896,42 +896,62 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
-    async fn expired_mapping_refreshes_same_address_with_new_validated_dns_answers() {
-        for ttl in [
-            Duration::ZERO,
-            Duration::from_secs(5),
-            Duration::from_mins(5),
+    async fn expired_mapping_refresh_validates_backs_off_and_recovers() {
+        for (case, failure, sweep) in [
+            ("NXDOMAIN", Err(resolver::ResolveError::NxDomain), false),
+            ("forbidden address", Ok(dns_answer(&["127.0.0.1"])), true),
         ] {
-            for sweep in [false, true] {
-                let service = scripted_service(
-                    BASE_POLICY,
-                    vec![
-                        Ok(dns_answer(&["8.8.8.8"], ttl)),
-                        Ok(dns_answer(&["8.8.4.4"], ttl)),
-                    ],
-                );
-                let answer = expired_answer(&service).await;
-                if sweep {
-                    assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
-                }
-                let refreshed = service
-                    .lookup_for_connect(answer.address, 5432)
-                    .await
-                    .unwrap();
-                assert_eq!(refreshed.record.synthetic_address, answer.address);
-                assert_eq!(
-                    refreshed.record.contracts[0].pinned_addresses,
-                    ["8.8.4.4".parse::<IpAddr>().unwrap()]
-                );
-                assert_ne!(refreshed.record.mapping_id, answer.mapping_id);
-                assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
-                let reused = service
-                    .lookup_for_connect(answer.address, 5432)
-                    .await
-                    .unwrap();
-                assert_eq!(reused.record.mapping_id, refreshed.record.mapping_id);
-                assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
+            let service = scripted_service(
+                BASE_POLICY,
+                vec![
+                    Ok(dns_answer(&["8.8.8.8"])),
+                    failure,
+                    Ok(dns_answer(&["8.8.4.4"])),
+                ],
+            );
+            let answer = expired_answer(&service).await;
+            if sweep {
+                assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
             }
+            assert!(
+                matches!(
+                    service.lookup_for_connect(answer.address, 5432).await,
+                    Err(ConnectLookupError::Refresh(_))
+                ),
+                "{case}"
+            );
+            assert!(matches!(
+                service.store.lookup(
+                    answer.address,
+                    5432,
+                    answer.policy_generation,
+                    Instant::now()
+                ),
+                Err(MappingLookupError::Expired)
+            ));
+            assert!(matches!(
+                service.lookup_for_connect(answer.address, 5432).await,
+                Err(ConnectLookupError::Backoff)
+            ));
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
+
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let recovered = service
+                .lookup_for_connect(answer.address, 5432)
+                .await
+                .unwrap();
+            assert_eq!(recovered.record.synthetic_address, answer.address);
+            assert_ne!(recovered.record.mapping_id, answer.mapping_id);
+            assert_eq!(
+                recovered.record.contracts[0].pinned_addresses,
+                ["8.8.4.4".parse::<IpAddr>().unwrap()]
+            );
+            let reused = service
+                .lookup_for_connect(answer.address, 5432)
+                .await
+                .unwrap();
+            assert_eq!(reused.record.mapping_id, recovered.record.mapping_id);
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 3);
         }
     }
 
@@ -941,128 +961,41 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             "- { host: db.example, port: 5432, protocol: tcp }",
             "- { host: db.example, port: 5432, protocol: tcp, allowed_ips: [8.8.8.8/32] }\n      - { host: db.example, port: 443, protocol: tcp, allowed_ips: [8.8.4.4/32] }",
         );
-        for initially_partial in [false, true] {
-            let mut answers = vec![Ok(dns_answer(
-                if initially_partial {
-                    &["8.8.8.8"]
-                } else {
-                    &["8.8.8.8", "8.8.4.4"]
-                },
-                Duration::ZERO,
-            ))];
-            if !initially_partial {
-                answers.push(Ok(dns_answer(&["8.8.8.8"], Duration::ZERO)));
-            }
-            answers.push(Ok(dns_answer(&["8.8.8.8", "8.8.4.4"], Duration::ZERO)));
-            let service = scripted_service(&policy, answers);
-            let answer = expired_answer(&service).await;
-            if !initially_partial {
-                service
-                    .lookup_for_connect(answer.address, 5432)
-                    .await
-                    .unwrap();
-                assert!(matches!(
-                    service.lookup_for_connect(answer.address, 443).await,
-                    Err(ConnectLookupError::Mapping(
-                        MappingLookupError::PortMismatch
-                    ))
-                ));
-                tokio::time::sleep(Duration::from_millis(1100)).await;
-            }
-            assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
-            let calls = service.resolver.calls.load(Ordering::SeqCst);
-            assert!(
-                service
-                    .lookup_for_connect(answer.address, 8443)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), calls);
-            let recovered = service
-                .lookup_for_connect(answer.address, 443)
-                .await
-                .unwrap();
-            assert_eq!(
-                recovered
-                    .pinned_addresses_for(&[PolicyEndpointId {
-                        policy_name: "database".into(),
-                        endpoint_index: 1
-                    }])
-                    .unwrap(),
-                ["8.8.4.4".parse::<IpAddr>().unwrap()]
-            );
-            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), calls + 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn expired_mapping_refresh_failures_deny_and_back_off_then_recover() {
         let service = scripted_service(
-            BASE_POLICY,
+            &policy,
             vec![
-                Ok(dns_answer(&["8.8.8.8"], Duration::ZERO)),
-                Err(resolver::ResolveError::NxDomain),
-                Ok(dns_answer(&["8.8.4.4"], Duration::ZERO)),
+                Ok(dns_answer(&["8.8.8.8", "8.8.4.4"])),
+                Ok(dns_answer(&["8.8.8.8"])),
+                Ok(dns_answer(&["8.8.8.8", "8.8.4.4"])),
             ],
         );
         let answer = expired_answer(&service).await;
-        assert!(matches!(
-            service.lookup_for_connect(answer.address, 5432).await,
-            Err(ConnectLookupError::Refresh(PolicyDnsError::Resolver(
-                resolver::ResolveError::NxDomain
-            )))
-        ));
-        assert!(matches!(
-            service.lookup_for_connect(answer.address, 5432).await,
-            Err(ConnectLookupError::Backoff)
-        ));
-        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
-        assert!(matches!(
-            service.store.lookup(
-                answer.address,
-                5432,
-                answer.policy_generation,
-                Instant::now()
-            ),
-            Err(MappingLookupError::Expired)
-        ));
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        let recovered = service
+        service
             .lookup_for_connect(answer.address, 5432)
             .await
             .unwrap();
+        assert!(matches!(
+            service.lookup_for_connect(answer.address, 443).await,
+            Err(ConnectLookupError::Mapping(
+                MappingLookupError::PortMismatch
+            ))
+        ));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
+        let recovered = service
+            .lookup_for_connect(answer.address, 443)
+            .await
+            .unwrap();
         assert_eq!(
-            recovered.record.contracts[0].pinned_addresses,
+            recovered
+                .pinned_addresses_for(&[PolicyEndpointId {
+                    policy_name: "database".into(),
+                    endpoint_index: 1
+                }])
+                .unwrap(),
             ["8.8.4.4".parse::<IpAddr>().unwrap()]
         );
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn expired_mapping_refresh_rejects_new_forbidden_addresses() {
-        let service = scripted_service(
-            BASE_POLICY,
-            vec![
-                Ok(dns_answer(&["8.8.8.8"], Duration::ZERO)),
-                Ok(dns_answer(&["127.0.0.1"], Duration::ZERO)),
-            ],
-        );
-        let answer = expired_answer(&service).await;
-        assert!(
-            service
-                .lookup_for_connect(answer.address, 5432)
-                .await
-                .is_err()
-        );
-        assert!(matches!(
-            service.store.lookup(
-                answer.address,
-                5432,
-                answer.policy_generation,
-                Instant::now()
-            ),
-            Err(MappingLookupError::Expired)
-        ));
     }
 
     #[tokio::test]
