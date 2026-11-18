@@ -104,6 +104,13 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 openshell sandbox create --from registry.example.com/your-org/codex-agent:latest --provider codex -- codex
 ```
 
+For fixed access, add `--frozen` at creation. The first accepted effective policy
+and provider authorization remain fixed until deletion; new policy requires
+recreation. Check `sandbox get` for pending or initialized freeze state and
+`policy get <name> --full` for the captured policy. Credential/token rotation
+continues within that authorization. Do not try to repair an initialized frozen
+sandbox with policy updates, proposal approvals or provider attach/detach.
+
 The agent will be prompted interactively if credentials are missing.
 
 ### Step 4: Exit and clean up

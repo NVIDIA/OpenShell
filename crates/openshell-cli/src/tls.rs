@@ -344,15 +344,8 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 /// `TRACEPARENT`/`TRACESTATE` trace context from the environment on every
 /// request. With no token and no trace context, the interceptor is a no-op.
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
-    let config = sdk_client_config(server, tls)?;
-    // Keep the SDK's transport state machine out of every command future.
-    // Most CLI commands compose this helper into larger async operations.
-    let client = Box::pin(OpenShellClient::connect(config))
-        .await
-        .into_diagnostic()?;
-    // tonic allows a single interceptor per channel: compose the SDK's auth
-    // interceptor (sharing its live bearer slot) with the CLI's passive
-    // trace-context forwarding.
+    let client = sdk_client(server, tls).await?;
+    // Share the SDK's live bearer slot and preserve passive trace forwarding.
     let interceptor = GatewayInterceptor {
         auth: client.auth_interceptor(),
         trace: EnvTraceContextInterceptor::from_env(),
@@ -361,6 +354,39 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
         client.channel(),
         interceptor,
     ))
+}
+
+pub(crate) async fn frozen_policies_client(
+    server: &str,
+    tls: &TlsOptions,
+) -> Result<
+    Option<
+        openshell_sdk::raw::FrozenSandboxPoliciesClient<
+            tonic::service::interceptor::InterceptedService<Channel, GatewayInterceptor>,
+        >,
+    >,
+> {
+    let client = sdk_client(server, tls).await?;
+    let interceptor = GatewayInterceptor {
+        auth: client.auth_interceptor(),
+        trace: EnvTraceContextInterceptor::from_env(),
+    };
+    let channel =
+        tonic::service::interceptor::InterceptedService::new(client.channel(), interceptor);
+    if !openshell_core::grpc_client::frozen_policies_supported(channel.clone()).await? {
+        return Ok(None);
+    }
+    Ok(Some(openshell_sdk::raw::FrozenSandboxPoliciesClient::new(
+        channel,
+    )))
+}
+
+async fn sdk_client(server: &str, tls: &TlsOptions) -> Result<OpenShellClient> {
+    let config = sdk_client_config(server, tls)?;
+    // Keep the SDK's transport state machine out of every command future.
+    Box::pin(OpenShellClient::connect(config))
+        .await
+        .into_diagnostic()
 }
 
 #[cfg(test)]

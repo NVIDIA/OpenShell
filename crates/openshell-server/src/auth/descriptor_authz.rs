@@ -299,6 +299,49 @@ mod tests {
     }
 
     #[test]
+    fn frozen_policy_methods_keep_distinct_user_and_sandbox_access() {
+        let table =
+            DescriptorAuthTable::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        for (method, mode, scope, workspace_role, global_role) in [
+            (
+                "CreateSandbox",
+                AuthMode::Bearer,
+                "sandbox:write",
+                Some("user"),
+                None,
+            ),
+            (
+                "GetPolicy",
+                AuthMode::Bearer,
+                "sandbox:read",
+                Some("user"),
+                None,
+            ),
+            (
+                "GetConfig",
+                AuthMode::Dual,
+                "config:read",
+                Some("user"),
+                None,
+            ),
+            (
+                "UpdateGlobalConfig",
+                AuthMode::Bearer,
+                "config:write",
+                None,
+                Some("platform_admin"),
+            ),
+        ] {
+            let path = format!("/openshell.v1.FrozenSandboxPolicies/{method}");
+            let entry = table.entries.get(&path).unwrap();
+            assert_eq!(entry.auth_mode, mode, "{path}");
+            assert_eq!(entry.scope.as_deref(), Some(scope), "{path}");
+            assert_eq!(entry.workspace_role.as_deref(), workspace_role, "{path}");
+            assert_eq!(entry.global_role.as_deref(), global_role, "{path}");
+        }
+    }
+
+    #[test]
     fn no_duplicate_paths() {
         let paths: Vec<&str> = all_paths().collect();
         let mut seen = Vec::new();

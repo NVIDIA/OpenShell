@@ -4,6 +4,7 @@
 //! Persistence layer for `OpenShell` Server.
 
 mod azure_workload_identity;
+pub mod frozen_policy;
 mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;

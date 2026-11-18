@@ -12,7 +12,9 @@ use tonic::Status;
 
 use super::super::StoredSettings;
 use super::super::provider::load_provider_environment_records;
-use super::{build_sandbox_config_snapshot_with_sources, load_global_settings};
+use super::{
+    build_sandbox_config_snapshot_with_sources, load_global_settings, load_sandbox_config_inputs,
+};
 use crate::ServerState;
 use crate::persistence::{ObjectListQuery, ObjectType};
 use crate::policy_store::PolicyStoreExt as _;
@@ -146,25 +148,6 @@ impl DiscoveryConfigInputs {
         if sandbox.object_workspace() != self.workspace {
             return Err(Status::internal("installation workspace mismatch"));
         }
-        let providers = sandbox
-            .spec
-            .as_ref()
-            .map_or(&[][..], |spec| spec.providers.as_slice());
-        let (records, latest) = tokio::try_join!(
-            load_provider_environment_records(
-                &state.store,
-                &state.refresh,
-                &self.workspace,
-                providers
-            ),
-            async {
-                state
-                    .store
-                    .get_latest_policy(sandbox.object_id())
-                    .await
-                    .map_err(|_| Status::unavailable("sandbox policy unavailable"))
-            },
-        )?;
         let routes = if let Some(declarations) = &self.declarations {
             let endpoints = declarations
                 .by_sandbox
@@ -185,6 +168,47 @@ impl DiscoveryConfigInputs {
         } else {
             None
         };
+        // Frozen mode is fixed at creation. Pending captures must use the
+        // shared loader's recheck; they cannot use collection-local live sources.
+        if state
+            .store
+            .get_sandbox_frozen_policy(sandbox.object_id())
+            .await
+            .map_err(|error| Status::internal(format!("fetch frozen policy failed: {error}")))?
+            .is_some()
+        {
+            let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
+            return build_sandbox_config_snapshot_with_sources(
+                state,
+                &inputs.sandbox,
+                &inputs.catalog,
+                &inputs.provider_records,
+                &inputs.global_settings,
+                inputs.latest_policy.as_ref(),
+                routes,
+                Some(&inputs),
+            )
+            .await;
+        }
+        let providers = sandbox
+            .spec
+            .as_ref()
+            .map_or(&[][..], |spec| spec.providers.as_slice());
+        let (records, latest) = tokio::try_join!(
+            load_provider_environment_records(
+                &state.store,
+                &state.refresh,
+                &self.workspace,
+                providers
+            ),
+            async {
+                state
+                    .store
+                    .get_latest_policy(sandbox.object_id())
+                    .await
+                    .map_err(|_| Status::unavailable("sandbox policy unavailable"))
+            },
+        )?;
         build_sandbox_config_snapshot_with_sources(
             state,
             sandbox,
@@ -193,6 +217,7 @@ impl DiscoveryConfigInputs {
             &self.global_settings,
             latest.as_ref(),
             routes,
+            None,
         )
         .await
     }

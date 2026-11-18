@@ -12,9 +12,10 @@ use openshell_core::proto::{
     CreateWorkspaceResponse, DeleteProviderProfileResponse, DeleteProviderRefreshResponse,
     DeleteProviderResponse, DeleteSandboxResponse, DeleteSandboxTemplateResponse,
     DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome, DetachSandboxProviderResponse,
-    ImportProviderProfilesResponse, ProviderProfile, RemoveWorkspaceMemberResponse, Sandbox,
-    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse,
-    UpdateProviderProfilesResponse, WorkspaceSelector, workspace_selector::Selection,
+    FrozenSandboxResponse, ImportProviderProfilesResponse, ProviderProfile,
+    RemoveWorkspaceMemberResponse, Sandbox, SandboxResponse, SandboxTemplateResponse,
+    ServiceEndpointResponse, UpdateProviderProfilesResponse, WorkspaceSelector,
+    workspace_selector::Selection,
 };
 use openshell_ocsf::ResourceDetails;
 use tonic::{Code, Response, Status};
@@ -112,6 +113,12 @@ fn stored_sandbox(sandbox: Option<&Sandbox>) -> Vec<Produced<'_>> {
 }
 
 impl Audited for SandboxResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_sandbox(self.sandbox.as_ref())
+    }
+}
+
+impl Audited for FrozenSandboxResponse {
     fn produced(&self) -> Vec<Produced<'_>> {
         stored_sandbox(self.sandbox.as_ref())
     }
@@ -710,6 +717,28 @@ mod tests {
         .await;
         let sandbox = result.unwrap().into_inner().sandbox.unwrap();
         assert!(event.get("status_detail").is_none(), "{event}");
+        assert_eq!(
+            event["resources"],
+            json!([
+                default_workspace(),
+                stored_json("sandbox", sandbox.metadata.as_ref().unwrap())
+            ])
+        );
+
+        let (result, event) = record_at(
+            "/openshell.v1.FrozenSandboxPolicies/CreateSandbox",
+            openshell_core::proto::frozen_sandbox_policies_server::FrozenSandboxPolicies::create_sandbox(
+                &service,
+                authed_request(openshell_core::proto::CreateFrozenSandboxRequest {
+                    workspace_scope: Some(workspace_selector("default")),
+                    name: "audit-frozen".into(),
+                    spec: Some(SandboxSpec::default()),
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await;
+        let sandbox = result.unwrap().into_inner().sandbox.unwrap();
         assert_eq!(
             event["resources"],
             json!([

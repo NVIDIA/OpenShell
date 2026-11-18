@@ -19,23 +19,28 @@
 //! ```
 
 pub use openshell_core::proto;
+pub use openshell_core::proto::frozen_sandbox_policies_client::FrozenSandboxPoliciesClient;
 pub use openshell_core::proto::open_shell_client::OpenShellClient as GrpcClient;
 pub use openshell_core::proto::sandbox_updates_client::SandboxUpdatesClient;
 pub use openshell_core::proto::service_discovery_client::ServiceDiscoveryClient;
 pub use openshell_core::proto::{
-    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateWorkspaceRequest,
-    DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteWorkspaceRequest, ExecSandboxRequest,
-    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
-    GetSandboxTemplateRequest, GetWorkspaceRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
-    ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt,
-    ProviderReadinessObservation, ProviderReadinessReason, ProviderReadinessState,
-    ProviderReadinessStatus, ResumeSandboxRequest, Sandbox, SandboxCommandUpdate, SandboxMapUpdate,
-    SandboxPhase as ProtoSandboxPhase, SandboxResources, SandboxServiceLevel,
-    SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate, SandboxTemplateResponse,
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
-    SandboxWorkloadTemplateSpec, ServiceStatus as ProtoServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, SuspendSandboxRequest, UpdateSandboxRequest, Workspace,
+    CreateFrozenSandboxRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
+    CreateWorkspaceRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
+    DeleteWorkspaceRequest, ExecSandboxRequest, FrozenSandboxConfigResponse,
+    FrozenSandboxPolicyState, FrozenSandboxResponse, GetFrozenSandboxConfigRequest,
+    GetFrozenSandboxPolicyRequest, GetSandboxProviderStatusRequest,
+    GetSandboxProviderStatusResponse, GetSandboxRequest, GetSandboxTemplateRequest,
+    GetWorkspaceRequest, HealthRequest, ListProvidersRequest, ListSandboxTemplatesRequest,
+    ListSandboxesRequest, ListWorkspacesRequest, ProviderDesiredIdentity, ProviderMutationKind,
+    ProviderMutationReceipt, ProviderReadinessObservation, ProviderReadinessReason,
+    ProviderReadinessState, ProviderReadinessStatus, ResumeSandboxRequest, Sandbox,
+    SandboxCommandUpdate, SandboxMapUpdate, SandboxPhase as ProtoSandboxPhase, SandboxResources,
+    SandboxServiceLevel, SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate,
+    SandboxTemplateResponse, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
+    ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest,
+    SuspendSandboxRequest, UpdateFrozenGlobalConfigRequest, UpdateFrozenGlobalConfigResponse,
+    UpdateSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.
@@ -57,6 +62,14 @@ pub type AuthedSandboxUpdatesClient = SandboxUpdatesClient<
 
 /// Application ingress discovery using the SDK transport and live auth slot.
 pub type AuthedServiceDiscoveryClient = ServiceDiscoveryClient<
+    tonic::service::interceptor::InterceptedService<
+        tonic::transport::Channel,
+        crate::EdgeAuthInterceptor,
+    >,
+>;
+
+/// Frozen-policy service sharing the client's transport and live auth slot.
+pub type AuthedFrozenSandboxPoliciesClient = FrozenSandboxPoliciesClient<
     tonic::service::interceptor::InterceptedService<
         tonic::transport::Channel,
         crate::EdgeAuthInterceptor,
