@@ -64,7 +64,7 @@ windows = { version = "0.62", features = ["Wdk_System_Threading", "Win32_Foundat
 anyhow = "1"
 
 # Logging/Tracing
-jiff = { version = "0.2.38", default-features = false, features = ["std"] }
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
