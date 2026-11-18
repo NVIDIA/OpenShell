@@ -149,7 +149,9 @@ pub struct Response {
     pub status: u16,
     /// The headers, in order, as they arrived.
     pub headers: Vec<(String, String)>,
-    /// The body, with chunked transfer encoding removed.
+    /// The body, with chunked transfer encoding removed. A body cut short is
+    /// returned as far as it arrived; [`Http::read_end`] says why reading
+    /// stopped.
     pub body: Vec<u8>,
 }
 

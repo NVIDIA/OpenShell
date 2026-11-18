@@ -970,8 +970,9 @@ impl Context {
     }
 }
 
-/// The longest sandbox name the gateway accepts. With `test-<run-id>-`, a
-/// sandbox suffix can have at most 5 characters.
+/// The longest sandbox name the gateway accepts, the server's
+/// `MAX_ROUTABLE_NAME_LEN` in `crates/openshell-server/src/grpc/mod.rs`. With
+/// `test-<run-id>-`, a sandbox suffix can have at most 5 characters.
 pub const MAX_SANDBOX_NAME_LEN: usize = 19;
 
 /// Panic, at the test's call, on a sandbox name the gateway would reject, so

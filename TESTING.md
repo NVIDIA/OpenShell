@@ -182,8 +182,8 @@ tests.
 
 To run Python in a testkit sandbox, use `Sandbox::run_python` with a sandbox
 from `testkit::python_image()`, not the Python SDK's `exec_python` described
-under Python E2E. The README's "Writing a sandbox client" section covers
-scripts that probe the network from inside a sandbox.
+under Python E2E. [Writing a sandbox client](tests/testkit/README.md#writing-a-sandbox-client)
+covers scripts that probe the network from inside a sandbox.
 
 The conformance crate also builds `openshell-conformance`, a program that
 runs the conformance suite against a gateway without cargo or nextest
