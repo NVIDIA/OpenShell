@@ -93,9 +93,12 @@
       changed_when: false
       failed_when: k3s_nodes.rc != 0 or k3s_nodes.stdout_lines | length != 1
 
-    - name: Select the K3s node IPv4 address
+    # On an IPv6-first cluster (playbooks/k3s-ipv6.yaml) the node lists its
+    # IPv6 address first, and the gateway and supervisor must listen on IPv6.
+    - name: Select the K3s node IPv4 address and listen address
       ansible.builtin.set_fact:
         k3s_node_ipv4: "{{ k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | first }}"
+        k3s_listen_address: "{{ '::' if ':' in k3s_node_address.stdout.split()[0] else '0.0.0.0' }}"
 
     - name: Write OpenShell Helm values
       ansible.builtin.copy:
@@ -106,6 +109,7 @@
             image:
               registry: ""
           gateway:
+            listenAddress: "{{ k3s_listen_address }}"
             image:
               repository: openshell/gateway
               tag: tmachine
@@ -116,6 +120,7 @@
               tag: tmachine
               pullPolicy: never
           supervisor:
+            listenAddress: "{{ k3s_listen_address }}"
             image:
               repository: openshell/supervisor
               tag: tmachine
@@ -134,27 +139,6 @@
         dest: /var/lib/openshell/artifacts/values-overlay.yaml
         mode: "0600"
         content: "{{ openshell_k3s_helm_values_overlay | default('{}') }}"
-
-    # An environment adapts the chart to its cluster by writing values to
-    # /etc/openshell-test/helm-values.yaml before the installer runs (for
-    # example playbooks/k3s-ipv6.yaml). They apply last. Other environments
-    # get an empty file.
-    - name: Create the test configuration directory
-      ansible.builtin.file:
-        path: /etc/openshell-test
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Ensure environment Helm values exist
-      ansible.builtin.copy:
-        dest: /etc/openshell-test/helm-values.yaml
-        content: "{}\n"
-        force: false
-        owner: root
-        group: root
-        mode: "0644"
 
     - name: Install Agent Sandbox
       ansible.builtin.command:
@@ -203,8 +187,6 @@
           - /var/lib/openshell/artifacts/values.yaml
           - --values
           - /var/lib/openshell/artifacts/values-overlay.yaml
-          - --values
-          - /etc/openshell-test/helm-values.yaml
           - --wait
           - --timeout=5m
       environment:

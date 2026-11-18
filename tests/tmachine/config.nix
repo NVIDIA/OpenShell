@@ -107,8 +107,8 @@ let
         inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
       };
     };
-    # A dual-stack cluster with IPv6 first, and the chart's IPv6 listen
-    # addresses, for running the k3s suites over IPv6.
+    # A dual-stack K3s cluster with IPv6 first, for running the k3s suites
+    # over IPv6.
     ipv6 = {
       bases = [ "ubuntu-k3s" ];
       setup.playbooks = [ "ansible/playbooks/k3s-ipv6.yaml" ];

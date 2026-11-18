@@ -607,12 +607,6 @@ installer applies it to the gateway's own file:
   with no overrides leaves it untouched.
 - `k3s` installers ignore the file.
 
-K3s environments adapt the Helm chart instead: a playbook that runs before the
-installer writes values to `/etc/openshell-test/helm-values.yaml`, and the
-`k3s` and `k3s-ha` installers apply them after their own values.
-`ubuntu-k3s-ipv6` uses this to set the gateway and supervisor `listenAddress`
-to `::`.
-
 `tests/tmachine/ansible/roles/openshell_gateway/files/merge-gateway-toml.py`
 does the work. Each key in the overrides replaces the same key in the table, or
 is added to it, and a table the file lacks is appended. The rest of the file,
