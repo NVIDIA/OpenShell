@@ -75,6 +75,18 @@ pub fn to_yaml(policy: &proto::SandboxPolicy) -> Result<String> {
         .context("serialize the policy")
 }
 
+/// `binaries` as the flow-style list a network policy's `binaries:` key
+/// takes in YAML, such as `[{path: "/usr/bin/python*"}]`. Use it in policy
+/// YAML a test writes by hand, for example with
+/// `binaries_yaml(PYTHON_BINARIES)`.
+pub fn binaries_yaml(binaries: &[&str]) -> String {
+    let paths: Vec<String> = binaries
+        .iter()
+        .map(|path| format!("{{path: {}}}", serde_json::Value::from(*path)))
+        .collect();
+    format!("[{}]", paths.join(", "))
+}
+
 /// Settings for an endpoint from [`allow`], named as in policy YAML.
 pub trait Endpoint {
     /// `protocol: rest` with `access`.
@@ -184,5 +196,27 @@ mod tests {
             openshell_policy::parse_sandbox_policy(&to_yaml(&policy).expect("serializes"))
                 .expect("the serialized policy parses");
         assert_eq!(round_trip, expected);
+    }
+
+    /// The list parses as the `binaries` of a policy, the same as
+    /// [`allow`] adds them.
+    #[test]
+    fn binaries_yaml_lists_each_path() {
+        let binaries = ["/usr/bin/python*", "/sandbox/.uv/python/*/bin/python*"];
+        let yaml = format!(
+            "{BASE}network_policies:
+  upstream:
+    name: upstream
+    endpoints:
+      - {{host: example.test, port: 8080}}
+    binaries: {}
+",
+            binaries_yaml(&binaries)
+        );
+        let parsed = openshell_policy::parse_sandbox_policy(&yaml).expect("the YAML parses");
+        let mut expected = base();
+        allow(&mut expected, "upstream", "example.test", 8080, &binaries);
+        assert_eq!(parsed, expected);
+        assert_eq!(binaries_yaml(&[]), "[]");
     }
 }

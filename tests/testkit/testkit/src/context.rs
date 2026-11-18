@@ -397,6 +397,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Attach these providers to the sandbox.
+    pub fn providers<I, S>(mut self, providers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.spec.providers = providers.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Create the sandbox with this policy instead of the gateway's default.
     pub fn policy(mut self, policy: proto::SandboxPolicy) -> Self {
         self.policy = Some(policy);
@@ -542,6 +552,19 @@ impl ExecOutput {
         Ok(self)
     }
 
+    /// The last line of stdout that parses as JSON, such as the result a
+    /// client script prints after its other output.
+    pub fn last_json(&self) -> Result<serde_json::Value> {
+        last_json_line(&self.stdout).ok_or_else(|| {
+            Error::msg(format!(
+                "{} printed no JSON line; stdout: {}; stderr: {}",
+                self.description,
+                self.stdout.trim(),
+                self.stderr.trim()
+            ))
+        })
+    }
+
     fn outcome(&self) -> Outcome<'_> {
         Outcome {
             what: &self.description,
@@ -550,6 +573,26 @@ impl ExecOutput {
             stderr: &self.stderr,
         }
     }
+}
+
+/// Only objects and arrays count, so a line that happens to parse, such as
+/// a number, isn't taken for the result.
+fn last_json_line(stdout: &str) -> Option<serde_json::Value> {
+    stdout.lines().rev().find_map(|line| {
+        serde_json::from_str(line.trim())
+            .ok()
+            .filter(|value: &serde_json::Value| value.is_object() || value.is_array())
+    })
+}
+
+/// A script's first line that isn't blank or a license header, which names
+/// it in reports instead of its full text.
+fn script_summary(script: &str) -> &str {
+    script
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("# SPDX-"))
+        .unwrap_or_default()
 }
 
 impl Sandbox {
@@ -725,6 +768,41 @@ impl Sandbox {
         })
     }
 
+    /// Run `script` with `python3 -c` and `args`, as in a sandbox from
+    /// [`crate::python_image`]. Fails unless it exits 0. Read a JSON result
+    /// with [`ExecOutput::last_json`].
+    pub async fn run_python(&self, script: &str, args: &[&str]) -> Result<ExecOutput> {
+        let mut command = vec!["python3", "-c", script];
+        command.extend_from_slice(args);
+        let mut output = self.exec(command).await?;
+        output.description = format!(
+            "python3 script {:?} with {args:?} in sandbox {}",
+            script_summary(script),
+            self.name
+        );
+        output.success()
+    }
+
+    /// The sandbox's policy revisions, from `policy list --output json`.
+    pub async fn policy_revisions(&self) -> Result<serde_json::Value> {
+        self.handles
+            .cli
+            .run(["policy", "list", &self.name, "--output", "json"])
+            .await?
+            .success()?
+            .json()
+    }
+
+    /// The sandbox's active policy, from `policy get --full --output json`.
+    pub async fn active_policy(&self) -> Result<serde_json::Value> {
+        self.handles
+            .cli
+            .run(["policy", "get", &self.name, "--full", "--output", "json"])
+            .await?
+            .success()?
+            .json()
+    }
+
     /// Run `command` every 250 ms until `ready` accepts its output, and return
     /// that output. An exec error fails at once; a timeout reports the last
     /// output.
@@ -872,6 +950,47 @@ fn generate_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exec_output(stdout: &str) -> ExecOutput {
+        ExecOutput {
+            description: "exec in sandbox".to_string(),
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn last_json_takes_the_last_object_or_array_line() {
+        let output = exec_output("{\"first\": 1}\nprogress\n  {\"last\": true}  \n42\nDONE\n");
+        assert_eq!(
+            output.last_json().expect("a JSON line"),
+            serde_json::json!({"last": true})
+        );
+        assert_eq!(
+            exec_output("[1, 2]\n").last_json().expect("a JSON line"),
+            serde_json::json!([1, 2])
+        );
+    }
+
+    #[test]
+    fn last_json_reports_output_without_a_json_line() {
+        let error = exec_output("ECHO_OK\n7\n")
+            .last_json()
+            .expect_err("no object or array");
+        assert!(error.to_string().contains("ECHO_OK"), "{error}");
+    }
+
+    #[test]
+    fn script_summary_skips_blank_and_license_lines() {
+        let script = "\n# SPDX-FileCopyrightText: x\n# SPDX-License-Identifier: y\n\n# Sends a request.\nimport json\n";
+        assert_eq!(script_summary(script), "# Sends a request.");
+        assert_eq!(
+            script_summary("import sys; print(1)"),
+            "import sys; print(1)"
+        );
+        assert_eq!(script_summary(""), "");
+    }
 
     #[test]
     fn policy_create_request_keeps_the_spec_and_adds_the_policy() {
