@@ -429,10 +429,19 @@ conflicts with `ConfigureProviderRefresh`, so a new reference cannot appear
 between the check and the delete. Deleting a provider or its refresh
 configuration removes its references. Workspace deletion is blocked while
 secrets exist; the secret type joins the resource kinds that workspace deletion
-checks. Workspace deletion marks the workspace terminating before it scans for
-blockers, so `CreateSecret` re-reads the workspace after its insert. If the
-workspace is no longer the active one it resolved, the create removes its row
-and staged value and fails. Otherwise the deletion's scan finds the secret.
+checks.
+
+`CreateSecret` must not leave a secret behind in a deleted workspace, even if
+the gateway exits mid-request. It inserts the record as a pending create that
+records the workspace's ID. A pending record is invisible to every read and
+reference, but it blocks workspace deletion. Workspace deletion marks the
+workspace terminating before it scans for blockers, so after the insert the
+create re-reads the workspace. If the workspace is still the active one it
+resolved, the create publishes the record with a version-checked write.
+Otherwise it discards the record and its staged value and fails. A record whose
+create never publishes is discarded by the sweep once it is stale or its
+workspace is gone or replaced, or by the next create of the same name. A later
+workspace with the same name therefore never inherits it.
 
 Bindings use immutable IDs. Deleting a secret and recreating one with the same
 name therefore never silently rebinds a provider.
@@ -531,6 +540,9 @@ support, the operator must:
    refresh-enabled secrets that a control-plane service also reveals. Their
    readers do not block deletion, so confirm each reader has switched first.
 4. Delete all secrets, which the delete guard now permits.
+5. Remove `enable_workspace_secrets`, `enable_secret_reveal`, and their process
+   flags from the gateway configuration. Older gateways reject unknown TOML
+   keys whatever their value.
 
 The rollback documentation states this. `ListSecrets` in each workspace, plus
 the referenced secrets that refresh status reports for each credential, shows
@@ -596,8 +608,8 @@ activation. Reveal has its own default-off setting.
    - a refresh sweep on the previous release binary over a refresh state with a
      binding, which must not mint
    - rollback: rotate a user's refresh token, disable `enable_workspace_secrets`, inline
-     the binding, delete the secret, and verify the provider mints on the
-     previous release
+     the binding, delete the secret, remove the new settings, start the
+     previous release with that configuration, and verify the provider mints
 3. **Reveal.** Add operator-only `RevealSecret`, `enable_secret_reveal`, and
    audited reads. Test denial for OIDC users with any scope, user mTLS, local
    development identities, and the disabled default, and acceptance for an

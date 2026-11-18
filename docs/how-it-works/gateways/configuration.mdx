@@ -717,6 +717,12 @@ Before rolling back to a release without workspace secrets:
    Move each value that is still needed to storage the target release
    supports, and confirm its readers no longer use `RevealSecret`.
 4. Delete every workspace secret.
+5. Remove `enable_workspace_secrets` and `enable_secret_reveal` from the gateway
+   configuration, including any Helm `gatewayConfig` values, and remove the
+   `--enable-workspace-secrets` and `--enable-secret-reveal` process flags and
+   their environment variables. Older gateways reject unknown configuration
+   keys even when they are set to `false`, so do this before starting the
+   older release.
 
 After the downgrade, the older gateway mints copied values without the
 allowed-endpoint and redirect checks. It still sends them only to the token
