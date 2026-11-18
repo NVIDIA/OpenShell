@@ -25,6 +25,7 @@ use std::time::Duration;
 
 static ACCESS_TOKENS: LazyLock<IntermediateTokenCache> = LazyLock::new(IntermediateTokenCache::new);
 static ACQUISITIONS: LazyLock<Acquisitions> = LazyLock::new(Acquisitions::default);
+static ADMISSION: LazyLock<Admission> = LazyLock::new(Admission::default);
 
 pub(in crate::grpc) async fn handle(
     state: &Arc<ServerState>,
@@ -73,7 +74,7 @@ async fn authorize(
     let session = authority
         .verify_gateway_token(bearer)
         .map_err(|error| error.status)?;
-    if session.expires_at == 0 {
+    if session.expires_at.saturating_mul(1000) <= crate::persistence::current_time_ms() {
         return Err(token_grant_identity_rejected(tonic::Code::Unauthenticated));
     }
     crate::auth::sandbox_session::authorize_persisted(&state.store, &session)
@@ -224,6 +225,9 @@ async fn obtain(
     if principal.sandbox_id != session.sandbox_id.as_str() {
         return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
+    // Bound outstanding work after authentication, independently of caching.
+    // A busy sandbox cannot occupy the gateway's entire acquisition budget.
+    let _admission = ADMISSION.enter(session.sandbox_id.as_str())?;
     // Startup enables an identity provider only with gateway session JWTs.
     let (Some(identity), Some(gateway_jwt)) = (
         state.sandbox_identity.as_deref(),
@@ -248,6 +252,13 @@ async fn obtain(
         .map(openshell_core::time::duration_to_std)
         .transpose()
         .map_err(|_| token_grant_configuration_status(tonic::Code::InvalidArgument))?;
+    // Millisecond truncation and final authorization reads would consume tiny
+    // cache lifetimes before they could be returned. Zero remains no-cache.
+    if ttl_override.is_some_and(|ttl| !ttl.is_zero() && ttl < Duration::from_secs(1)) {
+        return Err(token_grant_configuration_status(
+            tonic::Code::InvalidArgument,
+        ));
+    }
     let grant_type = ProviderCredentialTokenGrantType::try_from(grant.grant_type)
         .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     // Resolve the subject before any cache lookup, so its revocation or
@@ -278,73 +289,85 @@ async fn obtain(
     let fingerprint = cache_key(&session, &configured, subject_value, gateway_id)?;
     // A zero override disables caching, and with it shared acquisition.
     let caching = ttl_override != Some(Duration::ZERO);
-    let cached = || {
-        caching
-            .then(|| ACCESS_TOKENS.get_until(&fingerprint))
-            .flatten()
-    };
-    // A miss holds its fingerprint's turn until its token is cached, so
-    // concurrent misses wait and then find it. A miss is cached only after
-    // the final validation below, which a hit passes as well.
-    let mut turn = None;
-    let (response, serve_until_ms, acquired) = if let Some((token, until)) = cached() {
-        (token, until, false)
-    } else {
-        let waited = if caching {
-            Some(ACQUISITIONS.turn(&fingerprint).await)
-        } else {
-            None
+    let mut refresh = false;
+    loop {
+        let cached = || {
+            (caching && !refresh)
+                .then(|| ACCESS_TOKENS.get_until(&fingerprint))
+                .flatten()
+                .filter(|(_, until)| {
+                    *until > crate::persistence::current_time_ms().saturating_add(1000)
+                })
         };
-        if let Some((token, until)) = cached() {
+        // A miss holds its fingerprint's turn until its token is cached, so
+        // concurrent misses wait and then find it. A miss is cached only after
+        // the final validation below, which a hit passes as well.
+        let mut turn = None;
+        let (response, serve_until_ms, acquired) = if let Some((token, until)) = cached() {
             (token, until, false)
         } else {
-            turn = waited;
-            let (token, until) = acquire(
-                state,
-                &bearer,
-                &session,
-                identity,
-                gateway_id,
-                grant,
-                subject.as_ref(),
-                ttl_override,
-                request_id,
-            )
-            .await?;
-            (token, until, true)
+            let waited = if caching {
+                Some(ACQUISITIONS.turn(&fingerprint).await)
+            } else {
+                None
+            };
+            if let Some((token, until)) = cached() {
+                (token, until, false)
+            } else {
+                turn = waited;
+                let (token, until) = acquire(
+                    state,
+                    &bearer,
+                    &session,
+                    identity,
+                    gateway_id,
+                    grant,
+                    subject.as_ref(),
+                    ttl_override,
+                    request_id,
+                )
+                .await?;
+                (token, until, true)
+            }
+        };
+        // Re-read attachment, provider revision, and profile, then the session,
+        // before serving or caching any token.
+        let current = grant_configuration(state, session.sandbox_id.as_str(), key).await?;
+        if cache_key(&session, &current, subject_value, gateway_id)? != fingerprint {
+            return Err(token_grant_configuration_status(
+                tonic::Code::FailedPrecondition,
+            ));
         }
-    };
-    // Re-read attachment, provider revision, and profile, then the session,
-    // before serving or caching any token.
-    let current = grant_configuration(state, session.sandbox_id.as_str(), key).await?;
-    if cache_key(&session, &current, subject_value, gateway_id)? != fingerprint {
-        return Err(token_grant_configuration_status(
-            tonic::Code::FailedPrecondition,
-        ));
+        authorize(state, &bearer).await?;
+        // The lifetime runs from when the token service answered, so time spent
+        // in the final validation counts against it.
+        let remaining_ms = serve_until_ms.saturating_sub(crate::persistence::current_time_ms());
+        if remaining_ms <= 0 && !acquired {
+            // A hit can expire during the final asynchronous checks. Refresh once;
+            // a fresh acquisition still must pass every check before it is served.
+            refresh = true;
+            continue;
+        }
+        if remaining_ms <= 0 {
+            return Err(TokenGrantFailure::new(
+                TokenGrantFailureKind::Timeout,
+                TokenGrantStage::GatewayRpc,
+            )
+            .to_status());
+        }
+        if acquired && caching {
+            ACCESS_TOKENS.set(fingerprint, &response, serve_until_ms);
+        }
+        drop(turn);
+        return Ok(Response::new(GetSandboxProviderAccessTokenResponse {
+            access_token: response.access_token,
+            token_type: response.token_type,
+            expires_after: openshell_core::time::duration_from_std(Duration::from_millis(
+                u64::try_from(remaining_ms).unwrap_or_default(),
+            ))
+            .ok(),
+        }));
     }
-    authorize(state, &bearer).await?;
-    // The lifetime runs from when the token service answered, so time spent
-    // in the final validation counts against it.
-    let remaining_ms = serve_until_ms.saturating_sub(crate::persistence::current_time_ms());
-    if remaining_ms <= 0 {
-        return Err(TokenGrantFailure::new(
-            TokenGrantFailureKind::Timeout,
-            TokenGrantStage::GatewayRpc,
-        )
-        .to_status());
-    }
-    if acquired && caching {
-        ACCESS_TOKENS.set(fingerprint, &response, serve_until_ms);
-    }
-    drop(turn);
-    Ok(Response::new(GetSandboxProviderAccessTokenResponse {
-        access_token: response.access_token,
-        token_type: response.token_type,
-        expires_after: openshell_core::time::duration_from_std(Duration::from_millis(
-            u64::try_from(remaining_ms).unwrap_or_default(),
-        ))
-        .ok(),
-    }))
 }
 
 /// Acquire a final token, re-authorizing the session between network calls.
@@ -499,6 +522,55 @@ fn serve_until_ms(
 
 type AcquisitionSlots = HashMap<String, (Arc<tokio::sync::Mutex<()>>, usize)>;
 
+#[derive(Default)]
+struct Admission {
+    active: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+impl Admission {
+    fn enter(&self, sandbox: &str) -> Result<AdmissionGuard<'_>, Status> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.values().sum::<usize>() >= 64
+            || active.get(sandbox).copied().unwrap_or_default() >= 4
+        {
+            return Err(TokenGrantFailure::new(
+                TokenGrantFailureKind::Unavailable,
+                TokenGrantStage::GatewayRpc,
+            )
+            .to_status_with_code(tonic::Code::ResourceExhausted));
+        }
+        *active.entry(sandbox.to_string()).or_default() += 1;
+        Ok(AdmissionGuard {
+            admission: self,
+            sandbox: sandbox.to_string(),
+        })
+    }
+}
+
+struct AdmissionGuard<'a> {
+    admission: &'a Admission,
+    sandbox: String,
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .admission
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = active.get_mut(&self.sandbox) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.sandbox);
+            }
+        }
+    }
+}
+
 /// Coordinate token acquisition separately for each cache fingerprint.
 ///
 /// Concurrent misses share a single acquisition without locking unrelated
@@ -562,6 +634,27 @@ struct AcquisitionTurn<'a> {
 mod tests {
     use super::*;
     use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal};
+
+    #[test]
+    fn admission_is_bounded_per_sandbox_and_releases_cancelled_work() {
+        let admission = Admission::default();
+        let guards: Vec<_> = (0..4).map(|_| admission.enter("busy").unwrap()).collect();
+        assert_eq!(
+            admission.enter("busy").err().unwrap().code(),
+            tonic::Code::ResourceExhausted
+        );
+        let other = admission.enter("other").unwrap();
+        drop(guards);
+        drop(admission.enter("busy").unwrap());
+        drop(other);
+        assert!(admission.active.lock().unwrap().is_empty());
+        let guards: Vec<_> = (0..64)
+            .map(|i| admission.enter(&i.to_string()).unwrap())
+            .collect();
+        assert!(admission.enter("overflow").is_err());
+        drop(guards);
+        assert!(admission.active.lock().unwrap().is_empty());
+    }
     #[tokio::test]
     async fn broker_requires_a_signed_session_even_with_a_sandbox_principal() {
         let state = crate::grpc::test_support::test_server_state().await;

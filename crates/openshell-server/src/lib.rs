@@ -429,6 +429,7 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+    pub(crate) provider_token_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 
     /// Immutable public reflection index and its per-query rate limiter.
     pub(crate) reflection_service: reflection::GatewayReflectionServer,
@@ -666,6 +667,7 @@ impl ServerState {
         compute.configure_service_route_index(Arc::clone(&service_route_index));
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let provider_token_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let reflection_service = reflection::build_gateway_reflection_service(&config)
             .expect("compiled public gateway descriptors must be valid");
         let admin_role = config
@@ -709,6 +711,7 @@ impl ServerState {
             peer_authenticator: None,
             logons: auth::audit::Logons::default(),
             grpc_rate_limiter,
+            provider_token_rate_limiter,
             reflection_service,
             gateway_interceptors: None,
             provider_profile_sources:
