@@ -12,8 +12,8 @@ use crate::proxy::destination::{
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -278,15 +278,11 @@ struct StoreState {
     next_mapping_generation: u64,
 }
 
-type RefreshLock = Arc<tokio::sync::Mutex<Option<Instant>>>;
-
 pub(crate) struct ResolvedEndpointStore {
     state: RwLock<StoreState>,
     config: StoreConfig,
     ipv4_pool_high_water_emitted: AtomicBool,
     ipv6_pool_high_water_emitted: AtomicBool,
-    refresher: OnceLock<Weak<dyn super::MappingRefresher>>,
-    refreshes: Mutex<BTreeMap<IpAddr, RefreshLock>>,
 }
 
 impl ResolvedEndpointStore {
@@ -309,78 +305,35 @@ impl ResolvedEndpointStore {
             config,
             ipv4_pool_high_water_emitted: AtomicBool::new(false),
             ipv6_pool_high_water_emitted: AtomicBool::new(false),
-            refresher: OnceLock::new(),
-            refreshes: Mutex::new(BTreeMap::new()),
         }
     }
 
-    pub(super) fn set_refresher(&self, refresher: Weak<dyn super::MappingRefresher>) {
-        let _ = self.refresher.set(refresher);
-    }
-
-    /// Refresh only an expired, policy-backed mapping from the same policy
-    /// generation. Never let an expired observation acquire an egress grant.
-    pub(crate) async fn refresh_if_expired(
+    /// Recover refresh identity without authorizing expired upstream addresses.
+    pub(super) fn expired_for_connect(
         &self,
         address: IpAddr,
         port: u16,
         generation: u64,
-    ) -> miette::Result<()> {
-        if !matches!(
-            self.lookup_intent(address, port, generation, Instant::now()),
-            Err(MappingLookupError::Expired)
-        ) {
-            return Ok(());
+    ) -> Result<ResolvedEndpointRecord, MappingLookupError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| MappingLookupError::LockPoisoned)?;
+        let record = state
+            .records
+            .get(&address)
+            .or_else(|| state.expired_allocations.get(&address))
+            .ok_or(MappingLookupError::Missing)?;
+        if record.policy_generation != generation {
+            return Err(MappingLookupError::StalePolicy);
         }
-        let record = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| miette::miette!("mapping store lock poisoned"))?;
-            state
-                .records
-                .get(&address)
-                .or_else(|| state.expired_allocations.get(&address))
-                .cloned()
-                .ok_or_else(|| miette::miette!("expired mapping identity is unavailable"))?
-        };
-        if record.policy_generation != generation
-            || record.is_observation()
-            || !record.eligible_ports.contains(&port)
-        {
-            return Err(miette::miette!(
-                "expired mapping is not eligible for refresh"
-            ));
+        if record.is_observation() {
+            return Err(MappingLookupError::Expired);
         }
-        // Entries are allocated only for known mappings, bounded by the store's
-        // allocation budget. A failed lookup cools down for one second.
-        let refresh = self
-            .refreshes
-            .lock()
-            .map_err(|_| miette::miette!("mapping refresh lock poisoned"))?
-            .entry(address)
-            .or_default()
-            .clone();
-        let mut failed_at = refresh.lock().await;
-        if self
-            .lookup_intent(address, port, generation, Instant::now())
-            .is_ok()
-        {
-            return Ok(());
+        if !record.eligible_ports.contains(&port) {
+            return Err(MappingLookupError::PortMismatch);
         }
-        if failed_at.is_some_and(|failed| failed.elapsed() < super::MIN_MAPPING_TTL) {
-            return Err(miette::miette!(
-                "transparent TCP mapping refresh recently failed"
-            ));
-        }
-        let refresher = self
-            .refresher
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or_else(|| miette::miette!("transparent TCP mapping refresh is unavailable"))?;
-        let result = refresher.refresh(&record).await;
-        *failed_at = result.as_ref().err().map(|_| Instant::now());
-        result
+        Ok(record.clone())
     }
 
     pub(crate) fn publish(

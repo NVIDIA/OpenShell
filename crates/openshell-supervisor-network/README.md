@@ -37,9 +37,10 @@ Synthetic identities remain allocated after their DNS mappings expire. New
 transparent connections lazily refresh expired, policy-backed mappings through
 the same trusted resolver and destination-validation path as sandbox DNS
 queries. Refreshes for one address share a lock; failed refreshes back off for
-one second and never authorize expired upstream addresses. The service is held
-weakly by the store to avoid an ownership cycle. Observation-only mappings,
-wrong ports, and mappings from a previous policy generation cannot refresh.
+one second and never authorize expired upstream addresses.
+`PolicyDnsService::lookup_for_connect` owns refresh coordination and returns
+the resulting mapping; the underlying store stays synchronous. Observation-only
+mappings, wrong ports, and mappings from a previous policy generation cannot refresh.
 Refresh eligibility uses the authored ports, independently of which ports the
 latest DNS addresses satisfied. Dispatch reauthorizes mapped connections and
 rebuilds their connectors from current pins instead of retaining staged pins

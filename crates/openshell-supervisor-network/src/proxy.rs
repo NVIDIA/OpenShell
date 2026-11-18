@@ -17,8 +17,11 @@ use openshell_sandbox_backend::test_support as rpc_test;
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
+#[cfg(test)]
+use crate::policy_dns::SocketTrustedResolver;
 use crate::policy_dns::{
-    MappingLookup, MappingLookupError, PolicyEndpointId, ResolvedEndpointStore,
+    ConnectLookupError, MappingLookup, MappingLookupError, PolicyDnsService, PolicyEndpointId,
+    ResolvedEndpointStore,
 };
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::telemetry::egress_emit;
@@ -311,7 +314,7 @@ impl ProxyHandle {
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         backend_host_gateway: Option<IpAddr>,
         network_mediation_source: Option<Arc<NetworkMediationSource>>,
-        policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
+        policy_dns: Option<Arc<PolicyDnsService>>,
         direct_listener_identity: Option<ContractBinaryIdentity>,
         required_proxy_authorization: Option<Arc<str>>,
         reserved_destination: Option<ReservedDestination>,
@@ -477,7 +480,7 @@ impl ProxyHandle {
                             match pending {
                                 Ok(connection) => {
                                     let tx = preauthorized_tx.clone();
-                                    let dns_store = policy_dns_store.clone();
+                                    let dns_service = policy_dns.clone();
                                     let opa = opa_engine.clone();
                                     let cache = identity_cache.clone();
                                     let backend_gateway = *backend_host_gateway;
@@ -488,7 +491,7 @@ impl ProxyHandle {
                                     tokio::spawn(async move {
                                         if let Some(connection) = preauthorize_transparent_open(
                                             connection,
-                                            dns_store.as_ref(),
+                                            dns_service.as_ref(),
                                             &opa,
                                             &cache,
                                             backend_gateway,
@@ -548,7 +551,7 @@ impl ProxyHandle {
                         let backend_gw = backend_host_gateway.clone();
                         let up_proxy = upstream_proxy.clone();
                         let credentials = provider_credentials.clone();
-                        let dns_store = policy_dns_store.clone();
+                        let dns_service = policy_dns.clone();
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
@@ -563,7 +566,7 @@ impl ProxyHandle {
                                 supplied_identity,
                                 socket_addrs,
                                 transparent_destination,
-                                dns_store,
+                                dns_service,
                                 opa,
                                 cache,
                                 spid,
@@ -634,7 +637,7 @@ impl ProxyHandle {
 #[allow(clippy::too_many_arguments)]
 async fn preauthorize_transparent_open(
     connection: PendingTcpOpen,
-    policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
+    policy_dns: Option<&Arc<PolicyDnsService>>,
     opa_engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
     backend_host_gateway: Option<IpAddr>,
@@ -781,7 +784,7 @@ async fn preauthorize_transparent_open(
         ));
     }
     let TransparentTarget { host, intent } =
-        match resolve_transparent_target(destination, policy_dns_store, opa_engine).await {
+        match resolve_transparent_target(destination, policy_dns).await {
             Ok(target) => target,
             Err(error) => {
                 warn!(%destination, %error, "Denied staged transparent connection");
@@ -868,9 +871,9 @@ async fn preauthorize_transparent_open(
     // no addresses, so they never reach an upstream dial.
     let pinned_plan = match &intent {
         None => None,
-        Some(intent) => match policy_dns_store
+        Some(intent) => match policy_dns
             .ok_or(MappingLookupError::Missing)
-            .and_then(|store| pinned_transparent_plan(store, destination, &decision))
+            .and_then(|service| pinned_transparent_plan(service.store(), destination, &decision))
         {
             Ok(plan) => Some(plan),
             Err(error) => {
@@ -1024,39 +1027,27 @@ struct TransparentTarget {
 
 async fn resolve_transparent_target(
     destination: SocketAddr,
-    policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
-    opa_engine: &OpaEngine,
+    policy_dns: Option<&Arc<PolicyDnsService>>,
 ) -> Result<TransparentTarget> {
-    let Some(store) = policy_dns_store else {
+    let Some(service) = policy_dns else {
         return Ok(TransparentTarget {
             host: destination.ip().to_string(),
             intent: None,
         });
     };
-    store
-        .refresh_if_expired(
-            destination.ip(),
-            destination.port(),
-            opa_engine.current_generation(),
-        )
-        .await?;
-    match store.lookup_intent(
-        destination.ip(),
-        destination.port(),
-        opa_engine.current_generation(),
-        std::time::Instant::now(),
-    ) {
+    match service
+        .lookup_for_connect(destination.ip(), destination.port())
+        .await
+    {
         Ok(mapping) => Ok(TransparentTarget {
             host: mapping.record.normalized_name.as_str().to_string(),
             intent: Some(mapping),
         }),
-        Err(MappingLookupError::Missing) => Ok(TransparentTarget {
+        Err(ConnectLookupError::Mapping(MappingLookupError::Missing)) => Ok(TransparentTarget {
             host: destination.ip().to_string(),
             intent: None,
         }),
-        Err(error) => Err(miette::miette!(
-            "transparent destination mapping is unavailable: {error}"
-        )),
+        Err(error) => Err(miette::miette!("{error}")),
     }
 }
 
@@ -1131,7 +1122,7 @@ impl TransparentTcpHandle {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         listeners: Vec<TcpListener>,
-        store: Arc<ResolvedEndpointStore>,
+        dns: Arc<PolicyDnsService>,
         opa_engine: Arc<OpaEngine>,
         identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
@@ -1147,7 +1138,7 @@ impl TransparentTcpHandle {
         );
         let mut joins = Vec::with_capacity(listeners.len());
         for listener in listeners {
-            let store = store.clone();
+            let dns = dns.clone();
             let engine = opa_engine.clone();
             let cache = identity_cache.clone();
             let pid = entrypoint_pid.clone();
@@ -1173,7 +1164,7 @@ impl TransparentTcpHandle {
                         break;
                     };
                     set_tcp_nodelay_best_effort(&stream);
-                    let store = store.clone();
+                    let dns = dns.clone();
                     let engine = engine.clone();
                     let cache = cache.clone();
                     let pid = pid.clone();
@@ -1184,7 +1175,7 @@ impl TransparentTcpHandle {
                     tokio::spawn(async move {
                         if let Err(error) = handle_transparent_tcp_connection(
                             stream,
-                            store,
+                            dns,
                             engine,
                             cache,
                             pid,
@@ -1221,7 +1212,7 @@ impl Drop for TransparentTcpHandle {
 #[allow(clippy::too_many_arguments)]
 async fn handle_transparent_tcp_connection(
     mut client: TcpStream,
-    store: Arc<ResolvedEndpointStore>,
+    dns: Arc<PolicyDnsService>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
@@ -1232,25 +1223,17 @@ async fn handle_transparent_tcp_connection(
 ) -> Result<()> {
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
-    let current_generation = opa_engine.current_generation();
-    if let Err(error) = store
-        .refresh_if_expired(original.ip(), original.port(), current_generation)
-        .await
-    {
-        warn!(%original, %error, "Denied transparent connection after mapping refresh failed");
-        emit_transparent_mapping_denial(workload_addr, original, None, MappingLookupError::Expired);
-        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
-        return Ok(());
-    }
-    let mapping = match store.lookup_intent(
-        original.ip(),
-        original.port(),
-        current_generation,
-        std::time::Instant::now(),
-    ) {
+    let mapping = match dns.lookup_for_connect(original.ip(), original.port()).await {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, None, error);
+            warn!(%original, %error, "Denied transparent connection mapping");
+            let cause = match error {
+                ConnectLookupError::Mapping(error) => error,
+                ConnectLookupError::Refresh(_) | ConnectLookupError::Backoff => {
+                    MappingLookupError::Expired
+                }
+            };
+            emit_transparent_mapping_denial(workload_addr, original, None, cause);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1316,7 +1299,7 @@ async fn handle_transparent_tcp_connection(
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
     };
-    let mapping = match store.lookup(
+    let mapping = match dns.store().lookup(
         original.ip(),
         original.port(),
         decision.policy_generation,
@@ -2622,7 +2605,7 @@ async fn handle_mediated_connection(
     supplied_identity: Option<Result<ContractBinaryIdentity, ResolveError>>,
     socket_addrs: Option<(SocketAddr, SocketAddr)>,
     transparent_open: Option<TransparentOpen>,
-    policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
+    policy_dns: Option<Arc<PolicyDnsService>>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
@@ -2659,9 +2642,7 @@ async fn handle_mediated_connection(
                 policy_local_transparent = true;
                 (None, None, None)
             } else {
-                let target =
-                    resolve_transparent_target(destination, policy_dns_store.as_ref(), &opa_engine)
-                        .await?;
+                let target = resolve_transparent_target(destination, policy_dns.as_ref()).await?;
                 let host = target.host;
                 // Dispatch may refresh a lease after staging captured its
                 // connector. Authorize again and build fresh pins below rather
@@ -2998,11 +2979,11 @@ async fn handle_mediated_connection(
             hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway)
                 .and_then(|()| {
                     if let Some(destination) = mapped_transparent_destination {
-                        let plan = policy_dns_store
+                        let plan = policy_dns
                             .as_ref()
                             .ok_or(MappingLookupError::Missing)
-                            .and_then(|store| {
-                                pinned_transparent_plan(store, destination, &decision)
+                            .and_then(|service| {
+                                pinned_transparent_plan(service.store(), destination, &decision)
                             })
                             .map_err(|error| DestinationDenial {
                                 kind: DestinationDenialKind::DeclaredEndpoint,
@@ -7855,6 +7836,18 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         ))
     }
 
+    fn policy_dns_test_service(
+        store: &Arc<ResolvedEndpointStore>,
+        engine: &Arc<OpaEngine>,
+    ) -> Arc<PolicyDnsService> {
+        Arc::new(PolicyDnsService::new(
+            engine.clone(),
+            SocketTrustedResolver::new("127.0.0.1:9".parse().unwrap()),
+            store.clone(),
+            None,
+        ))
+    }
+
     fn publish_mapping(
         store: &ResolvedEndpointStore,
         name: &str,
@@ -8111,11 +8104,13 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn staged_transparent_open_dials_only_pinned_policy_dns_addresses() {
-        let engine = native_identity_engine(
-            include_str!("../data/sandbox-policy.rego"),
-            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
-        )
-        .unwrap();
+        let engine = Arc::new(
+            native_identity_engine(
+                include_str!("../data/sandbox-policy.rego"),
+                &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
+            )
+            .unwrap(),
+        );
         let store = policy_dns_test_store();
         let record = publish_mapping(
             &store,
@@ -8131,7 +8126,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
         let (_, _, _, transparent) = preauthorize_transparent_open(
             open,
-            Some(&store),
+            Some(&policy_dns_test_service(&store, &engine)),
             &engine,
             &BinaryIdentityCache::new(),
             None,
@@ -8152,25 +8147,12 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn dispatch_rebuilds_staged_connector_after_mapping_expiry() {
-        use crate::policy_dns::{
-            AddressFamily, NormalizedName, PolicyDnsService, TrustedAnswer, TrustedResolver,
+        use crate::policy_dns::AddressFamily;
+        use hickory_proto::{
+            op::{Message, OpCode},
+            rr::{RData, Record, rdata::A},
         };
         use std::time::{Duration, Instant};
-
-        struct DispatchResolver(IpAddr);
-        impl TrustedResolver for DispatchResolver {
-            async fn resolve(
-                &self,
-                _: &NormalizedName,
-                _: AddressFamily,
-            ) -> std::result::Result<TrustedAnswer, crate::policy_dns::TrustedResolveError>
-            {
-                Ok(TrustedAnswer {
-                    addresses: vec![self.0],
-                    ttl: Duration::ZERO,
-                })
-            }
-        }
 
         let Some(fresh_ip) = non_loopback_test_ipv4() else {
             return;
@@ -8194,13 +8176,32 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
         let cache = Arc::new(BinaryIdentityCache::new());
         let store = policy_dns_test_store();
+        let dns_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = SocketTrustedResolver::new(dns_socket.local_addr().unwrap());
+        let dns_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut wire = [0; 8192];
+                let (length, peer) = dns_socket.recv_from(&mut wire).await.unwrap();
+                let query = Message::from_vec(&wire[..length]).unwrap();
+                let mut response = Message::response(query.metadata.id, OpCode::Query);
+                response.queries = query.queries.clone();
+                response.add_answer(Record::from_rdata(
+                    query.queries[0].name.clone(),
+                    0,
+                    RData::A(A(fresh_ip)),
+                ));
+                dns_socket
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
         let service = Arc::new(PolicyDnsService::new(
             engine.clone(),
-            DispatchResolver(fresh_ip.into()),
+            resolver,
             store.clone(),
             None,
         ));
-        service.enable_refresh();
         let answer = service
             .answer_query("db.example", AddressFamily::Ipv4, Instant::now())
             .await
@@ -8233,7 +8234,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 authorization: Some((decision, old_connector)),
                 connect_span: None,
             }),
-            Some(store.clone()),
+            Some(service.clone()),
             engine,
             cache,
             Arc::new(AtomicU32::new(0)),
@@ -8288,6 +8289,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             [IpAddr::from(fresh_ip)]
         );
         assert_ne!(fresh.record.mapping_id, answer.mapping_id);
+        dns_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -8344,11 +8346,13 @@ landlock: {{ compatibility: best_effort }}
 process: {{ run_as_user: sandbox, run_as_group: sandbox }}
 "
                     );
-                    let engine = native_identity_engine(
-                        include_str!("../data/sandbox-policy.rego"),
-                        &policy_with_native_executable_paths(&policy),
-                    )
-                    .unwrap();
+                    let engine = Arc::new(
+                        native_identity_engine(
+                            include_str!("../data/sandbox-policy.rego"),
+                            &policy_with_native_executable_paths(&policy),
+                        )
+                        .unwrap(),
+                    );
                     let store = policy_dns_test_store();
                     let contract = |policy_name: &str, endpoint_index, addresses: Vec<IpAddr>| {
                         crate::policy_dns::ResolvedPortContract {
@@ -8403,7 +8407,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
                     );
                     let accepted = preauthorize_transparent_open(
                         open,
-                        Some(&store),
+                        Some(&policy_dns_test_service(&store, &engine)),
                         &engine,
                         &BinaryIdentityCache::new(),
                         None,
@@ -8449,11 +8453,13 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
 
     #[tokio::test]
     async fn staged_transparent_open_proposes_a_denied_observation_hostname() {
-        let engine = native_identity_engine(
-            include_str!("../data/sandbox-policy.rego"),
-            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
-        )
-        .unwrap();
+        let engine = Arc::new(
+            native_identity_engine(
+                include_str!("../data/sandbox-policy.rego"),
+                &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
+            )
+            .unwrap(),
+        );
         let store = policy_dns_test_store();
         let record = publish_observation(&store, "unknown.example", engine.current_generation());
         let (open, completion) = staged_curl_open(
@@ -8465,7 +8471,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         assert!(
             preauthorize_transparent_open(
                 open,
-                Some(&store),
+                Some(&policy_dns_test_service(&store, &engine)),
                 &engine,
                 &BinaryIdentityCache::new(),
                 None,
@@ -8493,11 +8499,13 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
 
     #[tokio::test]
     async fn staged_transparent_open_never_relays_an_observation_that_policy_allows() {
-        let engine = native_identity_engine(
-            include_str!("../data/sandbox-policy.rego"),
-            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
-        )
-        .unwrap();
+        let engine = Arc::new(
+            native_identity_engine(
+                include_str!("../data/sandbox-policy.rego"),
+                &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
+            )
+            .unwrap(),
+        );
         let identity_cache = BinaryIdentityCache::new();
         let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
         let preauthorize = |store: Arc<ResolvedEndpointStore>, destination: SocketAddr| {
@@ -8508,7 +8516,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             async move {
                 let admitted = preauthorize_transparent_open(
                     open,
-                    Some(&store),
+                    Some(&policy_dns_test_service(&store, engine)),
                     engine,
                     identity_cache,
                     None,
