@@ -142,9 +142,9 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 sqlx-core = { version = "0.9", default-features = false, features = ["rustls-native-certs"] }
 
 # Kubernetes
-kube = { version = "0.99", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
-kube-runtime = "0.99"
-k8s-openapi = { version = "0.24", features = ["v1_29"] }
+kube = { version = "=5.0.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+kube-runtime = "=5.0.0"
+k8s-openapi = { version = "0.29", features = ["v1_33"] }
 
 # IDs
 uuid = { version = "1.10", features = ["v4"] }
