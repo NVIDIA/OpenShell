@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Acceptance policy for e2e/kubevirt/run-demo.sh.
+#
+# - L4: one.one.one.one:443 is the only raw-TCP allowance; every other
+#   destination is denied at the connect level (the demo dials example.org:80
+#   and expects a denial).
+# - L7: on example.com:443 (HTTPS) GET / is allowed and POST / is denied; the
+#   demo fetches the page over TLS (proving the per-sandbox proxy CA was
+#   delivered into the guest) and expects a 403 on the POST.
+#
+# Binary-identity gotcha (Alpine guest image): busybox applets — nc, wget,
+# nslookup — all execute as /usr/bin/busybox, so a binary-scoped rule must
+# name /usr/bin/busybox itself. Naming /usr/bin/nc or /usr/bin/wget matches
+# nothing, and naming /usr/bin/busybox grants every applet the file-system
+# policy allows to run. This is the KubeVirt guest image's version of the
+# binary-identity caveat: the policy engine pins the resolved executable
+# path, not the invoked applet name.
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/bin, /usr, /lib, /proc, /sys, /dev/urandom, /etc, /opt, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null, /home/sandbox]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  l4_allowed:
+    name: l4-allowed
+    endpoints:
+      - host: one.one.one.one
+        port: 443
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/busybox
+  l7_https:
+    name: l7-https
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /
+        deny_rules:
+          - method: POST
+            path: /
+    binaries:
+      - path: /usr/bin/busybox
