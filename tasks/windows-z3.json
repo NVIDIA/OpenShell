@@ -4,5 +4,6 @@
   "repository": "ghcr.io/nvidia/openshell/z3",
   "artifactType": "application/vnd.nvidia.openshell.z3.v1",
   "packageRevision": 1,
+  "msvcToolset": "14.44",
   "packages": {}
 }

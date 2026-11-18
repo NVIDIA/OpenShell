@@ -537,6 +537,7 @@ function Invoke-Z3Package([string] $RustTarget) {
     $output = Join-Path $TargetDir 'windows-z3-packages'
     $install = Join-Path $build 'install'
     $package = Join-Path $build 'package'
+    $toolsetRecord = Join-Path $build 'msvc-toolset.txt'
     New-Item -ItemType Directory -Path $build, $output -Force | Out-Null
     if (Test-Path -LiteralPath $package) { Remove-Item -LiteralPath $package -Recurse -Force }
     $flags = @(
@@ -548,13 +549,18 @@ function Invoke-Z3Package([string] $RustTarget) {
     )
     $log = Join-Path $LogDir "package-z3-$RustTarget.log"
     $cmd = @(
-        "call `"$vsDevCmd`" -arch=$(Get-VsTargetArch $RustTarget) -host_arch=$(Get-HostArch)",
+        "call `"$vsDevCmd`" -arch=$(Get-VsTargetArch $RustTarget) -host_arch=$(Get-HostArch) -vcvars_ver=$($Z3Pin.msvcToolset)",
+        "set VCToolsVersion > `"$toolsetRecord`"",
+        "findstr /b /c:`"VCToolsVersion=$($Z3Pin.msvcToolset).`" `"$toolsetRecord`"",
         "`"$cmakePath`" -S `"$source`" -B `"$build`" $($flags -join ' ') -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_INSTALL_PREFIX=`"$install`"",
         "`"$cmakePath`" --build `"$build`" --target install --parallel $WindowsBuildJobs"
     ) -join ' && '
     Write-Host "==> Building pinned Z3 $Z3Version /MT package for $RustTarget (one-time dependency build)"
     & cmd /d /c "$cmd > `"$log`" 2>&1"
-    if ($LASTEXITCODE -ne 0) { Get-Content -LiteralPath $log -Tail 100; throw "Z3 package build failed. See $log" }
+    if ($LASTEXITCODE -ne 0) {
+        if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 100 }
+        throw "Z3 package build requires MSVC $($Z3Pin.msvcToolset), CMake, and Ninja. See $log"
+    }
     $solver = Join-Path $install 'bin/z3.exe'
     Assert-StaticWindowsRuntime $solver $RustTarget
     $version = & $solver -version
@@ -572,6 +578,7 @@ function Invoke-Z3Package([string] $RustTarget) {
     })
     [ordered]@{
         version = $Z3Version; target = $RustTarget; runtime = 'MT'; configuration = 'Release'; lto = $false
+        msvcToolset = (Get-Content -LiteralPath $toolsetRecord -Raw).Trim().Split('=')[1]
         sourceUrl = "https://github.com/Z3Prover/z3/archive/refs/tags/z3-$Z3Version.zip"
         sourceSha256 = $Z3SourceSha256; buildRevision = (& git -C $RepoRoot rev-parse HEAD)
         cmakeFlags = $flags; solverSmoke = $answers; staticRuntimeAudit = 'passed'; files = $files
