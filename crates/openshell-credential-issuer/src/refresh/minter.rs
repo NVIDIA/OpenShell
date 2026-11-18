@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use crate::endpoint::is_loopback_host;
 use async_trait::async_trait;
 use openshell_core::proto::{
     ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStrategy,
@@ -972,10 +973,6 @@ fn material_value<S: std::hash::BuildHasher>(
     None
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
-}
-
 /// Test-only STS endpoint override. Reads the `sts_endpoint_url` material and
 /// accepts it only when it is a loopback URL, so unit tests can target a local
 /// mock STS. Available only in tests or explicit test-support builds; release
@@ -1857,6 +1854,19 @@ pM2zFU8SeVkvHKlEuoHaP0s=
             failure.recovery_action,
             ProviderCredentialRefreshRecoveryAction::FixConfiguration
         );
+    }
+
+    #[tokio::test]
+    async fn plain_http_to_ipv6_loopback_is_accepted_like_endpoint_normalization() {
+        let token_url = "http://[::1]:1/token";
+        crate::endpoint::normalize_token_endpoint(token_url).unwrap();
+        // Nothing listens on port 1. A connection failure, not a scheme
+        // rejection, shows the URL passed the loopback check.
+        let failure = request_token(token_url, &[], 60, OAuthGrantKind::NonInteractive, &[])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.failure_code, "oauth_token_endpoint_unavailable");
     }
 
     #[tokio::test]

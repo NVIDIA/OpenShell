@@ -35,7 +35,10 @@ pub fn normalize_token_endpoint(raw: &str) -> Result<String, &'static str> {
     Ok(url.to_string())
 }
 
-fn is_loopback_host(host: &str) -> bool {
+/// Whether a URL host (as `Url::host_str` returns it, so IPv6 is bracketed) is
+/// a loopback host that may use plain HTTP. Shared by endpoint normalization
+/// and the minter so an endpoint accepted at creation can also mint.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
@@ -61,6 +64,19 @@ mod tests {
         assert!(normalize_token_endpoint("http://localhost/token").is_ok());
         assert!(normalize_token_endpoint("http://[::1]:9000/token").is_ok());
         assert!(normalize_token_endpoint("http://login.example.com/token").is_err());
+    }
+
+    #[test]
+    fn loopback_hosts_match_url_host_strings() {
+        for raw in ["http://localhost/", "http://127.0.0.1/", "http://[::1]/"] {
+            let host = reqwest::Url::parse(raw)
+                .unwrap()
+                .host_str()
+                .unwrap()
+                .to_string();
+            assert!(super::is_loopback_host(&host), "{raw} -> {host}");
+        }
+        assert!(!super::is_loopback_host("login.example.com"));
     }
 
     #[test]
