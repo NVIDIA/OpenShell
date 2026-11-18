@@ -138,7 +138,7 @@ tests:
             name: supervisor-token
             secret:
               secretName: openshell-supervisor-token
-  - it: mounts the Workload API through CSI without hostPath when broker identity is disabled
+  - it: rejects shared supervisor SPIFFE configuration without a broker
     template: templates/statefulset.yaml
     set:
       gatewayConfig:
@@ -146,14 +146,8 @@ tests:
           supervisor_topology: gateway
           provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: spiffe-workload-api
-            mountPath: /spiffe-workload-api
-            readOnly: true
-      - notExists:
-          path: spec.template.spec.volumes[*].hostPath
+      - failedTemplate:
+          errorMessage: "shared supervisor SPIFFE grants require spiffe_broker; remove provider_spiffe_workload_api_socket_path from the shared supervisor"
   - it: uses only the Workload API CSI mount for broker identity
     template: templates/statefulset.yaml
     set:

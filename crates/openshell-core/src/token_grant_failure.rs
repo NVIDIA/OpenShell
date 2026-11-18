@@ -34,11 +34,11 @@ pub const WORKLOAD_IDENTITY_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// One gateway-brokered provider access token request on the gateway,
 /// including waiting for a concurrent acquisition of the same token.
 ///
-/// A miss makes at most three SPIRE agent calls for the sandbox SVID, one
-/// Workload API acquisition of the gateway's own SVID, and two token-service
-/// requests. The remainder covers authorization and store reads.
+/// A miss bounds the complete sandbox identity acquisition at ten seconds,
+/// then may fetch the gateway's own SVID and make two token-service requests.
+/// The remaining forty seconds cover admission, authorization, and store reads.
 pub const BROKERED_TOKEN_GATEWAY_DEADLINE: Duration = Duration::from_secs(
-    4 * WORKLOAD_IDENTITY_CALL_TIMEOUT.as_secs() + 2 * TOKEN_SERVICE_REQUEST_TIMEOUT.as_secs() + 20,
+    2 * WORKLOAD_IDENTITY_CALL_TIMEOUT.as_secs() + 2 * TOKEN_SERVICE_REQUEST_TIMEOUT.as_secs() + 40,
 );
 
 /// Deadline for one brokered token request on the supervisor.

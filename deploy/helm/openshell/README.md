@@ -532,7 +532,7 @@ JWT signing Secret.
 ## SPIFFE/SPIRE provider token grants
 
 Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
-to let sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
+to let dedicated sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
 grants. The chart keeps supervisor-to-gateway authentication on gateway-minted
 sandbox JWTs and passes the configured socket path to the Kubernetes driver.
 
@@ -548,6 +548,13 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this path does not require access to the SPIRE OIDC
 discovery endpoint or its TLS CA.
+
+For `supervisor_topology: gateway`, configure
+`gatewayConfig.openshell.gateway.spiffe_broker` instead. Only the gateway mounts
+the CSI Workload API socket and obtains stable sandbox identities through the
+Broker API; shared supervisors receive final access tokens. See
+[gateway configuration](https://docs.nvidia.com/openshell/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api)
+for peer identity policies, multi-node registrations, and authorization.
 
 ## Values
 

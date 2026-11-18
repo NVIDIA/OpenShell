@@ -241,6 +241,18 @@ impl SpiffeBrokerConfig {
             .sandbox_spiffe_id(gateway_id, "sandbox")?;
         let endpoint = url::Url::parse(&self.endpoint)
             .map_err(|_| "spiffe_broker.endpoint must be an HTTPS endpoint")?;
+        let socket = std::path::Path::new(&self.workload_api_socket_path);
+        let valid_socket = socket.is_absolute()
+            && !self.workload_api_socket_path.ends_with('/')
+            && socket.file_name().is_some()
+            && socket
+                .parent()
+                .is_some_and(|parent| parent != std::path::Path::new("/"))
+            && self.workload_api_socket_path.trim() == self.workload_api_socket_path
+            && !self
+                .workload_api_socket_path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."));
         if endpoint.scheme() != "https"
             || endpoint.host_str().is_none()
             || !endpoint.username().is_empty()
@@ -248,7 +260,7 @@ impl SpiffeBrokerConfig {
             || endpoint.path() != "/"
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
-            || !std::path::Path::new(&self.workload_api_socket_path).is_absolute()
+            || !valid_socket
         {
             return Err(
                 "spiffe_broker requires an HTTPS endpoint and absolute Workload API socket path"
@@ -2140,7 +2152,16 @@ mod tests {
             assert!(config.validate("gw").is_err());
         }
         config.endpoint = "https://broker:8443".into();
-        config.workload_api_socket_path = "tcp:broker:1234".into();
-        assert!(config.validate("gw").is_err());
+        for socket in [
+            "tcp:broker:1234",
+            "/",
+            "/agent.sock",
+            "/run/../agent.sock",
+            "/run/spire/",
+            " /run/spire/agent.sock",
+        ] {
+            config.workload_api_socket_path = socket.into();
+            assert!(config.validate("gw").is_err(), "{socket}");
+        }
     }
 }

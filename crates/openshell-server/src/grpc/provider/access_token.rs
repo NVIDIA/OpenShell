@@ -7,7 +7,7 @@ use super::{
     Arc, HashMap, IntermediateTokenCache, LazyLock, Message, ObjectId, ObjectWorkspace, Principal,
     Provider, ProviderCredentialTokenGrantType, Request, Response, Sandbox, ServerState, Status,
     TokenExchangeParams, TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
-    canonical_request_id, effective_jwt_svid_audience, fetch_gateway_jwt_svid,
+    canonical_request_id, effective_jwt_svid_audience, fetch_gateway_jwt_svid_from,
     get_provider_type_profile_for_scope, insert_dynamic_credentials_for_profile, jwt_exp_ms,
     log_token_grant_failure, oauth, perform_intermediate_token_exchange,
     provider_credential_expiration_ms, resolve_subject_token_credential,
@@ -414,7 +414,15 @@ async fn acquire(
     let client = token_exchange_http_client()?;
     let subject_expiry = subject.and_then(|subject| subject.expires_at_ms);
     let token = if let Some(subject) = subject {
-        let component_svid = fetch_gateway_jwt_svid(&audience).await?;
+        let component_svid = fetch_gateway_jwt_svid_from(
+            &audience,
+            state
+                .config
+                .spiffe_broker
+                .as_ref()
+                .map(|broker| broker.workload_api_socket_path.as_str()),
+        )
+        .await?;
         let intermediate = perform_intermediate_token_exchange(
             &grant.token_endpoint,
             &TokenExchangeParams {

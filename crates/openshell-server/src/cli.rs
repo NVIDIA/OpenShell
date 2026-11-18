@@ -803,6 +803,24 @@ fn prepare_server_config_with_drivers(
         .as_ref()
         .and_then(|file| file.openshell.gateway.spiffe_broker.clone());
 
+    if let Some(kubernetes) = file
+        .as_ref()
+        .and_then(|file| file.openshell.drivers.get("kubernetes"))
+        && kubernetes
+            .get("supervisor_topology")
+            .and_then(toml::Value::as_str)
+            == Some("gateway")
+        && kubernetes
+            .get("provider_spiffe_workload_api_socket_path")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|socket| !socket.is_empty())
+        && config.spiffe_broker.is_none()
+    {
+        return Err(miette::miette!(
+            "shared supervisor SPIFFE grants require spiffe_broker; remove provider_spiffe_workload_api_socket_path from the shared supervisor"
+        ));
+    }
+
     // Reject invalid broker before startup; gateway state parses it later.
     crate::spiffe_broker::validate_config(&config).map_err(|error| miette::miette!("{error}"))?;
 

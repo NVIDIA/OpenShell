@@ -4776,9 +4776,20 @@ fn jwt_exp_ms(token: &str) -> Option<i64> {
 }
 
 async fn fetch_gateway_jwt_svid(audience: &str) -> Result<String, Status> {
-    let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    fetch_gateway_jwt_svid_from(audience, None).await
+}
+
+async fn fetch_gateway_jwt_svid_from(
+    audience: &str,
+    broker_socket: Option<&str>,
+) -> Result<String, Status> {
+    let socket_path = broker_socket
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
     // A wedged Workload API socket must not hold the grant past its deadline.

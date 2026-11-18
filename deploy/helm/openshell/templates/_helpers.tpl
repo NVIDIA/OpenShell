@@ -396,10 +396,12 @@ fullname, so the name never collapses into another release resource's name.
 {{/* Validate gateway-owned SPIFFE Broker API settings. */}}
 {{- define "openshell.validateSpiffeBroker" -}}
 {{- $broker := .broker -}}
-{{- if not (regexMatch "^https://[^/]+/?$" (get $broker "endpoint" | default "")) -}}
+{{- $url := urlParse (get $broker "endpoint" | default "") -}}
+{{- if or (ne $url.scheme "https") (empty $url.host) $url.userinfo $url.query $url.fragment (not (has $url.path (list "" "/"))) -}}
 {{- fail "spiffe_broker.endpoint must be an HTTPS endpoint" -}}
 {{- end -}}
-{{- if not (regexMatch "^(/[A-Za-z0-9_.-]+){2,}$" (get $broker "workload_api_socket_path" | default "")) -}}
+{{- $socket := get $broker "workload_api_socket_path" | default "" -}}
+{{- if or (not (hasPrefix "/" $socket)) (ne (trim $socket) $socket) (eq (dir $socket) "/") (hasSuffix "/" $socket) (regexMatch "(^|/)\\.\\.?(/|$)" $socket) -}}
 {{- fail "spiffe_broker.workload_api_socket_path must be an absolute UNIX socket path" -}}
 {{- end -}}
 {{- $exact := get $broker "server_spiffe_id" | default "" -}}
@@ -789,6 +791,9 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- end -}}
 {{- $broker := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_broker" | default dict -}}
+{{- if and (eq (get $kubernetes "supervisor_topology" | default "") "gateway") (get $kubernetes "provider_spiffe_workload_api_socket_path") (empty $broker) -}}
+{{- fail "shared supervisor SPIFFE grants require spiffe_broker; remove provider_spiffe_workload_api_socket_path from the shared supervisor" -}}
+{{- end -}}
 {{- if $broker -}}
 {{- if ne (get $kubernetes "supervisor_topology" | default "") "gateway" -}}
 {{- fail "spiffe_broker requires supervisor_topology=gateway" -}}

@@ -1471,7 +1471,7 @@ In managed workspace mode, the Kubernetes driver copies each explicitly named
 namespace on sandbox creation. Shared and operator modes require the Secret to
 already exist in the sandbox namespace.
 
-For token-exchange provider profiles, the gateway also needs access to its own
+For dedicated-supervisor token-exchange profiles, the gateway also needs access to its own
 SPIFFE Workload API socket. In Helm deployments, set
 `server.providerTokenGrants.spiffe.enabled=true`; the chart mounts the socket
 into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
@@ -1494,13 +1494,21 @@ workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
 ```
 
 Gateway session JWTs with a positive TTL are required.
+When enabling the broker on a gateway that omitted `gateway_jwt.ttl_secs`, set
+a positive value and restart existing sandboxes to issue expiring sessions;
+existing non-expiring sessions cannot request brokered tokens.
 The gateway fetches fresh X.509 credentials and trust bundles for each token
 acquisition, so Workload API rotation does not require a gateway restart.
+The same `workload_api_socket_path` supplies the gateway's JWT-SVID for
+`token_exchange`; no separate socket environment variable is needed. Omit
+the driver's `provider_spiffe_workload_api_socket_path` for shared supervisors.
 
 The operator must enable SPIRE's Broker endpoint, authorize the gateway SPIFFE
 ID for `KubernetesObjectReference` over TCP, and configure the Kubernetes
 attestor with `access_policy = "enforced"`. Give the agent permission to look
-up Sandbox resources and create SubjectAccessReviews. Grant the gateway's
+up Sandbox resources and create SubjectAccessReviews. UID-only references
+require cluster-wide Sandbox `get`/`list` permission for the agents, even
+though SPIRE requests metadata-only responses. Grant the gateway's
 SPIFFE ID the `impersonate-via-spire` verb on Sandbox resources only in its
 permitted namespaces.
 
@@ -1519,6 +1527,14 @@ endpoint serving one fixed identity, use `server_spiffe_id` instead. Certificate
 chain verification and the requirement for exactly one URI SAN apply to both
 modes. Do not use a trust-domain-wide peer policy. The installed SPIRE version and operator
 must support the experimental API; this configuration alone does not enable it.
+
+If grants fail after rescheduling or adding nodes, check that the Service's
+agents match the peer prefix and node alias, and that Sandbox registrations
+have reached each agent. Identity or configuration rejections require fixing
+registration, trust, or authorization; connection failures can be retried.
+Provider-token requests use a separate instance of the configured gRPC rate
+budget. Authenticated work is also capped at four concurrent requests per
+sandbox and 64 per gateway, including when token caching is disabled.
 
 ### MXC
 
