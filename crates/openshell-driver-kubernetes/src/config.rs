@@ -292,7 +292,7 @@ fn is_dns_label(value: &str) -> bool {
 #[serde(default, deny_unknown_fields)]
 pub struct WarmPoolSettings {
     pub enabled: bool,
-    /// Increment when changing driver configuration or runtime trust.
+    /// Increment when changing pool policy or effective runtime configuration.
     pub revision: u64,
     /// Per-template bound, including provisioning and deleting spares.
     pub max_size: u32,

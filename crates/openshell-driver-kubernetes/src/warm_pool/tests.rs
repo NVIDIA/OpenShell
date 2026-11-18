@@ -752,6 +752,14 @@ struct ApiTestPlacement {
 }
 
 impl InstancePlacement for ApiTestPlacement {
+    fn pending_warm_claims(
+        &self,
+        _: String,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
+        // This fixture exercises physical preparations only; it never claims.
+        Box::pin(async { Ok(openshell_supervisor_control::WarmClaimInventory::default()) })
+    }
+
     fn runtime_assignment(
         &self,
         workspace: String,
@@ -845,7 +853,20 @@ async fn warm_runtime_resources_on_kubernetes() {
     let namespace =
         std::env::var("OPENSHELL_E2E_KUBE_NAMESPACE").expect("run with the Kubernetes E2E wrapper");
     let release = std::env::var("OPENSHELL_E2E_KUBE_RELEASE").unwrap();
-    let client = Client::try_default().await.unwrap();
+    // Toolchain launchers can override KUBECONFIG. Use the wrapper's explicit
+    // coordinates so this test cannot accidentally target another cluster.
+    let path = std::env::var("OPENSHELL_E2E_KUBECONFIG").unwrap();
+    let options = kube::config::KubeConfigOptions {
+        context: Some(std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE").unwrap()),
+        ..Default::default()
+    };
+    let kube_config = kube::Config::from_custom_kubeconfig(
+        kube::config::Kubeconfig::read_from(path).unwrap(),
+        &options,
+    )
+    .await
+    .unwrap();
+    let client = Client::try_from(kube_config).unwrap();
     let config_map = Api::<ConfigMap>::namespaced(client.clone(), &namespace)
         .get(&format!("{release}-config"))
         .await
@@ -968,7 +989,19 @@ async fn warm_runtime_resources_on_kubernetes() {
         assert_eq!(resources.len(), 1);
         assert!(resources[0].released);
         assert_eq!(driver.reconcile_warm_pool(&pool).await?.ready, 0);
+        // Updating inventory limits preserves the same physical runtime.
         pool.revision += 1;
+        pool.max_age_secs += 60;
+        let report = driver.reconcile_warm_pool(&pool).await?;
+        assert!(!report.suspended);
+        assert_eq!(report.retiring, 0);
+        assert_eq!(
+            driver.warm_runtime_inventory(&pool.workspace).await?,
+            resources
+        );
+        // A relevant mismatch suspends provisioning, but disabling still drains.
+        driver.config.sandbox_runtime_image = "unused-during-drain:v2".into();
+        assert!(driver.reconcile_warm_pool(&pool).await?.suspended);
         pool.target_size = 0;
         tokio::time::timeout(Duration::from_mins(1), async {
             loop {
@@ -2628,13 +2661,16 @@ async fn template_targets_are_capped_and_disable_drains_without_changing_identit
     let active = driver.template_warm_pools(None).await.unwrap().remove(0);
     assert_eq!(active.target_size, 1);
     let trust = request().trust;
-    let before = reconciler::fingerprint(&driver.config, &active, &trust).unwrap();
+    let before = driver.warm_pool_fingerprint(&active, &trust).await.unwrap();
     driver.config.warm_pool.enabled = false;
     let disabled = driver.template_warm_pools(None).await.unwrap().remove(0);
     assert_eq!(disabled.target_size, 0);
     assert_eq!(disabled.name, active.name);
     assert_eq!(
-        reconciler::fingerprint(&driver.config, &disabled, &trust).unwrap(),
+        driver
+            .warm_pool_fingerprint(&disabled, &trust)
+            .await
+            .unwrap(),
         before
     );
 }
@@ -2664,3 +2700,6 @@ async fn corrupt_warm_records_do_not_enable_workspace_secret_recovery() {
             .is_err()
     );
 }
+
+#[path = "compatibility_tests.rs"]
+mod compatibility_tests;

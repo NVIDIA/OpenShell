@@ -3,10 +3,10 @@
 
 use super::*;
 use crate::config::WarmPoolConfig;
-use openshell_supervisor_control::warm_pool::{WarmPoolEntry, WarmPoolState, WarmPoolUpdate};
-use prost::Message;
+use openshell_supervisor_control::warm_pool::{
+    WarmPoolEntry, WarmPoolPolicy, WarmPoolState, WarmPoolUpdate,
+};
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 const BURST: usize = 4;
 const INTERVAL: Duration = Duration::from_secs(5);
@@ -24,6 +24,7 @@ pub struct WarmPoolReport {
     pub attempted: usize,
     pub failed: usize,
     pub conflicted: bool,
+    pub suspended: bool,
 }
 
 #[derive(Clone)]
@@ -42,54 +43,13 @@ fn now_ms() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-pub(super) fn fingerprint(
-    driver: &KubernetesComputeConfig,
-    pool: &WarmPoolConfig,
-    trust: &WarmRuntimeTrust,
-) -> Result<String, KubernetesDriverError> {
-    let mut config = driver.clone();
-    // Enabled only controls whether to refill; switching it off drains the
-    // same journal without requiring a new template or operator revision.
-    config.warm_pool.enabled = true;
-    if pool.revision == u64::MAX {
-        return Ok("0".repeat(64));
+fn policy(pool: &WarmPoolConfig) -> WarmPoolPolicy {
+    WarmPoolPolicy {
+        target_size: pool.target_size,
+        max_size: pool.max_size,
+        max_age_secs: pool.max_age_secs,
+        preparation_timeout_secs: pool.preparation_timeout_secs,
     }
-    let mut workload = pool.spec.clone();
-    let environment: BTreeMap<_, _> = std::mem::take(&mut workload.environment)
-        .into_iter()
-        .collect();
-    let (labels, template_environment): (BTreeMap<_, _>, BTreeMap<_, _>) = workload
-        .template
-        .as_mut()
-        .map(|t| {
-            (
-                std::mem::take(&mut t.labels).into_iter().collect(),
-                std::mem::take(&mut t.environment).into_iter().collect(),
-            )
-        })
-        .unwrap_or_default();
-    // Value uses sorted maps, including environment maps. Never hash Debug or
-    // protobuf map iteration order. This material contains no session tokens.
-    let canonical = serde_json::to_value((
-        &config,
-        &pool.name,
-        &pool.workspace,
-        pool.revision,
-        workload.encode_to_vec(),
-        environment,
-        labels,
-        template_environment,
-        trust,
-    ))
-    .map_err(record_error)?;
-    let bytes = serde_json::to_vec(&canonical).map_err(record_error)?;
-    let digest =
-        openshell_crypto::sha256(&bytes).map_err(|_| invalid("warm pool fingerprint failed"))?;
-    let mut fingerprint = String::with_capacity(64);
-    for byte in digest {
-        write!(fingerprint, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    Ok(fingerprint)
 }
 
 pub(super) fn spec(pool: &WarmPoolConfig) -> SandboxSpec {
@@ -104,6 +64,7 @@ fn plan(
     ready: &BTreeSet<SandboxSessionId>,
     lost: &BTreeSet<SandboxSessionId>,
     now: i64,
+    prepare: Option<CredentialEpoch>,
 ) -> (Vec<Action>, WarmPoolReport) {
     let resources: BTreeMap<_, _> = inventory
         .iter()
@@ -115,6 +76,9 @@ fn plan(
             .is_some_and(|resource| resource.claimed)
     });
     for entry in &mut state.entries {
+        if let Some(resource) = resources.get(&entry.session_id) {
+            entry.auth_epoch.get_or_insert(resource.auth_epoch);
+        }
         if let Some(uid) = &entry.resource_uid {
             entry.retiring |= resources
                 .get(&entry.session_id)
@@ -157,7 +121,7 @@ fn plan(
         .saturating_sub(useful)
         .min((pool.max_size as usize).saturating_sub(occupied))
         .min(BURST);
-    for _ in 0..refill {
+    for _ in 0..if prepare.is_some() { refill } else { 0 } {
         state.entries.push(WarmPoolEntry {
             session_id: SandboxSessionId::new(),
             created_at_ms: now,
@@ -165,6 +129,7 @@ fn plan(
             last_ready_at_ms: None,
             resource_uid: None,
             retiring: false,
+            auth_epoch: prepare,
         });
     }
     let mut actions = Vec::new();
@@ -179,6 +144,7 @@ fn plan(
                 last_ready_at_ms: None,
                 resource_uid: Some(resource.uid.clone()),
                 retiring: true,
+                auth_epoch: Some(resource.auth_epoch),
             },
             resource: Some(resource.clone()),
         });
@@ -188,9 +154,10 @@ fn plan(
         .iter_mut()
         .filter(|entry| {
             (entry.retiring
-                || !resources
-                    .get(&entry.session_id)
-                    .is_some_and(|resource| resource.released))
+                || (prepare.is_some()
+                    && !resources
+                        .get(&entry.session_id)
+                        .is_some_and(|resource| resource.released)))
                 && entry
                     .last_attempt_at_ms
                     .is_none_or(|last| now.saturating_sub(last) >= RETRY_MS)
@@ -270,16 +237,30 @@ impl KubernetesComputeDriver {
         pool.validate()
             .map_err(KubernetesDriverError::Precondition)?;
         let supervision = self.warm_supervision()?;
-        let trust = supervision
-            .warm_runtime_trust()
-            .await
-            .map_err(KubernetesDriverError::Message)?;
-        validate_trust(&trust)?;
-        let fingerprint = fingerprint(&self.config, pool, &trust)?;
         let snapshot = supervision
             .warm_pool_state(&pool.workspace, &pool.name)
             .await
             .map_err(KubernetesDriverError::Message)?;
+        if snapshot
+            .as_ref()
+            .is_some_and(|s| s.state.revision > pool.revision)
+        {
+            return Err(invalid(
+                "warm pool has a newer revision; this replica cannot change it",
+            ));
+        }
+        let trust = supervision
+            .warm_runtime_trust()
+            .await
+            .map_err(KubernetesDriverError::Message)
+            .and_then(|trust| {
+                validate_trust(&trust)?;
+                Ok(trust)
+            });
+        let fingerprint = match &trust {
+            Ok(trust) => self.warm_pool_fingerprint(pool, trust).await,
+            Err(error) => Err(invalid(&error.to_string())),
+        };
         let mut inventory = self.warm_runtime_inventory(&pool.workspace).await?;
         let reserved = self
             .recover_pending_warm_claims(&pool.workspace, &inventory)
@@ -298,7 +279,7 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Message)?;
         let mut ready = BTreeSet::new();
         let mut lost = BTreeSet::new();
-        for preparation in preparations {
+        for preparation in &preparations {
             let session = preparation.registration.runtime_descriptor.session_id;
             if preparation
                 .owner
@@ -318,27 +299,73 @@ impl KubernetesComputeDriver {
             }
         }
         let expected_version = snapshot.as_ref().map(|snapshot| snapshot.resource_version);
-        let mut state = snapshot.map_or_else(
-            || WarmPoolState {
+        let mut state = match snapshot {
+            Some(snapshot) => snapshot.state,
+            None => WarmPoolState {
                 revision: pool.revision,
-                fingerprint: fingerprint.clone(),
+                fingerprint: fingerprint
+                    .as_ref()
+                    .map_err(|error| invalid(&error.to_string()))?
+                    .clone(),
+                policy: Some(policy(pool)),
                 entries: Vec::new(),
             },
-            |snapshot| snapshot.state,
-        );
-        if state.revision > pool.revision
-            || (state.revision == pool.revision && state.fingerprint != fingerprint)
-        {
-            return Err(invalid(
-                "warm pool configuration changed; increase its revision on all gateway replicas",
-            ));
-        }
-        if state.revision < pool.revision {
-            for entry in &mut state.entries {
-                entry.retiring = true;
+        };
+        let compatible = fingerprint
+            .as_ref()
+            .is_ok_and(|value| *value == state.fingerprint);
+        let desired_policy = policy(pool);
+        if state.revision < pool.revision && (fingerprint.is_ok() || pool.target_size == 0) {
+            if !compatible {
+                for entry in &mut state.entries {
+                    entry.retiring = true;
+                }
             }
             state.revision = pool.revision;
-            state.fingerprint = fingerprint;
+            if let Ok(fingerprint) = &fingerprint {
+                state.fingerprint.clone_from(fingerprint);
+            }
+            state.policy = Some(desired_policy.clone());
+        } else if pool.target_size == 0 {
+            // A same-revision disable is monotonic: enabled replicas cannot undo it.
+            let stored = state.policy.get_or_insert_with(|| desired_policy.clone());
+            stored.target_size = 0;
+        } else if compatible && state.policy.is_none() {
+            state.policy = Some(desired_policy.clone());
+        }
+        let suspended = !fingerprint
+            .as_ref()
+            .is_ok_and(|value| *value == state.fingerprint)
+            || state.revision != pool.revision
+            || state.policy.as_ref() != Some(&desired_policy);
+        if suspended {
+            warn!(workspace = %pool.workspace, pool = %pool.name,
+                stored_revision = state.revision, local_revision = pool.revision,
+                error = ?fingerprint.as_ref().err(),
+                "warm provisioning suspended: configuration changed; deploy a higher warm_pool.revision; recorded cleanup continues");
+        }
+        // A mismatching replica uses the recorded policy only for cleanup. It
+        // cannot refill, resume preparations, or impose its own expiry settings.
+        let mut effective = pool.clone();
+        if let Some(policy) = &state.policy {
+            effective.target_size = policy.target_size;
+            effective.max_size = policy.max_size;
+            effective.max_age_secs = policy.max_age_secs;
+            effective.preparation_timeout_secs = policy.preparation_timeout_secs;
+        } else {
+            // Legacy journals have no authoritative lifetime policy. Only finish
+            // existing retirements until an operator publishes a new revision.
+            effective.target_size = u32::MAX;
+            effective.max_age_secs = u64::MAX / 1000;
+            effective.preparation_timeout_secs = u64::MAX / 1000;
+        }
+        for entry in &mut state.entries {
+            if entry.auth_epoch.is_none() {
+                entry.auth_epoch = preparations
+                    .iter()
+                    .find(|p| p.registration.runtime_descriptor.session_id == entry.session_id)
+                    .map(|p| p.auth_epoch);
+            }
         }
         let newly_ready: Vec<_> = state
             .entries
@@ -350,7 +377,21 @@ impl KubernetesComputeDriver {
             })
             .map(|entry| entry.session_id)
             .collect();
-        let (actions, mut report) = plan(pool, &mut state, &inventory, &ready, &lost, now_ms());
+        let prepare = if suspended {
+            None
+        } else {
+            trust.as_ref().ok().map(|t| t.auth_epoch)
+        };
+        let (actions, mut report) = plan(
+            &effective,
+            &mut state,
+            &inventory,
+            &ready,
+            &lost,
+            now_ms(),
+            prepare,
+        );
+        report.suspended = suspended;
         if !supervision
             .update_warm_pool(WarmPoolUpdate {
                 workspace: pool.workspace.clone(),
@@ -373,7 +414,7 @@ impl KubernetesComputeDriver {
             async move {
                 tokio::time::timeout(
                     OPERATION_TIMEOUT,
-                    Box::pin(self.execute_warm_action(pool, action, trust)),
+                    Box::pin(self.execute_warm_action(pool, action, trust.as_ref().ok())),
                 )
                 .await
                 .map_err(|_| invalid("warm pool operation timed out; its intent is retained"))?
@@ -395,9 +436,11 @@ impl KubernetesComputeDriver {
         &self,
         pool: &WarmPoolConfig,
         action: Action,
-        trust: &WarmRuntimeTrust,
+        trust: Option<&WarmRuntimeTrust>,
     ) -> Result<(), KubernetesDriverError> {
         if !action.entry.retiring {
+            let trust =
+                trust.ok_or_else(|| invalid("preparation requires current runtime trust"))?;
             if let Some(resource) = &action.resource {
                 self.resume_warm_runtime(resource).await?;
             } else {
@@ -428,7 +471,9 @@ impl KubernetesComputeDriver {
                     action.entry.session_id.to_string(),
                 )
                 .map_err(|_| invalid("invalid generation"))?,
-                auth_epoch: trust.auth_epoch,
+                auth_epoch: action.entry.auth_epoch.ok_or_else(|| {
+                    invalid("retirement is missing its original credential epoch")
+                })?,
             })
             .await
             .map_err(KubernetesDriverError::Message)?

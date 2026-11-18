@@ -26,6 +26,7 @@ fn state() -> WarmPoolState {
     WarmPoolState {
         revision: 1,
         fingerprint: "a".repeat(64),
+        policy: Some(policy(&pool())),
         entries: Vec::new(),
     }
 }
@@ -38,6 +39,7 @@ fn resource(entry: &WarmPoolEntry) -> WarmRuntimeResource {
         workspace: "team".into(),
         pool_id: "agents".into(),
         session_id: entry.session_id,
+        auth_epoch: CredentialEpoch::new(1).unwrap(),
         pod_uid: Some("pod".into()),
         released: true,
         retiring: false,
@@ -51,10 +53,11 @@ fn refill_is_bounded_and_pending_requests_are_not_duplicated() {
     let pool = pool();
     let mut state = state();
     let empty = BTreeSet::new();
-    let (actions, report) = plan(&pool, &mut state, &[], &empty, &empty, 1000);
+    let epoch = Some(CredentialEpoch::new(1).unwrap());
+    let (actions, report) = plan(&pool, &mut state, &[], &empty, &empty, 1000, epoch);
     assert_eq!((actions.len(), report.pending, report.ready), (4, 4, 0));
     let first: Vec<_> = state.entries.iter().map(|entry| entry.session_id).collect();
-    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 2000);
+    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 2000, epoch);
     assert_eq!(actions.len(), 4);
     assert_eq!(state.entries.len(), 8);
     assert!(
@@ -62,9 +65,9 @@ fn refill_is_bounded_and_pending_requests_are_not_duplicated() {
             .iter()
             .all(|action| !first.contains(&action.entry.session_id))
     );
-    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 3000);
+    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 3000, epoch);
     assert!(actions.is_empty());
-    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 32_000);
+    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 32_000, epoch);
     assert_eq!(actions.len(), 4);
     assert!(
         actions
@@ -80,15 +83,18 @@ fn readiness_requires_connection_and_disconnect_expiry_retires_without_exceeding
     pool.max_size = 2;
     let mut state = state();
     let empty = BTreeSet::new();
-    plan(&pool, &mut state, &[], &empty, &empty, 0);
+    let epoch = Some(CredentialEpoch::new(1).unwrap());
+    plan(&pool, &mut state, &[], &empty, &empty, 0, epoch);
     let resources: Vec<_> = state.entries.iter().map(resource).collect();
     let ready = BTreeSet::from([state.entries[0].session_id]);
-    let (_, report) = plan(&pool, &mut state, &resources, &ready, &empty, 1000);
+    let (_, report) = plan(&pool, &mut state, &resources, &ready, &empty, 1000, epoch);
     assert_eq!((report.ready, report.pending), (1, 1));
-    let (_, report) = plan(&pool, &mut state, &resources, &empty, &empty, 62_000);
+    let (_, report) = plan(&pool, &mut state, &resources, &empty, &empty, 62_000, epoch);
     assert_eq!((report.ready, report.pending, report.retiring), (0, 1, 1));
     assert_eq!(state.entries.len(), 2);
-    let (actions, report) = plan(&pool, &mut state, &resources, &empty, &empty, 121_000);
+    let (actions, report) = plan(
+        &pool, &mut state, &resources, &empty, &empty, 121_000, epoch,
+    );
     assert_eq!(report.retiring, 2);
     assert!(actions.iter().all(|action| action.entry.retiring));
     assert_eq!(state.entries.len(), 2);
@@ -101,11 +107,12 @@ fn drain_claims_host_loss_and_orphans_preserve_physical_accounting() {
     pool.max_size = 2;
     let mut state = state();
     let empty = BTreeSet::new();
-    plan(&pool, &mut state, &[], &empty, &empty, 0);
+    let epoch = Some(CredentialEpoch::new(1).unwrap());
+    plan(&pool, &mut state, &[], &empty, &empty, 0, epoch);
     let mut resources: Vec<_> = state.entries.iter().map(resource).collect();
     let lost = BTreeSet::from([state.entries[0].session_id]);
     resources[1].claimed = true;
-    plan(&pool, &mut state, &resources, &empty, &lost, 31_000);
+    plan(&pool, &mut state, &resources, &empty, &lost, 31_000, epoch);
     assert_eq!(state.entries.len(), 2);
     assert!(state.entries[0].retiring);
     assert!(
@@ -115,7 +122,7 @@ fn drain_claims_host_loss_and_orphans_preserve_physical_accounting() {
             .all(|entry| entry.session_id != resources[1].session_id)
     );
     pool.target_size = 0;
-    let (_, report) = plan(&pool, &mut state, &resources, &empty, &empty, 62_000);
+    let (_, report) = plan(&pool, &mut state, &resources, &empty, &empty, 62_000, epoch);
     assert_eq!(report.retiring, 2);
     // An untracked late CR consumes the maximum and is cleaned, not adopted.
     let mut state = WarmPoolState {
@@ -124,7 +131,7 @@ fn drain_claims_host_loss_and_orphans_preserve_physical_accounting() {
     };
     pool.target_size = 1;
     pool.max_size = 1;
-    let (actions, _) = plan(&pool, &mut state, &resources, &empty, &empty, 63_000);
+    let (actions, _) = plan(&pool, &mut state, &resources, &empty, &empty, 63_000, epoch);
     assert!(state.entries.is_empty());
     assert_eq!(actions.len(), 1);
     assert!(actions[0].entry.retiring);
@@ -137,16 +144,25 @@ fn missing_or_replaced_observed_resources_are_retired_instead_of_recreated() {
     pool.max_size = 1;
     let mut state = state();
     let empty = BTreeSet::new();
-    plan(&pool, &mut state, &[], &empty, &empty, 0);
+    let epoch = Some(CredentialEpoch::new(1).unwrap());
+    plan(&pool, &mut state, &[], &empty, &empty, 0, epoch);
     let physical = resource(&state.entries[0]);
-    plan(&pool, &mut state, &[physical], &empty, &empty, 1000);
+    plan(&pool, &mut state, &[physical], &empty, &empty, 1000, epoch);
     let mut replaced = state.clone();
     let mut replacement = resource(&replaced.entries[0]);
     replacement.uid = "replacement".into();
-    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 31_000);
+    let (actions, _) = plan(&pool, &mut state, &[], &empty, &empty, 31_000, epoch);
     assert_eq!(actions.len(), 1);
     assert!(actions[0].entry.retiring);
-    let (actions, _) = plan(&pool, &mut replaced, &[replacement], &empty, &empty, 31_000);
+    let (actions, _) = plan(
+        &pool,
+        &mut replaced,
+        &[replacement],
+        &empty,
+        &empty,
+        31_000,
+        epoch,
+    );
     assert_eq!(actions.len(), 1);
     assert!(actions[0].entry.retiring);
 }

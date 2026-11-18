@@ -11,8 +11,9 @@
 use super::*;
 use crate::prepared_runtime::PreparedRuntimeBootstrap;
 use openshell_core::SandboxSessionId;
+use openshell_core::jwt::CredentialEpoch;
 #[cfg(test)]
-use openshell_core::jwt::{CredentialEpoch, SessionRotation, SessionVerificationKey};
+use openshell_core::jwt::{SessionRotation, SessionVerificationKey};
 use openshell_supervisor_control::{
     PreparationRelease, PreparationRetirement, PreparedRuntimeRegistration,
 };
@@ -38,6 +39,9 @@ fn validate_trust(trust: &WarmRuntimeTrust) -> Result<(), KubernetesDriverError>
     .map(|_| ())
     .map_err(|_| invalid("invalid warm runtime gateway verification bundle"))
 }
+
+#[path = "warm_pool/compatibility.rs"]
+mod compatibility;
 
 #[path = "warm_pool/reconciler.rs"]
 mod reconciler;
@@ -74,6 +78,7 @@ pub struct WarmRuntimeResource {
     pub workspace: String,
     pub pool_id: String,
     pub session_id: SandboxSessionId,
+    pub auth_epoch: CredentialEpoch,
     pub pod_uid: Option<String>,
     /// Gate release is not authenticated runtime readiness or claim eligibility.
     pub released: bool,
@@ -149,6 +154,49 @@ impl KubernetesComputeDriver {
             .ok_or_else(|| invalid("warm pool gateway coordination is missing"))
     }
 
+    /// Render the same canonical shape for preparation, claims and compatibility.
+    fn warm_runtime_shape(
+        &self,
+        spec: Option<&SandboxSpec>,
+        physical_id: &str,
+        names: &SandboxRuntimeNames,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(serde_json::Value, BTreeMap<String, String>), KubernetesDriverError> {
+        let mut data = sandbox_to_k8s_spec(
+            spec,
+            &SandboxPodParams {
+                default_image: &self.config.default_image,
+                image_pull_policy: self.config.image_pull_policy,
+                image_pull_secrets: &self.generation_image_pull_secret_names(names),
+                sandbox_runtime_image: &self.config.sandbox_runtime_image,
+                sandbox_runtime_image_pull_policy: self.config.sandbox_runtime_image_pull_policy,
+                service_account_name: &self.config.service_account_name,
+                sandbox_id: physical_id,
+                enable_user_namespaces: self.config.enable_user_namespaces,
+                workspace_default_storage_size: &self.config.workspace_default_storage_size,
+                workspace_storage_class: &self.config.workspace_storage_class,
+                default_runtime_class_name: &self.config.default_runtime_class_name,
+                sandbox_uid: uid,
+                sandbox_gid: gid,
+                boundary_port: self.config.sandbox_runtime.boundary_port,
+                sandbox_secret_name: &names.sandbox_secret,
+            },
+        )
+        .map_err(KubernetesDriverError::InvalidArgument)?;
+        canonicalize_environment(&mut data);
+        let mut child_env = spec
+            .and_then(|spec| spec.template.as_ref())
+            .map_or_else(BTreeMap::new, |template| {
+                template.environment.clone().into_iter().collect()
+            });
+        if let Some(spec) = spec {
+            child_env.extend(spec.environment.clone());
+        }
+        child_env.retain(|key, _| !key.starts_with("OPENSHELL_"));
+        Ok((data, child_env))
+    }
+
     /// Create an OpenShell-owned spare using the Agent Sandbox core API. The
     /// unique bootstrap Secret reference is rendered before the Pod exists; no
     /// admission hook, extension template or runtime bootstrap exchange is used.
@@ -191,37 +239,8 @@ impl KubernetesComputeDriver {
         let (uid, gid, _) = self.resolve_sandbox_identity_in_namespace(&namespace).await;
         let physical_id = request.session_id.to_string();
         let names = SandboxRuntimeNames::for_generation(&physical_id, &physical_id);
-        let mut data = sandbox_to_k8s_spec(
-            Some(&request.spec),
-            &SandboxPodParams {
-                default_image: &self.config.default_image,
-                image_pull_policy: self.config.image_pull_policy,
-                image_pull_secrets: &self.generation_image_pull_secret_names(&names),
-                sandbox_runtime_image: &self.config.sandbox_runtime_image,
-                sandbox_runtime_image_pull_policy: self.config.sandbox_runtime_image_pull_policy,
-                service_account_name: &self.config.service_account_name,
-                sandbox_id: &physical_id,
-                enable_user_namespaces: self.config.enable_user_namespaces,
-                workspace_default_storage_size: &self.config.workspace_default_storage_size,
-                workspace_storage_class: &self.config.workspace_storage_class,
-                default_runtime_class_name: &self.config.default_runtime_class_name,
-                sandbox_uid: uid,
-                sandbox_gid: gid,
-                boundary_port: self.config.sandbox_runtime.boundary_port,
-                sandbox_secret_name: &names.sandbox_secret,
-            },
-        )
-        .map_err(KubernetesDriverError::InvalidArgument)?;
-        canonicalize_environment(&mut data);
-        let mut child_env = request
-            .spec
-            .template
-            .as_ref()
-            .map_or_else(BTreeMap::new, |template| {
-                template.environment.clone().into_iter().collect()
-            });
-        child_env.extend(request.spec.environment.clone());
-        child_env.retain(|key, _| !key.starts_with("OPENSHELL_"));
+        let (data, child_env) =
+            self.warm_runtime_shape(Some(&request.spec), &physical_id, &names, uid, gid)?;
         let record = Record {
             session_id: request.session_id,
             workspace: request.workspace.clone(),
@@ -769,6 +788,7 @@ fn resource_from_object(
         workspace: record.workspace.clone(),
         pool_id: record.pool_id.clone(),
         session_id: record.session_id,
+        auth_epoch: record.trust.auth_epoch,
         pod_uid: annotation(object, POD_UID).map(str::to_string),
         released: annotation(object, RELEASED) == Some("true"),
         deleting: object.metadata.deletion_timestamp.is_some(),

@@ -133,9 +133,13 @@ impl KubernetesComputeDriver {
             else {
                 continue;
             };
-            if snapshot.state.revision != pool.revision
-                || snapshot.state.fingerprint
-                    != reconciler::fingerprint(&self.config, pool, &trust)?
+            if snapshot
+                .state
+                .policy
+                .as_ref()
+                .is_some_and(|policy| policy.target_size == 0)
+                || snapshot.state.revision != pool.revision
+                || snapshot.state.fingerprint != self.warm_pool_fingerprint(pool, &trust).await?
             {
                 continue;
             }
@@ -154,7 +158,15 @@ impl KubernetesComputeDriver {
                             .as_ref()
                             .is_none_or(|uid| uid == &resource.uid)
                         && openshell_core::time::now_ms().saturating_sub(entry.created_at_ms)
-                            < i64::try_from(pool.max_age_secs * 1000).unwrap_or(i64::MAX)
+                            < i64::try_from(
+                                snapshot
+                                    .state
+                                    .policy
+                                    .as_ref()
+                                    .map_or(pool.max_age_secs, |policy| policy.max_age_secs)
+                                    * 1000,
+                            )
+                            .unwrap_or(i64::MAX)
                 }) {
                     continue;
                 }
@@ -388,38 +400,13 @@ impl KubernetesComputeDriver {
     ) -> Result<bool, KubernetesDriverError> {
         let names = record.names();
         let physical_id = record.physical_id();
-        let mut data = sandbox_to_k8s_spec(
+        let (data, env) = self.warm_runtime_shape(
             sandbox.spec.as_ref(),
-            &SandboxPodParams {
-                default_image: &self.config.default_image,
-                image_pull_policy: self.config.image_pull_policy,
-                image_pull_secrets: &self.generation_image_pull_secret_names(&names),
-                sandbox_runtime_image: &self.config.sandbox_runtime_image,
-                sandbox_runtime_image_pull_policy: self.config.sandbox_runtime_image_pull_policy,
-                service_account_name: &self.config.service_account_name,
-                sandbox_id: &physical_id,
-                enable_user_namespaces: self.config.enable_user_namespaces,
-                workspace_default_storage_size: &self.config.workspace_default_storage_size,
-                workspace_storage_class: &self.config.workspace_storage_class,
-                default_runtime_class_name: &self.config.default_runtime_class_name,
-                sandbox_uid: record.uid,
-                sandbox_gid: record.gid,
-                boundary_port: self.config.sandbox_runtime.boundary_port,
-                sandbox_secret_name: &names.sandbox_secret,
-            },
-        )
-        .map_err(KubernetesDriverError::InvalidArgument)?;
-        canonicalize_environment(&mut data);
-        let mut env: BTreeMap<String, String> = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.template.as_ref())
-            .map(|template| template.environment.clone().into_iter().collect())
-            .unwrap_or_default();
-        if let Some(spec) = &sandbox.spec {
-            env.extend(spec.environment.clone());
-        }
-        env.retain(|key, _| !key.starts_with("OPENSHELL_"));
+            &physical_id,
+            &names,
+            record.uid,
+            record.gid,
+        )?;
         Ok(data == record.shape && env == record.child_env)
     }
 

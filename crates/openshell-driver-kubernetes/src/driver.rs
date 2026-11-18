@@ -3592,9 +3592,8 @@ impl KubernetesComputeDriver {
         })
     }
 
-    /// Create one generation's gated supervisor Pod and return its UID.
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
-    async fn create_sandbox_runtime_supervisor(
+    fn render_sandbox_runtime_supervisor(
         &self,
         namespace: &str,
         names: &SandboxRuntimeNames,
@@ -3607,14 +3606,9 @@ impl KubernetesComputeDriver {
         log_level: &str,
         upstream_proxy_ca_bundle_staged: bool,
         warm: bool,
-    ) -> Result<String, KubernetesDriverError> {
-        // Validate or create the immutable trust generation before creating
-        // the dedicated supervisor Pod. A same-name delete/recreate with
-        // altered bytes therefore fails closed while no control process runs.
-        let network_additional_ca = self
-            .ensure_network_additional_ca_config_map(namespace)
-            .await?;
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        network_additional_ca: Option<(&str, &str)>,
+        tracing_environment: &[(&str, String)],
+    ) -> Result<Pod, KubernetesDriverError> {
         let mut pod = crate::sandbox_runtime::with_runtime_class(
             crate::app_listener::configure_supervisor_pod(
                 supervisor_pod(
@@ -3648,11 +3642,9 @@ impl KubernetesComputeDriver {
                             .provider_spiffe_workload_api_socket_path
                             .as_str(),
                     ),
-                    network_additional_ca
-                        .as_ref()
-                        .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
+                    network_additional_ca,
                     owner,
-                    &self.supervisor_otlp_environment(),
+                    tracing_environment,
                     self.config.sandbox_attach_request_timeout_seconds,
                 )
                 .map_err(KubernetesDriverError::Message)?,
@@ -3667,6 +3659,49 @@ impl KubernetesComputeDriver {
                 self.config.sandbox_runtime.boundary_port,
             );
         }
+        Ok(pod)
+    }
+
+    /// Create one generation's gated supervisor Pod and return its UID.
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    async fn create_sandbox_runtime_supervisor(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        owner: OwnerReference,
+        agent_uid: u32,
+        agent_gid: u32,
+        main_process_spec: &str,
+        log_level: &str,
+        upstream_proxy_ca_bundle_staged: bool,
+        warm: bool,
+    ) -> Result<String, KubernetesDriverError> {
+        // Validate or create the immutable trust generation before creating
+        // the dedicated supervisor Pod. A same-name delete/recreate with
+        // altered bytes therefore fails closed while no control process runs.
+        let network_additional_ca = self
+            .ensure_network_additional_ca_config_map(namespace)
+            .await?;
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod = self.render_sandbox_runtime_supervisor(
+            namespace,
+            names,
+            sandbox_id,
+            sandbox_name,
+            owner,
+            agent_uid,
+            agent_gid,
+            main_process_spec,
+            log_level,
+            upstream_proxy_ca_bundle_staged,
+            warm,
+            network_additional_ca
+                .as_ref()
+                .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
+            &self.supervisor_otlp_environment(),
+        )?;
         let stored = match pods.create(&PostParams::default(), &pod).await {
             Ok(stored) => stored,
             Err(KubeError::Api(error)) if warm && error.code == 409 => {

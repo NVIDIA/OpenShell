@@ -252,10 +252,18 @@ driver configuration. Normal Pod admission and shape checks still apply.
 
 The reconciler records a bounded plan in `warm_pool_journal` before creating
 resources. CAS writes coordinate replicas; `warm_pool.revision` fences older
-operator configurations. The fingerprint covers canonical driver settings,
-workload shape and public verification keys. Deleted templates leave journal
+operator configurations. A separate persisted inventory policy controls capacity
+and expiry. The compatibility fingerprint uses the shared workload and dedicated
+supervisor renderers with fixed physical coordinates, bootstrap trust, and shared
+supervisor routing where applicable. It excludes inventory policy, revision,
+request trace context, and unused configuration defaults. Higher revisions retain
+compatible entries; incompatible entries retire. Same-revision mismatches suspend
+preparation but still apply the recorded cleanup policy. Entries retain their
+original credential epoch so retirement can finish after trust changes and
+physical deletion. Deleted templates leave journal
 tombstones that drain old inventory, even after restart. Recreating a name gets a
-new pool. Disabling pooling drains spares without affecting claimed sandboxes.
+new pool. Disabling pooling persists a zero target without affecting claimed
+sandboxes; a higher revision is required to re-enable it.
 
 Each pool attempts at most four operations concurrently per pass, retries
 unfinished operations no sooner than 30 seconds later, and bounds an operation

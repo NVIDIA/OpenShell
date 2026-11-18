@@ -1378,16 +1378,23 @@ workspaces with TLS and JWT signing. No spares exist until a template requests b
 its workload shape, and `warm_pool.enabled` before investigating missing capacity.
 Check gateway logs for `warm template inventory unavailable`,
 `warm pool reconciliation deferred`, and `warm pool operation will be reconciled`.
-Configuration or verification-key changes require increasing `warm_pool.revision`;
-inconsistent revisions across replicas stop stale writers. Pending and deleting
-spares consume `warm_pool.max_size` per template. Missing supervisor capacity keeps
+Changes to pool limits, effective runtime configuration, or verification keys
+require increasing `warm_pool.revision`; gateway upgrades can change default
+runtime images. Rollbacks also need a higher revision. Compatible spares survive
+revision increases; incompatible unclaimed spares retire. Unused defaults and
+unrelated driver settings do not change compatibility. `warm provisioning
+suspended` indicates inconsistent configuration at the same revision: deploy a
+higher revision with consistent settings. Recorded expiry and retirement continue
+while preparation is suspended; stale revisions cannot overwrite the newer plan.
+Pending and deleting spares consume `warm_pool.max_size` per template. Missing supervisor capacity keeps
 runtime Pods gated. Warm pooling requires no additional workspace Secret reads.
 Recovery uses gateway assignment and credential storage; failures reading that
 storage leave recovery pending. Incomplete unclaimed preparations expire and are
 replaced with fresh physical identities.
 A running warm Pod is not proof of an authenticated parked connection.
 Delete a template to drain its unclaimed pool, or set `warm_pool.enabled=false`
-on all replicas to drain all pools.
+on all replicas to drain all pools even after a runtime configuration mismatch.
+Draining is recorded in the journal; re-enable with a higher `warm_pool.revision`.
 Creates with `--template` claim only that template's ready spares; unmatched
 requests use cold creation. `warm runtime ready for
 claim` records the first authenticated readiness observation. A claimed sandbox

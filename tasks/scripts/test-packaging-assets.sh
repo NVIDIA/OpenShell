@@ -95,7 +95,7 @@ assert_not_contains "$spec" '%%S/openshell/tls'
 # images through the same environment file consumed by preflight and startup,
 # without generating operator-owned gateway TOML.
 assert_contains "$package_qualification" 'dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.env"'
-assert_contains "$package_qualification" 'OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}'
+assert_contains "$package_qualification" 'OPENSHELL_COMPUTE_DRIVER={{ openshell_external_driver_name | default(openshell_gateway_driver) }}'
 assert_contains "$package_qualification" 'OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine'
 assert_contains "$package_qualification" 'OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine'
 assert_not_contains "$package_qualification" 'OPENSHELL_GATEWAY_CONFIG='

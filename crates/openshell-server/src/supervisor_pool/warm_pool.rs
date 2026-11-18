@@ -20,6 +20,14 @@ fn identity(workspace: &str, pool: &str) -> Result<String, String> {
 
 fn validate(state: &WarmPoolState) -> Result<(), String> {
     if state.revision == 0
+        || state.policy.as_ref().is_some_and(|policy| {
+            policy.max_size == 0
+                || policy.max_size > 256
+                || policy.target_size > policy.max_size
+                || !(60..=86400).contains(&policy.max_age_secs)
+                || !(30..=3600).contains(&policy.preparation_timeout_secs)
+                || policy.preparation_timeout_secs > policy.max_age_secs
+        })
         || state.fingerprint.len() != 64
         || state.entries.len() > 256
         || !state
@@ -196,13 +204,20 @@ impl SupervisorPool {
             && (current.state.revision > update.state.revision
                 || (current.state.revision == update.state.revision
                     && current.state.fingerprint != update.state.fingerprint)
-                || current.state.entries.iter().any(|old| {
-                    old.retiring
-                        && update
+                || (current.state.revision == update.state.revision
+                    && current.state.policy.as_ref().is_some_and(|old| {
+                        update
                             .state
-                            .entries
-                            .iter()
-                            .any(|new| new.session_id == old.session_id && !new.retiring)
+                            .policy
+                            .as_ref()
+                            .is_none_or(|new| new != old && !new.is_drain_of(old))
+                    }))
+                || current.state.entries.iter().any(|old| {
+                    update.state.entries.iter().any(|new| {
+                        new.session_id == old.session_id
+                            && ((old.retiring && !new.retiring)
+                                || (old.auth_epoch.is_some() && old.auth_epoch != new.auth_epoch))
+                    })
                 }))
         {
             return Err(
@@ -281,6 +296,7 @@ mod tests {
             state: WarmPoolState {
                 revision: 1,
                 fingerprint: "a".repeat(64),
+                policy: None,
                 entries: vec![WarmPoolEntry {
                     session_id: openshell_core::SandboxSessionId::new(),
                     created_at_ms: 1,
@@ -288,6 +304,7 @@ mod tests {
                     last_attempt_at_ms: None,
                     last_ready_at_ms: None,
                     resource_uid: None,
+                    auth_epoch: None,
                 }],
             },
         }
@@ -486,5 +503,50 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn inventory_policy_requires_revision_except_for_monotonic_drain() {
+        use openshell_supervisor_control::warm_pool::WarmPoolPolicy;
+
+        let fixture = Fixture::new().await;
+        let pool = fixture.replica("a");
+        let mut next = update();
+        next.state.policy = Some(WarmPoolPolicy {
+            target_size: 2,
+            max_size: 3,
+            max_age_secs: 600,
+            preparation_timeout_secs: 120,
+        });
+        assert!(pool.update_warm_pool(next.clone()).await.unwrap());
+        let stored = pool
+            .warm_pool_state("team", "agents")
+            .await
+            .unwrap()
+            .unwrap();
+        next.expected_version = Some(stored.resource_version);
+        next.state.policy.as_mut().unwrap().max_size = 4;
+        assert!(pool.update_warm_pool(next.clone()).await.is_err());
+        next.state.revision += 1;
+        assert!(pool.update_warm_pool(next.clone()).await.unwrap());
+
+        let stored = pool
+            .warm_pool_state("team", "agents")
+            .await
+            .unwrap()
+            .unwrap();
+        next.expected_version = Some(stored.resource_version);
+        next.state.policy.as_mut().unwrap().target_size = 0;
+        assert!(pool.update_warm_pool(next.clone()).await.unwrap());
+        let stored = pool
+            .warm_pool_state("team", "agents")
+            .await
+            .unwrap()
+            .unwrap();
+        next.expected_version = Some(stored.resource_version);
+        next.state.policy.as_mut().unwrap().target_size = 2;
+        assert!(pool.update_warm_pool(next.clone()).await.is_err());
+        next.state.revision += 1;
+        assert!(pool.update_warm_pool(next).await.unwrap());
     }
 }

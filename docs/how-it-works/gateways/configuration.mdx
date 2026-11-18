@@ -1684,14 +1684,32 @@ The target count is the template's `max_burst`, capped by `max_size`. Pending an
 deleting spares count against this per-template maximum (1–256).
 `max_age_secs` accepts 60–86400 seconds; `preparation_timeout_secs` accepts
 30–3600 seconds and must not exceed the maximum age. Increase `revision` when
-changing these limits, other driver settings, or gateway verification keys;
-older gateway replicas cannot overwrite a newer plan.
+changing these limits or the effective runtime configuration, including runtime
+images and gateway verification keys. Gateway upgrades can change the default
+OpenShell runtime images, so include a revision increase in those deployments.
+Use a higher revision for rollbacks too; older replicas cannot overwrite a newer
+plan.
+
+A revision increase retains compatible spares and applies the new capacity and
+expiry limits. It replaces unclaimed spares only when their effective workload,
+supervisor, bootstrap, or trust configuration changes. Unused defaults and
+unrelated driver settings do not affect compatibility. For example, changing the
+default workload image does not invalidate a template with an explicit image.
+Image references are compared without querying registries. Changing the contents
+behind an unchanged tag does not trigger replacement.
+
+If effective configuration changes without a revision increase, the gateway logs
+`warm provisioning suspended`. That replica stops preparing and selecting
+incompatible spares, while recorded expiry and retirement work continues. Deploy
+a higher revision with consistent settings across replicas to resume provisioning.
 
 Deleting a template drains its unclaimed capacity automatically, including after
 a gateway restart. Recreating the same template name creates a distinct pool.
 Set `warm_pool.enabled = false` on all gateway replicas to stop claims and drain
-all pools. Re-enabling allows tuned templates to refill. Claimed sandboxes continue
-through their normal lifecycle.
+all pools, even if runtime configuration no longer matches. Disabling is recorded
+in the pool journal so another replica cannot refill it. Set `enabled = true` with
+a higher `revision` to re-enable pooling. Claimed sandboxes continue through their
+normal lifecycle.
 
 Warm pooling supports managed, operator and shared workspaces without additional
 workspace Secret-read permissions. The gateway persists preparation and claim

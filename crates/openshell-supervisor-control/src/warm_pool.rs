@@ -30,6 +30,30 @@ pub struct WarmPoolEntry {
     pub resource_uid: Option<String>,
     /// Persisted before retirement. Never changed back to false.
     pub retiring: bool,
+    /// Epoch used by this preparation, retained after its physical CR is gone.
+    #[serde(default)]
+    pub auth_epoch: Option<CredentialEpoch>,
+}
+
+/// Revision-controlled inventory policy, independent of runtime compatibility.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmPoolPolicy {
+    pub target_size: u32,
+    pub max_size: u32,
+    pub max_age_secs: u64,
+    pub preparation_timeout_secs: u64,
+}
+
+impl WarmPoolPolicy {
+    /// Disabling is the only policy change permitted without a new revision.
+    #[must_use]
+    pub fn is_drain_of(&self, previous: &Self) -> bool {
+        self.target_size == 0
+            && self.max_size == previous.max_size
+            && self.max_age_secs == previous.max_age_secs
+            && self.preparation_timeout_secs == previous.preparation_timeout_secs
+    }
 }
 
 /// Bounded pool journal. Every replica acts on the same physical identities.
@@ -38,8 +62,11 @@ pub struct WarmPoolEntry {
 pub struct WarmPoolState {
     /// Operator-incremented revision fences older gateway configurations.
     pub revision: u64,
-    /// Canonical driver configuration and public trust digest.
+    /// Effective runtime preparation and public trust digest.
     pub fingerprint: String,
+    /// Older journals acquire a policy on their next authorized revision.
+    #[serde(default)]
+    pub policy: Option<WarmPoolPolicy>,
     pub entries: Vec<WarmPoolEntry>,
 }
 
