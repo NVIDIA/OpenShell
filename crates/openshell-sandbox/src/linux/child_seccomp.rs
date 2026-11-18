@@ -28,6 +28,7 @@ const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
+const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 1 << 3;
 const CLOSE_RANGE_UNSHARE_FLAG: u32 = 1 << 1;
 const CLOSE_RANGE_CLOEXEC_FLAG: u32 = 1 << 2;
 const F_SETOWN_COMMAND: u32 = 8;
@@ -249,6 +250,64 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         append_argument_equal_deny(&mut instructions, libc::SYS_ioctl, 1, request)?;
     }
 
+    instructions.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+    Ok(ChildHardeningProgram { instructions })
+}
+
+/// Syscalls [`prepare_namespaced`] refuses with `EPERM`.
+pub const NAMESPACED_DENIED_SYSCALLS: [i64; 17] = [
+    libc::SYS_ptrace,
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+    libc::SYS_pidfd_getfd,
+    libc::SYS_kcmp,
+    libc::SYS_process_madvise,
+    libc::SYS_process_mrelease,
+    libc::SYS_bpf,
+    libc::SYS_perf_event_open,
+    libc::SYS_userfaultfd,
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_kexec_load,
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+];
+
+/// Build the self-protection program for a workload that the sandbox already
+/// separates by UID or by a user namespace it does not own, before `fork`.
+///
+/// Kernel credential checks keep such a workload from signalling, tracing, or
+/// reading the sandbox, so this program does not name the sandbox process. It
+/// keeps the mediated networking listener authoritative instead: it refuses
+/// I/O paths that bypass syscall notification (`io_uring`), cross-process
+/// memory and descriptor access that could tamper with another workload
+/// process during mediation, BPF and perf, and a nested seccomp listener,
+/// which would take notifications ahead of the inherited one. Namespace,
+/// mount, and identity operations remain available so nested container
+/// runtimes can work inside the workload's own namespaces.
+pub fn prepare_namespaced() -> io::Result<ChildHardeningProgram> {
+    let mut instructions = vec![
+        stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
+        jump(BPF_JMP_JEQ_K, native_audit_arch(), 1, 0),
+        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    instructions.extend([
+        jump(BPF_JMP_JSET_K, X32_SYSCALL_BIT, 0, 1),
+        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+    ]);
+    for syscall in NAMESPACED_DENIED_SYSCALLS {
+        append_unconditional_deny(&mut instructions, syscall)?;
+    }
+    append_argument_masked_deny(
+        &mut instructions,
+        libc::SYS_seccomp,
+        1,
+        SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    )?;
     instructions.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
     Ok(ChildHardeningProgram { instructions })
 }
@@ -593,6 +652,91 @@ mod tests {
                 .env("OPENSHELL_CHILD_SECCOMP_CREATION_PROBE", "1")
                 .output()
                 .expect("run isolated child-hardening probe");
+        assert!(
+            output.status.success(),
+            "isolated probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn namespaced_filter_blocks_bypasses_and_keeps_namespace_operations() {
+        const MARKER: &str = "OPENSHELL_CHILD_SECCOMP_NAMESPACED_PROBE";
+        if std::env::var_os(MARKER).is_some() {
+            let expect_eperm = |result: libc::c_long, what: &str| {
+                assert_eq!(result, -1, "{what} must fail");
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EPERM),
+                    "{what} must be refused by the filter"
+                );
+            };
+            prepare_namespaced()
+                .expect("prepare namespaced filter")
+                .install()
+                .expect("install namespaced filter");
+            let mut buffer = [0_u8; 120];
+            // SAFETY: every probe passes live buffers or scalar arguments the
+            // filter refuses before the kernel reads them.
+            unsafe {
+                expect_eperm(
+                    libc::syscall(libc::SYS_io_uring_setup, 1, buffer.as_mut_ptr()),
+                    "io_uring_setup",
+                );
+                expect_eperm(
+                    libc::syscall(libc::SYS_ptrace, libc::PTRACE_TRACEME, 0, 0, 0),
+                    "ptrace",
+                );
+                expect_eperm(libc::syscall(libc::SYS_pidfd_getfd, 0, 0, 0), "pidfd_getfd");
+                expect_eperm(
+                    libc::syscall(libc::SYS_process_vm_readv, libc::getppid(), 0, 0, 0, 0, 0),
+                    "process_vm_readv",
+                );
+                expect_eperm(libc::syscall(libc::SYS_bpf, 0, 0, 0), "bpf");
+                let mut allow = [stmt(BPF_RET_K, SECCOMP_RET_ALLOW)];
+                let mut program = libc::sock_fprog {
+                    len: 1,
+                    filter: allow.as_mut_ptr(),
+                };
+                expect_eperm(
+                    libc::syscall(
+                        libc::SYS_seccomp,
+                        SECCOMP_SET_MODE_FILTER,
+                        SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                        std::ptr::addr_of_mut!(program),
+                    ),
+                    "seccomp listener",
+                );
+                // A nested runtime may still stack ordinary filters.
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_seccomp,
+                        SECCOMP_SET_MODE_FILTER,
+                        0,
+                        std::ptr::addr_of_mut!(program),
+                    ),
+                    0,
+                    "plain seccomp filter: {}",
+                    io::Error::last_os_error()
+                );
+                // Namespace and mount syscalls reach the kernel.
+                assert_eq!(libc::unshare(0), 0);
+                assert_eq!(libc::setns(-1, 0), -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            }
+            return;
+        }
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "linux::child_seccomp::tests::namespaced_filter_blocks_bypasses_and_keeps_namespace_operations",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(MARKER, "1")
+                .output()
+                .expect("run isolated namespaced probe");
         assert!(
             output.status.success(),
             "isolated probe failed: {}",

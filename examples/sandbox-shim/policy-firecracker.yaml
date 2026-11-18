@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Policy for the Firecracker substrate, where every workload socket is
+# mediated natively and clients need no proxy settings. sandbox-shim enforces
+# no filesystem policy, so this policy has no filesystem_policy section.
+version: 1
+
+network_policies:
+  example:
+    name: example-web
+    endpoints:
+      - { host: example.com, port: 443 }
+      - { host: example.com, port: 80 }
+    binaries:
+      - { path: /usr/bin/curl }
+  direct_ip:
+    name: direct-ip-literal
+    endpoints:
+      - { host: 1.1.1.1, port: 80 }
+    binaries:
+      - { path: /usr/bin/curl }
+  docker_hub:
+    name: docker-hub-pulls
+    endpoints:
+      - { host: registry-1.docker.io, port: 443 }
+      - { host: auth.docker.io, port: 443 }
+      - { host: production.cloudfront.docker.com, port: 443 }
+      - { host: "**.cloudflare.docker.com", port: 443 }
+      - { host: "**.r2.cloudflarestorage.com", port: 443 }
+    binaries:
+      - { path: /usr/local/bin/dockerd }
+  nested_container:
+    name: nested-container-http
+    endpoints:
+      - { host: example.com, port: 80 }
+    # Executables of nested containers are named inside their own root,
+    # under this prefix; Alpine's wget is BusyBox.
+    binaries:
+      - { path: /.openshell/nested-root/bin/busybox }

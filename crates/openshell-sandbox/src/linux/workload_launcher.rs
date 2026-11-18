@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::linux::seccomp_notify::{NotificationListener, install_workload_listener};
+use crate::linux::seccomp_notify::{
+    NotificationListener, install_network_listener, install_workload_listener,
+};
 
 type LaunchJob = Box<dyn FnOnce() + Send + 'static>;
 
@@ -68,6 +70,18 @@ impl WorkloadLauncher {
 /// Start the only workload launcher and return its listener to an unfiltered
 /// sandbox thread.
 pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
+    start_with(install_workload_listener)
+}
+
+/// Start a launcher whose inherited listener mediates only INET networking
+/// (see [`install_network_listener`]).
+pub fn start_networking() -> io::Result<(WorkloadLauncher, NotificationListener)> {
+    start_with(install_network_listener)
+}
+
+fn start_with(
+    install: fn() -> io::Result<NotificationListener>,
+) -> io::Result<(WorkloadLauncher, NotificationListener)> {
     let (jobs_tx, jobs_rx) = mpsc::sync_channel::<LaunchJob>(64);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let alive = Arc::new(AtomicBool::new(true));
@@ -75,7 +89,7 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
     thread::Builder::new()
         .name("openshell-workload-launcher".to_string())
         .spawn(move || {
-            match install_workload_listener() {
+            match install() {
                 Ok(listener) => {
                     if ready_tx.send(Ok(listener)).is_err() {
                         thread_alive.store(false, Ordering::Release);

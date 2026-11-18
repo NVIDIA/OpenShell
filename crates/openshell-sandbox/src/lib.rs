@@ -28,7 +28,7 @@ pub mod main_session;
 #[cfg(target_os = "linux")]
 pub mod managed_children;
 #[cfg(target_os = "linux")]
-mod network_broker;
+pub mod network_broker;
 #[cfg(all(target_os = "linux", feature = "perf-harness"))]
 pub mod perf;
 #[cfg(target_os = "linux")]

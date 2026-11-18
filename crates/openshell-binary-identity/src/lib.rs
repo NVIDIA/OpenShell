@@ -14,8 +14,9 @@ use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 use openshell_isolation_interface::contract::{ExecutableIdentity, Sha256Digest};
 #[cfg(target_os = "linux")]
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
 const EXECUTABLE_DIGEST_CACHE_CAPACITY: usize = 1_024;
@@ -34,8 +35,30 @@ const CMDLINE_READ_LIMIT: usize = 128 * 1024;
 #[derive(Clone, Debug)]
 pub struct ProcfsIdentityResolver {
     ancestry_scope: AncestryScope,
+    path_view: Option<Arc<dyn ExecutablePathView>>,
     #[cfg(target_os = "linux")]
     cache: Arc<Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>>,
+}
+
+/// Maps the executable path procfs reports to the path an identity names.
+///
+/// Procfs renders `/proc/<pid>/exe` relative to the observer's root. An
+/// observer whose root differs from the workload's installs a view to report
+/// the path the workload itself uses, or to fail when it cannot establish one.
+pub trait ExecutablePathView: Send + Sync + std::fmt::Debug {
+    /// Path to report for `pid`, whose `/proc/<pid>/exe` link reads
+    /// `procfs_path`. The resolver calls this again when it revalidates the
+    /// process, and treats a changed answer as a changed process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no trustworthy path can be reported; the
+    /// resolution then fails.
+    fn report_path(
+        &self,
+        pid: u32,
+        procfs_path: &std::path::Path,
+    ) -> Result<std::path::PathBuf, ResolveError>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +80,7 @@ impl ProcfsIdentityResolver {
     pub fn for_pid_namespace() -> Self {
         Self {
             ancestry_scope: AncestryScope::PidNamespace,
+            path_view: None,
             #[cfg(target_os = "linux")]
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -67,9 +91,17 @@ impl ProcfsIdentityResolver {
     pub fn for_process_tree(ancestor_root: u32) -> Self {
         Self {
             ancestry_scope: AncestryScope::ProcessTree(ancestor_root),
+            path_view: None,
             #[cfg(target_os = "linux")]
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Report every executable path, leaf and ancestors, through `view`.
+    #[must_use]
+    pub fn with_path_view(mut self, view: Arc<dyn ExecutablePathView>) -> Self {
+        self.path_view = Some(view);
+        self
     }
 
     /// Resolve the identity for an authoritative process ID.
@@ -80,7 +112,7 @@ impl ProcfsIdentityResolver {
                 AncestryScope::PidNamespace => nested_pid_namespace_init(pid),
                 AncestryScope::ProcessTree(root) => Some(root),
             };
-            resolve_linux_process(pid, ancestor_root, &self.cache)
+            resolve_linux_process(pid, ancestor_root, &self.cache, self.path_view.as_deref())
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -91,7 +123,7 @@ impl ProcfsIdentityResolver {
                     let _ = ancestor_root;
                 }
             }
-            let _ = pid;
+            let _ = (pid, &self.path_view);
             Err(ResolveError::Failed(
                 "procfs binary identity is only available on Linux".to_string(),
             ))
@@ -104,9 +136,10 @@ fn resolve_linux_process(
     pid: u32,
     ancestor_root: Option<u32>,
     cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
+    view: Option<&dyn ExecutablePathView>,
 ) -> Result<BinaryIdentity, ResolveError> {
-    let (snapshot, mut executable) = open_process_snapshot(pid)?;
-    let mut ancestor_processes = collect_ancestor_processes(&snapshot, ancestor_root)?;
+    let (snapshot, mut executable) = open_process_snapshot(pid, view)?;
+    let mut ancestor_processes = collect_ancestor_processes(&snapshot, ancestor_root, view)?;
 
     let mut excluded_paths = ancestor_processes
         .iter()
@@ -140,9 +173,9 @@ fn resolve_linux_process(
         )?);
     }
 
-    validate_process_snapshot(pid, &snapshot)?;
+    validate_process_snapshot(pid, &snapshot, view)?;
     for (ancestor, _) in &ancestor_processes {
-        validate_process_snapshot(ancestor.pid, ancestor)?;
+        validate_process_snapshot(ancestor.pid, ancestor, view)?;
     }
     for (key, digest) in pending_cache_entries {
         cache_executable_digest(cache, key, digest);
@@ -253,11 +286,14 @@ fn cache_executable_digest(
 }
 
 #[cfg(target_os = "linux")]
-fn open_process_snapshot(pid: u32) -> Result<(ProcessSnapshot, std::fs::File), ResolveError> {
+fn open_process_snapshot(
+    pid: u32,
+    view: Option<&dyn ExecutablePathView>,
+) -> Result<(ProcessSnapshot, std::fs::File), ResolveError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let path = format!("/proc/{pid}/exe");
-    let binary_path = executable_path(pid)?;
+    let binary_path = reported_executable_path(pid, view)?;
     let executable = std::fs::File::open(&path)
         .map_err(|error| ResolveError::Failed(format!("open {path}: {error}")))?;
     let metadata = executable
@@ -278,12 +314,16 @@ fn open_process_snapshot(pid: u32) -> Result<(ProcessSnapshot, std::fs::File), R
         start_time,
         cmdline: read_process_cmdline(pid)?,
     };
-    validate_process_snapshot(pid, &snapshot)?;
+    validate_process_snapshot(pid, &snapshot, view)?;
     Ok((snapshot, executable))
 }
 
 #[cfg(target_os = "linux")]
-fn validate_process_snapshot(pid: u32, expected: &ProcessSnapshot) -> Result<(), ResolveError> {
+fn validate_process_snapshot(
+    pid: u32,
+    expected: &ProcessSnapshot,
+    view: Option<&dyn ExecutablePathView>,
+) -> Result<(), ResolveError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let path = format!("/proc/{pid}/exe");
@@ -293,7 +333,7 @@ fn validate_process_snapshot(pid: u32, expected: &ProcessSnapshot) -> Result<(),
     let current = ProcessSnapshot {
         pid,
         parent_pid,
-        binary_path: executable_path(pid)?,
+        binary_path: reported_executable_path(pid, view)?,
         executable_device: metadata.dev(),
         executable_inode: metadata.ino(),
         executable_size: metadata.size(),
@@ -375,6 +415,18 @@ fn cap_cmdline(mut buffer: Vec<u8>) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
+fn reported_executable_path(
+    pid: u32,
+    view: Option<&dyn ExecutablePathView>,
+) -> Result<std::path::PathBuf, ResolveError> {
+    let path = executable_path(pid)?;
+    match view {
+        Some(view) => view.report_path(pid, &path),
+        None => Ok(path),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn executable_path(pid: u32) -> Result<std::path::PathBuf, ResolveError> {
     use std::ffi::OsString;
     use std::io::ErrorKind;
@@ -432,6 +484,7 @@ fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Dig
 fn collect_ancestor_processes(
     process: &ProcessSnapshot,
     ancestor_root: Option<u32>,
+    view: Option<&dyn ExecutablePathView>,
 ) -> Result<Vec<(ProcessSnapshot, std::fs::File)>, ResolveError> {
     const MAX_DEPTH: usize = 64;
 
@@ -452,7 +505,7 @@ fn collect_ancestor_processes(
             break;
         }
 
-        let (snapshot, executable) = open_process_snapshot(parent)?;
+        let (snapshot, executable) = open_process_snapshot(parent, view)?;
         let next_parent = snapshot.parent_pid;
         ancestors.push((snapshot, executable));
         if ancestor_root == Some(parent) || parent == 1 {
@@ -590,6 +643,51 @@ mod tests {
         assert!(identity.executable.digest.is_some());
     }
 
+    #[derive(Debug)]
+    struct PrefixView(Option<&'static str>);
+
+    impl ExecutablePathView for PrefixView {
+        fn report_path(
+            &self,
+            pid: u32,
+            procfs_path: &std::path::Path,
+        ) -> Result<std::path::PathBuf, ResolveError> {
+            assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+            self.0
+                .map(|prefix| {
+                    std::path::Path::new(prefix).join(procfs_path.strip_prefix("/").unwrap())
+                })
+                .ok_or_else(|| ResolveError::Failed("unverifiable executable path".into()))
+        }
+    }
+
+    #[test]
+    fn path_view_reports_every_executable_and_can_fail_resolution() {
+        let pid = std::process::id();
+        let raw = ProcfsIdentityResolver::for_pid_namespace()
+            .resolve(pid)
+            .expect("resolve without a view");
+        let viewed = ProcfsIdentityResolver::for_pid_namespace()
+            .with_path_view(Arc::new(PrefixView(Some("/viewed"))))
+            .resolve(pid)
+            .expect("resolve through a view");
+        assert_eq!(viewed.ancestors.len(), raw.ancestors.len());
+        for (viewed, raw) in std::iter::once(&viewed.executable)
+            .chain(&viewed.ancestors)
+            .zip(std::iter::once(&raw.executable).chain(&raw.ancestors))
+        {
+            assert_eq!(
+                viewed.path,
+                std::path::Path::new("/viewed").join(raw.path.strip_prefix("/").unwrap())
+            );
+            assert_eq!(viewed.digest, raw.digest);
+        }
+        let failed = ProcfsIdentityResolver::for_pid_namespace()
+            .with_path_view(Arc::new(PrefixView(None)))
+            .resolve(pid);
+        assert!(failed.is_err());
+    }
+
     #[test]
     #[ignore = "subprocess fixture for executable identity tests"]
     fn identity_helper_process() {
@@ -647,7 +745,7 @@ mod tests {
     #[test]
     fn executable_is_hashed_once_per_resolution() {
         let pid = std::process::id();
-        let (snapshot, mut executable) = open_process_snapshot(pid).unwrap();
+        let (snapshot, mut executable) = open_process_snapshot(pid, None).unwrap();
         let cache = Mutex::new(HashMap::new());
         let mut pending = HashMap::new();
 

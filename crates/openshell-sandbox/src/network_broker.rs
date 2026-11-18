@@ -101,9 +101,42 @@ impl PendingTcpOpen {
         self.decide(decision)?.established().await
     }
 
+    /// Destination the workload asked to connect to.
+    #[must_use]
+    pub const fn destination(&self) -> SocketAddr {
+        self.destination
+    }
+
+    /// Identity of the notifying thread's executable, resolved at notification.
+    pub const fn identity(&self) -> &Result<BinaryIdentity, ResolveError> {
+        &self.identity
+    }
+
+    /// Broker metadata of the workload socket.
+    #[must_use]
+    pub const fn socket(&self) -> NetworkSocketMetadata {
+        self.socket
+    }
+
+    /// Time from notification receipt to queueing.
+    #[must_use]
+    pub const fn notification_to_queue(&self) -> Duration {
+        self.notification_to_queue
+    }
+
+    /// Time the open has waited in the queue so far.
+    #[must_use]
+    pub fn queue_wait(&self) -> Duration {
+        self.queued_at.elapsed()
+    }
+
     /// Hand the decision to the broker. Once this returns the decision has
     /// taken effect; only the relay setup of an allowed open remains.
-    pub(crate) fn decide(self, decision: TcpOpenDecision) -> io::Result<DecidedTcpOpen> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the broker has stopped.
+    pub fn decide(self, decision: TcpOpenDecision) -> io::Result<DecidedTcpOpen> {
         self.decision
             .send(decision)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network broker stopped"))?;
@@ -119,7 +152,13 @@ pub struct DecidedTcpOpen {
 }
 
 impl DecidedTcpOpen {
-    pub(crate) async fn established(self) -> io::Result<Option<TcpStream>> {
+    /// The broker side of an allowed open's relay, once the workload socket
+    /// is connected to it; `None` for a denied open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the relay could not be established.
+    pub async fn established(self) -> io::Result<Option<TcpStream>> {
         let Some(relay) = self.relay else {
             return Ok(None);
         };
@@ -146,7 +185,41 @@ pub struct PendingDnsQuery {
 }
 
 impl PendingDnsQuery {
-    pub(crate) fn complete(self, response: io::Result<Vec<u8>>) -> io::Result<()> {
+    /// The query as received; TCP queries keep their two-byte length prefix.
+    #[must_use]
+    pub fn request(&self) -> &[u8] {
+        &self.request
+    }
+
+    /// Transport the workload used to reach the relay.
+    #[must_use]
+    pub const fn transport(&self) -> DnsTransport {
+        self.transport
+    }
+
+    /// Sender identity; kernel-driven relay writes never carry one.
+    pub const fn identity(&self) -> &Result<BinaryIdentity, ResolveError> {
+        &self.identity
+    }
+
+    /// Time from receipt to queueing.
+    #[must_use]
+    pub const fn notification_to_queue(&self) -> Duration {
+        self.notification_to_queue
+    }
+
+    /// Time the query has waited in the queue so far.
+    #[must_use]
+    pub fn queue_wait(&self) -> Duration {
+        self.queued_at.elapsed()
+    }
+
+    /// Answer the query; an error leaves the workload without a response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the relay worker has already given up.
+    pub fn complete(self, response: io::Result<Vec<u8>>) -> io::Result<()> {
         self.response
             .send(response)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DNS relay stopped"))
@@ -206,12 +279,24 @@ fn register_dns_socket(
     Ok(())
 }
 
+struct BrokerConfig {
+    listener: NotificationListener,
+    dns_address: SocketAddr,
+    protected_control_port: Option<u16>,
+    decision_timeout: Duration,
+    identity_resolver: ProcfsIdentityResolver,
+    networking_only: bool,
+}
+
 #[derive(Clone)]
 struct NotificationQueues {
     provider_files: crate::provider_files::ProviderFiles,
     workload_frozen: Arc<AtomicBool>,
     protected_control_port: Option<u16>,
     identity_resolver: ProcfsIdentityResolver,
+    /// Refuse signal and file-open notifications: their PID and path
+    /// arguments are relative to namespaces the broker does not share.
+    networking_only: bool,
     pending: mpsc::Sender<PendingTcpOpen>,
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
@@ -238,6 +323,45 @@ impl NetworkBroker {
         protected_control_port: Option<u16>,
     ) -> io::Result<Self> {
         Self::start_with_dns_address(listener, DNS_RELAY_ADDRESS, protected_control_port)
+    }
+
+    /// Start a broker for a listener from
+    /// [`crate::linux::workload_launcher::start_networking`].
+    ///
+    /// The broker serves the sandbox DNS relay on `127.0.0.53:53` in the
+    /// caller's network namespace and creates every injected socket there.
+    /// It attributes each external TCP open to the notifying thread with
+    /// `identity_resolver`. A signal or file-open notification, which the
+    /// networking listener never produces, is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the DNS relay cannot bind or the broker thread
+    /// cannot start.
+    pub fn start_networking(
+        listener: NotificationListener,
+        identity_resolver: ProcfsIdentityResolver,
+    ) -> io::Result<Self> {
+        Self::start_configured(BrokerConfig {
+            listener,
+            dns_address: DNS_RELAY_ADDRESS,
+            protected_control_port: None,
+            decision_timeout: NETWORK_DECISION_TIMEOUT,
+            identity_resolver,
+            networking_only: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_networking_for_test(listener: NotificationListener) -> io::Result<Self> {
+        Self::start_configured(BrokerConfig {
+            listener,
+            dns_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            protected_control_port: None,
+            decision_timeout: NETWORK_DECISION_TIMEOUT,
+            identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
+            networking_only: true,
+        })
     }
 
     #[cfg(any(test, feature = "perf-harness"))]
@@ -268,6 +392,25 @@ impl NetworkBroker {
         protected_control_port: Option<u16>,
         decision_timeout: Duration,
     ) -> io::Result<Self> {
+        Self::start_configured(BrokerConfig {
+            listener,
+            dns_address,
+            protected_control_port,
+            decision_timeout,
+            identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
+            networking_only: false,
+        })
+    }
+
+    fn start_configured(config: BrokerConfig) -> io::Result<Self> {
+        let BrokerConfig {
+            listener,
+            dns_address,
+            protected_control_port,
+            decision_timeout,
+            identity_resolver,
+            networking_only,
+        } = config;
         let listener = Arc::new(listener);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
@@ -282,7 +425,8 @@ impl NetworkBroker {
             provider_files: provider_files.clone(),
             workload_frozen: workload_frozen.clone(),
             protected_control_port,
-            identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
+            identity_resolver,
+            networking_only,
             pending: pending_tx,
             dns_relay,
             active_opens,
@@ -381,7 +525,13 @@ impl NetworkBroker {
         self.workload_frozen.store(frozen, Ordering::Release);
     }
 
-    pub(crate) async fn accept(&self) -> io::Result<PendingTcpOpen> {
+    /// Wait for the next external TCP open, blocked in the workload's
+    /// `connect` until it is decided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error once the broker has stopped.
+    pub async fn accept(&self) -> io::Result<PendingTcpOpen> {
         self.pending
             .lock()
             .await
@@ -390,7 +540,12 @@ impl NetworkBroker {
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "network broker queue closed"))
     }
 
-    pub(crate) async fn accept_dns(&self) -> io::Result<PendingDnsQuery> {
+    /// Wait for the next DNS query sent to the sandbox relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error once the DNS relay has stopped.
+    pub async fn accept_dns(&self) -> io::Result<PendingDnsQuery> {
         self.pending_dns
             .lock()
             .await
@@ -404,7 +559,12 @@ impl NetworkBroker {
         self.dns_address
     }
 
-    pub(crate) fn confirm_healthy(&self) -> io::Result<()> {
+    /// Whether the notification broker and its DNS relay are running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the broker thread has stopped.
+    pub fn confirm_healthy(&self) -> io::Result<()> {
         if self.healthy.load(Ordering::Acquire) && self.dns_address.port() != 0 {
             Ok(())
         } else {
@@ -693,6 +853,11 @@ fn dispatch_notification(
     queues: NotificationQueues,
 ) -> io::Result<()> {
     let syscall = i64::from(notification.syscall);
+    if queues.networking_only
+        && !crate::linux::seccomp_notify::NETWORK_NOTIFIED_SYSCALLS.contains(&syscall)
+    {
+        return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    }
     if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
         return queues.provider_files.handle_open(&listener, notification);
     }
@@ -3881,5 +4046,186 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let _wakeup = TcpStream::connect(address).expect("wake the accept loop");
         relay.join().expect("accept loop thread panicked");
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "workload-side test clients dial through the broker; Nagle is not under test"
+)]
+mod networking_only_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    const CHILD_MARKER: &str = "OPENSHELL_NETWORKING_BROKER_CHILD";
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    #[test]
+    fn networking_listener_leaves_signals_and_file_opens_to_the_kernel() {
+        // No broker services this listener: a notified syscall would block
+        // the launcher thread until the timeout below.
+        let (launcher, _listener) =
+            crate::linux::workload_launcher::start_networking().expect("start launcher");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = launcher.execute(|| -> io::Result<()> {
+                std::fs::read_to_string("/proc/self/status")?;
+                // SAFETY: signal 0 to ourselves only checks permission.
+                if unsafe { libc::kill(libc::getpid(), 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: as above, for the calling thread.
+                if unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), libc::gettid(), 0) }
+                    != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+            let _ = done_tx.send(result);
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("signal and open syscalls must not wait for a broker")
+            .expect("launcher result")
+            .expect("native signal and open");
+    }
+
+    #[test]
+    fn networking_broker_reports_socket_metadata_and_denies_with_eacces() {
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start_networking().expect("start launcher");
+        let broker = NetworkBroker::start_networking_for_test(listener).expect("start broker");
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(|| {
+                    // SAFETY: gettid has no arguments.
+                    let tid = unsafe { libc::gettid() };
+                    (tid, TcpStream::connect("203.0.113.7:443").map(drop))
+                })
+                .expect("launcher result")
+        });
+        let pending = runtime().block_on(broker.accept()).expect("pending open");
+        assert_eq!(pending.destination(), "203.0.113.7:443".parse().unwrap());
+        let socket = pending.socket();
+        assert_ne!(socket.socket_cookie, 0);
+        assert!(!socket.nonblocking);
+        let identity = pending.identity().as_ref().expect("resolved identity");
+        assert_eq!(
+            identity.executable.path,
+            std::env::current_exe().unwrap().canonicalize().unwrap()
+        );
+        assert!(identity.executable.digest.is_some());
+        pending
+            .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+            .expect("decide");
+        let (tid, result) = client.join().expect("join client");
+        assert_eq!(socket.process_generation, u64::try_from(tid).unwrap());
+        assert_eq!(
+            result.expect_err("denied connect").raw_os_error(),
+            Some(libc::EACCES)
+        );
+        broker.confirm_healthy().expect("broker keeps running");
+    }
+
+    #[test]
+    fn networking_broker_reports_dns_transport() {
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start_networking().expect("start launcher");
+        let broker = NetworkBroker::start_networking_for_test(listener).expect("start broker");
+        let dns = broker.dns_address();
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
+                    let udp = UdpSocket::bind("127.0.0.1:0")?;
+                    udp.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    udp.send_to(b"udp-query", dns)?;
+                    let mut answer = [0_u8; 32];
+                    let length = udp.recv(&mut answer)?;
+                    let mut tcp = TcpStream::connect(dns)?;
+                    tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    tcp.write_all(&[0, 1, 9])?;
+                    let mut framed = vec![0_u8; 3];
+                    tcp.read_exact(&mut framed)?;
+                    Ok((answer[..length].to_vec(), framed))
+                })
+                .expect("launcher result")
+        });
+        let runtime = runtime();
+        let udp = runtime.block_on(broker.accept_dns()).expect("UDP query");
+        assert_eq!(udp.transport(), DnsTransport::Udp);
+        assert_eq!(udp.request(), b"udp-query");
+        assert!(udp.identity().is_err(), "relay writes carry no identity");
+        udp.complete(Ok(b"udp-answer".to_vec())).unwrap();
+        let tcp = runtime.block_on(broker.accept_dns()).expect("TCP query");
+        assert_eq!(tcp.transport(), DnsTransport::Tcp);
+        assert_eq!(tcp.request(), [0, 1, 9]);
+        tcp.complete(Ok(vec![0, 1, 7])).unwrap();
+        let (udp_answer, tcp_answer) = client.join().expect("join").expect("DNS client");
+        assert_eq!(udp_answer, b"udp-answer");
+        assert_eq!(tcp_answer, [0, 1, 7]);
+    }
+
+    /// A hardened descendant keeps the inherited listener: it cannot reach
+    /// the network through `io_uring` or a nested listener, and its own
+    /// `connect` is still decided by the broker.
+    #[test]
+    fn hardened_descendant_cannot_bypass_the_inherited_listener() {
+        use std::os::unix::process::CommandExt as _;
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start_networking().expect("start launcher");
+        let broker = NetworkBroker::start_networking_for_test(listener).expect("start broker");
+        let executable = std::env::current_exe().unwrap();
+        let mut child = launcher
+            .execute(move || {
+                let mut hardening = crate::linux::child_seccomp::prepare_namespaced()?;
+                let mut command = std::process::Command::new(executable);
+                command
+                    .args([
+                        "--exact",
+                        "network_broker::networking_only_tests::hardened_descendant_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD_MARKER, "1");
+                // SAFETY: installing a prebuilt filter performs no allocation.
+                unsafe { command.pre_exec(move || hardening.install()) };
+                command.spawn()
+            })
+            .expect("launcher result")
+            .expect("spawn hardened child");
+        let pending = runtime().block_on(broker.accept()).expect("pending open");
+        assert_eq!(pending.destination(), "203.0.113.9:80".parse().unwrap());
+        let tid = u32::try_from(pending.socket().process_generation).unwrap();
+        assert!(
+            std::path::Path::new(&format!("/proc/{}/task/{tid}", child.id())).exists(),
+            "the open is attributed to a thread of the hardened child"
+        );
+        pending
+            .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+            .expect("decide");
+        assert!(child.wait().expect("wait child").success());
+    }
+
+    #[test]
+    fn hardened_descendant_child() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        let mut params = [0_u8; 120];
+        // SAFETY: io_uring_setup reads and writes the live params buffer.
+        let ring = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, params.as_mut_ptr()) };
+        assert_eq!(ring, -1, "io_uring must be unavailable");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        let error = TcpStream::connect("203.0.113.9:80").expect_err("broker denies");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
     }
 }

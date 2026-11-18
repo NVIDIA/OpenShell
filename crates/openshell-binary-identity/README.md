@@ -18,3 +18,9 @@ The crate does not intercept connections, authenticate remote observers, or
 evaluate policy. The isolation backend remains responsible for binding the
 resolved identity to the active boundary and exact accepted connection before
 constructing `PendingTcpOpen`.
+
+An observer whose root differs from the workload's can install an
+`ExecutablePathView` with `ProcfsIdentityResolver::with_path_view`. The view
+maps each `/proc/<pid>/exe` path, for the leaf and every ancestor, to the path
+the identity reports, or fails the resolution. The resolver applies it again
+when it revalidates a process.

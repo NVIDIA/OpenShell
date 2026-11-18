@@ -99,3 +99,21 @@ The runtime keeps the trust-on-first-use executable pins of the generation
 measurements. A contradicting identity is offered as a resolution failure,
 which every supervisor denies, so a replacement with an empty cache cannot pin
 a binary the workload replaced.
+
+## Networking-only mediation for other runtimes
+
+A runtime that is not the boundary server can reuse the broker. Use
+`linux::workload_launcher::start_networking`, which installs a listener that
+notifies only INET socket syscalls (`seccomp_notify::NETWORK_NOTIFIED_SYSCALLS`),
+and pass its listener to `network_broker::NetworkBroker::start_networking`
+with an identity resolver. The broker serves the DNS relay on `127.0.0.53:53`
+and creates injected sockets in the caller's network namespace. It never
+mediates signals or file opens: their PID and path arguments are relative to
+the caller's namespaces, which a workload that creates nested PID or mount
+namespaces does not share. Such a runtime must keep the workload away from
+the broker with kernel credentials, such as a separate UID or a user namespace
+it does not own. `child_seccomp::prepare_namespaced` builds the matching child
+filter. It refuses `io_uring`, cross-process memory and descriptor access,
+BPF, perf, and nested seccomp listeners, and allows the namespace, mount, and
+identity syscalls that nested container runtimes need. The boundary server
+does not use these entry points.

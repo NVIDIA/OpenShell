@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Allow only curl to reach example.com over HTTPS. sandbox-shim enforces no
+# filesystem policy, so this policy has no filesystem_policy section.
+version: 1
+
+network_policies:
+  example:
+    name: example-https
+    endpoints:
+      - host: example.com
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }

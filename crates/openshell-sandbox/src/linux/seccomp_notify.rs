@@ -354,6 +354,32 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
     install_listener(&syscalls)
 }
 
+/// Syscalls the networking-only listener notifies: every operation that can
+/// create, select, or materially reconfigure an INET endpoint.
+pub const NETWORK_NOTIFIED_SYSCALLS: [i64; 8] = [
+    libc::SYS_socket,
+    libc::SYS_connect,
+    libc::SYS_bind,
+    libc::SYS_listen,
+    libc::SYS_sendto,
+    libc::SYS_sendmsg,
+    libc::SYS_sendmmsg,
+    libc::SYS_setsockopt,
+];
+
+/// Install a listener that mediates only INET networking on the calling
+/// launcher thread.
+///
+/// Unlike [`install_workload_listener`], it never notifies signal or file-open
+/// syscalls. Their arguments name PIDs and paths relative to the caller's PID
+/// and mount namespaces, which the broker cannot interpret for a workload that
+/// creates nested namespaces. Use it only where kernel credentials, such as a
+/// separate UID or user namespace, already keep the workload from signalling
+/// or reading the broker.
+pub fn install_network_listener() -> io::Result<NotificationListener> {
+    install_listener(&NETWORK_NOTIFIED_SYSCALLS)
+}
+
 /// Run a no-capability conformance probe.
 ///
 /// This uses the production launcher-thread shape: the listener is created on
