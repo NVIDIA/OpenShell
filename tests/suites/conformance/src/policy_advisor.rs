@@ -9,7 +9,7 @@
 //! Lezar. Requests to `policy.local` run inside the sandbox; settings and drafts
 //! go through the gateway's gRPC API.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use testkit::sdk::raw::proto;
@@ -31,32 +31,36 @@ async fn policy_local_accepts_proposals(cx: &mut Context) -> testkit::Result {
 
     // The current-policy route is local; proposal lookup also needs the
     // supervisor's session with the gateway, so wait for both.
-    let started = Instant::now();
     let readiness = format!("/v1/proposals/test-{}-readiness", cx.run_id());
-    loop {
-        let ready = async {
-            let current = policy_local(&sandbox, "GET", "/v1/policy/current", "", 200).await?;
-            testkit::ensure!(
-                current["format"] == "yaml"
-                    && current["policy_yaml"]
-                        .as_str()
-                        .is_some_and(|yaml| yaml.contains("version: 1")),
-                "policy.local returned an invalid current policy: {current}"
-            );
-            let lookup = policy_local(&sandbox, "GET", &readiness, "", 404).await?;
-            testkit::ensure!(
-                lookup["error"] == "chunk_not_found",
-                "policy.local proposal lookup returned {lookup}"
-            );
-            Ok(())
-        }
-        .await;
-        match ready {
-            Ok(()) => break,
-            Err(error) if started.elapsed() >= READY_TIMEOUT => return Err(error),
-            Err(_) => tokio::time::sleep(POLL_INTERVAL).await,
-        }
-    }
+    testkit::poll_until(
+        "policy.local to be ready",
+        READY_TIMEOUT,
+        POLL_INTERVAL,
+        async || {
+            let ready = async {
+                let current = policy_local(&sandbox, "GET", "/v1/policy/current", "", 200).await?;
+                testkit::ensure!(
+                    current["format"] == "yaml"
+                        && current["policy_yaml"]
+                            .as_str()
+                            .is_some_and(|yaml| yaml.contains("version: 1")),
+                    "policy.local returned an invalid current policy: {current}"
+                );
+                let lookup = policy_local(&sandbox, "GET", &readiness, "", 404).await?;
+                testkit::ensure!(
+                    lookup["error"] == "chunk_not_found",
+                    "policy.local proposal lookup returned {lookup}"
+                );
+                Ok(())
+            }
+            .await;
+            Ok(match ready {
+                Ok(()) => testkit::Poll::Ready(()),
+                Err(error) => testkit::Poll::Pending(error.to_string()),
+            })
+        },
+    )
+    .await?;
 
     let denials = policy_local(&sandbox, "GET", "/v1/denials?last=1", "", 200).await?;
     testkit::ensure!(
@@ -360,22 +364,21 @@ async fn expect_draft(
     binary: &str,
     probe_stderr: &str,
 ) -> testkit::Result {
-    let started = Instant::now();
-    let chunks = loop {
-        match sandbox.draft_policy().await {
-            Ok(draft) if !draft.chunks.is_empty() => break draft.chunks,
-            Ok(_) | Err(_) if started.elapsed() < PROPOSAL_TIMEOUT => {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            Ok(_) => {
-                return Err(Error::msg(format!(
-                    "no draft rule for {}:{} after {PROPOSAL_TIMEOUT:?}; probe stderr: {probe_stderr}",
-                    endpoint.0, endpoint.1
-                )));
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let chunks = testkit::poll_until(
+        &format!("a draft rule for {}:{}", endpoint.0, endpoint.1),
+        PROPOSAL_TIMEOUT,
+        POLL_INTERVAL,
+        async || {
+            Ok(match sandbox.draft_policy().await {
+                Ok(draft) if !draft.chunks.is_empty() => testkit::Poll::Ready(draft.chunks),
+                Ok(_) => {
+                    testkit::Poll::Pending(format!("no draft rule; probe stderr: {probe_stderr}"))
+                }
+                Err(error) => testkit::Poll::Pending(error.to_string()),
+            })
+        },
+    )
+    .await?;
 
     testkit::ensure!(
         chunks.len() == 1,

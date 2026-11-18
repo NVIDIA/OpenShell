@@ -33,6 +33,7 @@ where
     F: AsyncFnOnce(&mut Context) -> Result,
 {
     let name = info.name;
+    crate::budget::start();
     eprintln!("[{name}] {}", info.description);
 
     let gateway = Gateway::from_env().unwrap_or_else(|error| panic!("[{name}] {error}"));
@@ -54,6 +55,13 @@ where
     F: AsyncFnOnce(&mut Context) -> Result,
 {
     let outcome = AssertUnwindSafe(body(cx)).catch_unwind().await;
+    // Say what failed before cleanup, which can run long enough for the
+    // runner to stop the test before the final failure is reported.
+    match &outcome {
+        Ok(Err(error)) => eprintln!("[{name}] {error}"),
+        Err(_) => eprintln!("[{name}] the test body panicked"),
+        Ok(Ok(())) => {}
+    }
     let cleanup_failures = cx.cleanup().await;
     for failure in &cleanup_failures {
         eprintln!("[{name}] cleanup failed: {failure}");

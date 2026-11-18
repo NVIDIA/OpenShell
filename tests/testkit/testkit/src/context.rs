@@ -209,6 +209,7 @@ impl Context {
     /// created and has not deleted. Returns the cleanup failures; they are
     /// reported separately from the test result.
     pub(crate) async fn cleanup(&self) -> Vec<String> {
+        crate::budget::release();
         self.handles.cleanup.run(CLEANUP_TIMEOUT).await
     }
 }
@@ -491,7 +492,7 @@ impl Sandbox {
         let snapshot = self
             .handles
             .client
-            .wait_ready(&self.name, READY_TIMEOUT)
+            .wait_ready(&self.name, crate::budget::cap(READY_TIMEOUT))
             .await
             .context(format!("wait for sandbox {} to be ready", self.name))?;
         crate::ensure!(
@@ -632,7 +633,7 @@ impl Sandbox {
         let command: Vec<String> = command.into_iter().map(Into::into).collect();
         let description = format!("exec {command:?} in sandbox {}", self.name);
         let options = ExecOptions {
-            timeout: Some(EXEC_TIMEOUT),
+            timeout: Some(crate::budget::cap(EXEC_TIMEOUT)),
             ..ExecOptions::default()
         };
         let result = self
@@ -744,7 +745,7 @@ impl Sandbox {
     pub async fn wait_absent(&self, timeout: Duration) -> Result {
         self.handles
             .client
-            .wait_deleted(&self.name, timeout, Some(&self.id))
+            .wait_deleted(&self.name, crate::budget::cap(timeout), Some(&self.id))
             .await
             .context(format!("wait for sandbox {} to be removed", self.name))?;
         self.expect_absent().await
@@ -759,7 +760,11 @@ impl Sandbox {
             .context(format!("delete sandbox {}", self.name))?;
         self.handles
             .client
-            .wait_deleted(&self.name, DELETE_TIMEOUT, Some(&self.id))
+            .wait_deleted(
+                &self.name,
+                crate::budget::cap(DELETE_TIMEOUT),
+                Some(&self.id),
+            )
             .await
             .context(format!("wait for sandbox {} to be deleted", self.name))?;
         self.handles

@@ -32,12 +32,17 @@ pub const PROFILE: &str = "openshell";
 pub const READY_BINARY: &str = "testkit-ready";
 
 /// Nextest flags a test as slow after this period and terminates it after
-/// [`SLOW_TERMINATE_AFTER`] periods, so a hung test fails after two minutes
-/// instead of holding the lane until the job times out.
+/// [`SLOW_TERMINATE_AFTER`] periods.
 const SLOW_PERIOD_SECS: u64 = 30;
 const SLOW_TERMINATE_AFTER: u64 = 4;
-/// How long a terminated test has between SIGTERM and SIGKILL.
-const GRACE_PERIOD_SECS: u64 = 10;
+
+/// How long one test may run before the runner stops it, on either kind of
+/// bundle, so a hung test fails after two minutes instead of holding the lane
+/// until the job times out.
+pub const TEST_TIMEOUT_SECS: u64 = SLOW_PERIOD_SECS * SLOW_TERMINATE_AFTER;
+/// How long a stopped test has between SIGTERM and SIGKILL, on either kind of
+/// bundle.
+pub const TEST_GRACE_SECS: u64 = 10;
 
 /// The nextest configuration written into a nextest bundle.
 fn nextest_config() -> String {
@@ -45,7 +50,7 @@ fn nextest_config() -> String {
         r#"# Written by the OpenShell test runner.
 [profile.openshell]
 fail-fast = false
-slow-timeout = {{ period = "{SLOW_PERIOD_SECS}s", terminate-after = {SLOW_TERMINATE_AFTER}, grace-period = "{GRACE_PERIOD_SECS}s" }}
+slow-timeout = {{ period = "{SLOW_PERIOD_SECS}s", terminate-after = {SLOW_TERMINATE_AFTER}, grace-period = "{TEST_GRACE_SECS}s" }}
 
 [profile.openshell.junit]
 path = "junit.xml"
@@ -354,11 +359,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nextest_profile_stops_a_hung_test_after_two_minutes() {
+    fn nextest_profile_stops_a_test_at_the_shared_timeout() {
         let config = nextest_config();
         assert!(config.contains(
             r#"slow-timeout = { period = "30s", terminate-after = 4, grace-period = "10s" }"#
         ));
+        assert_eq!(TEST_TIMEOUT_SECS, 120);
     }
 
     #[test]

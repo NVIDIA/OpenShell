@@ -26,6 +26,7 @@
 //! [`main`] is a test program that lists, runs, and reports its tests without
 //! Cargo (see [`program`]).
 
+mod budget;
 mod cleanup;
 mod cli;
 mod cli_sandbox;
@@ -43,6 +44,7 @@ mod registry;
 mod run;
 mod yaml_file;
 
+pub use budget::TIMEOUT_ENV;
 pub use cleanup::CLEANUP_TIMEOUT;
 pub use cli::{CLI_TIMEOUT, Cli, CliOutput};
 pub use cli_sandbox::CliSandboxBuilder;
