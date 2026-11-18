@@ -897,9 +897,17 @@ gateway, and supervisor must use the matching OpenShell release. Older
 runtimes can return an empty fingerprint; an empty value cannot verify an
 SSH server's identity.
 
-The CLI and TUI continue to use their existing SSH connection settings.
-Exposing the fingerprint does not enable automatic host-key verification in
-those clients.
+The CLI, the TUI, and generated SSH config entries check the sandbox's host
+key against this fingerprint on every SSH connection they open. When the SSH
+server presents a different key, they stop before authentication and report
+`SSH host key mismatch`.
+
+They refuse a sandbox that has no published fingerprint. If the gateway
+predates sandbox SSH identities, upgrade it. Otherwise stop and start the
+sandbox so the gateway assigns it a key. To connect without verification, set
+`OPENSHELL_SSH_ALLOW_UNVERIFIED_HOST_KEY=1`. OpenShell then prints a warning
+on every such connection. For an editor, set the variable in the editor's
+environment.
 
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
 
@@ -908,6 +916,11 @@ openshell sandbox ssh-config my-sandbox
 ```
 
 Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sandbox connect` for automatic setup.
+
+OpenShell refuses connections through SSH config entries that an earlier
+release generated, because those entries accept any host key. Replace each
+pasted entry with new `openshell sandbox ssh-config` output, or use `--editor`
+on `sandbox connect` again for that sandbox.
 
 ## Transfer Files
 

@@ -58,6 +58,8 @@ fn selected_workspace(
     }
 }
 
+const PUBLISHED_HOST_KEY: &str = "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA";
+
 #[derive(Clone, Default)]
 struct SandboxState {
     /// Make `ListProviderProfiles` fail while every other RPC keeps working,
@@ -508,6 +510,7 @@ impl OpenShell for TestOpenShell {
             gateway_scheme: "https".to_string(),
             gateway_host: "localhost".to_string(),
             gateway_port: 443,
+            host_key_fingerprint: PUBLISHED_HOST_KEY.to_string(),
             ..CreateSshSessionResponse::default()
         }))
     }
@@ -1317,6 +1320,22 @@ fn install_executable_script(
 
 fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "ssh", "#!/bin/sh\nexit 0\n")
+}
+
+/// A fake `ssh` that answers the workspace probe and records its arguments,
+/// one per line, in the returned file. Also installs a fake `code`.
+fn install_recording_ssh(dir: &TempDir) -> std::path::PathBuf {
+    let arguments = dir.path().join("ssh-arguments");
+    install_executable_script(
+        dir,
+        "ssh",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '/sandbox\\n'\n",
+            arguments.display()
+        ),
+    );
+    install_executable_script(dir, "code", "#!/bin/sh\nexit 0\n");
+    arguments
 }
 
 fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
@@ -3298,6 +3317,67 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
             assert!(
                 wait_for_process_exit(record.pid, Duration::from_secs(2)).await,
                 "tracked fake forward process should exit after stop"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn editor_connect_pins_the_published_host_key_for_ssh_and_the_config_entry() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            let ssh_arguments = install_recording_ssh(&fake_ssh_dir);
+            let pin = xdg_dir
+                .path()
+                .join("openshell/known_hosts/openshell/openshell-pinned.default");
+
+            run::sandbox_connect_editor(
+                &server.endpoint,
+                "openshell",
+                "pinned",
+                run::Editor::Vscode,
+                &tls,
+                "default",
+            )
+            .await
+            .unwrap();
+
+            let ssh_arguments = fs::read_to_string(ssh_arguments).unwrap();
+            let proxy_command = ssh_arguments
+                .lines()
+                .find(|argument| argument.starts_with("ProxyCommand="))
+                .unwrap();
+            assert!(
+                proxy_command.ends_with(&format!(
+                    " --host-key '{PUBLISHED_HOST_KEY}' --known-hosts {}",
+                    pin.display()
+                )),
+                "{proxy_command}"
+            );
+            for option in [
+                "StrictHostKeyChecking=yes".to_string(),
+                format!("UserKnownHostsFile=\"{}\"", pin.display()),
+                "HostKeyAlias=openshell-pinned.default".to_string(),
+            ] {
+                assert!(
+                    ssh_arguments.lines().any(|argument| argument == option),
+                    "ssh was not passed {option}:\n{ssh_arguments}"
+                );
+            }
+            let config_entry =
+                fs::read_to_string(xdg_dir.path().join("openshell/ssh_config")).unwrap();
+            assert!(
+                config_entry.contains(&format!("    UserKnownHostsFile \"{}\"\n", pin.display())),
+                "{config_entry}"
+            );
+            assert!(
+                config_entry.contains(&format!(" --known-hosts {}\n", pin.display())),
+                "{config_entry}"
             );
         })
         .await;

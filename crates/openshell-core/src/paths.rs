@@ -44,6 +44,22 @@ pub fn openshell_config_dir() -> Result<PathBuf> {
     Ok(xdg_config_dir()?.join("openshell"))
 }
 
+/// The directory name of a gateway under the `OpenShell` config directory. A
+/// gateway reached by `--gateway-endpoint` alone is named by its URL, so
+/// every character outside `[A-Za-z0-9._-]` becomes `_`.
+pub fn gateway_dir_name(gateway: &str) -> String {
+    gateway
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Resolve the XDG state base directory.
 ///
 /// Returns `$XDG_STATE_HOME` if set, otherwise `$HOME/.local/state`.

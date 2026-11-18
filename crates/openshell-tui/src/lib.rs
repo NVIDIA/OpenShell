@@ -994,14 +994,19 @@ async fn handle_shell_connect(
             return Ok(());
         }
     };
-    let proxy_command = build_proxy_command(
-        &exe.to_string_lossy(),
-        &gateway_url,
-        &sandbox_name,
-        &workspace,
-        &session.token,
-        &app.gateway_name,
-    );
+    let target = SandboxSshTarget {
+        gateway: &app.gateway_name,
+        workspace: &workspace,
+        sandbox: &sandbox_name,
+    };
+    let (proxy_command, unverified_warning) =
+        match sandbox_proxy_for_session(&session, &exe, &gateway_url, &target) {
+            Ok(proxy) => proxy,
+            Err(refusal) => {
+                app.status_text = host_key_refused_status(&refusal);
+                return Ok(());
+            }
+        };
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
     command
@@ -1033,6 +1038,9 @@ async fn handle_shell_connect(
     disable_raw_mode().into_diagnostic()?;
 
     // Step 8: Spawn SSH as child process and wait.
+    if let Some(warning) = unverified_warning {
+        eprintln!("{warning}");
+    }
     let status = tokio::task::spawn_blocking(move || command.status()).await;
     match &status {
         Ok(Ok(s)) if !s.success() => {
@@ -1124,14 +1132,19 @@ async fn handle_exec_command(
             return Ok(());
         }
     };
-    let proxy_command = build_proxy_command(
-        &exe.to_string_lossy(),
-        &gateway_url,
-        sandbox_name,
+    let target = SandboxSshTarget {
+        gateway: &app.gateway_name,
         workspace,
-        &session.token,
-        &app.gateway_name,
-    );
+        sandbox: sandbox_name,
+    };
+    let (proxy_command, unverified_warning) =
+        match sandbox_proxy_for_session(&session, &exe, &gateway_url, &target) {
+            Ok(proxy) => proxy,
+            Err(refusal) => {
+                app.status_text = format!("exec: {}", host_key_refused_status(&refusal));
+                return Ok(());
+            }
+        };
 
     // Step 3: Build SSH command — same flags as handle_shell_connect but with
     // the parsed command appended. Each argument is escaped individually so the
@@ -1165,6 +1178,9 @@ async fn handle_exec_command(
     disable_raw_mode().into_diagnostic()?;
 
     // Step 5: Run command — blocks until user Ctrl-C's or command exits.
+    if let Some(warning) = unverified_warning {
+        eprintln!("{warning}");
+    }
     let status = tokio::task::spawn_blocking(move || ssh.status()).await;
     match &status {
         Ok(Ok(s)) if !s.success() => {
@@ -1199,9 +1215,40 @@ async fn handle_exec_command(
 
 // SSH utility functions are shared via openshell_core::forward.
 use openshell_core::forward::{
-    build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args, shell_escape,
-    validate_ssh_session_response,
+    SandboxProxyCommand, format_gateway_url, resolve_ssh_gateway, sandbox_proxy_command,
+    sandbox_ssh_args, shell_escape, validate_ssh_session_response,
 };
+use openshell_core::ssh_host_key::{
+    HostKeyCheck, HostKeyError, SandboxSshTarget, UnverifiedPolicy,
+};
+
+/// Decide how the sandbox's SSH host key is checked and build the
+/// `ProxyCommand` that enforces it. The warning is present when the key cannot
+/// be verified.
+fn sandbox_proxy_for_session(
+    session: &openshell_core::proto::CreateSshSessionResponse,
+    exe: &std::path::Path,
+    gateway_url: &str,
+    target: &SandboxSshTarget<'_>,
+) -> std::result::Result<(SandboxProxyCommand, Option<String>), HostKeyError> {
+    let host_key = HostKeyCheck::for_session(session, target, UnverifiedPolicy::from_env())?;
+    let unverified_warning = host_key.unverified_warning(target.sandbox);
+    let proxy_command = sandbox_proxy_command(
+        &exe.to_string_lossy(),
+        gateway_url,
+        target,
+        &session.token,
+        host_key,
+    );
+    Ok((proxy_command, unverified_warning))
+}
+
+/// The status line shows one row, so it carries the first line of a refusal.
+/// `openshell sandbox connect` prints the rest.
+fn host_key_refused_status(refusal: &HostKeyError) -> String {
+    let refusal = refusal.to_string();
+    refusal.lines().next().unwrap_or_default().to_string()
+}
 
 fn build_exec_command(command: &[String]) -> String {
     command
@@ -1636,14 +1683,20 @@ async fn start_port_forwards(
             return warnings;
         }
     };
-    let proxy_command = build_proxy_command(
-        &exe.to_string_lossy(),
-        &gateway_url,
-        sandbox_name,
+    let target = SandboxSshTarget {
+        gateway: gateway_name,
         workspace,
-        &session.token,
-        gateway_name,
-    );
+        sandbox: sandbox_name,
+    };
+    let (proxy_command, unverified_warning) =
+        match sandbox_proxy_for_session(&session, &exe, &gateway_url, &target) {
+            Ok(proxy) => proxy,
+            Err(refusal) => {
+                warnings.push(host_key_refused_status(&refusal));
+                return warnings;
+            }
+        };
+    warnings.extend(unverified_warning);
 
     // Start a forward for each spec.
     for spec in specs {
@@ -3214,6 +3267,23 @@ mod exec_command_tests {
         assert_eq!(
             output.stdout,
             b"hello world\n\nit's\na b\n$HOME\n$(echo BAD)\n;\n|\n>\n*.txt\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_key_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn host_key_refusal_fits_the_status_line() {
+        let refusal = HostKeyError::Unpublished {
+            sandbox: "my-sb".to_string(),
+        };
+
+        assert_eq!(
+            host_key_refused_status(&refusal),
+            "sandbox 'my-sb' has no published SSH host key, so its SSH server cannot be verified."
         );
     }
 }
