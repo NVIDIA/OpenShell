@@ -186,17 +186,21 @@ impl fmt::Debug for Response {
 /// end of `bytes` without either. A truncated body is returned as far as it
 /// arrived.
 fn parse_response(bytes: &[u8], head: bool) -> Option<Response> {
-    let end = find(bytes, b"\r\n\r\n")?;
-    let text = std::str::from_utf8(&bytes[..end]).ok()?;
-    let mut lines = text.split("\r\n");
-    let status = parse_status_line(lines.next()?)?;
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_string(), value.trim().to_string()))
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut headers);
+    let httparse::Status::Complete(end) = parsed.parse(bytes).ok()? else {
+        return None;
+    };
+    let status = parsed.code?;
+    let headers = parsed
+        .headers
+        .iter()
+        .map(|header| {
+            let value = String::from_utf8_lossy(header.value).into_owned();
+            (header.name.to_string(), value)
         })
         .collect();
-    let rest = &bytes[end + 4..];
+    let rest = &bytes[end..];
     let mut response = Response {
         status,
         headers,
@@ -221,28 +225,13 @@ fn parse_response(bytes: &[u8], head: bool) -> Option<Response> {
     Some(response)
 }
 
-/// The status code in `HTTP/1.x NNN reason`.
-fn parse_status_line(line: &str) -> Option<u16> {
-    let mut parts = line.splitn(3, ' ');
-    let version = parts.next()?;
-    let code = parts.next()?;
-    if !version.starts_with("HTTP/1.") || code.len() != 3 {
-        return None;
-    }
-    code.parse().ok()
-}
-
 /// The data in a chunked body, up to the last complete chunk if it is cut
 /// short.
 fn dechunk(mut rest: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
-    while let Some(line_end) = find(rest, b"\r\n") {
-        let size_line = String::from_utf8_lossy(&rest[..line_end]);
-        let size = size_line.split(';').next().unwrap_or_default().trim();
-        let Ok(size) = usize::from_str_radix(size, 16) else {
-            break;
-        };
-        rest = &rest[line_end + 2..];
+    while let Ok(httparse::Status::Complete((start, size))) = httparse::parse_chunk_size(rest) {
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        rest = &rest[start..];
         if size == 0 {
             break;
         }
@@ -254,12 +243,6 @@ fn dechunk(mut rest: &[u8]) -> Vec<u8> {
         rest = rest.get(size + 2..).unwrap_or_default();
     }
     body
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 #[cfg(test)]

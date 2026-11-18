@@ -3186,6 +3186,7 @@ dependencies = [
 name = "sandbox-clients-support"
 version = "0.0.0"
 dependencies = [
+ "httparse",
  "openshell-testkit",
  "serde",
  "serde_json",
