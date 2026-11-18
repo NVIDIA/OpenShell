@@ -61,6 +61,48 @@ delete sandboxes already created from it. Templates without startup tuning do no
 create pools. Operators can disable pooling with
 [`openshell.drivers.kubernetes.warm_pool.enabled`](/how-it-works/gateways/configuration).
 
+### Identify Warm Pods
+
+A warm Kubernetes Sandbox resource and its workload Pod use the physical name
+`warm-<session-id>`. Claiming the runtime preserves both names and the Pod UID.
+The dedicated supervisor Pod also keeps its original name. Use the Sandbox
+resource's labels to find the logical sandbox created through OpenShell.
+
+| Resource | Label | Meaning |
+| --- | --- | --- |
+| Sandbox | `openshell.ai/warm-pool` | Immutable template ID identifying the originating pool. Remains after claim. |
+| Sandbox | `openshell.ai/sandbox-id` | Logical sandbox ID, added when the claim binds the resource. |
+| Sandbox | `openshell.ai/sandbox-name` | Logical sandbox name, added when the claim binds the resource. |
+| Sandbox | `openshell.ai/sandbox-workspace` | OpenShell workspace, present before and after claim. |
+| Pod | `openshell.ai/boundary-pair` | Physical runtime pairing used by network policies. Remains unchanged at claim. |
+| Pod | `openshell.ai/boundary-role` | `workload` or `supervisor` for dedicated runtime pairs. |
+
+List resources originating from warm pools, including claimed sandboxes:
+
+```shell
+kubectl get sandboxes.agents.x-k8s.io -A -l openshell.ai/warm-pool \
+  -L openshell.ai/warm-pool,openshell.ai/sandbox-id,openshell.ai/sandbox-name,openshell.ai/sandbox-workspace
+```
+
+An absent Sandbox `openshell.ai/sandbox-id` label means the resource has not yet
+been bound to a logical sandbox. It does not prove that the runtime is ready or
+available; preparation, reservation, or retirement may be in progress.
+
+Use the namespace and physical name from that output to inspect the workload Pod.
+Its boundary-pair value also selects its dedicated supervisor Pod:
+
+```shell
+kubectl -n <namespace> get pod <physical-name> \
+  -L openshell.ai/boundary-pair,openshell.ai/boundary-role
+kubectl -n <namespace> get pods -l openshell.ai/boundary-pair=<pair-value> \
+  -L openshell.ai/boundary-role
+```
+
+On a dedicated supervisor Pod, `openshell.ai/sandbox-id` initially contains the
+physical session ID and changes to the logical sandbox ID at claim. Use the
+Sandbox resource for logical name and workspace lookup. A shared supervisor
+serves multiple sandboxes and is not selected by a workload's boundary-pair label.
+
 ## Create a Sandbox from a Template
 
 ```shell

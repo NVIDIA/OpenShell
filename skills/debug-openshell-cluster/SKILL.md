@@ -1405,7 +1405,15 @@ physical sessions leave the pool journal. Journal read failures defer cleanup;
 Creates with `--template` claim only that template's ready spares; unmatched
 requests use cold creation. `warm runtime ready for
 claim` records the first authenticated readiness observation. A claimed sandbox
-keeps its `warm-` physical resource name. `warm claim completion remains pending`
+keeps its `warm-` physical resource name. The Kubernetes Sandbox resource retains
+`openshell.ai/warm-pool` after claim and gains logical `openshell.ai/sandbox-id`
+and `openshell.ai/sandbox-name` labels. The pool label alone does not identify
+available capacity. Find the workload Pod by the resource's namespace and physical
+name, then use its unchanged `openshell.ai/boundary-pair` label to find the dedicated
+supervisor. The supervisor Pod's `openshell.ai/sandbox-id` changes from the physical
+session ID to the logical sandbox ID at claim. See
+[Identify Warm Pods](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/templates#identify-warm-pods)
+for label meanings and lookup commands. `warm claim completion remains pending`
 indicates that recovery is retrying the recorded claim; inspect the reported API
 or supervisor error before deleting anything. A gateway reservation protects its
 runtime from pool draining even before the CR carries the logical Sandbox ID.
