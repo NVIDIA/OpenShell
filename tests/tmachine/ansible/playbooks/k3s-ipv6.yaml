@@ -1,0 +1,151 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Turn the K3s base into a dual-stack cluster with IPv6 first, so Pods and
+# Services get an IPv6 address first and OpenShell runs over IPv6.
+#
+# k3s.yaml ran first and reset the cluster, so the next start creates it again
+# from this configuration. This playbook starts it once to check it, then
+# resets it the same way. It also writes the Helm values the chart needs on an
+# IPv6 cluster to /etc/openshell-test/helm-values.yaml, which the k3s
+# installers (openshell-k3s.yaml) apply.
+---
+- name: Configure IPv6-first dual-stack K3s
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    k3s_ipv6_cluster_cidr: fd00:42::/56,10.42.0.0/16
+    k3s_ipv6_service_cidr: fd00:43::/112,10.43.0.0/16
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Gather the guest addresses
+      ansible.builtin.setup:
+        gather_subset: [network]
+
+    # K3s takes the node's addresses from the default routes, IPv6 first for
+    # an IPv6-first cluster.
+    - name: Require a global IPv6 address
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.default_ipv6.address is defined
+          - ansible_facts.default_ipv6.scope == "global"
+        fail_msg: >-
+          The guest needs a global IPv6 address with a default route, not
+          {{ ansible_facts.default_ipv6 | default('none') }}; tmachine sets
+          ipv6-net on QEMU user networking for this.
+
+    - name: Create the K3s configuration directory
+      ansible.builtin.file:
+        path: /etc/rancher/k3s/config.yaml.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # The order of each list makes IPv6 the primary family. Flannel
+    # masquerades IPv6 Pod traffic leaving the cluster, as it does for IPv4.
+    - name: Write the dual-stack K3s configuration
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml.d/50-ipv6-dual-stack.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          cluster-cidr: {{ k3s_ipv6_cluster_cidr }}
+          service-cidr: {{ k3s_ipv6_service_cidr }}
+          flannel-ipv6-masq: true
+
+    - name: Create the test configuration directory
+      ansible.builtin.file:
+        path: /etc/openshell-test
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write the Helm values for an IPv6 cluster
+      ansible.builtin.copy:
+        dest: /etc/openshell-test/helm-values.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          gateway:
+            listenAddress: "::"
+          supervisor:
+            listenAddress: "::"
+
+    - name: Start K3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+
+    - name: Wait for K3s
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - node
+          - --all
+          - --timeout=120s
+      register: k3s_ready
+      changed_when: false
+      until: k3s_ready.rc == 0
+      retries: 12
+      delay: 5
+
+    - name: Wait for CoreDNS
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --namespace=kube-system
+          - rollout
+          - status
+          - deployment/coredns
+          - --timeout=180s
+      register: k3s_coredns
+      changed_when: false
+      until: k3s_coredns.rc == 0
+      retries: 30
+      delay: 5
+
+    - name: Read the cluster's address families
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --namespace=kube-system
+          - get
+          - service
+          - kube-dns
+          - --output=jsonpath={.spec.clusterIPs}
+      register: k3s_dns_addresses
+      changed_when: false
+
+    - name: Require an IPv6-first dual-stack Service
+      ansible.builtin.assert:
+        that:
+          - k3s_dns_addresses.stdout | from_json | length == 2
+          - (k3s_dns_addresses.stdout | from_json)[0] is search(':')
+          - (k3s_dns_addresses.stdout | from_json)[1] is match('^[0-9.]+$')
+        fail_msg: "kube-dns has addresses {{ k3s_dns_addresses.stdout }}"
+
+    # Tests reach the gateway's Service from the node, which fails when the
+    # node picks a source address that replies can't reach.
+    - name: Check the node reaches a Pod through an IPv6 Service
+      ansible.builtin.uri:
+        url: "http://[{{ (k3s_dns_addresses.stdout | from_json)[0] }}]:9153/metrics"
+        timeout: 10
+      register: k3s_ipv6_service
+      until: k3s_ipv6_service.status == 200
+      retries: 6
+      delay: 5
+
+    - name: Reset the K3s cluster state
+      ansible.builtin.include_tasks: k3s-reset.yaml
