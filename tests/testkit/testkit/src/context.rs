@@ -177,12 +177,18 @@ impl Context {
     }
 
     /// Start describing a sandbox named `cx.name(suffix)`.
+    ///
+    /// # Panics
+    ///
+    /// If the name is longer than the gateway allows; see
+    /// [`MAX_SANDBOX_NAME_LEN`].
+    #[track_caller]
     pub fn sandbox(&self, suffix: &str) -> SandboxBuilder {
         SandboxBuilder {
             handles: self.handles.clone(),
             policy: None,
             spec: SandboxSpec {
-                name: Some(self.name(suffix)),
+                name: Some(self.sandbox_name(suffix)),
                 ..SandboxSpec::default()
             },
         }
@@ -192,8 +198,20 @@ impl Context {
     /// `openshell` CLI creates. Use it for what only `sandbox create`
     /// offers, such as a `--policy` file or `--no-keep`; prefer
     /// [`Context::sandbox`] otherwise.
+    ///
+    /// # Panics
+    ///
+    /// As [`Context::sandbox`].
+    #[track_caller]
     pub fn cli_sandbox(&self, suffix: &str) -> CliSandboxBuilder {
-        CliSandboxBuilder::new(self.handles.clone(), self.name(suffix))
+        CliSandboxBuilder::new(self.handles.clone(), self.sandbox_name(suffix))
+    }
+
+    #[track_caller]
+    fn sandbox_name(&self, suffix: &str) -> String {
+        let name = self.name(suffix);
+        check_sandbox_name(&name);
+        name
     }
 
     /// Track a sandbox the test is about to create through the CLI, so cleanup
@@ -203,7 +221,13 @@ impl Context {
     /// Cleanup deletes the sandbox and waits until it is gone, at the point
     /// in the cleanup order where it was first tracked. Tracking a sandbox
     /// again, for example by adopting it, doesn't move it.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is longer than [`MAX_SANDBOX_NAME_LEN`].
+    #[track_caller]
     pub fn track(&self, name: &str) {
+        check_sandbox_name(name);
         self.handles.track(name);
     }
 
@@ -936,6 +960,21 @@ impl Context {
             crate::gateway::Gateway::from_endpoint(ENDPOINT.to_string(), "default".to_string());
         Self::new(&client, "default", Cli::from_env(&gateway))
     }
+}
+
+/// The longest sandbox name the gateway accepts. With `test-<run-id>-`, a
+/// sandbox suffix can have at most 5 characters.
+pub const MAX_SANDBOX_NAME_LEN: usize = 19;
+
+/// Panic, at the test's call, on a sandbox name the gateway would reject, so
+/// the test fails with this message instead of the gateway's.
+#[track_caller]
+fn check_sandbox_name(name: &str) {
+    assert!(
+        name.len() <= MAX_SANDBOX_NAME_LEN,
+        "sandbox name {name:?} has {} characters; the gateway allows {MAX_SANDBOX_NAME_LEN}, so a suffix after `test-<run-id>-` can have at most 5",
+        name.len()
+    );
 }
 
 /// Short, lowercase, and DNS-label safe, so names work on every driver.

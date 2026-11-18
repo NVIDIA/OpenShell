@@ -63,7 +63,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 
 `Context` currently provides:
 
-- `cx.sandbox(suffix)` to build a sandbox with a run-unique name, then
+- `cx.sandbox(suffix)` to build a sandbox with a run-unique name
+  (`test-<run-id>-<suffix>`), then
   `create()` it or `create_ready()` to also wait for Ready. Set its image
   with `image(..)`, its policy with `policy(..)` and its providers with
   `providers(..)`. A long-running sandbox is
@@ -82,6 +83,9 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   can make, such as one with `policy_yaml(...)` or `--no-keep`. `create()`
   detaches and returns the `Sandbox`, `create_ready()` also waits for Ready,
   and `run()` returns the attached CLI output.
+- Sandbox names are limited to `testkit::MAX_SANDBOX_NAME_LEN` (19)
+  characters, so a sandbox suffix can have at most 5. `cx.sandbox`,
+  `cx.cli_sandbox` and `cx.track` panic on a longer name.
 - `cx.track(name)` to register a sandbox created some other way, such as
   through the CLI, for cleanup. Call it before the
   create, so a create that fails after the gateway accepted it is still cleaned

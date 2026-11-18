@@ -49,8 +49,8 @@ pub use cli::{CLI_TIMEOUT, Cli, CliOutput};
 pub use cli_child::CliChild;
 pub use cli_sandbox::CliSandboxBuilder;
 pub use context::{
-    Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,
-    SandboxBuilder,
+    Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, MAX_SANDBOX_NAME_LEN, READY_TIMEOUT,
+    STOP_TIMEOUT, Sandbox, SandboxBuilder,
 };
 pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
