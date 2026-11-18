@@ -355,8 +355,10 @@ openshell provider refresh configure alice-mcp \
 ```
 
 Rotate the shared value with `openshell secret update acme-oauth-client
---value-file ./client-secret`. Each provider uses the new value at its next
-refresh; `openshell provider refresh rotate` applies it immediately.
+--value-file ./client-secret`. The file is stored exactly as read, including
+any trailing newline, so write it with `printf '%s'`. Each provider uses the
+new value at its next refresh; `openshell provider refresh rotate` applies it
+immediately.
 
 These rules apply:
 

@@ -709,7 +709,14 @@ Before rolling back to a release without workspace secrets:
 2. For each row of `openshell provider refresh status` with a value in the
    `MATERIAL_SECRETS` column, run `openshell provider refresh inline-secrets`
    for that provider and credential key. Retry it if a mint is in progress.
-3. Delete every workspace secret.
+3. Run `openshell secret list` in each workspace and find every secret another
+   service reads directly through `RevealSecret`. These include all secrets
+   whose `REFRESH ENDPOINTS` column shows `reveal-only`, and any
+   refresh-enabled secret that a control-plane service also reveals. Provider
+   refresh status does not show them, and their readers do not block deletion.
+   Move each value that is still needed to storage the target release
+   supports, and confirm its readers no longer use `RevealSecret`.
+4. Delete every workspace secret.
 
 After the downgrade, the older gateway mints copied values without the
 allowed-endpoint and redirect checks. It still sends them only to the token

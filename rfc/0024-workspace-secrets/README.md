@@ -226,6 +226,8 @@ retries them.
 
 The CLI adds `openshell secret create|update|get|list|delete`. Values come from
 `--value-env VAR` or `--value-file PATH`, never from a command-line argument.
+Both are stored exactly as given; a file's trailing newline is part of the
+value.
 `--allowed-endpoint URL` is repeatable on `create` and sets `refresh_use`;
 omitting it creates a reveal-only secret. The CLI has no reveal command.
 
@@ -524,7 +526,11 @@ support, the operator must:
    credential that refresh status shows with a referenced secret. Active
    grants, including rotated refresh tokens, are preserved, and no user needs
    to reauthorize.
-3. Delete all secrets, which the delete guard now permits.
+3. Move values that other services still read through `RevealSecret`
+   elsewhere. Refresh status shows none of them: reveal-only secrets, and
+   refresh-enabled secrets that a control-plane service also reveals. Their
+   readers do not block deletion, so confirm each reader has switched first.
+4. Delete all secrets, which the delete guard now permits.
 
 The rollback documentation states this. `ListSecrets` in each workspace, plus
 the referenced secrets that refresh status reports for each credential, shows
