@@ -3622,6 +3622,18 @@ fn validate_material_secret_references(
     Ok(())
 }
 
+/// Material keys read when refresh is configured, not when it mints.
+const CONFIGURATION_MATERIAL_KEYS: &[&str] = &[
+    "token_url",
+    "token_uri",
+    "sts_endpoint_url",
+    "tenant_id",
+    "scope",
+    "scopes",
+    "refresh_before_seconds",
+    "max_lifetime_seconds",
+];
+
 /// Only secret minting material may come from a shared workspace secret, and
 /// never material the minter writes back for one provider.
 fn validate_material_secret_keys(
@@ -3630,6 +3642,13 @@ fn validate_material_secret_keys(
     material_secrets: &HashMap<String, String>,
 ) -> Result<(), Status> {
     for key in material_secrets.keys() {
+        // Configure reads these from inline material only, so a reference would
+        // be recorded but silently ignored, even if a profile marks it secret.
+        if CONFIGURATION_MATERIAL_KEYS.contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' configures the refresh and cannot come from a workspace secret"
+            )));
+        }
         if minter::strategy_rotated_material_keys(strategy).contains(&key.as_str()) {
             return Err(Status::invalid_argument(format!(
                 "material key '{key}' is rotated per provider and cannot come from a workspace secret"
@@ -5600,6 +5619,18 @@ pub(super) async fn handle_inline_provider_refresh_secrets(
     {
         return Err(Status::failed_precondition(
             "provider refresh is being deleted",
+        ));
+    }
+    // A mint persists this status before contacting the token endpoint and
+    // stages a rotated refresh token only if its version still matches.
+    // Replacing the state now would make it discard that token. A mint that
+    // starts after this read bumps the version, so the write below fails.
+    if matches!(
+        refresh.status.as_str(),
+        "refresh_in_progress" | "refresh_committing"
+    ) {
+        return Err(Status::aborted(
+            "a credential mint is in progress; retry once it finishes, or reconfigure the refresh if its outcome is uncertain",
         ));
     }
     let bindings = secret_refs::material_secret_bindings(refresh.metadata.as_ref())?;

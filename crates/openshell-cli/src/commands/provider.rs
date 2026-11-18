@@ -1944,7 +1944,7 @@ pub async fn provider_refresh_status(
 
 fn refresh_status_header() -> String {
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {:<32}  {}",
         "PROVIDER".bold(),
         "CREDENTIAL_KEY".bold(),
         "STRATEGY".bold(),
@@ -1954,6 +1954,7 @@ fn refresh_status_header() -> String {
         "NEXT_REFRESH".bold(),
         "LAST_REFRESH".bold(),
         "FAILURE_CODE".bold(),
+        "MATERIAL_SECRETS".bold(),
         "LAST_ERROR".bold(),
     )
 }
@@ -2169,7 +2170,7 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     let recovery_action = ProviderCredentialRefreshRecoveryAction::try_from(status.recovery_action)
         .unwrap_or(ProviderCredentialRefreshRecoveryAction::Unspecified);
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {:<32}  {}",
         status.provider,
         status.credential_key,
         provider_refresh_strategy_name(strategy),
@@ -2182,8 +2183,23 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
         ),
         format_optional_epoch_ms(proto_timestamp_ms(status.last_refresh_time.as_ref())),
         status.failure_code,
+        material_secrets_field(&status.material_secrets),
         truncate_status_field(&status.last_error, 72),
     )
+}
+
+/// Material keys supplied by workspace secrets, as `key=secret`, sorted. These
+/// are the credentials to convert with `provider refresh inline-secrets`.
+fn material_secrets_field(material_secrets: &HashMap<String, String>) -> String {
+    if material_secrets.is_empty() {
+        return "-".to_string();
+    }
+    let mut bindings: Vec<_> = material_secrets
+        .iter()
+        .map(|(key, secret)| format!("{key}={secret}"))
+        .collect();
+    bindings.sort();
+    bindings.join(",")
 }
 
 pub fn provider_refresh_recovery_action_name(
@@ -3509,6 +3525,7 @@ binaries: [/usr/bin/curl]
         assert!(header.contains("RECOVERY"));
         assert!(header.contains("FAILURE_CODE"));
         assert!(header.contains("LAST_ERROR"));
+        assert!(header.contains("MATERIAL_SECRETS"));
 
         let row = refresh_status_row(&ProviderCredentialRefreshStatus {
             provider: "my-graph".to_string(),
@@ -3537,6 +3554,21 @@ binaries: [/usr/bin/curl]
         assert!(row.contains("2026-01-01 00:00:00"));
         assert!(!row.contains("292278994"));
         assert!(row.contains("..."));
+        assert!(row.contains("  -  "), "no secret references render as '-'");
+    }
+
+    #[test]
+    fn refresh_status_row_lists_workspace_secret_bindings() {
+        let row = refresh_status_row(&ProviderCredentialRefreshStatus {
+            provider: "alice-mcp".to_string(),
+            credential_key: "MCP_ACCESS_TOKEN".to_string(),
+            material_secrets: HashMap::from([
+                ("private_key".to_string(), "signing-key".to_string()),
+                ("client_secret".to_string(), "acme-oauth-client".to_string()),
+            ]),
+            ..Default::default()
+        });
+        assert!(row.contains("client_secret=acme-oauth-client,private_key=signing-key"));
     }
 
     #[test]

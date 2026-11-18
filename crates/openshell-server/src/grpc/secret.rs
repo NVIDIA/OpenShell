@@ -35,7 +35,8 @@ use crate::auth::workspace_authz::{
 use crate::compute::MutationScope;
 use crate::pagination::Pagination;
 use crate::persistence::{
-    ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition, current_time_ms,
+    ObjectCursor, ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition,
+    current_time_ms,
 };
 use crate::storage_proto::StoredWorkspaceSecret;
 
@@ -45,7 +46,7 @@ const MAX_SECRETS_PER_WORKSPACE: u32 = 500;
 const MAX_ALLOWED_ENDPOINTS: usize = 16;
 const MAX_ENDPOINT_LEN: usize = 2048;
 const MAX_DESCRIPTION_LEN: usize = 1024;
-const SWEEP_LIMIT: u32 = 1000;
+const SWEEP_PAGE_SIZE: u32 = 1000;
 
 impl ObjectType for StoredWorkspaceSecret {
     fn object_type() -> &'static str {
@@ -280,6 +281,7 @@ pub(super) async fn handle_create_secret(
     let allowed_endpoints = normalize_allowed_endpoints(&req.allowed_endpoints)?;
     ensure_workspace_secrets_active(state).await?;
     ensure_credential_storage(state)?;
+    let workspace_id = active_workspace_id(&state.store, &workspace).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
@@ -331,12 +333,51 @@ pub(super) async fn handle_create_secret(
             return Err(Status::internal(format!("persist secret failed: {err}")));
         }
     };
+    // Workspace deletion marks the workspace terminating before it scans for
+    // blocking resources. If that scan ran before this insert, the workspace
+    // is no longer the active one we resolved, so undo the insert rather than
+    // leave a secret in a deleted workspace whose name can be reused.
+    let still_active = active_workspace_id(&state.store, &workspace)
+        .await
+        .is_ok_and(|current| current == workspace_id);
+    if !still_active {
+        if let Err(err) = state
+            .store
+            .delete_if(
+                StoredWorkspaceSecret::object_type(),
+                &id,
+                write.resource_version,
+            )
+            .await
+        {
+            warn!(secret_id = %id, error = %err, "failed to remove secret created during workspace deletion");
+        }
+        discard_staged_value(state, &workspace, &id, handle).await;
+        return Err(Status::failed_precondition(format!(
+            "workspace '{workspace}' was deleted while the secret was being created"
+        )));
+    }
     if let Some(metadata) = stored.metadata.as_mut() {
         metadata.resource_version = write.resource_version;
     }
     Ok(Response::new(SecretResponse {
         secret: Some(public_secret(&stored)),
     }))
+}
+
+/// ID of the named workspace while it is active.
+async fn active_workspace_id(store: &Store, workspace: &str) -> Result<String, Status> {
+    let record: Option<openshell_core::proto::Workspace> = store
+        .get_message_by_name("", workspace)
+        .await
+        .map_err(|e| Status::internal(format!("fetch workspace failed: {e}")))?;
+    record
+        .and_then(|record| record.metadata)
+        .filter(|metadata| metadata.deletion_time.is_none())
+        .map(|metadata| metadata.id)
+        .ok_or_else(|| {
+            Status::failed_precondition(format!("workspace '{workspace}' is being deleted"))
+        })
 }
 
 pub(super) async fn handle_get_secret(
@@ -785,11 +826,33 @@ async fn drain_pending_deletions(
 /// Retry backend deletions and tombstone removal that an earlier request could
 /// not finish. Runs on the gateway's periodic maintenance tick.
 pub async fn sweep_workspace_secrets(state: &ServerState) -> Result<usize, Status> {
-    let records = state
-        .store
-        .list_by_type(StoredWorkspaceSecret::object_type(), SWEEP_LIMIT, 0)
-        .await
-        .map_err(|e| Status::internal(format!("list secrets failed: {e}")))?;
+    let mut finished = 0;
+    let mut after: Option<ObjectCursor> = None;
+    // Page through every record: healthy secrets never leave the listing, so
+    // rereading one fixed page would starve later pending cleanup.
+    loop {
+        let records = state
+            .store
+            .list_by_type_after(
+                StoredWorkspaceSecret::object_type(),
+                after.as_ref(),
+                SWEEP_PAGE_SIZE,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("list secrets failed: {e}")))?;
+        let last_page = records.len() < SWEEP_PAGE_SIZE as usize;
+        after = records.last().map(ObjectCursor::from);
+        finished += sweep_page(state, records).await?;
+        if last_page {
+            return Ok(finished);
+        }
+    }
+}
+
+async fn sweep_page(
+    state: &ServerState,
+    records: Vec<crate::persistence::ObjectRecord>,
+) -> Result<usize, Status> {
     let mut finished = 0;
     for record in records {
         let mut stored = StoredWorkspaceSecret::decode(record.payload.as_slice())
@@ -1207,5 +1270,86 @@ mod tests {
             certificate_sha256: "00".to_string(),
         });
         assert_eq!(reveal(&state, operator).await.unwrap(), "the-value");
+    }
+
+    #[tokio::test]
+    async fn a_create_racing_workspace_deletion_leaves_nothing_behind() {
+        use openshell_core::proto::{CreateWorkspaceRequest, DeleteWorkspaceRequest};
+        let state = enabled_state().await;
+        super::super::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "team".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let baseline = state.credentials.stored_credential_count();
+
+        // Pause the create after its activity check, while it stages the value.
+        let (entered, release) = state.credentials.gate_next_store();
+        let creator = Arc::clone(&state);
+        let create = tokio::spawn(async move {
+            let mut request = create_request("acme", "value");
+            request.workspace_scope = Some(workspace_selector("team".to_string()));
+            handle_create_secret(&creator, authed_request(request)).await
+        });
+        entered.await.unwrap();
+        // The scan finds no secret yet, so the deletion completes.
+        super::super::workspace::handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
+                allow_missing: false,
+                name: "team".to_string(),
+            }),
+        )
+        .await
+        .expect("workspace deletion completes");
+        release.send(()).unwrap();
+
+        let err = create.await.unwrap().unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<StoredWorkspaceSecret>("team", "acme")
+                .await
+                .unwrap()
+                .is_none(),
+            "no secret row outlives the workspace"
+        );
+        assert_eq!(
+            state.credentials.stored_credential_count(),
+            baseline,
+            "the staged value is discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_reaches_pending_cleanup_behind_a_full_page_of_healthy_secrets() {
+        let state = enabled_state().await;
+        for index in 0..SWEEP_PAGE_SIZE {
+            let healthy = StoredWorkspaceSecret {
+                metadata: Some(ObjectMeta {
+                    id: format!("healthy-{index:04}"),
+                    name: format!("healthy-{index:04}"),
+                    // Another workspace, so the pending secret stays under
+                    // the per-workspace quota. The sweep covers every workspace.
+                    workspace: "elsewhere".to_string(),
+                    ..ObjectMeta::default()
+                }),
+                ..Default::default()
+            };
+            state.store.put_message(&healthy).await.unwrap();
+        }
+        create(&state, "zzz-pending", "value").await;
+        let record = stored(&state, "zzz-pending").await.unwrap();
+        tombstone(&state, record).await.unwrap();
+
+        assert_eq!(sweep_workspace_secrets(&state).await.unwrap(), 1);
+        assert!(stored(&state, "zzz-pending").await.is_none());
     }
 }

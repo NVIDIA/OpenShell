@@ -63,6 +63,15 @@ async fn import_profile(
     strategy: ProviderCredentialRefreshStrategy,
     token_url: &str,
 ) {
+    import_profile_with_material(state, strategy, token_url, Vec::new()).await;
+}
+
+async fn import_profile_with_material(
+    state: &Arc<ServerState>,
+    strategy: ProviderCredentialRefreshStrategy,
+    token_url: &str,
+    extra_material: Vec<ProviderCredentialRefreshMaterial>,
+) {
     let credential = ProviderProfileCredential {
         token_grant_owners: Vec::new(),
         name: "access_token".to_string(),
@@ -87,10 +96,13 @@ async fn import_profile(
                 nanos: 0,
             }),
             additional_outputs: Vec::new(),
-            material: vec![
+            material: [
                 material("client_id", false),
                 material("client_secret", true),
-            ],
+            ]
+            .into_iter()
+            .chain(extra_material)
+            .collect(),
         }),
         token_grant: None,
     };
@@ -508,4 +520,129 @@ async fn a_refresh_whose_secret_disappeared_fails_closed() {
     assert_eq!(err.code(), Code::FailedPrecondition);
     let stored = refresh_state(&state).await;
     assert_eq!(stored.failure_code, "referenced_secret_missing");
+}
+
+#[tokio::test]
+async fn configure_time_keys_cannot_come_from_a_secret_even_when_marked_secret() {
+    let state = enabled_state().await;
+    let token_url = "https://login.example.com/token";
+    import_profile_with_material(
+        &state,
+        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+        token_url,
+        vec![material("refresh_before_seconds", true)],
+    )
+    .await;
+    create_secret(&state, "600", token_url).await;
+    let mut request = configure_request(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials);
+    request
+        .material
+        .insert("client_secret".to_string(), "inline".to_string());
+    request.material_secrets =
+        HashMap::from([("refresh_before_seconds".to_string(), "acme".to_string())]);
+    request.secret_material_keys = vec!["refresh_before_seconds".to_string()];
+    let err = configure(&state, request).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(
+        err.message().contains("configures the refresh"),
+        "{}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn inlining_never_overlaps_a_rotating_mint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("refresh_token=original-refresh"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "access_token": "token-1",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 3600
+                }))
+                .set_delay(std::time::Duration::from_millis(500)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let token_url = format!("{}/token", server.uri());
+    let state = enabled_state().await;
+    import_profile(
+        &state,
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+        &token_url,
+    )
+    .await;
+    create_secret(&state, "client-secret", &token_url).await;
+    let mut request = configure_request(ProviderCredentialRefreshStrategy::Oauth2RefreshToken);
+    request
+        .material
+        .insert("refresh_token".to_string(), "original-refresh".to_string());
+    configure(&state, request).await.expect("configure");
+
+    let minter = Arc::clone(&state);
+    let mint = tokio::spawn(async move { rotate(&minter).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while refresh_state(&state).await.status != "refresh_in_progress" {
+        assert!(std::time::Instant::now() < deadline, "mint never started");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let err = inline(&state).await.unwrap_err();
+    assert_eq!(err.code(), Code::Aborted);
+
+    mint.await
+        .unwrap()
+        .expect("the mint keeps its rotated refresh token");
+    assert_eq!(
+        stored_refresh_token(&state).await.as_deref(),
+        Some("rotated-refresh")
+    );
+
+    // Once the mint finishes, inlining keeps the rotated token.
+    inline(&state).await.expect("inline after the mint");
+    let stored = refresh_state(&state).await;
+    assert!(
+        secret_refs::material_secret_bindings(stored.metadata.as_ref())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        stored_refresh_token(&state).await.as_deref(),
+        Some("rotated-refresh")
+    );
+}
+
+async fn inline(
+    state: &Arc<ServerState>,
+) -> Result<
+    tonic::Response<openshell_core::proto::InlineProviderRefreshSecretsResponse>,
+    tonic::Status,
+> {
+    handle_inline_provider_refresh_secrets(
+        state,
+        authed_request(InlineProviderRefreshSecretsRequest {
+            workspace_scope: Some(default_workspace()),
+            provider: PROVIDER.to_string(),
+            credential_key: KEY.to_string(),
+            request_id: String::new(),
+        }),
+    )
+    .await
+}
+
+async fn stored_refresh_token(state: &Arc<ServerState>) -> Option<String> {
+    let stored = refresh_state(state).await;
+    state
+        .credentials
+        .resolve_refresh_material(
+            openshell_credential_issuer::refresh::refresh_material_scope(&stored),
+            &stored.secret_material_handles,
+        )
+        .await
+        .unwrap()
+        .remove("refresh_token")
 }
