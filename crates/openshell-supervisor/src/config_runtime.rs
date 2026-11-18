@@ -444,6 +444,7 @@ impl ConfigRuntime {
                     connector: &ctx.middleware_connector,
                 },
                 ctx.vm_identity,
+                ctx.privileged_workload,
                 || {
                     if let Some(prepared) = prepared_provider.as_ref() {
                         ctx.provider_credentials
@@ -775,6 +776,22 @@ impl ConfigRuntime {
                 });
             }
         };
+        if ctx.privileged_workload
+            && (!provider.files.is_empty() || !provider.environment.is_empty())
+        {
+            // Nothing secret enters the guest: provider material fetched by
+            // polling is refused supervisor-side for a root workload,
+            // mirroring startup and session-delivered updates. An entirely
+            // empty environment stays installable (a fail-closed snapshot).
+            self.reject_provider_bindings(ctx, desired_identity.clone(), provider)
+                .await;
+            let error = "Privileged (root-workload) sandboxes cannot install provider files or environment; detach the provider to repair configuration";
+            return Err(ConfigRejection {
+                code: "privileged_provider_refused",
+                detail: error.to_string(),
+                admission_error: error.to_string(),
+            });
+        }
         if let Ok(prepared) = CapturedProviderEnvironment::prepare(&provider) {
             return Ok(prepared);
         }
@@ -1117,6 +1134,24 @@ impl ConfigRuntime {
                     config_apply_failure(
                         "provider_environment_unavailable",
                         "provider environment is not ready for installation",
+                        true,
+                    )
+                }
+                Ok(provider)
+                    if ctx.privileged_workload
+                        && (!provider.files.is_empty() || !provider.environment.is_empty()) =>
+                {
+                    // Nothing secret enters the guest: mid-session provider
+                    // material is refused supervisor-side for a root
+                    // workload, mirroring startup. An entirely empty
+                    // environment stays installable (a fail-closed snapshot).
+                    // The mode comes from the trusted launch descriptor held
+                    // by the poll context.
+                    self.reject_provider_bindings(ctx, desired.clone(), provider)
+                        .await;
+                    config_apply_failure(
+                        "privileged_provider_refused",
+                        "privileged (root-workload) sandboxes cannot install provider files or environment; detach the provider to repair configuration",
                         true,
                     )
                 }
@@ -2058,6 +2093,7 @@ mod tests {
             &startup,
             &policy,
             &stable_provider_environment(1, Some("initial")),
+            false,
         )
         .expect("stable credentials prepare for admitted startup");
         assert!(prepared.requires_stable_placeholders());
@@ -2100,7 +2136,7 @@ mod tests {
             .workload_credential_handle
             .clear();
         startup.provider_env_revision = 2;
-        assert!(prepare_startup_configuration(&startup, &policy, &invalid).is_err());
+        assert!(prepare_startup_configuration(&startup, &policy, &invalid, false).is_err());
         let rejected = initial_provider_credentials(invalid, &readiness);
         assert!(rejected.snapshot().child_env.is_empty());
         assert!(rejected.resolver().is_none());
@@ -2578,6 +2614,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn privileged_delivery_refuses_provider_material() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        // Nothing secret enters the guest: a privileged (root-workload)
+        // runtime refuses session-delivered provider material
+        // supervisor-side, mirroring startup.
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let engine = Arc::new(
+            OpaEngine::from_proto_with_pid_and_binary_identity(&proto_policy_fixture(), 0, false)
+                .expect("build OPA engine"),
+        );
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.privileged_workload = true;
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+
+        let mut desired = initial.clone();
+        desired.provider_env_revision = 2;
+        let snapshot = provider_snapshot_for(&desired, "REGION", "west");
+
+        let result = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+            .await;
+
+        assert_eq!(
+            result.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        );
+        assert_eq!(
+            result.failure.as_ref().unwrap().code,
+            "privileged_provider_refused"
+        );
+        assert_eq!(
+            result.admission.state,
+            i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected)
+        );
+        assert!(
+            !ctx.provider_credentials
+                .snapshot()
+                .child_env
+                .contains_key("EXTERNAL_TOKEN"),
+            "no provider environment may reach a root workload"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_poll_preserves_static_references_across_rotation_failure_and_detach() {
         let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
         let initial = settings_poll_result(
@@ -2806,6 +2895,7 @@ mod tests {
             opa_engine,
             loaded_policy_origin,
             vm_identity: None,
+            privileged_workload: false,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),

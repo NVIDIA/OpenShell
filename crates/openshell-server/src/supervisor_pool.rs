@@ -4782,6 +4782,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_generation_on_a_recorded_route_refuses_with_the_pinned_message() {
+        a_new_generation_on_a_recorded_route_refuses_with_the_pinned_message_on(
+            &Fixture::new().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_new_generation_on_a_recorded_route_refuses_with_the_pinned_message() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_new_generation_on_a_recorded_route_refuses_with_the_pinned_message_on(
+            &Fixture::with_store(schema.connect_store().await),
+        )
+        .await;
+    }
+
+    /// Pins the refusal message the `KubeVirt` driver's
+    /// `ROUTE_RECORD_RACE_MESSAGE` retry keys on: a launch for a new
+    /// generation on a route whose record is still Published is refused
+    /// with exactly this wording. If the message changes, this test fails
+    /// so the driver's constant is updated with it.
+    async fn a_new_generation_on_a_recorded_route_refuses_with_the_pinned_message_on(
+        fixture: &Fixture,
+    ) {
+        let pool = fixture.replica("gw-a");
+        fixture.member("m1", "p1", false).await;
+        fixture
+            .sandbox("sandbox-x", "generation-1", SandboxPhase::Ready)
+            .await;
+        pool.place_launch(launch("rt-route-race", "sandbox-x", "generation-1"))
+            .await
+            .unwrap();
+        let record = fixture.instance("rt-route-race").await.unwrap();
+        assert_eq!(record.payload.phase, RecordPhase::Published);
+
+        let refused = pool
+            .place_launch(launch("rt-route-race", "sandbox-x", "generation-2"))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("the sandbox instance route is recorded for another generation"),
+            "the route-record refusal message changed ({refused}); update \
+             ROUTE_RECORD_RACE_MESSAGE in openshell-driver-kubernetes"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_admission_keeps_the_record_for_a_retry_with_its_first_material() {
         a_failed_admission_keeps_the_record_for_a_retry_with_its_first_material_on(
             &Fixture::new().await,

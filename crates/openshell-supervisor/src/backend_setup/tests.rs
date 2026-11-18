@@ -255,6 +255,7 @@ impl BackendSetup for TestSetup {
                 session_id: self.auth.session_id,
                 workload_identity: identity(),
                 vm_policy_identity: None,
+                privileged_workload: false,
             },
             Box::new(TestLaunch {
                 name: self.built_name,
@@ -688,6 +689,57 @@ async fn constructed_backend_must_keep_selected_name() {
     assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
     tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
+}
+
+#[test]
+fn kubevirt_generation_claim_yields_vm_policy_identity() {
+    use openshell_sandbox_backend::boundary_protocol::{
+        SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTransport,
+    };
+
+    let setup = TestSetup::new();
+    let descriptor = SandboxRuntimeDescriptor {
+        boundary_id: setup.sandbox_id.clone(),
+        generation: setup.auth.runtime_generation.to_string(),
+        session_id: setup.auth.session_id,
+        workload_identity: ResolvedWorkloadIdentity::new(
+            10001,
+            10001,
+            vec![],
+            "kubevirt".into(),
+            "vm-uid-1".into(),
+        )
+        .unwrap(),
+        transport: SandboxTransport::Tcp {
+            authority: "supervisor.openshell.svc:5500".into(),
+            addresses: vec![],
+        },
+        tls: SandboxTlsClientConfig {
+            server_name: "boundary.sandbox.openshell".into(),
+            trust_anchor_pem: String::new(),
+        },
+        host_gateway_ip: None,
+        resource_claims: BTreeMap::from([(
+            openshell_sandbox_backend::boundary_protocol::KUBEVIRT_GENERATION_CLAIM.to_string(),
+            "generation-1".into(),
+        )]),
+        provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+            "generation-1",
+            b"test-evidence",
+        )
+        .unwrap(),
+    };
+    let selected = SelectedBackend::select(
+        &OpenShellBackendSetup,
+        descriptor.backend_descriptor().unwrap(),
+        Some(openshell_sandbox_backend::BACKEND_NAME),
+        Some(&setup.sandbox_id),
+        &setup.auth,
+    )
+    .unwrap();
+    let projected = selected.vm_policy_identity();
+    let projected = projected.expect("KubeVirt claims must yield a VM policy identity");
+    assert_eq!((projected.uid, projected.gid), (10001, 10001));
 }
 
 #[test]

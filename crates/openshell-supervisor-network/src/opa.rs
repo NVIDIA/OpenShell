@@ -487,7 +487,26 @@ impl OpaEngine {
     /// gap between user-specified symlink paths (e.g., `/usr/bin/python3`) and
     /// kernel-resolved canonical paths (e.g., `/usr/bin/python3.11`).
     pub fn from_proto_with_pid(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> Result<Self> {
-        Self::from_proto_with_pid_and_binary_identity_required(proto, entrypoint_pid, true)
+        Self::from_proto_with_pid_and_binary_identity(proto, entrypoint_pid, true)
+    }
+
+    /// Create OPA engine from a typed proto policy with an explicit
+    /// binary-identity requirement.
+    ///
+    /// Privileged (root-workload) sandboxes pass `false`: per-binary
+    /// identity checks are unenforceable in-guest and would deny every
+    /// connection the root workload makes. The requirement is a property
+    /// of the workload mode, not the policy.
+    pub fn from_proto_with_pid_and_binary_identity(
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        require_binary_identity: bool,
+    ) -> Result<Self> {
+        Self::from_proto_with_pid_and_binary_identity_required(
+            proto,
+            entrypoint_pid,
+            require_binary_identity,
+        )
     }
 
     fn from_proto_with_pid_and_binary_identity_required(
@@ -812,7 +831,14 @@ impl OpaEngine {
         registry: Option<MiddlewareRegistry>,
         commit_credentials: impl FnOnce(),
     ) -> Result<PolicyGenerationGuard> {
-        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        // The new engine inherits the binary-identity requirement from the
+        // current engine: the workload mode is fixed for the generation and
+        // cannot change across a policy reload.
+        let new = Self::from_proto_with_pid_and_binary_identity(
+            proto,
+            entrypoint_pid,
+            self.binary_identity_required(),
+        )?;
         let new_engine = new
             .engine
             .into_inner()
@@ -11830,6 +11856,31 @@ network_policies:
             })
             .expect_err("invalid candidate");
         assert_eq!(engine.current_generation(), 0);
+    }
+
+    #[test]
+    fn reload_inherits_binary_identity_requirement() {
+        // The workload mode is fixed for a sandbox generation; a policy
+        // reload must not silently re-enable per-binary identity checks
+        // for a privileged (root-workload) engine.
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto_with_pid_and_binary_identity(&proto, 0, false).unwrap();
+        assert!(!engine.binary_identity_required());
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {})
+            .expect("reload succeeds");
+        assert!(
+            !engine.binary_identity_required(),
+            "reload must inherit the privileged binary-identity mode"
+        );
+
+        // And a sandboxed engine keeps the requirement across reloads.
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        assert!(engine.binary_identity_required());
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {})
+            .expect("reload succeeds");
+        assert!(engine.binary_identity_required());
     }
 
     #[test]

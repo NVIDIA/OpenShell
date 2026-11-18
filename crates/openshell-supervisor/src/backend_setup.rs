@@ -28,6 +28,11 @@ pub struct LaunchIdentity {
     pub workload_identity: ResolvedWorkloadIdentity,
     /// Preserve driver-fixed VM selectors during shared startup and reload.
     pub vm_policy_identity: Option<super::VmPolicyIdentity>,
+    /// Whether the trusted launch descriptor selects the privileged
+    /// (root-workload) mode. Keyed off the descriptor's resource claims,
+    /// never boundary reports: the mode gates supervisor-side policy
+    /// validation and provider-material refusal.
+    pub privileged_workload: bool,
 }
 
 /// Runtime state remains owned by the supervisor.
@@ -156,6 +161,12 @@ impl SelectedBackend {
         self.identity.vm_policy_identity
     }
 
+    /// Whether the trusted launch descriptor selects the privileged
+    /// (root-workload) mode, for supervisor-side policy validation.
+    pub fn privileged_workload(&self) -> bool {
+        self.identity.privileged_workload
+    }
+
     /// Delegate image discovery only after shared name and identity checks.
     /// Callers may retry this read; discovery cannot authorize workload launch.
     pub async fn discover_policy(
@@ -230,13 +241,17 @@ impl BackendSetup for OpenShellBackendSetup {
             generation: descriptor.generation.clone(),
             session_id: descriptor.session_id,
             workload_identity: descriptor.workload_identity.clone(),
-            vm_policy_identity: descriptor
-                .resource_claims
-                .contains_key("vm.generation")
-                .then_some(super::VmPolicyIdentity {
-                    uid: descriptor.workload_identity.uid,
-                    gid: descriptor.workload_identity.gid,
-                }),
+            vm_policy_identity: openshell_sandbox_backend::boundary_protocol::is_vm_guest(
+                &descriptor.resource_claims,
+            )
+            .then_some(super::VmPolicyIdentity {
+                uid: descriptor.workload_identity.uid,
+                gid: descriptor.workload_identity.gid,
+            }),
+            privileged_workload:
+                openshell_sandbox_backend::boundary_protocol::is_privileged_workload(
+                    &descriptor.resource_claims,
+                ),
         };
         let transport = openshell_sandbox_backend::BoundaryTransport::for_descriptor(&descriptor)?;
         Ok((
@@ -293,6 +308,10 @@ impl BackendSetup for RoutedBackendSetup {
             session_id: descriptor.session_id,
             workload_identity: descriptor.workload_identity.clone(),
             vm_policy_identity: None,
+            privileged_workload:
+                openshell_sandbox_backend::boundary_protocol::is_privileged_workload(
+                    &descriptor.resource_claims,
+                ),
         };
         Ok((
             identity,

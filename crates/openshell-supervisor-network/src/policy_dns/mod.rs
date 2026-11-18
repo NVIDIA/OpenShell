@@ -694,6 +694,7 @@ fn build_observation_publication_event(
         .unmapped("policy_generation", record.policy_generation)
         .unmapped("mapping_generation", record.mapping_generation)
         .unmapped("mapping_id", record.mapping_id.to_string())
+        .guest_sourced()
         .message(format!(
             "Policy DNS staged unapproved name {} synthetic={} for TCP policy review",
             record.normalized_name, record.synthetic_address
@@ -739,6 +740,7 @@ fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell
         .unmapped("policy_generation", record.policy_generation)
         .unmapped("mapping_generation", record.mapping_generation)
         .unmapped("mapping_id", mapping_id)
+        .guest_sourced()
         .message(message)
         .build()
 }
@@ -1131,6 +1133,45 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 .is_ok()
         );
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_policy_names_never_reach_the_upstream_resolver() {
+        // The DNS exfiltration question: a root workload can encode data in
+        // the query name of a non-policy lookup. The ineligible path must
+        // answer entirely locally (a staged observation synthetic or an
+        // Ineligible refusal) — the name must never be sent upstream.
+        let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
+        let now = Instant::now();
+        for name in [
+            "review-denied.test",
+            // Data-encoded subdomains of a non-policy name.
+            "cGF5bG9hZA.exfil.review-denied.test",
+            "a.b.c.d.e.f.g.h.i.j.k.unapproved.example",
+        ] {
+            let _ = service.answer_query(name, AddressFamily::Ipv4, now).await;
+        }
+        assert_eq!(
+            service.resolver.calls.load(Ordering::SeqCst),
+            0,
+            "non-policy names must never reach the upstream resolver"
+        );
+        // And in fail-closed mode the refusal stays local too.
+        service
+            .policy
+            .enter_fail_closed("invalid candidate")
+            .unwrap();
+        assert!(matches!(
+            service
+                .answer_query("review-denied.test", AddressFamily::Ipv4, now)
+                .await,
+            Err(PolicyDnsError::Ineligible)
+        ));
+        assert_eq!(
+            service.resolver.calls.load(Ordering::SeqCst),
+            0,
+            "fail-closed non-policy refusals must not query upstream either"
+        );
     }
 
     #[tokio::test]

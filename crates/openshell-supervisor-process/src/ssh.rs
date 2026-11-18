@@ -174,6 +174,7 @@ pub async fn run_ssh_server(
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     host_key: PrivateKey,
+    privileged_mode: bool,
 ) -> Result<()> {
     let (listener, config, _ca_paths) =
         match ssh_server_init(&listen_path, &ca_file_paths, shared_socket, host_key) {
@@ -214,6 +215,7 @@ pub async fn run_ssh_server(
                         main_session,
                         server_endpoint.clone(),
                         SSH_PEER_TIMEOUT,
+                        privileged_mode,
                     )
                     .await
                     {
@@ -358,6 +360,7 @@ async fn handle_connection(
     main_session: Option<Arc<MainSession>>,
     server_endpoint: Arc<openshell_ocsf::Endpoint>,
     peer_timeout: Duration,
+    privileged_mode: bool,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -374,7 +377,13 @@ async fn handle_connection(
             .build()
     );
 
-    let handler = SshHandler::new(port_forward, boundary_exec, main_session, server_endpoint);
+    let handler = SshHandler::new(
+        port_forward,
+        boundary_exec,
+        main_session,
+        server_endpoint,
+        privileged_mode,
+    );
     let stream = peer_stream::PeerStream::new(stream, peer_timeout);
     russh::server::run_stream(config, stream, handler)
         .await
@@ -444,6 +453,10 @@ struct SshHandler {
     /// This server's endpoint, named on every SSH event it emits.
     server_endpoint: Arc<openshell_ocsf::Endpoint>,
     channels: HashMap<ChannelId, ChannelState>,
+    /// Whether the sandbox runs the privileged (root-workload) mode: the
+    /// boundary is untrusted after start, so exec exit codes it reports are
+    /// guest-sourced data.
+    privileged_mode: bool,
 }
 
 impl Drop for SshHandler {
@@ -471,6 +484,7 @@ impl SshHandler {
         boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
         main_session: Option<Arc<MainSession>>,
         server_endpoint: Arc<openshell_ocsf::Endpoint>,
+        privileged_mode: bool,
     ) -> Self {
         Self {
             port_forward,
@@ -478,6 +492,7 @@ impl SshHandler {
             main_session,
             server_endpoint,
             channels: HashMap::new(),
+            privileged_mode,
         }
     }
 }
@@ -1356,6 +1371,21 @@ impl SshHandler {
         spec: openshell_isolation_interface::contract::ExecSpec,
     ) -> anyhow::Result<()> {
         use tokio::io::AsyncReadExt;
+        // Capture the display name and the workload mode before the spec is
+        // consumed and the task spawns: the exit OCSF event uses both.
+        // Shell-executed commands carry the command in `shell.command` (the
+        // `program` field is empty); use the command's first word.
+        let program_name = if spec.program.is_empty() {
+            spec.shell
+                .as_ref()
+                .and_then(|shell| shell.command.as_deref())
+                .and_then(|command| command.split_whitespace().next())
+                .unwrap_or("exec")
+                .to_string()
+        } else {
+            spec.program.clone()
+        };
+        let privileged_mode = self.privileged_mode;
 
         let mut exec = self
             .boundary_exec
@@ -1468,6 +1498,34 @@ impl SshHandler {
             let Some(code) = code else {
                 return;
             };
+            // The exit code is guest-reported (the boundary reports the
+            // workload process lifecycle); in root mode the boundary is
+            // untrusted after start, so the event is marked guest-sourced.
+            let process = openshell_ocsf::Process::new(&program_name, 0);
+            if privileged_mode {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Close)
+                        .severity(SeverityId::Informational)
+                        .exit_code(code.cast_signed())
+                        .actor_process(openshell_ocsf::Process::new(&program_name, 0))
+                        .process(process)
+                        .guest_sourced()
+                        .message(format!("exec exit reported by the boundary: code {code}"))
+                        .build()
+                );
+            } else {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Close)
+                        .severity(SeverityId::Informational)
+                        .exit_code(code.cast_signed())
+                        .actor_process(openshell_ocsf::Process::new(&program_name, 0))
+                        .process(process)
+                        .message(format!("exec process exited: code {code}"))
+                        .build()
+                );
+            }
             let _ = handle.eof(channel).await;
             let _ = handle.exit_status_request(channel, code).await;
             let _ = handle.close(channel).await;
@@ -1707,6 +1765,7 @@ mod tests {
                             rpc_test::exec(Arc::new(RejectingExec)),
                             None,
                             server_endpoint,
+                            false,
                         );
                         if let Ok(session) =
                             russh::server::run_stream(config, stream, handler).await
@@ -1847,6 +1906,7 @@ mod tests {
             Arc::new(ssh_server_endpoint(Path::new(
                 "/run/openshell/test/ssh.sock",
             ))),
+            false,
         );
         let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {

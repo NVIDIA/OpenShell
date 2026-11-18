@@ -222,6 +222,7 @@ impl BackendSetup for HeldBackendSetup {
                     "test-image".into(),
                 )?,
                 vm_policy_identity: None,
+                privileged_workload: false,
             },
             Box::new(HeldPreparedBackend(self.probe.clone())),
         ))

@@ -134,6 +134,7 @@ impl Connection {
                 Some(main),
                 server_endpoint,
                 TEST_INTERVAL * 4,
+                false,
             )
             .await;
         });
