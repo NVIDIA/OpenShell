@@ -2720,6 +2720,12 @@ mod tests {
 
         let error = cached.snapshot(&store, "default").await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(
+            cached
+                .snapshot_profile(&store, "default", "github")
+                .await
+                .is_err()
+        );
         assert_eq!(inner.fetches.load(Ordering::SeqCst), 0);
     }
 
@@ -2734,6 +2740,23 @@ mod tests {
             assert_eq!(
                 cached.snapshot(&store, "default").await.unwrap().revision,
                 "r1"
+            );
+            assert_eq!(
+                cached
+                    .snapshot_profile(&store, "default", "github")
+                    .await
+                    .unwrap()
+                    .profiles
+                    .len(),
+                1
+            );
+            assert!(
+                cached
+                    .snapshot_profile(&store, "default", "missing")
+                    .await
+                    .unwrap()
+                    .profiles
+                    .is_empty()
             );
         }
         assert_eq!(inner.fetches.load(Ordering::SeqCst), 1);
@@ -2766,5 +2789,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(11)).await;
         let error = cached.snapshot(&store, "default").await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(
+            cached
+                .snapshot_profile(&store, "default", "github")
+                .await
+                .is_err()
+        );
     }
 }
