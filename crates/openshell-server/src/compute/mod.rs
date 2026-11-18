@@ -13972,6 +13972,7 @@ mod tests {
             traces: secret("authorization=traces"),
             ocsf: secret("authorization=Bearer%20secret"),
             agent: secret("x-mlflow-experiment-id=0"),
+            metrics: None,
         });
         runtime.configure_supervisor_otlp_tls(crate::otel_tracing::SupervisorOtlpTls {
             materials: vec![openshell_core::jwt::OtlpTlsMaterial {

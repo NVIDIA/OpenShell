@@ -1223,10 +1223,12 @@ mod tests {
             ssh_host_private_key: None,
             traces_otlp_headers: secret("lane=traces"),
             ocsf_otlp_headers: secret("lane=ocsf"),
+            metrics_otlp_headers: None,
             agent_otlp_headers: secret("lane=agent"),
             otlp_tls: vec![tls("ocsf-ca"), tls("traces-ca")],
             traces_otlp_tls: Some(1),
             ocsf_otlp_tls: Some(0),
+            metrics_otlp_tls: None,
             agent_otlp_tls: None,
         };
 

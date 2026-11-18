@@ -364,6 +364,7 @@ pub struct MetricsTlsFileConfig {
 /// `endpoint` is the collector for every enabled signal, and on its own
 /// enables trace export. `[otlp.traces]` overrides the trace endpoint;
 /// `[otlp.metrics]` with `enabled = true` exports gateway metrics;
+/// `[otlp.supervisor_metrics]` with `enabled = true` exports supervisor metrics;
 /// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records; and
 /// `[otlp.agent]` with `enabled = true` relays workload traces. Each signal
 /// can use a different endpoint. SDK tuning knobs are deliberately absent —
@@ -405,6 +406,14 @@ pub struct OtlpConfig {
         serialize_with = "serialize_enabled"
     )]
     pub agent: Option<AgentOtlpConfig>,
+
+    /// Export of supervisor egress metrics, when enabled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_enabled"
+    )]
+    pub supervisor_metrics: Option<OtlpCollectorConfig>,
 }
 
 /// Writes `enabled = true` so that a serialized config parses back to the
@@ -465,6 +474,10 @@ impl OtlpConfig {
             traces: self.traces.as_ref().map(|traces| traces.collector.export()),
             ocsf: self.ocsf.as_ref().map(|ocsf| ocsf.collector.export()),
             agent: self.agent.as_ref().map(|agent| agent.collector.export()),
+            metrics: self
+                .supervisor_metrics
+                .as_ref()
+                .map(OtlpCollectorConfig::export),
         }
     }
 }
@@ -831,7 +844,7 @@ impl OtlpCollectorConfig {
         }
     }
 
-    fn export(&self) -> openshell_core::sandbox_env::OtlpExport {
+    pub(crate) fn export(&self) -> openshell_core::sandbox_env::OtlpExport {
         openshell_core::sandbox_env::OtlpExport {
             endpoint: self.endpoint.clone(),
             protocol: self.protocol,
@@ -875,7 +888,7 @@ pub struct AgentOtlpConfig {
 #[serde(deny_unknown_fields)]
 struct RawOtlpConfig {
     #[serde(default)]
-    metrics: Option<RawOtlpMetrics>,
+    metrics: Option<RawEnabledOtlp>,
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
@@ -897,33 +910,14 @@ struct RawOtlpConfig {
     #[serde(default)]
     ocsf: Option<RawOcsfOtlp>,
     #[serde(default)]
-    agent: Option<RawAgentOtlp>,
+    agent: Option<RawEnabledOtlp>,
+    #[serde(default)]
+    supervisor_metrics: Option<RawEnabledOtlp>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAgentOtlp {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default)]
-    protocol: Option<OtlpProtocol>,
-    #[serde(default)]
-    headers: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    headers_file: Option<PathBuf>,
-    #[serde(default)]
-    ca_file: Option<PathBuf>,
-    #[serde(default)]
-    cert_file: Option<PathBuf>,
-    #[serde(default)]
-    key_file: Option<PathBuf>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawOtlpMetrics {
+struct RawEnabledOtlp {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
@@ -1106,7 +1100,19 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                 })
             })
             .transpose()?;
-        if traces.is_none() && metrics.is_none() && ocsf.is_none() && agent.is_none() {
+        let supervisor_metrics = raw
+            .supervisor_metrics
+            .filter(|metrics| metrics.enabled)
+            .map(|metrics| {
+                raw_collector!(metrics).resolve("otlp.supervisor_metrics", shared.as_ref())
+            })
+            .transpose()?;
+        if traces.is_none()
+            && metrics.is_none()
+            && ocsf.is_none()
+            && agent.is_none()
+            && supervisor_metrics.is_none()
+        {
             return Err("otlp needs an endpoint, or an enabled signal table".to_string());
         }
         let config = Self {
@@ -1115,6 +1121,7 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
             traces,
             ocsf,
             agent,
+            supervisor_metrics,
         };
         let supervisor_tls = config.supervisor_tls_bytes();
         if supervisor_tls > MAX_SUPERVISOR_TLS_BYTES {
@@ -2212,6 +2219,30 @@ service_name = "openshell-gateway-dev"
         assert!(otlp.service_name.is_none());
         assert_eq!(otlp.ocsf, None);
         assert!(otlp.metrics.is_none());
+        assert_eq!(otlp.supervisor_metrics, None);
+    }
+
+    #[test]
+    fn supervisor_metrics_accepts_an_inherited_or_independent_collector() {
+        let inherited = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'https://collector:4318'\n\
+             protocol = 'http/protobuf'\n\
+             [openshell.gateway.otlp.supervisor_metrics]\nenabled = true\n",
+        );
+        let metrics = inherited.supervisor_otlp().metrics.unwrap();
+        assert_eq!(metrics.endpoint, "https://collector:4318");
+        assert_eq!(metrics.protocol, OtlpProtocol::HttpProtobuf);
+
+        let independent = otlp(
+            "[openshell.gateway.otlp.supervisor_metrics]\nenabled = true\n\
+             endpoint = 'http://metrics:4317'\n",
+        );
+        assert!(independent.traces.is_none());
+        assert!(independent.metrics.is_none());
+        assert_eq!(
+            independent.supervisor_otlp().metrics.unwrap().endpoint,
+            "http://metrics:4317"
+        );
     }
 
     #[test]
@@ -2256,6 +2287,7 @@ service_name = "openshell-gateway-dev"
         assert_eq!(metrics.endpoint, "http://metrics:4318");
         assert_eq!(metrics.protocol, OtlpProtocol::HttpProtobuf);
         assert!(own.traces.is_none());
+        assert!(own.supervisor_metrics.is_none());
 
         let error = toml::from_str::<OtlpConfig>(
             "[metrics]\nenabled = true\n[traces]\nendpoint = 'http://traces:4317'\n",
@@ -2393,6 +2425,7 @@ service_name = "openshell-gateway-dev"
                 traces: export("http://shared:4318", OtlpProtocol::HttpProtobuf),
                 ocsf: export("http://shared:4318", OtlpProtocol::HttpProtobuf),
                 agent: export("http://agents:4317", OtlpProtocol::Grpc),
+                metrics: None,
             },
             "lanes without an endpoint inherit the shared protocol; a lane \
              with its own endpoint does not"

@@ -274,10 +274,12 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         ssh_host_private_key: None,
         traces_otlp_headers: None,
         ocsf_otlp_headers: None,
+        metrics_otlp_headers: None,
         agent_otlp_headers: None,
         otlp_tls: Vec::new(),
         traces_otlp_tls: None,
         ocsf_otlp_tls: None,
+        metrics_otlp_tls: None,
         agent_otlp_tls: None,
     };
     let setup = HeldBackendSetup {

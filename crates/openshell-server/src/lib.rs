@@ -934,6 +934,27 @@ pub(crate) async fn run_server(
             .as_ref()
             .and_then(|file| file.openshell.gateway.otlp.as_ref()),
     ));
+    if let Some(host) = compute.supervisor_host()
+        && let Some(otlp) = config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref())
+        && let Some(collector) = otlp.supervisor_metrics.as_ref()
+    {
+        let headers = supervisor_otlp_headers(Some(otlp));
+        let tls = otel_tracing::supervisor_otlp_tls(Some(otlp));
+        let metrics = openshell_core::sandbox_env::SharedSupervisorMetrics {
+            collector: collector.export(),
+            gateway_name: config.name.clone(),
+            headers: headers.metrics,
+            tls: tls
+                .metrics
+                .and_then(|index| tls.materials.get(index).cloned()),
+        };
+        let encoded = serde_json::to_vec(&metrics).map_err(|error| Error::Config {
+            message: format!("could not encode supervisor metrics settings: {error}"),
+        })?;
+        host.set_supervisor_metrics(encoded);
+    }
     let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {

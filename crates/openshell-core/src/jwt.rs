@@ -514,6 +514,9 @@ mod session {
         /// the gateway configures them. Never delivered to the workload.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent_otlp_headers: Option<SecretOtlpHeaders>,
+        /// Headers for the supervisor's metrics collector.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub metrics_otlp_headers: Option<SecretOtlpHeaders>,
         /// TLS material for the supervisor's collectors, each distinct
         /// material once, present only when the gateway configures it.
         /// Never delivered to the workload.
@@ -526,6 +529,8 @@ mod session {
         pub ocsf_otlp_tls: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent_otlp_tls: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub metrics_otlp_tls: Option<usize>,
     }
 
     /// Gateway-created authentication input trusted by a compute driver.
@@ -591,6 +596,7 @@ mod session {
                 self.traces_otlp_tls,
                 self.ocsf_otlp_tls,
                 self.agent_otlp_tls,
+                self.metrics_otlp_tls,
             ];
             if references
                 .into_iter()
@@ -615,6 +621,11 @@ mod session {
         /// What the agent trace relay sends its collector.
         pub fn agent_otlp(&self) -> OtlpExportCredentials<'_> {
             self.otlp_credentials(self.agent_otlp_headers.as_ref(), self.agent_otlp_tls)
+        }
+
+        /// What the supervisor's metrics export sends its collector.
+        pub fn metrics_otlp(&self) -> OtlpExportCredentials<'_> {
+            self.otlp_credentials(self.metrics_otlp_headers.as_ref(), self.metrics_otlp_tls)
         }
 
         /// [`Self::validate`] rejects a `tls` index outside `otlp_tls`.
@@ -654,10 +665,12 @@ mod session {
                 .field("traces_otlp_headers", &self.traces_otlp_headers)
                 .field("ocsf_otlp_headers", &self.ocsf_otlp_headers)
                 .field("agent_otlp_headers", &self.agent_otlp_headers)
+                .field("metrics_otlp_headers", &self.metrics_otlp_headers)
                 .field("otlp_tls", &self.otlp_tls)
                 .field("traces_otlp_tls", &self.traces_otlp_tls)
                 .field("ocsf_otlp_tls", &self.ocsf_otlp_tls)
                 .field("agent_otlp_tls", &self.agent_otlp_tls)
+                .field("metrics_otlp_tls", &self.metrics_otlp_tls)
                 .finish()
         }
     }
@@ -1790,10 +1803,12 @@ mod tests {
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
+                metrics_otlp_headers: None,
                 agent_otlp_headers: None,
                 otlp_tls: Vec::new(),
                 traces_otlp_tls: None,
                 ocsf_otlp_tls: None,
+                metrics_otlp_tls: None,
                 agent_otlp_tls: None,
             };
             bundle.validate().expect("non-expiring auth bundle");
@@ -1938,10 +1953,12 @@ mod tests {
                 ssh_host_private_key: None,
                 traces_otlp_headers: headers("traces"),
                 ocsf_otlp_headers: headers("ocsf"),
+                metrics_otlp_headers: None,
                 agent_otlp_headers: headers("agent"),
                 otlp_tls: vec![tls("agent"), tls("ocsf"), tls("traces")],
                 traces_otlp_tls: Some(2),
                 ocsf_otlp_tls: Some(1),
+                metrics_otlp_tls: None,
                 agent_otlp_tls: Some(0),
             };
 
@@ -1983,6 +2000,7 @@ mod tests {
                 ocsf_otlp_headers: Some(SecretOtlpHeaders::new(
                     "authorization=collector-token".to_string(),
                 )),
+                metrics_otlp_headers: None,
                 agent_otlp_headers: Some(SecretOtlpHeaders::new(
                     "authorization=agent-token".to_string(),
                 )),
@@ -1995,6 +2013,7 @@ mod tests {
                 }],
                 traces_otlp_tls: None,
                 ocsf_otlp_tls: None,
+                metrics_otlp_tls: None,
                 agent_otlp_tls: Some(0),
             };
 

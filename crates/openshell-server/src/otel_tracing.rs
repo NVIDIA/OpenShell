@@ -335,6 +335,7 @@ pub struct SupervisorOtlpHeaders {
     pub traces: Option<SecretOtlpHeaders>,
     pub ocsf: Option<SecretOtlpHeaders>,
     pub agent: Option<SecretOtlpHeaders>,
+    pub metrics: Option<SecretOtlpHeaders>,
 }
 
 impl SupervisorOtlpHeaders {
@@ -342,6 +343,7 @@ impl SupervisorOtlpHeaders {
         bundle.traces_otlp_headers.clone_from(&self.traces);
         bundle.ocsf_otlp_headers.clone_from(&self.ocsf);
         bundle.agent_otlp_headers.clone_from(&self.agent);
+        bundle.metrics_otlp_headers.clone_from(&self.metrics);
     }
 }
 
@@ -407,6 +409,7 @@ fn supervisor_otlp_headers_from(
             .agent
             .as_ref()
             .and_then(|agent| configured(&agent.collector)),
+        metrics: otlp.supervisor_metrics.as_ref().and_then(configured),
     }
 }
 
@@ -419,6 +422,7 @@ pub struct SupervisorOtlpTls {
     pub traces: Option<usize>,
     pub ocsf: Option<usize>,
     pub agent: Option<usize>,
+    pub metrics: Option<usize>,
 }
 
 impl SupervisorOtlpTls {
@@ -427,6 +431,7 @@ impl SupervisorOtlpTls {
         bundle.traces_otlp_tls = self.traces;
         bundle.ocsf_otlp_tls = self.ocsf;
         bundle.agent_otlp_tls = self.agent;
+        bundle.metrics_otlp_tls = self.metrics;
     }
 }
 
@@ -453,10 +458,11 @@ pub fn supervisor_otlp_tls(otlp: Option<&OtlpConfig>) -> SupervisorOtlpTls {
         otlp.traces.as_ref().map(|traces| &traces.collector),
         otlp.ocsf.as_ref().map(|ocsf| &ocsf.collector),
         otlp.agent.as_ref().map(|agent| &agent.collector),
+        otlp.supervisor_metrics.as_ref(),
     ];
     let mut materials = Vec::new();
     let mut seen = Vec::new();
-    let [traces, ocsf, agent] = lanes.map(|collector| {
+    let [traces, ocsf, agent, metrics] = lanes.map(|collector| {
         let collector = collector?;
         let pem = (collector.tls().ca_pem(), collector.tls().client_identity());
         if let Some(index) = seen.iter().position(|seen| *seen == pem) {
@@ -471,6 +477,7 @@ pub fn supervisor_otlp_tls(otlp: Option<&OtlpConfig>) -> SupervisorOtlpTls {
         traces,
         ocsf,
         agent,
+        metrics,
     }
 }
 
@@ -819,6 +826,7 @@ mod tests {
             }),
             ocsf: None,
             agent: None,
+            supervisor_metrics: None,
         }
     }
 
@@ -994,6 +1002,7 @@ mod tests {
             agent: Some(AgentOtlpConfig {
                 collector: collector("https://agents:4318"),
             }),
+            supervisor_metrics: None,
         };
 
         let tls = supervisor_otlp_tls(Some(&otlp));

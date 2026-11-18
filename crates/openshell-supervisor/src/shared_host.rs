@@ -2096,6 +2096,7 @@ mod tests {
                     nanos: 0,
                 }),
                 peer_endpoint: peer_endpoint.to_string(),
+                supervisor_metrics: Vec::new(),
             },
         ))
     }
