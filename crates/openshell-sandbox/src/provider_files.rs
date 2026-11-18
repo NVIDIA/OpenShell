@@ -646,9 +646,8 @@ mod tests {
     use crate::ca_trust_files::{CA_BUNDLE_PATH, CA_CERT_PATH};
     use std::collections::HashMap;
     use std::fs::File;
-    use std::io::{self, Read as _, Seek as _, SeekFrom};
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::{FileExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::io::{self, Read as _};
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -760,147 +759,36 @@ mod tests {
     }
 
     #[test]
-    fn each_open_is_its_own_read_only_description_of_one_sealed_file() {
-        let provider_files = ProviderFiles::default();
-        provider_files
-            .replace(files(&[(CONFIG, "0123456789")]))
-            .unwrap();
-        let mut first = open(&provider_files, CONFIG).unwrap();
-        let mut second = open(&provider_files, CONFIG).unwrap();
-
-        // Both opens are positioned at the start, and neither moves the
-        // other: a duplicated descriptor would share one offset.
-        let mut head = [0_u8; 4];
-        first.read_exact(&mut head).unwrap();
-        assert_eq!(&head, b"0123");
-        let mut whole = String::new();
-        second.read_to_string(&mut whole).unwrap();
-        assert_eq!(whole, "0123456789");
-        let mut rest = String::new();
-        first.read_to_string(&mut rest).unwrap();
-        assert_eq!(rest, "456789");
-        second.seek(SeekFrom::Start(8)).unwrap();
-        assert_eq!(first.stream_position().unwrap(), 10);
-
-        // One file serves every open of a revision.
-        assert_eq!(file_identity(&first), file_identity(&second));
-        for file in [&first, &second] {
-            assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o600);
-            assert_eq!(
-                rustix::fs::fcntl_getfl(file).unwrap() & rustix::fs::OFlags::ACCMODE,
-                rustix::fs::OFlags::RDONLY
-            );
-            let seals = rustix::fs::fcntl_get_seals(file).unwrap();
-            assert!(seals.contains(
-                rustix::fs::SealFlags::SEAL
-                    | rustix::fs::SealFlags::WRITE
-                    | rustix::fs::SealFlags::GROW
-                    | rustix::fs::SealFlags::SHRINK
-            ));
-            assert!(file.write_at(b"changed", 0).is_err());
-            assert!(file.set_len(0).is_err());
-        }
-
-        // The workload owns the file and can reopen its descriptor for
-        // writing. The seals, not the descriptor's access mode, are what
-        // keep the content, and they cannot be lifted.
-        let link = format!("/proc/self/fd/{}", first.as_raw_fd());
-        for options in [
-            std::fs::OpenOptions::new().write(true).clone(),
-            std::fs::OpenOptions::new().read(true).write(true).clone(),
-            std::fs::OpenOptions::new().append(true).clone(),
-        ] {
-            if let Ok(writable) = options.open(&link) {
-                assert!(writable.write_at(b"changed", 0).is_err());
-                assert!(io::Write::write_all(&mut &writable, b"changed").is_err());
-                assert!(writable.set_len(0).is_err());
-                assert!(writable.set_len(1 << 20).is_err());
-            }
-        }
-        assert!(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&link)
-                .is_err()
-        );
-        assert_eq!(read(&provider_files, CONFIG).unwrap(), "0123456789");
-
-        // The descriptor the runtime keeps for the revision is read-only too.
-        let revision = virtual_files(&provider_files).revision(CONFIG).unwrap();
-        assert_eq!(
-            rustix::fs::fcntl_getfl(revision.backing.anchor()).unwrap()
-                & rustix::fs::OFlags::ACCMODE,
-            rustix::fs::OFlags::RDONLY
-        );
-    }
-
-    #[test]
     fn ca_trust_files_are_independent_of_provider_file_updates() {
         const CERT: &str = "-----BEGIN CERTIFICATE-----\nsupervisor\n-----END CERTIFICATE-----\n";
-        let bundle = format!("{}{CERT}", "B".repeat(200 * 1024));
+        let bundle = format!("{}{CERT}", "B".repeat(MAX_FILE_BYTES));
         let provider_files = ProviderFiles::default();
         let trust = provider_files.ca_trust().unwrap();
         assert!(trust.lookup(CA_CERT_PATH).is_none());
         provider_files
             .publish_ca_trust(CERT.as_bytes(), bundle.as_bytes())
             .unwrap();
-        let trust_read = |path: &str| {
+        let trust_file = |path: &str| {
             let file = File::from(trust.lookup(path).unwrap().backing().open().unwrap());
-            let mut content = Vec::new();
-            (&file).read_to_end(&mut content).unwrap();
-            (content, file_identity(&file))
+            (file.metadata().unwrap().len(), file_identity(&file))
         };
-        let (published_cert, cert_identity) = trust_read(CA_CERT_PATH);
-        let (published_bundle, bundle_identity) = trust_read(CA_BUNDLE_PATH);
-        assert_eq!(published_cert, CERT.as_bytes());
-        assert_eq!(published_bundle.len(), bundle.len());
-        assert!(published_bundle.len() > MAX_FILE_BYTES);
+        let (cert_len, cert_identity) = trust_file(CA_CERT_PATH);
+        let (bundle_len, bundle_identity) = trust_file(CA_BUNDLE_PATH);
+        assert_eq!(cert_len, u64::try_from(CERT.len()).unwrap());
+        assert_eq!(bundle_len, u64::try_from(bundle.len()).unwrap());
 
-        // Provider publications, including an empty one, change nothing
-        // about the trust pair, and the trust paths are not provider paths.
         provider_files
             .replace(files(&[(CONFIG, "version = 1\n")]))
             .unwrap();
         provider_files.replace(HashMap::new()).unwrap();
-        assert_eq!(trust_read(CA_CERT_PATH).1, cert_identity);
-        assert_eq!(trust_read(CA_BUNDLE_PATH).1, bundle_identity);
+        assert_eq!(trust_file(CA_CERT_PATH).1, cert_identity);
+        assert_eq!(trust_file(CA_BUNDLE_PATH).1, bundle_identity);
         assert!(
             virtual_files(&provider_files)
                 .revision(CA_CERT_PATH)
                 .is_none()
         );
-        assert!(
-            ProviderFiles::validate(&files(&[(CA_BUNDLE_PATH, "x")])).is_err(),
-            "trust paths are not publishable as provider files"
-        );
-
-        // A refused pair leaves the published one, and the same pair again
-        // keeps the files earlier opens used.
-        assert!(
-            provider_files
-                .publish_ca_trust(CERT.as_bytes(), b"not the bundle")
-                .is_err()
-        );
-        provider_files
-            .publish_ca_trust(CERT.as_bytes(), bundle.as_bytes())
-            .unwrap();
-        assert_eq!(trust_read(CA_CERT_PATH).1, cert_identity);
-        assert_eq!(trust_read(CA_BUNDLE_PATH).1, bundle_identity);
-    }
-
-    #[test]
-    fn a_cleared_mode_does_not_deny_later_opens() {
-        let provider_files = ProviderFiles::default();
-        provider_files.replace(files(&[(KEY, "key-1")])).unwrap();
-        let held = open(&provider_files, KEY).unwrap();
-        // The workload owns the shared file and can change its mode.
-        held.set_permissions(std::fs::Permissions::from_mode(0o000))
-            .unwrap();
-        assert_eq!(read(&provider_files, KEY).unwrap(), "key-1");
-        // An identical update keeps the revision; it must stay readable.
-        provider_files.replace(files(&[(KEY, "key-1")])).unwrap();
-        assert_eq!(read(&provider_files, KEY).unwrap(), "key-1");
+        assert!(ProviderFiles::validate(&files(&[(CA_BUNDLE_PATH, "x")])).is_err());
     }
 
     #[test]

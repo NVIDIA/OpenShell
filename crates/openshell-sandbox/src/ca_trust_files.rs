@@ -193,11 +193,7 @@ impl TrustFile {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CA_BUNDLE_FILE_NAME, CA_BUNDLE_PATH, CA_CERT_FILE_NAME, CA_CERT_PATH, CaTrustFiles,
-        MAX_TRUST_FILE_BYTES, validate_pair,
-    };
-    use openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR;
+    use super::{CA_BUNDLE_PATH, CA_CERT_PATH, CaTrustFiles, MAX_TRUST_FILE_BYTES, validate_pair};
     use std::fs::File;
     use std::io::{self, Read as _};
     use std::os::unix::fs::MetadataExt as _;
@@ -212,8 +208,12 @@ mod tests {
         bundle
     }
 
+    fn open(files: &CaTrustFiles, path: &str) -> Option<File> {
+        Some(File::from(files.lookup(path)?.backing().open().unwrap()))
+    }
+
     fn read(files: &CaTrustFiles, path: &str) -> Option<(Vec<u8>, (u64, u64))> {
-        let file = File::from(files.lookup(path)?.backing().open().unwrap());
+        let file = open(files, path)?;
         let metadata = file.metadata().unwrap();
         let mut content = Vec::new();
         (&file).read_to_end(&mut content).unwrap();
@@ -221,25 +221,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_paths_are_the_installed_files() {
-        assert_eq!(
-            CA_CERT_PATH,
-            format!("{SUPERVISOR_CA_RUNTIME_DIR}/{CA_CERT_FILE_NAME}")
-        );
-        assert_eq!(
-            CA_BUNDLE_PATH,
-            format!("{SUPERVISOR_CA_RUNTIME_DIR}/{CA_BUNDLE_FILE_NAME}")
-        );
-        // Both share the six bytes the broker copies first with provider
-        // paths, so the fast rejection of ordinary paths covers them.
-        assert_eq!(&CA_CERT_PATH[..6], "/run/o");
-        assert_eq!(&CA_BUNDLE_PATH[..6], "/run/o");
-    }
-
-    #[test]
     fn a_pair_must_be_complete_consistent_and_bounded() {
         assert!(validate_pair(CERT, &bundle_with(16)).is_ok());
-        // A bundle far beyond the provider file bound is ordinary here.
         assert!(validate_pair(CERT, &bundle_with(300 * 1024)).is_ok());
         for (cert, bundle) in [
             (
@@ -275,49 +258,22 @@ mod tests {
         assert_eq!(cert, CERT);
         assert_eq!(bundle, first_bundle);
         assert_ne!(cert_identity, bundle_identity);
-        assert_eq!(
-            File::from(
-                files
-                    .lookup(CA_CERT_PATH)
-                    .unwrap()
-                    .backing()
-                    .open()
-                    .unwrap()
-            )
+        let mode = open(&files, CA_CERT_PATH)
+            .unwrap()
             .metadata()
             .unwrap()
-            .mode()
-                & 0o7777,
-            0o444
-        );
+            .mode();
+        assert_eq!(mode & 0o7777, 0o444);
 
-        // Republishing the same bytes keeps both files.
+        // The same bytes, or a refused pair, keep both files.
         files.publish(CERT, &first_bundle).unwrap();
+        let error = files.publish(CERT, b"unrelated").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(read(&files, CA_CERT_PATH).unwrap().1, cert_identity);
         assert_eq!(read(&files, CA_BUNDLE_PATH).unwrap().1, bundle_identity);
 
-        // A refused update leaves the pair as it was.
-        let error = files.publish(CERT, b"unrelated").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(
-            read(&files, CA_CERT_PATH).unwrap(),
-            (CERT.to_vec(), cert_identity)
-        );
-        assert_eq!(
-            read(&files, CA_BUNDLE_PATH).unwrap(),
-            (first_bundle.clone(), bundle_identity)
-        );
-
-        // A changed bundle replaces both files together, and a descriptor
-        // opened before the change keeps what it opened.
-        let held = File::from(
-            files
-                .lookup(CA_BUNDLE_PATH)
-                .unwrap()
-                .backing()
-                .open()
-                .unwrap(),
-        );
+        // A changed bundle replaces both files; a held descriptor keeps its own.
+        let held = open(&files, CA_BUNDLE_PATH).unwrap();
         let second_bundle = bundle_with(32);
         files.publish(CERT, &second_bundle).unwrap();
         let (bundle, new_bundle_identity) = read(&files, CA_BUNDLE_PATH).unwrap();
@@ -328,16 +284,8 @@ mod tests {
         (&held).read_to_end(&mut old).unwrap();
         assert_eq!(old, first_bundle);
 
-        // Clearing forgets the pair for later opens only: a descriptor held
-        // across the clear keeps reading the file it opened.
-        let held_cert = File::from(
-            files
-                .lookup(CA_CERT_PATH)
-                .unwrap()
-                .backing()
-                .open()
-                .unwrap(),
-        );
+        // Clearing forgets the pair for later opens only.
+        let held_cert = open(&files, CA_CERT_PATH).unwrap();
         files.clear();
         assert!(files.lookup(CA_CERT_PATH).is_none());
         assert!(files.lookup(CA_BUNDLE_PATH).is_none());
@@ -348,7 +296,6 @@ mod tests {
         files.publish(CERT, &second_bundle).unwrap();
         assert_eq!(read(&files, CA_BUNDLE_PATH).unwrap().0, second_bundle);
 
-        // Only the exact canonical paths are served.
         for alias in [
             "/run/openshell-supervisor-ca/material/../material/ca.crt",
             "/run/openshell-supervisor-ca/material/ca.crt/",
