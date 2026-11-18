@@ -14,7 +14,7 @@ use super::vm::{LAYER_POWER_OFF_TIMEOUT, QemuVm};
 
 /// Where setup layers are kept, under tmachine's cache directory. They depend
 /// only on the environment, so CI caches the disks here across commits.
-pub(super) const SETUP_DISKS: &str = "disks";
+pub(super) const SETUP_DISKS: &str = "disks/setup";
 /// Where install layers are kept. They hold the build under test, so CI leaves
 /// them out of its cache.
 pub(super) const INSTALL_DISKS: &str = "disks/install";

@@ -167,7 +167,7 @@ jobs:
           # Only the setup layers, which depend on the environment alone. The
           # install layers under disks/install hold this commit's build (and
           # on k3s, the gateway's credentials), so no later run could use them.
-          path: ~/.cache/tmachine/disks/*.qcow2
+          path: ~/.cache/tmachine/disks/setup/*.qcow2
           # tmachine keys its setup layers on a hash of the Ansible tree, the
           # environments' playbook lists and setup inputs (config.nix, and
           # files such as the Keycloak realm file) and the cache version in
