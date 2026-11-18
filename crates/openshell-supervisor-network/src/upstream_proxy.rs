@@ -2188,6 +2188,7 @@ mod tests {
         let err = connect_via(&endpoint, "api.example.com", 443, ConnectTarget::Hostname)
             .await
             .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
         assert!(err.to_string().contains("407"), "{err}");
     }
 

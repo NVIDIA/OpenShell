@@ -134,6 +134,8 @@ pub struct PolicyDnsEligibilitySnapshot {
 #[derive(Debug, Clone)]
 pub struct EgressAuthorization {
     pub action: NetworkAction,
+    /// Whether the policy engine evaluated the request.
+    pub(crate) policy_evaluated: bool,
     pub endpoint_configs: Vec<regorus::Value>,
     pub matched_endpoints: Vec<MatchedEndpoint>,
     pub exact_declared_endpoint_host: bool,
@@ -630,6 +632,15 @@ impl OpaEngine {
     /// Authorize egress and return all connection metadata from one Rego result
     /// evaluated against one policy generation.
     pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
+        use crate::metrics::{Scope, evaluate};
+        evaluate(
+            Scope::Connection,
+            || self.authorize_egress_inner(input),
+            |decision| matches!(decision.action, NetworkAction::Allow { .. }),
+        )
+    }
+
+    fn authorize_egress_inner(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
         #[cfg(test)]
         record_test_opa_query();
 
@@ -649,6 +660,7 @@ impl OpaEngine {
         if let Some(reason) = fail_closed_reason {
             return Ok(EgressAuthorization {
                 action: NetworkAction::Deny { reason },
+                policy_evaluated: false,
                 endpoint_configs: Vec::new(),
                 matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
@@ -688,6 +700,7 @@ impl OpaEngine {
 
         Ok(EgressAuthorization {
             action,
+            policy_evaluated: true,
             endpoint_configs,
             matched_endpoints,
             exact_declared_endpoint_host,
@@ -9052,6 +9065,9 @@ network_policies:
                 reason: "candidate policy validation failed: conflicting tls".to_string()
             }
         );
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert_eq!(authorization.action, action);
+        assert!(!authorization.policy_evaluated);
     }
 
     #[test]

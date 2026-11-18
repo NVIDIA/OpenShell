@@ -1444,6 +1444,8 @@ where
         }
         L7Protocol::Graphql => relay_graphql(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
+            use crate::metrics::{self, InspectionType, Outcome, Policy, Scope};
+
             if close_if_stale(engine.generation_guard(), ctx) {
                 return Ok(());
             }
@@ -1451,15 +1453,25 @@ where
             // chain can never inspect this stream: gate it like any other
             // uninspectable protocol.
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            match uninspectable_traffic_gate(&chain) {
+            let outcome = match uninspectable_traffic_gate(&chain) {
                 UninspectableTrafficGate::Deny => {
                     emit_middleware_uninspectable(ctx, "sql passthrough", true);
-                    return Ok(());
+                    Outcome::Deny
                 }
                 UninspectableTrafficGate::BypassWithFinding => {
                     emit_middleware_uninspectable(ctx, "sql passthrough", false);
+                    Outcome::FailOpen
                 }
-                UninspectableTrafficGate::Unrestricted => {}
+                UninspectableTrafficGate::Unrestricted => Outcome::Allow,
+            };
+            metrics::decision(
+                Scope::Connection,
+                outcome,
+                InspectionType::Tcp,
+                Policy::from(Some(ctx.policy_name.as_str())),
+            );
+            if matches!(outcome, Outcome::Deny) {
+                return Ok(());
             }
             // SQL provider is Phase 3 — fall through to passthrough with warning
             {

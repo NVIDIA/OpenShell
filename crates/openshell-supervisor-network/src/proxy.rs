@@ -17,6 +17,7 @@ use openshell_sandbox_backend::test_support as rpc_test;
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::correlation::{HttpOutcome, RequestStage};
 use crate::l7::tls::ProxyTlsState;
+use crate::metrics::{InspectionType, Outcome, Scope};
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(test)]
 use crate::policy_dns::SocketTrustedResolver;
@@ -824,6 +825,7 @@ async fn preauthorize_transparent_open(
     });
     let mut decision = supplied_authorization.decision;
     if let NetworkAction::Deny { reason } = &decision.action {
+        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
         let (denial, status_detail) = supplied_authorization.denial.map_or(
             (TcpOpenDenial::PolicyDenied, "transparent_tcp_policy_denied"),
             |denial| match denial {
@@ -1266,6 +1268,7 @@ async fn handle_transparent_tcp_connection(
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
 
     if let NetworkAction::Deny { reason } = &decision.action {
+        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Tcp);
         emit_transparent_policy_denial(&decision, workload_addr, &host, port);
         emit_denial(
             &denial_tx,
@@ -1454,6 +1457,7 @@ async fn handle_transparent_tcp_connection(
         }
     ));
     emit_activity(&activity_tx, false, "transparent_tcp");
+    decision.record_admission(Scope::Connection, Outcome::Allow, InspectionType::Tcp);
     relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await
 }
 
@@ -2410,6 +2414,7 @@ async fn deny_connect_destination<C>(
 where
     C: TokioAsyncWrite + Unpin,
 {
+    decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
     let detail = destination_denial_detail(denial.kind);
     egress_emit!(build_connect_destination_deny_ocsf_event(
         denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
@@ -2927,6 +2932,7 @@ async fn handle_mediated_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
+        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -3106,6 +3112,7 @@ async fn handle_mediated_connection(
     if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
         .await?
     {
+        decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
         if let Some(observer) = connect_endpoint_observer.as_ref() {
             observer.observe(EndpointResult::TlsFailed);
         }
@@ -3216,9 +3223,11 @@ async fn handle_mediated_connection(
     // Gate a `tls: skip` tunnel before `200 Connection Established`, so a
     // denial is a plain 403. Policy validation rejects fail-closed middleware
     // overlapping `tls: skip` endpoints; this runtime gate is defense in depth.
+    let mut raw_admission = Outcome::Allow;
     if effective_tls_skip {
         match middleware_uninspectable_gate(&opa_engine, &ctx)? {
             crate::l7::middleware::UninspectableTrafficGate::Deny => {
+                decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Tcp);
                 crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
                 respond(
                     &mut client,
@@ -3233,6 +3242,7 @@ async fn handle_mediated_connection(
                 return Ok(());
             }
             crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding => {
+                raw_admission = Outcome::FailOpen;
                 crate::l7::middleware::emit_middleware_uninspectable(
                     &ctx,
                     "tls-skip tunnel",
@@ -3317,6 +3327,7 @@ async fn handle_mediated_connection(
         else {
             return Ok(());
         };
+        decision.record_admission(Scope::Connection, raw_admission, InspectionType::Tcp);
         relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
         return Ok(());
     }
@@ -3475,6 +3486,7 @@ async fn handle_mediated_connection(
         if let Some(protocol_detail) =
             unsupported_l7_tunnel_protocol_detail(tunnel_protocol, requirement)
         {
+            decision.record_admission(Scope::Connection, Outcome::Deny, InspectionType::Unknown);
             if requirement == InspectionRequirement::RequiredMiddleware {
                 crate::l7::middleware::emit_middleware_uninspectable(&ctx, protocol_detail, true);
             }
@@ -3533,6 +3545,14 @@ async fn handle_mediated_connection(
         else {
             return Ok(());
         };
+        let outcome = if middleware_gate
+            == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding
+        {
+            Outcome::FailOpen
+        } else {
+            Outcome::Allow
+        };
+        decision.record_admission(Scope::Connection, outcome, InspectionType::Tcp);
         relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
     }
 
@@ -4745,33 +4765,30 @@ async fn dial_upstream(
     port: u16,
     addrs: &[SocketAddr],
 ) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    use crate::metrics::{Route, connect};
+
     if let Some(cfg) = upstream_proxy.as_ref() {
         return match cfg.decision(host_lc, port, addrs) {
             upstream_proxy::ProxyDecision::Proxy(endpoint) => {
-                if cfg.connect_by_hostname() {
-                    upstream_proxy::connect_via(
-                        endpoint,
-                        raw_host_lc,
-                        port,
-                        upstream_proxy::ConnectTarget::Hostname,
-                    )
-                    .await
-                } else {
-                    // Try every validated address in order, matching the
-                    // fallback the direct path's `TcpStream::connect` does.
-                    upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
-                }
+                connect(Route::Proxy, async {
+                    if cfg.connect_by_hostname() {
+                        upstream_proxy::connect_via(
+                            endpoint,
+                            raw_host_lc,
+                            port,
+                            upstream_proxy::ConnectTarget::Hostname,
+                        )
+                        .await
+                    } else {
+                        upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
+                    }
+                })
+                .await
             }
-            upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
-                Ok(upstream_proxy::PrefixedStream::without_prefix(
-                    connect_tcp_nodelay_best_effort(&direct_addrs[..]).await?,
-                ))
-            }
+            upstream_proxy::ProxyDecision::Direct(direct_addrs) => dial_direct(&direct_addrs).await,
         };
     }
-    Ok(upstream_proxy::PrefixedStream::without_prefix(
-        connect_tcp_nodelay_best_effort(addrs).await?,
-    ))
+    dial_direct(addrs).await
 }
 
 /// Dial a policy-DNS-correlated transparent TCP destination.
@@ -4787,21 +4804,30 @@ async fn dial_transparent_upstream(
     port: u16,
     addrs: &[SocketAddr],
 ) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    use crate::metrics::{Route, connect};
+
     if let Some(cfg) = upstream_proxy.as_ref() {
         return match cfg.decision(host_lc, port, addrs) {
             upstream_proxy::ProxyDecision::Proxy(endpoint) => {
-                upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
+                connect(
+                    Route::Proxy,
+                    upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs),
+                )
+                .await
             }
-            upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
-                Ok(upstream_proxy::PrefixedStream::without_prefix(
-                    connect_tcp_nodelay_best_effort(&direct_addrs[..]).await?,
-                ))
-            }
+            upstream_proxy::ProxyDecision::Direct(direct_addrs) => dial_direct(&direct_addrs).await,
         };
     }
-    Ok(upstream_proxy::PrefixedStream::without_prefix(
-        connect_tcp_nodelay_best_effort(addrs).await?,
-    ))
+    dial_direct(addrs).await
+}
+
+async fn dial_direct(addrs: &[SocketAddr]) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    crate::metrics::connect(
+        crate::metrics::Route::Direct,
+        connect_tcp_nodelay_best_effort(addrs),
+    )
+    .await
+    .map(upstream_proxy::PrefixedStream::without_prefix)
 }
 
 /// Resolve a host:port using the supervisor resolver, then reject if any
