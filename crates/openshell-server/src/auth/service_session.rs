@@ -1174,17 +1174,20 @@ pub mod tests {
     }
 
     async fn replica(state: &Arc<ServerState>) -> Arc<ServerState> {
-        Arc::new(ServerState::new_with_credentials(
-            state.config.clone(),
-            state.store.clone(),
-            crate::compute::new_test_runtime(state.store.clone()).await,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            state.oidc_cache.clone(),
-            state.credentials.clone(),
-        ))
+        Arc::new(
+            ServerState::new_with_credentials(
+                state.config.clone(),
+                state.store.clone(),
+                crate::compute::new_test_runtime(state.store.clone()).await,
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+                state.oidc_cache.clone(),
+                state.credentials.clone(),
+            )
+            .expect("valid replica configuration"),
+        )
     }
     fn application(cookie: &str) -> Request<Body> {
         let mut req = request(Method::GET, &format!("{APP}/"));
