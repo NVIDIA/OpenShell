@@ -125,10 +125,16 @@ replica, independent of which replica runs the compute driver's watch:
   warm-pool controller, rather than an unfenced takeover. Workspace-scoped
   preparation inventory supplies physical coordinates, original-owner
   availability, and an exact reservation revision. Conditional release fences
-  claims before retiring material and retaining a permanent physical-route
+  claims before retiring material and retaining a physical-route
   fence; it never enqueues an unconditional route withdrawal. Retirement can
   also fence an absent or not-yet-admitted preparation, preventing delayed
   retries from recreating it. The fence has no credentials or capacity charge.
+  Reconciliation collects up to 64 retirement tombstones per pass after 24 hours,
+  once no warm-pool journal references their physical session. Missing session
+  identity or unreadable journals defer collection. Preparation reserves its route
+  atomically with a version check of its live journal entry and bootstrap epoch,
+  so delayed requests cannot recreate a collected route. Existing preparations
+  remain recoverable without a new admission.
   The Kubernetes driver's default-on warm-pool reconciler derives capacity from
   templates with startup tuning. It stores bounded creation intents in
   `warm_pool_journal`, scoped by workspace and immutable template ID. Template

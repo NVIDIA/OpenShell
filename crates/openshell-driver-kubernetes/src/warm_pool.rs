@@ -561,6 +561,7 @@ impl KubernetesComputeDriver {
         let route = record.route();
         let bootstrap = PreparedRuntimeBootstrap {
             workspace: record.workspace.clone(),
+            pool_id: record.pool_id.clone(),
             namespace: resource.namespace.clone(),
             pod_name: resource.name.clone(),
             pod_uid: pod_uid.into(),

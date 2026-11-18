@@ -90,6 +90,8 @@ pub type PlacementFuture<T = ()> = Pin<Box<dyn Future<Output = Result<T, String>
 #[derive(Clone, Debug)]
 pub struct PreparationRequest {
     pub registration: PreparedRuntimeRegistration,
+    /// Durable pool journal that authorizes admission of this physical session.
+    pub pool_id: String,
     /// Workspace whose warm pool owns this runtime and its stored material.
     pub workspace: String,
     /// Epoch installed in the runtime bootstrap; activation must use it.

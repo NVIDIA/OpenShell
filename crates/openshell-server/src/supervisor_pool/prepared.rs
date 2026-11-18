@@ -817,7 +817,11 @@ impl SupervisorPool {
                 .record_assignment_scoped(
                     &assignment,
                     RecordPhase::Published,
-                    Some((&request.workspace, request.auth_epoch.get())),
+                    Some((
+                        &request.workspace,
+                        request.auth_epoch.get(),
+                        &request.pool_id,
+                    )),
                 )
                 .await
                 .map(drop);
@@ -827,7 +831,7 @@ impl SupervisorPool {
                 assignment,
                 auth_epoch: request.auth_epoch.get(),
             },
-            Some(&request.workspace),
+            Some((&request.workspace, &request.pool_id)),
         )
         .await
     }
@@ -878,6 +882,10 @@ impl SupervisorPool {
                     material_handle: Vec::new(),
                     prepared: true,
                     prepared_epoch: retirement.auth_epoch.get(),
+                    prepared_session: retirement
+                        .route
+                        .strip_prefix("rt-")
+                        .and_then(|session| session.parse().ok()),
                     activation_candidate: false,
                     claim_handle: Vec::new(),
                 };

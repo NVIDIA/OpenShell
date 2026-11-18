@@ -6,8 +6,13 @@ use super::*;
 use openshell_core::jwt::CredentialEpoch;
 use openshell_supervisor_control::{PreparedRuntimeRegistration, SandboxInstanceRegistration};
 
-fn preparation(route: &str) -> PreparationRequest {
+async fn preparation(fixture: &Fixture, route: &str) -> PreparationRequest {
     let session = openshell_core::SandboxSessionId::new();
+    let route = if route.is_empty() {
+        format!("rt-{session}")
+    } else {
+        route.into()
+    };
     let name = format!("sandbox.{session}.openshell.internal");
     let tls = openshell_crypto::pki::generate_simple_self_signed(vec![name.clone()]).unwrap();
     let registration: PreparedRuntimeRegistration = serde_json::from_value(serde_json::json!({
@@ -23,11 +28,14 @@ fn preparation(route: &str) -> PreparationRequest {
         }
     })).unwrap();
     registration.validate().unwrap();
-    PreparationRequest {
+    let request = PreparationRequest {
+        pool_id: "test-pool".into(),
         registration,
         workspace: "default".into(),
         auth_epoch: CredentialEpoch::new(1).unwrap(),
-    }
+    };
+    authorize_preparation(fixture, &request).await;
+    request
 }
 
 fn activation(prepared: &PreparationRequest, sandbox: &str) -> ActivationRequest {
@@ -56,6 +64,44 @@ fn activation(prepared: &PreparationRequest, sandbox: &str) -> ActivationRequest
     }
 }
 
+async fn authorize_preparation(fixture: &Fixture, request: &PreparationRequest) {
+    use openshell_supervisor_control::warm_pool::{WarmPoolEntry, WarmPoolState, WarmPoolUpdate};
+    let pool = fixture.replica("journal-writer");
+    let previous = pool
+        .warm_pool_state(&request.workspace, &request.pool_id)
+        .await
+        .unwrap();
+    let expected_version = previous.as_ref().map(|snapshot| snapshot.resource_version);
+    let mut state = previous.map_or_else(
+        || WarmPoolState {
+            revision: 1,
+            fingerprint: "a".repeat(64),
+            policy: None,
+            entries: Vec::new(),
+        },
+        |snapshot| snapshot.state,
+    );
+    state.entries.push(WarmPoolEntry {
+        session_id: request.registration.runtime_descriptor.session_id,
+        created_at_ms: now_ms(),
+        last_attempt_at_ms: None,
+        last_ready_at_ms: None,
+        resource_uid: None,
+        retiring: false,
+        auth_epoch: Some(request.auth_epoch),
+    });
+    assert!(
+        pool.update_warm_pool(WarmPoolUpdate {
+            workspace: request.workspace.clone(),
+            pool_id: request.pool_id.clone(),
+            expected_version,
+            state,
+        })
+        .await
+        .unwrap()
+    );
+}
+
 async fn setup() -> (Fixture, Arc<SupervisorPool>, PreparationRequest) {
     let fixture = Fixture::new().await;
     fixture.member("m1", "p1", false).await;
@@ -63,7 +109,7 @@ async fn setup() -> (Fixture, Arc<SupervisorPool>, PreparationRequest) {
         .sandbox("sandbox-a", "generation-1", SandboxPhase::Provisioning)
         .await;
     let pool = fixture.replica("gateway-a");
-    let prepared = preparation("rt-prepared-0123456789");
+    let prepared = preparation(&fixture, "rt-prepared-0123456789").await;
     pool.prepare_runtime(prepared.clone()).await.unwrap();
     (fixture, pool, prepared)
 }
@@ -78,14 +124,15 @@ async fn inventory(pool: &SupervisorPool) -> PreparedRuntime {
 async fn preparation_inventory_is_scoped_durable_and_excludes_unadmitted_and_claimed_runtimes() {
     let (fixture, pool, prepared) = setup().await;
     let before = inventory(&pool).await;
-    let mut other = preparation("rt-other-workspace-0123456789");
+    let mut other = preparation(&fixture, "rt-other-workspace-0123456789").await;
     other.workspace = "another-workspace".into();
+    authorize_preparation(&fixture, &other).await;
     pool.prepare_runtime(other.clone()).await.unwrap();
-    let pending = preparation("rt-unadmitted-0123456789");
+    let pending = preparation(&fixture, "rt-unadmitted-0123456789").await;
     pool.record_assignment_scoped(
         &pending.registration.to_assignment().unwrap(),
         RecordPhase::Admitting,
-        Some(("default", 1)),
+        Some(("default", 1, "test-pool")),
     )
     .await
     .unwrap();
@@ -253,7 +300,7 @@ async fn preparation_release_rejects_wrong_workspace_and_prevents_route_reuse() 
     pool.reconcile_once().await.unwrap();
 
     // Delayed retries and accidental reuse cannot resurrect a retired route.
-    let replacement = preparation(&prepared.registration.route);
+    let replacement = preparation(&fixture, &prepared.registration.route).await;
     assert!(pool.prepare_runtime(replacement).await.is_err());
     assert!(pool.prepare_runtime(prepared.clone()).await.is_err());
     assert_eq!(
@@ -498,7 +545,7 @@ async fn claim_adopts_physical_identity_and_issues_bound_credentials() {
 #[tokio::test]
 async fn one_sandbox_cannot_claim_two_preparations() {
     let (fixture, pool, first) = setup().await;
-    let second = preparation("rt-second-0123456789");
+    let second = preparation(&fixture, "rt-second-0123456789").await;
     pool.prepare_runtime(second.clone()).await.unwrap();
     let other = fixture.replica("gateway-b");
     let (a, b) = tokio::join!(
@@ -581,7 +628,7 @@ async fn winning_claim_retry_cannot_republish_an_ended_launch() {
 async fn warm_and_active_reservations_share_capacity_and_claim_needs_no_free_slot() {
     let (fixture, pool, prepared) = setup().await;
     fixture.fill("m1", "p1", MAX_ASSIGNED_INSTANCES - 1).await;
-    let overflow = preparation("rt-overflow-0123456789");
+    let overflow = preparation(&fixture, "rt-overflow-0123456789").await;
     assert!(pool.prepare_runtime(overflow.clone()).await.is_err());
     assert!(
         pool.assignment(&overflow.registration.route)
@@ -829,7 +876,7 @@ async fn retirement_before_preparation_survives_restart_and_blocks_late_preparat
     let fixture = Fixture::new().await;
     fixture.member("m1", "p1", false).await;
     let pool = fixture.replica("gateway-a");
-    let prepared = preparation("rt-never-admitted-0123456789");
+    let prepared = preparation(&fixture, "rt-never-admitted-0123456789").await;
     let request = retirement(&prepared);
     assert_eq!(
         pool.retire_preparation(request.clone()).await.unwrap(),
@@ -871,7 +918,7 @@ async fn retirement_fences_preparation_while_its_material_is_being_staged() {
     let fixture = Fixture::new().await;
     fixture.member("m1", "p1", false).await;
     let pool = fixture.replica("gateway-a");
-    let prepared = preparation("rt-staging-0123456789");
+    let prepared = preparation(&fixture, "rt-staging-0123456789").await;
     let request = retirement(&prepared);
     let (reached, wait) = tokio::sync::oneshot::channel();
     let (resume, resumed) = tokio::sync::oneshot::channel();
@@ -923,11 +970,11 @@ async fn retirement_covers_admitting_records_but_never_a_claim_or_other_identity
             PreparationRelease::Changed
         );
     }
-    let pending = preparation("rt-admitting-0123456789");
+    let pending = preparation(&fixture, "rt-admitting-0123456789").await;
     pool.record_assignment_scoped(
         &pending.registration.to_assignment().unwrap(),
         RecordPhase::Admitting,
-        Some(("default", 1)),
+        Some(("default", 1, "test-pool")),
     )
     .await
     .unwrap();
@@ -1020,7 +1067,7 @@ async fn dedicated_setup() -> (Fixture, Arc<SupervisorPool>, PreparationRequest)
         .await;
     let mut pool = fixture.replica("dedicated");
     Arc::get_mut(&mut pool).unwrap().dedicated = true;
-    let mut request = preparation("rt-dedicated-0123456789");
+    let mut request = preparation(&fixture, "rt-dedicated-0123456789").await;
     request
         .registration
         .runtime_descriptor
@@ -1208,7 +1255,7 @@ async fn dedicated_registration_watcher_observes_remote_activation_and_local_ret
 
     let (fixture, pool, prepared) = dedicated_setup().await;
     let identity = registration_identity(&prepared);
-    let mut other = preparation("rt-unaffected-0123456789");
+    let mut other = preparation(&fixture, "rt-unaffected-0123456789").await;
     other
         .registration
         .runtime_descriptor
@@ -1339,7 +1386,7 @@ async fn committed_intent_owns_the_preparation_before_infrastructure_binding() {
 
 #[tokio::test]
 async fn retirement_winner_is_a_typed_miss_and_allows_a_cold_decision() {
-    let (_, pool, prepared) = setup().await;
+    let (fixture, pool, prepared) = setup().await;
     let intent = claim_intent(&prepared, "sandbox-a");
     pool.retire_preparation(retirement(&prepared))
         .await
@@ -1356,7 +1403,7 @@ async fn retirement_winner_is_a_typed_miss_and_allows_a_cold_decision() {
             .unwrap()
             .is_none()
     );
-    let other = preparation("rt-other-prepared-0123456789");
+    let other = preparation(&fixture, "rt-other-prepared-0123456789").await;
     pool.prepare_runtime(other.clone()).await.unwrap();
     assert!(matches!(
         pool.reserve_warm_claim("default", claim_intent(&other, "sandbox-a"))
@@ -1658,7 +1705,7 @@ async fn warm_claim_collection_and_retirement_fence_delayed_intent_publication()
 #[tokio::test]
 async fn one_logical_launch_selects_one_intent_before_either_cr_is_bound() {
     let (fixture, first, prepared) = setup().await;
-    let other = preparation("rt-another-prepared-0123456789");
+    let other = preparation(&fixture, "rt-another-prepared-0123456789").await;
     first.prepare_runtime(other.clone()).await.unwrap();
     let second = fixture.replica("gateway-b");
     let (a, b) = tokio::join!(
@@ -1695,5 +1742,255 @@ async fn one_logical_launch_selects_one_intent_before_either_cr_is_bound() {
             .is_none()
     );
     restarted.remove_stale_candidates().await;
+    assert_eq!(fixture.candidates().await, 0);
+}
+
+async fn remove_preparation_intent(pool: &SupervisorPool, prepared: &PreparationRequest) {
+    use openshell_supervisor_control::warm_pool::WarmPoolUpdate;
+    let mut snapshot = pool
+        .warm_pool_state(&prepared.workspace, &prepared.pool_id)
+        .await
+        .unwrap()
+        .unwrap();
+    snapshot
+        .state
+        .entries
+        .retain(|entry| entry.session_id != prepared.registration.runtime_descriptor.session_id);
+    assert!(
+        pool.update_warm_pool(WarmPoolUpdate {
+            workspace: prepared.workspace.clone(),
+            pool_id: prepared.pool_id.clone(),
+            expected_version: Some(snapshot.resource_version),
+            state: snapshot.state,
+        })
+        .await
+        .unwrap()
+    );
+}
+
+async fn aged_assignments(pool: &SupervisorPool) -> BTreeMap<String, AssignmentRecord> {
+    let mut records = pool.all_assignments().await.unwrap();
+    for record in records.values_mut() {
+        record.updated_at_ms = now_ms() - 25 * 60 * 60 * 1000;
+    }
+    records
+}
+
+#[tokio::test]
+async fn retirement_cleanup_waits_for_retention_and_journal_removal() {
+    let (fixture, pool, prepared) = dedicated_setup().await;
+    pool.retire_preparation(retirement(&prepared))
+        .await
+        .unwrap();
+    let aged = aged_assignments(&pool).await;
+    pool.remove_retired_assignments(&aged).await;
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    remove_preparation_intent(&pool, &prepared).await;
+    pool.reconcile_once().await.unwrap();
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    pool.remove_retired_assignments(&aged).await;
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut recovered = fixture.replica("restarted");
+    Arc::get_mut(&mut recovered).unwrap().dedicated = true;
+    assert!(recovered.prepare_runtime(prepared.clone()).await.is_err());
+    assert!(
+        recovered
+            .activate_runtime(activation(&prepared, "sandbox-a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        recovered
+            .assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn retirement_cleanup_fences_preparation_paused_before_reservation() {
+    for dedicated in [false, true] {
+        retirement_cleanup_race(&Fixture::new().await, dedicated).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database; run mise run test:rust:postgres"]
+async fn postgres_retirement_cleanup_fences_preparation_paused_before_reservation() {
+    let schema = crate::persistence::test_postgres::TestSchema::create("retirement_cleanup").await;
+    for dedicated in [false, true] {
+        retirement_cleanup_race(
+            &Fixture::with_store(schema.connect_store().await),
+            dedicated,
+        )
+        .await;
+    }
+    schema.drop_schema().await;
+}
+
+async fn retirement_cleanup_race(fixture: &Fixture, dedicated: bool) {
+    fixture.member("m1", "p1", false).await;
+    let mut pool = fixture.replica("preparer");
+    Arc::get_mut(&mut pool).unwrap().dedicated = dedicated;
+    let mut prepared = preparation(fixture, "").await;
+    prepared
+        .registration
+        .runtime_descriptor
+        .resource_claims
+        .insert(
+            "kubernetes.supervisor_pod_uid".into(),
+            "supervisor-pod".into(),
+        );
+    let (reached, wait) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    *lock(&pool.hooks.preparation_gate) = Some((reached, resumed));
+    let worker = pool.clone();
+    let request = prepared.clone();
+    let task = tokio::spawn(async move { worker.prepare_runtime(request).await });
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    pool.retire_preparation(retirement(&prepared))
+        .await
+        .unwrap();
+    remove_preparation_intent(&pool, &prepared).await;
+    pool.remove_retired_assignments(&aged_assignments(&pool).await)
+        .await;
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    resume.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.candidates().await, 0);
+}
+
+#[tokio::test]
+async fn retirement_cleanup_preserves_changed_rows_and_fails_closed_on_invalid_journals() {
+    let (_fixture, pool, prepared) = dedicated_setup().await;
+    pool.retire_preparation(retirement(&prepared))
+        .await
+        .unwrap();
+    remove_preparation_intent(&pool, &prepared).await;
+    let aged = aged_assignments(&pool).await;
+    let record = &aged[&prepared.registration.route];
+    let journal_id = serde_json::to_string(&(&prepared.workspace, &prepared.pool_id)).unwrap();
+    let journal = pool
+        .store
+        .get("warm_pool_journal", &journal_id)
+        .await
+        .unwrap()
+        .unwrap();
+    pool.store
+        .put_if(
+            "warm_pool_journal",
+            &journal.id,
+            &journal.name,
+            &journal.workspace,
+            b"invalid",
+            None,
+            WriteCondition::Unconditional,
+        )
+        .await
+        .unwrap();
+    pool.remove_retired_assignments(&aged).await;
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    pool.store
+        .put_if(
+            "warm_pool_journal",
+            &journal.id,
+            &journal.name,
+            &journal.workspace,
+            &journal.payload,
+            None,
+            WriteCondition::Unconditional,
+        )
+        .await
+        .unwrap();
+    // An old collector must not delete a row changed by another replica.
+    pool.store
+        .put_if(
+            ASSIGNMENT_OBJECT_TYPE,
+            &assignment_object_id(&record.payload.route, &record.payload.writer),
+            &record.payload.route,
+            "",
+            &serde_json::to_vec(&record.payload).unwrap(),
+            None,
+            WriteCondition::MatchResourceVersion(record.resource_version),
+        )
+        .await
+        .unwrap();
+    pool.remove_retired_assignments(&aged).await;
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    pool.remove_retired_assignments(&aged_assignments(&pool).await)
+        .await;
+    assert!(
+        pool.assignment(&prepared.registration.route)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn retirement_cleanup_is_bounded_and_preserves_active_assignments() {
+    let (fixture, pool, prepared) = dedicated_setup().await;
+    let mut request = retirement(&prepared);
+    for _ in 0..=CLEANUP_PER_PASS {
+        request.route = format!("rt-{}", openshell_core::SandboxSessionId::new());
+        pool.retire_preparation(request.clone()).await.unwrap();
+    }
+    pool.remove_retired_assignments(&aged_assignments(&pool).await)
+        .await;
+    let records = pool.all_assignments().await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[&prepared.registration.route].payload.phase,
+        RecordPhase::Published
+    );
+    pool.remove_retired_assignments(&aged_assignments(&pool).await)
+        .await;
+    assert_eq!(pool.all_assignments().await.unwrap().len(), 1);
     assert_eq!(fixture.candidates().await, 0);
 }

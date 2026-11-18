@@ -1399,6 +1399,9 @@ A running warm Pod is not proof of an authenticated parked connection.
 Delete a template to drain its unclaimed pool, or set `warm_pool.enabled=false`
 on all replicas to drain all pools even after a runtime configuration mismatch.
 Draining is recorded in the journal; re-enable with a higher `warm_pool.revision`.
+Retired route records remain for at least 24 hours and are collected once their
+physical sessions leave the pool journal. Journal read failures defer cleanup;
+`could not check warm-pool journals for retirement cleanup` identifies this case.
 Creates with `--template` claim only that template's ready spares; unmatched
 requests use cold creation. `warm runtime ready for
 claim` records the first authenticated readiness observation. A claimed sandbox

@@ -274,6 +274,9 @@ struct AssignmentPayload {
     /// its physical route remains single-use after the assigned Sandbox stops.
     #[serde(default)]
     prepared_epoch: u64,
+    /// Journal identity retained after activation and retirement.
+    #[serde(default)]
+    prepared_session: Option<openshell_core::SandboxSessionId>,
     /// A material candidate whose version fences an in-flight activation.
     #[serde(default)]
     activation_candidate: bool,
@@ -479,6 +482,8 @@ type TransitionGate = (
 #[cfg(test)]
 #[derive(Default)]
 struct TestHooks {
+    /// Pauses preparation after reading its journal, before reserving the route.
+    preparation_gate: Mutex<Option<Gate>>,
     /// Pauses the next listing of an object type after its first page.
     listing_gate: Mutex<Option<(String, Gate)>>,
     /// Routes dropped from assignment and owner listings, as a listing that
@@ -1641,7 +1646,7 @@ impl SupervisorPool {
         &self,
         assignment: &SandboxInstanceAssignment,
         phase: RecordPhase,
-        preparation: Option<(&str, u64)>,
+        preparation: Option<(&str, u64, &str)>,
     ) -> Result<Recording, String> {
         let read = |error: PersistenceError| format!("read supervisor pool instance: {error}");
         let existing = |record: AssignmentRecord| match record.payload.phase {
@@ -1649,7 +1654,7 @@ impl SupervisorPool {
                 if record.payload.generation == assignment.generation
                     && record.payload.sandbox_id == assignment.sandbox_id
                     && record.payload.prepared == assignment.prepared
-                    && preparation.is_none_or(|(workspace, epoch)| {
+                    && preparation.is_none_or(|(workspace, epoch, _)| {
                         record.payload.workspace == workspace
                             && record.payload.prepared_epoch == epoch
                     }) =>
@@ -1678,7 +1683,7 @@ impl SupervisorPool {
             }
             if record.payload.prepared != assignment.prepared
                 || (assignment.prepared
-                    && (preparation
+                    && (preparation.map(|(workspace, epoch, _)| (workspace, epoch))
                         != Some((
                             record.payload.workspace.as_str(),
                             record.payload.prepared_epoch,
@@ -1690,7 +1695,7 @@ impl SupervisorPool {
             }
             return existing(record);
         }
-        let workspace = if let Some((workspace, _)) = preparation {
+        let workspace = if let Some((workspace, _, _)) = preparation {
             workspace.to_string()
         } else {
             let sandbox = self
@@ -1711,7 +1716,19 @@ impl SupervisorPool {
             writer: Uuid::new_v4().to_string(),
             material_handle: Vec::new(),
             prepared: assignment.prepared,
-            prepared_epoch: preparation.map_or(0, |(_, epoch)| epoch),
+            prepared_epoch: preparation.map_or(0, |(_, epoch, _)| epoch),
+            prepared_session: if preparation.is_some() {
+                Some(
+                    openshell_supervisor_control::PreparedRuntimeRegistration::from_assignment(
+                        assignment,
+                    )
+                    .map_err(|e| e.to_string())?
+                    .runtime_descriptor
+                    .session_id,
+                )
+            } else {
+                None
+            },
             activation_candidate: false,
             claim_handle: Vec::new(),
         };
@@ -1720,22 +1737,26 @@ impl SupervisorPool {
             serde_json::to_vec(payload)
                 .map_err(|error| format!("encode supervisor pool instance: {error}"))
         };
-        let reservation = match self
-            .store
-            .put_if(
-                ASSIGNMENT_OBJECT_TYPE,
-                &id,
-                &payload.route,
-                "",
-                &encode(&payload)?,
-                None,
-                WriteCondition::MustCreate,
-            )
-            .await
-        {
+        let reservation_write = if let Some((workspace, epoch, pool_id)) = preparation {
+            Box::pin(self.reserve_warm_assignment(workspace, pool_id, epoch, assignment, &payload))
+                .await
+        } else {
+            self.store
+                .put_if(
+                    ASSIGNMENT_OBJECT_TYPE,
+                    &id,
+                    &payload.route,
+                    "",
+                    &encode(&payload)?,
+                    None,
+                    WriteCondition::MustCreate,
+                )
+                .await
+        };
+        let reservation = match reservation_write {
             Ok(written) => written.resource_version,
             // Another recording reserved or published the route first.
-            Err(PersistenceError::UniqueViolation { .. }) => {
+            Err(PersistenceError::UniqueViolation { .. } | PersistenceError::Conflict { .. }) => {
                 return existing(
                     self.assignment(&payload.route)
                         .await
@@ -2079,7 +2100,7 @@ impl SupervisorPool {
     async fn place_scoped(
         &self,
         request: PlacementRequest,
-        workspace: Option<&str>,
+        preparation: Option<(&str, &str)>,
     ) -> Result<(), String> {
         let assignment = &request.assignment;
         let members = self
@@ -2121,11 +2142,11 @@ impl SupervisorPool {
         if targets.is_empty() {
             return Err(no_room());
         }
-        let recording = if workspace.is_some() {
+        let recording = if preparation.is_some() {
             self.record_assignment_scoped(
                 assignment,
                 RecordPhase::Admitting,
-                workspace.map(|w| (w, request.auth_epoch)),
+                preparation.map(|(workspace, pool)| (workspace, request.auth_epoch, pool)),
             )
             .await?
         } else {
@@ -2329,6 +2350,7 @@ impl SupervisorPool {
         }
         self.fence_stale_reservations(&records).await;
         self.remove_stale_candidates().await;
+        self.remove_retired_assignments(&records).await;
         let mut desired = records
             .into_iter()
             .filter(|(route, record)| {
@@ -3358,7 +3380,7 @@ mod tests {
         }
 
         /// A fixture over `store`, such as one connected to `PostgreSQL`.
-        fn with_store(store: Store) -> Self {
+        pub(super) fn with_store(store: Store) -> Self {
             let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
             let store = Arc::new(store);
             let config = crate::Config::new(None)
@@ -3577,6 +3599,7 @@ mod tests {
                 material_handle: b"handle".to_vec(),
                 prepared: false,
                 prepared_epoch: 0,
+                prepared_session: None,
                 activation_candidate: false,
                 claim_handle: Vec::new(),
             };

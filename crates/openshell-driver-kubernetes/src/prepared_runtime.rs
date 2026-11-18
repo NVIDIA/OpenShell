@@ -45,6 +45,7 @@ const MAX_BOOTSTRAP_BYTES: usize = 512 * 1024;
 #[derive(Clone, Debug)]
 pub struct PreparedRuntimeBootstrap {
     pub workspace: String,
+    pub pool_id: String,
     pub namespace: String,
     pub pod_name: String,
     pub pod_uid: String,
@@ -108,6 +109,7 @@ impl PreparedRuntimeBootstrap {
     fn validate(&self) -> Result<(), KubernetesDriverError> {
         if [
             &self.workspace,
+            &self.pool_id,
             &self.namespace,
             &self.pod_name,
             &self.pod_uid,
@@ -172,6 +174,7 @@ impl PreparedRuntimeBootstrap {
             .map_err(|_| invalid("invalid prepared runtime registration"))?;
         Ok(PreparationRequest {
             workspace: self.workspace.clone(),
+            pool_id: self.pool_id.clone(),
             auth_epoch: config.auth_epoch,
             registration,
         })

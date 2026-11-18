@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{BTreeSet, PersistenceError, SupervisorPool, WriteCondition};
+use super::{
+    ASSIGNMENT_OBJECT_TYPE, AssignmentPayload, AssignmentRecord, AtomicWrite, BTreeMap, BTreeSet,
+    CLEANUP_PER_PASS, PersistenceError, RecordPhase, SandboxInstanceAssignment, SupervisorPool,
+    TRANSITION_ATTEMPTS, WriteCondition, assignment_object_id, now_ms,
+};
 use openshell_supervisor_control::warm_pool::{WarmPoolSnapshot, WarmPoolState, WarmPoolUpdate};
 
 use crate::persistence::ObjectListQuery;
@@ -10,6 +14,7 @@ use openshell_supervisor_control::warm_pool::WarmPoolTarget;
 
 const OBJECT_TYPE: &str = "warm_pool_journal";
 const MAX_JOURNAL_BYTES: usize = 128 * 1024;
+const RETIREMENT_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn identity(workspace: &str, pool: &str) -> Result<String, String> {
     if workspace.is_empty() || workspace.len() > 63 || pool.is_empty() || pool.len() > 63 {
@@ -55,6 +60,136 @@ fn validate(state: &WarmPoolState) -> Result<(), String> {
 }
 
 impl SupervisorPool {
+    /// Admission and journal removal must contend in the same transaction.
+    /// Otherwise a request paused after reading its entry could recreate a
+    /// route whose retirement tombstone has already been collected.
+    pub(super) async fn reserve_warm_assignment(
+        &self,
+        workspace: &str,
+        pool_id: &str,
+        epoch: u64,
+        assignment: &SandboxInstanceAssignment,
+        payload: &AssignmentPayload,
+    ) -> crate::persistence::PersistenceResult<crate::persistence::WriteResult> {
+        let invalid = PersistenceError::Config;
+        let registration =
+            openshell_supervisor_control::PreparedRuntimeRegistration::from_assignment(assignment)
+                .map_err(|e| invalid(e.to_string()))?;
+        let journal_id = identity(workspace, pool_id).map_err(invalid)?;
+        for _ in 0..TRANSITION_ATTEMPTS {
+            let journal = self
+                .store
+                .get(OBJECT_TYPE, &journal_id)
+                .await?
+                .ok_or_else(|| invalid("warm preparation has no pool journal".into()))?;
+            let state = decode_journal(&journal)?;
+            if journal.workspace != workspace
+                || journal.name != pool_id
+                || !state.entries.iter().any(|entry| {
+                    entry.session_id == registration.runtime_descriptor.session_id
+                        && !entry.retiring
+                        && entry.auth_epoch.is_some_and(|auth| auth.get() == epoch)
+                })
+            {
+                return Err(invalid(
+                    "warm preparation has no live journal entry at its bootstrap epoch".into(),
+                ));
+            }
+            let writes = [
+                AtomicWrite::Create {
+                    object_type: ASSIGNMENT_OBJECT_TYPE.into(),
+                    id: assignment_object_id(&payload.route, &payload.writer),
+                    name: payload.route.clone(),
+                    workspace: String::new(),
+                    payload: serde_json::to_vec(payload)
+                        .map_err(|e| PersistenceError::Encode(e.to_string()))?,
+                },
+                AtomicWrite::Update {
+                    object_type: OBJECT_TYPE.into(),
+                    id: journal.id,
+                    payload: journal.payload,
+                    expected_version: journal.resource_version,
+                },
+            ];
+            #[cfg(test)]
+            {
+                let gate = super::lock(&self.hooks.preparation_gate).take();
+                if let Some((reached, resume)) = gate {
+                    let _ = reached.send(());
+                    let _ = resume.await;
+                }
+            }
+            match self.store.write_atomically(&writes).await {
+                Ok(mut results) => {
+                    return results.remove(0).ok_or_else(|| {
+                        invalid("warm reservation write returned no revision".into())
+                    });
+                }
+                Err(error @ PersistenceError::Conflict { .. }) => {
+                    // A competing preparation may have won. Let the caller
+                    // validate it; only journal contention is retried here.
+                    if self.assignment(&payload.route).await?.is_some() {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(invalid(
+            "warm-pool journal changed repeatedly during admission".into(),
+        ))
+    }
+
+    pub(super) async fn remove_retired_assignments(
+        &self,
+        records: &BTreeMap<String, AssignmentRecord>,
+    ) {
+        if !records.values().any(expired_retirement) {
+            return;
+        }
+        let journals = async {
+            let mut referenced = BTreeSet::new();
+            for journal in self.list_all(OBJECT_TYPE).await? {
+                for entry in decode_journal(&journal)?.entries {
+                    referenced.insert(entry.session_id);
+                }
+            }
+            Ok::<_, PersistenceError>(referenced)
+        }
+        .await;
+        let referenced = match journals {
+            Ok(referenced) => referenced,
+            Err(error) => {
+                tracing::warn!(%error, "could not check warm-pool journals for retirement cleanup");
+                return;
+            }
+        };
+        for record in records
+            .values()
+            .filter(|record| {
+                expired_retirement(record)
+                    && retirement_session(record)
+                        .is_some_and(|session| !referenced.contains(&session))
+            })
+            .take(CLEANUP_PER_PASS)
+        {
+            match self
+                .store
+                .delete_if(
+                    ASSIGNMENT_OBJECT_TYPE,
+                    &assignment_object_id(&record.payload.route, &record.payload.writer),
+                    record.resource_version,
+                )
+                .await
+            {
+                Ok(_) | Err(PersistenceError::Conflict { .. }) => {}
+                Err(error) => {
+                    tracing::warn!(route = %record.payload.route, %error, "could not collect retired warm runtime");
+                }
+            }
+        }
+    }
+
     pub(super) async fn warm_pool_targets(
         &self,
         sandbox_id: Option<&str>,
@@ -252,6 +387,35 @@ impl SupervisorPool {
             Err(error) => Err(error.to_string()),
         }
     }
+}
+
+fn expired_retirement(record: &AssignmentRecord) -> bool {
+    record.payload.phase == RecordPhase::Retired
+        && now_ms().saturating_sub(record.updated_at_ms) >= RETIREMENT_RETENTION_MS
+}
+
+fn retirement_session(record: &AssignmentRecord) -> Option<openshell_core::SandboxSessionId> {
+    record.payload.prepared_session.or_else(|| {
+        record
+            .payload
+            .route
+            .strip_prefix("rt-")
+            .and_then(|session| session.parse().ok())
+    })
+}
+
+fn decode_journal(
+    row: &crate::persistence::ObjectRecord,
+) -> Result<WarmPoolState, PersistenceError> {
+    if row.payload.len() > MAX_JOURNAL_BYTES {
+        return Err(PersistenceError::Decode(
+            "warm-pool journal exceeds its size limit".into(),
+        ));
+    }
+    let state = serde_json::from_slice(&row.payload)
+        .map_err(|e| PersistenceError::Decode(format!("invalid warm-pool journal: {e}")))?;
+    validate(&state).map_err(PersistenceError::Decode)?;
+    Ok(state)
 }
 
 fn template_target(template: &SandboxWorkloadTemplate) -> Result<Option<WarmPoolTarget>, String> {

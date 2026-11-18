@@ -24,6 +24,7 @@ use crate::isolation::{
 
 fn bootstrap() -> PreparedRuntimeBootstrap {
     PreparedRuntimeBootstrap {
+        pool_id: "pool-a".into(),
         workspace: "team-a".into(),
         namespace: "sandbox-ns".into(),
         pod_name: "warm-pod".into(),
