@@ -6,8 +6,10 @@
 //! Keycloak is only the provider's token issuer here; the CLI still reaches
 //! the gateway the usual way.
 
+use std::io::Write as _;
+
 use keycloak_support::KeycloakContext;
-use testkit::{CliOutput, Context};
+use testkit::{CliOutput, Context, ResultExt as _};
 
 const CREDENTIAL_KEY: &str = "KEYCLOAK_ACCESS_TOKEN";
 
@@ -20,12 +22,32 @@ async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -
     let provider = kc.name("kc-refresh");
     let profile_id = kc.name("kc-refresh-profile");
     let grant = kc.keycloak().password_grant().await?;
-    kc.install_provider(
-        &provider,
-        &profile(&profile_id, kc.keycloak()),
+    let profile = write_profile(&profile_id, kc.keycloak())?;
+    let profile_path = profile.path().to_string_lossy().into_owned();
+
+    // Register each delete before its create, so cleanup also covers a create
+    // the gateway applied but the CLI reported as failed. Both deletes succeed
+    // when there is nothing to delete.
+    delete_on_cleanup(&kc, "profile", &profile_id);
+    kc.cli(["profile", "import", "--file", &profile_path])
+        .await?
+        .success()?;
+    delete_on_cleanup(&kc, "provider", &provider);
+    kc.cli_with_env(
         &[(CREDENTIAL_KEY, &grant.access_token)],
+        [
+            "provider",
+            "create",
+            "--name",
+            &provider,
+            "--type",
+            &profile_id,
+            "--credential",
+            CREDENTIAL_KEY,
+        ],
     )
-    .await?;
+    .await?
+    .success()?;
     let client_id = format!("client_id={}", kc.keycloak().client_id());
     kc.cli_with_env(
         &[("KEYCLOAK_REFRESH_TOKEN", &grant.refresh_token)],
@@ -95,13 +117,27 @@ async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -
     Ok(())
 }
 
+/// Delete the `kind` named `name` when the test ends, since testkit only
+/// cleans up sandboxes by itself.
+fn delete_on_cleanup(cx: &Context, kind: &'static str, name: &str) {
+    let cli = cx.cli_handle();
+    let name = name.to_string();
+    cx.on_cleanup(format!("delete {kind} {name}"), async move || {
+        cli.run([kind, "delete", &name]).await?.success()?;
+        Ok(())
+    });
+}
+
 fn combined(output: &CliOutput) -> String {
     format!("{}{}", output.stdout, output.stderr)
 }
 
-fn profile(profile_id: &str, keycloak: &keycloak_support::Keycloak) -> String {
+fn write_profile(
+    profile_id: &str,
+    keycloak: &keycloak_support::Keycloak,
+) -> testkit::Result<tempfile::NamedTempFile> {
     let issuer_token_url = keycloak.token_endpoint();
-    format!(
+    let profile = format!(
         r#"id: {profile_id}
 display_name: Keycloak provider refresh test
 category: other
@@ -132,5 +168,13 @@ endpoints:
 binaries:
   - /usr/bin/curl
 "#
-    )
+    );
+    let mut file = tempfile::Builder::new()
+        .suffix(".yaml")
+        .tempfile()
+        .context("create provider profile")?;
+    file.write_all(profile.as_bytes())
+        .and_then(|()| file.flush())
+        .context("write provider profile")?;
+    Ok(file)
 }
