@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: app version labels
+templates:
+  - templates/statefulset.yaml
+  - templates/service.yaml
+  - templates/certgen.yaml
+  - templates/gateway-config.yaml
+chart:
+  appVersion: 0.1.9+build.1
+set:
+  agentSandbox.preflight.enabled: false
+
+tests:
+  - it: normalizes build metadata on gateway workload
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9_build.1
+
+  - it: normalizes build metadata on gateway Service
+    template: templates/service.yaml
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9_build.1
+
+  - it: normalizes build metadata on certgen hook resources
+    template: templates/certgen.yaml
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9_build.1
+
+  - it: preserves version 0.1.9
+    template: templates/statefulset.yaml
+    chart:
+      appVersion: 0.1.9
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9
+
+  - it: preserves version 0.1.9-rc.1
+    template: templates/statefulset.yaml
+    chart:
+      appVersion: 0.1.9-rc.1
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9-rc.1
+
+  - it: trims trailing hyphens after truncation
+    template: templates/statefulset.yaml
+    chart:
+      appVersion: 0.1.9+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - matchRegex:
+          path: metadata.labels["app.kubernetes.io/version"]
+          pattern: '^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$'
+
+  - it: trims trailing underscores after truncation
+    template: templates/statefulset.yaml
+    chart:
+      appVersion: 0.1.9-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa+tail
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - matchRegex:
+          path: metadata.labels["app.kubernetes.io/version"]
+          pattern: '^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$'
+
+  - it: trims trailing dots after truncation
+    template: templates/statefulset.yaml
+    chart:
+      appVersion: 0.1.9+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tail
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: 0.1.9_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - matchRegex:
+          path: metadata.labels["app.kubernetes.io/version"]
+          pattern: '^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$'
+
+  - it: preserves an explicit gateway tag with build metadata in appVersion
+    template: templates/statefulset.yaml
+    set:
+      gateway.image.tag: release-test
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/nvidia/openshell/gateway:release-test
+
+  - it: preserves digest precedence over a gateway tag for the workload
+    template: templates/statefulset.yaml
+    set:
+      gateway.image.tag: release-test
+      gateway.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/nvidia/openshell/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+  - it: preserves digest precedence over a gateway tag for the certgen Job
+    template: templates/certgen.yaml
+    documentIndex: 3
+    set:
+      gateway.image.tag: release-test
+      gateway.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/nvidia/openshell/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+  - it: leaves the appVersion image fallback unchanged
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/nvidia/openshell/gateway:0.1.9+build.1

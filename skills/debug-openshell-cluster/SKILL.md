@@ -511,6 +511,13 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+If Kubernetes rejects `app.kubernetes.io/version` on a resource or certgen hook,
+inspect the rendered label and chart app version. Charts normalize SemVer build
+metadata for labels (`0.1.9+build.1` becomes `0.1.9_build.1`) without changing
+the app version or image references. Upgrade older charts that emit `+` in
+labels; use explicit image tags or digests when the app version is not a valid
+container image tag.
+
 When checking a Helm values migration, compare the rendered `gateway.toml`
 with the intended `gatewayConfig` tables. Explicit resource-admission settings
 and the Kubernetes Secrets credential namespace take precedence over deprecated
@@ -1749,7 +1756,6 @@ verify workload identity/memory survives and new connections reach the replaceme
 Shared serving leases last at most fifteen seconds from issuance, independently
 of configuration renewal; include membership failure detection when measuring a
 partition's stale-owner interval. Storage failures prevent renewal.
-
 
 Application ingress consumers call the separate `openshell.v1.ServiceDiscovery`
 service, rather than `OpenShell`. Discovery snapshots share a one-second cache
