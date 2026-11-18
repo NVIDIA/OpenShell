@@ -197,7 +197,7 @@ mod tests {
         let mut roots = RootCertStore::empty();
         roots.add(ca.der().clone()).unwrap();
         let expected = format!("{PREFIX}/node-a");
-        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000));
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_hours(500_000));
         let server_name = ServerName::try_from("broker.invalid").unwrap();
         for (name, uris, trusted, expired, prefix, succeeds) in [
             ("exact", vec![expected.clone()], true, false, false, true),
