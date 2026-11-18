@@ -13,9 +13,8 @@ use sha2::{Digest, Sha256};
 pub struct AppListenerConfig {
     pub enabled: bool,
     pub port: u16,
-    pub domain: String,
-    /// Public HTTPS origin, independently of the supervisor's listener port.
-    pub public_url: Option<String>,
+    /// Public HTTPS origin used to derive service hostnames and URLs.
+    pub base_url: Option<String>,
 }
 
 impl Default for AppListenerConfig {
@@ -23,56 +22,73 @@ impl Default for AppListenerConfig {
         Self {
             enabled: false,
             port: 8443,
-            domain: String::new(),
-            public_url: None,
+            base_url: None,
         }
     }
+}
+
+/// Validate a listener endpoint after deriving its domain from the base URL.
+fn validate_listener_endpoint(port: u16, domain: &str) -> Result<(), String> {
+    if port < 1024 {
+        return Err("supervisor.app_listener.port must be at least 1024".into());
+    }
+    if domain.is_empty()
+        || domain.len() > 253
+        || !domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+    {
+        return Err("app listener domain must be a lowercase DNS name".into());
+    }
+    Ok(())
 }
 
 impl AppListenerConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !self.enabled {
-            if self.public_url.is_some() {
-                return Err("supervisor.app_listener.public_url requires enabled = true".into());
-            }
             return Ok(());
         }
-        if self.port < 1024 {
-            return Err("supervisor.app_listener.port must be at least 1024".into());
-        }
-        if self.domain.len() > 253
-            || !self.domain.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            })
+        let origin = self.parsed_base_url()?;
+        validate_listener_endpoint(self.port, origin.host_str().unwrap_or_default())
+    }
+
+    fn parsed_base_url(&self) -> Result<url::Url, String> {
+        let base = self.base_url.as_deref().ok_or_else(|| {
+            "supervisor.app_listener.base_url is required when enabled".to_string()
+        })?;
+        let parsed = url::Url::parse(base)
+            .map_err(|_| "supervisor.app_listener.base_url must be an HTTPS origin".to_string())?;
+        if parsed.scheme() != "https"
+            || !matches!(parsed.host(), Some(url::Host::Domain(_)))
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.port() == Some(0)
         {
-            return Err("supervisor.app_listener.domain must be a lowercase DNS name".into());
+            return Err("supervisor.app_listener.base_url must be an HTTPS origin with a DNS hostname, without credentials, path, query, or fragment".into());
         }
-        if let Some(origin) = &self.public_url {
-            let parsed = url::Url::parse(origin)
-                .map_err(|_| "supervisor.app_listener.public_url must be an HTTPS origin")?;
-            if parsed.scheme() != "https"
-                || parsed.host_str() != Some(self.domain.as_str())
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.path() != "/"
-                || parsed.query().is_some()
-                || parsed.fragment().is_some()
-                || parsed.port() == Some(0)
-            {
-                return Err("supervisor.app_listener.public_url must be an HTTPS origin matching domain, without credentials, path, query, or fragment".into());
-            }
-        }
-        Ok(())
+        validate_listener_endpoint(self.port, parsed.host_str().unwrap_or_default())?;
+        Ok(parsed)
+    }
+
+    /// Hostname suffix derived from the configured base URL. Unconfigured or
+    /// invalid listener settings have no service domain.
+    pub fn domain(&self) -> String {
+        self.parsed_base_url()
+            .ok()
+            .and_then(|origin| origin.host_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     /// Canonical SNI/Host shared by URL publication, configuration and discovery.
-    /// A discriminator selects the gateway's hashed mode; otherwise use readable names.
     pub fn service_hostname(
         &self,
         workspace: &str,
@@ -81,7 +97,7 @@ impl AppListenerConfig {
         discriminator: Option<&str>,
     ) -> String {
         let label = service_route_label(discriminator, workspace, sandbox, service);
-        format!("{label}.{}", self.domain)
+        format!("{label}.{}", self.domain())
     }
 
     /// Configured address only; this does not imply installation or readiness.
@@ -95,7 +111,7 @@ impl AppListenerConfig {
         if !self.enabled {
             return None;
         }
-        let mut origin = url::Url::parse(self.public_url.as_deref()?).ok()?;
+        let mut origin = self.parsed_base_url().ok()?;
         origin
             .set_host(Some(&self.service_hostname(
                 workspace,
@@ -198,8 +214,7 @@ mod tests {
     fn application_urls_share_gateway_hash_labels_and_preserve_public_origin() {
         let config = AppListenerConfig {
             enabled: true,
-            domain: "apps.example.com".into(),
-            public_url: Some("https://apps.example.com:10443".into()),
+            base_url: Some("https://apps.example.com:10443".into()),
             ..Default::default()
         };
         assert_eq!(
@@ -221,28 +236,30 @@ mod tests {
     }
 
     #[test]
-    fn public_origin_is_explicit_https_and_matches_listener_domain() {
+    fn base_url_defines_the_service_domain_and_public_port() {
         let mut config = AppListenerConfig {
             enabled: true,
-            domain: "services.example.com".into(),
-            public_url: Some("https://services.example.com:10443".into()),
+            base_url: Some("https://services.example.com:10443".into()),
             ..Default::default()
         };
         config.validate().unwrap();
+        assert_eq!(config.domain(), "services.example.com");
         assert_eq!(
             config
                 .service_url("default", "demo", "web", None)
                 .as_deref(),
             Some("https://default--demo--web.services.example.com:10443/")
         );
-        config.public_url = Some("https://services.example.com:443/".into());
+        config.base_url = Some("https://services.example.com:443/".into());
         assert_eq!(
             config.service_url("default", "demo", "", None).as_deref(),
             Some("https://default--demo.services.example.com/")
         );
         for bad in [
             "http://services.example.com",
-            "https://other.example.com",
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://services.example.com.",
             "https://user:password@services.example.com",
             "https://services.example.com/path",
             "https://services.example.com/?query",
@@ -250,13 +267,29 @@ mod tests {
             "https://services.example.com:0",
             "not-a-url",
         ] {
-            config.public_url = Some(bad.into());
+            config.base_url = Some(bad.into());
             assert!(config.validate().is_err(), "{bad}");
         }
-        config.public_url = Some("https://services.example.com".into());
+        config.base_url = Some("https://services.example.com".into());
         config.enabled = false;
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
         assert!(config.service_url("default", "demo", "web", None).is_none());
+    }
+
+    #[test]
+    fn base_url_is_the_only_authored_service_domain() {
+        let config: AppListenerConfig = serde_json::from_str(
+            r#"{"enabled":true,"port":9443,"base_url":"https://services.example.com:10443"}"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.domain(), "services.example.com");
+        assert_eq!(config.port, 9443);
+        for field in ["domain", "public_url"] {
+            let value = serde_json::json!({field: "services.example.com"});
+            let error = serde_json::from_value::<AppListenerConfig>(value).unwrap_err();
+            assert!(error.to_string().contains(field));
+        }
     }
 
     #[test]
@@ -268,7 +301,7 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
-        config.domain = "services.example.com".into();
+        config.base_url = Some("https://services.example.com".into());
         assert!(config.validate().is_ok());
         config.port = 0;
         assert!(config.validate().is_err());

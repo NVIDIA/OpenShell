@@ -1551,8 +1551,7 @@ mod tests {
             cfg.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
                 enabled: true,
                 port: 9443,
-                domain: "apps.example.com".into(),
-                public_url: Some("https://apps.example.com".into()),
+                base_url: Some("https://apps.example.com".into()),
             };
             for workspace in ["default", "team-a"] {
                 for service in ["", "web"] {

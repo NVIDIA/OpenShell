@@ -295,8 +295,10 @@ five seconds, even if the configured polling interval is longer. Failed polls
 do not renew routes. Ending the configuration loop suspends routes.
 
 `OPENSHELL_APP_LISTENER_ENABLED=true` explicitly enables the process listener.
-`OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_SERVICE_DOMAIN`,
-`OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. Hosted
+`OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_BASE_URL`,
+`OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. The domain
+is derived from the HTTPS base URL; its public port does not change the listen
+address. Hosted
 instances receive the process router explicitly and never read another
 instance's configuration from process environment. TLS configuration uses
 `openshell-crypto`; certificates are read at process startup. Restart the

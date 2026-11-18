@@ -635,8 +635,7 @@ mod tests {
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
-            public_url: None,
+            base_url: Some("https://services.example.com".into()),
         };
         seed_sandbox(&state, "limited").await;
         state
@@ -762,8 +761,7 @@ mod tests {
                 config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
                     enabled: application_enabled,
                     port: 9443,
-                    domain: "services.example.com".into(),
-                    public_url: application_enabled
+                    base_url: application_enabled
                         .then(|| "https://services.example.com:10443".into()),
                 };
                 seed_sandbox(&state, "demo").await;
@@ -828,8 +826,7 @@ mod tests {
         config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
-            public_url: Some("https://services.example.com:10443".into()),
+            base_url: Some("https://services.example.com:10443".into()),
         };
         let response = service_endpoint_response(
             &state,
@@ -869,10 +866,9 @@ mod tests {
             .expect("unshared test state")
             .config
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
-            public_url: None,
+            base_url: Some("https://services.example.com".into()),
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
         };
         seed_sandbox(&state, "first").await;
         seed_sandbox(&state, "second").await;

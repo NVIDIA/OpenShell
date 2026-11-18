@@ -648,7 +648,7 @@ mod tests {
                 installed_fixture_for_gateway("gateway-a", format).await;
             let config = &mut Arc::get_mut(&mut state).unwrap().config;
             config.service_routing.enabled = false;
-            config.supervisor_app_listener.public_url =
+            config.supervisor_app_listener.base_url =
                 Some("https://services.example.com:10443".into());
             accept(&state, &owner, &report, current_time_ms() + 10_000)
                 .await
@@ -689,7 +689,7 @@ mod tests {
             .unwrap()
             .config
             .supervisor_app_listener
-            .public_url = Some("https://services.example.com:10443".into());
+            .base_url = Some("https://services.example.com:10443".into());
         accept(&state, &owner, &report, current_time_ms() + 10_000)
             .await
             .unwrap();

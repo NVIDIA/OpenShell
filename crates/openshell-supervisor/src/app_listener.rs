@@ -57,25 +57,26 @@ impl Config {
             }
         }
         let address = read("OPENSHELL_APP_LISTEN_ADDRESS");
-        let domain = read("OPENSHELL_APP_SERVICE_DOMAIN");
+        let base_url = read("OPENSHELL_APP_BASE_URL");
         let certificate = read("OPENSHELL_APP_TLS_CERT");
         let key = read("OPENSHELL_APP_TLS_KEY");
-        let (Some(address), Some(domain), Some(certificate), Some(key)) =
-            (address, domain, certificate, key)
+        let (Some(address), Some(base_url), Some(certificate), Some(key)) =
+            (address, base_url, certificate, key)
         else {
             return Err(miette::miette!(
-                "app listener requires address, domain, certificate, and key"
+                "app listener requires address, base_url, certificate, and key"
             ));
         };
         let address: SocketAddr = address.parse().into_diagnostic()?;
-        openshell_core::app_listener::AppListenerConfig {
-            public_url: None,
+        let listener = openshell_core::app_listener::AppListenerConfig {
             enabled: true,
             port: address.port(),
-            domain: domain.clone(),
-        }
-        .validate()
-        .map_err(|error| miette::miette!(error))?;
+            base_url: Some(base_url),
+        };
+        listener
+            .validate()
+            .map_err(|error| miette::miette!(error))?;
+        let domain = listener.domain();
         Ok(Some(Self {
             address,
             domain,
@@ -1095,7 +1096,10 @@ mod tests {
     fn listener_requires_explicit_enablement_and_complete_configuration() {
         let complete = BTreeMap::from([
             ("OPENSHELL_APP_LISTEN_ADDRESS", "0.0.0.0:9443"),
-            ("OPENSHELL_APP_SERVICE_DOMAIN", "services.example.com"),
+            (
+                "OPENSHELL_APP_BASE_URL",
+                "https://SERVICES.example.com:10443",
+            ),
             ("OPENSHELL_APP_TLS_CERT", "/operator/cert.pem"),
             ("OPENSHELL_APP_TLS_KEY", "/operator/key.pem"),
         ]);
@@ -1112,14 +1116,11 @@ mod tests {
                 .is_none()
         );
         values.insert("OPENSHELL_APP_LISTENER_ENABLED", "true");
-        assert_eq!(
-            Config::from_values(|name| values.get(name).map(ToString::to_string))
-                .unwrap()
-                .unwrap()
-                .address
-                .port(),
-            9443
-        );
+        let configured = Config::from_values(|name| values.get(name).map(ToString::to_string))
+            .unwrap()
+            .unwrap();
+        assert_eq!(configured.address.port(), 9443);
+        assert_eq!(configured.domain, "services.example.com");
         values.remove("OPENSHELL_APP_TLS_KEY");
         assert!(Config::from_values(|name| values.get(name).map(ToString::to_string)).is_err());
         assert!(

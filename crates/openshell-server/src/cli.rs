@@ -1078,7 +1078,7 @@ async fn run_from_args(
 
     if prepared.config.supervisor_app_listener.enabled {
         info!(
-            domain = %prepared.config.supervisor_app_listener.domain,
+            domain = %prepared.config.supervisor_app_listener.domain(),
             port = prepared.config.supervisor_app_listener.port,
             "App-listener-based service routing enabled"
         );

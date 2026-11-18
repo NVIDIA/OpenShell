@@ -1771,7 +1771,7 @@ routes. When the listener is enabled, polling delays are capped at five seconds
 even if the configured interval is longer; failed polls do not renew the lease.
 App traffic uses application/edge authentication independently of gateway
 user authentication. The discovery API publishes accepted listener installations. CLI URLs use the
-configured application origin when `public_url` is set, otherwise the gateway path.
+configured application origin when `base_url` is set, otherwise the gateway path.
 
 When enabled application routes are not published, check the authenticated
 supervisor session and installed configuration before checking ingress. The
@@ -1814,8 +1814,8 @@ For incorrect public service URLs, inspect
 `[openshell.gateway].service_routing_enabled` first. When false, gateway URL fields
 are empty and gateway application requests return `404`; direct listener and
 discovery behavior is independent. Then inspect
-`[openshell.supervisor.app_listener].public_url`. It is an external HTTPS origin
-whose hostname matches `domain`; its port is independent of the listener port.
+`[openshell.supervisor.app_listener].base_url`. It is the external HTTPS base origin
+whose hostname supplies the service domain; its port is independent of the listener port.
 Service responses identify the application and gateway paths separately. A
 configured application URL must retain its public port even when the CLI uses a
 gateway port-forward. Inspect discovery and ingress acceptance separately:

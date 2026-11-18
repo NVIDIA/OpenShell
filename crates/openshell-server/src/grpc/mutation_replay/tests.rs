@@ -118,9 +118,7 @@ async fn create_url_maps_follow_independent_routing_flags_and_replays_keep_recor
             config.service_routing.enabled = gateway_enabled;
             config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
                 enabled: application_enabled,
-                domain: "services.example.com".into(),
-                public_url: application_enabled
-                    .then(|| "https://services.example.com:10443".into()),
+                base_url: application_enabled.then(|| "https://services.example.com:10443".into()),
                 ..Default::default()
             };
             let request = CreateSandboxRequest {
@@ -168,7 +166,7 @@ async fn create_url_maps_follow_independent_routing_flags_and_replays_keep_recor
             let config = &mut Arc::get_mut(&mut state).unwrap().config;
             config.service_routing.enabled = !gateway_enabled;
             config.supervisor_app_listener.enabled = !application_enabled;
-            config.supervisor_app_listener.public_url =
+            config.supervisor_app_listener.base_url =
                 (!application_enabled).then(|| "https://services.example.com:10443".into());
             let replay = run(&state, authed_request(request)).await.unwrap();
             assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
@@ -213,8 +211,7 @@ async fn create_replay_preserves_recorded_urls_and_refreshes_explicit_origins() 
     config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
         enabled: true,
         port: 9443,
-        domain: "services.example.com".into(),
-        public_url: Some("https://services.example.com:10443".into()),
+        base_url: Some("https://services.example.com:10443".into()),
     };
     let replay = run(&state, authed_request(request)).await.unwrap();
     assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
@@ -253,8 +250,7 @@ async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disable
         .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
         enabled: true,
         port: 9443,
-        domain: "old.example.com".into(),
-        public_url: Some("https://old.example.com:10443".into()),
+        base_url: Some("https://old.example.com:10443".into()),
     };
     run(
         &state,
@@ -286,8 +282,7 @@ async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disable
     let config = &mut Arc::get_mut(&mut state).unwrap().config;
     config.service_routing.base_domains = vec!["gateway.example.com".into()];
     config.bind_address.set_port(12443);
-    config.supervisor_app_listener.domain = "new.example.com".into();
-    config.supervisor_app_listener.public_url = Some("https://new.example.com:11443".into());
+    config.supervisor_app_listener.base_url = Some("https://new.example.com:11443".into());
     let replay = run(&state, authed_request(request.clone())).await.unwrap();
     assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
     assert_eq!(replay.get_ref().endpoint, original.endpoint);
@@ -304,7 +299,7 @@ async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disable
     assert_eq!(gateway.port(), Some(12443));
     let config = &mut Arc::get_mut(&mut state).unwrap().config;
     config.supervisor_app_listener.enabled = false;
-    config.supervisor_app_listener.public_url = None;
+    config.supervisor_app_listener.base_url = None;
     let without_application = run(&state, authed_request(request.clone())).await.unwrap();
     assert_eq!(
         without_application
