@@ -68,6 +68,8 @@ pub use headers::{encode_otlp_headers, merge_otlp_headers, parse_otlp_headers};
 #[cfg(feature = "export")]
 pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 #[cfg(feature = "export")]
+pub use opentelemetry_sdk::metrics::SdkMeterProvider;
+#[cfg(feature = "export")]
 pub use tls::{MAX_TLS_FILE_BYTES, OtlpTls, TlsError, TlsFileError};
 #[cfg(feature = "export")]
 pub use transport::{

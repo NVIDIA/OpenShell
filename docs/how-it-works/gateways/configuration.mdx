@@ -981,6 +981,23 @@ A collector can accept a batch while rejecting some of its records, an OTLP part
 
 Metrics include `openshell_ocsf_otlp_queued_total`, `openshell_ocsf_otlp_exported_total`, `openshell_ocsf_otlp_dropped_total` (with a `reason` label of `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`), `openshell_ocsf_otlp_export_errors_total`, and `openshell_ocsf_otlp_retries_total`.
 
+### Supervisor Metrics Export
+
+Enable supervisor egress metrics in `gateway.toml`.
+
+```toml
+[openshell.gateway.otlp.supervisor_metrics]
+enabled = true
+endpoint = "https://otel-collector.observability.svc:4317"
+```
+
+Omit `endpoint` to inherit the full `[openshell.gateway.otlp]` collector
+configuration. With its own endpoint, this table accepts the same protocol,
+header, and TLS settings as the base collector table. The collector must be
+reachable from supervisor processes. In Helm, put the table under
+`gatewayConfig`. See [Supervisor Metrics](/observability/gateway-metrics#supervisor-metrics)
+for the catalog.
+
 ### Agent trace relay
 
 Set `enabled = true` in `[openshell.gateway.otlp.agent]` to have each sandbox forward the workload's own traces. It defaults to `false`, so trace export alone never changes the workload environment. Traces go to the table's collector, or to the `[openshell.gateway.otlp]` collector when it has no `endpoint`, and that collector must be reachable from sandboxes. Use `protocol = "http/protobuf"` for trace backends that accept only OTLP/HTTP, and `headers` for the ones that need them. For example, MLflow accepts traces directly when each request names an experiment:

@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use miette::Result;
@@ -196,6 +196,7 @@ pub struct SharedHost {
     /// Routes of the latest applied snapshot, so a withdrawal whose cleanup
     /// failed can be retried without the gateway resending the snapshot.
     desired_routes: Mutex<Option<std::collections::BTreeSet<String>>>,
+    metrics_provider: OnceLock<openshell_otel::SdkMeterProvider>,
     /// This process's identity as a member of the supervisor pool.
     pool: PoolIdentity,
     /// Routes of the latest snapshot listed for stopping. Every other route
@@ -311,6 +312,7 @@ impl SharedHost {
             attach_request_timeout: config.attach_request_timeout,
             rejected: Mutex::new(BTreeMap::new()),
             desired_routes: Mutex::new(None),
+            metrics_provider: OnceLock::new(),
             pool: config.pool,
             stop_routes: Mutex::new(std::collections::BTreeSet::new()),
             deferred: Mutex::new(None),
@@ -372,6 +374,50 @@ impl SharedHost {
     /// keep running.
     pub async fn shut_down(&self) {
         self.host.relinquish_all().await;
+        if let Some(provider) = self.metrics_provider.get().cloned() {
+            *self
+                .desired_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            let _ = tokio::task::spawn_blocking(move || crate::metrics::shutdown(&provider)).await;
+        }
+    }
+
+    fn start_metrics(self: &Arc<Self>, configuration: &[u8]) {
+        if configuration.is_empty() || self.metrics_provider.get().is_some() {
+            return;
+        }
+        let Ok(config) = serde_json::from_slice::<
+            openshell_core::sandbox_env::SharedSupervisorMetrics,
+        >(configuration) else {
+            tracing::warn!("Invalid supervisor metrics settings from gateway");
+            return;
+        };
+        let host = Arc::downgrade(self);
+        let result = crate::metrics::start(
+            &config.collector.endpoint,
+            config.collector.protocol,
+            openshell_core::jwt::OtlpExportCredentials {
+                headers: config.headers.as_ref(),
+                tls: config.tls.as_ref(),
+            },
+            Some(&config.gateway_name),
+            move || host.upgrade().map_or(0, |host| host.assigned_sandboxes()),
+        );
+        match result {
+            Ok(provider) => {
+                let _ = self.metrics_provider.set(provider);
+            }
+            Err(error) => tracing::warn!(%error, "OTLP metrics export could not be started"),
+        }
+    }
+
+    fn assigned_sandboxes(&self) -> u64 {
+        self.desired_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |routes| routes.len() as u64)
     }
 
     /// Address of the routed runtime listener.
@@ -1500,6 +1546,7 @@ async fn run_stream(
                 last_heard = tokio::time::Instant::now();
                 match payload {
                     Some(host_gateway_message::Payload::Accepted(accepted_message)) => {
+                        host.start_metrics(&accepted_message.supervisor_metrics);
                         accepted = true;
                         host.gateway_connected.send_replace(true);
                         host.gateway_home.send_replace(Some(accepted_message.peer_endpoint.clone()));
@@ -1713,6 +1760,7 @@ mod tests {
             },
         })
         .unwrap();
+        assert_eq!(host.assigned_sandboxes(), 0);
         let routes = [
             "rt-kept-0123456789",
             "rt-released-012345",
@@ -1749,6 +1797,7 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(host.assigned_sandboxes(), 1);
 
         // The kept instance is untouched; the released one ended without
         // stopping its workload; only the withdrawn one was stopped.

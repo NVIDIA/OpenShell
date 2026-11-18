@@ -24,6 +24,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+pub mod metrics;
 mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
