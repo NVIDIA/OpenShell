@@ -4548,6 +4548,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "url",
  "uuid",
  "wiremock",
 ]

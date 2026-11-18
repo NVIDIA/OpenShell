@@ -40,6 +40,22 @@ pub struct MintedCredential {
     pub additional_credentials: HashMap<String, String>,
 }
 
+const CLIENT_AUTH_METHOD_KEY: &str = "token_endpoint_auth_method";
+
+/// Form fields plus optional HTTP Basic client credentials for one token request.
+#[derive(Default)]
+struct TokenRequest {
+    form: Vec<(String, String)>,
+    basic_auth: Option<(String, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientAuthMethod {
+    None,
+    Post,
+    Basic,
+}
+
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -345,24 +361,16 @@ async fn mint_oauth2_refresh_token(
     state: &MintRequest,
 ) -> Result<MintedCredential, RefreshFailure> {
     let token_url = oauth2_token_url(state)?;
-    let client_id = required_material(&state.material, "client_id")?;
     let refresh_token = required_material(&state.material, "refresh_token")?;
-    let mut form = vec![
-        ("grant_type".to_string(), "refresh_token".to_string()),
-        ("client_id".to_string(), client_id),
-        ("refresh_token".to_string(), refresh_token),
-    ];
-    if let Some(client_secret) = material_value(&state.material, &["client_secret"]) {
-        form.push(("client_secret".to_string(), client_secret));
-    }
-    let scope = refresh_scopes(state).join(" ");
-    if !scope.is_empty() {
-        form.push(("scope".to_string(), scope));
-    }
+    let request = oauth_client_request(
+        state,
+        "refresh_token",
+        vec![("refresh_token".to_string(), refresh_token)],
+    )?;
 
     request_token(
         &token_url,
-        &form,
+        &request,
         max_lifetime_seconds(state),
         OAuthGrantKind::UserRefreshToken,
     )
@@ -373,21 +381,12 @@ async fn mint_oauth2_client_credentials(
     state: &MintRequest,
 ) -> Result<MintedCredential, RefreshFailure> {
     let token_url = oauth2_token_url(state)?;
-    let client_id = required_material(&state.material, "client_id")?;
-    let client_secret = required_material(&state.material, "client_secret")?;
-    let mut form = vec![
-        ("grant_type".to_string(), "client_credentials".to_string()),
-        ("client_id".to_string(), client_id),
-        ("client_secret".to_string(), client_secret),
-    ];
-    let scope = refresh_scopes(state).join(" ");
-    if !scope.is_empty() {
-        form.push(("scope".to_string(), scope));
-    }
+    required_material(&state.material, "client_secret")?;
+    let request = oauth_client_request(state, "client_credentials", Vec::new())?;
 
     request_token(
         &token_url,
-        &form,
+        &request,
         max_lifetime_seconds(state),
         OAuthGrantKind::NonInteractive,
     )
@@ -428,16 +427,19 @@ async fn mint_google_service_account_jwt(
         })?,
     )
     .map_err(|_| Status::internal("sign google service account jwt failed"))?;
-    let form = vec![
-        (
-            "grant_type".to_string(),
-            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
-        ),
-        ("assertion".to_string(), assertion),
-    ];
+    let request = TokenRequest {
+        form: vec![
+            (
+                "grant_type".to_string(),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+            ),
+            ("assertion".to_string(), assertion),
+        ],
+        basic_auth: None,
+    };
     request_token(
         &token_url,
-        &form,
+        &request,
         lifetime_secs,
         OAuthGrantKind::NonInteractive,
     )
@@ -565,7 +567,7 @@ async fn mint_aws_sts_assume_role(state: &MintRequest) -> Result<MintedCredentia
 
 async fn request_token(
     token_url: &str,
-    form: &[(String, String)],
+    request: &TokenRequest,
     max_lifetime_seconds: i64,
     grant_kind: OAuthGrantKind,
 ) -> Result<MintedCredential, RefreshFailure> {
@@ -588,42 +590,43 @@ async fn request_token(
         .build()
         .map_err(|e| Status::internal(format!("build refresh HTTP client failed: {e}")))?;
     // GitHub returns form-encoded bodies unless JSON is requested.
-    let response = client
+    let mut builder = client
         .post(parsed)
         .header(reqwest::header::ACCEPT, "application/json")
-        .form(form)
-        .send()
-        .await
-        .map_err(|error| {
-            let error_kind = if error.is_timeout() {
-                "timeout"
-            } else if error.is_connect() {
-                "connect"
-            } else if error.is_request() {
-                "request"
-            } else {
-                "other"
-            };
-            warn!(
-                error = %error.without_url(),
-                error_kind,
-                "OAuth token endpoint request failed"
-            );
-            if grant_kind == OAuthGrantKind::UserRefreshToken && error_kind != "connect" {
-                RefreshFailure::reauthorize(
-                    Status::failed_precondition(
-                        "refresh token exchange has an uncertain outcome; reauthorize the grant",
-                    ),
-                    "oauth_refresh_exchange_uncertain",
-                    None,
-                )
-            } else {
-                RefreshFailure::retryable(
-                    Status::unavailable("token endpoint request failed"),
-                    "oauth_token_endpoint_unavailable",
-                )
-            }
-        })?;
+        .form(&request.form);
+    if let Some((id, secret)) = &request.basic_auth {
+        builder = builder.basic_auth(id, Some(secret));
+    }
+    let response = builder.send().await.map_err(|error| {
+        let error_kind = if error.is_timeout() {
+            "timeout"
+        } else if error.is_connect() {
+            "connect"
+        } else if error.is_request() {
+            "request"
+        } else {
+            "other"
+        };
+        warn!(
+            error = %error.without_url(),
+            error_kind,
+            "OAuth token endpoint request failed"
+        );
+        if grant_kind == OAuthGrantKind::UserRefreshToken && error_kind != "connect" {
+            RefreshFailure::reauthorize(
+                Status::failed_precondition(
+                    "refresh token exchange has an uncertain outcome; reauthorize the grant",
+                ),
+                "oauth_refresh_exchange_uncertain",
+                None,
+            )
+        } else {
+            RefreshFailure::retryable(
+                Status::unavailable("token endpoint request failed"),
+                "oauth_token_endpoint_unavailable",
+            )
+        }
+    })?;
     let status = response.status();
     if !status.is_success() {
         let body = read_bounded_oauth_error_body(response).await;
@@ -807,6 +810,95 @@ fn classify_oauth_token_error(
             "oauth_unrecognized_error",
         ),
     }
+}
+
+/// Validates the OAuth client authentication and `resource` material.
+pub fn validate_oauth_client_material<S: std::hash::BuildHasher>(
+    strategy: i32,
+    material: &HashMap<String, String, S>,
+) -> Result<(), Status> {
+    if strategy != ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32
+        && strategy != ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32
+    {
+        return Ok(());
+    }
+    client_auth_method(material)?;
+    oauth_resource(material)?;
+    Ok(())
+}
+
+fn client_auth_method<S: std::hash::BuildHasher>(
+    material: &HashMap<String, String, S>,
+) -> Result<ClientAuthMethod, Status> {
+    let has_secret = material_value(material, &["client_secret"]).is_some();
+    match material_value(material, &[CLIENT_AUTH_METHOD_KEY]).as_deref() {
+        None if has_secret => Ok(ClientAuthMethod::Post),
+        None => Ok(ClientAuthMethod::None),
+        Some("none") if !has_secret => Ok(ClientAuthMethod::None),
+        Some("none") => Err(Status::invalid_argument(format!(
+            "{CLIENT_AUTH_METHOD_KEY} none cannot be used with client_secret material"
+        ))),
+        Some(method @ ("client_secret_post" | "client_secret_basic")) if !has_secret => {
+            Err(Status::invalid_argument(format!(
+                "{CLIENT_AUTH_METHOD_KEY} {method} requires client_secret material"
+            )))
+        }
+        Some("client_secret_post") => Ok(ClientAuthMethod::Post),
+        Some("client_secret_basic") => Ok(ClientAuthMethod::Basic),
+        Some(_) => Err(Status::invalid_argument(format!(
+            "{CLIENT_AUTH_METHOD_KEY} must be none, client_secret_post, or client_secret_basic"
+        ))),
+    }
+}
+
+/// RFC 8707 resource indicator: an absolute URI without a fragment.
+fn oauth_resource<S: std::hash::BuildHasher>(
+    material: &HashMap<String, String, S>,
+) -> Result<Option<String>, Status> {
+    let Some(resource) = material_value(material, &["resource"]) else {
+        return Ok(None);
+    };
+    match reqwest::Url::parse(&resource) {
+        Ok(url) if url.fragment().is_none() => Ok(Some(resource)),
+        _ => Err(Status::invalid_argument(
+            "resource material must be an absolute URI without a fragment",
+        )),
+    }
+}
+
+/// RFC 6749 section 2.3.1: Basic credentials are form-urlencoded first.
+fn form_urlencode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn oauth_client_request(
+    state: &MintRequest,
+    grant_type: &str,
+    grant_fields: Vec<(String, String)>,
+) -> Result<TokenRequest, Status> {
+    let client_id = required_material(&state.material, "client_id")?;
+    let client_secret = material_value(&state.material, &["client_secret"]);
+    let mut form = vec![("grant_type".to_string(), grant_type.to_string())];
+    let mut basic_auth = None;
+    match (client_auth_method(&state.material)?, client_secret) {
+        (ClientAuthMethod::Basic, Some(secret)) => {
+            basic_auth = Some((form_urlencode(&client_id), form_urlencode(&secret)));
+        }
+        (ClientAuthMethod::Post, Some(secret)) => {
+            form.push(("client_id".to_string(), client_id));
+            form.push(("client_secret".to_string(), secret));
+        }
+        _ => form.push(("client_id".to_string(), client_id)),
+    }
+    form.extend(grant_fields);
+    let scope = refresh_scopes(state).join(" ");
+    if !scope.is_empty() {
+        form.push(("scope".to_string(), scope));
+    }
+    if let Some(resource) = oauth_resource(&state.material)? {
+        form.push(("resource".to_string(), resource));
+    }
+    Ok(TokenRequest { form, basic_auth })
 }
 
 pub fn refresh_scopes(state: &MintRequest) -> Vec<String> {
@@ -1243,7 +1335,10 @@ mod tests {
 
         let minted = request_token(
             &format!("{}/token", mock_server.uri()),
-            &[("grant_type".to_string(), "refresh_token".to_string())],
+            &TokenRequest {
+                form: vec![("grant_type".to_string(), "refresh_token".to_string())],
+                ..Default::default()
+            },
             60,
             OAuthGrantKind::UserRefreshToken,
         )
@@ -1566,6 +1661,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth2_refresh_token_basic_auth_sends_resource_without_form_secret() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header(
+                "authorization",
+                "Basic Y2xpZW50JTNBaWQ6c2VjcmV0JTI2JTJC",
+            ))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=old-refresh-token"))
+            .and(body_string_contains(
+                "resource=https%3A%2F%2Fexample.com%2Fmcp",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let request = MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+            material: HashMap::from([
+                ("client_id".into(), "client:id".into()),
+                ("client_secret".into(), "secret&+".into()),
+                ("refresh_token".into(), "old-refresh-token".into()),
+                (
+                    "token_endpoint_auth_method".into(),
+                    "client_secret_basic".into(),
+                ),
+                ("resource".into(), "https://example.com/mcp".into()),
+            ]),
+            token_url: format!("{}/token", mock_server.uri()),
+            ..Default::default()
+        };
+        mint_credential(&request).await.unwrap();
+
+        let received = mock_server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&received[0].body);
+        assert!(!body.contains("client_secret"));
+        assert!(!body.contains("client_id"));
+    }
+
+    #[test]
+    fn oauth_client_request_defaults_preserve_existing_client_auth() {
+        let mut request = MintRequest {
+            material: HashMap::from([("client_id".into(), "id".into())]),
+            ..Default::default()
+        };
+        let public = oauth_client_request(&request, "refresh_token", Vec::new()).unwrap();
+        assert!(public.basic_auth.is_none());
+        assert!(public.form.contains(&("client_id".into(), "id".into())));
+        assert!(!public.form.iter().any(|(key, _)| key == "client_secret"));
+
+        request.material.insert("client_secret".into(), "s".into());
+        let post = oauth_client_request(&request, "refresh_token", Vec::new()).unwrap();
+        assert!(post.basic_auth.is_none());
+        assert!(post.form.contains(&("client_secret".into(), "s".into())));
+        assert!(!post.form.iter().any(|(key, _)| key == "resource"));
+    }
+
+    #[test]
+    fn oauth_client_material_validation_rejects_bad_combinations() {
+        let refresh = ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32;
+        let check = |pairs: &[(&str, &str)]| {
+            let material = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect::<HashMap<_, _>>();
+            validate_oauth_client_material(refresh, &material).is_ok()
+        };
+        assert!(check(&[]));
+        assert!(check(&[("token_endpoint_auth_method", "none")]));
+        assert!(check(&[
+            ("client_secret", "s"),
+            ("token_endpoint_auth_method", "client_secret_basic"),
+            ("resource", "https://example.com/mcp"),
+        ]));
+        assert!(!check(&[(
+            "token_endpoint_auth_method",
+            "client_secret_basic"
+        )]));
+        assert!(!check(&[(
+            "token_endpoint_auth_method",
+            "client_secret_post"
+        )]));
+        assert!(!check(&[
+            ("client_secret", "s"),
+            ("token_endpoint_auth_method", "none")
+        ]));
+        assert!(!check(&[("token_endpoint_auth_method", "private_key_jwt")]));
+        assert!(!check(&[("resource", "example.com/mcp")]));
+        assert!(!check(&[("resource", "https://example.com/mcp#frag")]));
+        assert!(
+            validate_oauth_client_material(
+                ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
+                &HashMap::from([("resource".to_string(), "bad".to_string())]),
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn oauth_success_response_failures_preserve_grant_specific_recovery() {
         let mock_server = MockServer::start().await;
         for (path_name, body, code) in [
@@ -1587,7 +1785,7 @@ mod tests {
             ] {
                 let failure = request_token(
                     &format!("{}/{path_name}", mock_server.uri()),
-                    &[],
+                    &TokenRequest::default(),
                     60,
                     grant_kind,
                 )
