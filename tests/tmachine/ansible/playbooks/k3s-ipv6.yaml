@@ -21,9 +21,15 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    # SSH can be up before the guest has its IPv6 address, so wait for it.
     - name: Gather the guest addresses
       ansible.builtin.setup:
         gather_subset: [network]
+      register: k3s_ipv6_facts
+      until: (k3s_ipv6_facts.ansible_facts.ansible_default_ipv6.scope | default('')) == "global"
+      retries: 10
+      delay: 2
+      failed_when: false
 
     # K3s takes the node's addresses from the default routes, IPv6 first for
     # an IPv6-first cluster.
