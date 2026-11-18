@@ -31,6 +31,7 @@ export type {
   ProviderRef,
   SandboxConfig,
   SandboxFromTemplateSpec,
+  SandboxIngressAdmission,
   SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,

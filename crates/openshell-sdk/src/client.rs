@@ -1498,6 +1498,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         command,
         tty,
         service_exposures,
+        forward_ports,
         restart_policy,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
@@ -1525,6 +1526,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         workspace_scope: Some(proto::workspace_selector("default")),
         await_main_process_attachment: false,
         workload_template: String::new(),
+        forward_ports: forward_ports.into_iter().map(u32::from).collect(),
         service_exposures: service_exposures
             .into_iter()
             .map(|exposure| proto::SandboxServiceExposure {
@@ -1550,6 +1552,7 @@ fn create_sandbox_from_template_request(
         tty,
         policy,
         service_exposures,
+        forward_ports,
     } = spec;
     proto::CreateSandboxRequest {
         request_id: String::new(),
@@ -1566,6 +1569,7 @@ fn create_sandbox_from_template_request(
         workspace_scope: Some(proto::workspace_selector("default")),
         workload_template: template_name,
         await_main_process_attachment: false,
+        forward_ports: forward_ports.into_iter().map(u32::from).collect(),
         service_exposures: service_exposures
             .into_iter()
             .map(|exposure| proto::SandboxServiceExposure {

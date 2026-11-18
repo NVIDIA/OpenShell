@@ -264,7 +264,12 @@ impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShell
                 [mutation_audit::requested("sandbox", &request.name)],
             )
         };
-        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+        let mut response =
+            mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 }
 
@@ -352,7 +357,12 @@ impl OpenShell for OpenShellService {
                 [mutation_audit::requested("sandbox", &request.name)],
             )
         };
-        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+        let mut response =
+            mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn begin_rootfs_tar_staging(
@@ -471,7 +481,12 @@ impl OpenShell for OpenShellService {
                 ],
             )
         };
-        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+        let mut response =
+            mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn detach_sandbox_provider(
@@ -488,7 +503,12 @@ impl OpenShell for OpenShellService {
                 ],
             )
         };
-        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+        let mut response =
+            mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn get_sandbox_provider_status(
@@ -530,7 +550,12 @@ impl OpenShell for OpenShellService {
                 [mutation_audit::requested("sandbox", &request.name)],
             )
         };
-        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+        let mut response =
+            mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn start_sandbox(
@@ -544,7 +569,12 @@ impl OpenShell for OpenShellService {
                 [mutation_audit::requested("sandbox", &request.name)],
             )
         };
-        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+        let mut response =
+            mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn suspend_sandbox(

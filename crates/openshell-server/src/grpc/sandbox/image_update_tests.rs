@@ -135,7 +135,10 @@ async fn state() -> (Arc<ServerState>, Arc<FakeComputeDriver>, Sandbox) {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/image-test",
                 "test",
-                [openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into()],
+                [
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into(),
+                    openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.into(),
+                ],
             )),
             ..Default::default()
         }),
@@ -258,6 +261,20 @@ async fn public_image_update_replays_without_reapplying_or_touching_same_name_re
         .sandbox
         .unwrap();
     assert_eq!(updated.object_id(), sandbox.object_id());
+    assert_eq!(
+        updated.status.as_ref().unwrap().ingress_admission,
+        Some(openshell_core::proto::SandboxIngressAdmission::default())
+    );
+    let stored = state
+        .store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.status.as_ref().unwrap().ingress_admission.is_none(),
+        "inspection projection must not invent durable admission evidence"
+    );
     assert_eq!(
         updated
             .spec

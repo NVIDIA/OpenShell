@@ -480,7 +480,7 @@ impl MxcComputeBackend {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/mxc",
                 openshell_core::VERSION,
-                [],
+                [openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string()],
             )),
         }
     }

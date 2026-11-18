@@ -1279,6 +1279,7 @@ async fn create_sandbox_passes_spec_through() {
         image: Some("ghcr.io/foo:bar".to_string()),
         labels: labels.clone(),
         gpu: true,
+        forward_ports: vec![8080],
         service_exposures: vec![ServiceExposure {
             service: "web".to_string(),
             target_port: 8080,
@@ -1299,6 +1300,7 @@ async fn create_sandbox_passes_spec_through() {
     assert_eq!(observed.name, "my-box");
     assert_eq!(observed.labels, labels);
     assert!(observed.annotations.is_empty());
+    assert_eq!(observed.forward_ports, vec![8080]);
     assert_eq!(observed.service_exposures.len(), 1);
     assert_eq!(observed.service_exposures[0].service, "web");
     assert_eq!(observed.service_exposures[0].target_port, 8080);
