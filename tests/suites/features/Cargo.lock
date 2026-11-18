@@ -1397,6 +1397,7 @@ version = "0.0.0"
 dependencies = [
  "host-server-support",
  "openshell-testkit",
+ "sandbox-clients-support",
 ]
 
 [[package]]
