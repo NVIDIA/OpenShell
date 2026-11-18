@@ -307,7 +307,7 @@ async fn obtain(
             (token, until, false)
         } else {
             let waited = if caching {
-                Some(ACQUISITIONS.turn(&fingerprint).await)
+                Some(ACQUISITIONS.turn(&fingerprint).await?)
             } else {
                 None
             };
@@ -326,7 +326,12 @@ async fn obtain(
                     ttl_override,
                     request_id,
                 )
-                .await?;
+                .await
+                .inspect_err(|status| {
+                    if let Some(turn) = turn.as_mut() {
+                        *turn.failure = Some(status.clone());
+                    }
+                })?;
                 (token, until, true)
             }
         };
@@ -528,7 +533,7 @@ fn serve_until_ms(
     )
 }
 
-type AcquisitionSlots = HashMap<String, (Arc<tokio::sync::Mutex<()>>, usize)>;
+type AcquisitionSlots = HashMap<String, (Arc<tokio::sync::Mutex<Option<Status>>>, usize)>;
 
 #[derive(Default)]
 struct Admission {
@@ -582,15 +587,15 @@ impl Drop for AdmissionGuard<'_> {
 /// Coordinate token acquisition separately for each cache fingerprint.
 ///
 /// Concurrent misses share a single acquisition without locking unrelated
-/// tokens. An entry exists only
-/// while a request holds or awaits its turn, including a cancelled wait.
+/// tokens. Current waiters receive the holder's acquisition failure; a new
+/// group can retry after they leave. Entries exist only while held or awaited.
 #[derive(Default)]
 struct Acquisitions {
     slots: std::sync::Mutex<AcquisitionSlots>,
 }
 
 impl Acquisitions {
-    async fn turn(&self, key: &str) -> AcquisitionTurn<'_> {
+    async fn turn(&self, key: &str) -> Result<AcquisitionTurn<'_>, Status> {
         let registration = {
             let mut slots = self.lock();
             let (slot, users) = slots.entry(key.to_string()).or_default();
@@ -601,10 +606,14 @@ impl Acquisitions {
                 slot: slot.clone(),
             }
         };
-        AcquisitionTurn {
-            _guard: registration.slot.clone().lock_owned().await,
-            _registration: registration,
+        let failure = registration.slot.clone().lock_owned().await;
+        if let Some(status) = failure.as_ref() {
+            return Err(status.clone());
         }
+        Ok(AcquisitionTurn {
+            failure,
+            _registration: registration,
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AcquisitionSlots> {
@@ -617,7 +626,7 @@ impl Acquisitions {
 struct Registration<'a> {
     acquisitions: &'a Acquisitions,
     key: String,
-    slot: Arc<tokio::sync::Mutex<()>>,
+    slot: Arc<tokio::sync::Mutex<Option<Status>>>,
 }
 
 impl Drop for Registration<'_> {
@@ -634,7 +643,7 @@ impl Drop for Registration<'_> {
 
 /// Fields drop in order: the turn is released before its registration.
 struct AcquisitionTurn<'a> {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    failure: tokio::sync::OwnedMutexGuard<Option<Status>>,
     _registration: Registration<'a>,
 }
 
@@ -806,9 +815,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_misses_take_turns_per_fingerprint_and_leave_no_entries() {
         let acquisitions: &'static Acquisitions = Box::leak(Box::default());
-        let first = acquisitions.turn("a").await;
+        let first = acquisitions.turn("a").await.unwrap();
         // Another fingerprint is independent.
-        drop(acquisitions.turn("b").await);
+        drop(acquisitions.turn("b").await.unwrap());
         // A waiter for the same fingerprint blocks; cancelling it leaves only
         // the holder's entry.
         let waiting = tokio::time::timeout(Duration::from_millis(50), acquisitions.turn("a"));
@@ -818,11 +827,46 @@ mod tests {
             Some(1)
         );
         assert_eq!(acquisitions.lock().len(), 1);
-        let waiter = tokio::spawn(async move { drop(acquisitions.turn("a").await) });
+        let waiter = tokio::spawn(async move { drop(acquisitions.turn("a").await.unwrap()) });
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
         drop(first);
         waiter.await.unwrap();
+        assert!(acquisitions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_acquisition_is_shared_with_waiters_but_not_later_requests() {
+        let acquisitions: &'static Acquisitions = Box::leak(Box::default());
+        let mut holder = acquisitions.turn("grant").await.unwrap();
+        let waiters: Vec<_> = (0..3)
+            .map(|_| tokio::spawn(async move { acquisitions.turn("grant").await }))
+            .collect();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while acquisitions.lock().get("grant").map(|(_, users)| *users) != Some(4) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all requests should join the in-flight acquisition");
+        let expected = TokenGrantFailure::new(
+            TokenGrantFailureKind::Unavailable,
+            TokenGrantStage::TokenEndpoint,
+        );
+        *holder.failure = Some(expected.to_status());
+        drop(holder);
+        for waiter in waiters {
+            let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("waiters should fail without another acquisition")
+                .unwrap();
+            let Err(status) = result else {
+                panic!("a waiter started another acquisition after the holder failed");
+            };
+            assert_eq!(TokenGrantFailure::from_status(&status), expected);
+        }
+        assert!(acquisitions.lock().is_empty());
+        drop(acquisitions.turn("grant").await.unwrap());
         assert!(acquisitions.lock().is_empty());
     }
 }
