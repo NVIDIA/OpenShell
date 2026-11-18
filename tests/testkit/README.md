@@ -65,12 +65,19 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 
 - `cx.sandbox(suffix)` to build a sandbox with a run-unique name, then
   `create()` it or `create_ready()` to also wait for Ready. Set its image
-  with `image(..)` and its policy with `policy(..)`. The returned
+  with `image(..)`, its policy with `policy(..)` and its providers with
+  `providers(..)`. A long-running sandbox is
+  `.command(["sleep", "infinity"])`; add `.image(testkit::python_image())`
+  when a test runs Python clients in it. The returned
   `Sandbox` can wait for ready or finished, stop, start, exec or
   `poll_exec` until the output matches, read its config and draft policy, set
-  a setting, read `sandbox get` JSON with `get_json()`, and delete. Its
-  `expect_listed`, `expect_absent` and `wait_absent` check list and get.
-  Exec output has `success()`, `failure()` and `expect_stdout()`.
+  a setting, read `sandbox get` JSON with `get_json()`, read its policy
+  revisions and active policy with `policy_revisions()` and
+  `active_policy()`, and delete. Its `expect_listed`, `expect_absent` and
+  `wait_absent` check list and get. `run_python(script, args)` runs a script
+  with `python3 -c` and fails unless it exits 0. Exec output has `success()`,
+  `failure()`, `expect_stdout()`, and `last_json()` for the last JSON object
+  or array line of stdout, such as a client script's result.
 - `cx.cli_sandbox(suffix)` for a sandbox only `openshell sandbox create`
   can make, such as one with `policy_yaml(...)` or `--no-keep`. `create()`
   detaches and returns the `Sandbox`, `create_ready()` also waits for Ready,
@@ -110,7 +117,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   (binaries apply to every endpoint under `name`) that `policy::Endpoint`
   configures (`.rest(Access::Full)`, `.credential_binding(provider)`, ...).
   Pass the result to `cx.sandbox(..).policy(policy)`, or `policy::to_yaml`
-  for the CLI.
+  for the CLI. `policy::binaries_yaml(binaries)` writes a `binaries:` list
+  into policy YAML a test writes by hand.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
 - `cx.import_profile(profile)` to import a provider profile and return its
   `id`, and `cx.create_provider(name, type, credentials)` to create a
@@ -118,6 +126,11 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   credentials)` does both.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
+- In `tests/support`: `host-server` starts servers on the machine that runs
+  the tests, which sandboxes reach as `host_server_support::TEST_HOST`, and
+  `sandbox-clients` runs clients in a sandbox: `connect`, `http` and
+  `http_raw` return typed results, and `scripts` holds client scripts for
+  `run_python`.
 - `?` and `.context(..)` on I/O, JSON, YAML, SDK and gRPC results, which
   convert into `testkit::Error`.
 - `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a
