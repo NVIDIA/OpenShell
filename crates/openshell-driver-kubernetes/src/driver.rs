@@ -543,6 +543,162 @@ fn is_kube_resource_version_conflict(error: &KubeError) -> bool {
     matches!(error, KubeError::Api(api) if api.code == 409 && api.reason == "Conflict")
 }
 
+/// Any 409 from a pinned write: the precondition (UID or
+/// resourceVersion) failed, so the write must be retried from a fresh
+/// read or aborted — never repeated verbatim.
+fn is_kube_conflict(error: &KubeError) -> bool {
+    matches!(error, KubeError::Api(api) if api.code == 409)
+}
+
+/// Pin a JSON merge patch to the object that was checked (H5): inject
+/// the expected `metadata.uid` and the `metadata.resourceVersion` read
+/// in the same iteration, so the API server rejects the write when the
+/// object was replaced (a new UID under the same name) or concurrently
+/// modified.
+fn pin_patch_to_checked_object(patch: &mut serde_json::Value, uid: &str, resource_version: &str) {
+    if !patch["metadata"].is_object() {
+        patch["metadata"] = serde_json::json!({});
+    }
+    let metadata = patch["metadata"]
+        .as_object_mut()
+        .expect("metadata object was just ensured");
+    metadata.insert("uid".to_string(), serde_json::json!(uid));
+    metadata.insert(
+        "resourceVersion".to_string(),
+        serde_json::json!(resource_version),
+    );
+}
+
+/// Whether the object's ownerReferences include the expected owner UID.
+fn owner_reference_matches(
+    owner_references: &Option<Vec<OwnerReference>>,
+    expected_uid: &str,
+) -> bool {
+    owner_references
+        .as_ref()
+        .is_some_and(|owners| owners.iter().any(|owner| owner.uid == expected_uid))
+}
+
+/// Patch a `KubeVirt` `VirtualMachine` pinned to the object the caller
+/// checked (H5: lifecycle checks must fence subsequent mutations).
+///
+/// Every patch carries the expected `metadata.uid` and the
+/// `metadata.resourceVersion` from the same read, so the API server
+/// rejects the write when the VM was replaced or concurrently modified.
+/// A resourceVersion conflict is a transient race and is retried from a
+/// fresh read; a UID change is not: the object the caller verified is
+/// gone, so the operation aborts with a Precondition error rather than
+/// falling back to a name-only write.
+async fn patch_kubevirt_vm_pinned_to_checked_uid(
+    api: &Api<DynamicObject>,
+    kube_name: &str,
+    expected_vm_uid: &str,
+    mut patch_for_resource_version: impl FnMut(&str) -> serde_json::Value,
+) -> Result<DynamicObject, KubernetesDriverError> {
+    let operation = async {
+        loop {
+            let current = api
+                .get(kube_name)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            let resource_version = current
+                .metadata
+                .resource_version
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            let observed_uid = current.metadata.uid.as_deref().unwrap_or_default();
+            if observed_uid != expected_vm_uid {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "VirtualMachine {kube_name} was replaced after it was checked: \
+                     expected UID {expected_vm_uid}, found {observed_uid}"
+                )));
+            }
+            let mut patch = patch_for_resource_version(&resource_version);
+            pin_patch_to_checked_object(&mut patch, expected_vm_uid, &resource_version);
+            match api
+                .patch(kube_name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+            {
+                Ok(updated) => return Ok(updated),
+                Err(error) if is_kube_conflict(&error) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+            }
+        }
+    };
+    tokio::time::timeout(KUBE_API_TIMEOUT, operation)
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s patching VirtualMachine {kube_name}",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+}
+
+/// Patch the guest bootstrap Secret pinned to the VM that owns it (H5).
+///
+/// The Secret is read first and its ownerReference UID must be the
+/// checked VM — a foreign object under the derived name is never
+/// rewritten. The patch carries the read resourceVersion and the
+/// Secret's UID, so a replaced or concurrently modified Secret is
+/// rejected (a 409 retries from a fresh read and re-checks the owner).
+async fn patch_kubevirt_bootstrap_secret_pinned(
+    secrets: &Api<Secret>,
+    secret_name: &str,
+    expected_vm_uid: &str,
+    patch_body: serde_json::Value,
+) -> Result<(), KubernetesDriverError> {
+    let operation = async {
+        loop {
+            let current = secrets
+                .get(secret_name)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            if !owner_reference_matches(&current.metadata.owner_references, expected_vm_uid) {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "bootstrap Secret {secret_name} is not owned by this sandbox's \
+                     VirtualMachine (expected owner UID {expected_vm_uid}); refusing to rewrite it"
+                )));
+            }
+            let resource_version = current
+                .metadata
+                .resource_version
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            let secret_uid = current
+                .metadata
+                .uid
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            let mut pinned = patch_body.clone();
+            pin_patch_to_checked_object(&mut pinned, &secret_uid, &resource_version);
+            match secrets
+                .patch(secret_name, &PatchParams::default(), &Patch::Merge(&pinned))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if is_kube_conflict(&error) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+            }
+        }
+    };
+    tokio::time::timeout(KUBE_API_TIMEOUT, operation)
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s patching bootstrap Secret {secret_name}",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+}
+
 async fn patch_dynamic_object_with_resource_version_retry(
     api: &Api<DynamicObject>,
     name: &str,
@@ -5412,10 +5568,12 @@ impl KubernetesComputeDriver {
 
         // Start the VM: patch runStrategy from Halted to Once and clear the
         // in-flight annotation (a later Halted without it is a user stop).
-        patch_dynamic_object_with_resource_version_retry(&vm_api, kube_name, |version| {
+        // H5: the patch is pinned to the VM UID captured before the
+        // companions were built, so a VM replaced under the same name
+        // during provisioning is never booted.
+        patch_kubevirt_vm_pinned_to_checked_uid(&vm_api, kube_name, vm_uid, |_| {
             serde_json::json!({
                 "metadata": {
-                    "resourceVersion": version,
                     "annotations": {
                         crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
                     }
@@ -5707,9 +5865,21 @@ impl KubernetesComputeDriver {
             if err.code != 409 {
                 return Err(KubernetesDriverError::from_kube(KubeError::Api(err)));
             }
-            let _ = secrets
-                .delete(&names.supervisor_secret, &DeleteParams::default())
-                .await;
+            // H5: the leftover Secret from an earlier attempt of this
+            // generation is read first and deleted with its UID as a
+            // precondition, so a replacement created between the read and
+            // the delete is never removed.
+            if let Ok(Some(leftover)) = secrets.get_opt(&names.supervisor_secret).await {
+                let _ = secrets
+                    .delete(
+                        &names.supervisor_secret,
+                        &DeleteParams::default().preconditions(Preconditions {
+                            uid: leftover.metadata.uid,
+                            resource_version: None,
+                        }),
+                    )
+                    .await;
+            }
             secrets
                 .create(&PostParams::default(), &supervisor_secret)
                 .await
@@ -5881,7 +6051,18 @@ impl KubernetesComputeDriver {
                 continue;
             }
             debug!(sandbox_id = sandbox_id, secret = %name, "deleting stale shared-instance Secret");
-            let _ = secrets.delete(&name, &DeleteParams::default()).await;
+            // H5: the delete carries the listed Secret's UID as a
+            // precondition, so a replacement under the same name is
+            // never removed.
+            let _ = secrets
+                .delete(
+                    &name,
+                    &DeleteParams::default().preconditions(Preconditions {
+                        uid: secret.metadata.uid,
+                        resource_version: None,
+                    }),
+                )
+                .await;
         }
     }
 
@@ -6284,21 +6465,15 @@ impl KubernetesComputeDriver {
         .map_err(KubernetesDriverError::Precondition)?;
 
         // Patch the bootstrap Secret with the new generation's payload.
+        // H5: the Secret is pinned to the checked VM — it is read first,
+        // its ownerReference UID must be this VM, and the patch carries
+        // the read resourceVersion, so a foreign or replaced object
+        // under the derived name is never rewritten.
         let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
         let secret_name = crate::kubevirt::bootstrap_secret_name(&kube_name);
         let patch =
             serde_json::json!({"stringData": {"userData": bootstrap.guest_payload.clone()}});
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            secret_api.patch(&secret_name, &PatchParams::default(), &Patch::Merge(&patch)),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out patching bootstrap Secret {secret_name}"
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
+        patch_kubevirt_bootstrap_secret_pinned(&secret_api, &secret_name, &vm_uid, patch).await?;
 
         // X3: install the generation's supervisor material: the shared
         // instance re-registers on the same route, the dedicated
@@ -6335,30 +6510,48 @@ impl KubernetesComputeDriver {
         self.delete_stale_kubevirt_supervisor_secrets(sandbox_id, &namespace, &current_generation)
             .await;
 
+        // H5: every VM patch is pinned to the UID captured at lookup —
+        // the patch re-reads the VM, refuses a replacement (a new UID
+        // under the same name), and carries the read resourceVersion, so
+        // a concurrent modification is rejected and retried from a fresh
+        // read rather than landing as a name-only write.
         let patch_strategy = |strategy: String| {
             let api = api.clone();
             let kube_name = kube_name.clone();
+            let vm_uid = vm_uid.clone();
             async move {
-                let patch = serde_json::json!({
-                    "metadata": {"annotations": {
-                        crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
-                    }},
-                    "spec": {"runStrategy": strategy}
-                });
-                tokio::time::timeout(
-                    KUBE_API_TIMEOUT,
-                    api.patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch)),
-                )
+                patch_kubevirt_vm_pinned_to_checked_uid(&api, &kube_name, &vm_uid, |_| {
+                    serde_json::json!({
+                        "metadata": {"annotations": {
+                            crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
+                        }},
+                        "spec": {"runStrategy": strategy}
+                    })
+                })
                 .await
-                .map_err(|_| {
-                    KubernetesDriverError::Message(format!(
-                        "timed out after {}s patching VirtualMachine run strategy",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ))
-                })?
-                .map_err(KubernetesDriverError::from_kube)
+                .map(|_| ())
             }
         };
+        // H5: re-verify the fence immediately before the patch that boots
+        // the guest — the check at the top of start must not be stale by
+        // the time the VM can run workload code. A fence widened or
+        // replaced during provisioning fails the start instead of
+        // releasing the VM.
+        let reverify_fence_before_release =
+            |client: Client,
+             namespace: String,
+             sandbox_id: String,
+             expected_fence: crate::kubevirt_boundary::ExpectedFence| async move {
+                crate::kubevirt_boundary::verify_fence(
+                    &client,
+                    &namespace,
+                    &sandbox_id,
+                    &expected_fence,
+                )
+                .await
+                .map(|_| ())
+                .map_err(KubernetesDriverError::Precondition)
+            };
 
         let wait_for_vmi_gone = async {
             let vmi_api = crate::kubevirt::virtual_machine_instance_api(&self.client, &namespace);
@@ -6392,6 +6585,13 @@ impl KubernetesComputeDriver {
                 // still exist here. Wait it out before patching so the
                 // controller does not reject or ignore the boot.
                 wait_for_vmi_gone.await?;
+                reverify_fence_before_release(
+                    self.client.clone(),
+                    namespace.clone(),
+                    sandbox_id.to_string(),
+                    expected_fence.clone(),
+                )
+                .await?;
                 patch_strategy("Once".to_string()).await?;
             }
             // AlreadyRunning returned before any side effect above.
@@ -6402,6 +6602,13 @@ impl KubernetesComputeDriver {
                 // for it to go away, then boot a fresh one.
                 patch_strategy("Halted".to_string()).await?;
                 wait_for_vmi_gone.await?;
+                reverify_fence_before_release(
+                    self.client.clone(),
+                    namespace.clone(),
+                    sandbox_id.to_string(),
+                    expected_fence.clone(),
+                )
+                .await?;
                 patch_strategy("Once".to_string()).await?;
             }
         }
@@ -6454,24 +6661,18 @@ impl KubernetesComputeDriver {
         // Also clear any lingering create-in-flight annotation: a create
         // interrupted before its Once patch leaves one, and the
         // provisioning-timeout reclaim reaches this stop.
-        let patch = serde_json::json!({
-            "metadata": {"annotations": {
-                crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
-            }},
-            "spec": {"runStrategy": "Halted"}
-        });
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            api.patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch)),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s patching VirtualMachine run strategy",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
+        // H5: the halt is pinned to the UID from the lookup — a VM
+        // replaced under the same name is never halted by this stop.
+        let checked_vm_uid = object.metadata.uid.clone().unwrap_or_default();
+        patch_kubevirt_vm_pinned_to_checked_uid(&api, &kube_name, &checked_vm_uid, |_| {
+            serde_json::json!({
+                "metadata": {"annotations": {
+                    crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
+                }},
+                "spec": {"runStrategy": "Halted"}
+            })
+        })
+        .await?;
 
         info!(
             sandbox_id,
@@ -6602,8 +6803,9 @@ impl KubernetesComputeDriver {
                 );
             }
         }
+        let checked_vm_uid = object.metadata.uid.clone().unwrap_or_default();
         let preconditions = Preconditions {
-            uid: object.metadata.uid,
+            uid: Some(checked_vm_uid.clone()),
             resource_version: None,
         };
 
@@ -6636,37 +6838,90 @@ impl KubernetesComputeDriver {
         // namespace-wide launcher isolation floor keeps the pod fenced
         // after the per-sandbox fence goes, and the owner references
         // cascade the companions once the VM is actually removed.
+        //
+        // H5: each companion delete is pinned to the object that was read
+        // — the object's ownerReference UID must be the checked VM, and
+        // the delete carries the read UID as a precondition, so a
+        // replaced or foreign-owned object under a derived name is
+        // skipped, never deleted.
         let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
-        let _ = secret_api
-            .delete(
-                &crate::kubevirt::bootstrap_secret_name(&kube_name),
-                &DeleteParams::default(),
-            )
-            .await;
+        if let Ok(Some(secret)) = secret_api
+            .get_opt(&crate::kubevirt::bootstrap_secret_name(&kube_name))
+            .await
+        {
+            if owner_reference_matches(&secret.metadata.owner_references, &checked_vm_uid) {
+                let _ = secret_api
+                    .delete(
+                        &crate::kubevirt::bootstrap_secret_name(&kube_name),
+                        &DeleteParams::default().preconditions(Preconditions {
+                            uid: secret.metadata.uid,
+                            resource_version: None,
+                        }),
+                    )
+                    .await;
+            } else {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    "bootstrap Secret is not owned by this sandbox's VirtualMachine; skipping its deletion"
+                );
+            }
+        }
         if self.config.kubevirt.workspace_pvc {
             let pvc_api: Api<PersistentVolumeClaim> =
                 Api::namespaced(self.client.clone(), &namespace);
-            let _ = pvc_api
-                .delete(
-                    &crate::kubevirt::workspace_pvc_name(&kube_name),
-                    &DeleteParams::default(),
-                )
-                .await;
+            if let Ok(Some(pvc)) = pvc_api
+                .get_opt(&crate::kubevirt::workspace_pvc_name(&kube_name))
+                .await
+            {
+                if owner_reference_matches(&pvc.metadata.owner_references, &checked_vm_uid) {
+                    let _ = pvc_api
+                        .delete(
+                            &crate::kubevirt::workspace_pvc_name(&kube_name),
+                            &DeleteParams::default().preconditions(Preconditions {
+                                uid: pvc.metadata.uid,
+                                resource_version: None,
+                            }),
+                        )
+                        .await;
+                } else {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        "workspace PVC is not owned by this sandbox's VirtualMachine; skipping its deletion"
+                    );
+                }
+            }
         }
         // W8: delete the egress fence in the normal path too — its name
         // derives from the sandbox ID, so the name-based companion cleanup
-        // above misses it.
+        // above misses it. H5: the fence is read first and its UID is a
+        // delete precondition (a replaced fence under the same name is
+        // not deleted).
         let fence_api: Api<DynamicObject> = Api::namespaced_with(
             self.client.clone(),
             &namespace,
             &crate::kubevirt_boundary::fence_api_resource(),
         );
-        let _ = fence_api
-            .delete(
-                &crate::kubevirt_boundary::fence_name(sandbox_id),
-                &DeleteParams::default(),
-            )
-            .await;
+        if let Ok(Some(fence)) = fence_api
+            .get_opt(&crate::kubevirt_boundary::fence_name(sandbox_id))
+            .await
+        {
+            if owner_reference_matches(&fence.metadata.owner_references, &checked_vm_uid) {
+                let _ = fence_api
+                    .delete(
+                        &crate::kubevirt_boundary::fence_name(sandbox_id),
+                        &DeleteParams::default().preconditions(Preconditions {
+                            uid: fence.metadata.uid,
+                            resource_version: None,
+                        }),
+                    )
+                    .await;
+            } else {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    "egress fence is not owned by this sandbox's VirtualMachine; skipping its deletion"
+                );
+            }
+        }
         Ok(true)
     }
 
@@ -6809,37 +7064,34 @@ impl KubernetesComputeDriver {
                         == Some("Halted");
                     let vmi_running = matches!(vmi_state.0.as_deref(), Some("Running"));
                     if !halted && vmi_running {
-                        let patch = serde_json::json!({
-                            "spec": {"runStrategy": "Halted"}
-                        });
+                        // H5: the auto-halt is pinned to the watched VM's
+                        // UID — a replaced VM is never halted by this
+                        // watch loop.
+                        let checked_vm_uid = vm.metadata.uid.clone().unwrap_or_default();
                         let vm_api = crate::kubevirt::virtual_machine_api(client, namespace);
-                        match tokio::time::timeout(
-                            KUBE_API_TIMEOUT,
-                            vm_api.patch(
-                                &kube_name,
-                                &PatchParams::default(),
-                                &Patch::Merge(&patch),
-                            ),
+                        let halt = patch_kubevirt_vm_pinned_to_checked_uid(
+                            &vm_api,
+                            &kube_name,
+                            &checked_vm_uid,
+                            |_| {
+                                serde_json::json!({
+                                    "spec": {"runStrategy": "Halted"}
+                                })
+                            },
                         )
-                        .await
-                        {
-                            Ok(Ok(_)) => {
+                        .await;
+                        match halt {
+                            Ok(_) => {
                                 warn!(
                                     sandbox = %kube_name,
                                     "halted root-workload VM after terminal generation end (R3)"
                                 );
                             }
-                            Ok(Err(error)) => {
+                            Err(error) => {
                                 warn!(
                                     sandbox = %kube_name,
                                     %error,
                                     "could not halt root-workload VM after terminal generation end (R3)"
-                                );
-                            }
-                            Err(_) => {
-                                warn!(
-                                    sandbox = %kube_name,
-                                    "timed out halting root-workload VM after terminal generation end (R3)"
                                 );
                             }
                         }
@@ -12167,6 +12419,15 @@ mod tests {
         inner: Arc<std::sync::Mutex<MockKubeInner>>,
     }
 
+    /// An armed `swap_on_get` hook: swap `replacement` in when the
+    /// `target`-th GET of `path` arrives after arming.
+    struct MockSwapOnGet {
+        path: String,
+        target: u32,
+        seen: u32,
+        replacement: serde_json::Value,
+    }
+
     #[derive(Default)]
     struct MockKubeInner {
         objects: std::collections::HashMap<String, serde_json::Value>,
@@ -12174,6 +12435,17 @@ mod tests {
         fail_next: Option<(String, String)>,
         counter: u64,
         cluster_ip: u32,
+        /// Armed swaps: on the Nth exact-path GET *after arming*, swap
+        /// the stored object for the replacement before responding
+        /// (simulates an out-of-band replacement between reads).
+        swap_on_get: Vec<MockSwapOnGet>,
+        /// Paths whose stored resourceVersion is bumped after each GET
+        /// (simulates a concurrent writer racing the read-modify-write).
+        bump_rv_after_get: Vec<String>,
+        /// When set, DELETE does not cascade owner-referenced dependents
+        /// (simulates the real API's asynchronous garbage collector, so
+        /// tests can exercise the explicit companion deletes).
+        disable_gc: bool,
     }
 
     impl MockKube {
@@ -12198,6 +12470,38 @@ mod tests {
 
         fn exists(&self, path: &str) -> bool {
             self.inner.lock().unwrap().objects.contains_key(path)
+        }
+
+        /// On the `occurrence`-th GET of `path` after this call (1-based),
+        /// replace the stored object with `replacement` before responding.
+        fn swap_on_get(&self, path: &str, occurrence: u32, replacement: serde_json::Value) {
+            self.inner.lock().unwrap().swap_on_get.push(MockSwapOnGet {
+                path: path.to_string(),
+                target: occurrence,
+                seen: 0,
+                replacement,
+            });
+        }
+
+        /// Bump the stored resourceVersion of `path` after every GET, so
+        /// a value just read is stale by the time a patch lands with it.
+        fn bump_rv_after_get(&self, path: &str) {
+            self.inner
+                .lock()
+                .unwrap()
+                .bump_rv_after_get
+                .push(path.to_string());
+        }
+
+        /// Disable the mock's synchronous owner-reference garbage
+        /// collection (the real collector is asynchronous).
+        fn disable_gc(&self) {
+            self.inner.lock().unwrap().disable_gc = true;
+        }
+
+        /// The currently stored object at `path`, if any.
+        fn object(&self, path: &str) -> Option<serde_json::Value> {
+            self.inner.lock().unwrap().objects.get(path).cloned()
         }
     }
 
@@ -12317,10 +12621,47 @@ mod tests {
         let counter = inner.counter;
         inner.counter += 1;
         match method.as_str() {
-            "GET" if query.is_empty() => inner.objects.get(&path).map_or_else(
-                || mock_kube_response(404, &mock_kube_status(404, "NotFound")),
-                mock_kube_response_with_ok,
-            ),
+            "GET" if query.is_empty() => {
+                // H5 hooks: a configured swap replaces the stored object
+                // first (an out-of-band replacement), and a configured
+                // bump invalidates the resourceVersion this response
+                // carries (a concurrent writer).
+                let mut swap_index = None;
+                for (index, hook) in inner.swap_on_get.iter_mut().enumerate() {
+                    if hook.path == path {
+                        hook.seen += 1;
+                        if hook.seen == hook.target {
+                            swap_index = Some(index);
+                        }
+                    }
+                }
+                if let Some(index) = swap_index {
+                    let hook = inner.swap_on_get.remove(index);
+                    inner.objects.insert(path.clone(), hook.replacement);
+                }
+                let found = inner.objects.get(&path).cloned();
+                if found.is_some()
+                    && let Some(index) = inner
+                        .bump_rv_after_get
+                        .iter()
+                        .position(|bump| bump == &path)
+                {
+                    // One shot: invalidate the resourceVersion this GET is
+                    // about to serve, then stop (a racing writer that
+                    // touched the object once, not forever).
+                    inner.bump_rv_after_get.remove(index);
+                    if let Some(stored) = inner.objects.get_mut(&path)
+                        && let Some(rv) = stored["metadata"]["resourceVersion"].as_str()
+                    {
+                        let bumped = format!("bumped-{rv}");
+                        stored["metadata"]["resourceVersion"] = serde_json::json!(bumped);
+                    }
+                }
+                found.map_or_else(
+                    || mock_kube_response(404, &mock_kube_status(404, "NotFound")),
+                    |object| mock_kube_response_with_ok(&object),
+                )
+            }
             // Listing requests always carry a query (limit or selector).
             "GET" => {
                 let selector = query
@@ -12404,6 +12745,24 @@ mod tests {
                 };
                 let merge_patch: serde_json::Value =
                     serde_json::from_slice(&payload).unwrap_or_else(|_| serde_json::json!({}));
+                // H5: the real API server rejects a patch whose pinned
+                // metadata.uid or metadata.resourceVersion does not match
+                // the stored object (a replaced or concurrently modified
+                // object); the mock enforces the same contract.
+                if let Some(patch_uid) = merge_patch["metadata"]["uid"].as_str()
+                    && object["metadata"]["uid"]
+                        .as_str()
+                        .is_some_and(|stored| stored != patch_uid)
+                {
+                    return mock_kube_response(409, &mock_kube_status(409, "Conflict"));
+                }
+                if let Some(patch_rv) = merge_patch["metadata"]["resourceVersion"].as_str()
+                    && object["metadata"]["resourceVersion"]
+                        .as_str()
+                        .is_some_and(|stored| stored != patch_rv)
+                {
+                    return mock_kube_response(409, &mock_kube_status(409, "Conflict"));
+                }
                 merge_json(object, &merge_patch);
                 mock_kube_response(200, object)
             }
@@ -12411,13 +12770,31 @@ mod tests {
                 let Some(object) = inner.objects.remove(&path) else {
                     return mock_kube_response(404, &mock_kube_status(404, "NotFound"));
                 };
+                // H5: DeleteOptions.preconditions.uid from the request body
+                // must match the stored object's UID, as the real API
+                // server enforces (a replaced object under the same name
+                // is not deleted).
+                if let Ok(options) = serde_json::from_slice::<serde_json::Value>(&payload)
+                    && let Some(expected) = options["preconditions"]["uid"].as_str()
+                    && object["metadata"]["uid"]
+                        .as_str()
+                        .is_some_and(|stored| stored != expected)
+                {
+                    inner.objects.insert(path, object);
+                    return mock_kube_response(409, &mock_kube_status(409, "Conflict"));
+                }
                 let mut deleted_uids = vec![object["metadata"]["uid"].clone()];
-                // Simple transitive owner-reference garbage collection:
+                // Simple transitive owner-reference garbage collection
+                // (skipped when the test simulates the real asynchronous
+                // collector):
                 // dependents of a deleted object go with it (as the real
                 // API does), so tests can observe the owner-reference
                 // cleanup (H1) — including second-level dependents like a
                 // supervisor Secret owned by the cascaded supervisor Pod.
                 loop {
+                    if inner.disable_gc {
+                        break;
+                    }
                     let dependents: Vec<(String, serde_json::Value)> = inner
                         .objects
                         .iter()
@@ -12609,6 +12986,193 @@ mod tests {
         }
     }
 
+    /// H5: a VM replaced under the same name between the start's lookup
+    /// and its first patch is refused — the patch is pinned to the
+    /// checked UID, so the replacement is never booted by this start.
+    #[tokio::test]
+    async fn kubevirt_start_refuses_a_replaced_vm() {
+        let state = MockKube::default();
+        seed_kubevirt_namespace(&state);
+        let driver = kubevirt_mock_driver(mock_kube_client(state.clone()));
+        let created = driver
+            .create_sandbox(&kubevirt_test_sandbox())
+            .await
+            .expect("create succeeds against the mock");
+        // Simulate the stopped state start operates on: halt the VM the
+        // create left running.
+        let mut halted = state
+            .object(MOCK_VM_PATH)
+            .expect("the created VM is stored");
+        halted["spec"]["runStrategy"] = serde_json::json!("Halted");
+        state.seed(MOCK_VM_PATH, halted);
+        // Replace the VM (same name, new UID) after the start's lookup:
+        // the pinned patch's first read sees the replacement.
+        let mut replaced = state
+            .object(MOCK_VM_PATH)
+            .expect("the created VM is stored");
+        replaced["metadata"]["uid"] = serde_json::json!("vm-uid-replaced");
+        state.swap_on_get(MOCK_VM_PATH, 1, replaced);
+        let requests_before_start = state.requests().len();
+        let authentication = serde_json::to_vec(&kubevirt_test_launch_authentication()).unwrap();
+        let error = driver
+            .start_kubevirt_sandbox("sbx-id", &authentication, &created)
+            .await
+            .expect_err("a replaced VM must refuse the start");
+        assert!(
+            error.to_string().contains("was replaced"),
+            "the error must name the replacement: {error}"
+        );
+        assert!(
+            error.to_string().contains("vm-uid-replaced"),
+            "the error must name the observed UID: {error}"
+        );
+        // The replacement was never patched: no write reached the VM
+        // during the start.
+        let start_requests = &state.requests()[requests_before_start..];
+        assert!(
+            !start_requests
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains("virtualmachines/")),
+            "no VM patch may land after a replacement is detected: {start_requests:?}"
+        );
+    }
+
+    /// H5: a bootstrap Secret that is not owned by this sandbox's VM is
+    /// never rewritten by start — a foreign object under the derived name
+    /// is refused, not patched.
+    #[tokio::test]
+    async fn kubevirt_start_refuses_a_foreign_owned_bootstrap_secret() {
+        let state = MockKube::default();
+        seed_kubevirt_namespace(&state);
+        let driver = kubevirt_mock_driver(mock_kube_client(state.clone()));
+        let created = driver
+            .create_sandbox(&kubevirt_test_sandbox())
+            .await
+            .expect("create succeeds against the mock");
+        // Simulate the stopped state start operates on: halt the VM the
+        // create left running.
+        let mut halted = state
+            .object(MOCK_VM_PATH)
+            .expect("the created VM is stored");
+        halted["spec"]["runStrategy"] = serde_json::json!("Halted");
+        state.seed(MOCK_VM_PATH, halted);
+        // A foreign object under the bootstrap Secret's name: same name,
+        // owned by another VM.
+        let secret_path = "/api/v1/namespaces/openshell-e2e-ns/secrets/default--demo-bootstrap";
+        let mut foreign = state.object(secret_path).expect("the secret exists");
+        foreign["metadata"]["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "kubevirt.io/v1", "kind": "VirtualMachine",
+            "name": "default--other", "uid": "other-vm-uid",
+            "controller": false, "blockOwnerDeletion": false,
+        }]);
+        state.seed(secret_path, foreign);
+        let authentication = serde_json::to_vec(&kubevirt_test_launch_authentication()).unwrap();
+        let error = driver
+            .start_kubevirt_sandbox("sbx-id", &authentication, &created)
+            .await
+            .expect_err("a foreign-owned bootstrap Secret must refuse the start");
+        assert!(
+            error.to_string().contains("not owned by this sandbox"),
+            "the error must name the owner check: {error}"
+        );
+        // The foreign Secret was never rewritten.
+        assert!(
+            !state
+                .requests()
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains(secret_path)),
+            "the foreign bootstrap Secret must not be patched: {:?}",
+            state.requests()
+        );
+    }
+
+    /// H5: the fence is re-verified immediately before the patch that
+    /// boots the VM — a fence widened after the start's first check fails
+    /// the start instead of releasing the guest.
+    #[tokio::test]
+    async fn kubevirt_start_reverifies_the_fence_before_release() {
+        let state = MockKube::default();
+        seed_kubevirt_namespace(&state);
+        let driver = kubevirt_mock_driver(mock_kube_client(state.clone()));
+        let created = driver
+            .create_sandbox(&kubevirt_test_sandbox())
+            .await
+            .expect("create succeeds against the mock");
+        // Simulate the stopped state start operates on: halt the VM the
+        // create left running.
+        let mut halted = state
+            .object(MOCK_VM_PATH)
+            .expect("the created VM is stored");
+        halted["spec"]["runStrategy"] = serde_json::json!("Halted");
+        state.seed(MOCK_VM_PATH, halted);
+        // Widen the fence (same UID, an extra egress allow) between the
+        // start's first verification and its immediate pre-release
+        // re-check: the second GET of the fence serves the widened spec.
+        let fence_path = "/apis/networking.k8s.io/v1/namespaces/openshell-e2e-ns/networkpolicies/openshell-kubevirt-fence-sbx-id";
+        let mut widened = state.object(fence_path).expect("the fence exists");
+        widened["spec"]["egress"] = serde_json::json!([{}]);
+        state.swap_on_get(fence_path, 2, widened);
+        let authentication = serde_json::to_vec(&kubevirt_test_launch_authentication()).unwrap();
+        let error = driver
+            .start_kubevirt_sandbox("sbx-id", &authentication, &created)
+            .await
+            .expect_err("a fence widened before release must refuse the start");
+        assert!(
+            error.to_string().contains("fence"),
+            "the error must name the fence: {error}"
+        );
+        // The VM was never booted: the run strategy is not Once.
+        let vm = state.object(MOCK_VM_PATH).expect("the VM is stored");
+        assert_ne!(
+            vm["spec"]["runStrategy"],
+            serde_json::json!("Once"),
+            "the release patch must not land after fence drift"
+        );
+    }
+
+    /// H5: a resourceVersion conflict on a pinned VM patch retries from a
+    /// fresh read and completes — the conflict is a transient race, never
+    /// a name-only fallback or an abort.
+    #[tokio::test]
+    async fn kubevirt_patches_retry_cleanly_after_a_conflict() {
+        let state = MockKube::default();
+        seed_kubevirt_namespace(&state);
+        let driver = kubevirt_mock_driver(mock_kube_client(state.clone()));
+        let created = driver
+            .create_sandbox(&kubevirt_test_sandbox())
+            .await
+            .expect("create succeeds against the mock");
+        // Simulate the stopped state start operates on: halt the VM the
+        // create left running.
+        let mut halted = state
+            .object(MOCK_VM_PATH)
+            .expect("the created VM is stored");
+        halted["spec"]["runStrategy"] = serde_json::json!("Halted");
+        state.seed(MOCK_VM_PATH, halted);
+        // A concurrent writer bumps the VM's resourceVersion right after
+        // the pinned patch's first read: the first patch conflicts (409)
+        // and the retry succeeds with the fresh version.
+        state.bump_rv_after_get(MOCK_VM_PATH);
+        let authentication = serde_json::to_vec(&kubevirt_test_launch_authentication()).unwrap();
+        let identity = driver
+            .start_kubevirt_sandbox("sbx-id", &authentication, &created)
+            .await
+            .expect("a transient conflict retries and the start completes");
+        assert!(
+            identity.starts_with("kubernetes://openshell-e2e-ns/"),
+            "the retried start returns a Kubernetes identity, got {identity}"
+        );
+        let vm_patches = state
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("PATCH") && request.contains("virtualmachines/"))
+            .count();
+        assert!(
+            vm_patches >= 2,
+            "the conflicted patch must have been retried (VM patches: {vm_patches})"
+        );
+    }
+
     /// M4: a start on a live or booting VMI is idempotent — the plan is
     /// computed first, so no supervisor Pod is recreated, no Secret
     /// rewritten, and no instance registered.
@@ -12723,6 +13287,9 @@ mod tests {
     async fn kubevirt_delete_waits_for_the_vm_before_companions() {
         let state = MockKube::default();
         seed_kubevirt_namespace(&state);
+        // Keep the companions alive past the VM delete (the real garbage
+        // collector is asynchronous) so the explicit pinned deletes run.
+        state.disable_gc();
         let labels = serde_json::json!({
             "openshell.ai/managed-by": "openshell",
             "openshell.ai/sandbox-id": "sbx-id",

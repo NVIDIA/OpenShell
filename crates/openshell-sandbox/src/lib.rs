@@ -47,7 +47,6 @@ pub mod sftp;
 /// Results of actively qualifying the admitted workload runtime.
 ///
 /// Produced before the sandbox consumes protected bootstrap material.
-
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 #[allow(

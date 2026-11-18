@@ -490,11 +490,6 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
 const KUBEVIRT_VM_LABEL: &str = "kubevirt.io/domain";
 const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
 
-/// The workload identity the `KubeVirt` guest's boundary runs as. The guest
-/// image provisions this uid/gid (the `sandbox` user in the Alpine guest).
-pub const KUBEVIRT_WORKLOAD_UID: u32 = 10001;
-pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
-
 /// Set on the `VirtualMachine` while the driver's create still holds it
 /// `Halted` (the W6 window between capturing the VM's UID and patching
 /// `runStrategy` to `Once`). A `Halted` VM with this annotation maps to a

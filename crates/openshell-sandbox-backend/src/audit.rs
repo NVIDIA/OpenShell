@@ -16,7 +16,7 @@ use openshell_isolation_interface::contract::BackendError;
 /// - Trusted boundary (container or libkrun VM, or unknown): the full
 ///   capability-free posture (zero caps, `no_new_privs`, seccomp,
 ///   Landlock, DNS/TCP round trips) is required.
-/// - Untrusted KubeVirt guest: only what is still meaningful (the boundary
+/// - Untrusted `KubeVirt` guest: only what is still meaningful (the boundary
 ///   honestly reports no caps/Landlock/seccomp because none are enforced).
 ///   Everything the guest reports after start is advisory and is never
 ///   treated as proof of enforcement.
