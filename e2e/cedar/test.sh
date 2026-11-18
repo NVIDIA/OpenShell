@@ -121,8 +121,7 @@ PY
 sed -e "s|__HOST__|${UP_HOST}|g" -e "s|__PORT__|${UP_PORT}|g" -e "s|__PREFIX__|${UP_PREFIX}|g" \
     "${SCRIPT_DIR}/policy.template.cedar" > "${TMP_DIR}/policy.cedar"
 
-# The CLI rejects this request before provisioning if the gateway does not
-# advertise Cedar support.
+# The gateway validates Cedar support and returns any policy error to the CLI.
 "$OPENSHELL_BIN" sandbox create \
     --name "$SANDBOX" \
     --policy "${TMP_DIR}/policy.cedar" \

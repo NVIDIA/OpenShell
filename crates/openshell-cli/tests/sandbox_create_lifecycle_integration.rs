@@ -63,9 +63,10 @@ struct SandboxState {
     /// Make `ListProviderProfiles` fail while every other RPC keeps working,
     /// so a catalog lookup failure can be told apart from an empty catalog.
     fail_list_provider_profiles: Arc<AtomicBool>,
+    reject_cedar_policy: Arc<AtomicBool>,
+    health_requests: Arc<AtomicUsize>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
-    provider_create_requests: Arc<AtomicUsize>,
     policy_update_requests: Arc<AtomicUsize>,
     /// The policy `GetSandboxConfig` returns.
     sandbox_config_policy: Arc<Mutex<Option<openshell_core::proto::SandboxPolicy>>>,
@@ -165,10 +166,11 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
+        self.state.health_requests.fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(HealthResponse {
-            supported_capabilities: Vec::new(),
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
+            ..Default::default()
         }))
     }
 
@@ -195,7 +197,17 @@ impl OpenShell for TestOpenShell {
                 )
             })
             .collect();
+        let cedar = request
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.policy.as_ref())
+            .is_some_and(openshell_core::proto::SandboxPolicy::is_cedar);
         self.state.create_requests.lock().await.push(request);
+        if cedar && self.state.reject_cedar_policy.load(Ordering::SeqCst) {
+            return Err(Status::failed_precondition(
+                "this gateway was built without Cedar policy support",
+            ));
+        }
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
         } else {
@@ -575,9 +587,6 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        self.state
-            .provider_create_requests
-            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(ProviderResponse::default()))
     }
 
@@ -984,11 +993,22 @@ impl OpenShell for TestOpenShell {
 
     async fn update_config(
         &self,
-        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+        request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
     ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
         self.state
             .policy_update_requests
             .fetch_add(1, Ordering::SeqCst);
+        if self.state.reject_cedar_policy.load(Ordering::SeqCst)
+            && request
+                .into_inner()
+                .policy
+                .as_ref()
+                .is_some_and(openshell_core::proto::SandboxPolicy::is_cedar)
+        {
+            return Err(Status::failed_precondition(
+                "this gateway was built without Cedar policy support",
+            ));
+        }
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -4191,8 +4211,13 @@ async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway(
 }
 
 #[tokio::test]
-async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
+async fn cedar_policy_surfaces_gateway_rejection_without_health_preflight() {
     let server = run_server().await;
+    server
+        .openshell
+        .state
+        .reject_cedar_policy
+        .store(true, Ordering::SeqCst);
     let dir = helpers::tempdir().unwrap();
     let path = dir.path().join("policy.cedar");
     fs::write(&path, r#"permit(principal, action == Sandbox::Action::"NetworkConnect", resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#).unwrap();
@@ -4202,9 +4227,7 @@ async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
         &server.endpoint,
         "openshell",
         run::SandboxCreateConfig {
-            name: Some("cedar-legacy"),
-            providers: &["github".to_string()],
-            auto_providers_override: Some(true),
+            name: Some("cedar-unsupported"),
             policy: Some(path),
             ..test_config()
         },
@@ -4214,8 +4237,22 @@ async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
     .await
     .unwrap_err();
     assert!(
-        error.to_string().contains("Cedar policy support"),
+        error
+            .to_string()
+            .contains("this gateway was built without Cedar policy support"),
         "{error}"
+    );
+    let requests = create_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .policy
+            .as_ref()
+            .unwrap()
+            .is_cedar()
     );
     for global in [false, true] {
         let result = if global {
@@ -4224,7 +4261,7 @@ async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
         } else {
             run::sandbox_policy_set(
                 &server.endpoint,
-                "cedar-legacy",
+                "cedar-unsupported",
                 path,
                 false,
                 1,
@@ -4235,24 +4272,25 @@ async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
         };
         let error = result.unwrap_err();
         assert!(
-            error.to_string().contains("Cedar policy support"),
+            error
+                .to_string()
+                .contains("this gateway was built without Cedar policy support"),
             "{error}"
         );
     }
-    assert!(create_requests(&server).await.is_empty());
-    assert_eq!(
-        server
-            .openshell
-            .state
-            .provider_create_requests
-            .load(Ordering::SeqCst),
-        0
-    );
     assert_eq!(
         server
             .openshell
             .state
             .policy_update_requests
+            .load(Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .health_requests
             .load(Ordering::SeqCst),
         0
     );

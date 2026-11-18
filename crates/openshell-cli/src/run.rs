@@ -571,10 +571,6 @@ pub async fn sandbox_create(
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
 
-    // Keep the early-loaded policy off the provisioning future's stack.
-    let policy = Box::new(load_sandbox_policy(policy)?);
-    require_cedar_gateway_support(&mut client, policy.as_ref().as_ref()).await?;
-
     // Provider profiles are import-only, so the catalog lives on the gateway.
     // Its only consumer is the credential warning, which is advisory: an
     // unreachable catalog degrades the warning to its generic form rather than
@@ -622,7 +618,7 @@ pub async fn sandbox_create(
         ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
             .await?;
 
-    let policy = *policy;
+    let policy = load_sandbox_policy(policy)?;
     let resource_limits = if template.is_none() {
         build_sandbox_resource_limits(cpu, memory)?
     } else {
@@ -1535,29 +1531,6 @@ fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> 
     openshell_policy::load_sandbox_policy(cli_path)
 }
 
-/// Reject Cedar before any provisioning or policy mutation on older gateways.
-async fn require_cedar_gateway_support(
-    client: &mut crate::tls::GrpcClient,
-    policy: Option<&SandboxPolicy>,
-) -> Result<()> {
-    if policy.is_some_and(SandboxPolicy::is_cedar) {
-        let info = client
-            .health(openshell_core::proto::HealthRequest {})
-            .await
-            .into_diagnostic()?
-            .into_inner();
-        if !openshell_core::extension_protocol::has_capability(
-            &info.supported_capabilities,
-            openshell_core::extension_protocol::POLICY_CEDAR_V1,
-        ) {
-            return Err(miette::miette!(
-                "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Sync files to or from a sandbox.
 ///
 /// Dispatches to `sandbox_sync_up` or `sandbox_sync_down` based on the
@@ -1664,13 +1637,11 @@ where
 
     let config_result = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await;
     let config = match config_result {
@@ -5452,7 +5423,6 @@ pub async fn sandbox_policy_set_global(
         .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
     let mut client = grpc_client(server, tls).await?;
-    require_cedar_gateway_support(&mut client, Some(&policy)).await?;
     let response = client
         .update_config(UpdateConfigRequest {
             policy: Some(policy),
@@ -5486,13 +5456,11 @@ pub async fn sandbox_settings_get(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -5792,7 +5760,6 @@ pub async fn sandbox_policy_set(
         .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
     let mut client = grpc_client(server, tls).await?;
-    require_cedar_gateway_support(&mut client, Some(&policy)).await?;
 
     // Get current version so we can detect no-ops.
     let current_version = client
@@ -5946,13 +5913,11 @@ pub async fn sandbox_policy_update(
     let mut client = grpc_client(server, tls).await?;
     let current = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6246,13 +6211,11 @@ where
 
     let config = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
