@@ -7,12 +7,11 @@ import io
 import json
 import tempfile
 import unittest
-import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from managed_label_classifier import (
-    API_ROOT,
     API_VERSION,
     BETA,
     AgentConfig,
@@ -44,9 +43,21 @@ class FakeTransport:
     def __init__(self, pages):
         self.pages = iter(pages)
         self.calls = []
+        self.running = False
+        self.pending_interrupt = False
 
     def request(self, method, path, payload, timeout):
         self.calls.append((method, path, payload, timeout))
+        if path == "/sessions/sesn_test/events" and method == "POST":
+            self.pending_interrupt = True
+            return {}
+        if path == "/sessions/sesn_test" and method == "GET":
+            status = "running" if self.running else "idle"
+            if self.pending_interrupt:
+                self.running = False
+            return {"status": status}
+        if path.endswith("/archive") and self.running:
+            raise ClassifierError("Cannot archive a running session")
         if method == "POST":
             return {"id": "sesn_test"} if path == "/sessions" else {}
         return next(self.pages)
@@ -190,7 +201,11 @@ class ExecutionTests(unittest.TestCase):
             classify(transport, {})
         self.assertEqual(
             [call[1] for call in transport.calls if call[0] == "POST"],
-            ["/sessions", "/sessions/sesn_test/archive"],
+            [
+                "/sessions",
+                "/sessions/sesn_test/events",
+                "/sessions/sesn_test/archive",
+            ],
         )
 
     def test_malformed_proposal_archives_session_without_retry(self):
@@ -213,16 +228,73 @@ class ExecutionTests(unittest.TestCase):
             [
                 ("POST", "/sessions"),
                 ("GET", "/sessions/sesn_test/events?order=asc&limit=100"),
+                ("POST", "/sessions/sesn_test/events"),
+                ("GET", "/sessions/sesn_test"),
                 ("POST", "/sessions/sesn_test/archive"),
             ],
         )
 
     def test_timeout_archives_session(self):
         transport = FakeTransport([])
+        transport.running = True
         ticks = iter([0, 181])
+        sleeps = []
         with self.assertRaisesRegex(ClassifierError, "deadline.*session archived"):
-            classify(transport, {}, clock=lambda: next(ticks))
+            classify(transport, {}, clock=lambda: next(ticks, 181), sleep=sleeps.append)
+        self.assertFalse(transport.running)
+        self.assertEqual(sleeps, [2])
+        self.assertEqual(
+            transport.calls[1][2], {"events": [{"type": "user.interrupt"}]}
+        )
         self.assertEqual(transport.calls[-1][1], "/sessions/sesn_test/archive")
+
+    def test_keyboard_interrupt_stops_running_session_before_archival(self):
+        transport = FakeTransport([])
+        transport.running = True
+        original = transport.request
+
+        def request(method, path, payload, timeout):
+            if "?" in path:
+                raise KeyboardInterrupt()
+            return original(method, path, payload, timeout)
+
+        transport.request = request
+        with self.assertRaisesRegex(ClassifierError, "sesn_test.*session archived"):
+            classify(transport, {}, sleep=lambda _: None)
+        self.assertFalse(transport.running)
+        self.assertEqual(transport.calls[-1][1], "/sessions/sesn_test/archive")
+
+    def test_cleanup_deadline_reports_unconfirmed_remote_execution(self):
+        transport = FakeTransport([])
+        original = transport.request
+
+        def request(method, path, payload, timeout):
+            if method == "GET":
+                return {"status": "running"}
+            return original(method, path, payload, timeout)
+
+        transport.request = request
+        now = [0]
+
+        def clock():
+            return now[0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        def timed_request(method, path, payload, timeout):
+            result = request(method, path, payload, timeout)
+            if path == "/sessions":
+                now[0] = 181
+            return result
+
+        transport.request = timed_request
+        with self.assertRaisesRegex(
+            ClassifierError, "sesn_test.*cleanup unconfirmed.*may continue"
+        ):
+            classify(transport, {}, clock=clock, sleep=sleep)
+        self.assertEqual(now[0], 211)
+        self.assertFalse(any(call[1].endswith("/archive") for call in transport.calls))
 
     def test_pagination_cycles_fail_and_archive(self):
         transport = FakeTransport(
@@ -241,7 +313,7 @@ class ExecutionTests(unittest.TestCase):
             return original(method, path, payload, timeout)
 
         transport.request = request
-        with self.assertRaisesRegex(ClassifierError, "sesn_test.*archival also failed"):
+        with self.assertRaisesRegex(ClassifierError, "sesn_test.*cleanup unconfirmed"):
             classify(transport, {})
 
     def test_nonfinite_deadlines_are_rejected_before_session_creation(self):
@@ -253,45 +325,93 @@ class ExecutionTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
-    def test_request_uses_documented_endpoint_and_headers(self):
-        transport = ManagedAgents("test-secret")
-        with patch(
-            "urllib.request.urlopen", return_value=io.BytesIO(b'{"id":"sesn_test"}')
-        ) as opened:
-            self.assertEqual(
-                transport.request("POST", "/sessions", {"test": True}, 5),
-                {"id": "sesn_test"},
-            )
-        request = opened.call_args.args[0]
-        self.assertEqual(request.full_url, API_ROOT + "/sessions")
-        headers = {key.lower(): value for key, value in request.header_items()}
-        self.assertEqual(headers["authorization"], "Bearer test-secret")
-        self.assertEqual(headers["anthropic-version"], API_VERSION)
-        self.assertEqual(headers["anthropic-beta"], BETA)
-        self.assertEqual(json.loads(request.data), {"test": True})
+    def setUp(self):
+        class APIError(Exception):
+            pass
 
-    def test_http_failure_is_not_retried_or_echoed(self):
-        error = urllib.error.HTTPError(
-            API_ROOT + "/sessions", 403, "test-secret", {}, None
+        class APIStatusError(APIError):
+            status_code = 403
+
+        self.sdk = SimpleNamespace(
+            Anthropic=Mock(), APIError=APIError, APIStatusError=APIStatusError
         )
-        with (
-            patch("urllib.request.urlopen", side_effect=error) as opened,
-            self.assertRaisesRegex(ClassifierError, "HTTP 403") as caught,
-        ):
-            ManagedAgents("test-secret").request("POST", "/sessions", {}, 5)
-        self.assertEqual(opened.call_count, 1)
-        self.assertNotIn("test-secret", str(caught.exception))
+        with patch.dict("sys.modules", {"anthropic": self.sdk}):
+            self.transport = ManagedAgents("test-secret")
+        self.sessions = self.sdk.Anthropic.return_value.beta.sessions
 
-    def test_invalid_response_is_rejected(self):
-        for payload in [b"[]", b"not json"]:
-            with (
-                self.subTest(payload=payload),
-                patch("urllib.request.urlopen", return_value=io.BytesIO(payload)),
-                self.assertRaises(ClassifierError),
-            ):
-                ManagedAgents("test-secret").request(
-                    "GET", "/sessions/sesn_test", None, 5
+    def test_sdk_configuration_disables_retries(self):
+        self.sdk.Anthropic.assert_called_once_with(
+            api_key="test-secret",
+            max_retries=0,
+            default_headers={"anthropic-version": API_VERSION},
+        )
+
+    def test_operations_use_sdk_bindings_and_bounded_timeouts(self):
+        for method, path, payload, operation, arguments, keywords in [
+            (
+                "POST",
+                "/sessions",
+                {"title": "test"},
+                self.sessions.create,
+                (),
+                {"title": "test"},
+            ),
+            (
+                "GET",
+                "/sessions/sesn_test",
+                None,
+                self.sessions.retrieve,
+                ("sesn_test",),
+                {},
+            ),
+            (
+                "GET",
+                "/sessions/sesn_test/events?order=asc&limit=100&page=cursor%2B1",
+                None,
+                self.sessions.events.list,
+                ("sesn_test",),
+                {"order": "asc", "limit": 100, "page": "cursor+1"},
+            ),
+            (
+                "POST",
+                "/sessions/sesn_test/events",
+                {"events": [{"type": "user.interrupt"}]},
+                self.sessions.events.send,
+                ("sesn_test",),
+                {"events": [{"type": "user.interrupt"}]},
+            ),
+            (
+                "POST",
+                "/sessions/sesn_test/archive",
+                {},
+                self.sessions.archive,
+                ("sesn_test",),
+                {},
+            ),
+        ]:
+            with self.subTest(path=path):
+                operation.return_value.to_dict.return_value = {"id": "test"}
+                self.assertEqual(
+                    self.transport.request(method, path, payload, 5), {"id": "test"}
                 )
+                operation.assert_called_once_with(
+                    *arguments, **keywords, timeout=5, betas=[BETA]
+                )
+
+    def test_sdk_failures_are_not_retried_or_echoed(self):
+        for error, message in [
+            (self.sdk.APIStatusError("test-secret"), "HTTP 403"),
+            (self.sdk.APIError("test-secret"), "no automatic retry"),
+        ]:
+            self.sessions.create.reset_mock()
+            self.sessions.create.side_effect = error
+            with (
+                self.subTest(error=error),
+                self.assertRaisesRegex(ClassifierError, message) as caught,
+            ):
+                self.transport.request("POST", "/sessions", {}, 5)
+            self.sessions.create.assert_called_once()
+            self.assertNotIn("test-secret", str(caught.exception))
 
 
 class CliTests(unittest.TestCase):

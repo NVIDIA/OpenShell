@@ -27,7 +27,7 @@ on representative evidence before rollout; CLI cost estimates are not CMA measur
 ## Smoke-test CLI
 
 ```shell
-uv run --no-project python tasks/scripts/managed_label_classifier.py \
+uv run --no-project tasks/scripts/managed_label_classifier.py \
   --instructions /path/to/trusted-classifier-instructions.md \
   --evidence /path/to/prepared-evidence.json \
   --agent-id agent_CONFIGURED_ID --agent-version 1 \
@@ -41,7 +41,13 @@ Add `--run` with `ANTHROPIC_API_KEY` in the environment to create a billable
 session. Never include credentials in evidence. `--help` lists the budget and
 deadline defaults. The result contains `session_id` and `proposal`.
 
-Failed or timed-out sessions are archived; successful sessions remain for review.
+The CLI installs its pinned `anthropic` SDK through script metadata. Importing the
+adapter and running offline tests need no SDK. SDK requests disable automatic retries.
+
+On failure or interruption, cleanup sends `user.interrupt`, waits for idle, and
+archives within a separate 30-second deadline. Unconfirmed cleanup reports the
+session ID and warns that execution may continue. Successful sessions remain for
+review.
 See the [session event API](https://platform.claude.com/docs/en/managed-agents/events-and-streaming).
 
 ## Verification
