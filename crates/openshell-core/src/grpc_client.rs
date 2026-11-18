@@ -388,7 +388,7 @@ fn configure_gateway_tls(
         .wrap_err("failed to configure TLS")
 }
 
-/// Build the plain (un-intercepted) gRPC channel.
+/// Configure the plain (un-intercepted) gRPC endpoint.
 ///
 /// When the endpoint uses `https://`, server-authenticated TLS is configured
 /// using this env var:
@@ -396,7 +396,7 @@ fn configure_gateway_tls(
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
-async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+fn build_plain_endpoint(endpoint: &str) -> Result<Endpoint> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
         .wrap_err("invalid gRPC endpoint")?
@@ -431,7 +431,12 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref())?;
     }
 
-    ep.connect()
+    Ok(ep)
+}
+
+async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+    build_plain_endpoint(endpoint)?
+        .connect()
         .await
         .into_diagnostic()
         .wrap_err("failed to connect to OpenShell server")
@@ -1705,8 +1710,8 @@ pub async fn exchange_provider_subject_token(
 /// Final provider access tokens for one sandbox instance over one reused
 /// gateway channel.
 ///
-/// The channel connects on the first request; a failed connection is retried
-/// by the next one. Concurrent requests share the channel without holding a
+/// The lazy channel connects when used, so initialization never waits on a
+/// network connection. Concurrent requests share it without holding a
 /// lock across the call, and tonic reconnects it after transport loss. Each
 /// request reads the instance's current bearer, so renewal and revocation
 /// apply without reconnecting, and the gateway authorizes every request.
@@ -1741,9 +1746,8 @@ impl SandboxProviderTokenClient {
     /// the sandbox identity and resolves all grant parameters from its
     /// configuration.
     ///
-    /// One deadline bounds waiting for and connecting the channel as well as
-    /// the call. Concurrent initializers may retry a failed connection, but
-    /// waiting for an initializer cannot exceed this request's deadline.
+    /// One deadline bounds connection readiness and the call. Network failures
+    /// do not serialize channel initialization for concurrent requests.
     #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
     pub async fn get_access_token(
         &self,
@@ -1768,7 +1772,17 @@ impl SandboxProviderTokenClient {
         let response = tokio::time::timeout(self.deadline, async {
             let mut client = self
                 .client
-                .get_or_try_init(|| connect(gateway))
+                .get_or_try_init(|| async {
+                    let channel = build_plain_endpoint(gateway.url())?.connect_lazy();
+                    let intercepted = InterceptedService::new(
+                        channel.clone(),
+                        AuthInterceptor::new(gateway.credentials.inner.bearer.clone()),
+                    );
+                    gateway
+                        .credentials
+                        .start_renewal(&intercepted, &channel, gateway.url());
+                    Ok::<_, miette::Report>(OpenShellClient::new(intercepted))
+                })
                 .await
                 .map_err(|_| unavailable())?
                 .clone();
@@ -1947,6 +1961,10 @@ mod token_grant_exchange_tests {
             let failure = result.err().expect("unanswered gateway times out");
             assert_eq!(failure.kind(), TokenGrantFailureKind::Timeout);
         }
+        assert!(
+            client.client.get().is_some(),
+            "an unresponsive gateway must not prevent channel initialization"
+        );
         // Concurrent requests share one budget rather than queueing behind it.
         assert!(started.elapsed() < deadline * 3);
         held.abort();
