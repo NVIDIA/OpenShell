@@ -81,6 +81,14 @@ This creates a sandbox whose canonical main process is `/bin/bash -l` and
 attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
+Creates retry while the gateway mutation lock is busy. The CLI retries for up
+to 60 seconds by default, backing off from the gateway's suggested delay to a
+10-second ceiling and making at most five create attempts, and prints its
+progress to stderr. Change the budget with `--create-retry-timeout SECONDS` or
+`OPENSHELL_CREATE_RETRY_TIMEOUT`, or pass `--no-create-retry` to fail on the
+first busy reply. Only a `MUTATION_LOCK_TIMEOUT` failure retries; every other
+failure stops the command.
+
 An explicit trailing command is foreground even when stdin or stdout is not a
 terminal. The CLI streams its stdout and stderr and reports the command's exit
 status after output drains. A failure to deliver output makes the CLI report a
@@ -326,11 +334,18 @@ Key flags:
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
 - `--no-keep`: Delete the sandbox after main output and the exit result drain
+- `--create-retry-timeout SECONDS`: Keep retrying while the gateway mutation lock is busy for this many seconds (default 60, or `OPENSHELL_CREATE_RETRY_TIMEOUT`); at most five create attempts are made, with the delay backing off to 10 seconds
+- `--no-create-retry`: Fail immediately instead of retrying a busy gateway mutation lock
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
 If the driver rejects foreground attachment during create validation, use `--detach`.
+
+A named create that hits `ALREADY_EXISTS` while the previous sandbox with that
+name is still being deleted or is still being created waits for cleanup and
+retries within the same budget. A live sandbox holding the name is reported
+immediately.
 
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one

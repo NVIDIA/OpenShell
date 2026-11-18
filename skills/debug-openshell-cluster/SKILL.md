@@ -839,15 +839,15 @@ blocks, every other one. A backend that holds the legacy key as `ShareLock`
 holds or waits for exactly one sandbox's SSH identity key, so its other
 advisory lock row in `pg_locks` is that sandbox's key.
 Sandbox create holds its mutation guard while it waits for those keys. A wait
-that runs out returns `UNAVAILABLE` with "lock sandbox SSH identity failed",
-and neither
-`openshell_server_mutation_lock_timeouts_total` nor
-`openshell_server_mutation_lock_errors_total` counts it. A 10-second wait for
-one of the replica's data-pool lock slots (half of
-`database_max_connections`), which provider refresh shares, fails the same way (or with "credential refresh
-coordination unavailable") and logs "data-pool lock slots stayed busy". At a
-small `database_max_connections`, slow refresh mints or slow credential
-drivers cause it, and raising the pool fixes it.
+that runs out returns `UNAVAILABLE` with reason `MUTATION_LOCK_TIMEOUT`, a
+one-second `RetryInfo`, and a message naming the SSH identity lock timeout, so
+clients retry the create; it also increments
+`openshell_server_mutation_lock_timeouts_total{scope="sandbox"}`. A 10-second
+wait for one of the replica's data-pool lock slots (half of
+`database_max_connections`), which provider refresh shares, fails the same way
+(or with "credential refresh coordination unavailable") and logs "data-pool
+lock slots stayed busy". At a small `database_max_connections`, slow refresh
+mints or slow credential drivers cause it, and raising the pool fixes it.
 
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor

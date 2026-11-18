@@ -32,7 +32,7 @@ Recognized gateway reasons include the following.
 | `RESOURCE_VERSION_CONFLICT` | `ABORTED` | Read the resource again and construct a new conditional write. `metadata.recovery` is `REFRESH_STATE`; `current_resource_version` is included when known. |
 | `PROFILE_SOURCE_UNAVAILABLE` | `UNAVAILABLE` | Retry a profile snapshot read after at least the supplied delay. |
 | `DATABASE_UNAVAILABLE` | `UNAVAILABLE` | The gateway could not get a database connection within 5 seconds. Retry after at least the supplied delay. |
-| `MUTATION_LOCK_TIMEOUT` | `UNAVAILABLE` | The request waited more than 10 seconds for a concurrent mutation to release a sandbox, workspace, or gateway-wide lock. Retry after at least the supplied delay. A request that carried a `request_id` leaves its admission unresolved, like any other error, so a retry with that ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe resource state and reconcile effects before you start a new request with a new ID. |
+| `MUTATION_LOCK_TIMEOUT` | `UNAVAILABLE` | The request waited more than 10 seconds for a concurrent mutation to release a sandbox, workspace, or gateway-wide lock. Retry after at least the supplied delay. The Rust SDK's retrying sandbox-create methods and the CLI retry this reason automatically; see [Sandbox create retry](#sandbox-create-retry). A request that carried a `request_id` leaves its admission unresolved, like any other error, so a retry with that ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe resource state and reconcile effects before you start a new request with a new ID. |
 | `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
 | `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
 | `REQUEST_REPLAY_UNAVAILABLE` | `FAILED_PRECONDITION` | The original scope, resource, interceptor transformation, or fingerprint key is no longer replayable. Reconcile effects; the gateway does not execute the request again. Missing private-key material can also reject admission before work starts. |
@@ -43,8 +43,8 @@ Recognized gateway reasons include the following.
 A timeout or disconnected transport can occur after a mutation commits. Do not
 automatically repeat creates, credential rotation, or command execution based
 only on a transient status. Retry a mutation only when its documented operation
-contract makes the repeated request safe. A correlation ID does not provide that
-guarantee.
+contract makes the repeated request safe. The retrying sandbox-create methods
+below are such a contract; a correlation ID does not provide that guarantee.
 
 | Status | Recovery |
 |---|---|
@@ -60,6 +60,59 @@ guarantee.
 | `UNIMPLEMENTED` | Check gateway and SDK version compatibility and whether the compute driver supports the operation. |
 | `INTERNAL`, `UNKNOWN`, `DATA_LOSS` | Preserve the status and correlation metadata for diagnosis. Do not blindly retry mutations. |
 
+## Sandbox create retry
+
+The Rust SDK ships opt-in retrying create methods: `create_sandbox_with_retry`
+and `create_sandbox_from_template_with_retry` on both `OpenShellClient` and
+`WorkspaceScopedClient`. Each takes `CreateRetryOptions`, whose default budget
+is 60 seconds. The plain create methods never retry, because library callers
+own their retry policy. `SdkError::mutation_lock_timeout()` reports whether a
+failure is the retryable one; `retryable()` keeps its auth-only contract.
+
+A retrying create repeats the request only on `MUTATION_LOCK_TIMEOUT`. The
+match is exact over `UNAVAILABLE`, so `DATABASE_UNAVAILABLE`, a bare
+`UNAVAILABLE`, and every other failure end the loop, because a create can fail
+after the gateway persisted it. The reason covers two gateway steps: a create
+that loses the pre-record creation guard is rejected before any write runs,
+while one that loses the SSH identity step reports the same reason after the
+record was persisted. That second failure is safe to repeat because the gateway
+compensates the failed record and the next attempt resolves the name through
+the `ALREADY_EXISTS` wait below. The gateway consumes a single-use rootfs
+staging token when an attempt passes the pre-record creation guard, so a retry
+after a guard timeout can re-send the same token; a retry after the SSH identity
+step cannot, and gets the terminal re-stage error instead. The retrying SDK
+methods carry no staging token. Each attempt waits the server's `retry_delay`,
+or one second when the gateway supplies none, doubling that floor per retry up
+to 10 seconds (a server delay above that ceiling stays binding) and adding
+jitter of at most half the delay and never more than 500 milliseconds. The
+jitter seed is drawn once per retrying call, so clients contending on one
+sandbox name spread their attempts. A retrying call makes at
+most five create attempts, including the first, so it cannot keep re-entering
+the gateway's 10-second mutation-lock wait on the budget alone.
+
+One wall-clock budget covers the retry delays and the `ALREADY_EXISTS` cleanup
+waits below. The first attempt always runs, even with a zero budget. When the
+budget or the attempt cap runs out, the surfaced error names the create attempt
+count, plus the last mutation-lock message when the surfaced failure is not
+itself a lock timeout. A cleanup-wait timeout is therefore not misread as a
+bare name conflict.
+
+A named create that hits `ALREADY_EXISTS` inspects the holder in the create's
+workspace. A holder that is being deleted, or that is still being created, is
+polled again, backing off from one second to a five-second ceiling and
+jittered like the retry delays; the `ALREADY_EXISTS` status carries no delay
+hint of its own. A holder that is not found permits an immediate create retry,
+up to three consecutive times, after which the conflict is surfaced. A live
+holder, including one that was deleting and returns live, is a terminal
+conflict, and a different sandbox ID under the same name surfaces
+`ALREADY_EXISTS` immediately. The wait never follows a same-name replacement.
+A transient `UNAVAILABLE` while polling the holder is retried for as long as
+the budget allows; any other poll failure surfaces the `ALREADY_EXISTS`
+conflict with the poll error appended. Every attempt leaves
+`request_id` empty, because a non-empty ID would engage
+[durable request admission](#durable-request-admission) and replay the recorded
+failure instead of retrying.
+
 ## SDK access
 
 Each SDK exposes decoded fields and an escape hatch for complete transport data.
@@ -68,7 +121,7 @@ does not recognize their message type.
 
 | SDK | Decoded details | Original failure |
 |---|---|---|
-| Rust | `SdkError::error_details()`, `retry_delay()` | `SdkError::grpc_status()` returns the original `tonic::Status`, including details bytes and metadata. |
+| Rust | `SdkError::error_details()`, `retry_delay()`, `mutation_lock_timeout()` | `SdkError::grpc_status()` returns the original `tonic::Status`, including details bytes and metadata. |
 | Go | `StatusError.FieldViolations`, `ErrorInfo`, `RetryDelay`, `GRPCCode` | `StatusError.Cause` retains the gRPC error. `status.FromError` can recover its details through error wrapping. |
 | TypeScript | `SdkError.fieldViolations`, `errorInfo`, `retryDelayMs`, `connectCode` | `SdkError.cause` retains the `ConnectError`, including all details and metadata. Use `fromConnect` for raw calls. |
 | Python | `GatewayError.field_violations`, `error_info`, `retry_delay` | `raw_error` retains the gRPC exception and metadata; `raw_status` retains the parsed envelope. Use `from_grpc_error` for raw calls. |
@@ -89,7 +142,9 @@ propagate. Rust error variants now retain
 status fields; use `..` when destructuring variants that do not need those fields.
 Go and TypeScript add typed detail fields to their existing error types.
 
-No SDK automatically retries a mutation as a result of decoding these details.
+No SDK retries a mutation only because its status decodes. The opt-in Rust
+sandbox-create retry in [Sandbox create retry](#sandbox-create-retry) is the
+documented exception, and the CLI enables it by default.
 
 ## Durable request admission
 

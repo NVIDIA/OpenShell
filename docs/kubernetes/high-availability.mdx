@@ -503,13 +503,14 @@ sandboxes at once. During a rollout, replicas from an earlier release still
 take a fleet-wide lock for that step, so it can wait on other sandboxes' steps
 until the rollout finishes. Each replica runs at most half of
 `database_max_connections` of these steps and provider refreshes at once, and a
-step that can't start within 10 seconds returns `UNAVAILABLE`. For other
-mutations, a lock wait longer than 10 seconds returns `UNAVAILABLE` with the
-reason `MUTATION_LOCK_TIMEOUT`, and clients can retry the request. A request
-that carried a `request_id` leaves its admission unresolved, like any other
-error, so a retry with the same ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe
-resource state and reconcile effects, then send a new request with a new
-`request_id`. Refer to
+step that can't start within 10 seconds returns `UNAVAILABLE` with the reason
+`MUTATION_LOCK_TIMEOUT`. Other mutations that wait longer than 10 seconds for a
+lock return the same reason. The CLI and the Rust SDK's retrying sandbox-create
+methods retry that reason automatically within a bounded budget; other clients
+retry the request explicitly. A request that carried a `request_id` leaves its
+admission unresolved, like any other error, so a retry with the same ID returns
+`REQUEST_OUTCOME_UNCERTAIN`. Observe resource state and reconcile effects, then
+send a new request with a new `request_id`. Refer to
 [Durable Request Admission](/sdk/api-errors#durable-request-admission).
 
 ### Upgrade from an Earlier Release
