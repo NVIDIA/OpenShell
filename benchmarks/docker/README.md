@@ -15,6 +15,11 @@ experiment. The [original results](RESULTS.md) preserve the first run. The
 [performance candidates](PERFORMANCE-IDEAS.md) record the review, attribution
 experiments, and implementation outcomes.
 
+The [ARM64 paired rerun](RESULTS-ARM64.md) repeats the compatible comparison
+on a shared aarch64 host with a reconstructed baseline. Its outcome is mixed:
+1- and 4-thread config opens improve, 16-thread opens regress, and the report
+records the code review findings and validation from that run.
+
 The [historical PR #3832 comparison](RESULTS-PR3832.md) benchmarks its exact
 parent and merged commit to identify when file-open overhead appeared.
 
