@@ -142,10 +142,6 @@ const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = iowr::<RawNotification>(0);
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = iowr::<RawResponse>(1);
 const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = iow::<u64>(2);
 const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = iow::<RawAddFd>(3);
-#[cfg(feature = "perf-harness")]
-const SECCOMP_IOCTL_NOTIF_SET_FLAGS: libc::c_ulong = iow::<u64>(4);
-#[cfg(feature = "perf-harness")]
-const SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP: libc::c_ulong = 1;
 
 /// One validated seccomp user-notification request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,39 +213,6 @@ impl NotificationListener {
     #[must_use]
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
-    }
-
-    /// Ask the kernel to wake this listener synchronously, on the notifying
-    /// task's CPU (Linux 6.6 and newer).
-    ///
-    /// Only the opt-in performance harness can request this. Production
-    /// listeners keep the default wakeup: the hint was measured and not
-    /// adopted.
-    #[cfg(feature = "perf-harness")]
-    pub fn enable_sync_wakeup(&self) -> io::Result<()> {
-        let request = SECCOMP_IOCTL_NOTIF_SET_FLAGS;
-        // musl models the request as `c_int`; the value fits either type.
-        #[cfg(target_env = "musl")]
-        let request = libc::c_int::from_ne_bytes(
-            u32::try_from(request)
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "ioctl request exceeds 32 bits")
-                })?
-                .to_ne_bytes(),
-        );
-        // SAFETY: this ioctl takes its flags by value, not through a pointer.
-        let result = unsafe {
-            libc::ioctl(
-                self.fd.as_raw_fd(),
-                request,
-                SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP,
-            )
-        };
-        if result < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
     }
 
     /// Receive the next kernel notification.
