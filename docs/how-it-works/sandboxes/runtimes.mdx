@@ -23,6 +23,34 @@ the sandbox record and driver-supported persistent storage.
 | [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
 | [Windows MXC](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) | `mxc` | Native Windows workloads on x64 or ARM64. |
 
+## Inspect Workload Compatibility
+
+Before choosing commands for an agent, inspect the runtime used by its gateway:
+
+```shell
+openshell gateway info
+openshell gateway info --output json
+```
+
+`Workload platform` is the workload's operating system and architecture reported
+by the configured driver.
+It can differ from your workstation and the gateway host. For example, a
+MicroVM gateway on an Apple silicon Mac reports `linux / arm64` for its workload.
+Some drivers determine the architecture from the image or placement, so they
+leave that value unreported.
+
+`Execution restrictions` lists fixed limits reported by the runtime. A native
+runtime might explain that setuid executables cannot run, even when the
+executable is readable. This can explain a system command failing with
+`Operation not permitted` without suggesting a policy change can enable it.
+
+Older gateways and drivers may leave this information unreported. An empty
+restriction list does not mean execution is unrestricted. This inspection
+describes known runtime limits; it does not check installation health or predict
+every command's result. Policy checks and the runtime still decide whether a
+particular operation can proceed. Use JSON output when an agent or script needs
+the same information.
+
 ## Select a Compute Driver
 
 Set `compute_driver` in the gateway TOML file. A gateway uses one driver at a time.

@@ -359,6 +359,49 @@ pub fn validate_gateway_metadata(
     negotiate(family, extension_name, &gateway, extension.cloned()).map(drop)
 }
 
+/// Validate diagnostic facts before exposing a compute driver's startup snapshot.
+/// Empty platform fields remain unreported; reported explanations are bounded text.
+pub fn validate_workload_compatibility(
+    name: &str,
+    workload: Option<&crate::proto::compute::v1::WorkloadCompatibility>,
+) -> Result<(), NegotiationError> {
+    let Some(workload) = workload else {
+        return Ok(());
+    };
+    for (field, value) in [
+        (
+            "workload_compatibility.operating_system",
+            &workload.operating_system,
+        ),
+        (
+            "workload_compatibility.architecture",
+            &workload.architecture,
+        ),
+    ] {
+        if !value.is_empty() {
+            validate_text("compute", name, field, value, 64)?;
+        }
+    }
+    if workload.execution_restrictions.len() > 16 {
+        return Err(NegotiationError::InvalidMetadata {
+            family: "compute",
+            name: name.to_string(),
+            field: "workload_compatibility.execution_restrictions",
+            reason: "must contain at most 16 explanations".into(),
+        });
+    }
+    for restriction in &workload.execution_restrictions {
+        validate_text(
+            "compute",
+            name,
+            "workload_compatibility.execution_restrictions",
+            restriction,
+            512,
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_text(
     family: &'static str,
     name: &str,
@@ -648,6 +691,53 @@ mod tests {
             ),
             Err(NegotiationError::InvalidMetadata { .. })
         ));
+    }
+
+    #[test]
+    fn workload_compatibility_preserves_unknown_values_and_bounds_plain_text() {
+        use crate::proto::compute::v1::WorkloadCompatibility;
+
+        assert!(validate_workload_compatibility("native", None).is_ok());
+        assert!(
+            validate_workload_compatibility("native", Some(&WorkloadCompatibility::default()))
+                .is_ok()
+        );
+        let valid = WorkloadCompatibility {
+            operating_system: "future-os".into(),
+            architecture: "future-arch".into(),
+            execution_restrictions: vec!["Fixed runtime restriction".into()],
+        };
+        assert!(validate_workload_compatibility("native", Some(&valid)).is_ok());
+        for invalid in [
+            WorkloadCompatibility {
+                operating_system: "x".repeat(65),
+                ..valid.clone()
+            },
+            WorkloadCompatibility {
+                architecture: "bad\narch".into(),
+                ..valid.clone()
+            },
+            WorkloadCompatibility {
+                execution_restrictions: vec!["x".repeat(513)],
+                ..valid.clone()
+            },
+            WorkloadCompatibility {
+                execution_restrictions: vec!["fixed".into(); 17],
+                ..valid.clone()
+            },
+            WorkloadCompatibility {
+                execution_restrictions: vec!["  ".into()],
+                ..valid.clone()
+            },
+            WorkloadCompatibility {
+                execution_restrictions: vec!["\u{1b}[31mPRIVATE DIAGNOSTIC".into()],
+                ..valid
+            },
+        ] {
+            let error = validate_workload_compatibility("native", Some(&invalid)).unwrap_err();
+            assert!(matches!(error, NegotiationError::InvalidMetadata { .. }));
+            assert!(!error.to_string().contains("PRIVATE DIAGNOSTIC"));
+        }
     }
 
     #[test]
