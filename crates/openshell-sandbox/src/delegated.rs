@@ -37,12 +37,22 @@ pub async fn spawn_workload(
     interactive: bool,
     policy: &SandboxPolicy,
     entrypoint_pid: Arc<AtomicU32>,
+    privileged: bool,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
     otlp_relay_active: bool,
 ) -> Result<SpawnedAgent> {
+    // Fail closed: if the process is root but the qualification does not
+    // say privileged, refuse — a sandboxed boundary running as root
+    // through any launch bug would silently skip Landlock and seccomp.
+    if !privileged && nix::unistd::geteuid().as_raw() == 0 {
+        return Err(miette::miette!(
+            "sandboxed boundary process is running as root without the \
+             privileged qualification; refusing to launch workload children"
+        ));
+    }
     // Driver-selected workspaces are the sandbox identity's home. This keeps
     // canonical and later exec processes consistent for image WorkingDir and
     // the managed /sandbox fallback without consulting privileged account
@@ -86,6 +96,7 @@ pub async fn spawn_workload(
             boundary_runtime.clone(),
             otlp_relay_active,
             launcher.clone(),
+            privileged,
         ));
 
     // The delegated workload runs behind OpenShell's mediated network path,
@@ -103,6 +114,7 @@ pub async fn spawn_workload(
         tls_environment_mode,
         &provider_env,
         otlp_relay_active,
+        privileged,
     )
     .wrap_err("spawn delegated workload process")?;
     #[cfg(not(target_os = "linux"))]
@@ -116,6 +128,7 @@ pub async fn spawn_workload(
         tls_environment_mode,
         &provider_env,
         otlp_relay_active,
+        privileged,
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);

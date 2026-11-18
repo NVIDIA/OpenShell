@@ -41,6 +41,11 @@ pub struct LocalBoundaryExec {
     user_environment: HashMap<String, String>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
     otlp_relay_active: bool,
+    /// Whether this executor runs in privileged (root-workload) mode: no
+    /// Landlock ruleset and no seccomp filter are applied to workload
+    /// children (they are meaningless against root; the fence and the
+    /// supervisor's policy are the boundary).
+    privileged: bool,
     #[cfg(target_os = "linux")]
     launcher: crate::linux::workload_launcher::WorkloadLauncher,
 }
@@ -58,6 +63,7 @@ impl LocalBoundaryExec {
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
         otlp_relay_active: bool,
         #[cfg(target_os = "linux")] launcher: crate::linux::workload_launcher::WorkloadLauncher,
+        privileged: bool,
     ) -> Self {
         Self {
             policy,
@@ -67,6 +73,7 @@ impl LocalBoundaryExec {
             user_environment,
             runtime,
             otlp_relay_active,
+            privileged,
             #[cfg(target_os = "linux")]
             launcher,
         }
@@ -219,6 +226,12 @@ impl LocalBoundaryExec {
         &self,
         workdir: Option<&str>,
     ) -> Result<Option<crate::sandbox::linux::PreparedSandbox>, BackendError> {
+        if self.privileged {
+            // B3c1: no Landlock ruleset for a root workload — it is
+            // meaningless against root, and the fence plus the
+            // supervisor's policy are the boundary.
+            return Ok(None);
+        }
         crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
         let runtime_read_only =
             crate::process::ca_runtime_read_only_paths(self.ca_file_paths.as_deref());
@@ -237,8 +250,14 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = if self.privileged {
+            // B3c1: no seccomp filter for a root workload — a no-op
+            // program that sets only the process invariants.
+            crate::linux::child_seccomp::ChildHardeningProgram::noop()
+        } else {
+            crate::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| BackendError::Process(error.to_string()))?
+        };
         crate::pty::install_dedicated_process_group(&mut command);
         crate::pty::install_pre_exec_no_pty(
             &mut command,
@@ -375,8 +394,14 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = if self.privileged {
+            // B3c1: no seccomp filter for a root workload — a no-op
+            // program that sets only the process invariants.
+            crate::linux::child_seccomp::ChildHardeningProgram::noop()
+        } else {
+            crate::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| BackendError::Process(error.to_string()))?
+        };
         crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),
@@ -849,6 +874,7 @@ mod tests {
             crate::boundary_io::BoundaryRuntimeState::new(),
             otlp_relay_active,
             launcher,
+            false,
         )
     }
 

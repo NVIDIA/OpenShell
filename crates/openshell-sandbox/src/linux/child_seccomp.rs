@@ -46,16 +46,42 @@ const CLONE_NAMESPACE_FLAGS: u32 = (libc::CLONE_NEWCGROUP
 /// A prebuilt child filter that can be installed without heap allocation.
 pub struct ChildHardeningProgram {
     instructions: Vec<libc::sock_filter>,
+    /// Whether  sets . False only for the
+    /// privileged (root-workload) noop:  is meaningless for
+    /// root but inherited by every descendant, breaking setuid binaries
+    /// (sudo, su, ping) for non-root users the root workload creates.
+    set_no_new_privs: bool,
 }
 
 impl ChildHardeningProgram {
+    /// An empty program that installs nothing: used for the privileged
+    /// (root-workload) mode, where no seccomp filter applies to workload
+    /// children. `install` on an empty program sets only
+    /// `no_new_privs` and the close-on-exec marks — the sandbox
+    /// invariants that are still meaningful for root.
+    pub fn noop() -> Self {
+        Self {
+            instructions: Vec::new(),
+            set_no_new_privs: false,
+        }
+    }
+
     /// Install this filter on the calling thread only.
     ///
     /// The caller must invoke this from the post-fork child after all
     /// sandbox-wide TSYNC work and the launcher's `NEW_LISTENER` filter.
     pub fn install(&mut self) -> io::Result<()> {
         mark_inherited_descriptors_close_on_exec()?;
-        set_no_new_privileges()?;
+        if self.set_no_new_privs {
+            set_no_new_privileges()?;
+        }
+        // The privileged (root-workload) noop program has no instructions:
+        // the kernel rejects a zero-length seccomp filter with EINVAL, so
+        // skip the syscall entirely. The process invariants (close-on-exec,
+        // optionally no_new_privs) are already applied above.
+        if self.instructions.is_empty() {
+            return Ok(());
+        }
         let len = u16::try_from(self.instructions.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -250,7 +276,10 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     }
 
     instructions.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
-    Ok(ChildHardeningProgram { instructions })
+    Ok(ChildHardeningProgram {
+        instructions,
+        set_no_new_privs: true,
+    })
 }
 
 fn append_unconditional_deny(
@@ -598,5 +627,151 @@ mod tests {
             "isolated probe failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod noop_tests {
+    use super::ChildHardeningProgram;
+
+    #[test]
+    fn noop_program_install_skips_the_seccomp_syscall() {
+        // The kernel rejects a zero-length seccomp filter with EINVAL, so
+        // noop().install() must return Ok without making the syscall.
+        // Run in a forked child because install() calls pre-exec-only
+        // operations (setpgid would fail in the parent).
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                let mut program = ChildHardeningProgram::noop();
+                let result = program.install();
+                if result.is_ok() {
+                    std::process::exit(0);
+                } else {
+                    std::process::exit(1);
+                }
+            }
+            let mut status = 0;
+            libc::waitpid(pid, std::ptr::addr_of_mut!(status), 0);
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "noop().install() must succeed (the seccomp syscall is skipped for empty programs)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod privileged_syscall_tests {
+    /// Read `NoNewPrivs` and `Seccomp` from `/proc/self/status`.
+    fn proc_status_fields() -> (String, String) {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+        let no_new_privs = status
+            .lines()
+            .find(|line| line.starts_with("NoNewPrivs:"))
+            .map(|line| line.split_whitespace().nth(1).unwrap_or("?").to_string())
+            .unwrap_or_default();
+        let seccomp = status
+            .lines()
+            .find(|line| line.starts_with("Seccomp:"))
+            .map(|line| line.split_whitespace().nth(1).unwrap_or("?").to_string())
+            .unwrap_or_default();
+        (no_new_privs, seccomp)
+    }
+
+    /// Attempt a syscall in the forked child and report whether it failed
+    /// with EPERM. Used as a diagnostic only: in restricted environments
+    /// (dev containers) the environment's own seccomp profile blocks these
+    /// syscalls, so EPERM here does not implicate our filter. The
+    /// authoritative check is the Seccomp/NoNewPrivs status, which proves
+    /// our filter cannot be the blocker.
+    unsafe fn attempt_syscall(syscall_nr: libc::c_long) -> bool {
+        let ret = unsafe { libc::syscall(syscall_nr, 0, 0, 0, 0, 0) };
+        ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[test]
+    fn noop_child_has_no_no_new_privs_and_no_seccomp() {
+        // B7: in privileged mode, the boundary process skips the supervisor
+        // prelude (no_new_privs + TSYNC seccomp blocking mount, umount2,
+        // unshare, bpf, perf_event_open, init_module, kexec, ...). The
+        // noop hardening program installs neither. A forked child must
+        // report NoNewPrivs: 0 and Seccomp: 0 — with zero seccomp filters
+        // installed, none of those syscalls can be blocked by our filter
+        // (they may still fail for kernel or environment reasons, which
+        // is the documented root-mode posture: the guest kernel is the
+        // user's by design).
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                let mut program = super::ChildHardeningProgram::noop();
+                program.install().expect("noop install succeeds");
+                let (nnp, seccomp) = proc_status_fields();
+                // Exit code bit 0: NoNewPrivs/Seccomp status (must be 0/0).
+                // Bit 1: any of the probe syscalls returned EPERM
+                // (diagnostic only — environment seccomp may cause this).
+                let status_fail = !(nnp == "0" && seccomp == "0");
+                let eperm_probe = attempt_syscall(libc::SYS_mount)
+                    || attempt_syscall(libc::SYS_umount2)
+                    || attempt_syscall(libc::SYS_unshare)
+                    || attempt_syscall(libc::SYS_bpf)
+                    || attempt_syscall(libc::SYS_perf_event_open)
+                    || attempt_syscall(libc::SYS_init_module);
+                std::process::exit(i32::from(status_fail) | (i32::from(eperm_probe) << 1));
+            }
+            let mut status = 0;
+            libc::waitpid(pid, std::ptr::addr_of_mut!(status), 0);
+            let code = libc::WEXITSTATUS(status);
+            assert_eq!(
+                code & 1,
+                0,
+                "noop child must have NoNewPrivs:0 Seccomp:0 (got exit code {code})"
+            );
+            if code & 2 != 0 {
+                // Not a failure: the probe syscalls returned EPERM, which
+                // in restricted environments (containers with their own
+                // seccomp profiles) is expected. Our filter is proven
+                // absent by the Seccomp:0 check above.
+                eprintln!("note: probe syscalls returned EPERM (environment seccomp, not ours)");
+            }
+        }
+    }
+
+    #[test]
+    fn sandboxed_prelude_still_sets_no_new_privs_and_seccomp() {
+        // The sandboxed counter-test: apply_supervisor_prelude() must
+        // still install no_new_privs and the seccomp filter, so sandboxed
+        // boundary children keep the syscall blocks (mount, bpf, ...
+        // return EPERM — asserted behaviorally in
+        // sandbox/linux/seccomp.rs::behavioral_supervisor_prelude_mount_blocked).
+        // This test asserts the status fields from the child-hardening
+        // side: the prelude composes with the child program.
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                if let Err(err) = crate::sandbox::apply_supervisor_startup_hardening() {
+                    let msg = format!("failed to install supervisor prelude: {err}\n");
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(2);
+                }
+                let (nnp, seccomp) = proc_status_fields();
+                if nnp != "1" || seccomp != "2" {
+                    let msg = format!(
+                        "expected NoNewPrivs:1 Seccomp:2 after prelude, got {nnp}/{seccomp}\n"
+                    );
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(3);
+                }
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            libc::waitpid(pid, std::ptr::addr_of_mut!(status), 0);
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "sandboxed prelude must set NoNewPrivs:1 Seccomp:2"
+            );
+        }
     }
 }

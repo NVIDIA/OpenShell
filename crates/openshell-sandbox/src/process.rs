@@ -497,6 +497,7 @@ impl ProcessHandle {
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
         otlp_relay_active: bool,
+        privileged: bool,
     ) -> Result<Self> {
         Self::spawn_impl(
             launcher,
@@ -509,6 +510,7 @@ impl ProcessHandle {
             tls_environment_mode,
             provider_env,
             otlp_relay_active,
+            privileged,
         )
     }
 
@@ -529,6 +531,7 @@ impl ProcessHandle {
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
         otlp_relay_active: bool,
+        privileged: bool,
     ) -> Result<Self> {
         Self::spawn_impl(
             program,
@@ -540,6 +543,7 @@ impl ProcessHandle {
             tls_environment_mode,
             provider_env,
             otlp_relay_active,
+            privileged,
         )
     }
 
@@ -556,6 +560,7 @@ impl ProcessHandle {
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
         otlp_relay_active: bool,
+        privileged: bool,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args).kill_on_drop(true);
@@ -607,17 +612,33 @@ impl ProcessHandle {
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
         #[cfg(target_os = "linux")]
-        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
+        if !privileged {
+            sandbox::linux::log_sandbox_readiness(policy, workspace.root());
+        }
 
         // Prepare the Landlock ruleset as the workload UID. Inaccessible paths
-        // are already unavailable to the child and remain omitted.
+        // are already unavailable to the child and remain omitted. In
+        // privileged (root-workload) mode there is no Landlock ruleset and no
+        // child self-protection filter — a no-op program — matching the
+        // exec path (B3c1/B8): the fence plus the supervisor's policy are
+        // the boundary, and an inherited no_new_privs/filter would defeat
+        // setuid binaries, mounts, and container runtimes.
         #[cfg(target_os = "linux")]
         let runtime_read_only = ca_runtime_read_only_paths(ca_paths);
-        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
-            .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
-            .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
+        let prepared_sandbox = if privileged {
+            None
+        } else {
+            prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
+                .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?
+        };
+        #[cfg(target_os = "linux")]
+        let mut child_hardening = if privileged {
+            crate::linux::child_seccomp::ChildHardeningProgram::noop()
+        } else {
+            crate::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?
+        };
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -713,7 +734,11 @@ impl ProcessHandle {
         tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
         otlp_relay_active: bool,
+        privileged: bool,
     ) -> Result<Self> {
+        // Sandbox preparation is Linux-only; the flag is accepted for call
+        // signature parity so the delegated spawn path stays mode-gated.
+        let _ = privileged;
         let mut cmd = Command::new(program);
         cmd.args(args).kill_on_drop(true);
 
@@ -2100,5 +2125,56 @@ mod tests {
             );
         }
         assert!(stdout.contains("PATH=/usr/bin:/bin"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn privileged_main_process_has_no_seccomp_or_no_new_privs() {
+        // B8: the MAIN workload process in privileged (root-workload) mode
+        // must not inherit Landlock, the child self-protection filter, or
+        // no_new_privs — before the fix only `sandbox exec` children got
+        // the root posture and the entrypoint always ran fully sandboxed.
+        // With Seccomp: 0 and NoNewPrivs: 0 the filter cannot block mount,
+        // umount2, unshare, bpf, perf_event_open, or init_module (they may
+        // still fail for kernel or environment reasons).
+        let launcher = crate::linux::workload_launcher::start_privileged().expect("start launcher");
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+        let mut handle = ProcessHandle::spawn(
+            &launcher,
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "grep -E 'NoNewPrivs:|Seccomp:' /proc/self/status".to_string(),
+            ],
+            &ResolvedWorkspace::default(),
+            false,
+            &policy,
+            None,
+            child_env::TlsEnvironmentMode::FillMissing,
+            &HashMap::new(),
+            false,
+            true,
+        )
+        .expect("spawn privileged main process");
+
+        // Read the child's /proc/self/status report from its stdout.
+        let mut buf = String::new();
+        if let ProcessIo::Pipes { stdout: out, .. } = handle.take_io() {
+            use tokio::io::AsyncReadExt;
+            let mut out = out;
+            out.read_to_string(&mut buf).await.expect("read stdout");
+        }
+        handle.wait().await.expect("wait for exit");
+        assert!(
+            buf.contains("NoNewPrivs:\t0"),
+            "privileged main process must report NoNewPrivs:0, got: {buf}"
+        );
+        assert!(
+            buf.contains("Seccomp:\t0"),
+            "privileged main process must report Seccomp:0, got: {buf}"
+        );
     }
 }
