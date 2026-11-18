@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/kilo.yaml
+#   openshell provider profile import -f providers/kilo.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   Kilo.
+# Reference layout:  Kilo at /usr/local/bin/kilo, as in
+#                    ghcr.io/kilo-org/kilocode:latest-openshell.
+# Credential scope:  KILO_API_KEY, sent as a bearer token to the Kilo Gateway
+#                    hosts api.kilo.ai and ai-gateway.kilo.ai and nowhere else.
+# Endpoint access:   api.kilo.ai and ai-gateway.kilo.ai, read-write, L7
+#                    enforced. us.i.posthog.com (CLI telemetry) is allowed so
+#                    Kilo does not log denials; it never receives the key.
+# Blocked hosts:     models.dev (Kilo falls back to a bundled model catalog),
+#                    ingest.kilosessions.ai (cloud session upload) and
+#                    events.kiloapps.io (presence). The last two would receive
+#                    the key if a policy allowed them. The published image sets
+#                    KILO_DISABLE_MODELS_FETCH=1, KILO_DISABLE_SESSION_INGEST=1,
+#                    KILO_DISABLE_PRESENCE=1 and KILO_TELEMETRY_LEVEL=off so
+#                    Kilo does not try them.
+# Kilo's own sandbox: it uses bubblewrap, which cannot create namespaces under
+#                    OpenShell's seccomp filter. When a project's kilo.jsonc
+#                    turns it on, tool calls fail and `kilo run` still exits 0.
+#                    The published image keeps it off through
+#                    /etc/kilo/kilo.json, which loads after project
+#                    configuration: {"sandbox": {"enabled": false}}. Other
+#                    images need the same file. The image's environment
+#                    variables reach the sandbox's main command only.
+# Smoke test:        openshell sandbox create --provider <name> \
+#                      --from ghcr.io/kilo-org/kilocode:latest-openshell -- \
+#                      kilo run --model kilo/nvidia/nemotron-3.5-lightning:free 'reply with OK'
+
+id: kilo
+display_name: Kilo
+description: Kilo Gateway inference API
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Kilo API key
+    env_vars: [KILO_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.kilo.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: ai-gateway.kilo.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: us.i.posthog.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/kilo]
