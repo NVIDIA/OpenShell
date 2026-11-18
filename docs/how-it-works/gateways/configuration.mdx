@@ -1494,7 +1494,6 @@ sa_token_ttl_secs              = 3600
 # Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic
 # provider token grants. Use an absolute path under a dedicated directory;
 # shared roots such as /run, /var, /tmp, and /etc are rejected.
-# Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
 # Explicit sandbox UID/GID for the supervisor container securityContext and
 # PVC init container. When unset, the driver auto-detects from OpenShift SCC
@@ -1510,6 +1509,55 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # operator_namespace_file reads allowed namespaces from a JSON/YAML file
 # (hot-reloaded on change, e.g. via ConfigMap volume mount).
 # operator_namespace_file      = "/etc/openshell/workspace-namespaces.json"
+
+# Runtime substrate for sandboxes (proof of concept). "pod" (default)
+# provisions `agents.x-k8s.io` Sandbox CRs reconciled into pods by the
+# upstream Agent Sandbox controller. "kubevirt" provisions `kubevirt.io/v1`
+# VirtualMachine objects directly — the KubeVirt controller replaces the
+# Agent Sandbox controller, and each sandbox boots a purpose-built guest
+# image whose init stages the boundary and runs `openshell-sandbox`. The kubevirt
+# runtime currently supports only `workspace_mode = "shared"` and supports
+# the same supervisor topologies as the pod runtime: the default is a
+# dedicated supervisor Pod per sandbox (which requires `grpc_endpoint` to be
+# reachable from those Pods), and `supervisor_topology = "gateway"` places
+# each generation on the gateway's shared supervisor. See
+# `e2e/kubevirt/README.md` for the PoC workflow, guest-image build, and
+# known gaps.
+# runtime                      = "kubevirt"
+
+# Settings used only when runtime = "kubevirt".
+# workload selects how the guest workload runs: "sandboxed" (the default —
+# unprivileged, Landlock + seccomp enforced by the in-guest boundary) or
+# "root" (the privileged VM class — the workload runs as root, in-guest
+# enforcement is removed, the security boundary is the fence + the
+# supervisor's policy + per-boot trusted code; requires the dedicated
+# supervisor topology; provider files and provider env vars are
+# unsupported — nothing secret enters the guest).
+# workload                   = "root"
+# guest_image is the containerDisk providing the bootable guest filesystem
+# (Alpine + supervisor + kernel, built by `e2e/kubevirt/build-guest-image.sh`);
+# it is NOT an arbitrary sandbox OCI image. cpu_cores and memory size the
+# guest. workspace_pvc attaches a per-sandbox PVC at /sandbox (virtio-fs),
+# surviving stop/start. Guest egress is fenced by a per-sandbox
+# NetworkPolicy to the sandbox's supervisor only — no DNS, no gateway: the
+# boundary's in-guest DNS relay forwards through the supervisor's network
+# mediation.
+# Supervisor topologies: the default provisions one dedicated supervisor
+# Pod per sandbox (supervisor_image, and the supervisor settings above,
+# apply as on the pod runtime; the guest's boundary dials that Pod's
+# per-sandbox Service, and a NetworkPolicy fences guest egress to only
+# that Pod). supervisor_topology = "gateway" instead places each
+# generation on the gateway's shared supervisor: the guest's boundary
+# dials the shared supervisor Service named by shared_supervisor, whose
+# ClusterIP and pod selector are resolved through the API at create time,
+# and the fence admits only that Service. Either way no gateway token or
+# endpoint reaches the guest.
+# [openshell.drivers.kubernetes.kubevirt]
+# guest_image              = "openshell/sandbox-vm:dev"
+# guest_image_pull_policy  = "IfNotPresent"
+# cpu_cores                = 1
+# memory                   = "1Gi"
+# workspace_pvc            = true
 
 [openshell.drivers.kubernetes.managed_ssh_ingress]
 enabled = true

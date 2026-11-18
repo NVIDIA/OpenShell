@@ -285,6 +285,8 @@ On Linux with a non-root gateway, the sandbox can create files in a read-write m
 
 The Kubernetes driver runs sandboxes as pods in a sandbox namespace. It requires the [Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller. Install the gateway with the Helm chart; see [Kubernetes setup](/kubernetes/setup).
 
+The driver also has an experimental `runtime = "kubevirt"` mode that runs each sandbox as a KubeVirt virtual machine instead of a pod, with a per-sandbox egress fence and a purpose-built guest image. The sandbox API and security model are unchanged. See the [KubeVirt runtime settings](/how-it-works/gateways/configuration) and `e2e/kubevirt/README.md` in the source tree for the workflow, guest-image build, and current limits.
+
 <Warning>
 The cluster CNI must enforce `NetworkPolicy` in every sandbox namespace. Without it, sandbox pods can bypass OpenShell network policy.
 
