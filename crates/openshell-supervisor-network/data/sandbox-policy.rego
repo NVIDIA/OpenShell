@@ -145,7 +145,7 @@ binary_allowed(_, _) if {
 # ASCII-folded candidate only after querying every parent directory of the
 # runtime-observed executable and confirming case-insensitive lookup throughout.
 binary_path_matches(binary, candidate) if {
-	binary.path == candidate.path
+	binary.windows_path == candidate.path
 }
 
 binary_path_matches(binary, candidate) if {
@@ -154,7 +154,7 @@ binary_path_matches(binary, candidate) if {
 }
 
 binary_glob_matches(binary, candidate) if {
-	glob.match(binary.path, ["/"], candidate.path)
+	glob.match(binary.windows_path, ["/"], candidate.path)
 }
 
 binary_glob_matches(binary, candidate) if {
@@ -179,9 +179,8 @@ binary_allowed(policy, exec) if {
 	b.path == ancestor
 }
 
-# Trusted runtime evidence may additionally authorize an ASCII case-folded
-# Windows path. Legacy and synthetic L7 inputs omit match_paths and continue to
-# use only the exact rules above.
+# An opted-in Windows runtime can supply alternate path spellings. Other
+# runtimes and default Windows configurations only use the original path.
 binary_allowed(policy, exec) if {
 	some b in policy.binaries
 	not contains(b.path, "*")

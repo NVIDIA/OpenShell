@@ -2840,6 +2840,14 @@ fn prepare_startup_configuration(
         ));
     }
     let engine = OpaEngine::from_proto(policy)?;
+    #[cfg(target_os = "windows")]
+    let engine = if std::env::var_os("OPENSHELL_WINDOWS_BINARY_PATH_NORMALIZATION").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        engine.with_windows_binary_path_normalization()
+    } else {
+        engine
+    };
     let process_policy = SandboxPolicy::try_from(policy.clone())?;
     let credentials = prepare_provider_environment(provider)?;
     Ok((engine, process_policy, credentials))

@@ -12,6 +12,12 @@
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// Whether a Windows path starts with an ordinary absolute drive prefix.
+#[must_use]
+pub fn is_ordinary_windows_drive_path(path: &[u8]) -> bool {
+    matches!(path, [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+}
+
 use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 #[cfg(target_os = "linux")]
 use openshell_isolation_interface::contract::{ExecutableIdentity, Sha256Digest};

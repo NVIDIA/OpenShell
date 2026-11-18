@@ -133,11 +133,20 @@ impl BinaryIdentityCache {
         self.verify_or_cache_with_paths(path, path, procfs::file_sha256)
     }
 
-    /// Atomically verify or pin every authorization-capable executable in a
-    /// backend-supplied identity chain.
+    #[cfg(test)]
     pub(crate) fn verify_or_cache_supplied_identity(
         &self,
         identity: &BinaryIdentity,
+    ) -> std::result::Result<(), SuppliedIdentityError> {
+        self.verify_or_cache_supplied_identity_with_path_normalization(identity, false)
+    }
+
+    /// Atomically verify or pin every authorization-capable executable in a
+    /// backend-supplied identity chain.
+    pub(crate) fn verify_or_cache_supplied_identity_with_path_normalization(
+        &self,
+        identity: &BinaryIdentity,
+        normalize_windows_paths: bool,
     ) -> std::result::Result<(), SuppliedIdentityError> {
         let mut supplied = HashMap::new();
         for executable in std::iter::once(&identity.executable).chain(&identity.ancestors) {
@@ -153,8 +162,21 @@ impl BinaryIdentityCache {
                     executable.path.display()
                 ))
             })?;
-            if let Some(existing) = supplied.insert(executable.path.clone(), digest)
-                && existing != digest
+            let path = &executable.path;
+            // Reserve one pin for all potential case aliases in opt-in mode.
+            // A failed directory query or changed directory flag must not create
+            // a fresh pin. Policy admission still requires directory evidence.
+            let key = if cfg!(windows)
+                && normalize_windows_paths
+                && openshell_binary_identity::is_ordinary_windows_drive_path(
+                    path.as_os_str().as_encoded_bytes(),
+                ) {
+                PathBuf::from(path.as_os_str().to_ascii_lowercase())
+            } else {
+                path.clone()
+            };
+            if let Some(existing) = supplied.insert(key, (digest, path))
+                && existing.0 != digest
             {
                 return Err(SuppliedIdentityError::Unavailable(format!(
                     "Invalid executable identity: conflicting evidence for {}",
@@ -167,8 +189,8 @@ impl BinaryIdentityCache {
             SuppliedIdentityError::Unavailable("Binary identity cache lock poisoned".to_string())
         })?;
 
-        for (path, digest) in &supplied {
-            if let Some(existing) = hashes.get(path)
+        for (key, (digest, path)) in &supplied {
+            if let Some(existing) = hashes.get(key)
                 && existing.hash != digest.to_string()
             {
                 return Err(SuppliedIdentityError::Unavailable(format!(
@@ -186,8 +208,8 @@ impl BinaryIdentityCache {
             return Err(SuppliedIdentityError::CapacityExhausted);
         }
 
-        for (path, digest) in supplied {
-            hashes.entry(path).or_insert_with(|| CachedBinary {
+        for (key, (digest, _)) in supplied {
+            hashes.entry(key).or_insert_with(|| CachedBinary {
                 hash: digest.to_string(),
                 fingerprint: None,
             });

@@ -3712,7 +3712,8 @@ network_policies:
       - path: 'C:\WINDOWS\SYSTEM32\CURL.EXE'
 ",
         )
-        .unwrap();
+        .unwrap()
+        .with_windows_binary_path_normalization();
         let input = NetworkInput {
             host: "example.com".into(),
             port: 443,
@@ -3735,7 +3736,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: input.host,
             port: input.port,
-            binary_path: crate::opa::network_binary_match_path(&input.binary_path),
+            binary_path: input.binary_path.to_string_lossy().into_owned(),
             ..Default::default()
         };
         let mut request = L7RequestInfo {

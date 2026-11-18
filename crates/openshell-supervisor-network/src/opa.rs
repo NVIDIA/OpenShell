@@ -179,6 +179,7 @@ pub struct SandboxConfig {
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     binary_identity_required: bool,
+    windows_binary_path_normalization: bool,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
@@ -318,6 +319,7 @@ impl OpaEngine {
         Self {
             engine: Mutex::new(engine),
             binary_identity_required,
+            windows_binary_path_normalization: false,
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
@@ -329,6 +331,32 @@ impl OpaEngine {
     /// Whether network authorization requires a workload binary identity.
     pub const fn binary_identity_required(&self) -> bool {
         self.binary_identity_required
+    }
+
+    /// Opt in to equivalent Windows executable paths for this engine's lifetime.
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub fn with_windows_binary_path_normalization(mut self) -> Self {
+        self.windows_binary_path_normalization = true;
+        self
+    }
+
+    pub(crate) const fn windows_binary_path_normalization(&self) -> bool {
+        self.windows_binary_path_normalization
+    }
+
+    fn binary_match_paths(&self, input: &NetworkInput) -> Vec<NetworkBinaryPathEvidence> {
+        if !self.windows_binary_path_normalization || !self.binary_identity_required {
+            return Vec::new();
+        }
+        std::iter::once(&input.binary_path)
+            .chain(&input.ancestors)
+            .filter_map(|path| network_binary_path_evidence(path))
+            .collect()
+    }
+
+    fn network_input_json(&self, input: &NetworkInput) -> serde_json::Value {
+        network_input_json_with_match_paths(input, &self.binary_match_paths(input))
     }
 
     fn advance_generation(&self) -> u64 {
@@ -543,7 +571,7 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let input_json = network_input_json(input);
+        let input_json = self.network_input_json(input);
 
         let mut engine = self
             .engine
@@ -614,7 +642,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let binary_match_paths = network_binary_path_evidence_for_input(input);
+        let binary_match_paths = self.binary_match_paths(input);
         let input_json = network_input_json_with_match_paths(input, &binary_match_paths);
 
         let mut engine = self
@@ -1015,7 +1043,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_json = self.network_input_json(input);
 
         let mut engine = self
             .engine
@@ -1046,7 +1074,7 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<Vec<regorus::Value>> {
-        let input_json = network_input_json(input);
+        let input_json = self.network_input_json(input);
 
         let mut engine = self
             .engine
@@ -1106,7 +1134,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_json = self.network_input_json(input);
 
         let mut engine = self
             .engine
@@ -1214,32 +1242,14 @@ fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
     }
 }
 
-fn network_input_json(input: &NetworkInput) -> serde_json::Value {
-    let match_paths = network_binary_path_evidence_for_input(input);
-    network_input_json_with_match_paths(input, &match_paths)
-}
-
-fn network_binary_path_evidence_for_input(input: &NetworkInput) -> Vec<NetworkBinaryPathEvidence> {
-    let mut match_paths = Vec::with_capacity(input.ancestors.len() + 1);
-    match_paths.push(network_binary_path_evidence(&input.binary_path));
-    match_paths.extend(
-        input
-            .ancestors
-            .iter()
-            .map(|path| network_binary_path_evidence(path)),
-    );
-    match_paths
-}
-
 fn network_input_json_with_match_paths(
     input: &NetworkInput,
     match_paths: &[NetworkBinaryPathEvidence],
 ) -> serde_json::Value {
-    let binary = &match_paths[0];
-    let ancestor_strs: Vec<&str> = match_paths
+    let ancestor_strs: Vec<_> = input
+        .ancestors
         .iter()
-        .skip(1)
-        .map(|path| path.path.as_str())
+        .map(|path| path.to_string_lossy())
         .collect();
     let cmdline_strs: Vec<String> = input
         .cmdline_paths
@@ -1248,7 +1258,7 @@ fn network_input_json_with_match_paths(
         .collect();
     serde_json::json!({
         "exec": {
-            "path": &binary.path,
+            "path": input.binary_path.to_string_lossy(),
             "ancestors": ancestor_strs,
             "cmdline_paths": cmdline_strs,
             "match_paths": match_paths,
@@ -1260,35 +1270,10 @@ fn network_input_json_with_match_paths(
     })
 }
 
-/// Return the stable representation used only for network-policy path matching.
-///
-/// Windows paths accept either path separator. Namespace paths retain their exact
-/// spelling, and other platforms retain exact matching. This lexical operation
-/// never probes the filesystem, so it is also safe for policy-authored paths.
-pub(crate) fn network_binary_match_path(path: &Path) -> String {
-    let path = path.to_string_lossy();
-    #[cfg(target_os = "windows")]
-    {
-        windows_network_binary_match_path(&path)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        path.into_owned()
-    }
-}
-
 #[cfg(any(target_os = "windows", test))]
-fn windows_network_binary_match_path(path: &str) -> String {
-    if is_windows_namespace_path(path) {
-        return path.to_owned();
-    }
-    path.replace('\\', "/")
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn is_windows_namespace_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && matches!(bytes[0], b'/' | b'\\') && matches!(bytes[1], b'/' | b'\\')
+fn windows_network_binary_match_path(path: &str) -> Option<String> {
+    openshell_binary_identity::is_ordinary_windows_drive_path(path.as_bytes())
+        .then(|| path.replace('\\', "/"))
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1299,20 +1284,23 @@ pub(crate) struct NetworkBinaryPathEvidence {
     ascii_case_folded: String,
 }
 
-fn network_binary_path_evidence(path: &Path) -> NetworkBinaryPathEvidence {
-    let normalized = network_binary_match_path(path);
-    #[cfg(target_os = "windows")]
+#[cfg(target_os = "windows")]
+fn network_binary_path_evidence(path: &Path) -> Option<NetworkBinaryPathEvidence> {
+    let normalized = windows_network_binary_match_path(path.to_str()?)?;
     let ascii_case_folded =
         openshell_binary_identity::windows::path_components_case_insensitive(path)
             .filter(|case_insensitive| *case_insensitive)
             .map_or_else(String::new, |_| normalized.to_ascii_lowercase());
-    #[cfg(not(target_os = "windows"))]
-    let ascii_case_folded = String::new();
 
-    NetworkBinaryPathEvidence {
+    Some(NetworkBinaryPathEvidence {
         path: normalized,
         ascii_case_folded,
-    }
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn network_binary_path_evidence(_path: &Path) -> Option<NetworkBinaryPathEvidence> {
+    None
 }
 
 /// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
@@ -1878,6 +1866,7 @@ fn normalize_endpoint_protocols(data: &mut serde_json::Value) {
 /// Policy paths are untrusted input and may name remote shares or device
 /// namespaces. Case-insensitive matching is therefore decided later using only
 /// trusted runtime path evidence.
+#[cfg(target_os = "windows")]
 fn normalize_network_binary_paths(data: &mut serde_json::Value) {
     let Some(policies) = data
         .get_mut("network_policies")
@@ -1897,18 +1886,26 @@ fn normalize_network_binary_paths(data: &mut serde_json::Value) {
             let Some(binary) = binary.as_object_mut() else {
                 continue;
             };
-            let Some(value) = binary.get("path").and_then(serde_json::Value::as_str) else {
+            binary.remove("windows_path");
+            binary.remove("ascii_case_folded_path");
+            let Some(normalized) = binary
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .and_then(windows_network_binary_match_path)
+            else {
                 continue;
             };
-            let normalized = network_binary_match_path(Path::new(value));
             binary.insert(
                 "ascii_case_folded_path".to_string(),
                 normalized.to_ascii_lowercase().into(),
             );
-            binary.insert("path".to_string(), normalized.into());
+            binary.insert("windows_path".to_string(), normalized.into());
         }
     }
 }
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_network_binary_paths(_data: &mut serde_json::Value) {}
 
 /// Normalize endpoint port/ports in JSON data.
 ///
@@ -2802,7 +2799,7 @@ mod tests {
     #[test]
     fn windows_binary_match_path_normalizes_separators_preserving_case() {
         let normalized = windows_network_binary_match_path(r"C:\WINDOWS\SYSTEM32\CURL.EXE");
-        assert_eq!(normalized, "C:/WINDOWS/SYSTEM32/CURL.EXE");
+        assert_eq!(normalized.as_deref(), Some("C:/WINDOWS/SYSTEM32/CURL.EXE"));
         assert_ne!(
             normalized,
             windows_network_binary_match_path(r"C:\Windows\System32\powershell.exe")
@@ -2816,10 +2813,7 @@ mod tests {
             r"\\.\PhysicalDrive0",
             r"\\server\share\tool.exe",
         ] {
-            assert_eq!(
-                windows_network_binary_match_path(namespace_path),
-                namespace_path
-            );
+            assert_eq!(windows_network_binary_match_path(namespace_path), None);
         }
     }
 
@@ -2874,7 +2868,9 @@ mod tests {
                 }],
             },
         );
-        let engine = OpaEngine::from_proto(&proto).expect("load Windows policy");
+        let engine = OpaEngine::from_proto(&proto)
+            .expect("load Windows policy")
+            .with_windows_binary_path_normalization();
         let decision = engine
             .evaluate_network(&NetworkInput {
                 host: "example.com".to_string(),
@@ -2905,7 +2901,9 @@ mod tests {
                 },
             },
         });
-        let engine = OpaEngine::from_strings(TEST_POLICY, &data.to_string()).unwrap();
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
+            .unwrap()
+            .with_windows_binary_path_normalization();
         let input = NetworkInput {
             host: "example.com".into(),
             port: 443,
@@ -5372,7 +5370,7 @@ network_policies:
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn from_proto_matches_windows_equivalent_binary_path() {
+    fn from_proto_matches_windows_equivalent_binary_path_only_with_opt_in() {
         for configured in [
             r"C:\Windows\System32\curl.exe",
             "C:/Windows/System32/curl.exe",
@@ -5404,6 +5402,19 @@ network_policies:
                 ancestors: vec![],
                 cmdline_paths: vec![],
             };
+            let exact_match = configured == r"C:\Windows\System32\curl.exe";
+            assert_eq!(
+                engine.evaluate_network(&equivalent).unwrap().allowed,
+                exact_match
+            );
+            engine.reload_from_proto(&proto).unwrap();
+            assert_eq!(
+                engine.evaluate_network(&equivalent).unwrap().allowed,
+                exact_match
+            );
+
+            let engine = engine.with_windows_binary_path_normalization();
+            engine.reload_from_proto(&proto).unwrap();
             let decision = engine.evaluate_network(&equivalent).unwrap();
             assert!(
                 decision.allowed,
@@ -5425,7 +5436,7 @@ network_policies:
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn from_strings_matches_windows_equivalent_binary_path() {
+    fn from_strings_matches_windows_equivalent_binary_path_only_with_opt_in() {
         for configured in [
             r"C:\Windows\System32\curl.exe",
             "C:/Windows/System32/curl.exe",
@@ -5455,7 +5466,14 @@ network_policies:
                 cmdline_paths: vec![],
             };
 
-            let decision = engine.evaluate_network(&input).unwrap();
+            assert_eq!(
+                engine.evaluate_network(&input).unwrap().allowed,
+                configured == r"C:\Windows\System32\curl.exe",
+            );
+            let decision = engine
+                .with_windows_binary_path_normalization()
+                .evaluate_network(&input)
+                .unwrap();
             assert!(
                 decision.allowed,
                 "Windows-equivalent YAML binary {configured} should be allowed: {}",
@@ -5525,7 +5543,8 @@ network_policies:
                     "network_policies:\n  windows_binary:\n    endpoints:\n      - {{host: example.com, port: 443}}\n    binaries:\n      - {{path: '{configured}'}}\n"
                 ),
             )
-            .expect("load Windows policy");
+            .expect("load Windows policy")
+            .with_windows_binary_path_normalization();
             let executable = PathBuf::from("c:/windows/system32/curl.exe");
             let mut input = NetworkInput {
                 host: "example.com".into(),

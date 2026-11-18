@@ -334,6 +334,7 @@ fn pc_proxy_scopes_network_policy_to_socket_owner() {
     for scenario in [
         "socket-owner-allow",
         "socket-owner-normalized",
+        "socket-owner-normalized-default",
         "socket-owner-deny",
     ] {
         let directory = tempfile::tempdir().unwrap();

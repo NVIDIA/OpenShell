@@ -76,12 +76,12 @@ pub(super) fn http_context(
         binary_path: decision
             .binary
             .as_ref()
-            .map(|path| crate::opa::network_binary_match_path(path))
+            .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default(),
         ancestors: decision
             .ancestors
             .iter()
-            .map(|path| crate::opa::network_binary_match_path(path))
+            .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         cmdline_paths: decision
             .cmdline_paths
@@ -535,7 +535,8 @@ network_policies:
       - path: 'C:\WINDOWS\SYSTEM32\CURL.EXE'
 ",
             )
-            .expect("load Windows L7 policy");
+            .expect("load Windows L7 policy")
+            .with_windows_binary_path_normalization();
             let input = NetworkInput {
                 host: "example.com".to_string(),
                 port: 80,

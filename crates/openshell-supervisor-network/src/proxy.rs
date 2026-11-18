@@ -623,7 +623,10 @@ async fn preauthorize_transparent_open(
             .map_err(|_| TcpOpenDenial::IdentityUnavailable)
             .and_then(|identity| {
                 identity_cache
-                    .verify_or_cache_supplied_identity(identity)
+                    .verify_or_cache_supplied_identity_with_path_normalization(
+                        identity,
+                        opa_engine.windows_binary_path_normalization(),
+                    )
                     .map_err(|error| match error {
                         SuppliedIdentityError::Unavailable(_) => TcpOpenDenial::IdentityUnavailable,
                         SuppliedIdentityError::CapacityExhausted => {
@@ -664,7 +667,10 @@ async fn preauthorize_transparent_open(
             .map_err(|_| TcpOpenDenial::IdentityUnavailable)
             .and_then(|identity| {
                 identity_cache
-                    .verify_or_cache_supplied_identity(identity)
+                    .verify_or_cache_supplied_identity_with_path_normalization(
+                        identity,
+                        opa_engine.windows_binary_path_normalization(),
+                    )
                     .map_err(|error| match error {
                         SuppliedIdentityError::Unavailable(_) => TcpOpenDenial::IdentityUnavailable,
                         SuppliedIdentityError::CapacityExhausted => {
@@ -3806,7 +3812,10 @@ fn authorize_supplied_identity_with_denial_inner(
         .iter()
         .map(|ancestor| ancestor.path.clone())
         .collect::<Vec<_>>();
-    if let Err(error) = identity_cache.verify_or_cache_supplied_identity(identity) {
+    if let Err(error) = identity_cache.verify_or_cache_supplied_identity_with_path_normalization(
+        identity,
+        engine.windows_binary_path_normalization(),
+    ) {
         let denial = match &error {
             SuppliedIdentityError::Unavailable(_) => SuppliedIdentityDenial::IdentityUnavailable,
             SuppliedIdentityError::CapacityExhausted => SuppliedIdentityDenial::ResourceExhausted,
@@ -7210,6 +7219,52 @@ process:
         assert!(
             matches!(replacement.action, NetworkAction::Deny { .. }),
             "a new digest at an already trusted executable path must be denied"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn supplied_identity_pins_equivalent_windows_paths_when_enabled() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            r"
+network_policies:
+  tool:
+    endpoints: [{ host: example.com, port: 443 }]
+    binaries: [{ path: 'C:\Windows\System32\curl.exe' }]
+",
+        )
+        .unwrap()
+        .with_windows_binary_path_normalization();
+        let observed = |path: &str, byte: &str| {
+            Ok(ContractBinaryIdentity {
+                executable: ContractExecutableIdentity {
+                    path: PathBuf::from(path),
+                    digest: Some(byte.repeat(32).parse().unwrap()),
+                },
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+        };
+        let cache = BinaryIdentityCache::new();
+        let intent = || EgressIntent::connect("example.com".into(), 443);
+
+        for path in [
+            r"C:\Windows\System32\curl.exe",
+            "c:/windows/system32/CURL.EXE",
+        ] {
+            let decision =
+                authorize_supplied_identity(&engine, &cache, intent(), &observed(path, "11"));
+            assert!(matches!(decision.action, NetworkAction::Allow { .. }));
+        }
+        let decision = authorize_supplied_identity(
+            &engine,
+            &cache,
+            intent(),
+            &observed(r"C:\Windows\System32\CURL.EXE", "22"),
+        );
+        assert!(
+            matches!(decision.action, NetworkAction::Deny { reason } if reason.contains("integrity violation"))
         );
     }
 

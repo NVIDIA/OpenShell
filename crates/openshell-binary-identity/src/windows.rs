@@ -39,16 +39,7 @@ fn windows_directory_case_sensitive(path: &Path) -> Option<bool> {
 #[must_use]
 pub fn path_components_case_insensitive(path: &Path) -> Option<bool> {
     let text = path.to_string_lossy();
-    let bytes = text.as_bytes();
-    if text.contains(['*', '?'])
-        || (bytes.len() >= 2
-            && matches!(bytes[0], b'/' | b'\\')
-            && matches!(bytes[1], b'/' | b'\\'))
-        || bytes.len() < 3
-        || !bytes[0].is_ascii_alphabetic()
-        || bytes[1] != b':'
-        || !matches!(bytes[2], b'/' | b'\\')
-    {
+    if text.contains(['*', '?']) || !super::is_ordinary_windows_drive_path(text.as_bytes()) {
         return None;
     }
 
