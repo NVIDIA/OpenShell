@@ -95,6 +95,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `cx.expect_compute_driver(name)` to fail unless the gateway runs only that
   compute driver. Driver suites call it first. `cx.compute_driver()` returns
   the driver's name, for setup that depends on it, such as a driver config.
+  `cx.gateway_info()` returns the whole gateway info, such as the resource
+  capabilities the driver reports.
 - `testkit::base_image()` for the image to create sandboxes from or build on:
   `OPENSHELL_TEST_BASE_IMAGE`, or OpenShell's default sandbox image.
 - `testkit::python_image()` for sandboxes that run `python3`, curl, git, or

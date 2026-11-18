@@ -294,7 +294,13 @@ impl Context {
     /// tests whose setup depends on it. Fails unless gateway info reports
     /// exactly one driver, under the same configured and driver name.
     pub async fn compute_driver(&self) -> Result<String> {
-        let info = self
+        single_compute_driver(&self.gateway_info().await?)
+    }
+
+    /// The gateway's info: its version, compute drivers and their reported
+    /// capabilities, and negotiated extensions.
+    pub async fn gateway_info(&self) -> Result<proto::GetGatewayInfoResponse> {
+        Ok(self
             .handles
             .grpc
             .client()
@@ -302,8 +308,7 @@ impl Context {
             .get_gateway_info(proto::GetGatewayInfoRequest {})
             .await
             .context("get gateway info")?
-            .into_inner();
-        single_compute_driver(&info)
+            .into_inner())
     }
 
     /// Run the cleanup hooks, including deleting the sandboxes the test
