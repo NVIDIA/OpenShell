@@ -2625,7 +2625,8 @@ enum SecretCommands {
         #[arg(long = "value-env", value_name = "ENVVAR")]
         value_env: Option<String>,
 
-        /// Read the value from this file. One trailing newline is removed.
+        /// Read the value from this file, stored exactly as read, including any
+        /// trailing newline. Write it with `printf '%s'` to avoid one.
         #[arg(long = "value-file", value_name = "PATH")]
         value_file: Option<PathBuf>,
 
@@ -2657,7 +2658,8 @@ enum SecretCommands {
         #[arg(long = "value-env", value_name = "ENVVAR")]
         value_env: Option<String>,
 
-        /// Read the new value from this file. One trailing newline is removed.
+        /// Read the new value from this file, stored exactly as read, including
+        /// any trailing newline. Write it with `printf '%s'` to avoid one.
         #[arg(long = "value-file", value_name = "PATH")]
         value_file: Option<PathBuf>,
 

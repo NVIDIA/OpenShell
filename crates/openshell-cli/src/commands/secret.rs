@@ -36,17 +36,11 @@ impl SecretValueSource<'_> {
                 Ok(Some(value))
             }
             (None, Some(path)) => {
-                let mut value = std::fs::read_to_string(path)
+                // Stored exactly as read, including any trailing newline, so
+                // a revealed value matches the file. Same as --value-env.
+                let value = std::fs::read_to_string(path)
                     .into_diagnostic()
                     .wrap_err_with(|| format!("failed to read {}", path.display()))?;
-                // Files written by editors and `echo` end with a newline that
-                // is not part of the secret.
-                if value.ends_with('\n') {
-                    value.pop();
-                    if value.ends_with('\r') {
-                        value.pop();
-                    }
-                }
                 if value.is_empty() {
                     return Err(miette!("{} is empty", path.display()));
                 }
@@ -365,7 +359,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_sources_are_exclusive_and_trim_one_trailing_newline() {
+    fn value_sources_are_exclusive_and_read_files_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret");
         std::fs::write(&path, "s3cret\r\n").unwrap();
@@ -373,7 +367,11 @@ mod tests {
             env: None,
             file: Some(&path),
         };
-        assert_eq!(file.read().unwrap().as_deref(), Some("s3cret"));
+        assert_eq!(
+            file.read().unwrap().as_deref(),
+            Some("s3cret\r\n"),
+            "a trailing newline is part of the value"
+        );
 
         let both = SecretValueSource {
             env: Some("OPENSHELL_UNUSED"),
@@ -382,7 +380,7 @@ mod tests {
         assert!(both.read().is_err());
         assert!(SecretValueSource::default().read().unwrap().is_none());
 
-        std::fs::write(&path, "\n").unwrap();
+        std::fs::write(&path, "").unwrap();
         assert!(file.read().is_err(), "an empty value is rejected");
     }
 
