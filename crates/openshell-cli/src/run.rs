@@ -34,6 +34,10 @@ pub use crate::commands::provider::{
     sandbox_provider_attach, sandbox_provider_detach, sandbox_provider_list,
 };
 pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provider_status};
+pub use crate::commands::secret::{
+    SecretCreateInput, SecretUpdateInput, SecretValueSource, secret_create, secret_delete,
+    secret_get, secret_list, secret_update,
+};
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
