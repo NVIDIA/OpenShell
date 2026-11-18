@@ -15,10 +15,23 @@ spire-server:
       clusterSPIFFEIDs:
         openshell-sandboxes:
           enabled: true
-          spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
-          namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: openshell
+          # The final path segment joins namespace, pod-name, and sandbox-id with
+          # "." into a single opaque token. Treat the whole SPIFFE ID as an opaque
+          # principal: only the trust domain is authoritative, and the final
+          # sandbox segment (or any substring of it) must not drive authorization.
+          # The sandbox-id is appended conditionally, so pods without the
+          # openshell.ai/sandbox-id annotation render
+          # spiffe://<td>/openshell/sandbox/<namespace>.<pod-name> with no trailing dot.
+          spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ .PodMeta.Namespace }}.{{ .PodMeta.Name }}{{ with (index .PodMeta.Annotations "openshell.ai/sandbox-id") }}.{{ . }}{{ end }}'
+          # Match sandbox pods in shared, managed, and operator workspace modes.
+          # This CI/dev overlay intentionally leaves namespaceSelector broad so it
+          # works without requiring namespace labels. To restrict identity issuance
+          # to OpenShell-managed namespaces, label those namespaces and uncomment
+          # the namespaceSelector block below.
+          namespaceSelector: {}
+          # namespaceSelector:
+          #   matchLabels:
+          #     openshell.ai/managed-by: openshell
           podSelector:
             matchLabels:
               openshell.ai/managed-by: openshell

@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const http = require("http");
+const https = require("https");
 const crypto = require("crypto");
+const fs = require("fs");
 
 const PORT = Number(process.env.PORT || 8080);
 const JWKS_URI =
   process.env.SPIRE_JWKS_URI ||
   "https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local/keys";
+const SPIRE_JWKS_CA_FILE = process.env.SPIRE_JWKS_CA_FILE || "";
 const SPIRE_ISSUER =
   process.env.SPIRE_ISSUER ||
   "https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local";
@@ -57,13 +60,40 @@ async function jwks() {
   if (cachedJwks && now - cachedJwksAt < 60000) {
     return cachedJwks;
   }
-  const response = await fetch(JWKS_URI);
-  if (!response.ok) {
-    throw new Error(`JWKS fetch failed with HTTP ${response.status}`);
-  }
-  cachedJwks = await response.json();
+  cachedJwks = await fetchJson(JWKS_URI);
   cachedJwksAt = now;
   return cachedJwks;
+}
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const isHttps = parsed.protocol === "https:";
+    const client = isHttps ? https : http;
+    const options = {};
+    if (isHttps && SPIRE_JWKS_CA_FILE) {
+      options.ca = fs.readFileSync(SPIRE_JWKS_CA_FILE);
+    }
+
+    const req = client.get(parsed, options, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`JWKS fetch failed with HTTP ${res.statusCode}: ${body}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(10000, () => req.destroy(new Error("JWKS fetch timed out")));
+  });
 }
 
 function hasAudience(payload, expected) {
