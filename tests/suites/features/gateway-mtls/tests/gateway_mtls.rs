@@ -77,19 +77,31 @@ async fn foreign_client_certificate_is_rejected(_cx: &mut Context) -> testkit::R
     let mut config = ClientConfig::new(gateway.endpoint.clone());
     config.ca_cert = Some(read(&dir.join("ca.crt"))?);
     config.client_identity = Some(ClientIdentity::new(rogue.cert.pem(), key));
-    expect_refused(config, "a client certificate from another CA").await
+    expect_refused(
+        &gateway,
+        &dir,
+        config,
+        "a client certificate from another CA",
+    )
+    .await
 }
 
 /// The gateway's port doesn't answer gRPC over plaintext.
 #[testkit::test]
 async fn plaintext_client_is_rejected(_cx: &mut Context) -> testkit::Result {
-    let (gateway, _) = mtls_gateway()?;
+    let (gateway, dir) = mtls_gateway()?;
     let endpoint = gateway
         .endpoint
         .strip_prefix("https://")
         .map(|rest| format!("http://{rest}"))
         .ok_or_else(|| Error::msg(format!("{} isn't an https endpoint", gateway.endpoint)))?;
-    expect_refused(ClientConfig::new(endpoint), "a plaintext connection").await
+    expect_refused(
+        &gateway,
+        &dir,
+        ClientConfig::new(endpoint),
+        "a plaintext connection",
+    )
+    .await
 }
 
 /// The gateway under test, which must be an mTLS gateway, and its mTLS
@@ -146,11 +158,20 @@ async fn expect_unauthenticated(client: &OpenShellClient, workspace: &str, how: 
     }
 }
 
-/// Fail unless a client with `config` can't connect, or its Health call
-/// fails at the transport.
-async fn expect_refused(config: ClientConfig, what: &str) -> Result {
-    let Ok(client) = OpenShellClient::connect(config).await else {
-        return Ok(());
+/// Fail unless a client with `config` is refused at the transport: it can't
+/// connect, or its Health call fails with a transport error rather than a
+/// gRPC answer from the gateway. A CA-only client first reaches Health, so a
+/// wrong port or a stopped gateway fails the test instead of passing it.
+async fn expect_refused(gateway: &Gateway, dir: &Path, config: ClientConfig, what: &str) -> Result {
+    let mut control = ClientConfig::new(gateway.endpoint.clone());
+    control.ca_cert = Some(read(&dir.join("ca.crt"))?);
+    expect_healthy(&connect(control).await?)
+        .await
+        .context("the gateway should answer a client that trusts its CA")?;
+
+    let client = match OpenShellClient::connect(config).await {
+        Ok(client) => client,
+        Err(error) => return expect_transport_error(&error.to_string(), what),
     };
     match client
         .raw_grpc()
@@ -160,21 +181,22 @@ async fn expect_refused(config: ClientConfig, what: &str) -> Result {
         Ok(_) => Err(Error::msg(format!(
             "the gateway answered Health over {what}"
         ))),
-        Err(status)
-            if matches!(
-                status.code(),
-                GrpcCode::Unavailable
-                    | GrpcCode::Unknown
-                    | GrpcCode::Internal
-                    | GrpcCode::Unimplemented
-            ) =>
-        {
-            Ok(())
-        }
-        Err(status) => {
-            Err(Error::from(status).context(format!("expected a transport refusal for {what}")))
-        }
+        Err(status) => expect_transport_error(&format!("{status:?}"), what),
     }
+}
+
+/// Fail unless `error` describes a failed transport, not a gRPC status the
+/// gateway chose. A refused TLS handshake and a plaintext request to a TLS
+/// port both close the connection, so tonic reports them as transport errors.
+fn expect_transport_error(error: &str, what: &str) -> Result {
+    let error_lower = error.to_lowercase();
+    testkit::ensure!(
+        ["transport error", "connection closed", "tls", "handshake"]
+            .iter()
+            .any(|marker| error_lower.contains(marker)),
+        "expected a transport refusal for {what}; got: {error}"
+    );
+    Ok(())
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {

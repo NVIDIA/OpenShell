@@ -22,6 +22,10 @@ use crate::support::python_sandbox;
 const TEST_HOST: &str = "host.openshell.internal";
 const TOKEN_ENV: &str = "E2E_PLACEMENT_TOKEN";
 const TEST_SECRET: &str = "synthetic-placement-secret";
+/// The built-in profiles these tests need. A gateway starts without profiles,
+/// so each test imports the one it uses.
+const GOOGLE_CLOUD_PROFILE: &str = include_str!("../../../../providers/google-cloud.yaml");
+const CLAUDE_CODE_PROFILE: &str = include_str!("../../../../providers/claude-code.yaml");
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
 /// Sends the provider's token from `argv[2]`'s placement to `TEST_HOST` on
@@ -207,32 +211,14 @@ async fn google_metadata_serves_placeholder_token(cx: &mut Context) -> testkit::
     const KEY: &str = "GCP_ADC_ACCESS_TOKEN";
 
     let provider = cx.name("gcp");
-    let cli = cx.cli_handle();
-    let owned = provider.clone();
-    cx.on_cleanup(format!("delete provider {provider}"), async move || {
-        cli.run(["provider", "delete", &owned]).await?.success()?;
-        Ok(())
-    });
-    cx.cli_with_env(
+    let provider_type = cx.import_profile(GOOGLE_CLOUD_PROFILE).await?;
+    cx.create_provider_with_config(
+        &provider,
+        &provider_type,
         &[(KEY, SECRET)],
-        [
-            "provider",
-            "create",
-            "--name",
-            &provider,
-            "--type",
-            "google-cloud",
-            "--credential",
-            KEY,
-            "--config",
-            &format!("project_id={PROJECT}"),
-            "--config",
-            &format!("service_account_email={EMAIL}"),
-        ],
+        &[("project_id", PROJECT), ("service_account_email", EMAIL)],
     )
-    .await?
-    .success()
-    .context(format!("create provider {provider}"))?;
+    .await?;
 
     let mut bound = policy::base();
     policy::allow(
@@ -327,8 +313,12 @@ async fn create_rejects_unknown_provider(cx: &mut Context) -> testkit::Result {
 async fn provider_credentials_are_not_stored_in_sandbox_spec(cx: &mut Context) -> testkit::Result {
     const KEY: &str = "ANTHROPIC_API_KEY";
     let provider = cx.name("nop");
-    cx.create_provider(&provider, "claude-code", &[(KEY, "sk-should-not-persist")])
-        .await?;
+    cx.install_provider(
+        &provider,
+        CLAUDE_CODE_PROFILE,
+        &[(KEY, "sk-should-not-persist")],
+    )
+    .await?;
     let sandbox = cx
         .sandbox("nop")
         .spec(|spec| spec.providers = vec![provider.clone()])

@@ -79,7 +79,13 @@ async fn create_stores_default_mcp_version(cx: &mut Context) -> testkit::Result 
     testkit::ensure!(endpoint.mcp.is_none(), "the test policy names MCP options");
 
     // The policy is stored at create, so the sandbox needn't become ready.
-    let sandbox = cx.sandbox("mcp").policy(mcp).create().await?;
+    // The policy runs the workload as `sandbox`, which the Python image has.
+    let sandbox = cx
+        .sandbox("mcp")
+        .policy(mcp)
+        .spec(|spec| spec.image = Some(testkit::python_image()))
+        .create()
+        .await?;
 
     let stored = sandbox.spec().await?.and_then(|spec| spec.policy);
     expect_default_mcp_version("the stored policy", stored.as_ref())?;
