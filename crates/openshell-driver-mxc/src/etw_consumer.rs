@@ -62,18 +62,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessBasicInformation, ProcessTelemetryIdInformation,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WIN32_ERROR};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WIN32_ERROR};
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, ENABLE_TRACE_PARAMETERS,
     ENABLE_TRACE_PARAMETERS_VERSION_2, EVENT_ENABLE_PROPERTY_PROCESS_START_KEY, EVENT_HEADER,
     EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXTENDED_DATA_ITEM, EVENT_PROPERTY_INFO,
     EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
     EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, TRACE_EVENT_INFO,
-    TRACE_LEVEL_VERBOSE, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
+    PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    ProcessTrace, StartTraceW, TRACE_EVENT_INFO, TRACE_LEVEL_VERBOSE, TdhGetEventInformation,
+    WNODE_FLAG_TRACED_GUID,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetProcessTimes, OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -186,9 +189,9 @@ unsafe impl Send for RawEtwEvent {}
 /// [`DecodedEtwEvent::summary`] for sanitized diagnostic output.
 #[derive(Clone)]
 pub(crate) struct DecodedEtwEvent {
-    /// QPC timestamp recorded by ETW when the producer emitted the event.
-    /// Attribution deliberately does not use elapsed time as process-generation
-    /// evidence.
+    /// Raw QPC reading ETW stamped when the producer emitted the event (the trace is
+    /// opened with raw timestamps). It is used to place the event on the wall clock with
+    /// `event_time`, never as process-generation evidence on its own.
     pub timestamp_qpc: i64,
     /// Provider that emitted the event.
     pub provider: GUID,
@@ -641,6 +644,10 @@ fn alloc_properties_buf(session_name: &str) -> Vec<u8> {
     buf
 }
 
+/// `Wnode.ClientContext` value that makes ETW stamp events with the performance counter
+/// (QPC). [`event_time`] reads the raw timestamp as a QPC value, so the two go together.
+const SESSION_CLOCK_QPC: u32 = 1;
+
 fn start_trace_session(session_name: &str) -> Result<u64, String> {
     let name = session_name_wide(session_name);
     let mut buf = alloc_properties_buf(session_name);
@@ -648,7 +655,7 @@ fn start_trace_session(session_name: &str) -> Result<u64, String> {
 
     unsafe {
         (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        (*props).Wnode.ClientContext = 1; // QPC timestamps
+        (*props).Wnode.ClientContext = SESSION_CLOCK_QPC;
         (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         // ETW uses per-processor buffers. A short sandbox-create burst can leave
         // a low-volume buffer on one CPU unflushed until the session stops,
@@ -752,6 +759,14 @@ fn stop_session(handle: u64, session_name: &str) {
 /// sender + health counters; on failure the caller reclaims it (we do not drop it
 /// here). On success it and the `LoggerName` buffer are handed to the returned
 /// [`OpenedTrace`] so they outlive the subsequent blocking `ProcessTrace`.
+/// How the trace is opened. Raw timestamps: the QPC readings ETW stamped, not values
+/// converted to system time from the session's start (a conversion that drifts from the
+/// clock the kernel stamps process creation with on a long-running session).
+/// [`event_time`] converts them against the clocks as they are when an event is received.
+const TRACE_MODE: u32 = PROCESS_TRACE_MODE_REAL_TIME
+    | PROCESS_TRACE_MODE_EVENT_RECORD
+    | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
+
 #[allow(clippy::field_reassign_with_default)]
 fn open_trace(
     session_name: &str,
@@ -761,8 +776,7 @@ fn open_trace(
 
     let mut logfile = EVENT_TRACE_LOGFILEW::default();
     logfile.LoggerName = PWSTR(name.as_mut_ptr());
-    logfile.Anonymous1.ProcessTraceMode =
-        PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    logfile.Anonymous1.ProcessTraceMode = TRACE_MODE;
     logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
     logfile.Context = callback_context.cast::<c_void>();
 
@@ -1259,6 +1273,10 @@ fn format_property_value(
 /// once its sandbox's attribution is seeded.
 struct PendingEvent {
     at: Instant,
+    /// When the event was emitted, as an instant on this machine's monotonic clock, if
+    /// it could be worked out. `at` is only when it was received, up to a few seconds
+    /// later.
+    emitted_at: Option<Instant>,
     ev: DecodedEtwEvent,
     /// For `ProcessLaunched`: the launched process's parent as seen when the event
     /// was first received. A replay must not look the PID up again, because by then
@@ -1342,12 +1360,105 @@ fn process_start_key_from_handle(handle: HANDLE, expected_pid: u32) -> Result<u6
     }
 }
 
+/// A `FILETIME` as 100-nanosecond ticks since 1601.
+fn filetime_ticks(time: FILETIME) -> i64 {
+    (i64::from(time.dwHighDateTime) << 32) | i64::from(time.dwLowDateTime)
+}
+
+/// When the process behind `handle` was created, as `FILETIME` ticks.
+fn process_create_ticks(handle: HANDLE) -> Option<i64> {
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    // SAFETY: the handle is valid for the call and the out-parameters outlive it.
+    unsafe {
+        GetProcessTimes(
+            handle,
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    }
+    .ok()?;
+    Some(filetime_ticks(created))
+}
+
+/// Where an ETW event lies on the wall clock.
+#[derive(Clone, Copy)]
+pub(crate) struct EventTime {
+    /// When it was emitted, as `FILETIME` ticks.
+    pub filetime: i64,
+    /// How long ago that was, as of now.
+    pub age: Duration,
+}
+
+/// Convert a raw ETW timestamp (QPC ticks, see [`SESSION_CLOCK_QPC`] and [`TRACE_MODE`])
+/// by pairing the performance counter with the precise system time as they are now. An
+/// event reaches the consumer about a second after it was emitted (measured: 1.2 to
+/// 1.9 s), which is also how far back the pairing reaches.
+///
+/// The trace's own counter frequency is not read; the performance counter's is used,
+/// which is the same on every host seen. `None` when a clock cannot be read or the value
+/// is not a plausible reading of the counter.
+fn event_time(raw_qpc: i64) -> Option<EventTime> {
+    let (mut frequency, mut counter) = (0_i64, 0_i64);
+    // SAFETY: plain queries into local variables.
+    let now = unsafe {
+        QueryPerformanceFrequency(&raw mut frequency).ok()?;
+        let precise = GetSystemTimePreciseAsFileTime();
+        QueryPerformanceCounter(&raw mut counter).ok()?;
+        filetime_ticks(precise)
+    };
+    convert_event_time(raw_qpc, frequency, counter, now)
+}
+
+/// [`event_time`] over explicit clock readings: the counter and its frequency, and the
+/// system time (`FILETIME` ticks) read at that same moment.
+fn convert_event_time(
+    raw_qpc: i64,
+    frequency: i64,
+    counter: i64,
+    now_filetime: i64,
+) -> Option<EventTime> {
+    // An event is stamped before it is received, so a reading that is not positive, or
+    // ahead of the counter, is not a reading of this counter at all (for example a
+    // timestamp in another clock): refuse it rather than guess.
+    if raw_qpc <= 0 || frequency <= 0 || raw_qpc > counter {
+        return None;
+    }
+    let elapsed_ticks = i128::from(counter - raw_qpc) * 10_000_000 / i128::from(frequency);
+    Some(EventTime {
+        filetime: i64::try_from(i128::from(now_filetime) - elapsed_ticks).ok()?,
+        age: Duration::from_nanos(u64::try_from(elapsed_ticks * 100).ok()?),
+    })
+}
+
+/// How far after an event a launched process may have been created and still count as
+/// the one the event names, in `FILETIME` ticks (1 ms). A launched process exists before
+/// the event reporting it is emitted (measured: 5 to 11 ms before, on x64 and ARM64), so
+/// this only absorbs clock noise.
+///
+/// What the bound cannot rule out: a process created within the creation time's own
+/// resolution (at worst one system timer tick, about 15 ms, if the kernel stamps it that
+/// coarsely) after the event, which needs the named process to exit and its PID to be
+/// handed out again inside that window; and a system clock step during the one to two
+/// seconds between emission and receipt (a forward step makes the check lenient, a
+/// backward step refuses a legitimate event, which is then counted as possible loss).
+const LAUNCH_SLACK_TICKS: i64 = 10_000;
+
 /// A process's parent as it is right now: the parent PID and, when the parent is
 /// still reachable, its kernel generation key.
 #[derive(Clone)]
 pub(crate) struct ParentIdentity {
     pub pid: u32,
     pub start_key: Option<u64>,
+    /// When the process that was asked about (the child) was created, as `FILETIME`
+    /// ticks, if it could be read.
+    pub child_created: Option<i64>,
 }
 
 /// Looks up a process's parent. Injected so attribution can be unit-tested
@@ -1401,6 +1512,7 @@ pub(crate) fn live_parent_of(pid: u32) -> Option<ParentIdentity> {
     Some(ParentIdentity {
         pid: parent_pid,
         start_key,
+        child_created: process_create_ticks(child.0),
     })
 }
 
@@ -1441,6 +1553,8 @@ pub(crate) struct AttributionIndex {
     last_live: Option<Instant>,
     /// Overrides the real parent lookup (tests only).
     parent_lookup: Option<ParentLookup>,
+    /// Overrides the real event-time conversion (tests only).
+    event_time_source: Option<Box<dyn Fn(i64) -> Option<EventTime> + Send>>,
 }
 
 impl AttributionIndex {
@@ -1534,9 +1648,19 @@ impl AttributionIndex {
 
     /// Drop all keys for a finished sandbox to bound memory.
     pub fn forget(&mut self, sandbox_id: &str) {
-        // The driver can forget a sandbox without retiring it first. Record that one
-        // was live, so an event that waited alongside it is not classed as foreign.
-        self.last_live = Some(Instant::now());
+        // The driver can forget a sandbox without retiring it first, and forgets it again
+        // when it is deleted, possibly much later. Record that one was live, so an event
+        // emitted while it was is not classed as foreign, but only the first time: a
+        // second call for an id this index no longer holds says nothing about liveness.
+        let known = self.names.contains_key(sandbox_id)
+            || self.retired_sandboxes.contains_key(sandbox_id)
+            || self
+                .by_pid
+                .values()
+                .any(|registration| registration.sid == sandbox_id);
+        if known {
+            self.last_live = Some(Instant::now());
+        }
         self.by_pid
             .retain(|_, registration| registration.sid != sandbox_id);
         self.by_identity.retain(|_, v| v != sandbox_id);
@@ -1647,32 +1771,56 @@ impl AttributionIndex {
         (parent.start_key == Some(registration.process_start_key)).then(|| registration.sid.clone())
     }
 
-    /// The parent of the process a `ProcessLaunched` event names, read now. This
-    /// must be called when the event is first received and the result kept with the
-    /// event: the launched process can exit before a queued event is replayed, and
-    /// its PID can then be reused by a child of another sandbox, so a later lookup
-    /// would attribute this event to that sandbox. `None` for any other event, or
-    /// when the launched process is already gone (nothing can then be proven).
+    /// Where `raw_qpc` (an event's timestamp) lies on the wall clock.
+    fn event_time(&self, raw_qpc: i64) -> Option<EventTime> {
+        self.event_time_source
+            .as_ref()
+            .map_or_else(|| event_time(raw_qpc), |source| source(raw_qpc))
+    }
+
+    /// The parent of the process a `ProcessLaunched` event names, read now, if that
+    /// process is provably the one the event named.
+    ///
+    /// This must be called when the event is first received and the result kept with the
+    /// event: the launched process can exit before a queued event is replayed, and its
+    /// PID can then be reused by a child of another sandbox.
+    ///
+    /// The event reaches the consumer about a second after it was emitted, so the PID can
+    /// also have been reused *before* this call. The event carries no start key for the
+    /// child, so the process now holding the PID must at least have existed when the event
+    /// was emitted: a process created later is a reuse of the PID and is refused. When
+    /// either time is unknown nothing is proven and the event is not attributed through
+    /// ancestry. `None` for any other event, or when the launched process is already gone.
     fn launch_parent(&self, ev: &DecodedEtwEvent) -> Option<ParentIdentity> {
         if ev.event_name.as_deref() != Some("ProcessLaunched") {
             return None;
         }
         let launched: u32 = ev.get("processId")?.trim().parse().ok()?;
-        self.parent_lookup
+        let parent = self
+            .parent_lookup
             .as_ref()
-            .map_or_else(|| live_parent_of(launched), |lookup| lookup(launched))
+            .map_or_else(|| live_parent_of(launched), |lookup| lookup(launched))?;
+        let emitted = self.event_time(ev.timestamp_qpc)?;
+        let created = parent.child_created?;
+        (created <= emitted.filetime.saturating_add(LAUNCH_SLACK_TICKS)).then_some(parent)
     }
 
     /// Record that `ev` is being discarded without ever being attributed. Only
     /// events that would have been written to the audit trail count as a gap.
     ///
     /// The provider is system-wide, so an unresolved event is not necessarily this
-    /// gateway's. It counts as possible loss only if this gateway had a live
-    /// sandbox at some point while the event waited (`since` is when it arrived);
-    /// otherwise it is foreign traffic and is counted separately.
-    fn note_unattributed_drop(&mut self, ev: &DecodedEtwEvent, since: Instant, why: &str) {
+    /// gateway's. It counts as possible loss only if this gateway had a live sandbox at
+    /// some point since the event was *emitted* (`emitted_at`, not when it was received:
+    /// a short-lived sandbox can be gone by the time its event arrives); otherwise it is
+    /// foreign traffic and is counted separately.
+    fn note_unattributed_drop(
+        &mut self,
+        ev: &DecodedEtwEvent,
+        emitted_at: Option<Instant>,
+        why: &str,
+    ) {
         if is_audited_event(ev.event_name.as_deref()) {
-            if self.had_live_sandbox_since(since) {
+            if self.had_live_sandbox_since(emitted_at) {
                 self.unattributed_dropped += 1;
             } else {
                 self.unowned_dropped += 1;
@@ -1684,11 +1832,15 @@ impl AttributionIndex {
     /// Whether a sandbox of this gateway was live at any time since `since`.
     ///
     /// `last_live` is stamped on every register, retire and forget, so a sandbox that
-    /// came and went while the event waited still counts.
-    fn had_live_sandbox_since(&self, since: Instant) -> bool {
+    /// came and went since then still counts. When `since` is unknown the answer is
+    /// conservative: any sandbox this gateway ever had counts.
+    fn had_live_sandbox_since(&self, since: Option<Instant>) -> bool {
         !self.by_pid.is_empty()
             || !self.retired_sandboxes.is_empty()
-            || self.last_live.is_some_and(|at| at >= since)
+            || since.map_or_else(
+                || self.last_live.is_some(),
+                |since| self.last_live.is_some_and(|at| at >= since),
+            )
     }
 
     /// Possible-loss events dropped without attribution since the last call.
@@ -1705,7 +1857,7 @@ impl AttributionIndex {
     /// can attribute it, so account for it now instead of losing it silently.
     fn expire_all_pending(&mut self) {
         for p in std::mem::take(&mut self.pending) {
-            self.note_unattributed_drop(&p.ev, p.at, "session ended");
+            self.note_unattributed_drop(&p.ev, p.emitted_at, "session ended");
         }
     }
 
@@ -1737,7 +1889,7 @@ impl AttributionIndex {
             if now.duration_since(front.at) > PENDING_TTL {
                 let stale = self.pending.pop_front();
                 if let Some(p) = stale {
-                    self.note_unattributed_drop(&p.ev, p.at, "aged out");
+                    self.note_unattributed_drop(&p.ev, p.emitted_at, "aged out");
                 }
             } else {
                 break;
@@ -1746,10 +1898,14 @@ impl AttributionIndex {
         if self.pending.len() >= PENDING_MAX
             && let Some(p) = self.pending.pop_front()
         {
-            self.note_unattributed_drop(&p.ev, p.at, "buffer full");
+            self.note_unattributed_drop(&p.ev, p.emitted_at, "buffer full");
         }
+        let emitted_at = self
+            .event_time(ev.timestamp_qpc)
+            .and_then(|time| now.checked_sub(time.age));
         self.pending.push_back(PendingEvent {
             at: now,
+            emitted_at,
             ev,
             launch_parent,
         });
@@ -1774,7 +1930,7 @@ impl AttributionIndex {
             let mut keep = VecDeque::with_capacity(drained.len());
             for p in drained {
                 if now.duration_since(p.at) > PENDING_TTL {
-                    self.note_unattributed_drop(&p.ev, p.at, "aged out");
+                    self.note_unattributed_drop(&p.ev, p.emitted_at, "aged out");
                     continue;
                 }
                 match self.resolve_with(&p.ev, p.launch_parent.as_ref()) {
@@ -2879,10 +3035,27 @@ mod tests {
         broker_event("ProcessLaunched", activity, &[("processId", &pid)])
     }
 
-    /// An index whose parent lookup answers from `parents` (child pid -> parent).
+    /// When the launched child of the tests below was created, and when its
+    /// `ProcessLaunched` event was emitted: 10 ms later, as measured on real hosts.
+    const CHILD_CREATED: i64 = 1_000_000;
+    const EVENT_AT: i64 = 1_100_000;
+
+    /// An event clock that places every event at `filetime`, received 1.2 s later.
+    fn event_clock(filetime: i64) -> Box<dyn Fn(i64) -> Option<EventTime> + Send> {
+        Box::new(move |_| {
+            Some(EventTime {
+                filetime,
+                age: Duration::from_millis(1200),
+            })
+        })
+    }
+
+    /// An index whose parent lookup answers from `parents` (child pid -> parent), for a
+    /// child created at [`CHILD_CREATED`] and an event emitted at [`EVENT_AT`].
     fn index_with_parents(parents: &[(u32, u32, Option<u64>)]) -> AttributionIndex {
         let table: Vec<(u32, u32, Option<u64>)> = parents.to_vec();
         let mut idx = AttributionIndex::new();
+        idx.event_time_source = Some(event_clock(EVENT_AT));
         idx.parent_lookup = Some(Box::new(move |child| {
             table
                 .iter()
@@ -2890,6 +3063,7 @@ mod tests {
                 .map(|&(_, parent, start_key)| ParentIdentity {
                     pid: parent,
                     start_key,
+                    child_created: Some(CHILD_CREATED),
                 })
         }));
         idx
@@ -3193,12 +3367,14 @@ mod tests {
         // arrived may decide the owner.
         let parents = Arc::new(Mutex::new((100_u32, 1000_u64)));
         let mut idx = AttributionIndex::new();
+        idx.event_time_source = Some(event_clock(EVENT_AT));
         let table = parents.clone();
         idx.parent_lookup = Some(Box::new(move |_child| {
             let (pid, key) = *table.lock().unwrap();
             Some(ParentIdentity {
                 pid,
                 start_key: Some(key),
+                child_created: Some(CHILD_CREATED),
             })
         }));
 
@@ -3235,6 +3411,297 @@ mod tests {
 
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, "sbx-A");
+    }
+
+    // ---- Child PID reuse before the first receipt ----
+
+    /// An index whose lookup of child 777 answers with parent 100 (key 1000) and the given
+    /// creation time, and whose event clock places the event at the given time.
+    fn index_with_times(child_created: Option<i64>, event: Option<i64>) -> AttributionIndex {
+        let mut idx = AttributionIndex::new();
+        idx.event_time_source = Some(match event {
+            Some(filetime) => event_clock(filetime),
+            None => Box::new(|_| None),
+        });
+        idx.parent_lookup = Some(Box::new(move |_| {
+            Some(ParentIdentity {
+                pid: 100,
+                start_key: Some(1000),
+                child_created,
+            })
+        }));
+        idx
+    }
+
+    #[test]
+    fn a_child_pid_reused_before_the_first_receipt_is_not_attributed() {
+        // The case a review reproduced. Sandbox A's child (pid 777) is launched and its
+        // event is emitted at EVENT_AT, but the event reaches the consumer about a second
+        // later. Meanwhile the child exited, A was forgotten, B registered, and Windows
+        // gave pid 777 to a child of B, created 500 ms after the event was emitted. The
+        // lookup on first receipt therefore answers with B's parent.
+        let mut idx = AttributionIndex::new();
+        idx.event_time_source = Some(event_clock(EVENT_AT));
+        idx.parent_lookup = Some(Box::new(|_| {
+            Some(ParentIdentity {
+                pid: 200,
+                start_key: Some(2000),
+                child_created: Some(EVENT_AT + 5_000_000),
+            })
+        }));
+        idx.register_launch("sbx-B", "b", 200, 2000);
+
+        let a_launch = launched(0xA1, 777);
+        let snapshot = idx.launch_parent(&a_launch);
+
+        assert!(
+            snapshot.is_none(),
+            "a process created after the event cannot be the one it named"
+        );
+        assert!(idx.resolve_with(&a_launch, snapshot.as_ref()).is_none());
+        assert!(
+            idx.resolve(&broker_event("SandboxConfig", 0xA1, &[]))
+                .is_none(),
+            "A's activity id must not have been linked to B"
+        );
+    }
+
+    #[test]
+    fn a_child_created_before_its_event_is_accepted() {
+        let idx = index_with_times(Some(CHILD_CREATED), Some(EVENT_AT));
+        assert!(idx.launch_parent(&launched(0xA1, 777)).is_some());
+    }
+
+    #[test]
+    fn clock_noise_is_tolerated_but_only_a_little() {
+        let at_the_edge = index_with_times(Some(EVENT_AT + LAUNCH_SLACK_TICKS), Some(EVENT_AT));
+        assert!(at_the_edge.launch_parent(&launched(0xA1, 777)).is_some());
+
+        let beyond = index_with_times(Some(EVENT_AT + LAUNCH_SLACK_TICKS + 1), Some(EVENT_AT));
+        assert!(beyond.launch_parent(&launched(0xA1, 777)).is_none());
+    }
+
+    #[test]
+    fn a_launch_is_not_attributed_when_a_time_it_depends_on_is_unknown() {
+        let no_creation_time = index_with_times(None, Some(EVENT_AT));
+        assert!(
+            no_creation_time
+                .launch_parent(&launched(0xA1, 777))
+                .is_none()
+        );
+
+        let no_event_time = index_with_times(Some(CHILD_CREATED), None);
+        assert!(no_event_time.launch_parent(&launched(0xA1, 777)).is_none());
+    }
+
+    #[test]
+    fn the_trace_is_opened_with_raw_timestamps() {
+        // `event_time` treats the header timestamp as a raw QPC reading; ETW converts it
+        // to system time (from the session's start) unless this flag is set.
+        assert_ne!(TRACE_MODE & PROCESS_TRACE_MODE_RAW_TIMESTAMP, 0);
+        assert_ne!(TRACE_MODE & PROCESS_TRACE_MODE_REAL_TIME, 0);
+        assert_ne!(TRACE_MODE & PROCESS_TRACE_MODE_EVENT_RECORD, 0);
+    }
+
+    /// The performance counter as an ETW raw timestamp would read it.
+    fn qpc_now() -> i64 {
+        let mut counter = 0_i64;
+        // SAFETY: a plain query into a local variable.
+        unsafe { QueryPerformanceCounter(&raw mut counter) }.expect("QueryPerformanceCounter");
+        counter
+    }
+
+    #[test]
+    fn real_clocks_order_a_new_process_after_an_earlier_event_and_before_a_later_one() {
+        // No injected lookup or clock: the real creation time of a real child against the
+        // real conversion of a raw QPC reading. A launch event stamped before the child
+        // existed cannot be the one that named it (the PID would have been reused); one
+        // stamped after it can. This is what the production bound stands on, so it also
+        // catches a wrong assumption about either clock.
+        let before_child = qpc_now();
+        std::thread::sleep(Duration::from_millis(200));
+        let mut child = std::process::Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        std::thread::sleep(Duration::from_millis(200));
+        let after_child = qpc_now();
+
+        let idx = AttributionIndex::new();
+        let mut early = launched(0xA1, child.id());
+        early.timestamp_qpc = before_child;
+        let mut late = launched(0xA1, child.id());
+        late.timestamp_qpc = after_child;
+        let refused = idx.launch_parent(&early);
+        let accepted = idx.launch_parent(&late);
+        let age = event_time(after_child).map(|time| time.age);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            refused.is_none(),
+            "an event stamped before the child existed must not be attributed through it"
+        );
+        let parent = accepted.expect("an event stamped after the child existed is accepted");
+        assert_eq!(
+            parent.pid,
+            std::process::id(),
+            "the child's parent is this process"
+        );
+        let age = age.expect("the conversion works");
+        assert!(
+            age >= Duration::ZERO && age < Duration::from_secs(5),
+            "an event read a moment ago is not old: {age:?}"
+        );
+    }
+
+    #[test]
+    fn the_real_clock_refuses_a_value_that_is_not_a_qpc_reading() {
+        assert!(event_time(0).is_none());
+        assert!(event_time(-1).is_none());
+        assert!(
+            event_time(qpc_now() + 10_000_000).is_none(),
+            "a reading ahead of the counter is not a QPC reading"
+        );
+    }
+
+    // ---- Events delivered after their sandbox is gone ----
+
+    /// Give up on every waiting event now, as at the end of a session. The receipt time
+    /// of each stays as it was: waiting out the time-to-live would make it older than
+    /// anything the sandbox did, and the point of these tests is the order of the three
+    /// moments (event emitted, sandbox gone, event received).
+    fn give_up_on_pending(idx: &mut AttributionIndex) {
+        idx.expire_all_pending();
+    }
+
+    /// An event whose emission the index's clock places `seconds_ago` seconds back.
+    fn index_with_emission(seconds_ago: u64) -> AttributionIndex {
+        let mut idx = AttributionIndex::new();
+        idx.event_time_source = Some(Box::new(move |_| {
+            Some(EventTime {
+                filetime: EVENT_AT,
+                age: Duration::from_secs(seconds_ago),
+            })
+        }));
+        idx
+    }
+
+    fn unresolved_audited_event() -> DecodedEtwEvent {
+        let mut event = mk_event(1, "SandboxConfig");
+        event.process_start_key = None;
+        event
+    }
+
+    #[test]
+    fn an_event_emitted_before_its_sandbox_was_forgotten_is_possible_loss_when_received_after() {
+        // The case a review reproduced. A short-lived sandbox emits an audited event and
+        // exits; the driver forgets it (3 s ago); the event, emitted 5 s ago, only now
+        // reaches the consumer. By receipt time nothing of this gateway is live and its
+        // last activity is older than the receipt, which is what the old classification
+        // looked at.
+        let mut idx = index_with_emission(5);
+        idx.last_live = Instant::now().checked_sub(Duration::from_secs(3));
+
+        idx.buffer_unresolved(unresolved_audited_event(), None);
+        give_up_on_pending(&mut idx);
+
+        assert_eq!(idx.take_unattributed_drops(), 1, "this gateway's own event");
+        assert_eq!(idx.take_unowned_drops(), 0);
+    }
+
+    #[test]
+    fn an_event_emitted_after_the_gateways_last_sandbox_ended_is_foreign() {
+        // Same shape, but the event was emitted (1 s ago) after the last sandbox ended
+        // (3 s ago): it cannot be this gateway's.
+        let mut idx = index_with_emission(1);
+        idx.last_live = Instant::now().checked_sub(Duration::from_secs(3));
+
+        idx.buffer_unresolved(unresolved_audited_event(), None);
+        give_up_on_pending(&mut idx);
+
+        assert_eq!(idx.take_unattributed_drops(), 0);
+        assert_eq!(idx.take_unowned_drops(), 1);
+    }
+
+    #[test]
+    fn a_sandbox_forgotten_while_an_event_was_in_flight_makes_it_possible_loss() {
+        // The same case through the real calls: register, forget, then receive an event
+        // that was emitted 1.2 s ago, before the forget.
+        let mut idx = index_with_emission(1);
+        idx.register_launch("sbx-A", "a", 100, 1000);
+        idx.forget("sbx-A");
+
+        idx.buffer_unresolved(unresolved_audited_event(), None);
+        give_up_on_pending(&mut idx);
+
+        assert_eq!(idx.take_unattributed_drops(), 1);
+        assert_eq!(idx.take_unowned_drops(), 0);
+    }
+
+    #[test]
+    fn forgetting_an_unknown_sandbox_does_not_make_later_events_possible_loss() {
+        // The driver forgets a sandbox when it exits and again when it is deleted, maybe
+        // much later. The second call must not look like the sandbox was live then.
+        let mut idx = index_with_emission(1);
+        idx.register_launch("sbx-A", "a", 100, 1000);
+        idx.forget("sbx-A");
+        idx.last_live = Instant::now().checked_sub(Duration::from_mins(1));
+
+        idx.forget("sbx-A");
+        idx.buffer_unresolved(unresolved_audited_event(), None);
+        give_up_on_pending(&mut idx);
+
+        assert_eq!(idx.take_unattributed_drops(), 0);
+        assert_eq!(idx.take_unowned_drops(), 1);
+    }
+
+    #[test]
+    fn an_event_whose_emission_time_is_unknown_is_possible_loss_if_a_sandbox_ever_existed() {
+        let mut ever = AttributionIndex::new();
+        ever.event_time_source = Some(Box::new(|_| None));
+        ever.register_launch("sbx-A", "a", 100, 1000);
+        ever.forget("sbx-A");
+        let mut never = AttributionIndex::new();
+        never.event_time_source = Some(Box::new(|_| None));
+
+        for idx in [&mut ever, &mut never] {
+            idx.buffer_unresolved(unresolved_audited_event(), None);
+            give_up_on_pending(idx);
+        }
+
+        assert_eq!(ever.take_unattributed_drops(), 1);
+        assert_eq!(never.take_unowned_drops(), 1);
+        assert_eq!(never.take_unattributed_drops(), 0);
+    }
+
+    #[test]
+    fn converting_a_raw_timestamp_places_it_on_the_wall_clock() {
+        // 10 MHz counter; the event was stamped one second (10_000_000 ticks) before now.
+        let time = convert_event_time(40_000_000, 10_000_000, 50_000_000, 1_000_000_000)
+            .expect("converted");
+        assert_eq!(time.filetime, 1_000_000_000 - 10_000_000);
+        assert_eq!(time.age, Duration::from_secs(1));
+
+        // A different counter frequency scales the elapsed time.
+        let time = convert_event_time(1_000, 1_000, 3_500, 77_000_000).expect("converted");
+        assert_eq!(time.age, Duration::new(2, 500_000_000));
+        assert_eq!(time.filetime, 77_000_000 - 25_000_000);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_reading_of_the_counter_is_refused() {
+        let ok = (40, 10_000_000, 50);
+        assert!(convert_event_time(ok.0, ok.1, ok.2, 1_000_000_000).is_some());
+        // Not positive, ahead of the counter (a timestamp in another clock), or a counter
+        // without a frequency.
+        assert!(convert_event_time(0, ok.1, ok.2, 1_000_000_000).is_none());
+        assert!(convert_event_time(-5, ok.1, ok.2, 1_000_000_000).is_none());
+        assert!(convert_event_time(51, ok.1, ok.2, 1_000_000_000).is_none());
+        assert!(convert_event_time(ok.0, 0, ok.2, 1_000_000_000).is_none());
+        // An absurdly old reading does not wrap or panic.
+        assert!(convert_event_time(1, 1, i64::MAX, 1_000_000_000).is_none());
     }
 
     #[test]
