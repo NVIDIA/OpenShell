@@ -583,16 +583,22 @@ complete the published
 [activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates)
 before enabling `enable_sandbox_updates`. Keep it false during a rolling
 upgrade and never enable it merely to bypass a failed compatibility check.
-After activation, image, command, and environment updates initially support only
-stopped Kubernetes sandboxes; other drivers return `UNIMPLEMENTED` for those
-fields. Metadata-only updates also support stopped sandboxes on other drivers. Stop and
+After activation, stopped Kubernetes sandboxes support image, command, and
+environment updates. Docker supports image-only updates for workspaces created
+with the driver's opt-in `persist_workspace` setting: both images must be cached,
+the target must declare a numeric `USER UID:GID` matching the recorded non-root
+identity, and neither image may declare volumes. Existing Docker writable-layer
+workspaces are not migrated; command and environment updates remain unsupported.
+Other drivers return `UNIMPLEMENTED` for configuration fields. Metadata-only
+updates also support stopped sandboxes on other drivers. Stop and
 wait for `Stopped`, read the sandbox's current resource version through
 `GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
 selected image, command, environment overrides, labels or annotations, and required nonzero `expected_resource_version`, then start after
 success. Rust SDK callers use `client.raw_sandbox_updates_fresh()`; generated
 clients use `SandboxUpdates`, not the unchanged `OpenShell` service. There is no
-curated SDK update method. The sandbox identity, Kubernetes
-custom resource, and persistent volume claim remain; the existing workspace is
+curated SDK update method. The sandbox identity and persistent workspace remain;
+Kubernetes retains its custom resource and PVC, while Docker replaces the stopped
+workload container and retains its owned `/sandbox` volume. The existing workspace is
 not reseeded and trusted runtime images do not change. Omitted update fields are
 unchanged; supplied lists and maps replace their user-owned values, including
 explicitly empty values. Template environment defaults still apply. System metadata

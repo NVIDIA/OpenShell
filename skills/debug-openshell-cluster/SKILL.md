@@ -281,6 +281,18 @@ See [gateway configuration](https://docs.nvidia.com/openshell/latest/how-it-work
 
 ### Step 4: Check Docker-Backed Gateways
 
+For stopped workload image updates, check both Docker `persist_workspace` and
+gateway `enable_sandbox_updates`. Only newly created persistent `/sandbox`
+workspaces support image-only changes; cached images must retain non-root
+UID/GID and declare no volumes. An interrupted accepted update can temporarily
+have no workload container. Retry the same gateway operation before Start; do
+not treat that gap as an orphan or delete its volumes. The private driver update
+record can contain environment and bootstrap material: do not export it in logs
+or diagnostics. Workspace ownership requires the protected driver record and
+matching runtime claim; caller container labels cannot enable persistence or
+authorize volume adoption/removal. Preserve that record after failed creation
+until explicit deletion. See the published sandbox update and Docker configuration docs.
+
 The sandbox container's log holds the sandbox runtime's warnings and the
 main process's stdout and stderr when it runs without a TTY. The supervisor
 container's log holds supervisor diagnostics and OCSF shorthand. With

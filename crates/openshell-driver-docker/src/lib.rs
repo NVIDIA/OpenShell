@@ -5,8 +5,10 @@
 
 #![allow(clippy::result_large_err)]
 
+mod image_update;
 mod isolation;
 pub mod otel_tracing;
+mod workspace;
 
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -261,6 +263,10 @@ pub struct DockerComputeConfig {
     #[serde(default)]
     pub enable_bind_mounts: bool,
 
+    /// Give newly created default /sandbox workspaces dedicated persistent storage.
+    /// Existing writable-layer workspaces are not migrated by this setting.
+    pub persist_workspace: bool,
+
     /// Corporate forward-proxy settings supplied to the supervisor.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
@@ -331,6 +337,7 @@ impl Default for DockerComputeConfig {
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
+            persist_workspace: false,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_socket: None,
@@ -367,6 +374,7 @@ struct DockerDriverRuntimeConfig {
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
+    workspace_storage: workspace::Storage,
     upstream_proxy: UpstreamProxyConfig,
     proxy_ca_bundle: Option<PathBuf>,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
@@ -392,6 +400,7 @@ pub struct DockerComputeDriver {
     lifecycle_event_fences: DockerLifecycleEventFences,
     control_processes: Arc<Mutex<HashMap<String, DockerControlProcess>>>,
     runtime_failures: Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
+    image_update_gates: Arc<image_update::Gates>,
 }
 
 struct DockerControlProcess {
@@ -1031,6 +1040,11 @@ impl DockerComputeDriver {
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                workspace_storage: if docker_config.persist_workspace {
+                    workspace::Storage::Persistent
+                } else {
+                    workspace::Storage::WritableLayer
+                },
                 allow_driver_config: docker_config.allow_driver_config,
                 resource_admission: docker_config.resource_admission.clone(),
                 upstream_proxy: docker_config.upstream_proxy.clone(),
@@ -1050,6 +1064,7 @@ impl DockerComputeDriver {
             lifecycle_event_fences: DockerLifecycleEventFences::default(),
             control_processes: Arc::new(Mutex::new(HashMap::new())),
             runtime_failures: Arc::new(Mutex::new(HashMap::new())),
+            image_update_gates: Arc::new(image_update::Gates::default()),
         };
 
         Box::pin(driver.reconcile_runtime_resources_at_startup())
@@ -1100,7 +1115,14 @@ impl DockerComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/docker",
                 openshell_core::VERSION,
-                [],
+                if self.config.workspace_storage == workspace::Storage::Persistent {
+                    vec![
+                        openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
+                            .to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                },
             )),
         }
     }
@@ -1275,6 +1297,9 @@ impl DockerComputeDriver {
         &self,
         container: &bollard::models::ContainerInspectResponse,
     ) -> Result<(), Status> {
+        // Driver-owned state remains checked even when caller resource
+        // admission is explicitly disabled by an operator.
+        let persistent_workspace = workspace::admit(&self.docker, container, &self.config).await?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
         }
@@ -1334,6 +1359,12 @@ impl DockerComputeDriver {
                                 "sandbox-private volume ownership changed",
                             ));
                         }
+                    } else if mount.destination.as_deref()
+                        == Some(driver_mounts::DEFAULT_WORKSPACE_ROOT)
+                        && persistent_workspace
+                    {
+                        // Independently checked above, including exact volume
+                        // identity and the admitted workload UID/GID.
                     } else if !expected.contains_key(name)
                         && mount
                             .destination
@@ -1488,6 +1519,11 @@ impl DockerComputeDriver {
         if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
             return Ok(Some(pending));
         }
+        if let Some(pending) =
+            image_update::pending_snapshot(&self.config, sandbox_id, sandbox_name)?
+        {
+            return Ok(Some(pending));
+        }
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?;
@@ -1499,6 +1535,16 @@ impl DockerComputeDriver {
         }
 
         Ok(None)
+    }
+
+    async fn resolve_lifecycle_id(&self, id: &str, name: &str) -> Result<Option<String>, Status> {
+        if !id.is_empty() {
+            return Ok(Some(id.to_string()));
+        }
+        Ok(self
+            .get_sandbox_snapshot(id, name)
+            .await?
+            .map(|sandbox| sandbox.id))
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
@@ -1557,6 +1603,9 @@ impl DockerComputeDriver {
         // attached to both the sandbox and gateway. A running workload
         // container alone is not a usable sandbox.
         by_id.extend(self.pending_snapshot_map().await);
+        for pending in image_update::pending_snapshots(&self.config)? {
+            by_id.insert(pending.id.clone(), pending);
+        }
         let mut sandboxes = by_id.into_values().collect::<Vec<_>>();
         sandboxes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sandboxes)
@@ -1685,14 +1734,14 @@ impl DockerComputeDriver {
         create_docker_channel_volume(&self.docker, sandbox, &self.config, true)
             .await
             .map_err(|status| {
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 DockerProvisioningFailure::new("BoundaryChannelCreateFailed", status.message())
             })?;
         let token_file_created = match write_sandbox_token_file(sandbox, &self.config).await {
             Ok(created) => created,
             Err(status) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "SandboxTokenWriteFailed",
                     status.message(),
@@ -1701,7 +1750,7 @@ impl DockerComputeDriver {
         };
         if !token_file_created {
             cleanup_runtime_volumes().await;
-            cleanup_docker_boundary_state(sandbox, &self.config);
+            cleanup_failed_docker_boundary_state(sandbox, &self.config);
             return Err(DockerProvisioningFailure::new(
                 "SandboxTokenWriteFailed",
                 "Docker control mode requires a gateway sandbox token",
@@ -1720,7 +1769,7 @@ impl DockerComputeDriver {
             Ok(devices) => devices,
             Err(status) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "ContainerCreateFailed",
                     status.message(),
@@ -1738,7 +1787,7 @@ impl DockerComputeDriver {
             Ok(body) => body,
             Err(status) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "ContainerCreateFailed",
                     status.message(),
@@ -1753,7 +1802,7 @@ impl DockerComputeDriver {
             Err(status) => {
                 let _ = remove_docker_channel_volume_by_id(&self.docker, &sandbox.id, &self.config)
                     .await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::from_admission_status(status));
             }
         };
@@ -1766,6 +1815,25 @@ impl DockerComputeDriver {
                     DockerProvisioningFailure::new("ResourceAdmissionDenied", error.to_string())
                 })?,
             );
+        match workspace::prepare(
+            &self.docker,
+            sandbox,
+            &self.config,
+            &image,
+            &workload_identity,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(status) => {
+                cleanup_runtime_volumes().await;
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
+                return Err(DockerProvisioningFailure::from_status(
+                    "WorkspaceStorageFailed",
+                    status,
+                ));
+            }
+        }
         let create_result = async {
             openshell_otel::record_error_result(
                 self.docker
@@ -1792,7 +1860,7 @@ impl DockerComputeDriver {
             Ok(created) => created,
             Err(error) => {
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::from_status(
                     "ContainerCreateFailed",
                     create_status_from_docker_error("create docker sandbox container", error),
@@ -1810,7 +1878,7 @@ impl DockerComputeDriver {
                     )
                     .await;
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::from_status(
                     "OuterFenceInspectFailed",
                     internal_status("inspect Docker sandbox outer fence", error),
@@ -1831,7 +1899,7 @@ impl DockerComputeDriver {
                 )
                 .await;
             cleanup_runtime_volumes().await;
-            cleanup_docker_boundary_state(sandbox, &self.config);
+            cleanup_failed_docker_boundary_state(sandbox, &self.config);
             return Err(DockerProvisioningFailure::from_status(
                 "OuterFenceRejected",
                 status,
@@ -1865,7 +1933,7 @@ impl DockerComputeDriver {
                     )
                     .await;
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     "BoundaryConfigWriteFailed",
                     status.message(),
@@ -1902,7 +1970,7 @@ impl DockerComputeDriver {
                     "Failed to clean up Docker container after start failure"
                 );
             }
-            cleanup_docker_boundary_state(sandbox, &self.config);
+            cleanup_failed_docker_boundary_state(sandbox, &self.config);
             cleanup_runtime_volumes().await;
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerStartFailed",
@@ -1939,7 +2007,7 @@ impl DockerComputeDriver {
                     )
                     .await;
                 cleanup_runtime_volumes().await;
-                cleanup_docker_boundary_state(sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
                     supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
                     status.message(),
@@ -2098,7 +2166,7 @@ impl DockerComputeDriver {
         // leave a trusted supervisor eligible for launch.
         self.verify_network_trust()?;
         let sandboxes = self.list_managed_container_summaries().await?;
-        let sandbox_ids = sandboxes
+        let mut sandbox_ids = sandboxes
             .iter()
             .filter_map(|container| {
                 container
@@ -2108,6 +2176,9 @@ impl DockerComputeDriver {
                     .cloned()
             })
             .collect::<HashSet<_>>();
+        // A valid accepted update can temporarily have no workload container.
+        // Its runtime channel/key resources are not orphans during that gap.
+        sandbox_ids.extend(image_update::pending_ids(&self.config)?);
 
         let filters = managed_resource_label_filters(&self.config.sandbox_namespace, []);
         let auxiliary = self
@@ -2173,6 +2244,12 @@ impl DockerComputeDriver {
             .await
             .map_err(|error| internal_status("list Docker startup volumes", error))?;
         for volume in volumes.volumes.unwrap_or_default() {
+            // Workspace storage is retained independently of disposable runtime
+            // resources, including a future interrupted replacement gap.
+            if volume.labels.get(workspace::ROLE_LABEL).map(String::as_str) == Some(workspace::ROLE)
+            {
+                continue;
+            }
             let sandbox_id = volume.labels.get(LABEL_SANDBOX_ID);
             if sandbox_id.is_some_and(|id| sandbox_ids.contains(id)) {
                 continue;
@@ -2299,7 +2376,7 @@ impl DockerComputeDriver {
                 {
                     Ok(()) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        remove_docker_channel_volume_by_id(
+                        remove_docker_owned_storage_by_id(
                             &self.docker,
                             &record.sandbox.id,
                             &self.config,
@@ -2310,12 +2387,12 @@ impl DockerComputeDriver {
                     }
                     Err(err) if is_not_found_error(&err) => {
                         self.clear_runtime_failure(&record.sandbox.id).await;
-                        let _ = remove_docker_channel_volume_by_id(
+                        remove_docker_owned_storage_by_id(
                             &self.docker,
                             &record.sandbox.id,
                             &self.config,
                         )
-                        .await;
+                        .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
@@ -2325,14 +2402,17 @@ impl DockerComputeDriver {
                 }
             }
             if !sandbox_id.is_empty() {
+                let removed_update =
+                    image_update::pending_snapshot(&self.config, sandbox_id, sandbox_name)?
+                        .is_some();
                 self.stop_control_process(sandbox_id).await;
                 let removed = self
                     .remove_auxiliary_containers_for_sandbox(sandbox_id)
                     .await?;
-                remove_docker_channel_volume_by_id(&self.docker, sandbox_id, &self.config).await?;
+                remove_docker_owned_storage_by_id(&self.docker, sandbox_id, &self.config).await?;
                 cleanup_docker_boundary_state_by_id(sandbox_id, &self.config);
                 self.clear_runtime_failure(sandbox_id).await;
-                return Ok(removed);
+                return Ok(removed || removed_update);
             }
             return Ok(false);
         };
@@ -2358,19 +2438,15 @@ impl DockerComputeDriver {
         {
             Ok(()) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                remove_docker_channel_volume_by_id(&self.docker, resolved_sandbox_id, &self.config)
+                remove_docker_owned_storage_by_id(&self.docker, resolved_sandbox_id, &self.config)
                     .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(true)
             }
             Err(err) if is_not_found_error(&err) => {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
-                let _ = remove_docker_channel_volume_by_id(
-                    &self.docker,
-                    resolved_sandbox_id,
-                    &self.config,
-                )
-                .await;
+                remove_docker_owned_storage_by_id(&self.docker, resolved_sandbox_id, &self.config)
+                    .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(pending.is_some())
             }
@@ -2400,7 +2476,7 @@ impl DockerComputeDriver {
                 self.clear_runtime_failure(&record.sandbox.id).await;
                 remove_docker_channel_volume_by_id(&self.docker, &record.sandbox.id, &self.config)
                     .await?;
-                cleanup_docker_boundary_state(&record.sandbox, &self.config);
+                cleanup_failed_docker_boundary_state(&record.sandbox, &self.config);
                 self.publish_deleted(record.sandbox.id);
                 return Ok(());
             }
@@ -2408,6 +2484,9 @@ impl DockerComputeDriver {
                 self.stop_control_process(sandbox_id).await;
                 self.remove_auxiliary_containers_for_sandbox(sandbox_id)
                     .await?;
+            }
+            if image_update::pending_snapshot(&self.config, sandbox_id, sandbox_name)?.is_some() {
+                return Ok(());
             }
             return Err(Status::not_found("sandbox not found"));
         };
@@ -2478,18 +2557,28 @@ impl DockerComputeDriver {
             generation_id.to_string(),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let resolved_id = self
+            .resolve_lifecycle_id(sandbox_id, sandbox_name)
+            .await?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let _lifecycle = self
+            .image_update_gates
+            .gate_for(&resolved_id)
+            .lock_owned()
+            .await;
+        image_update::require_settled(&self.config, &resolved_id)?;
         self.lifecycle_event_fences
-            .clear_stop(sandbox_id, sandbox_name);
-        self.lifecycle_event_fences.begin_start(sandbox_id);
+            .clear_stop(&resolved_id, sandbox_name);
+        self.lifecycle_event_fences.begin_start(&resolved_id);
         let result = Box::pin(self.start_sandbox_with_lifecycle_fence(
-            sandbox_id,
+            &resolved_id,
             sandbox_name,
             &generation,
             launch_authentication,
             durable_sandbox,
         ))
         .await;
-        self.lifecycle_event_fences.finish_start(sandbox_id);
+        self.lifecycle_event_fences.finish_start(&resolved_id);
         span_status.finish(result)
     }
 
@@ -2519,6 +2608,18 @@ impl DockerComputeDriver {
         validate_docker_outer_fence(&inspected)?;
         self.admit_container_resources(&inspected).await?;
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
+        let validation = if container_state_needs_start(state) && !launch_authentication.is_empty()
+        {
+            image_update::LaunchValidation::BeforeStoppedRotation
+        } else {
+            image_update::LaunchValidation::Complete
+        };
+        image_update::validate_committed_resource(
+            &self.config,
+            sandbox_id,
+            &inspected,
+            validation,
+        )?;
         let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             inspected
                 .state
@@ -2584,6 +2685,7 @@ impl DockerComputeDriver {
             )
             .await?;
         }
+        image_update::validate_committed_boundary(&self.config, resolved_sandbox_id)?;
         let Some(runtime_descriptor) =
             read_docker_runtime_descriptor(resolved_sandbox_id, &self.config).await?
         else {
@@ -2722,7 +2824,7 @@ impl DockerComputeDriver {
         sandbox: &DriverSandbox,
         failure: &DockerProvisioningFailure,
     ) {
-        cleanup_docker_boundary_state(sandbox, &self.config);
+        cleanup_failed_docker_boundary_state(sandbox, &self.config);
         let snapshot = pending_sandbox_snapshot(
             sandbox,
             &self.config.sandbox_namespace,
@@ -2756,16 +2858,7 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<(), Status> {
-        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
-            self.publish_sandbox_snapshot(pending);
-            return Ok(());
-        }
-        if let Some(summary) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-            && let Some(mut sandbox) = sandbox_from_container_summary(&summary)
-        {
-            self.apply_runtime_failure(&mut sandbox).await;
+        if let Some(sandbox) = self.get_sandbox_snapshot(sandbox_id, sandbox_name).await? {
             self.publish_sandbox_snapshot(sandbox);
         }
         Ok(())
@@ -2976,7 +3069,7 @@ impl DockerComputeDriver {
             .await
             .map_err(|err| internal_status("find Docker sandbox container", err))?;
 
-        Ok(containers.into_iter().find(|summary| {
+        let mut matches = containers.into_iter().filter(|summary| {
             let Some(labels) = summary.labels.as_ref() else {
                 return false;
             };
@@ -2992,7 +3085,14 @@ impl DockerComputeDriver {
                     .get(LABEL_SANDBOX_NAME)
                     .is_some_and(|value| value == sandbox_name);
             namespace_matches && id_matches && name_matches
-        }))
+        });
+        let selected = matches.next();
+        if matches.next().is_some() {
+            return Err(Status::failed_precondition(
+                "multiple managed Docker workloads match the native identity",
+            ));
+        }
+        Ok(selected)
     }
 
     async fn ensure_image_available(
@@ -3145,9 +3245,6 @@ fn validate_docker_outer_fence(
     }
     Ok(())
 }
-#[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
-
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
@@ -3311,7 +3408,51 @@ impl ComputeDriver for ComputeDriverService {
 }
 
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for DockerComputeDriver {}
+impl openshell_core::compute::ComputeDriver for DockerComputeDriver {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = Box::pin(self.update_workload_image(&request.into_inner())).await;
+        span_status.finish(result.map(|()| {
+            Response::new(openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {})
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::UPDATE_SANDBOX_CONFIGURATION,
+                openshell_core::compute::ComputeDriver::update_sandbox_configuration(
+                    &self.driver,
+                    request,
+                ),
+            )
+            .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
+    }
+}
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
@@ -3442,9 +3583,21 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let request = request.into_inner();
+        let mut request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
+        let Some(id) = self
+            .resolve_lifecycle_id(&request.sandbox_id, &request.name)
+            .await?
+        else {
+            return Err(Status::not_found("sandbox not found"));
+        };
+        request.sandbox_id = id;
+        let _lifecycle = self
+            .image_update_gates
+            .gate_for(&request.sandbox_id)
+            .lock_owned()
+            .await;
         self.lifecycle_event_fences
             .request_stop(&request.sandbox_id, &request.name);
         if let Err(error) = self
@@ -3503,9 +3656,21 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let request = request.into_inner();
+        let mut request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
+        let Some(id) = self
+            .resolve_lifecycle_id(&request.sandbox_id, &request.name)
+            .await?
+        else {
+            return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
+        };
+        request.sandbox_id = id;
+        let _lifecycle = self
+            .image_update_gates
+            .gate_for(&request.sandbox_id)
+            .lock_owned()
+            .await;
         let event_sandbox_id = request.sandbox_id.clone();
         let deleted = self
             .delete_sandbox_inner(&request.sandbox_id, &request.name)
@@ -4272,6 +4437,15 @@ async fn create_docker_runtime_volume(
     Ok(())
 }
 
+async fn remove_docker_owned_storage_by_id(
+    docker: &Docker,
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), Status> {
+    workspace::remove(docker, sandbox_id, config).await?;
+    remove_docker_channel_volume_by_id(docker, sandbox_id, config).await
+}
+
 async fn remove_docker_channel_volume_by_id(
     docker: &Docker,
     sandbox_id: &str,
@@ -4708,7 +4882,7 @@ async fn prepare_docker_boundary_files(
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
     let verification_keys = gateway_verification_keys(&launch_authentication.verification_keys)?;
-    let provisioning = isolation::DockerBoundarySpec {
+    let mut provisioning = isolation::DockerBoundarySpec {
         boundary_id: sandbox.id.clone(),
         generation: launch_authentication
             .supervisor
@@ -4738,6 +4912,19 @@ async fn prepare_docker_boundary_files(
     }
     .provision()
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if config.workspace_storage == workspace::Storage::Persistent {
+        let record = workspace::record_claim(&sandbox.id, config)?.ok_or_else(|| {
+            Status::failed_precondition(
+                "private Docker workspace record is missing during provisioning",
+            )
+        })?;
+        for claims in [
+            &mut provisioning.boundary_config.resource_claims,
+            &mut provisioning.runtime_descriptor.resource_claims,
+        ] {
+            claims.insert(workspace::RECORD_CLAIM.into(), record.clone());
+        }
+    }
     let boundary_config = provisioning
         .boundary_config
         .encode()
@@ -5933,9 +6120,23 @@ async fn stop_docker_control_process(mut process: DockerControlProcess) {
     let _ = process.task.await;
 }
 
-/// Make a private, on-disk rollback copy of the driver state before a stopped
-/// workload is replaced. Only regular files are copied: a compromised state
-/// directory cannot smuggle symlinks into the gateway filesystem.
+// Failed or interrupted creation can leave a retained workspace. Keep its
+// independent ownership record until explicit deletion removes that volume.
+fn cleanup_failed_docker_boundary_state(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) {
+    let Ok(path) = workspace::record_path(&sandbox.id, config) else {
+        return;
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cleanup_docker_boundary_state(sandbox, config);
+        }
+        _ => {} // Preserve unreadable/invalid records too; recovery fails closed.
+    }
+}
+
 fn cleanup_docker_boundary_state(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
     cleanup_docker_boundary_state_by_id(&sandbox.id, config);
 }
@@ -6198,6 +6399,9 @@ fn build_container_create_body_for_image(
     )
     .map_err(Status::failed_precondition)?;
     let mut user_mounts = docker_driver_mounts(driver_config)?;
+    if let Some(mount) = workspace::mount(sandbox, config, image)? {
+        user_mounts.push(mount);
+    }
     user_mounts.push(Mount {
         target: Some(BOUNDARY_MOUNT_PATH.to_string()),
         source: Some(docker_channel_volume_name(sandbox, config)),
@@ -6231,6 +6435,8 @@ fn build_container_create_body_for_image(
         }]
     });
     let mut labels = template.labels.clone();
+    // Persistence is recorded in protected driver state, never inferred from
+    // or published over caller-owned template labels.
     labels.insert(
         "openshell.ai/private-image-volume-targets".into(),
         serde_json::to_string(&image.volumes)
