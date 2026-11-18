@@ -4348,7 +4348,7 @@ mod tests {
                 "literal & value".into(),
                 String::new(),
             ],
-            environment: std::collections::HashMap::from([("NAME".into(), "two words".into())]),
+            environment: HashMap::from([("NAME".into(), "two words".into())]),
             workdir: r"C:\sandbox\work".into(),
             ..Default::default()
         };

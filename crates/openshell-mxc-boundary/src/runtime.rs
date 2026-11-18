@@ -1212,13 +1212,15 @@ fn windows_launch(spec: ExecSpecWire) -> Result<WindowsLaunch, &'static str> {
         ..
     } = spec;
     if let Some(shell) = shell {
-        let (args, raw_command_tail) = match shell.command {
-            Some(command) => (
-                vec!["/d".to_string(), "/s".to_string(), "/c".to_string()],
-                Some(format!("\"{command}\"")),
-            ),
-            None => (vec!["/d".to_string(), "/q".to_string()], None),
-        };
+        let (args, raw_command_tail) = shell.command.map_or_else(
+            || (vec!["/d".to_string(), "/q".to_string()], None),
+            |command| {
+                (
+                    vec!["/d".to_string(), "/s".to_string(), "/c".to_string()],
+                    Some(format!("\"{command}\"")),
+                )
+            },
+        );
         return Ok(WindowsLaunch {
             program: "cmd.exe".to_string(),
             args,
