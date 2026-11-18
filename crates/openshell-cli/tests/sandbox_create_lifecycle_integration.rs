@@ -32,7 +32,8 @@ use openshell_core::proto::{
     UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event, tcp_forward_frame,
     tcp_forward_init,
 };
-use std::collections::HashMap;
+use openshell_core::rpc_error::StatusExt as _;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -65,6 +66,26 @@ struct SandboxState {
     fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    /// Scripted `create_sandbox` failures, oldest first. Empty means success.
+    create_failures: Arc<Mutex<VecDeque<Status>>>,
+    /// Delay applied by `create_sandbox` before it answers, to spend a retry
+    /// budget the way a slow gateway would.
+    create_delay: Arc<Mutex<Option<Duration>>>,
+    /// Directory the mock gateway hands out as a rootfs tar upload target.
+    rootfs_staging_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// Every `BeginRootfsTarStaging` request, in call order.
+    staging_requests: Arc<Mutex<Vec<openshell_core::proto::BeginRootfsTarStagingRequest>>>,
+    /// Scripted `get_sandbox` failures, oldest first.
+    get_sandbox_failures: Arc<Mutex<VecDeque<Status>>>,
+    /// Delay applied by `get_sandbox` before it answers, so a test can hold a
+    /// holder poll past the client's retry budget.
+    get_sandbox_delay: Arc<Mutex<Option<Duration>>>,
+    /// Scripted `get_sandbox` phases, oldest first; `Ready` when empty.
+    get_sandbox_phases: Arc<Mutex<VecDeque<SandboxPhase>>>,
+    /// Ordered `get_sandbox` outcomes that interleave phases with missing
+    /// sandboxes. Checked before `get_sandbox_failures` and
+    /// `get_sandbox_phases`.
+    get_sandbox_script: Arc<Mutex<VecDeque<GetSandboxOutcome>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     stop_response: Arc<Mutex<Option<Sandbox>>>,
@@ -98,6 +119,21 @@ struct SandboxState {
 #[derive(Clone, Default)]
 struct TestOpenShell {
     state: SandboxState,
+}
+
+/// One scripted `get_sandbox` observation.
+#[derive(Clone, Copy)]
+enum GetSandboxOutcome {
+    Phase(SandboxPhase),
+    Missing,
+    /// A holder with a specific id, to script a name that changes hands.
+    Holder {
+        id: &'static str,
+        phase: SandboxPhase,
+    },
+    /// A holder response without object metadata, as an unusual gateway would
+    /// omit it.
+    NoMetadata(SandboxPhase),
 }
 
 #[tonic::async_trait]
@@ -140,9 +176,23 @@ impl OpenShell for TestOpenShell {
 
     async fn begin_rootfs_tar_staging(
         &self,
-        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+        request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
     ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
+        let request = request.into_inner();
+        let Some(dir) = self.state.rootfs_staging_dir.lock().await.clone() else {
+            return Err(Status::unimplemented("not used by this test server"));
+        };
+        let mut requests = self.state.staging_requests.lock().await;
+        let token = format!("staging-token-{}", requests.len());
+        requests.push(request);
+        Ok(Response::new(
+            openshell_core::proto::BeginRootfsTarStagingResponse {
+                staging_token: token.clone(),
+                upload_path: dir.join(format!("{token}.tar")).display().to_string(),
+                max_bytes: 1 << 20,
+                expiration_time: None,
+            },
+        ))
     }
 
     async fn report_main_process_exit(
@@ -200,6 +250,14 @@ impl OpenShell for TestOpenShell {
             })
             .collect();
         self.state.create_requests.lock().await.push(request);
+        let delay = *self.state.create_delay.lock().await;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let failure = self.state.create_failures.lock().await.pop_front();
+        if let Some(status) = failure {
+            return Err(status);
+        }
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
         } else {
@@ -280,9 +338,36 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<SandboxResponse>, Status> {
         let request = request.into_inner();
         let name = request.name;
+        let delay = *self.state.get_sandbox_delay.lock().await;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let scripted_outcome = self.state.get_sandbox_script.lock().await.pop_front();
+        let (phase, id): (SandboxPhase, Option<String>) = match scripted_outcome {
+            Some(GetSandboxOutcome::Missing) => {
+                return Err(Status::not_found("sandbox not found"));
+            }
+            Some(GetSandboxOutcome::Phase(phase)) => (phase, Some(format!("id-{name}"))),
+            Some(GetSandboxOutcome::Holder { id, phase }) => (phase, Some(id.to_string())),
+            Some(GetSandboxOutcome::NoMetadata(phase)) => (phase, None),
+            None => {
+                let failure = self.state.get_sandbox_failures.lock().await.pop_front();
+                if let Some(status) = failure {
+                    return Err(status);
+                }
+                let phase = self
+                    .state
+                    .get_sandbox_phases
+                    .lock()
+                    .await
+                    .pop_front()
+                    .unwrap_or(SandboxPhase::Ready);
+                (phase, Some(format!("id-{name}")))
+            }
+        };
         let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: format!("id-{name}"),
+            metadata: id.map(|id| openshell_core::proto::datamodel::v1::ObjectMeta {
+                id,
                 name,
                 created_time: None,
                 labels: HashMap::new(),
@@ -293,7 +378,7 @@ impl OpenShell for TestOpenShell {
             }),
             ..Sandbox::default()
         };
-        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox.set_phase(phase as i32);
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
@@ -4283,6 +4368,1552 @@ async fn rejected_suspend_preserves_active_forwards() {
                 "rejected suspension must keep the forward process alive"
             );
             forward.kill().await.unwrap();
+        })
+        .await;
+}
+
+fn mutation_lock_timeout(delay: Duration) -> Status {
+    openshell_core::rpc_error::unavailable(
+        openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+        "gateway busy",
+        delay,
+    )
+}
+
+fn name_taken(poll_delay: Option<Duration>) -> Status {
+    let mut details = openshell_core::rpc_error::ErrorDetails::new();
+    if let Some(delay) = poll_delay {
+        details.set_retry_info(Some(delay));
+    }
+    Status::with_error_details(
+        tonic::Code::AlreadyExists,
+        "sandbox 'busy-name' already exists",
+        details,
+    )
+}
+
+/// The gateway's answer when a create sends a staging token it already consumed.
+fn staging_token_spent() -> Status {
+    Status::failed_precondition(
+        "rootfs tar staging token is unknown or expired; re-stage the archive",
+    )
+}
+
+fn assert_empty_request_ids(requests: &[CreateSandboxRequest]) {
+    assert!(
+        requests.iter().all(|request| request.request_id.is_empty()),
+        "every attempt must keep request_id empty so mutation replay cannot surface the failure"
+    );
+}
+
+/// Rootfs staging token carried by a create request's driver config.
+fn rootfs_staging_token(request: &CreateSandboxRequest) -> String {
+    use prost_types::value::Kind;
+
+    let config = request
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| template.driver_config.as_ref())
+        .expect("create request must carry driver config");
+    let Some(Kind::StructValue(vm)) = config
+        .fields
+        .get("vm")
+        .expect("vm driver config")
+        .kind
+        .as_ref()
+    else {
+        panic!("vm driver config must be an object");
+    };
+    let Some(Kind::StringValue(token)) = vm
+        .fields
+        .get("rootfs_tar_staging_token")
+        .expect("staging token")
+        .kind
+        .as_ref()
+    else {
+        panic!("staging token must be a string");
+    };
+    token.clone()
+}
+
+#[tokio::test]
+async fn sandbox_create_retries_mutation_lock_timeout_to_success() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(mutation_lock_timeout(Duration::from_millis(1)));
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("retry-lock-timeout"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a lock timeout inside the budget should retry");
+
+            let requests = create_requests(&server).await;
+            assert_eq!(
+                requests.len(),
+                2,
+                "the create should be sent again after the lock timeout"
+            );
+            assert_empty_request_ids(&requests);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_does_not_retry_other_transient_failures() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(openshell_core::rpc_error::unavailable(
+            "DATABASE_UNAVAILABLE",
+            "database is unavailable",
+            Duration::from_millis(1),
+        ));
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("no-retry-database"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a database outage must not retry a create");
+
+            let msg = err.to_string();
+            assert!(msg.contains("database is unavailable"), "{msg}");
+            assert!(
+                !msg.contains("create retry stopped"),
+                "only mutation lock timeouts are annotated: {msg}"
+            );
+            assert_eq!(
+                create_requests(&server).await.len(),
+                1,
+                "a non-lock failure is terminal"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_retry_budget_exhaustion_surfaces_the_annotated_error() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    {
+        // A 600ms floor against a 1s budget leaves no room for a third
+        // attempt, whatever jitter the loop picks.
+        let mut failures = server.openshell.state.create_failures.lock().await;
+        for _ in 0..4 {
+            failures.push_back(mutation_lock_timeout(Duration::from_millis(600)));
+        }
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("retry-budget"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(1),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("the retry budget should run out");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("create retry stopped after 2 create attempts"),
+                "{msg}"
+            );
+            assert!(msg.contains("gateway busy"), "{msg}");
+            let requests = create_requests(&server).await;
+            assert_eq!(requests.len(), 2);
+            assert_empty_request_ids(&requests);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_bounds_a_stuck_holder_poll_by_the_retry_budget() {
+    // A GetSandbox that never answers inside the budget must not keep the
+    // retrying create pending: the poll itself is bounded by the remaining
+    // budget, not only the sleeps between polls.
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    *server.openshell.state.get_sandbox_delay.lock().await = Some(Duration::from_secs(3));
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = tokio::time::timeout(
+                Duration::from_secs(10),
+                run::sandbox_create(
+                    &server.endpoint,
+                    "openshell",
+                    run::SandboxCreateConfig {
+                        name: Some("busy-name"),
+                        command: &["echo".into(), "OK".into()],
+                        create_retry_timeout_secs: Some(1),
+                        ..test_config()
+                    },
+                    "default",
+                    &tls,
+                ),
+            )
+            .await
+            .expect("a stuck holder poll must not outlive the retry budget")
+            .expect_err("the conflict must surface when the poll exhausts the budget");
+
+            let msg = err.to_string();
+            assert!(msg.contains("sandbox 'busy-name' already exists"), "{msg}");
+            assert!(
+                msg.contains("create retry stopped after 1 create attempt"),
+                "the surfaced conflict must carry the budget annotation: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 1);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_waits_out_a_deleting_holder() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    server
+        .openshell
+        .state
+        .get_sandbox_phases
+        .lock()
+        .await
+        .push_back(SandboxPhase::Deleting);
+    server
+        .openshell
+        .state
+        .get_sandbox_failures
+        .lock()
+        .await
+        .push_back(Status::not_found("sandbox not found"));
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a deleting holder should be waited out");
+
+            let requests = create_requests(&server).await;
+            assert_eq!(
+                requests.len(),
+                2,
+                "the create should be sent again once the name frees"
+            );
+            assert_empty_request_ids(&requests);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_waits_out_a_provisioning_holder() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    {
+        // A holder that is still creating is not a live sandbox: its record
+        // can be compensated, so the loop waits and resends the create once
+        // the record disappears.
+        let mut script = server.openshell.state.get_sandbox_script.lock().await;
+        script.push_back(GetSandboxOutcome::Phase(SandboxPhase::Provisioning));
+        script.push_back(GetSandboxOutcome::Missing);
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a provisioning holder should be waited out");
+
+            let requests = create_requests(&server).await;
+            assert_eq!(
+                requests.len(),
+                2,
+                "the create should be sent again once the record disappears"
+            );
+            assert_empty_request_ids(&requests);
+            assert_eq!(
+                server.openshell.state.get_sandbox_script.lock().await.len(),
+                0,
+                "the loop must re-observe the holder after the wait"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_surfaces_the_conflict_when_the_holder_poll_fails() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(None));
+    server
+        .openshell
+        .state
+        .get_sandbox_failures
+        .lock()
+        .await
+        .push_back(Status::permission_denied("not allowed to read sandboxes"));
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("an unreadable holder must not hide the name conflict");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("sandbox 'busy-name' already exists"),
+                "the conflict must survive the failed poll: {msg}"
+            );
+            assert!(
+                msg.contains("holder status unavailable"),
+                "the poll failure must be reported: {msg}"
+            );
+            assert!(
+                msg.contains("not allowed to read sandboxes"),
+                "the poll failure detail must be reported: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 1);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_keeps_a_rootfs_tar_token_across_a_guard_timeout() {
+    let server = run_server().await;
+    let staging_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.rootfs_staging_dir.lock().await =
+        Some(staging_dir.path().to_path_buf());
+    let source = helpers::tempdir().unwrap();
+    let archive = source.path().join("rootfs.tar");
+    fs::write(&archive, b"rootfs archive").unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(mutation_lock_timeout(Duration::from_millis(1)));
+    let from = archive.to_str().unwrap().to_string();
+
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async move {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("restage-rootfs"),
+                    from: Some(&from),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("the retry should succeed");
+
+            assert_eq!(
+                server.openshell.state.staging_requests.lock().await.len(),
+                1,
+                "a pre-record guard timeout leaves the token outstanding, so re-staging would waste a slot"
+            );
+            let requests = create_requests(&server).await;
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                rootfs_staging_token(&requests[0]),
+                rootfs_staging_token(&requests[1]),
+                "the retry must re-send the still-valid staging token"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_does_not_spend_staging_slots_on_guard_timeouts() {
+    // The gateway caps a caller at four outstanding staging slots and the
+    // create loop allows five attempts, so re-staging before each guard-timeout
+    // retry would exhaust the quota and turn the fifth attempt into
+    // RESOURCE_EXHAUSTED. Every retry here reuses the still-valid token.
+    let server = run_server().await;
+    let staging_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.rootfs_staging_dir.lock().await =
+        Some(staging_dir.path().to_path_buf());
+    let source = helpers::tempdir().unwrap();
+    let archive = source.path().join("rootfs.tar");
+    fs::write(&archive, b"rootfs archive").unwrap();
+    {
+        let mut failures = server.openshell.state.create_failures.lock().await;
+        for _ in 0..4 {
+            failures.push_back(mutation_lock_timeout(Duration::from_millis(1)));
+        }
+    }
+    let from = archive.to_str().unwrap().to_string();
+
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async move {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("restage-rootfs"),
+                    from: Some(&from),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("guard-timeout retries must reuse the outstanding token");
+
+            assert_eq!(
+                server.openshell.state.staging_requests.lock().await.len(),
+                1,
+                "each guard-timeout retry must keep the same staging slot"
+            );
+            let requests = create_requests(&server).await;
+            assert_eq!(requests.len(), 5, "four retries then the successful send");
+            assert!(
+                requests
+                    .windows(2)
+                    .all(|pair| rootfs_staging_token(&pair[0]) == rootfs_staging_token(&pair[1])),
+                "every attempt must carry the same staging token"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_restages_a_spent_rootfs_tar_token() {
+    let server = run_server().await;
+    let staging_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.rootfs_staging_dir.lock().await =
+        Some(staging_dir.path().to_path_buf());
+    let source = helpers::tempdir().unwrap();
+    let archive = source.path().join("rootfs.tar");
+    fs::write(&archive, b"rootfs archive").unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(staging_token_spent());
+    let from = archive.to_str().unwrap().to_string();
+
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async move {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("restage-rootfs"),
+                    from: Some(&from),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a spent token should be re-staged and the create should succeed");
+
+            assert_eq!(
+                server.openshell.state.staging_requests.lock().await.len(),
+                2,
+                "a spent token must be re-staged exactly once"
+            );
+            let requests = create_requests(&server).await;
+            assert_eq!(requests.len(), 2);
+            assert_ne!(
+                rootfs_staging_token(&requests[0]),
+                rootfs_staging_token(&requests[1]),
+                "the re-send must not repeat the spent staging token"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_fails_when_a_restaged_rootfs_tar_token_is_spent_again() {
+    let server = run_server().await;
+    let staging_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.rootfs_staging_dir.lock().await =
+        Some(staging_dir.path().to_path_buf());
+    let source = helpers::tempdir().unwrap();
+    let archive = source.path().join("rootfs.tar");
+    fs::write(&archive, b"rootfs archive").unwrap();
+    {
+        let mut failures = server.openshell.state.create_failures.lock().await;
+        failures.push_back(staging_token_spent());
+        failures.push_back(staging_token_spent());
+    }
+    let from = archive.to_str().unwrap().to_string();
+
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async move {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("restage-rootfs"),
+                    from: Some(&from),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a second spent token must stay terminal");
+
+            assert!(
+                err.to_string().contains("rootfs tar staging token"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(
+                server.openshell.state.staging_requests.lock().await.len(),
+                2,
+                "the loop must re-stage only once"
+            );
+            assert_eq!(create_requests(&server).await.len(), 2);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_restages_again_after_a_consuming_send_spends_the_new_token() {
+    // The SSH identity step reports a lock timeout only after consuming the
+    // staged archive, so the re-send that follows carries a spent token and
+    // triggers a re-stage. A second consuming send spends that fresh token too:
+    // the next spent-token rejection must re-stage again instead of ending the
+    // loop with the raw error.
+    let server = run_server().await;
+    let staging_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.rootfs_staging_dir.lock().await =
+        Some(staging_dir.path().to_path_buf());
+    let source = helpers::tempdir().unwrap();
+    let archive = source.path().join("rootfs.tar");
+    fs::write(&archive, b"rootfs archive").unwrap();
+    {
+        let mut failures = server.openshell.state.create_failures.lock().await;
+        failures.push_back(mutation_lock_timeout(Duration::from_millis(1)));
+        failures.push_back(staging_token_spent());
+        failures.push_back(mutation_lock_timeout(Duration::from_millis(1)));
+        failures.push_back(staging_token_spent());
+    }
+    let from = archive.to_str().unwrap().to_string();
+
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async move {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("restage-rootfs"),
+                    from: Some(&from),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("every spent token that follows a consuming send should be re-staged");
+
+            assert_eq!(
+                server.openshell.state.staging_requests.lock().await.len(),
+                3,
+                "each consuming send must be followed by its own re-stage"
+            );
+            let requests = create_requests(&server).await;
+            assert_eq!(requests.len(), 5);
+            assert_ne!(
+                rootfs_staging_token(&requests[1]),
+                rootfs_staging_token(&requests[2]),
+                "the re-send after a consuming send must carry a fresh token"
+            );
+            assert_ne!(
+                rootfs_staging_token(&requests[3]),
+                rootfs_staging_token(&requests[4]),
+                "the second re-send must carry a fresh token too"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_does_not_restage_a_spent_token_past_the_budget() {
+    let server = run_server().await;
+    let staging_dir = helpers::tempdir().unwrap();
+    *server.openshell.state.rootfs_staging_dir.lock().await =
+        Some(staging_dir.path().to_path_buf());
+    let source = helpers::tempdir().unwrap();
+    let archive = source.path().join("rootfs.tar");
+    fs::write(&archive, b"rootfs archive").unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(staging_token_spent());
+    // The create outlives the retry budget, so the spent-token arm finds
+    // nothing left to spend on an archive re-copy and another send.
+    *server.openshell.state.create_delay.lock().await = Some(Duration::from_millis(1100));
+    let from = archive.to_str().unwrap().to_string();
+
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async move {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("restage-rootfs"),
+                    from: Some(&from),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(1),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("an exhausted budget must not re-stage the archive");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rootfs tar staging token"),
+                "the spent-token failure must surface: {msg}"
+            );
+            assert!(
+                msg.contains("create retry stopped after 1 create attempt"),
+                "the budget stop must name the attempt count: {msg}"
+            );
+            assert_eq!(
+                server.openshell.state.staging_requests.lock().await.len(),
+                1,
+                "a spent token past the deadline must not burn another staging slot"
+            );
+            assert_eq!(
+                create_requests(&server).await.len(),
+                1,
+                "a spent token past the deadline must not send another create"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_does_not_wait_for_a_live_holder() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a live holder keeps the name");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("hint: delete it first"),
+                "a live holder should explain how to free the name: {msg}"
+            );
+            assert!(
+                !msg.contains("create retry stopped"),
+                "a first-attempt conflict stays plain: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 1);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_stops_when_a_deleting_holder_recovers() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    // Deleting on the first poll, then Ready by default: the deletion was
+    // abandoned, so the name stays taken.
+    server
+        .openshell
+        .state
+        .get_sandbox_phases
+        .lock()
+        .await
+        .push_back(SandboxPhase::Deleting);
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a recovered holder keeps the name");
+
+            let msg = err.to_string();
+            assert!(msg.contains("hint: delete it first"), "{msg}");
+            assert_eq!(create_requests(&server).await.len(), 1);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_stops_when_a_different_id_holder_takes_the_name() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    {
+        // The name changes hands between polls: the first holder is replaced
+        // by another sandbox, so waiting on it would watch the wrong record.
+        // The third observation would free the name, so a loop that ignores
+        // the id would retry the create instead of stopping.
+        let mut script = server.openshell.state.get_sandbox_script.lock().await;
+        script.push_back(GetSandboxOutcome::Holder {
+            id: "holder-a",
+            phase: SandboxPhase::Deleting,
+        });
+        script.push_back(GetSandboxOutcome::Holder {
+            id: "holder-b",
+            phase: SandboxPhase::Deleting,
+        });
+        script.push_back(GetSandboxOutcome::Missing);
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a different id under the same name is a terminal conflict");
+
+            let msg = err.to_string();
+            assert!(msg.contains("sandbox 'busy-name' already exists"), "{msg}");
+            assert_eq!(
+                server.openshell.state.get_sandbox_script.lock().await.len(),
+                1,
+                "the poll must stop as soon as the holder id changes, \
+                 leaving the name-free observation untouched"
+            );
+            assert_eq!(
+                create_requests(&server).await.len(),
+                1,
+                "a changed holder id must not resend the create"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_ignores_a_holder_without_metadata() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    {
+        // The first poll omits the holder id. Recording it as an empty string
+        // would make the next poll's real id look like a new holder and stop
+        // the create on a phantom name change.
+        let mut script = server.openshell.state.get_sandbox_script.lock().await;
+        script.push_back(GetSandboxOutcome::NoMetadata(SandboxPhase::Deleting));
+        script.push_back(GetSandboxOutcome::Holder {
+            id: "holder-a",
+            phase: SandboxPhase::Deleting,
+        });
+        script.push_back(GetSandboxOutcome::Missing);
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a holder without metadata must not look like a name change");
+
+            let requests = create_requests(&server).await;
+            assert_eq!(requests.len(), 2, "the name frees, so the create retries");
+            assert_empty_request_ids(&requests);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_live_replacement_gets_the_delete_hint() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    {
+        // The name changes hands to a live sandbox. Stopping is right, and the
+        // observed phase must drive the delete-first hint: the replacement is
+        // running, not being deleted.
+        let mut script = server.openshell.state.get_sandbox_script.lock().await;
+        script.push_back(GetSandboxOutcome::Holder {
+            id: "holder-a",
+            phase: SandboxPhase::Deleting,
+        });
+        script.push_back(GetSandboxOutcome::Holder {
+            id: "holder-b",
+            phase: SandboxPhase::Ready,
+        });
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a live replacement keeps the name");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("hint: delete it first"),
+                "a live replacement should explain how to free the name: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 1);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_survives_a_transient_holder_poll_failure() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(None));
+    {
+        // UNAVAILABLE says nothing about the holder: the loop must wait and
+        // poll again instead of discarding the retry budget. The next read
+        // reports the name free, so the create succeeds.
+        let mut failures = server.openshell.state.get_sandbox_failures.lock().await;
+        failures.push_back(Status::unavailable("database is unavailable"));
+        failures.push_back(Status::not_found("sandbox not found"));
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a transient poll failure must not end the retry");
+
+            let requests = create_requests(&server).await;
+            assert_eq!(requests.len(), 2, "the create should be retried once");
+            assert_empty_request_ids(&requests);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_cleanup_wait_keeps_the_lock_timeout_cause() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    {
+        let mut failures = server.openshell.state.create_failures.lock().await;
+        failures.push_back(mutation_lock_timeout(Duration::from_millis(1)));
+        failures.push_back(name_taken(Some(Duration::from_millis(400))));
+    }
+    {
+        // The holder never finishes deleting, so the cleanup wait exhausts the
+        // budget instead of resolving the conflict.
+        let mut phases = server.openshell.state.get_sandbox_phases.lock().await;
+        for _ in 0..4 {
+            phases.push_back(SandboxPhase::Deleting);
+        }
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(1),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("the cleanup wait should run out of budget");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("create retry stopped after 2 create attempts"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("last mutation lock timeout: gateway busy"),
+                "a cleanup-wait timeout must not be misread as a bare conflict: {msg}"
+            );
+            assert!(
+                !msg.contains("hint: delete it first"),
+                "the delete-first hint fires only for a live holder: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 2);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_first_attempt_cleanup_wait_exhaustion_is_annotated() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(400))));
+    {
+        // The holder never finishes deleting, so the cleanup wait exhausts the
+        // budget on the first create attempt.
+        let mut phases = server.openshell.state.get_sandbox_phases.lock().await;
+        for _ in 0..4 {
+            phases.push_back(SandboxPhase::Deleting);
+        }
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(1),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("the cleanup wait should run out of budget");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("create retry stopped after 1 create attempt"),
+                "a first-attempt cleanup-wait timeout must name the attempt: {msg}"
+            );
+            assert!(
+                !msg.contains("hint: delete it first"),
+                "the delete-first hint fires only for a live holder: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 1);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_retry_progress_goes_to_stderr() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(mutation_lock_timeout(Duration::from_millis(1)));
+
+    let output = run_cli_sandbox_create_with_env(
+        &server,
+        "retry-progress",
+        &["--output=json"],
+        &[("OPENSHELL_CREATE_RETRY_TIMEOUT", "5")],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "sandbox create failed: {stderr}");
+    assert!(
+        stderr.contains("gateway busy (MUTATION_LOCK_TIMEOUT); retrying in"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("gateway busy"),
+        "retry progress must not leak into structured output: {stdout}"
+    );
+    let requests = create_requests(&server).await;
+    assert_eq!(requests.len(), 2);
+    assert_empty_request_ids(&requests);
+}
+
+#[tokio::test]
+async fn sandbox_create_cleanup_wait_progress_goes_to_stderr() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(Some(Duration::from_millis(1))));
+    {
+        // A deleting holder, then the name frees. The wait must report itself
+        // on stderr instead of looking hung, and structured output must stay
+        // clean.
+        let mut script = server.openshell.state.get_sandbox_script.lock().await;
+        script.push_back(GetSandboxOutcome::Phase(SandboxPhase::Deleting));
+        script.push_back(GetSandboxOutcome::Missing);
+    }
+
+    let output = run_cli_sandbox_create_with_env(
+        &server,
+        "cleanup-progress",
+        &["--output=json"],
+        &[("OPENSHELL_CREATE_RETRY_TIMEOUT", "5")],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "sandbox create failed: {stderr}");
+    assert!(
+        stderr.contains("exists and is being deleted; waiting for cleanup"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("waiting for cleanup"),
+        "cleanup progress must not leak into structured output: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_no_create_retry_flag_fails_immediately() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(mutation_lock_timeout(Duration::from_millis(1)));
+
+    let output = run_cli_sandbox_create(&server, "no-retry", &["--no-create-retry"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("gateway busy"), "{stderr}");
+    assert!(
+        !stderr.contains("retrying in"),
+        "--no-create-retry must not retry: {stderr}"
+    );
+    assert_eq!(create_requests(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn sandbox_create_no_create_retry_conflict_shows_the_delete_hint() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(None));
+
+    let output = run_cli_sandbox_create(&server, "no-retry-conflict", &["--no-create-retry"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("hint: delete it first with: openshell sandbox delete"),
+        "a conflict that skips the retry loop must explain how to free the name: {stderr}"
+    );
+    assert!(stderr.contains("or use a different name"), "{stderr}");
+    assert_eq!(create_requests(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn sandbox_create_unnamed_conflict_shows_the_delete_hint_without_a_phase_poll() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(None));
+    // Consumed only if the loop polls a phase it has no name for.
+    server
+        .openshell
+        .state
+        .get_sandbox_failures
+        .lock()
+        .await
+        .push_back(Status::not_found("sandbox not found"));
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: None,
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a generated name has no holder to disambiguate");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("hint: delete it first with: openshell sandbox delete"),
+                "{msg}"
+            );
+            assert!(msg.contains("or use a different name"), "{msg}");
+            assert_eq!(create_requests(&server).await.len(), 1);
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .get_sandbox_failures
+                    .lock()
+                    .await
+                    .len(),
+                1,
+                "an unnamed conflict must not poll the phase"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_retries_a_missing_holder_up_to_the_cap() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    {
+        let mut failures = server.openshell.state.create_failures.lock().await;
+        for _ in 0..4 {
+            failures.push_back(name_taken(None));
+        }
+    }
+    {
+        // The name stays missing: a fourth create is already queued to fail.
+        let mut looks = server.openshell.state.get_sandbox_failures.lock().await;
+        for _ in 0..8 {
+            looks.push_back(Status::not_found("sandbox not found"));
+        }
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("a missing holder may only drive three retries");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("create retry stopped after 4 create attempts"),
+                "{msg}"
+            );
+            assert!(
+                !msg.contains("hint: delete it first"),
+                "no live holder kept the name: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 4);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_resets_the_missing_holder_cap_after_a_deleting_poll() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    {
+        let mut failures = server.openshell.state.create_failures.lock().await;
+        for _ in 0..6 {
+            failures.push_back(name_taken(Some(Duration::from_millis(1))));
+        }
+    }
+    {
+        // Missing twice, then a deleting holder, then missing again: the
+        // non-missing observation resets the consecutive-missing counter.
+        let mut script = server.openshell.state.get_sandbox_script.lock().await;
+        script.push_back(GetSandboxOutcome::Missing);
+        script.push_back(GetSandboxOutcome::Missing);
+        script.push_back(GetSandboxOutcome::Phase(SandboxPhase::Deleting));
+        for _ in 0..4 {
+            script.push_back(GetSandboxOutcome::Missing);
+        }
+    }
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(5),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("the reset counter must allow three more retries");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("create retry stopped after 5 create attempts"),
+                "a deleting poll must reset the missing-holder counter, and the fifth \
+                 attempt is where the overall cap stops: {msg}"
+            );
+            assert_eq!(create_requests(&server).await.len(), 5);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_stops_a_missing_holder_retry_when_the_budget_is_spent() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    server
+        .openshell
+        .state
+        .create_failures
+        .lock()
+        .await
+        .push_back(name_taken(None));
+    // The create outlives the retry budget, so the missing-holder decision
+    // finds nothing left to spend on another create.
+    *server.openshell.state.create_delay.lock().await = Some(Duration::from_millis(1100));
+    server
+        .openshell
+        .state
+        .get_sandbox_script
+        .lock()
+        .await
+        .push_back(GetSandboxOutcome::Missing);
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("busy-name"),
+                    command: &["echo".into(), "OK".into()],
+                    create_retry_timeout_secs: Some(1),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("an exhausted budget must not resend the create");
+
+            let msg = err.to_string();
+            assert!(msg.contains("sandbox 'busy-name' already exists"), "{msg}");
+            assert!(
+                !msg.contains("hint: delete it first"),
+                "no live holder kept the name: {msg}"
+            );
+            assert_eq!(
+                create_requests(&server).await.len(),
+                1,
+                "an exhausted budget must not resend the create"
+            );
         })
         .await;
 }

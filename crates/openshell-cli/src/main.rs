@@ -1586,6 +1586,16 @@ enum SandboxCommands {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<std::num::NonZeroU32>,
 
+        /// Seconds to keep retrying while the gateway mutation lock is busy
+        /// (default: 60, or `OPENSHELL_CREATE_RETRY_TIMEOUT`).
+        #[arg(long, value_name = "SECONDS", overrides_with = "no_create_retry")]
+        create_retry_timeout: Option<std::num::NonZeroU32>,
+
+        /// Fail immediately when the gateway mutation lock is busy instead of
+        /// retrying.
+        #[arg(long, overrides_with = "create_retry_timeout")]
+        no_create_retry: bool,
+
         /// Auto-create missing providers from local credentials.
         ///
         /// Without this flag, an interactive prompt asks per-provider;
@@ -3435,6 +3445,8 @@ async fn run_async() -> Result<()> {
                     detach,
                     restart_policy,
                     timeout,
+                    create_retry_timeout,
+                    no_create_retry,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3462,6 +3474,15 @@ async fn run_async() -> Result<()> {
                         Some(true)
                     } else {
                         None // prompt or auto-detect
+                    };
+
+                    // Resolve --create-retry-timeout / --no-create-retry.
+                    // A zero budget disables retries; the environment and the
+                    // 60s default are applied in `run::sandbox_create`.
+                    let create_retry_timeout_secs = if no_create_retry {
+                        Some(0)
+                    } else {
+                        create_retry_timeout.map(std::num::NonZeroU32::get)
                     };
 
                     // Parse --label and --annotation flags into maps.
@@ -3531,6 +3552,7 @@ async fn run_async() -> Result<()> {
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
                             provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
+                            create_retry_timeout_secs,
                         },
                         &cli.workspace,
                         &tls,
@@ -6405,6 +6427,59 @@ mod tests {
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
         assert!(Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "0"]).is_err());
+    }
+
+    fn create_retry_flags(args: &[&str]) -> (Option<std::num::NonZeroU32>, bool) {
+        let cli = Cli::try_parse_from(
+            ["openshell", "sandbox", "create"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        create_retry_timeout,
+                        no_create_retry,
+                        ..
+                    }),
+                ..
+            }) => (create_retry_timeout, no_create_retry),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_retry_flags_parse() {
+        assert_eq!(
+            create_retry_flags(&["--create-retry-timeout", "30"]),
+            (std::num::NonZeroU32::new(30), false)
+        );
+        assert_eq!(create_retry_flags(&["--no-create-retry"]), (None, true));
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--create-retry-timeout",
+                "0"
+            ])
+            .is_err(),
+            "a zero retry budget must be rejected; --no-create-retry disables retries"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_retry_flags_use_the_last_one_given() {
+        assert_eq!(
+            create_retry_flags(&["--no-create-retry", "--create-retry-timeout", "30"]),
+            (std::num::NonZeroU32::new(30), false)
+        );
+        assert_eq!(
+            create_retry_flags(&["--create-retry-timeout", "30", "--no-create-retry"]),
+            (None, true)
+        );
     }
 
     #[test]
