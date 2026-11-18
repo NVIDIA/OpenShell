@@ -55,9 +55,8 @@ async fn rest_rules_allow_get_and_deny_post(cx: &mut Context) -> testkit::Result
 #[testkit::test]
 async fn rest_upgrade_is_refused_in_enforce_and_audit_modes(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::serve(rest_upstream).await?;
-    for enforcement in ["enforce", "audit"] {
-        let sandbox =
-            python_sandbox(cx, enforcement, rest_policy(server.port, enforcement)?).await?;
+    for (suffix, enforcement) in [("enfrc", "enforce"), ("audit", "audit")] {
+        let sandbox = python_sandbox(cx, suffix, rest_policy(server.port, enforcement)?).await?;
         run_python(&sandbox, REST_UPGRADE_CLIENT, &[TEST_HOST, &port(&server)])
             .await
             .context(format!("{enforcement} mode"))?
@@ -109,7 +108,7 @@ async fn graphql_rules_allow_and_deny_operations(cx: &mut Context) -> testkit::R
         port = server.port,
         binaries = python_binaries_yaml(),
     ))?;
-    let sandbox = python_sandbox(cx, "graphql", policy).await?;
+    let sandbox = python_sandbox(cx, "gql", policy).await?;
     let output = run_python(&sandbox, GRAPHQL_CLIENT, &[TEST_HOST, &port(&server)]).await?;
     let mut expected = Vec::new();
     for path in ["forward", "raw"] {
@@ -162,7 +161,7 @@ async fn jsonrpc_rules_allow_and_deny_methods(cx: &mut Context) -> testkit::Resu
         port = server.port,
         binaries = python_binaries_yaml(),
     ))?;
-    let sandbox = python_sandbox(cx, "jsonrpc", policy).await?;
+    let sandbox = python_sandbox(cx, "jrpc", policy).await?;
     let output = run_python(&sandbox, JSONRPC_CLIENT, &[TEST_HOST, &port(&server)]).await?;
     let mut expected = Vec::new();
     for path in ["forward", "raw"] {
@@ -212,7 +211,7 @@ async fn jsonrpc_default_audit_mode_still_denies_response_frames(
         port = server.port,
         binaries = python_binaries_yaml(),
     ))?;
-    let sandbox = python_sandbox(cx, "jsonaudit", policy).await?;
+    let sandbox = python_sandbox(cx, "jaud", policy).await?;
     let output = run_python(&sandbox, JSONRPC_AUDIT_CLIENT, &[TEST_HOST, &port(&server)]).await?;
     expect_values(
         &json_result(&output)?,

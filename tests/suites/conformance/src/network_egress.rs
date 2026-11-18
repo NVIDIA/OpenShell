@@ -47,7 +47,7 @@ const PIPELINE_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 async fn policy_reload_denies_new_and_open_connections(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::serve(|_| Response::text("ok").keep_alive()).await?;
     let allowed = allow_server(server.port);
-    let sandbox = python_sandbox(cx, "reload", allowed.clone()).await?;
+    let sandbox = python_sandbox(cx, "reld", allowed.clone()).await?;
     policy::set(&sandbox, &allowed).await?;
 
     let port = server.port.to_string();
@@ -160,7 +160,7 @@ async fn tls_skip_relays_opaque_bytes(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::echo().await?;
     let mut policy = policy::base();
     allow(&mut policy, server.port).tls_skip();
-    let sandbox = python_sandbox(cx, "tlsskip", policy).await?;
+    let sandbox = python_sandbox(cx, "tlskp", policy).await?;
     let mut payload = vec![0x00, 0xff, 0x13, 0x37, 0x80, 0x0a];
     payload.extend_from_slice(b"not-http-or-tls");
     payload.extend(0..64_u8);
@@ -185,7 +185,7 @@ async fn middleware_redacts_request_bodies(cx: &mut Context) -> testkit::Result 
     })
     .await?;
     let policy = middleware_policy(server.port, "fail_closed", "")?;
-    let sandbox = python_sandbox(cx, "redact", policy).await?;
+    let sandbox = python_sandbox(cx, "redct", policy).await?;
     let output = run_python(
         &sandbox,
         REDACTION_CLIENT,
@@ -206,7 +206,7 @@ async fn middleware_redacts_request_bodies(cx: &mut Context) -> testkit::Result 
 async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::echo().await?;
     let policy = middleware_policy(server.port, "fail_closed", "")?;
-    let sandbox = python_sandbox(cx, "failclosed", policy).await?;
+    let sandbox = python_sandbox(cx, "fclos", policy).await?;
     run_python(
         &sandbox,
         UNINSPECTABLE_CLIENT,
@@ -239,7 +239,7 @@ async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -
 async fn fail_open_middleware_relays_uninspectable_traffic(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::echo().await?;
     let policy = middleware_policy(server.port, "fail_open", "        tls: skip\n")?;
-    let sandbox = python_sandbox(cx, "failopen", policy).await?;
+    let sandbox = python_sandbox(cx, "fopen", policy).await?;
     let mut payload = vec![0x00, 0xff, 0x13, 0x37, 0x80];
     payload.extend_from_slice(b"middleware-bypass");
     run_python(
@@ -264,7 +264,7 @@ async fn fail_open_middleware_relays_uninspectable_traffic(cx: &mut Context) -> 
 #[testkit::test]
 async fn pipelined_request_is_authorized_separately(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::reply_when_idle(PIPELINE_REPLY).await?;
-    let sandbox = python_sandbox(cx, "pipeline", rest_policy(server.port, "GET")?).await?;
+    let sandbox = python_sandbox(cx, "pipe", rest_policy(server.port, "GET")?).await?;
     let target = format!("{TEST_HOST}:{}", server.port);
     let requests = format!(
         "GET /allowed HTTP/1.1\r\nHost: {target}\r\nConnection: keep-alive\r\n\r\n\
@@ -287,7 +287,7 @@ async fn pipelined_request_is_authorized_separately(cx: &mut Context) -> testkit
 #[testkit::test]
 async fn chunked_pipelined_request_is_authorized_separately(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::reply_when_idle(PIPELINE_REPLY).await?;
-    let sandbox = python_sandbox(cx, "chunked", rest_policy(server.port, "POST")?).await?;
+    let sandbox = python_sandbox(cx, "chunk", rest_policy(server.port, "POST")?).await?;
     let target = format!("{TEST_HOST}:{}", server.port);
     let requests = format!(
         "POST /allowed HTTP/1.1\r\nHost: {target}\r\nTransfer-Encoding: chunked\r\n\

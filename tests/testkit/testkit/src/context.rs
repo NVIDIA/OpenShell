@@ -172,6 +172,9 @@ impl Context {
     }
 
     /// A resource name unique to this run: `test-<run-id>-<suffix>`.
+    ///
+    /// The gateway limits sandbox names to 19 characters, so a sandbox
+    /// suffix can have at most 5.
     pub fn name(&self, suffix: &str) -> String {
         format!("test-{}-{suffix}", self.run_id)
     }

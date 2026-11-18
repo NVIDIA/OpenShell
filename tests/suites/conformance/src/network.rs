@@ -28,7 +28,7 @@ const SOCKET_NOT_INHERITED: &str = include_str!("scripts/socket_not_inherited.py
 /// permission error well before the socket's 10-second timeout.
 #[testkit::test]
 async fn direct_connect_bypass_is_denied_promptly(cx: &mut Context) -> testkit::Result {
-    let sandbox = python_sandbox(cx, "bypass", policy::base()).await?;
+    let sandbox = python_sandbox(cx, "bypas", policy::base()).await?;
     let output = run_python(&sandbox, BYPASS_CLIENT, &[]).await?;
     let result = json_result(&output)?;
     testkit::ensure!(
@@ -65,7 +65,7 @@ async fn reserved_destinations_fail_with_eacces_even_when_allowed(
 "#,
         binaries = python_binaries_yaml(),
     ))?;
-    let sandbox = python_sandbox(cx, "denials", policy).await?;
+    let sandbox = python_sandbox(cx, "deny", policy).await?;
     let output = run_python(&sandbox, DESTINATION_DENIALS_CLIENT, &[]).await?;
     expect_values(
         &json_result(&output)?,
@@ -97,7 +97,7 @@ async fn localhost_is_reachable_without_proxy_environment(cx: &mut Context) -> t
 /// doesn't inherit the exited child's listener.
 #[testkit::test]
 async fn closed_or_exited_listener_releases_its_port(cx: &mut Context) -> testkit::Result {
-    let sandbox = python_sandbox(cx, "listen", policy::base()).await?;
+    let sandbox = python_sandbox(cx, "lsten", policy::base()).await?;
     let output = run_python(&sandbox, LISTENER_LIFETIME_PROBE, &[]).await?;
     let inode = json_result(&output)?[1].to_string();
     run_python(&sandbox, SOCKET_NOT_INHERITED, &[&inode])
@@ -111,7 +111,7 @@ async fn closed_or_exited_listener_releases_its_port(cx: &mut Context) -> testki
 #[testkit::test]
 async fn exec_does_not_inherit_main_process_socket(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("preconn")
+        .sandbox("prcon")
         .policy(policy::base())
         .image(testkit::python_image())
         .command(["python3", "-c", PRECONNECT_OWNER])

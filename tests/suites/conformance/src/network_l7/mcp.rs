@@ -31,7 +31,7 @@ async fn mcp_sessionless_discovery_tools_and_subscription(cx: &mut Context) -> t
 /// Each legacy revision: initialization, then an allowed and a denied tool.
 #[testkit::test]
 async fn mcp_legacy_revisions_authorize_tools(cx: &mut Context) -> testkit::Result {
-    for (suffix, version) in [("mcp0326", "2025-03-26"), ("mcp0618", "2025-06-18")] {
+    for (suffix, version) in [("m0326", "2025-03-26"), ("m0618", "2025-06-18")] {
         run_profile(cx, suffix, &[version]).await?;
     }
     Ok(())

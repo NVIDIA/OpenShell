@@ -34,7 +34,7 @@ const LOAD_TIMEOUT: Duration = Duration::from_mins(2);
 #[testkit::test]
 async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("polset")
+        .sandbox("pset")
         .policy(policy::base())
         .command(["sleep", "infinity"])
         .create_ready()
@@ -97,7 +97,7 @@ async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::R
 #[testkit::test]
 async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("polscope")
+        .sandbox("pscop")
         .policy(scoped_policy()?)
         .command(["sleep", "infinity"])
         .create_ready()
@@ -209,7 +209,7 @@ async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> t
 #[testkit::test]
 async fn sparse_initial_policy_revision_is_loaded(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .cli_sandbox("sparse")
+        .cli_sandbox("spars")
         .policy_yaml(SPARSE_POLICY)
         .command(["sleep", "infinity"])
         .create_ready()

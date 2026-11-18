@@ -234,7 +234,7 @@ async fn profile_rest_endpoint_rewrites_header_and_body(cx: &mut Context) -> tes
     let server = HttpRecorder::start("ok").await?;
     let sandbox = profile_endpoint_sandbox(
         cx,
-        "rewrite",
+        "rwrt",
         &format!(
             "{{host: {TEST_HOST}, port: {}, path: /probe, protocol: rest, access: full, \
              enforcement: enforce, request_body_credential_rewrite: true}}",
@@ -273,7 +273,7 @@ async fn profile_websocket_endpoint_rewrites_text_frames(cx: &mut Context) -> te
     let server = WebSocketRecorder::start().await?;
     let sandbox = profile_endpoint_sandbox(
         cx,
-        "wstext",
+        "wstxt",
         &format!(
             "{{host: {TEST_HOST}, port: {}, path: /ws, protocol: websocket, \
              enforcement: enforce, access: read-write, websocket_credential_rewrite: true}}",
@@ -339,9 +339,9 @@ async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit:
         endpoint(server_a.port),
         endpoint(server_b.port),
     ))?;
-    // The default image, like the e2e test this replaces, for its bash.
     let sandbox = cx
         .sandbox("bind")
+        .image(testkit::python_image())
         .policy(policy)
         .spec(|spec| spec.providers = vec![provider_a, provider_b])
         .command(["sleep", "infinity"])

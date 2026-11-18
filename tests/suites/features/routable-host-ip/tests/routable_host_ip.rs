@@ -30,7 +30,7 @@ async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Resul
     let explicit = HttpRecorder::start("explicit").await?;
     let implicit = HttpRecorder::start("implicit").await?;
     let sandbox = cx
-        .sandbox("hostip")
+        .sandbox("hstip")
         .policy(policy::base())
         .image(testkit::python_image())
         .command(["sleep", "infinity"])
