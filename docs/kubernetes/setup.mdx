@@ -38,7 +38,7 @@ Make sure the following are in place before you install.
 
 | Prerequisite | Required | Notes |
 |---|---|---|
-| Kubernetes 1.29+ with RBAC enabled | Yes | No additional notes. |
+| Kubernetes cluster with RBAC enabled | Yes | Minimum tested version is 1.33. Older cluster versions are untested. |
 | CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces | Yes | Verify enforcement on your cluster. |
 | Helm 3.x | Yes | No additional notes. |
 | Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |

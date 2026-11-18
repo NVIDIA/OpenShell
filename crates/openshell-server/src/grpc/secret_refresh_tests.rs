@@ -683,3 +683,48 @@ async fn a_reveal_only_secret_cannot_supply_refresh_material() {
         err.message()
     );
 }
+
+#[tokio::test]
+async fn basic_client_auth_accepts_a_client_secret_from_a_workspace_secret() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Basic Y2xpZW50LWlkOmJhc2ljLXNlY3JldA==",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "token-basic",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let token_url = format!("{}/token", server.uri());
+    let state = enabled_state().await;
+    import_profile(
+        &state,
+        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+        &token_url,
+    )
+    .await;
+    create_secret(&state, "basic-secret", &token_url).await;
+    let mut request = configure_request(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials);
+    request.material.insert(
+        "token_endpoint_auth_method".to_string(),
+        "client_secret_basic".to_string(),
+    );
+    configure(&state, request)
+        .await
+        .expect("a referenced client_secret satisfies Basic client authentication");
+
+    rotate(&state)
+        .await
+        .expect("mint with Basic client authentication");
+    let received = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&received[0].body);
+    assert!(
+        !body.contains("client_secret"),
+        "Basic keeps the secret out of the form: {body}"
+    );
+}

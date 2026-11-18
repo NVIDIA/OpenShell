@@ -8,7 +8,7 @@
 //! channel, endpoint, token, or replica id. The scrape target already identifies the replica.
 //!
 //! Metric handles bind to whichever recorder is current when a macro runs. `run_server`
-//! installs the Prometheus recorder after it builds `ServerState`, so never cache a handle in a
+//! installs the recorder after it builds `ServerState`, so never cache a handle in a
 //! static or in state built before [`install_global_recorder`]. [`GaugeSlot`] acquires its
 //! handle when the tracked object is created and releases it through the same handle, so a
 //! slot can never drive a series negative.
@@ -19,7 +19,11 @@ use metrics::{
     Gauge, Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
 };
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_util::layers::FanoutBuilder;
 use tonic::{Code, Status};
+
+mod otlp_recorder;
+pub use otlp_recorder::OtlpRecorder;
 
 // Gauges
 pub const SUPERVISOR_SESSIONS: &str = "openshell_server_supervisor_sessions";
@@ -247,10 +251,38 @@ pub fn configure_exporter(builder: PrometheusBuilder) -> Result<PrometheusBuilde
 /// once, from `run_server`. `mutation_lock_connections` is the `PostgreSQL` lock pool size,
 /// `None` on a backend without a lock pool.
 pub fn install_global_recorder(
+    prometheus: bool,
+    otlp: Option<OtlpRecorder>,
     relay: RelayCapacity,
     mutation_lock_connections: Option<u32>,
-) -> Result<PrometheusHandle, BuildError> {
-    let handle = configure_exporter(PrometheusBuilder::new())?.install_recorder()?;
+) -> anyhow::Result<Option<PrometheusHandle>> {
+    if !prometheus && otlp.is_none() {
+        return Ok(None);
+    }
+    let recorder = prometheus
+        .then(|| {
+            configure_exporter(PrometheusBuilder::new()).map(PrometheusBuilder::build_recorder)
+        })
+        .transpose()?;
+    let handle = recorder
+        .as_ref()
+        .map(metrics_exporter_prometheus::PrometheusRecorder::handle);
+    match (recorder, otlp) {
+        (Some(prometheus), Some(otlp)) => metrics::set_global_recorder(
+            FanoutBuilder::default()
+                .add_recorder(prometheus)
+                .add_recorder(otlp)
+                .build(),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?,
+        (Some(prometheus), None) => {
+            metrics::set_global_recorder(prometheus).map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+        (None, Some(otlp)) => {
+            metrics::set_global_recorder(otlp).map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+        (None, None) => unreachable!(),
+    }
     describe_and_initialize(relay, mutation_lock_connections);
     Ok(handle)
 }
@@ -854,6 +886,85 @@ mod tests {
         assert!(
             rendered.contains("openshell_server_relay_claim_duration_seconds_bucket{le=\"15\"}")
         );
+    }
+
+    #[test]
+    fn recorder_modes_preserve_gateway_metric_values() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ScopeMetrics};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        for (prometheus, otlp) in [(false, false), (true, false), (false, true), (true, true)] {
+            crate::test_environment::Environment::new().run(|| {
+                let exporter = InMemoryMetricExporter::default();
+                let provider = SdkMeterProvider::builder()
+                    .with_reader(PeriodicReader::builder(exporter.clone()).build())
+                    .build();
+                let recorder = otlp.then(|| OtlpRecorder::new(provider.meter("test")));
+                let handle = install_global_recorder(prometheus, recorder, RelayCapacity { per_replica: 256 }, None).unwrap();
+                let requests = counter!("openshell_server_grpc_requests_total", "method" => "ListSandboxes", "code" => "0");
+                requests.increment(2);
+                requests.absolute(3);
+                requests.absolute(2);
+                let pending = gauge!(RELAY_PENDING);
+                pending.set(4.0);
+                gauge!(RELAY_PENDING).increment(2.0);
+                pending.decrement(3.0);
+                histogram!(RELAY_CLAIM_DURATION_SECONDS).record(0.005);
+                let queue_wait_name = "openshell_supervisor_config_queue_wait_seconds";
+                histogram!(queue_wait_name).record(0.2);
+                assert_eq!(handle.is_some(), prometheus);
+                if let Some(handle) = handle {
+                    let rendered = handle.render();
+                    let request = rendered.lines().find(|line| line.starts_with("openshell_server_grpc_requests_total{")).unwrap();
+                    assert!(request.contains("method=\"ListSandboxes\""));
+                    assert!(request.contains("code=\"0\""));
+                    assert!(request.ends_with(" 3"), "{request}");
+                    assert!(rendered.contains("openshell_server_relay_pending 3"));
+                    assert!(rendered.contains("openshell_server_relay_claim_duration_seconds_count 1"));
+                    assert!(rendered.contains(&format!("# TYPE {queue_wait_name} summary")));
+                }
+                for _ in 0..2 {
+                    provider.force_flush().unwrap();
+                    let batches = exporter.get_finished_metrics().unwrap();
+                    if !otlp {
+                        assert!(batches.is_empty());
+                        continue;
+                    }
+                    let metrics: Vec<_> = batches.last().unwrap().scope_metrics()
+                        .flat_map(ScopeMetrics::metrics).collect();
+                    let counter = metrics.iter().find(|metric| metric.name() == "openshell_server_grpc_requests_total").unwrap();
+                    let AggregatedMetrics::U64(MetricData::Sum(sum)) = counter.data() else { panic!("expected counter") };
+                    assert!(sum.is_monotonic());
+                    assert_eq!(sum.data_points().next().unwrap().value(), 3);
+                    let gauge = metrics.iter().find(|metric| metric.name() == RELAY_PENDING).unwrap();
+                    assert_eq!(gauge.unit(), "1");
+                    let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = gauge.data() else { panic!("expected gauge") };
+                    assert!((gauge.data_points().next().unwrap().value() - 3.0).abs() < f64::EPSILON);
+                    let histogram = metrics.iter().find(|metric| metric.name() == RELAY_CLAIM_DURATION_SECONDS).unwrap();
+                    assert_eq!(histogram.unit(), "s");
+                    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = histogram.data() else { panic!("expected histogram") };
+                    let point = histogram.data_points().next().unwrap();
+                    assert_eq!(point.count(), 1);
+                    assert!((point.sum() - 0.005).abs() < f64::EPSILON);
+                    assert_eq!(point.bounds().collect::<Vec<_>>(), LATENCY_BUCKETS_SECONDS);
+
+                    let queue_wait = metrics
+                        .iter()
+                        .find(|metric| metric.name() == queue_wait_name)
+                        .unwrap();
+                    let AggregatedMetrics::F64(MetricData::Histogram(queue_wait)) = queue_wait.data()
+                    else {
+                        panic!("expected queue wait histogram");
+                    };
+                    let point = queue_wait.data_points().next().unwrap();
+                    assert_eq!(point.bounds().collect::<Vec<_>>(), LATENCY_BUCKETS_SECONDS);
+                }
+                provider.shutdown().unwrap();
+            });
+        }
     }
 
     #[test]

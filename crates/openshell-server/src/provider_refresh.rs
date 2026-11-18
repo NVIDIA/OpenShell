@@ -20,7 +20,7 @@ use openshell_core::proto::{
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 pub use openshell_credential_issuer::refresh::minter::{
     material_scopes, next_refresh_at_ms, parse_material_i64, refresh_strategy_name,
-    strategy_secret_material_keys,
+    strategy_secret_material_keys, validate_oauth_client_material,
 };
 use openshell_credential_issuer::refresh::{
     CredentialRefresh, RefreshCommitSink, RefreshRuntime, RefreshState, RefreshStateStore,

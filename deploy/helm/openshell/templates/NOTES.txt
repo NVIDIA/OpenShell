@@ -1,0 +1,22 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/ -}}
+{{- $broker := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_broker" | default dict -}}
+{{- if $broker }}
+SPIFFE Broker API (openshell.gateway.spiffe_broker) is enabled.
+The gateway uses mTLS with X.509-SVIDs from its CSI Workload API socket.
+Enable the experimental Broker endpoint on SPIRE, allowlist the gateway SPIFFE
+ID and KubernetesObjectReference over TCP, and configure enforced Kubernetes
+SubjectAccessReview authorization (impersonate-via-spire) for Sandbox resources.
+Registrations must match the attested Sandbox resource UID on every selected
+agent, for example through a cluster-scoped SPIRE node alias.
+{{- if hasKey $broker "node_local_port" }}
+The gateway connects directly to its node's Broker port using status.hostIP;
+no Broker Service is used. Expose the agent listener on that node address.
+Registrations must cover every node where a gateway replica may run.
+{{- end }}
+Use server_spiffe_id_prefix for agents in one attested cluster,
+or server_spiffe_id for one exact identity. The alias is a registration parent,
+not a replacement for the agent's certificate identity.
+{{- end }}

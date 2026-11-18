@@ -2588,6 +2588,13 @@ async fn handle_tcp_connection(
 /// Adapt a transparent application stream to the existing CONNECT pipeline.
 /// The synthetic CONNECT request is supervisor-owned and its successful 200
 /// response is consumed before bytes are returned to the workload.
+fn transparent_connect_authority(host: &str, port: u16) -> String {
+    host.parse::<IpAddr>().map_or_else(
+        |_| format!("{host}:{port}"),
+        |ip| SocketAddr::new(ip, port).to_string(),
+    )
+}
+
 fn virtual_connect_stream(
     workload: BoundaryDuplexStream,
     authority: String,
@@ -2682,7 +2689,7 @@ async fn handle_mediated_connection(
                     .map_or((None, None), |(decision, connector)| {
                         (Some(decision), Some(connector))
                     });
-                let authority = format!("{host}:{}", destination.port());
+                let authority = transparent_connect_authority(&host, destination.port());
                 client = tokio::io::BufReader::new(virtual_connect_stream(
                     client.into_inner(),
                     authority,
@@ -14588,6 +14595,18 @@ network_policies:
     }
 
     // -- parse_target: CONNECT target parser regression tests --
+
+    #[test]
+    fn transparent_connect_authority_round_trips_through_parse_target() {
+        for (host, port) in [
+            ("fd00:10:96::5", 8081),
+            ("10.96.0.5", 8081),
+            ("echo.svc", 8080),
+        ] {
+            let authority = transparent_connect_authority(host, port);
+            assert_eq!(parse_target(&authority).unwrap(), (host.to_string(), port));
+        }
+    }
 
     #[test]
     fn test_parse_target_valid_baseline() {
