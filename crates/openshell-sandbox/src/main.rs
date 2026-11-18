@@ -1499,10 +1499,10 @@ fn launch_privileged(args: &[String]) -> Result<()> {
         ));
     };
 
-    // Privileged qualification (reviewer B3a): assert uid 0 and that the
-    // boundary config carries the root-mode claim. The capability-free
-    // probe (zero caps, no_new_privs) is NOT run — it is the sandboxed
-    // path's invariant.
+    // Privileged qualification: assert uid 0. The capability-free probe
+    // (zero caps, no_new_privs) is NOT run — it is the trusted-boundary
+    // path's invariant; this boundary is the untrusted-guest (root-
+    // workload) class.
     let uid = nix::unistd::geteuid().as_raw();
     let gid = nix::unistd::getegid().as_raw();
     if uid != 0 || gid != 0 {
@@ -1517,15 +1517,9 @@ fn launch_privileged(args: &[String]) -> Result<()> {
         serde_json::from_slice(&config_bytes)
             .into_diagnostic()
             .wrap_err("decode boundary config")?;
-    let mode = config
-        .resource_claims
-        .get(openshell_sandbox::WORKLOAD_MODE_CLAIM)
-        .map(String::as_str);
-    if mode != Some(openshell_sandbox::PRIVILEGED_WORKLOAD_MODE) {
+    if !openshell_sandbox_backend::boundary_protocol::is_kubevirt_guest(&config.resource_claims) {
         return Err(miette::miette!(
-            "privileged launch requires the {:#?} claim to be {:?}, got {mode:?}",
-            openshell_sandbox::WORKLOAD_MODE_CLAIM,
-            openshell_sandbox::PRIVILEGED_WORKLOAD_MODE
+            "privileged launch is only for KubeVirt guests (kubevirt.generation claim)"
         ));
     }
 

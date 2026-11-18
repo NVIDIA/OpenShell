@@ -1742,12 +1742,6 @@ struct KubeVirtGeneration<'a> {
     /// The guest image the rendered VM actually boots (M6: claimed, not
     /// the configured string).
     boot_image: String,
-    /// The workload uid/gid the guest boundary runs as (0/0 in root mode,
-    /// the provisioned sandbox uid in sandboxed mode).
-    workload_uid: u32,
-    workload_gid: u32,
-    /// The workload mode, carried into the boundary claim.
-    workload_mode: crate::config::KubeVirtWorkloadMode,
 }
 
 impl KubernetesComputeDriver {
@@ -5047,8 +5041,6 @@ impl KubernetesComputeDriver {
         // covers them all (the fence, bootstrap Secret, and PVC are also
         // owner-referenced to the VM, so Kubernetes GC cascades them even
         // if the gateway dies mid-create).
-        let (workload_uid, workload_gid, workload_mode) =
-            crate::kubevirt::guest_workload_identity(&self.config);
         let mut created: Vec<crate::kubevirt::CreatedCompanion> = Vec::new();
         let generation = KubeVirtGeneration {
             sandbox,
@@ -5062,9 +5054,6 @@ impl KubernetesComputeDriver {
             log_level: &log_level,
             launch_authentication: &launch_authentication,
             boot_image: crate::kubevirt::kubevirt_boot_image(&vm),
-            workload_uid,
-            workload_gid,
-            workload_mode,
         };
         let supervisor_component = match self
             .provision_kubevirt_generation(&generation, &mut created)
@@ -5267,9 +5256,6 @@ impl KubernetesComputeDriver {
                 &fence_rv,
                 fence_spec,
                 &supervisor,
-                generation.workload_uid,
-                generation.workload_gid,
-                generation.workload_mode,
             )
             .map_err(KubernetesDriverError::Precondition)?
         };
@@ -6284,8 +6270,6 @@ impl KubernetesComputeDriver {
         // M6: the image identity claims the image the VM actually boots
         // (its kernelBoot containerDisk), not the configured string.
         let boot_image = crate::kubevirt::kubevirt_boot_image(&object);
-        let (workload_uid, workload_gid, workload_mode) =
-            crate::kubevirt::guest_workload_identity(&self.config);
         let bootstrap = crate::kubevirt_boundary::render_kubevirt_bootstrap(
             &authentication,
             sandbox_id,
@@ -6296,9 +6280,6 @@ impl KubernetesComputeDriver {
             &fence.resource_version,
             fence.spec,
             &supervisor,
-            workload_uid,
-            workload_gid,
-            workload_mode,
         )
         .map_err(KubernetesDriverError::Precondition)?;
 
@@ -6783,8 +6764,6 @@ impl KubernetesComputeDriver {
         // VM (runStrategy Halted, a trusted control-plane action) when a
         // root-mode sandbox reaches SupervisorFailed (which covers the
         // reset-detection path).
-        let halt_ended_root_workloads =
-            self.config.kubevirt.workload == crate::config::KubeVirtWorkloadMode::Root;
         tokio::spawn(async move {
             async fn emit(
                 vm: DynamicObject,
@@ -6792,7 +6771,6 @@ impl KubernetesComputeDriver {
                 vmi_phases: &std::collections::HashMap<String, (Option<String>, Option<i64>)>,
                 client: &Client,
                 tx: &mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
-                halt_ended_root_workloads: bool,
             ) -> bool {
                 let Some(kube_name) = vm.metadata.name.clone() else {
                     return true;
@@ -6822,7 +6800,7 @@ impl KubernetesComputeDriver {
                 // VMI — the P1/P2 reset-detection outcome). Already-halted
                 // VMs and terminal VM failures (the guest is dead) are
                 // skipped.
-                if halt_ended_root_workloads && supervisor_failure.is_some() {
+                if supervisor_failure.is_some() {
                     let halted = vm
                         .data
                         .get("spec")
@@ -6886,7 +6864,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     event = vm_stream.next() => match event {
                         Some(Event::Apply(obj) | Event::InitApply(obj)) => {
-                            if !emit(obj, &namespace, &vmi_phases, &watch_client, &tx, halt_ended_root_workloads).await {
+                            if !emit(obj, &namespace, &vmi_phases, &watch_client, &tx).await {
                                 break;
                             }
                         }
@@ -6948,7 +6926,7 @@ impl KubernetesComputeDriver {
                                 if let Ok(vm) =
                                     tokio::time::timeout(KUBE_API_TIMEOUT, vm_api.get(&name)).await
                                     && let Ok(vm) = vm
-                                    && !emit(vm, &namespace, &vmi_phases, &watch_client, &tx, halt_ended_root_workloads).await
+                                    && !emit(vm, &namespace, &vmi_phases, &watch_client, &tx).await
                                 {
                                     break;
                                 }
@@ -7016,7 +6994,7 @@ impl KubernetesComputeDriver {
                                     &vmi_phases,
                                     &watch_client,
                                     &tx,
-                                    halt_ended_root_workloads,
+
                                 )
                                 .await
                                 {

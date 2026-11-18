@@ -495,24 +495,6 @@ const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
 pub const KUBEVIRT_WORKLOAD_UID: u32 = 10001;
 pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
 
-/// The workload identity and mode claim for a config: root mode runs as
-/// uid/gid 0 with the "root" mode claim; the sandboxed default keeps the
-/// provisioned sandbox uid/gid with the "sandboxed" claim.
-pub fn guest_workload_identity(
-    config: &KubernetesComputeConfig,
-) -> (u32, u32, crate::config::KubeVirtWorkloadMode) {
-    match config.kubevirt.workload {
-        crate::config::KubeVirtWorkloadMode::Root => {
-            (0, 0, crate::config::KubeVirtWorkloadMode::Root)
-        }
-        crate::config::KubeVirtWorkloadMode::Sandboxed => (
-            KUBEVIRT_WORKLOAD_UID,
-            KUBEVIRT_WORKLOAD_GID,
-            crate::config::KubeVirtWorkloadMode::Sandboxed,
-        ),
-    }
-}
-
 /// Set on the `VirtualMachine` while the driver's create still holds it
 /// `Halted` (the W6 window between capturing the VM's UID and patching
 /// `runStrategy` to `Once`). A `Halted` VM with this annotation maps to a
@@ -952,7 +934,6 @@ mod tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
-                workload: crate::config::KubeVirtWorkloadMode::default(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1339,7 +1320,6 @@ mod kubevirt_review_tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
-                workload: crate::config::KubeVirtWorkloadMode::default(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1809,9 +1789,7 @@ mod kubevirt_review_tests {
         ];
         assert_eq!(
             guest_image_digest(&pod(&launcher_statuses, &spec), GUEST),
-            GuestImageDigest::Patch(
-                "docker.io/openshell/sandbox-vm@sha256:5a58c279".to_string()
-            )
+            GuestImageDigest::Patch("docker.io/openshell/sandbox-vm@sha256:5a58c279".to_string())
         );
         // The node knows the same digest under ANOTHER name (a side-loaded
         // copy of the registry tag): the status .image disagrees with the
@@ -1864,11 +1842,7 @@ mod kubevirt_review_tests {
             guest_image_digest(&Pod::default(), GUEST),
             GuestImageDigest::Absent
         );
-        let empty = [(
-            "volumerootdisk",
-            "docker.io/openshell/sandbox-vm:test",
-            "",
-        )];
+        let empty = [("volumerootdisk", "docker.io/openshell/sandbox-vm:test", "")];
         assert_eq!(
             guest_image_digest(&pod(&empty, &spec), GUEST),
             GuestImageDigest::Absent
@@ -2033,9 +2007,15 @@ mod kubevirt_review_tests {
         assert!(ready.message.contains("image pull"));
 
         // No timestamp: the rule cannot fire (timing fails open).
-        let (_, sbx) =
-            sandbox_from_vm_object_with_runtime("openshell-e2e-ns", stale(), None, None, None, None)
-                .expect("converts");
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "openshell-e2e-ns",
+            stale(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("converts");
         let ready = sbx.status.unwrap().conditions[0].clone();
         assert_eq!(ready.reason, REASON_VM_NOT_READY);
     }
@@ -2067,8 +2047,8 @@ mod kubevirt_review_tests {
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
 
         // Without the VMI phase the not-ready VM stays transient (Starting).
-        let (_, sbx) =
-            sandbox_from_vm_object_with_vmi("openshell-e2e-ns", vm.clone(), None).expect("converts");
+        let (_, sbx) = sandbox_from_vm_object_with_vmi("openshell-e2e-ns", vm.clone(), None)
+            .expect("converts");
         let ready = sbx.status.unwrap().conditions[0].clone();
         assert_eq!(ready.reason, "Starting");
 
@@ -2100,39 +2080,25 @@ mod kubevirt_review_tests {
             err.contains("grpc_endpoint"),
             "message should name the key: {err}"
         );
-        // The shared topology's guest never learns the gateway endpoint
-        // (the boundary resolves the shared supervisor's Service through
-        // the API), so grpc_endpoint is neither required nor restricted.
-        let mut cfg = review_config();
-        cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
-        cfg.grpc_endpoint = String::new();
-        assert!(cfg.validate_kubevirt_config().is_ok());
     }
 
     #[test]
-    fn root_workload_mode_requires_dedicated_supervisor() {
-        // The privileged root-workload class requires the dedicated
-        // supervisor: a shared supervisor would let a parser bug reached
-        // by a hostile root guest cross tenants.
+    fn kubevirt_runtime_requires_dedicated_supervisor() {
+        // Every KubeVirt guest is the untrusted root class, so the runtime
+        // requires the dedicated supervisor: a shared supervisor would let
+        // a parser bug reached by a hostile root guest cross tenants.
         let mut cfg = review_config();
-        cfg.kubevirt.workload = crate::config::KubeVirtWorkloadMode::Root;
         cfg.shared_supervisor = None;
         assert!(cfg.validate_kubevirt_config().is_ok());
 
         cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
         let err = cfg
             .validate_kubevirt_config()
-            .expect_err("root + gateway topology is refused");
+            .expect_err("kubevirt + gateway topology is refused");
         assert!(
             err.contains("requires the dedicated supervisor topology"),
             "message should name the requirement: {err}"
         );
-
-        // The sandboxed default is fine with either topology.
-        let mut cfg = review_config();
-        cfg.kubevirt.workload = crate::config::KubeVirtWorkloadMode::Sandboxed;
-        cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
-        assert!(cfg.validate_kubevirt_config().is_ok());
     }
 
     #[test]

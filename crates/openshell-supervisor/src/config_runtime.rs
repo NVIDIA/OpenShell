@@ -444,7 +444,7 @@ impl ConfigRuntime {
                     connector: &ctx.middleware_connector,
                 },
                 ctx.vm_identity,
-                ctx.privileged_workload,
+                ctx.untrusted_guest,
                 || {
                     if let Some(prepared) = prepared_provider.as_ref() {
                         ctx.provider_credentials
@@ -776,9 +776,7 @@ impl ConfigRuntime {
                 });
             }
         };
-        if ctx.privileged_workload
-            && (!provider.files.is_empty() || !provider.environment.is_empty())
-        {
+        if ctx.untrusted_guest && (!provider.files.is_empty() || !provider.environment.is_empty()) {
             // Nothing secret enters the guest: provider material fetched by
             // polling is refused supervisor-side for a root workload,
             // mirroring startup and session-delivered updates. An entirely
@@ -1138,7 +1136,7 @@ impl ConfigRuntime {
                     )
                 }
                 Ok(provider)
-                    if ctx.privileged_workload
+                    if ctx.untrusted_guest
                         && (!provider.files.is_empty() || !provider.environment.is_empty()) =>
                 {
                     // Nothing secret enters the guest: mid-session provider
@@ -2633,7 +2631,7 @@ mod tests {
             },
             default_middleware_connector(),
         );
-        ctx.privileged_workload = true;
+        ctx.untrusted_guest = true;
         let (client, _polls, _reports) = scripted_policy_gateway();
         let mut runtime = started_runtime(&ctx, &initial);
 
@@ -2895,7 +2893,7 @@ mod tests {
             opa_engine,
             loaded_policy_origin,
             vm_identity: None,
-            privileged_workload: false,
+            untrusted_guest: false,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),

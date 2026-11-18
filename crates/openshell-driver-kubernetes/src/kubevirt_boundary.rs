@@ -60,11 +60,6 @@ pub const CLAIM_VM_UID: &str = "kubevirt.vm_uid";
 pub const CLAIM_GENERATION: &str =
     openshell_sandbox_backend::boundary_protocol::KUBEVIRT_GENERATION_CLAIM;
 pub const CLAIM_IMAGE_IDENTITY: &str = "kubevirt.image_identity";
-/// How the guest workload runs, claimed in both the boundary config and
-/// the descriptor so the supervisor's confirm refuses a mode mismatch
-/// (a sandboxed guest presenting a root config, or the reverse).
-pub const CLAIM_WORKLOAD_MODE: &str = "kubevirt.workload_mode";
-
 /// The dedicated supervisor Pod's UID, claimed only in the dedicated
 /// topology (mirrors the pod path's `kubernetes.supervisor_pod_uid`).
 pub const CLAIM_SUPERVISOR_POD_UID: &str = "kubevirt.supervisor_pod_uid";
@@ -227,8 +222,6 @@ pub struct KubeVirtBoundarySpec {
     pub supervisor_tls: SandboxTlsClientConfig,
     /// The workload identity (uid/gid) the boundary runs as.
     pub workload_identity: ResolvedWorkloadIdentity,
-    /// The workload mode ("root" | "sandboxed") — claimed and confirmed.
-    pub workload_mode: crate::config::KubeVirtWorkloadMode,
     /// Environment the boundary passes to workload children.
     pub child_env: HashMap<String, String>,
 }
@@ -250,10 +243,6 @@ impl KubeVirtBoundarySpec {
             (
                 CLAIM_IMAGE_IDENTITY.to_string(),
                 self.image_identity.clone(),
-            ),
-            (
-                CLAIM_WORKLOAD_MODE.to_string(),
-                self.workload_mode.to_string(),
             ),
         ]);
         // The dedicated topology claims the supervisor Pod's UID (mirroring
@@ -426,7 +415,6 @@ mod tests {
             }],
             vm_uid: "vm-uid-1".to_string(),
             image_identity: "openshell/sandbox-vm:test".to_string(),
-            workload_mode: crate::config::KubeVirtWorkloadMode::Sandboxed,
             network_policy_uid: "np-uid-1".to_string(),
             network_policy_resource_version: "1945".to_string(),
             supervisor,
@@ -434,10 +422,7 @@ mod tests {
                 server_name: "boundary.sandbox.openshell".to_string(),
                 trust_anchor_pem: "test-ca".to_string(),
             },
-            workload_identity: ResolvedWorkloadIdentity::new(
-                10001,
-                10001,
-                Vec::new(),
+            workload_identity: ResolvedWorkloadIdentity::new_privileged(
                 "kubevirt-config".to_string(),
                 format!("sandbox:{}", "vm-uid-1"),
             )
@@ -546,10 +531,7 @@ mod tests {
         let original = spec().provision().expect("provision");
         let mut replaced = spec();
         replaced.vm_uid = "vm-uid-2".to_string();
-        replaced.workload_identity = ResolvedWorkloadIdentity::new(
-            10001,
-            10001,
-            Vec::new(),
+        replaced.workload_identity = ResolvedWorkloadIdentity::new_privileged(
             "kubevirt-config".to_string(),
             "sandbox:vm-uid-2".to_string(),
         )
@@ -625,11 +607,10 @@ mod tests {
     }
 
     #[test]
-    fn root_mode_bootstrap_renders_with_uid_zero_identity() {
-        // B1: the root workload class must render a bootstrap end to end.
+    fn bootstrap_renders_with_uid_zero_identity() {
+        // B1: the untrusted-guest class must render a bootstrap end to end.
         // The standard ResolvedWorkloadIdentity::new refuses UID/GID zero,
-        // so the privileged constructor is used; the identity and the mode
-        // claim are checked.
+        // so the privileged constructor is used.
         let auth = payload_tests::test_launch_authentication();
         let target = shared_target();
         let bootstrap = render_kubevirt_bootstrap(
@@ -642,50 +623,20 @@ mod tests {
             "1945",
             serde_json::json!({}),
             &target,
-            0,
-            0,
-            crate::config::KubeVirtWorkloadMode::Root,
         )
-        .expect("root-mode bootstrap renders");
-        // The descriptor carries the mode claim and the uid-0 identity.
-        assert_eq!(
-            bootstrap.runtime_descriptor.resource_claims[CLAIM_WORKLOAD_MODE],
-            "root"
+        .expect("untrusted-guest bootstrap renders");
+        // The descriptor carries the kubevirt guest claim and the uid-0
+        // identity.
+        assert!(
+            bootstrap
+                .runtime_descriptor
+                .resource_claims
+                .contains_key(CLAIM_GENERATION),
+            "the kubevirt generation claim marks the guest class"
         );
         let identity = &bootstrap.runtime_descriptor.workload_identity;
-        assert_eq!(identity.uid, 0, "root mode runs as uid 0");
-        assert_eq!(identity.gid, 0, "root mode runs as gid 0");
-    }
-
-    #[test]
-    fn workload_mode_claim_is_in_both_config_and_descriptor() {
-        // The mode claim binds the sandbox class into the confirmed
-        // evidence: the supervisor's descriptor check refuses a mode
-        // mismatch in either direction.
-        let provisioned = spec_with(shared_target()).provision().expect("provision");
-        assert_eq!(
-            provisioned.boundary_config.resource_claims[CLAIM_WORKLOAD_MODE],
-            "sandboxed"
-        );
-        assert_eq!(
-            provisioned.runtime_descriptor.resource_claims[CLAIM_WORKLOAD_MODE],
-            "sandboxed"
-        );
-        // A root-mode config never matches a sandboxed descriptor.
-        let mut root_spec = spec_with(shared_target());
-        root_spec.workload_mode = crate::config::KubeVirtWorkloadMode::Root;
-        let root = root_spec.provision().expect("provision");
-        assert_eq!(
-            root.boundary_config.resource_claims[CLAIM_WORKLOAD_MODE],
-            "root"
-        );
-        assert!(
-            !openshell_sandbox_backend::boundary_protocol::descriptor_matches_config(
-                &root.runtime_descriptor,
-                &provisioned.boundary_config
-            ),
-            "a root descriptor must not match a sandboxed config"
-        );
+        assert_eq!(identity.uid, 0, "the guest workload runs as uid 0");
+        assert_eq!(identity.gid, 0, "the guest workload runs as gid 0");
     }
 
     #[test]
@@ -1510,9 +1461,6 @@ mod payload_tests {
             "1945",
             serde_json::json!({}),
             &target,
-            10001,
-            10001,
-            crate::config::KubeVirtWorkloadMode::Sandboxed,
         )
         .expect("render");
         let decoded = bootstrap
@@ -1572,9 +1520,6 @@ mod payload_tests {
             "1945",
             serde_json::json!({}),
             &target,
-            10001,
-            10001,
-            crate::config::KubeVirtWorkloadMode::Sandboxed,
         )
         .expect("render");
 
@@ -1659,31 +1604,18 @@ pub fn render_kubevirt_bootstrap(
     fence_resource_version: &str,
     fence_spec: serde_json::Value,
     target: &KubeVirtSupervisorTarget,
-    workload_uid: u32,
-    workload_gid: u32,
-    workload_mode: crate::config::KubeVirtWorkloadMode,
 ) -> Result<KubeVirtBootstrap, String> {
     let launch_inputs = boundary_launch_inputs(launch_authentication)
         .map_err(|error| format!("boundary launch inputs: {error}"))?;
 
-    let workload_identity = if workload_mode == crate::config::KubeVirtWorkloadMode::Root {
-        // The privileged VM class runs the workload as root by design
-        // (kernel separation is the boundary); the standard constructor
-        // refuses UID/GID zero, which is the right invariant for every
-        // other workload.
-        ResolvedWorkloadIdentity::new_privileged(
-            "kubevirt-config".to_string(),
-            format!("sandbox:{vm_uid}"),
-        )
-    } else {
-        ResolvedWorkloadIdentity::new(
-            workload_uid,
-            workload_gid,
-            Vec::new(),
-            "kubevirt-config".to_string(),
-            format!("sandbox:{vm_uid}"),
-        )
-    }
+    // Every KubeVirt guest runs its workload as root by design (kernel
+    // separation is the boundary); the standard constructor refuses
+    // UID/GID zero, which is the right invariant for every other
+    // workload.
+    let workload_identity = ResolvedWorkloadIdentity::new_privileged(
+        "kubevirt-config".to_string(),
+        format!("sandbox:{vm_uid}"),
+    )
     .map_err(|error| format!("workload identity: {error}"))?;
 
     let spec = KubeVirtBoundarySpec {
@@ -1699,7 +1631,6 @@ pub fn render_kubevirt_bootstrap(
         verification_keys: launch_inputs.verification_keys,
         vm_uid: vm_uid.to_string(),
         image_identity: guest_image.to_string(),
-        workload_mode,
         network_policy_uid: fence_uid.to_string(),
         network_policy_resource_version: fence_resource_version.to_string(),
         // The supervisor target carries the topology: the per-sandbox

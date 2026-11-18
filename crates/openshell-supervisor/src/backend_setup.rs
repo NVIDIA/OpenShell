@@ -28,11 +28,13 @@ pub struct LaunchIdentity {
     pub workload_identity: ResolvedWorkloadIdentity,
     /// Preserve driver-fixed VM selectors during shared startup and reload.
     pub vm_policy_identity: Option<super::VmPolicyIdentity>,
-    /// Whether the trusted launch descriptor selects the privileged
-    /// (root-workload) mode. Keyed off the descriptor's resource claims,
-    /// never boundary reports: the mode gates supervisor-side policy
-    /// validation and provider-material refusal.
-    pub privileged_workload: bool,
+    /// Whether the trusted launch descriptor marks the boundary as an
+    /// untrusted `KubeVirt` guest. Keyed off the descriptor's resource
+    /// claims, never boundary reports: the class gates supervisor-side
+    /// policy validation and provider-material refusal. Every `KubeVirt`
+    /// guest is this class; the guest (including its boundary) is
+    /// untrusted, and the security boundary is outside it.
+    pub untrusted_guest: bool,
 }
 
 /// Runtime state remains owned by the supervisor.
@@ -161,10 +163,10 @@ impl SelectedBackend {
         self.identity.vm_policy_identity
     }
 
-    /// Whether the trusted launch descriptor selects the privileged
-    /// (root-workload) mode, for supervisor-side policy validation.
-    pub fn privileged_workload(&self) -> bool {
-        self.identity.privileged_workload
+    /// Whether the trusted launch descriptor marks an untrusted guest,
+    /// for supervisor-side policy validation.
+    pub fn untrusted_guest(&self) -> bool {
+        self.identity.untrusted_guest
     }
 
     /// Delegate image discovery only after shared name and identity checks.
@@ -248,10 +250,9 @@ impl BackendSetup for OpenShellBackendSetup {
                 uid: descriptor.workload_identity.uid,
                 gid: descriptor.workload_identity.gid,
             }),
-            privileged_workload:
-                openshell_sandbox_backend::boundary_protocol::is_privileged_workload(
-                    &descriptor.resource_claims,
-                ),
+            untrusted_guest: openshell_sandbox_backend::boundary_protocol::is_kubevirt_guest(
+                &descriptor.resource_claims,
+            ),
         };
         let transport = openshell_sandbox_backend::BoundaryTransport::for_descriptor(&descriptor)?;
         Ok((
@@ -308,10 +309,9 @@ impl BackendSetup for RoutedBackendSetup {
             session_id: descriptor.session_id,
             workload_identity: descriptor.workload_identity.clone(),
             vm_policy_identity: None,
-            privileged_workload:
-                openshell_sandbox_backend::boundary_protocol::is_privileged_workload(
-                    &descriptor.resource_claims,
-                ),
+            untrusted_guest: openshell_sandbox_backend::boundary_protocol::is_kubevirt_guest(
+                &descriptor.resource_claims,
+            ),
         };
         Ok((
             identity,

@@ -663,17 +663,15 @@ pub fn validate_runtime_coordinates(
         ));
     }
     let identity = &runtime_descriptor.workload_identity;
-    // The privileged (root-workload) mode uses a uid-0 identity by design;
-    // the standard constructor refuses it, so the mode claim (present in
-    // the descriptor's resource_claims) decides which constructor
-    // normalizes — and an unknown mode fails closed (the standard
-    // constructor refuses uid 0).
-    let privileged_mode = runtime_descriptor
-        .resource_claims
-        .get("kubevirt.workload_mode")
-        .map(String::as_str)
-        == Some("root");
-    let normalized = if privileged_mode {
+    // A `KubeVirt` guest runs its workload as root by design, so its
+    // identity uses the privileged constructor (uid 0, gid 0, no
+    // supplementary groups). The class is read from the descriptor's
+    // resource claims (`kubevirt.generation`); everything else —
+    // including libkrun VM guests — keeps the standard constructor,
+    // which refuses uid 0 and fails closed.
+    let untrusted_guest =
+        crate::boundary_protocol::is_kubevirt_guest(&runtime_descriptor.resource_claims);
+    let normalized = if untrusted_guest {
         ResolvedWorkloadIdentity::new_privileged(
             identity.source.clone(),
             identity.resource_digest.clone(),
@@ -823,19 +821,20 @@ impl BoundBoundary {
             ));
         }
         if self.client.backend_name == crate::BACKEND_NAME {
-            // The per-mode evidence check (item 3): the workload mode comes
+            // The per-class evidence check (item 3): the guest class comes
             // from the trusted launch descriptor's resource_claims, never
-            // from the boundary's own report. The sandboxed path requires
-            // the full capability-free posture; the privileged (root) path
-            // requires only what is still meaningful (kernel release and
-            // architecture), because the boundary honestly reports no
-            // seccomp/Landlock evidence in that mode.
-            let privileged = self
-                .resource_claims
-                .get("kubevirt.workload_mode")
-                .map(String::as_str)
-                == Some("root");
-            crate::audit::validate_native_linux_audit(&confirmation.backend_audit, privileged)?;
+            // from the boundary's own report. A trusted boundary (container
+            // or libkrun VM) requires the full capability-free posture; an
+            // untrusted KubeVirt guest requires only what is still
+            // meaningful (kernel release and architecture), because the
+            // boundary honestly reports no seccomp/Landlock evidence for
+            // that class.
+            let untrusted_guest =
+                crate::boundary_protocol::is_kubevirt_guest(&self.resource_claims);
+            crate::audit::validate_native_linux_audit(
+                &confirmation.backend_audit,
+                untrusted_guest,
+            )?;
         }
         let client = self.client.clone();
         // Adopt from a snapshot taken after the promotion: the replaced owner

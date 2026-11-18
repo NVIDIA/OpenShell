@@ -160,14 +160,15 @@ impl NativeLinuxSandboxAuditEvidence {
         }
     }
 
-    /// Validate the privileged (root-workload) evidence: only what is
-    /// still meaningful for a root workload. The boundary honestly
-    /// reports no seccomp/Landlock/`no_new_privs` evidence because none
-    /// are enforced in that mode — the security boundary is outside the
+    /// Validate the evidence an untrusted guest reports: only what is
+    /// still meaningful. The boundary honestly reports no
+    /// seccomp/Landlock/`no_new_privs` evidence because none are enforced
+    /// for an untrusted guest — the security boundary is outside the
     /// guest. The kernel release and architecture must still be present
     /// (the boundary measured them from the host kernel). Everything
-    /// the guest reports after start is advisory.
-    pub fn validate_privileged(&self) -> Result<(), BackendError> {
+    /// the guest reports after start is advisory and is never treated as
+    /// proof of enforcement.
+    pub fn validate_untrusted_guest(&self) -> Result<(), BackendError> {
         let present = !self.native_architecture.is_empty() && !self.kernel_release.is_empty();
         if present {
             Ok(())
@@ -2027,15 +2028,6 @@ pub const VM_GENERATION_CLAIM: &str = "vm.generation";
 /// the Kubernetes driver's kubevirt runtime).
 pub const KUBEVIRT_GENERATION_CLAIM: &str = "kubevirt.generation";
 
-/// Resource claim key carrying the `KubeVirt` workload mode: the boundary
-/// runs the workload as an unprivileged sandboxed user or as root.
-pub const WORKLOAD_MODE_CLAIM: &str = "kubevirt.workload_mode";
-
-/// Claim value selecting the privileged (root-workload) mode: the workload
-/// runs as root in the guest and in-guest enforcement (Landlock, seccomp,
-/// identity) is demoted by design.
-pub const PRIVILEGED_WORKLOAD_MODE: &str = "root";
-
 /// Whether the boundary's resource claims mark it as a VM guest (libkrun or
 /// `KubeVirt`).
 ///
@@ -2047,16 +2039,18 @@ pub fn is_vm_guest(resource_claims: &std::collections::BTreeMap<String, String>)
         || resource_claims.contains_key(KUBEVIRT_GENERATION_CLAIM)
 }
 
-/// Whether the trusted launch descriptor's resource claims select the
-/// privileged (root-workload) mode.
+/// Whether the trusted launch descriptor's resource claims mark the
+/// boundary as an untrusted `KubeVirt` guest.
 ///
-/// The mode is read only from the TRUSTED descriptor claims, never from
-/// boundary reports: a sandboxed boundary cannot dodge supervisor-side
-/// policy validation by claiming the privileged mode.
-pub fn is_privileged_workload(
-    resource_claims: &std::collections::BTreeMap<String, String>,
-) -> bool {
-    resource_claims.get(WORKLOAD_MODE_CLAIM).map(String::as_str) == Some(PRIVILEGED_WORKLOAD_MODE)
+/// Every `KubeVirt` guest runs its workload as root and its in-guest
+/// boundary is untrusted: the guest, including the boundary program, is
+/// untrusted as soon as a workload executes, so the supervisor must not
+/// trust boundary reports (image policy, binary identity, enforcement
+/// evidence) from it. The claim is read only from the TRUSTED descriptor,
+/// never from boundary reports. libkrun VM guests (`vm.generation`) keep
+/// the trusted-boundary model.
+pub fn is_kubevirt_guest(resource_claims: &std::collections::BTreeMap<String, String>) -> bool {
+    resource_claims.contains_key(KUBEVIRT_GENERATION_CLAIM)
 }
 
 #[cfg(test)]
@@ -2072,35 +2066,13 @@ mod vm_guest_tests {
     }
 
     #[test]
-    fn is_privileged_workload_requires_root_claim() {
-        assert!(is_privileged_workload(&claims(&[(
-            "kubevirt.workload_mode",
-            "root"
-        )])));
-    }
-
-    #[test]
-    fn is_privileged_workload_rejects_sandboxed_mode() {
-        assert!(!is_privileged_workload(&claims(&[(
-            "kubevirt.workload_mode",
-            "sandboxed"
-        )])));
-    }
-
-    #[test]
-    fn is_privileged_workload_rejects_absent_or_unknown_claims() {
-        // Fail closed: absent, empty, or unknown mode claims are NOT
-        // privileged — a missing claim must not weaken validation.
-        assert!(!is_privileged_workload(&claims(&[])));
-        assert!(!is_privileged_workload(&claims(&[(
-            "kubevirt.workload_mode",
-            ""
-        )])));
-        assert!(!is_privileged_workload(&claims(&[(
-            "kubevirt.workload_mode",
-            "privileged"
-        )])));
-        assert!(!is_privileged_workload(&claims(&[("other.claim", "root")])));
+    fn is_kubevirt_guest_keys_on_the_generation_claim() {
+        // Fail closed: only the kubevirt generation claim marks the
+        // untrusted guest class; libkrun guests and unmarked boundaries
+        // keep the trusted-boundary model.
+        assert!(is_kubevirt_guest(&claims(&[("kubevirt.generation", "g1")])));
+        assert!(!is_kubevirt_guest(&claims(&[("vm.generation", "g1")])));
+        assert!(!is_kubevirt_guest(&claims(&[])));
     }
 
     #[test]

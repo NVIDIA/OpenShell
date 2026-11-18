@@ -47,13 +47,6 @@ pub mod sftp;
 /// Results of actively qualifying the admitted workload runtime.
 ///
 /// Produced before the sandbox consumes protected bootstrap material.
-/// The workload-mode resource claim key, shared with the Kubernetes
-/// driver's boundary spec (`kubevirt.workload_mode`).
-pub const WORKLOAD_MODE_CLAIM: &str = "kubevirt.workload_mode";
-/// The claim value for the privileged (root-workload) VM class.
-pub const PRIVILEGED_WORKLOAD_MODE: &str = "root";
-/// The claim value for the sandboxed (default) class.
-pub const SANDBOXED_WORKLOAD_MODE: &str = "sandboxed";
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]

@@ -255,7 +255,7 @@ impl BackendSetup for TestSetup {
                 session_id: self.auth.session_id,
                 workload_identity: identity(),
                 vm_policy_identity: None,
-                privileged_workload: false,
+                untrusted_guest: false,
             },
             Box::new(TestLaunch {
                 name: self.built_name,

@@ -174,7 +174,7 @@ pub async fn run_ssh_server(
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     host_key: PrivateKey,
-    privileged_mode: bool,
+    untrusted_guest: bool,
 ) -> Result<()> {
     let (listener, config, _ca_paths) =
         match ssh_server_init(&listen_path, &ca_file_paths, shared_socket, host_key) {
@@ -215,7 +215,7 @@ pub async fn run_ssh_server(
                         main_session,
                         server_endpoint.clone(),
                         SSH_PEER_TIMEOUT,
-                        privileged_mode,
+                        untrusted_guest,
                     )
                     .await
                     {
@@ -360,7 +360,7 @@ async fn handle_connection(
     main_session: Option<Arc<MainSession>>,
     server_endpoint: Arc<openshell_ocsf::Endpoint>,
     peer_timeout: Duration,
-    privileged_mode: bool,
+    untrusted_guest: bool,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -382,7 +382,7 @@ async fn handle_connection(
         boundary_exec,
         main_session,
         server_endpoint,
-        privileged_mode,
+        untrusted_guest,
     );
     let stream = peer_stream::PeerStream::new(stream, peer_timeout);
     russh::server::run_stream(config, stream, handler)
@@ -456,7 +456,7 @@ struct SshHandler {
     /// Whether the sandbox runs the privileged (root-workload) mode: the
     /// boundary is untrusted after start, so exec exit codes it reports are
     /// guest-sourced data.
-    privileged_mode: bool,
+    untrusted_guest: bool,
 }
 
 impl Drop for SshHandler {
@@ -484,7 +484,7 @@ impl SshHandler {
         boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
         main_session: Option<Arc<MainSession>>,
         server_endpoint: Arc<openshell_ocsf::Endpoint>,
-        privileged_mode: bool,
+        untrusted_guest: bool,
     ) -> Self {
         Self {
             port_forward,
@@ -492,7 +492,7 @@ impl SshHandler {
             main_session,
             server_endpoint,
             channels: HashMap::new(),
-            privileged_mode,
+            untrusted_guest,
         }
     }
 }
@@ -1385,7 +1385,7 @@ impl SshHandler {
         } else {
             spec.program.clone()
         };
-        let privileged_mode = self.privileged_mode;
+        let untrusted_guest = self.untrusted_guest;
 
         let mut exec = self
             .boundary_exec
@@ -1502,7 +1502,7 @@ impl SshHandler {
             // workload process lifecycle); in root mode the boundary is
             // untrusted after start, so the event is marked guest-sourced.
             let process = openshell_ocsf::Process::new(&program_name, 0);
-            if privileged_mode {
+            if untrusted_guest {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Close)

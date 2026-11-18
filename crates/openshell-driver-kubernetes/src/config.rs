@@ -187,44 +187,6 @@ impl std::fmt::Display for KubernetesRuntimeMode {
 
 /// How the guest workload runs.
 ///
-/// The sandboxed default (unprivileged, Landlock + seccomp enforced by
-/// the in-guest boundary) or the privileged "root VM" class (root
-/// workload, no in-guest enforcement — the boundary is demoted to an
-/// authenticated agent; the fence, the supervisor's policy, and per-boot
-/// trusted code are the boundary). The privileged class requires the
-/// dedicated supervisor topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum KubeVirtWorkloadMode {
-    /// The default: the workload runs as the provisioned sandbox uid with
-    /// Landlock and seccomp enforced by the in-guest boundary.
-    #[default]
-    Sandboxed,
-    /// The privileged VM class: the workload runs as root, in-guest
-    /// enforcement is removed (the boundary becomes an authenticated
-    /// agent), and the security boundary is everything outside the guest.
-    Root,
-}
-
-impl std::fmt::Display for KubeVirtWorkloadMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Sandboxed => f.write_str("sandboxed"),
-            Self::Root => f.write_str("root"),
-        }
-    }
-}
-
-impl KubeVirtWorkloadMode {
-    /// The claim value carried in the boundary config and descriptor.
-    pub fn claim(&self) -> &'static str {
-        match self {
-            Self::Sandboxed => "sandboxed",
-            Self::Root => "root",
-        }
-    }
-}
-
 /// `KubeVirt` runtime mode settings (proof of concept).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -245,11 +207,6 @@ pub struct KubeVirtConfig {
     /// Attach a per-sandbox PVC at `/sandbox` so the workspace survives
     /// stop/start (mirrors the pod path's PVC-backed workspace).
     pub workspace_pvc: bool,
-    /// How the guest workload runs: "sandboxed" (the default —
-    /// unprivileged, Landlock + seccomp) or "root" (the privileged VM
-    /// class — root workload, no in-guest enforcement, dedicated
-    /// supervisor topology required).
-    pub workload: KubeVirtWorkloadMode,
 }
 
 impl Default for KubeVirtConfig {
@@ -258,7 +215,6 @@ impl Default for KubeVirtConfig {
             guest_image: String::new(),
             guest_image_pull_policy: String::new(),
             cpu_cores: 1,
-            workload: KubeVirtWorkloadMode::default(),
             memory: "1Gi".to_string(),
             workspace_pvc: true,
         }
@@ -835,16 +791,15 @@ impl KubernetesComputeConfig {
                 self.workspace_mode
             ));
         }
-        // The privileged root-workload class requires the dedicated
-        // supervisor: a shared supervisor would let a parser bug reached by
-        // a hostile root guest cross tenants.
-        if self.kubevirt.workload == KubeVirtWorkloadMode::Root
-            && self.supervisor_topology.is_some()
-        {
+        // Every KubeVirt guest runs its workload as root and its boundary
+        // is untrusted, so the dedicated supervisor is required: a shared
+        // supervisor would let a parser bug reached by a hostile root guest
+        // cross tenants.
+        if self.supervisor_topology.is_some() {
             return Err(
-                "kubevirt workload = \"root\" requires the dedicated supervisor topology \
+                "kubevirt runtime requires the dedicated supervisor topology \
                  (supervisor_topology unset); the gateway-shared supervisor is not \
-                 supported for privileged VMs"
+                 supported for KubeVirt VMs"
                     .to_string(),
             );
         }

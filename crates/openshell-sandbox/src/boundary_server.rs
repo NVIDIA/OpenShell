@@ -433,22 +433,18 @@ mod linux {
         uid: u32,
         gid: u32,
     ) -> Result<(), String> {
-        let workload_mode = resource_claims
-            .get(crate::WORKLOAD_MODE_CLAIM)
-            .map(String::as_str);
-        match workload_mode {
-            Some(crate::PRIVILEGED_WORKLOAD_MODE) => {
-                if uid != 0 || gid != 0 {
-                    return Err(
-                        "privileged (root-mode) boundary requires UID and GID zero".to_string()
-                    );
-                }
+        // A `KubeVirt` guest is the untrusted root-workload class: its
+        // workload identity is uid/gid zero by design. Everything else
+        // (container boundaries, libkrun VM guests) must be nonzero.
+        if openshell_sandbox_backend::boundary_protocol::is_kubevirt_guest(resource_claims) {
+            if uid != 0 || gid != 0 {
+                return Err(
+                    "untrusted-guest (root-workload) boundary requires UID and GID zero"
+                        .to_string(),
+                );
             }
-            _ => {
-                if uid == 0 || gid == 0 {
-                    return Err("sandbox workload UID and GID must be nonzero".to_string());
-                }
-            }
+        } else if uid == 0 || gid == 0 {
+            return Err("sandbox workload UID and GID must be nonzero".to_string());
         }
         Ok(())
     }
@@ -6929,39 +6925,37 @@ mod linux {
         }
 
         #[test]
-        fn workload_mode_identity_allows_root_only_with_root_claim() {
+        fn workload_mode_identity_allows_root_only_for_kubevirt_guests() {
             use std::collections::BTreeMap;
 
-            let claims = |mode: Option<&str>| {
+            let claims = |kubevirt: bool, vm: bool| {
                 let mut map = BTreeMap::new();
-                if let Some(mode) = mode {
-                    map.insert(crate::WORKLOAD_MODE_CLAIM.to_string(), mode.to_string());
+                if kubevirt {
+                    map.insert("kubevirt.generation".to_string(), "g1".to_string());
+                }
+                if vm {
+                    map.insert("vm.generation".to_string(), "g1".to_string());
                 }
                 map
             };
 
-            // Root claim + uid 0: passes.
-            assert!(validate_workload_mode_identity(&claims(Some("root")), 0, 0).is_ok());
+            // KubeVirt guest + uid 0: passes (the untrusted root-workload class).
+            assert!(validate_workload_mode_identity(&claims(true, false), 0, 0).is_ok());
 
-            // Root claim + nonzero uid: fails (config error).
-            assert!(validate_workload_mode_identity(&claims(Some("root")), 1000, 1000).is_err());
+            // KubeVirt guest + nonzero uid: fails (config error).
+            assert!(validate_workload_mode_identity(&claims(true, false), 1000, 1000).is_err());
 
-            // Sandboxed claim + uid 0: fails (security invariant).
-            assert!(validate_workload_mode_identity(&claims(Some("sandboxed")), 0, 0).is_err());
+            // libkrun VM guest + uid 0: fails (trusted-boundary invariant).
+            assert!(validate_workload_mode_identity(&claims(false, true), 0, 0).is_err());
 
-            // Sandboxed claim + nonzero uid: passes.
-            assert!(
-                validate_workload_mode_identity(&claims(Some("sandboxed")), 1000, 1000).is_ok()
-            );
+            // libkrun VM guest + nonzero uid: passes.
+            assert!(validate_workload_mode_identity(&claims(false, true), 1000, 1000).is_ok());
 
-            // No claim (the default) + uid 0: fails (fail closed).
-            assert!(validate_workload_mode_identity(&claims(None), 0, 0).is_err());
+            // No claims + uid 0: fails (fail closed).
+            assert!(validate_workload_mode_identity(&claims(false, false), 0, 0).is_err());
 
-            // Unknown claim + uid 0: fails (fail closed).
-            assert!(validate_workload_mode_identity(&claims(Some("unknown")), 0, 0).is_err());
-
-            // No claim + nonzero uid: passes (the sandboxed default).
-            assert!(validate_workload_mode_identity(&claims(None), 1000, 1000).is_ok());
+            // No claims + nonzero uid: passes (the container default).
+            assert!(validate_workload_mode_identity(&claims(false, false), 1000, 1000).is_ok());
         }
 
         fn test_runtime_qualification() -> crate::RuntimeQualification {

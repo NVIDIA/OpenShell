@@ -8,17 +8,18 @@ use openshell_isolation_interface::contract::BackendError;
 /// Validate the built-in Linux backend's measured enforcement state.
 /// Validate the boundary's audit evidence.
 ///
-/// The mode comes from the TRUSTED launch descriptor's `kubevirt.workload_mode`
-/// claim (never from anything the boundary reports — a sandboxed guest could
-/// otherwise dodge validation by claiming to be privileged). The caller must
-/// pass the mode it resolved from the descriptor.
+/// The class comes from the TRUSTED launch descriptor's resource claims
+/// (never from anything the boundary reports — a guest could otherwise
+/// dodge validation by claiming a class). The caller must pass the class
+/// it resolved from the descriptor.
 ///
-/// - Sandboxed (or unknown): the full capability-free posture (zero caps,
-///   `no_new_privs`, seccomp, Landlock, DNS/TCP round trips) is required.
-/// - Root: the privileged evidence check — only what is still meaningful
-///   for a root workload (the boundary honestly reports no caps/Landlock/
-///   seccomp because none are enforced). Everything the guest reports
-///   after start is advisory.
+/// - Trusted boundary (container or libkrun VM, or unknown): the full
+///   capability-free posture (zero caps, `no_new_privs`, seccomp,
+///   Landlock, DNS/TCP round trips) is required.
+/// - Untrusted KubeVirt guest: only what is still meaningful (the boundary
+///   honestly reports no caps/Landlock/seccomp because none are enforced).
+///   Everything the guest reports after start is advisory and is never
+///   treated as proof of enforcement.
 pub fn validate_native_linux_audit(
     evidence: &serde_json::Value,
     privileged: bool,
@@ -28,7 +29,7 @@ pub fn validate_native_linux_audit(
             BackendError::Confirm(format!("decode Linux sandbox audit evidence: {error}"))
         })?;
     if privileged {
-        audit.validate_privileged()
+        audit.validate_untrusted_guest()
     } else {
         audit.validate()
     }

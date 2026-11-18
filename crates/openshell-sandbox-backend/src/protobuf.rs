@@ -352,12 +352,12 @@ impl WireMessage for c::BoundaryConfirmation {
         let identity = required(v.identity)?;
         Ok(Self {
             generation: v.generation,
-            // The wire-format conversion must accept the privileged (root-
-            // workload) identity: the boundary reports uid 0 by design in
-            // that mode, and the policy check (mode-gated, in
+            // The wire-format conversion must accept the untrusted-guest
+            // (root-workload) identity: a `KubeVirt` boundary reports
+            // uid 0 by design, and the class check (claim-gated, in
             // validate_runtime_coordinates) has already run. Using
-            // new() here would refuse every privileged confirmation at
-            // deserialization.
+            // new() here would refuse every untrusted-guest confirmation
+            // at deserialization.
             identity: if identity.uid == 0 && identity.gid == 0 {
                 c::ResolvedWorkloadIdentity::new_privileged(
                     identity.source,

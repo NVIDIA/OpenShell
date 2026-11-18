@@ -78,10 +78,9 @@ impl BackendSetup for RegisteredBackendSetup {
                 session_id: self.descriptor.session_id,
                 workload_identity: self.descriptor.workload_identity.clone(),
                 vm_policy_identity: None,
-                privileged_workload:
-                    openshell_sandbox_backend::boundary_protocol::is_privileged_workload(
-                        &self.descriptor.resource_claims,
-                    ),
+                untrusted_guest: openshell_sandbox_backend::boundary_protocol::is_kubevirt_guest(
+                    &self.descriptor.resource_claims,
+                ),
             },
             Box::new(RegisteredLaunch {
                 name: self.name.clone(),

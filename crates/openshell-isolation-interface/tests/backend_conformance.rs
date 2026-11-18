@@ -249,11 +249,9 @@ async fn port_forward_rejects_non_loopback() {
 
 #[test]
 fn workload_identity_decoding_rejects_non_canonical_zero_forms() {
-    let privileged = ResolvedWorkloadIdentity::new_privileged(
-        "policy".to_string(),
-        "sha256:test".to_string(),
-    )
-    .unwrap();
+    let privileged =
+        ResolvedWorkloadIdentity::new_privileged("policy".to_string(), "sha256:test".to_string())
+            .unwrap();
 
     // The canonical privileged identity round-trips through serialization.
     let json = serde_json::to_string(&privileged).unwrap();

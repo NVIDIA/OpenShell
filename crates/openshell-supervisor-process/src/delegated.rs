@@ -95,7 +95,7 @@ pub async fn start_boundary_access(
     host_key: Option<russh::keys::PrivateKey>,
     gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
     app_installations: Option<openshell_core::app_listener::InstallationSource>,
-    privileged_mode: bool,
+    untrusted_guest: bool,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -113,7 +113,7 @@ pub async fn start_boundary_access(
         port_forward.clone(),
         main_session.clone(),
         host_key,
-        privileged_mode,
+        untrusted_guest,
     )
     .await?;
 
@@ -166,7 +166,7 @@ async fn start_optional_ssh(
     port_forward: Arc<BoundaryLoopbackConnector>,
     main_session: Arc<crate::main_session::MainSession>,
     host_key: Option<russh::keys::PrivateKey>,
-    privileged_mode: bool,
+    untrusted_guest: bool,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
     let Some(socket_path) = socket_path else {
         return Ok(None);
@@ -183,7 +183,7 @@ async fn start_optional_ssh(
             boundary_exec,
             Some(main_session),
             host_key,
-            privileged_mode,
+            untrusted_guest,
         )
         .await
         {
