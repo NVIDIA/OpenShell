@@ -157,6 +157,23 @@ message GetCapabilitiesResponse {
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
   string resource_admission_policy = 13;
+  // Diagnostic workload facts from this configured driver. Absence means
+  // unreported, not the gateway host's platform or unrestricted execution.
+  WorkloadCompatibility workload_compatibility = 15;
+}
+
+// Workload compatibility reported by the driver, not by the CLI or gateway host.
+// These facts describe the runtime; they do not admit a particular command.
+message WorkloadCompatibility {
+  // Workload OS, such as "linux", "windows", or "macos". Empty is unreported.
+  string operating_system = 1;
+  // Workload architecture in OCI form, such as "arm64" or "amd64".
+  // Empty is unreported, including when placement or the image determines it.
+  string architecture = 2;
+  // At most 16 fixed execution restrictions, each a nonempty plain-text
+  // explanation of at most 512 bytes. Platform strings are at most 64 bytes.
+  // An empty list does not establish that execution is unrestricted.
+  repeated string execution_restrictions = 3;
 }
 
 message AuthenticateSandboxRequest {

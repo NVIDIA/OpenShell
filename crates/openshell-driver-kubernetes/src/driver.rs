@@ -1317,6 +1317,13 @@ impl KubernetesComputeDriver {
                     count_selection_supported: true,
                 }),
             }),
+            workload_compatibility: Some(
+                openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "linux".to_string(),
+                    architecture: String::new(),
+                    execution_restrictions: Vec::new(),
+                },
+            ),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
             extension: Some(openshell_core::extension_protocol::extension_metadata(

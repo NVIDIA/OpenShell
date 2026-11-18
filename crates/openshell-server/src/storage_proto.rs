@@ -178,8 +178,10 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
+    // Workload compatibility adds one diagnostic-only public message. Startup
+    // snapshots are not persisted; the durable and overlap inventories stay fixed.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "daa132037ee47c7a46b08dfab9bab379961bc06ff3e9ebbb329809b724f2a4f6";
+        "96834e77fb6ee4dbc288222cf200ef0b61047aee921829109b50c66882a05854";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -726,7 +728,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (344, 31),
+                (345, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
