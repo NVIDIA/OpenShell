@@ -14,7 +14,7 @@ nextest run the tests as the library's unit tests. The crate also builds the
 | `exec-cli` | `sandbox exec` through the CLI: complete large output, piped stdin up to the 4 MiB limit, early exit, a forced TTY, unreadable stdin |
 | `attach` | `sandbox connect` to the main process: one input owner, read-only viewers, history replay on reconnect, stop and start while attached, a main exit of 255 |
 | `ssh` | The SSH host key: the same in get, list, and `ssh`; kept across stop and start; new for a recreated sandbox |
-| `persistent-workspace` | Files in `/sandbox` survive stop and start |
+| `persistent-workspace` | Files in `/sandbox` survive stop and start; `/sandbox` belongs to the sandbox user and no other user can write to it |
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
 | `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |
 | `create-upload` | `sandbox create --upload`: directory basename and nested files, multiple uploads, a single file |

@@ -1047,6 +1047,15 @@ const WORKSPACE_VOLUME_NAME: &str = "workspace";
 /// contents into the PVC before the agent starts.
 const WORKSPACE_MOUNT_PATH: &str = "/sandbox";
 
+/// Directory on the workspace PVC that the agent container mounts at
+/// `/sandbox`.  The provisioner decides the owner and mode of the PVC root
+/// (local-path creates it root-owned with mode `0777`), and the non-root
+/// init container cannot change them, so the init container creates this
+/// directory owned by the sandbox identity with mode `0700`, as the Docker
+/// and Podman drivers create `/sandbox`.  `openshell-sandbox
+/// seed-private-workspace` uses the same name.
+const WORKSPACE_SUB_PATH: &str = "sandbox";
+
 /// Mount path for the workspace PVC in the **init** container.  A temporary
 /// path so the init container can see the image's original `/sandbox` and
 /// copy it into the PVC.
@@ -7650,7 +7659,9 @@ fn apply_supervisor_sandbox_runtime_boundary(
 /// Apply workspace persistence transforms to an already-built pod template.
 ///
 /// This injects:
-///   1. A volume mount on the agent container at `/sandbox`.
+///   1. A volume mount on the agent container at `/sandbox`.  With a
+///      `workspace_owner`, it mounts the PVC's `WORKSPACE_SUB_PATH`
+///      directory rather than the PVC root.
 ///   2. An init container (same image) that seeds the PVC with the image's
 ///      original `/sandbox` contents on first use.
 ///
@@ -7703,10 +7714,14 @@ fn apply_workspace_persistence(
                 .or_insert_with(|| serde_json::json!([]))
                 .as_array_mut();
             if let Some(volume_mounts) = volume_mounts {
-                volume_mounts.push(serde_json::json!({
+                let mut mount = serde_json::json!({
                     "name": WORKSPACE_VOLUME_NAME,
                     "mountPath": WORKSPACE_MOUNT_PATH
-                }));
+                });
+                if workspace_owner.is_some() {
+                    mount["subPath"] = serde_json::json!(WORKSPACE_SUB_PATH);
+                }
+                volume_mounts.push(mount);
             }
         }
     }
@@ -7751,7 +7766,7 @@ fn apply_workspace_persistence(
             serde_json::json!({
                 "name": WORKSPACE_INIT_CONTAINER_NAME,
                 "image": image,
-                "command": [format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"), "seed-workspace"],
+                "command": [format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"), "seed-private-workspace"],
                 "securityContext": {
                     "runAsUser": uid,
                     "runAsGroup": gid,
@@ -12048,11 +12063,23 @@ mod tests {
             workspace_init["command"],
             serde_json::json!([
                 format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
-                "seed-workspace"
+                "seed-private-workspace"
             ])
         );
         assert_eq!(workspace_init["securityContext"]["runAsUser"], 1500);
         assert_eq!(workspace_init["imagePullPolicy"], "Always");
+        let workspace_mount = agent["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["name"] == WORKSPACE_VOLUME_NAME)
+            .unwrap();
+        assert_eq!(workspace_mount["mountPath"], WORKSPACE_MOUNT_PATH);
+        assert_eq!(workspace_mount["subPath"], WORKSPACE_SUB_PATH);
+        assert_eq!(
+            workspace_init["volumeMounts"][0],
+            serde_json::json!({"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_INIT_MOUNT_PATH})
+        );
         assert_eq!(
             workspace_init["securityContext"]["capabilities"],
             serde_json::json!({"drop": ["ALL"]})

@@ -29,6 +29,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
+const SEED_PRIVATE_WORKSPACE_SUBCOMMAND: &str = "seed-private-workspace";
 #[cfg(target_os = "linux")]
 const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
@@ -1787,6 +1788,122 @@ fn seed_kubernetes_workspace() -> Result<()> {
     ))
 }
 
+/// Directory on the Kubernetes workspace volume that the agent container
+/// mounts at `/sandbox` through a `subPath`. The Kubernetes driver uses the
+/// same name.
+#[cfg(target_os = "linux")]
+const PRIVATE_WORKSPACE_DIR: &str = "sandbox";
+
+/// Staging directory for an incomplete private workspace seed.
+#[cfg(target_os = "linux")]
+const PRIVATE_WORKSPACE_STAGING_DIR: &str = ".sandbox.seeding";
+
+/// Seed the private workspace directory from the agent image as the final
+/// workload identity. The driver uses this subcommand for new sandboxes;
+/// `seed-workspace` keeps its meaning for sandboxes whose stored Pod template
+/// still mounts the volume root at `/sandbox`.
+#[cfg(target_os = "linux")]
+fn seed_private_kubernetes_workspace() -> Result<()> {
+    seed_private_kubernetes_workspace_at(
+        Path::new("/sandbox"),
+        Path::new("/mnt/openshell-workspace"),
+    )
+}
+
+/// Create the workload's `/sandbox` as a directory on the workspace volume
+/// owned by this (the workload) identity with mode `0700`, and seed it from
+/// the image.
+///
+/// The volume root's owner and mode come from the storage provisioner and
+/// kubelet. Some provisioners create a root-owned, world-writable root:
+/// local-path creates it with mode `0777`, and kubelet does not apply
+/// `fsGroup` to its hostPath volumes. This non-root container cannot change
+/// that, so the agent mounts `PRIVATE_WORKSPACE_DIR` instead, as the Docker
+/// and Podman drivers create `/sandbox` with mode `0700`.
+///
+/// The image contents are copied into a staging directory that is renamed into
+/// place, so the directory exists only after a complete seed, and an
+/// interrupted seed starts over on the next Pod start.
+#[cfg(target_os = "linux")]
+fn seed_private_kubernetes_workspace_at(source: &Path, volume: &Path) -> Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let volume_metadata = fs::symlink_metadata(volume).into_diagnostic()?;
+    if !volume_metadata.is_dir() {
+        return Err(miette::miette!(
+            "workspace volume must be a real directory: {}",
+            volume.display()
+        ));
+    }
+
+    let workspace = volume.join(PRIVATE_WORKSPACE_DIR);
+    match fs::symlink_metadata(&workspace) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(miette::miette!(
+                    "workspace must be a real directory: {}",
+                    workspace.display()
+                ));
+            }
+            let uid = nix::unistd::geteuid().as_raw();
+            if metadata.uid() != uid {
+                return Err(miette::miette!(
+                    "workspace {} is owned by UID {}, not the workload UID {uid}",
+                    workspace.display(),
+                    metadata.uid()
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).into_diagnostic(),
+    }
+
+    let staging = volume.join(PRIVATE_WORKSPACE_STAGING_DIR);
+    match fs::symlink_metadata(&staging) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&staging).into_diagnostic()?,
+        Ok(_) => fs::remove_file(&staging).into_diagnostic()?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).into_diagnostic(),
+    }
+    fs::create_dir(&staging).into_diagnostic()?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).into_diagnostic()?;
+
+    if source.try_exists().into_diagnostic()? {
+        let metadata = fs::symlink_metadata(source).into_diagnostic()?;
+        if !metadata.is_dir() {
+            return Err(miette::miette!(
+                "image workspace must be a real directory: {}",
+                source.display()
+            ));
+        }
+        copy_workspace_tree(source, &staging)?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .open(&staging)
+        .into_diagnostic()?
+        .sync_all()
+        .into_diagnostic()?;
+    fs::rename(&staging, &workspace).into_diagnostic()?;
+    OpenOptions::new()
+        .read(true)
+        .open(volume)
+        .into_diagnostic()?
+        .sync_all()
+        .into_diagnostic()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn seed_private_kubernetes_workspace() -> Result<()> {
+    Err(miette::miette!(
+        "Kubernetes workspace seeding is supported only on Linux"
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
     let console_filter =
@@ -1832,6 +1949,14 @@ fn main() -> Result<()> {
             ));
         }
         return seed_kubernetes_workspace();
+    }
+    if raw_args.get(1).map(String::as_str) == Some(SEED_PRIVATE_WORKSPACE_SUBCOMMAND) {
+        if raw_args.len() != 2 {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {SEED_PRIVATE_WORKSPACE_SUBCOMMAND}"
+            ));
+        }
+        return seed_private_kubernetes_workspace();
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_PROBE_SUBCOMMAND) {
         return run_capability_probe();
@@ -2008,6 +2133,89 @@ mod tests {
             0
         );
         assert!(destination.join(".openshell-initialized").is_file());
+    }
+
+    #[test]
+    fn private_kubernetes_workspace_is_owned_and_not_world_writable() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let volume = root.path().join("volume");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(source.join("README"), b"workspace").unwrap();
+        std::fs::write(source.join("bin/tool"), b"tool").unwrap();
+        std::os::unix::fs::symlink("README", source.join("latest")).unwrap();
+        // A provisioner such as local-path creates the volume root
+        // world-writable, and this identity cannot change its mode.
+        std::fs::create_dir(&volume).unwrap();
+        std::fs::set_permissions(&volume, std::fs::Permissions::from_mode(0o777)).unwrap();
+        // A seed interrupted before its rename leaves a staging directory.
+        std::fs::create_dir(volume.join(PRIVATE_WORKSPACE_STAGING_DIR)).unwrap();
+        std::fs::write(
+            volume.join(PRIVATE_WORKSPACE_STAGING_DIR).join("README"),
+            b"partial",
+        )
+        .unwrap();
+
+        seed_private_kubernetes_workspace_at(&source, &volume).unwrap();
+
+        let workspace = volume.join(PRIVATE_WORKSPACE_DIR);
+        let metadata = std::fs::symlink_metadata(&workspace).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert_eq!(
+            std::fs::read(workspace.join("README")).unwrap(),
+            b"workspace"
+        );
+        assert_eq!(std::fs::read(workspace.join("bin/tool")).unwrap(), b"tool");
+        assert_eq!(
+            std::fs::read_link(workspace.join("latest")).unwrap(),
+            Path::new("README")
+        );
+        assert!(!volume.join(PRIVATE_WORKSPACE_STAGING_DIR).exists());
+
+        // Later starts keep the workload's changes and do not reseed.
+        std::fs::write(workspace.join("README"), b"changed").unwrap();
+        std::fs::remove_file(workspace.join("bin/tool")).unwrap();
+        seed_private_kubernetes_workspace_at(&source, &volume).unwrap();
+        assert_eq!(std::fs::read(workspace.join("README")).unwrap(), b"changed");
+        assert!(!workspace.join("bin/tool").exists());
+    }
+
+    #[test]
+    fn private_kubernetes_workspace_seeds_an_image_without_sandbox() {
+        let root = tempfile::tempdir().unwrap();
+        let volume = root.path().join("volume");
+        std::fs::create_dir(&volume).unwrap();
+
+        seed_private_kubernetes_workspace_at(&root.path().join("missing"), &volume).unwrap();
+
+        let workspace = volume.join(PRIVATE_WORKSPACE_DIR);
+        assert_eq!(
+            std::fs::symlink_metadata(&workspace)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(std::fs::read_dir(&workspace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn private_kubernetes_workspace_rejects_a_symlinked_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let volume = root.path().join("volume");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&volume).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, volume.join(PRIVATE_WORKSPACE_DIR)).unwrap();
+
+        let error = seed_private_kubernetes_workspace_at(&root.path().join("missing"), &volume)
+            .unwrap_err();
+        assert!(error.to_string().contains("real directory"), "{error}");
     }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
