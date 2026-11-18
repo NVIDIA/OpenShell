@@ -206,33 +206,55 @@ cargo build -p openshell-prover-cli --features vendored-z3
 Local gateway image and E2E builds enable `vendored-z3` so their
 copied gateway binaries do not need a shared Z3 library in the runtime image.
 
-For x86-64 and ARM64 Windows MSVC builds from the `windows` branch, the
-`windows:*` tasks compile checksum-pinned Z3 5.1.0 source into a static library.
-The Windows targets enable `crt-static` in `.cargo/config.toml`; the Z3 build
-uses the same static MSVC runtime. CMake and a C++ compiler are required on
-cold builds. Source lives under `.cache/windows-z3-source`; Cargo caches the
-compiled library separately. `Z3_SRC_SOURCE_DIR` can point
-to a local Z3 5.1.0 source tree instead of downloading it.
-The wrapper uses Ninja to preserve MSVC optimization flags and keeps Z3
-optimized in development and test builds, matching the
-previous prebuilt solver's performance. Rust application debug settings stay
-unchanged; the dependency profile lives in `.cargo/windows-msvc.toml`.
+For x86-64 and ARM64 Windows MSVC builds from the `windows` branch, use one of these Z3 paths:
 
-To supply your own library, set `Z3_LIBRARY_PATH_OVERRIDE` to the directory
-containing a target-compatible, **static** `libz3.lib` built with `/MT`, and
-`Z3_SYS_Z3_HEADER` to its `z3.h`. Import libraries for `libz3.dll` are rejected
-by the release build's executable dependency check.
-If an inherited override points to a directory containing `libz3.dll`, the
-wrapper uses the pinned source build instead.
+- Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
+  pinned Z3 5.1.0 GitHub release for the target architecture on the first
+  build. Cargo reuses the extracted archive from its target directory. Windows
+  CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
+  preserves the archive in the architecture-specific Cargo target cache. For
+  cold local builds, you may set `READ_ONLY_GITHUB_TOKEN` to avoid anonymous
+  GitHub API rate limits.
+- System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
+  target-compatible MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
+  The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
+  is set.
 
-Windows package builds intentionally stop linking shared Z3 installations.
-Existing automation using a prebuilt override can keep that environment setting
-when `libz3.dll` is in the override directory, but must provide CMake and a C++
-compiler for the source build. For offline builds, point `Z3_SRC_SOURCE_DIR`
-to a local Z3 5.1.0 source tree. To retain a custom binary library, rebuild it
-with `Z3_BUILD_LIBZ3_SHARED=OFF` and `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`,
-then update the override to that static library directory. A DLL import library
-without an adjacent DLL still fails the release dependency check.
+Normal Windows builds and CI keep this prebuilt default and the existing CRT
+linkage. If the pinned release asset is absent (HTTP 404), the wrapper falls
+back to checksum-pinned Z3 5.1.0 source. Cached prebuilts are reused without
+an availability request; other download errors fail without starting a source
+build. To request source explicitly, set `OPENSHELL_WINDOWS_Z3_SOURCE=1`.
+`Z3_SRC_SOURCE_DIR` can supply a local 5.1.0 source tree.
+
+For ZIP packages that embed Z3 and the CRT in all four executables, opt in:
+
+```powershell
+$env:OPENSHELL_WINDOWS_STATIC_RUNTIME='1'
+mise run --skip-tools windows:build:x64
+```
+
+Use `windows:build:arm64` for ARM64. This mode accepts a supplied static
+`libz3.lib` built with `/MT` through the same library/header overrides. The
+upstream pinned Windows archives contain DLL import libraries, so this mode
+builds source when no static library is supplied. An explicit shared-library
+override fails with a migration message. Source builds require CMake and Ninja;
+the wrapper preserves native Release optimization in development and test builds.
+The explicit source flag takes precedence over a library override; otherwise a
+library override takes precedence over a source directory.
+
+Static package builds validate architecture and normal/delayed PE imports for
+all four executables and reject Z3 or redistributable CRT DLL dependencies.
+They remove a previously staged `libz3.dll`. Default shared builds continue
+staging the matching DLL. The wrapper loads `.cargo/windows-static.toml` only
+for the explicit static mode; ordinary Cargo builds retain their defaults.
+
+`openshell-prover` itself has no `bindgen`/`libclang` dependency, so building
+just this crate does not require `LIBCLANG_PATH`:
+
+```powershell
+cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebuilt-z3
+```
 
 ### Windows full build
 
@@ -240,7 +262,7 @@ Run these commands in a `windows`-based checkout. To build the full set of
 Windows binaries, including `openshell-gateway.exe`, `openshell.exe`,
 `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe`,
 use the `windows:build:x64` mise task instead of a
-single-crate `cargo build`. It builds the pinned static Z3 library by default. A
+single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
 full build also compiles crates that use `bindgen` (e.g. the MXC driver on
 Windows), so it requires `libclang.dll`; if LLVM is not on the default search
 path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
@@ -251,18 +273,17 @@ mise run --skip-tools windows:build:x64
 ```
 
 For ARM64, use `windows:build:arm64` with ARM64 MSVC components and host-native
-LLVM. The four executables do not require `libz3.dll` or the Visual C++
-redistributable. Release builds check both normal and delayed PE imports.
+LLVM. Keep the matching `libz3.dll` staged by the build beside the executables.
 See [Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
 for native tests and MXC E2E requirements. Docker is not required for the native
 Windows build or MXC runtime.
 
-To use a local static x64 Z3 build with the static CRT, set
+To use a local x64 Z3 release instead of the prebuilt download, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
 
 ```powershell
-$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-5.1.0-x64-static\lib'
-$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-5.1.0-x64-static\include\z3.h'
+$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-5.1.0-x64-win\bin'
+$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-5.1.0-x64-win\include\z3.h'
 mise run --skip-tools windows:build:x64
 ```
 

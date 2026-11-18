@@ -88,3 +88,8 @@ function Assert-StaticWindowsRuntime([string] $Path, [string] $RustTarget) {
     if ($dynamic.Count) { throw "Dynamic Z3/CRT dependency in ${Path}: $($dynamic -join ', ')" }
     Write-Host "==> Static Z3/CRT and PE architecture verified: $Path"
 }
+
+function Test-SharedWindowsZ3([string] $Path) {
+    $image = Get-WindowsImageDependencies $Path
+    return @($image.Dependencies | Where-Object { $_ -match '^(libz3|z3)\.dll$' }).Count -gt 0
+}

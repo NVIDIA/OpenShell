@@ -256,10 +256,16 @@ drivers need no UI-specific handling. UI policy itself does not require the
 
 ## Validation
 
-Windows release build tasks use static CRT linkage and embed Z3 in the gateway.
-They verify PE architecture and reject normal or delayed imports of Z3 and
-redistributable CRT DLLs. Keep the four executables from the same build together;
-no adjacent `libz3.dll` or Visual C++ redistributable is required for them.
+Windows release build tasks stage the pinned, target-matching `libz3.dll` beside
+the gateway and verify its architecture and copied SHA256. Conflicting cached
+DLLs fail the build instead of selecting an arbitrary runtime. Local E2E requires
+this adjacent DLL; rebuild for the native architecture if preflight reports it
+missing.
+
+For static ZIP packages, set `OPENSHELL_WINDOWS_STATIC_RUNTIME=1` before the
+build. This mode embeds Z3 and the CRT and rejects their DLL imports; the four
+executables need neither `libz3.dll` nor the Visual C++ redistributable.
+Normal builds continue to use the pinned upstream shared Z3 prebuilt.
 
 ### Remote Windows host
 
@@ -282,13 +288,16 @@ uses the existing `windows:build:*` task, and validates the executable PE
 architecture before testing. `-BuildDirectory` selects a dedicated Cargo cache.
 `-SkipBuild` reuses existing artifacts without claiming they match current
 sources. `-Scenario` selects an existing harness scenario.
-The deprecated `-Z3DllPath` argument remains accepted for existing automation;
-it is ignored because packages embed Z3.
 
-The package contains the four statically linked OpenShell executables plus the
-test-only forwarding fixture. The remote runner verifies their PE architecture
-and static Z3/CRT imports, then checks gateway startup before invoking E2E.
-The separate MXC executor retains its own prerequisites.
+The package includes `libz3.dll` from the target-specific Cargo build cache.
+Windows prebuilt Z3 uses a dynamic runtime DLL. Supply `-Z3DllPath` if multiple
+different cached versions exist or when using a custom Z3 build. The remote
+host needs the native Visual C++ runtime; the runner validates DLL architecture
+and gateway startup before invoking E2E.
+
+The remote helper also accepts static packages: it reads gateway imports and
+includes `libz3.dll` only when required. `-Z3DllPath` retains its existing meaning
+for shared builds. The separate MXC executor retains its own prerequisites.
 
 The example gateway explicitly enables caller driver config so tests can submit
 their workload command and directory. MXC does not implement external-resource

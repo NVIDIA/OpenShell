@@ -78,9 +78,11 @@ The [Windows MSVC workflow on `windows`](https://github.com/NVIDIA/OpenShell/blo
 runs native x64 and ARM64 lanes. Windows PR checks are opt-in: add
 `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
-These lanes run packaging helper regressions, Clippy, native tests, and release
-builds that reject Z3 or redistributable CRT DLL imports on both architectures.
 Windows checks are not required for merging and do not run in merge queues.
+Normal Windows CI retains pinned prebuilt Z3 and its original lint/test workload.
+Manual dispatch exposes `static_runtime` (default `false`) to validate static
+CRT/Z3 builds on both native runner architectures. This opt-in can build Z3
+from source; it uses separate compiler/target cache keys.
 Pushes to `windows` and manual runs on that branch seed the lint/test caches and run dependent
 release binary builds. Those jobs use `continue-on-error: true`, so inspect
 their individual results rather than treating a green workflow as qualification.

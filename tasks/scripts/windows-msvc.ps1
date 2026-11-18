@@ -13,7 +13,11 @@ param(
     [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "native", "all")]
     [string] $Target = "all",
 
-    [string] $LogDir
+    [string] $LogDir,
+
+    [switch] $StaticRuntime = ($env:OPENSHELL_WINDOWS_STATIC_RUNTIME -eq '1'),
+
+    [switch] $Z3Source = ($env:OPENSHELL_WINDOWS_Z3_SOURCE -eq '1')
 )
 
 Set-StrictMode -Version Latest
@@ -57,9 +61,11 @@ $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
 $Z3Version = '5.1.0'
 $Z3SourceSha256 = 'e7ab3f8b682d5f55e813f951c7f9bb4fb9a48567ce6143d7adae23027e0e42a0'
-$Z3WorkspaceFeatures = '--features openshell-prover/vendored-z3'
-$Z3ServerFeatures = '--features openshell-server/vendored-z3,openshell-prover/vendored-z3'
-$Z3GatewayFeatures = '--features vendored-z3'
+$PrebuiltZ3Version = $Z3Version
+$Z3WorkspaceFeatures = '--features openshell-prover/prebuilt-z3'
+$Z3ServerFeatures = '--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3'
+$Z3GatewayFeatures = '--features prebuilt-z3'
+$Z3FromSource = $false
 
 function Get-VsInstallRoots {
     $programFiles = @(
@@ -295,7 +301,7 @@ function Configure-Arm64CrossBuild([string[]] $RustTargets) {
     Write-Host "==> ARM64 cross-build toolchain"
     Write-Host "    clang-cl: $clangCl"
     Write-Host "    ninja:    $ninja"
-    Write-Host "    Z3:       MSVC cl.exe with Ninja"
+    Write-Host "    Z3:       pinned prebuilt, or MSVC cl.exe with Ninja for source builds"
 }
 
 function Get-HostArch {
@@ -396,20 +402,67 @@ function Resolve-Z3Source {
     return $source
 }
 
-function Configure-Z3 {
-    if ($env:Z3_LIBRARY_PATH_OVERRIDE -and (Test-Path -LiteralPath (Join-Path $env:Z3_LIBRARY_PATH_OVERRIDE 'libz3.dll'))) {
-        Write-Warning 'Ignoring the shared Z3 override; Windows packages require static Z3 and CRT linkage. Building pinned source instead.'
+function Test-PinnedZ3Available([string] $RustTarget) {
+    foreach ($profile in @('debug', 'release')) {
+        $cached = Join-Path $TargetDir "$RustTarget/$profile/build/z3-sys-*/out/z3-$Z3Version/bin/libz3.lib"
+        if (Get-Item -Path $cached -ErrorAction SilentlyContinue) { return $true }
+    }
+    $arch = switch ($RustTarget) {
+        'aarch64-pc-windows-msvc' { 'arm64' }
+        'x86_64-pc-windows-msvc' { 'x64' }
+        default { return $false }
+    }
+    # z3-sys still owns downloading and caching the release. Only probe a cold
+    # target so a genuinely missing release asset can select the source fallback.
+    $url = "https://github.com/Z3Prover/z3/releases/download/z3-$Z3Version/z3-$Z3Version-$arch-win.zip"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -UseBasicParsing -Method Head -Uri $url -TimeoutSec 30 | Out-Null
+        return $true
+    } catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $false }
+        # A transient network/API error must not unexpectedly start a long build.
+        throw
+    }
+}
+
+function Configure-Z3([string[]] $RustTargets) {
+    $sourceRequested = $Z3Source -or ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE) -and -not [string]::IsNullOrWhiteSpace($env:Z3_SRC_SOURCE_DIR))
+    if ($sourceRequested) {
         $env:Z3_LIBRARY_PATH_OVERRIDE = $null
         $env:Z3_SYS_Z3_HEADER = $null
     }
     if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
+        $useSource = $sourceRequested -or $StaticRuntime
+        if (-not $useSource) {
+            foreach ($rustTarget in $RustTargets) {
+                if (-not (Test-PinnedZ3Available $rustTarget)) {
+                    Write-Warning "Pinned Z3 $Z3Version prebuilt unavailable for $rustTarget; building pinned source."
+                    $useSource = $true
+                }
+            }
+        }
+        if (-not $useSource) {
+            $env:Z3_SYS_Z3_VERSION = $Z3Version
+            Write-Host "==> Z3: pinned prebuilt $Z3Version (z3-sys download/cache)"
+            return [pscustomobject]@{
+                WorkspaceFeatures = '--features openshell-prover/prebuilt-z3'
+                ServerFeatures = '--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3'
+                GatewayFeatures = '--features prebuilt-z3'
+                FromSource = $false
+            }
+        }
+        # Upstream's pinned Windows archives contain DLL import libraries, so
+        # static packages need a supplied /MT archive or this source fallback.
         $env:Z3_SRC_SOURCE_DIR = Resolve-Z3Source
         $env:Z3_SYS_Z3_VERSION = $Z3Version
         $env:CMAKE_BUILD_PARALLEL_LEVEL = "$WindowsBuildJobs"
-        Write-Host "==> Z3: static library and static CRT from $env:Z3_SRC_SOURCE_DIR"
+        Write-Host "==> Z3: source $env:Z3_SRC_SOURCE_DIR (static CRT: $StaticRuntime)"
         return [pscustomobject]@{
-            WorkspaceFeatures = $Z3WorkspaceFeatures
-            ServerFeatures = $Z3ServerFeatures
+            WorkspaceFeatures = '--features openshell-prover/vendored-z3'
+            ServerFeatures = '--features openshell-server/vendored-z3,openshell-prover/vendored-z3'
+            GatewayFeatures = '--features vendored-z3'
+            FromSource = $true
         }
     }
 
@@ -425,18 +478,23 @@ function Configure-Z3 {
 
     $env:Z3_LIBRARY_PATH_OVERRIDE = $libDir
     $env:Z3_SYS_Z3_HEADER = Resolve-Z3HeaderPath $env:Z3_SYS_Z3_HEADER
+    if ($StaticRuntime -and (Test-Path -LiteralPath (Join-Path $libDir 'libz3.dll'))) {
+        throw 'StaticRuntime requires a genuine static libz3.lib built with /MT. Remove the shared override to build pinned source, or supply a static library.'
+    }
 
     if (($env:PATH -split ";") -notcontains $libDir) {
         $env:PATH = "$libDir;$env:PATH"
     }
 
-    Write-Host "==> Z3: supplied static MSVC library (must use /MT)"
+    Write-Host "==> Z3: supplied MSVC library (static packages require /MT)"
     Write-Host "    Z3_LIBRARY_PATH_OVERRIDE=$env:Z3_LIBRARY_PATH_OVERRIDE"
     Write-Host "    Z3_SYS_Z3_HEADER=$env:Z3_SYS_Z3_HEADER"
 
     return [pscustomobject]@{
         WorkspaceFeatures = ""
         ServerFeatures = ""
+        GatewayFeatures = ""
+        FromSource = $false
     }
 }
 
@@ -474,18 +532,27 @@ function Invoke-VsCargo {
     # cmake-rs clears MSVC's configuration optimization flags when it selects
     # the Visual Studio generator implicitly. Ninja preserves /O2 for Release
     # Z3, including the dependency profile used by development/test builds.
-    $ninja = Resolve-NinjaPath
-    Add-PathEntry (Split-Path -Parent $ninja)
+    if ($Z3FromSource) {
+        $ninja = Resolve-NinjaPath
+        Add-PathEntry (Split-Path -Parent $ninja)
+    }
 
-    if ($CargoArgs.StartsWith('cargo ') -and $CargoArgs -notmatch '--manifest-path') {
+    if (($Z3FromSource -or $StaticRuntime) -and $CargoArgs.StartsWith('cargo ')) {
         # The old prebuilt solver was optimized even in debug/test builds.
         # An unoptimized native Z3 can exhaust otherwise unchanged solver budgets.
-        $config = Join-Path $RepoRoot '.cargo/windows-msvc.toml'
+        $configs = @()
+        if ($Z3FromSource -and $CargoArgs -notmatch '--manifest-path') {
+            $configs += '--config "' + (Join-Path $RepoRoot '.cargo/windows-msvc.toml') + '"'
+        }
+        if ($StaticRuntime) {
+            $configs += '--config "' + (Join-Path $RepoRoot '.cargo/windows-static.toml') + '"'
+        }
+        $configArgs = $configs -join ' '
         if ($CargoArgs.StartsWith('cargo nextest run ')) {
             # Nextest starts Cargo itself; global Cargo options are not forwarded.
-            $CargoArgs = 'cargo nextest run --config "' + $config + '" ' + $CargoArgs.Substring(18)
+            $CargoArgs = 'cargo nextest run ' + $configArgs + ' ' + $CargoArgs.Substring(18)
         } else {
-            $CargoArgs = 'cargo --config "' + $config + '" ' + $CargoArgs.Substring(6)
+            $CargoArgs = 'cargo ' + $configArgs + ' ' + $CargoArgs.Substring(6)
         }
     }
 
@@ -511,12 +578,15 @@ function Invoke-VsCargo {
         "set `"CARGO_TARGET_DIR=$TargetDir`"",
         "set `"CARGO_BUILD_JOBS=$WindowsBuildJobs`"",
         "set `"CARGO_INCREMENTAL=0`"",
-        "set `"CMAKE_GENERATOR=Ninja`"",
-        # z3-src adds MSBuild's -m unless a C++ launcher is configured. Use
-        # CMake's portable passthrough when no compiler cache was requested.
-        'if not defined CMAKE_CXX_COMPILER_LAUNCHER (set "CMAKE_CXX_COMPILER_LAUNCHER=cmake;-E;env")',
         "set `"RUSTC_WRAPPER=$rustcWrapper`""
     )
+    if ($Z3FromSource) {
+        $environmentSetup += @(
+            'set "CMAKE_GENERATOR=Ninja"',
+            # z3-src otherwise adds MSBuild's -m argument to Ninja.
+            'if not defined CMAKE_CXX_COMPILER_LAUNCHER (set "CMAKE_CXX_COMPILER_LAUNCHER=cmake;-E;env")'
+        )
+    }
     if ($hostArch -eq "amd64" -and $RustTarget -eq "aarch64-pc-windows-msvc") {
         # Native ARM64 dependencies select their own compilers. Clear inherited
         # overrides so AWS-LC can select clang-cl inside its build script.
@@ -550,7 +620,7 @@ function Invoke-VsCargo {
             throw "Timed out waiting for another Windows Cargo task to finish."
         }
 
-        Reset-WindowsCMakeGeneratorCache $RustTarget
+        if ($Z3FromSource) { Reset-WindowsCMakeGeneratorCache $RustTarget }
         $cmdWithLog = "$cmd > `"$logPath`" 2>&1"
         & cmd /v:on /d /c $cmdWithLog
         $exitCode = $LASTEXITCODE
@@ -612,12 +682,50 @@ function Invoke-Build([string] $RustTarget) {
         -RustTarget $RustTarget `
         -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor --bin openshell-windows-sandbox $Z3WorkspaceFeatures" `
         -LogName "build-$RustTarget-release.log"
-    foreach ($binary in @('openshell-gateway.exe', 'openshell.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe')) {
-        Assert-StaticWindowsRuntime (Join-Path $TargetDir "$RustTarget/release/$binary") $RustTarget
+    if ($StaticRuntime) {
+        foreach ($binary in @('openshell-gateway.exe', 'openshell.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe')) {
+            Assert-StaticWindowsRuntime (Join-Path $TargetDir "$RustTarget/release/$binary") $RustTarget
+        }
+    }
+    if (Test-SharedWindowsZ3 (Join-Path $TargetDir "$RustTarget/release/openshell-gateway.exe")) {
+        Stage-Z3Runtime $RustTarget
+        return
     }
     # Do not leave a previously staged DLL in a directory used for ZIP packages.
     $staleDll = Join-Path $TargetDir "$RustTarget/release/libz3.dll"
     if (Test-Path -LiteralPath $staleDll) { Remove-Item -LiteralPath $staleDll }
+}
+
+function Stage-Z3Runtime([string] $RustTarget) {
+    $release = Join-Path $TargetDir "$RustTarget/release"
+    if ($env:Z3_LIBRARY_PATH_OVERRIDE) {
+        $candidates = @(Get-Item -LiteralPath (Join-Path $env:Z3_LIBRARY_PATH_OVERRIDE 'libz3.dll') -ErrorAction SilentlyContinue)
+    } else {
+        # Only use the pinned release from this target's build cache. Never pick
+        # the newest arbitrary DLL, or trust a stale adjacent runtime.
+        $candidates = @(Get-ChildItem -Path (Join-Path $release "build/z3-sys-*/out/z3-$PrebuiltZ3Version/bin/libz3.dll") -File -ErrorAction SilentlyContinue)
+    }
+    if ($candidates.Count -eq 0) { throw "Matching libz3.dll not found for $RustTarget." }
+    $hashes = @($candidates | ForEach-Object { Get-Sha256 $_.FullName } | Select-Object -Unique)
+    if ($hashes.Count -ne 1) { throw "Ambiguous Z3 runtimes for $RustTarget; use a clean target cache or Z3_LIBRARY_PATH_OVERRIDE." }
+    $source = $candidates[0].FullName
+    $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($source))
+    try {
+        if ($reader.ReadUInt16() -ne 0x5A4D) { throw "Invalid Z3 DLL: $source" }
+        $reader.BaseStream.Position = 0x3C
+        $offset = $reader.ReadInt32()
+        if ($offset -lt 64 -or $offset -gt $reader.BaseStream.Length - 6) { throw 'Invalid Z3 PE offset.' }
+        $reader.BaseStream.Position = $offset
+        if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Invalid Z3 PE signature.' }
+        $expected = if ($RustTarget -eq 'aarch64-pc-windows-msvc') { 0xAA64 } else { 0x8664 }
+        if ($reader.ReadUInt16() -ne $expected) { throw "Z3 DLL architecture does not match $RustTarget." }
+    } finally { $reader.Dispose() }
+    $destination = Join-Path $release 'libz3.dll'
+    if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($destination)) {
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+    if ((Get-Sha256 $destination) -ne $hashes[0]) { throw 'Staged Z3 DLL hash mismatch.' }
+    Write-Host "==> Staged $destination (SHA256=$($hashes[0]))"
 }
 
 function Invoke-Test([string] $RustTarget) {
@@ -719,10 +827,11 @@ if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")
 }
 
 if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "ci")) {
-    $z3Features = Configure-Z3
+    $z3Features = Configure-Z3 $targets
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
-    $Z3GatewayFeatures = if ($z3Features.WorkspaceFeatures) { "--features vendored-z3" } else { "" }
+    $Z3GatewayFeatures = $z3Features.GatewayFeatures
+    $Z3FromSource = $z3Features.FromSource
     $env:LIBCLANG_PATH = Resolve-LibclangPath
     Add-PathEntry $env:LIBCLANG_PATH
     Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
@@ -810,6 +919,11 @@ switch ($Action) {
             New-Item -ItemType Directory -Force $package | Out-Null
             foreach ($binary in @('openshell-gateway.exe', 'openshell.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe')) {
                 Copy-Item -LiteralPath (Join-Path $TargetDir "$rustTarget/release/$binary") -Destination $package -Force
+            }
+            if (Test-SharedWindowsZ3 (Join-Path $package 'openshell-gateway.exe')) {
+                Copy-Item -LiteralPath (Join-Path $TargetDir "$rustTarget/release/libz3.dll") -Destination $package -Force
+            } elseif (Test-Path -LiteralPath (Join-Path $package 'libz3.dll')) {
+                Remove-Item -LiteralPath (Join-Path $package 'libz3.dll')
             }
             foreach ($artifact in @('run-ocsf-audit.ps1', 'mxc-ocsf-audit.toml', 'ocsf-audit.yaml')) {
                 Copy-Item -LiteralPath (Join-Path $RepoRoot "crates/openshell-driver-mxc/examples/$artifact") -Destination $package -Force

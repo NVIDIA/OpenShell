@@ -3,7 +3,6 @@
 
 # Remote half of test-mxc-remote.ps1. No source checkout or build tools required.
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'windows-runtime.ps1')
 $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
@@ -31,8 +30,10 @@ try {
     $native = Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' PROCESSOR_ARCHITECTURE
     $expected = if ($manifest.target -eq 'aarch64-pc-windows-msvc') { 0xaa64 } else { 0x8664 }
     if (($expected -eq 0xaa64 -and $native -ne 'ARM64') -or ($expected -eq 0x8664 -and $native -ne 'AMD64')) { throw 'Native host architecture changed.' }
-    foreach ($name in @('openshell.exe', 'openshell-gateway.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe', 'mxc-forwarding-agent.exe')) {
-        Assert-StaticWindowsRuntime (Join-Path $repo "bin/$name") $manifest.target
+    $names = @('openshell.exe', 'openshell-gateway.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe', 'mxc-forwarding-agent.exe')
+    if (@($manifest.files | Where-Object { $_.path -eq 'bin/libz3.dll' }).Count) { $names += 'libz3.dll' }
+    foreach ($name in $names) {
+        if ((Get-PeMachine (Join-Path $repo "bin/$name")) -ne $expected) { throw "Wrong executable architecture: $name" }
     }
     $wxc = $manifest.wxcExecPath
     # Check loader dependencies before the harness starts a gateway.
@@ -51,7 +52,7 @@ try {
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(15000)) { $process.Kill(); throw 'Gateway loader check timed out.' }
         @($stdout.Result, $stderr.Result) | Set-Content (Join-Path $export 'gateway-version.txt') -Encoding UTF8
-        if ($process.ExitCode -ne 0) { throw "Gateway loader check failed: exit $($process.ExitCode). Check the package architecture and Windows loader diagnostics." }
+        if ($process.ExitCode -ne 0) { throw "Gateway loader check failed: exit $($process.ExitCode). Check the packaged DLLs and native Visual C++ runtime." }
         Write-Host "Gateway loader check passed: $($stdout.Result.Trim())"
     } finally { $process.Dispose() }
     if (-not $wxc) { $wxc = (Get-Command wxc-exec.exe -ErrorAction Stop).Source }

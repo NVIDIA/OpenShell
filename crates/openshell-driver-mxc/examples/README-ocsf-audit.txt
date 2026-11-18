@@ -45,10 +45,11 @@ WHAT YOU GET BACK
   -ShareOut '\\server\share' (off by default; results stay local otherwise).
 
 FILES IN THIS PACKAGE
-  openshell-gateway.exe    the gateway (static CRT and embedded Z3)
+  openshell-gateway.exe    the gateway (self-contained; needs only VC++ runtime)
   openshell.exe            the CLI
   openshell-supervisor.exe host supervisor
   openshell-windows-sandbox.exe sandbox runtime
+  libz3.dll                matching native Z3 runtime
   mxc-ocsf-audit.toml      gateway/driver config (process_container, etw_audit=true, egress proxy)
   ocsf-audit.yaml          sandbox policy (read-write grant to the share dir)
   run-ocsf-audit.ps1       the orchestrator you run

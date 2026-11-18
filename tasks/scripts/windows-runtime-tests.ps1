@@ -51,6 +51,7 @@ try {
             [IO.File]::WriteAllBytes($fixture, (New-Image 0xaa64 $dependency -Delay:$delay))
             $image = Get-WindowsImageDependencies $fixture
             if ($image.Dependencies -notcontains $dependency) { throw "Import not detected: $dependency" }
+            if ((Test-SharedWindowsZ3 $fixture) -ne ($dependency -eq 'libz3.dll')) { throw 'Shared Z3 detection disagrees with imports.' }
             $rejected = $false
             try { Assert-StaticWindowsRuntime $fixture 'aarch64-pc-windows-msvc' } catch {
                 if ($_.Exception.Message -notmatch 'Dynamic Z3/CRT') { throw }
@@ -72,12 +73,11 @@ try {
     $count++
 } finally { Remove-Item -LiteralPath $fixture }
 
-# Exercise cold source preparation without network access, including the legacy
-# shared-Z3 environment used by the ARM64 CI host.
+# Exercise prebuilt selection and source fallback without network access.
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'windows-msvc.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-foreach ($name in @('Get-Sha256', 'Resolve-Z3Source', 'Configure-Z3', 'Reset-WindowsCMakeGeneratorCache')) {
+foreach ($name in @('Get-Sha256', 'Resolve-Z3HeaderPath', 'Resolve-Z3Source', 'Test-PinnedZ3Available', 'Configure-Z3', 'Reset-WindowsCMakeGeneratorCache')) {
     $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
     if ($null -eq $function) { throw "Missing build helper: $name" }
     Invoke-Expression $function.Extent.Text
@@ -90,13 +90,27 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $sourceArchive = Join-Path $sourceFixture 'source.zip'
     [IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $sourceFixture 'input'), $sourceArchive)
-    function Invoke-WebRequest([switch] $UseBasicParsing, [string] $Uri, [string] $OutFile) {
-        Copy-Item -LiteralPath $sourceArchive -Destination $OutFile
+    Add-Type @'
+public sealed class OpenShellZ3TestResponse { public int StatusCode; }
+public sealed class OpenShellZ3TestException : System.Exception {
+    public OpenShellZ3TestResponse Response;
+    public OpenShellZ3TestException(int status) { Response = new OpenShellZ3TestResponse(); Response.StatusCode = status; }
+}
+'@
+    $script:headStatus = 200
+    $script:headCalls = @()
+    $script:sourceDownloads = 0
+    function Invoke-WebRequest([switch] $UseBasicParsing, [string] $Uri, [string] $OutFile, [string] $Method, [int] $TimeoutSec) {
+        if ($Method -eq 'Head') {
+            $script:headCalls += $Uri
+            if ($script:headStatus -ne 200) { throw [OpenShellZ3TestException]::new($script:headStatus) }
+        } else {
+            $script:sourceDownloads++
+            Copy-Item -LiteralPath $sourceArchive -Destination $OutFile
+        }
     }
     $Z3Version = '5.1.0'
     $Z3SourceSha256 = Get-Sha256 $sourceArchive
-    $Z3WorkspaceFeatures = '--features openshell-prover/vendored-z3'
-    $Z3ServerFeatures = '--features openshell-server/vendored-z3,openshell-prover/vendored-z3'
     $WindowsBuildJobs = 2
     $RepoRoot = $sourceFixture
     $TargetDir = Join-Path $sourceFixture 'target'
@@ -125,11 +139,52 @@ try {
     Reset-WindowsCMakeGeneratorCache 'aarch64-pc-windows-msvc'
     if ($script:cleanCalls.Count -ne 2) { throw 'Cached solver archive without build rules was reused.' }
     $count++
+
+    $Z3Source = $false
+    $StaticRuntime = $false
     $env:Z3_SRC_SOURCE_DIR = $null
+    $env:Z3_LIBRARY_PATH_OVERRIDE = $null
+    $env:Z3_SYS_Z3_HEADER = $null
+    $features = Configure-Z3 @('aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc')
+    if ($features.WorkspaceFeatures -notmatch 'prebuilt-z3' -or $features.FromSource -or $script:sourceDownloads) { throw 'Default no longer reuses pinned prebuilts.' }
+    if ($script:headCalls.Count -ne 2 -or $script:headCalls[0] -notmatch 'z3-5.1.0-arm64-win.zip$' -or $script:headCalls[1] -notmatch 'z3-5.1.0-x64-win.zip$') { throw 'Prebuilt architecture/version mapping changed.' }
+    $count++
+    $cache = Join-Path $TargetDir 'aarch64-pc-windows-msvc/debug/build/z3-sys-cached/out/z3-5.1.0/bin'
+    New-Item -ItemType Directory -Force -Path $cache | Out-Null
+    Set-Content -LiteralPath (Join-Path $cache 'libz3.lib') -Value 'cached prebuilt'
+    $script:headStatus = 500
+    if (-not (Test-PinnedZ3Available 'aarch64-pc-windows-msvc') -or $script:headCalls.Count -ne 2) { throw 'Cached prebuilt was not reused offline.' }
+    $count++
+    $rejected = $false
+    try { Test-PinnedZ3Available 'x86_64-pc-windows-msvc' | Out-Null } catch { $rejected = $true }
+    if (-not $rejected -or $script:sourceDownloads) { throw 'Transient prebuilt failure unexpectedly built source.' }
+    $count++
+
     $env:Z3_LIBRARY_PATH_OVERRIDE = $sourceFixture
+    Set-Content -LiteralPath (Join-Path $sourceFixture 'libz3.lib') -Value 'supplied library'
+    $env:Z3_SYS_Z3_HEADER = Join-Path $sourceFixture 'z3.h'
+    Set-Content -LiteralPath $env:Z3_SYS_Z3_HEADER -Value '// header'
     Set-Content -LiteralPath (Join-Path $sourceFixture 'libz3.dll') -Value 'legacy shared runtime'
-    $features = Configure-Z3
-    if ($features.WorkspaceFeatures -notmatch 'vendored-z3' -or $env:Z3_LIBRARY_PATH_OVERRIDE) { throw 'Legacy shared override selected instead of static Z3.' }
+    $features = Configure-Z3 @('aarch64-pc-windows-msvc')
+    if ($features.WorkspaceFeatures -or $features.FromSource -or $script:sourceDownloads) { throw 'Shared library override no longer works by default.' }
+    $count++
+    $StaticRuntime = $true
+    $rejected = $false
+    try { Configure-Z3 @('aarch64-pc-windows-msvc') | Out-Null } catch {
+        if ($_.Exception.Message -notmatch 'genuine static') { throw }
+        $rejected = $true
+    }
+    if (-not $rejected -or $script:sourceDownloads) { throw 'Shared override silently replaced for static build.' }
+    $count++
+    Remove-Item -LiteralPath (Join-Path $sourceFixture 'libz3.dll')
+    $env:Z3_SRC_SOURCE_DIR = Join-Path $sourceFixture 'source-must-not-be-used'
+    $features = Configure-Z3 @('aarch64-pc-windows-msvc')
+    if ($features.WorkspaceFeatures -or $features.FromSource -or $script:sourceDownloads) { throw 'Supplied static library unexpectedly rebuilt source.' }
+    $count++
+    $env:Z3_LIBRARY_PATH_OVERRIDE = $null
+    $env:Z3_SRC_SOURCE_DIR = $null
+    $features = Configure-Z3 @('aarch64-pc-windows-msvc')
+    if ($features.WorkspaceFeatures -notmatch 'vendored-z3' -or -not $features.FromSource -or $script:sourceDownloads -ne 1) { throw 'Explicit static package did not prepare pinned source.' }
     $count++
     if ($env:Z3_SRC_SOURCE_DIR.StartsWith($TargetDir, [StringComparison]::OrdinalIgnoreCase)) { throw 'Source cache is inside the pruned Cargo target directory.' }
     $count++
@@ -140,6 +195,19 @@ try {
     # A verified cache can be reused without downloading another archive.
     if (-not (Resolve-Z3Source)) { throw 'Source cache reuse failed.' }
     $count++
+    $StaticRuntime = $false
+    $script:headStatus = 404
+    $env:Z3_SRC_SOURCE_DIR = $null
+    $features = Configure-Z3 @('x86_64-pc-windows-msvc')
+    if (-not $features.FromSource -or $script:sourceDownloads -ne 1) { throw 'Missing pinned prebuilt did not reuse source fallback.' }
+    $count++
+    $env:Z3_SRC_SOURCE_DIR = $null
+    $Z3Source = $true
+    $script:headStatus = 500
+    $features = Configure-Z3 @('x86_64-pc-windows-msvc')
+    if (-not $features.FromSource -or $script:sourceDownloads -ne 1) { throw 'Explicit source request queried a prebuilt or missed the cache.' }
+    $count++
+    $env:Z3_SRC_SOURCE_DIR = $null
     $RepoRoot = Join-Path $sourceFixture 'bad-checksum'
     $rejected = $false
     try { Resolve-Z3Source | Out-Null } catch {
@@ -155,4 +223,4 @@ try {
     if (-not $rejected) { throw 'Wrong solver source version accepted.' }
     $count++
 } finally { Remove-Item -LiteralPath $sourceFixture -Recurse -Force }
-Write-Host "$count static-runtime regression checks passed. No MXC qualification claimed."
+Write-Host "$count Windows dependency/runtime regression checks passed. No MXC qualification claimed."

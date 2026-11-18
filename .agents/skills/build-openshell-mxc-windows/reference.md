@@ -12,7 +12,7 @@ when reading this reference on `main`.
 |---|---|
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
-| `.github/workflows/windows-msvc.yml` | Opt-in PR lint, test, and release builds plus `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 
 ## Commands
 
@@ -93,10 +93,9 @@ For ARM64, verify the Visual Studio instance contains the ARM64 MSVC tools,
 ARM64 Spectre-mitigated libraries, Clang tools, CMake tools, and a Windows SDK.
 Clang supplies host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for
 ARM64 crypto dependencies such as `aws-lc-sys`. Native and
-x64-to-ARM64 builds compile checksum-pinned Z3 5.1.0 source with the static CRT.
-The four executables use static CRT linkage and the gateway embeds Z3. Release
-builds verify architecture and reject normal/delayed CRT or Z3 DLL imports.
-Do not package `libz3.dll`; the executables do not require the VC++ redistributable.
+x64-to-ARM64 builds use the official prebuilt Z3 5.1.0 import library and
+`libz3.dll` for the target architecture. Release build tasks stage that DLL
+beside the four executables; copy it with them to the runtime host.
 An x64-to-ARM64 check/build discovers and adds host-native
 Ninja to `PATH`, while the crypto crates select `clang-cl`. Use a short
 `CARGO_TARGET_DIR` if Windows path-length limits are reached.
@@ -270,3 +269,8 @@ if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
 
 Run the full x64-host `windows:ci` lane when build or test behavior changed and
 the host can run that lane natively.
+
+For explicit static ZIP builds, set `OPENSHELL_WINDOWS_STATIC_RUNTIME=1`. Supply
+a static `/MT` library/header override or build checksum-pinned 5.1.0 source.
+Only this mode embeds the CRT and Z3 and removes the DLL; default build and CI
+behavior continues to reuse upstream's pinned shared prebuilts.

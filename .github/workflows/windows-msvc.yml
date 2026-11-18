@@ -6,6 +6,11 @@ on:
       - windows
       - "pull-request/[0-9]+"
   workflow_dispatch:
+    inputs:
+      static_runtime:
+        description: Build and test static CRT/Z3 packages (may build Z3 from source)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +23,7 @@ env:
   # sccache cannot cache incremental Rust compilations, and rust-cache removes
   # incremental artifacts before saving the target directory.
   CARGO_INCREMENTAL: "0"
+  OPENSHELL_WINDOWS_STATIC_RUNTIME: ${{ inputs.static_runtime && '1' || '0' }}
 
 jobs:
   pr_metadata:
@@ -27,12 +33,12 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      should_run: ${{ github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true' }}
+      should_run: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
-        if: github.ref != 'refs/heads/windows'
+        if: github.ref != 'refs/heads/windows' && github.event_name != 'workflow_dispatch'
         uses: ./.github/actions/pr-gate
         with:
           required_label: test:windows
@@ -58,7 +64,7 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-static-v1-${{ matrix.arch }}
+      SCCACHE_GHA_VERSION: windows-msvc${{ inputs.static_runtime && '-static-v1' || '' }}-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -90,22 +96,14 @@ jobs:
           # wrapper; build steps still inherit sccache from the job.
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-static-v3-${{ matrix.arch }}
+          shared-key: windows-msvc${{ inputs.static_runtime && '-static-v3' || '' }}-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
-      - name: Check Windows packaging helpers
-        run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-runtime-tests.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Static runtime regressions failed." }
-          powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/test-mxc-remote-tests.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Remote helper regressions failed." }
       - name: Lint Windows-supported crates
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
-      - name: Build and verify release binaries
-        run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats
@@ -117,7 +115,7 @@ jobs:
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
-      github.ref == 'refs/heads/windows'
+      (github.ref == 'refs/heads/windows' || github.event_name == 'workflow_dispatch')
     strategy:
       fail-fast: false
       matrix:
@@ -132,7 +130,7 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-static-v1-${{ matrix.arch }}
+      SCCACHE_GHA_VERSION: windows-msvc${{ inputs.static_runtime && '-static-v1' || '' }}-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -158,16 +156,10 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-static-v3-${{ matrix.arch }}
+          shared-key: windows-msvc${{ inputs.static_runtime && '-static-v3' || '' }}-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
-      - name: Check Windows packaging helpers
-        run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-runtime-tests.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Static runtime regressions failed." }
-          powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/test-mxc-remote-tests.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Remote helper regressions failed." }
       - name: Lint Windows-supported crates
         # Keep the seed workload identical to the pull-request workload so the
         # windows-branch cache reflects the same lint and test commands.
@@ -196,7 +188,7 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-static-v1-${{ matrix.arch }}
+      SCCACHE_GHA_VERSION: windows-msvc${{ inputs.static_runtime && '-static-v1' || '' }}-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -219,7 +211,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-static-v3-${{ matrix.arch }}
+          shared-key: windows-msvc${{ inputs.static_runtime && '-static-v3' || '' }}-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
