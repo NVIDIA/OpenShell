@@ -31,6 +31,21 @@ Without a Workload API socket, token grants fail closed. A process hosting
 several instances serves `/v1/denials` from a per-instance
 `SandboxInstanceDenialLog` instead of the shared shorthand log files.
 
+## Policy DNS expiry
+
+Synthetic identities remain allocated after their DNS mappings expire. New
+transparent connections lazily refresh expired, policy-backed mappings through
+the same trusted resolver and destination-validation path as sandbox DNS
+queries. Refreshes for one address share a lock; failed refreshes back off for
+one second and never authorize expired upstream addresses.
+`PolicyDnsService::lookup_for_connect` owns refresh coordination and returns
+the resulting mapping; the underlying store stays synchronous. Observation-only
+mappings, wrong ports, and mappings from a previous policy generation cannot refresh.
+Refresh eligibility uses the authored ports, independently of which ports the
+latest DNS addresses satisfied. Dispatch reauthorizes mapped connections and
+rebuilds their connectors from current pins instead of retaining staged pins
+across a refresh.
+
 ## Reserved destinations
 
 `preauthorize_transparent_open` matches a staged TCP open against the reserved
