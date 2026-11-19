@@ -131,9 +131,7 @@ pub async fn delete_observed_refresh_state_with_credentials(
         state.authorization_epoch = uuid::Uuid::new_v4().to_string();
         state.status = "deleting".to_string();
         state.next_refresh_at_ms = i64::MAX;
-        let Some(current_version) =
-            persist_refresh_state_if_current(store, &state, version).await?
-        else {
+        let Some(current_version) = store.replace_configuration(&mut state, version).await? else {
             if store
                 .get_by_id(state.object_id())
                 .await
@@ -303,6 +301,18 @@ async fn delete_pending_secret_handles(
     credentials: &Arc<dyn CredentialIssuer>,
     state: &RefreshState,
 ) -> Result<(), Status> {
+    for handle in &state.retired_output_handles {
+        credentials
+            .delete(
+                SecretOwner::provider(
+                    state.object_workspace(),
+                    &state.provider_id,
+                    &state.provider_name,
+                ),
+                &HashMap::from([(state.credential_key.clone(), handle.clone())]),
+            )
+            .await?;
+    }
     credentials
         .delete_refresh_material_deletions(
             refresh_material_scope(state),
@@ -317,7 +327,7 @@ async fn cleanup_pending_secret_deletions(
     state: &mut RefreshState,
     expected_version: u64,
 ) -> Result<u64, Status> {
-    if state.pending_secret_deletions.is_empty() {
+    if !state.has_pending_deletions() {
         return Ok(expected_version);
     }
     let credentials = credentials.ok_or_else(|| {
@@ -331,6 +341,7 @@ async fn cleanup_pending_secret_deletions(
     // cleared tombstone list over the durable retry references.
     let mut cleaned = state.clone();
     cleaned.pending_secret_deletions.clear();
+    cleaned.retired_output_handles.clear();
     let new_version = persist_refresh_state_if_current(store, &cleaned, expected_version)
         .await?
         .ok_or_else(|| {
@@ -382,6 +393,9 @@ async fn persist_refresh_failure_state(
     state.next_refresh_at_ms = match failure.retry_schedule {
         RefreshRetrySchedule::Short => {
             now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000))
+        }
+        RefreshRetrySchedule::NotBefore(deadline) => {
+            deadline.max(now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS * 1000))
         }
         RefreshRetrySchedule::Configuration => {
             now_ms.saturating_add(REFRESH_CONFIGURATION_RETRY_SECONDS.saturating_mul(1000))
@@ -464,7 +478,7 @@ async fn cleanup_pending_secret_deletions_coordinated(
     credentials: Option<&Arc<dyn CredentialIssuer>>,
     state: &mut RefreshState,
 ) -> Result<(), Status> {
-    if state.pending_secret_deletions.is_empty() {
+    if !state.has_pending_deletions() {
         return Ok(());
     }
     let _local = tokio::time::timeout(Duration::from_secs(40), refresh_lock(state)?.lock_owned())
@@ -881,29 +895,40 @@ async fn refresh_provider_credential_locked(
             };
 
             // Generation is ours; write the minted credentials into the provider.
-            if let Err(err) = apply_minted_credential(
+            let result = apply_minted_credential(
                 Some(credentials),
                 provider.as_ref(),
                 credential_key,
                 &minted,
+                Some(effective_authorization_epoch(&state)?),
             )
-            .await
-            {
-                // Reflect the failure on the state we just wrote; skip silently
-                // if it was deleted concurrently (it is not recreated).
-                let failure = RefreshFailure::from_status(&err);
-                persist_refresh_failure_state(store, &mut state, new_version, &failure).await?;
-                warn!(
-                    provider = %state.provider_name,
-                    credential_key = %state.credential_key,
-                    strategy = %refresh_strategy_name(state.strategy),
-                    status = %state.status,
-                    next_refresh_at_ms = state.next_refresh_at_ms,
-                    seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
-                    error = %err,
-                    "provider credential refresh errored"
-                );
-                return Err(err);
+            .await;
+            match result {
+                Ok(version) => {
+                    if state.strategy
+                        == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+                        && state.first_mint_provider_version == 0
+                    {
+                        state.first_mint_provider_version = version;
+                    }
+                }
+                Err(err) => {
+                    // Reflect the failure on the state we just wrote; skip silently
+                    // if it was deleted concurrently (it is not recreated).
+                    let failure = RefreshFailure::from_status(&err);
+                    persist_refresh_failure_state(store, &mut state, new_version, &failure).await?;
+                    warn!(
+                        provider = %state.provider_name,
+                        credential_key = %state.credential_key,
+                        strategy = %refresh_strategy_name(state.strategy),
+                        status = %state.status,
+                        next_refresh_at_ms = state.next_refresh_at_ms,
+                        seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
+                        error = %err,
+                        "provider credential refresh errored"
+                    );
+                    return Err(err);
+                }
             }
             // A success snapshot must not become visible before its provider
             // handles are committed. Park incomplete commits rather than minting
@@ -931,7 +956,7 @@ async fn refresh_provider_credential_locked(
                 seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
                 "provider credential refresh completed"
             );
-            if !state.pending_secret_deletions.is_empty()
+            if state.has_pending_deletions()
                 && let Err(err) = cleanup_pending_secret_deletions(
                     store,
                     Some(credentials),
@@ -992,7 +1017,8 @@ pub async fn apply_minted_credential(
     attempt: &dyn RefreshAttempt,
     credential_key: &str,
     minted: &MintedCredential,
-) -> Result<(), Status> {
+    grant_epoch: Option<&str>,
+) -> Result<u64, Status> {
     let expiration =
         openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -1030,6 +1056,7 @@ pub async fn apply_minted_credential(
     let empty = HashMap::new();
     let result = attempt
         .commit(RefreshOutputs {
+            grant_epoch,
             credential_key,
             additional_keys: minted.additional_credentials.keys().cloned().collect(),
             handles: staged.as_ref(),
@@ -1044,15 +1071,15 @@ pub async fn apply_minted_credential(
             }
             Err(error)
         }
-        Ok(old_handles) => {
-            if !old_handles.is_empty()
+        Ok(committed) => {
+            if !committed.replaced.is_empty()
                 && let Some(credentials) = credentials
-                && let Err(cleanup_err) = credentials.delete(owner, &old_handles).await
+                && let Err(cleanup_err) = credentials.delete(owner, &committed.replaced).await
             {
                 warn!(provider_name = %owner.legacy_scope().provider, error = %cleanup_err,
                     "failed to clean up old provider credential handles after successful refresh");
             }
-            Ok(())
+            Ok(committed.provider_version)
         }
     }
 }
@@ -1108,7 +1135,7 @@ fn refresh_state_has_work(state: &RefreshState, now_ms: i64) -> bool {
         .metadata
         .as_ref()
         .is_some_and(|metadata| metadata.deletion_time.is_some())
-        || !state.pending_secret_deletions.is_empty()
+        || state.has_pending_deletions()
         || state.next_refresh_at_ms <= 0
         || state.next_refresh_at_ms <= now_ms
         || state.status == "rotation_requested"
@@ -1136,14 +1163,9 @@ pub async fn refresh_states(
                 );
                 continue;
             };
-            if let Err(err) = delete_refresh_state_with_credentials(
-                store,
-                credentials,
-                state.object_workspace(),
-                &state.provider_id,
-                &state.credential_key,
-            )
-            .await
+            if let Err(err) =
+                delete_observed_refresh_state_with_credentials(store, credentials, state.clone())
+                    .await
             {
                 warn!(
                     provider = %state.provider_name,
@@ -1304,8 +1326,12 @@ impl CredentialRefresh for RefreshRuntime {
     async fn create(&self, state: RefreshState) -> Result<(), Status> {
         self.store.create(&state).await
     }
-    async fn replace(&self, state: RefreshState, version: u64) -> Result<bool, Status> {
-        Ok(self.store.replace(&state, version).await?.is_some())
+    async fn replace(&self, mut state: RefreshState, version: u64) -> Result<bool, Status> {
+        Ok(self
+            .store
+            .replace_configuration(&mut state, version)
+            .await?
+            .is_some())
     }
     async fn delete(&self, state: RefreshState) -> Result<(), Status> {
         let credentials = self.credentials.as_ref().ok_or_else(|| {

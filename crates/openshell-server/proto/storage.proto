@@ -63,8 +63,7 @@ message StoredProviderCredentialRefreshState {
   int64 last_error_at_ms = 24;
 }
 
-// Current durable refresh state. V1 remains frozen so pre-upgrade records can
-// be decoded and transactionally rewritten into this representation.
+// Historical refresh state with presence-aware durations.
 message StoredProviderCredentialRefreshStateV2 {
   reserved 15, 16;
   reserved "refresh_before_seconds", "max_lifetime_seconds";

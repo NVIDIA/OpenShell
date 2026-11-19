@@ -11,6 +11,10 @@ const PROFILE_ID: &str = "e2e-github-app-refresh-handle";
 
 #[tokio::test]
 async fn github_app_survives_rotations_and_reconfigure_revokes() -> Result<(), String> {
+    if openshell_e2e::harness::gateway::ManagedGateway::from_env()?.is_none() {
+        eprintln!("skipping GitHub App fixture: requires a harness-managed Podman gateway");
+        return Ok(());
+    }
     let key = std::process::Command::new("openssl")
         .args([
             "genpkey",

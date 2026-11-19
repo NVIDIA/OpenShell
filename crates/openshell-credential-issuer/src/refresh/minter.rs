@@ -104,6 +104,7 @@ pub struct RefreshFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefreshRetrySchedule {
     Short,
+    NotBefore(i64),
     Configuration,
     Parked,
 }

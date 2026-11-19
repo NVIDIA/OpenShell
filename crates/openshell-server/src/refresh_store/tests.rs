@@ -85,6 +85,8 @@ fn full_state() -> StoredProviderCredentialRefreshState {
             ("refresh_token".into(), handle("current")),
             ("client_secret".into(), handle("client")),
         ]),
+        first_mint_provider_version: 23,
+        retired_output_handles: vec![handle("retired-output")],
         pending_secret_deletions: vec![
             StoredRefreshMaterialDeletion {
                 material_key: "refresh_token".into(),
@@ -120,6 +122,69 @@ fn assert_same_state(actual: &RefreshState, expected: &RefreshState) {
         StoredProviderCredentialRefreshState::from(actual),
         StoredProviderCredentialRefreshState::from(expected)
     );
+}
+
+#[tokio::test]
+async fn reads_prior_refresh_rows_without_granting_mint_proof() {
+    use crate::storage_proto::v1::StoredProviderCredentialRefreshStateV2;
+    use openshell_core::proto::ProviderCredentialRefreshStrategy;
+
+    let store = test_store().await;
+    let name = refresh_state_name("provider-id", "GH_TOKEN");
+    let previous = StoredProviderCredentialRefreshStateV2 {
+        metadata: Some(ObjectMeta {
+            id: "refresh-id".into(),
+            name: name.clone(),
+            workspace: "default".into(),
+            ..Default::default()
+        }),
+        provider_id: "provider-id".into(),
+        credential_key: "GH_TOKEN".into(),
+        strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation as i32,
+        authorization_epoch: "previous-epoch".into(),
+        refresh_before: Some(prost_types::Duration::default()),
+        secret_material_handles: HashMap::from([("private_key".into(), handle("key"))]),
+        ..Default::default()
+    };
+    store
+        .create_scoped(
+            "provider_credential_refresh_state",
+            "refresh-id",
+            &name,
+            "default",
+            "provider-id",
+            &previous.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let adapter = ServerRefreshStore(Arc::new(store));
+    let mut grant = adapter
+        .get("default", "provider-id", "GH_TOKEN")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(grant.authorization_epoch, previous.authorization_epoch);
+    assert_eq!(grant.strategy, previous.strategy);
+    assert_eq!(grant.refresh_before, previous.refresh_before);
+    assert_eq!(
+        grant.secret_material_handles,
+        previous.secret_material_handles
+    );
+    assert_eq!(grant.first_mint_provider_version, 0);
+    assert!(grant.retired_output_handles.is_empty());
+
+    grant.first_mint_provider_version = 23;
+    grant.retired_output_handles.push(handle("retired"));
+    let new_version = adapter
+        .replace(&grant, version(&grant))
+        .await
+        .unwrap()
+        .unwrap();
+    grant.metadata.as_mut().unwrap().resource_version = new_version;
+    let reloaded = adapter.get_by_id("refresh-id").await.unwrap().unwrap();
+    assert_same_state(&reloaded, &grant);
 }
 
 #[tokio::test]

@@ -256,8 +256,8 @@ permissions do not grant API writes or Git push through a read-only sandbox poli
 Use `--material-secret private_key=NAME` to reference a workspace secret; allow
 the concrete installation token endpoint when creating it. Updating that secret
 applies at the next refresh without reconfiguration. Inline key or scope
-replacement uses explicit reconfiguration and requires restarting processes with
-old workload handles.
+replacement withdraws the old token from gateway delivery. After reconfiguring,
+rotate and restart processes holding the old workload handle.
 Use one refresh configuration for the GitHub App token credential. The logical
 name selects its configured environment alias; use status without a credential
 filter and exact-key deletion to clean up legacy alias conflicts.

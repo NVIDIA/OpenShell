@@ -49,8 +49,7 @@ use crate::auth::workspace_authz::{
 use crate::grpc::{policy, provider, sandbox, secret, service};
 use crate::persistence::{ObjectType, SetResourceVersion, Store};
 use crate::storage_proto::{
-    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredProviderProfile, StoredWorkspaceSecret,
+    StoredProviderCredentialRefreshState, StoredProviderProfile, StoredWorkspaceSecret,
 };
 use crate::{ServerState, config_update_operation};
 
