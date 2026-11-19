@@ -55,6 +55,8 @@ navigation:
       path: how-it-works/providers/aws.mdx
     - page: "Google"
       path: how-it-works/providers/google.mdx
+    - page: "Slack"
+      path: how-it-works/providers/slack.mdx
   - section: "Policies"
     slug: policies
     contents:

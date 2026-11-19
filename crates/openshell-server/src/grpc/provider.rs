@@ -7902,7 +7902,8 @@ mod tests {
                 "oci-genai",
                 "openai",
                 "openrouter",
-                "pypi"
+                "pypi",
+                "slack"
             ]
         );
 
