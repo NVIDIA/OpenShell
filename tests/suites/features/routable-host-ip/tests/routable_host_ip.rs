@@ -4,8 +4,10 @@
 //! A policy endpoint whose host is an IP literal reaches that address
 //! transparently, whether `allowed_ips` names it or not.
 //!
-//! The servers run on the test host, and the sandbox reaches them by the
-//! address `host.openshell.internal` resolves to. Not conformance, because
+//! The servers run on the test host. The sandbox can't learn the host's
+//! address, since policy DNS answers it with a synthetic one, so the test
+//! reaches a server by `host.openshell.internal` first and takes the address
+//! the server saw the request arrive at. Not conformance, because
 //! that address must be one the supervisor lets an IP literal reach: rootless
 //! Podman's is link-local, which is always blocked.
 //!
@@ -15,7 +17,7 @@
 use host_server_support::{HttpRecorder, TEST_HOST};
 use sandbox_clients_support::{Request, http};
 use testkit::policy;
-use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
+use testkit::{Context, PYTHON_BINARIES};
 
 /// Requests reach a server by an IP literal endpoint with `allowed_ips` for
 /// that address, and another by an IP literal endpoint without it.
@@ -23,23 +25,46 @@ use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
 async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Result {
     let explicit = HttpRecorder::start("explicit").await?;
     let implicit = HttpRecorder::start("implicit").await?;
+    let mut name_policy = policy::base();
+    policy::allow(
+        &mut name_policy,
+        "by_name",
+        TEST_HOST,
+        explicit.port,
+        PYTHON_BINARIES,
+    );
     let sandbox = cx
         .sandbox("hstip")
-        .policy(policy::base())
+        .policy(name_policy)
         .image(testkit::python_image())
         .command(["sleep", "infinity"])
         .create_ready()
         .await?;
-    let ip = sandbox
-        .run_python(
-            "import socket, sys; print(socket.gethostbyname(sys.argv[1]))",
-            &[TEST_HOST],
-        )
-        .await
-        .context(format!("resolve {TEST_HOST} in the sandbox"))?
-        .stdout
-        .trim()
-        .to_string();
+    let reply = http(
+        &sandbox,
+        TEST_HOST,
+        explicit.port,
+        &Request::get("/by-name"),
+    )
+    .await?;
+    testkit::ensure!(
+        reply.status() == Some(200),
+        "request to {TEST_HOST}:{} failed: {reply:?}",
+        explicit.port
+    );
+    let host_ip = explicit
+        .requests()
+        .first()
+        .and_then(|request| request.local_addr)
+        .ok_or_else(|| testkit::Error::msg("the host server didn't record its address"))?
+        .ip();
+    // Docker Desktop relays the host gateway through a host-side proxy.
+    testkit::ensure!(
+        !host_ip.is_loopback(),
+        "requests to {TEST_HOST} arrive at the host on {host_ip}, which a sandbox can't reach"
+    );
+    let ip = host_ip.to_string();
+    let prefix = if host_ip.is_ipv4() { 32 } else { 128 };
 
     let mut ip_policy = policy::base();
     policy::allow(
@@ -49,7 +74,7 @@ async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Resul
         explicit.port,
         PYTHON_BINARIES,
     )
-    .allowed_ips = vec![format!("{ip}/32")];
+    .allowed_ips = vec![format!("{ip}/{prefix}")];
     policy::allow(
         &mut ip_policy,
         "implicit",
