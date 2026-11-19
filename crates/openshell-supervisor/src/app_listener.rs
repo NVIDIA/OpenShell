@@ -34,6 +34,44 @@ const FRESHNESS: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallRejection {
+    ConfigurationNotAdmitted,
+    InvalidWorkspace,
+    InvalidRoute,
+    DuplicateServiceName,
+    TooManyRoutes,
+    HostnameOutsideDomain,
+    InvalidHostname,
+    DuplicateHostname,
+    HostnameInUse,
+    Stopped,
+}
+
+impl InstallRejection {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ConfigurationNotAdmitted => "configuration was not admitted",
+            Self::InvalidWorkspace => "workspace is not a canonical DNS label",
+            Self::InvalidRoute => "service route declaration is invalid",
+            Self::DuplicateServiceName => "service name is duplicated",
+            Self::TooManyRoutes => "service route limit exceeded",
+            Self::HostnameOutsideDomain => "application hostname is outside the listener domain",
+            Self::InvalidHostname => "application hostname is not a valid DNS name",
+            Self::DuplicateHostname => "application hostname is duplicated",
+            Self::HostnameInUse => "application hostname is registered to another sandbox",
+            Self::Stopped => "listener is stopped",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RejectedConfiguration {
+    instance_id: String,
+    revision: u64,
+    reason: InstallRejection,
+}
+
 pub struct Config {
     address: SocketAddr,
     domain: String,
@@ -118,8 +156,19 @@ struct Snapshot {
     workspace: String,
     configuration_instance_id: String,
     config_revision: u64,
+    rejection: Option<RejectedConfiguration>,
     // Whole-sandbox suspension fence, independent of individual service edits.
     epoch: u64,
+}
+
+impl Snapshot {
+    fn suspend(&mut self) {
+        self.routes.clear();
+        self.generations.clear();
+        self.expires = None;
+        self.authority_expires = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -242,45 +291,46 @@ impl Routes {
         }
         let mut routes = BTreeMap::new();
         if !result.configuration_admitted {
-            self.suspend();
+            self.reject(result, InstallRejection::ConfigurationNotAdmitted);
             return;
         }
-        if result.configuration_admitted
-            && openshell_core::app_listener::valid_dns_label(&result.workspace)
-            && !result.workspace.contains("--")
-        {
-            for route in &result.service_routes {
-                if route.endpoint_id.is_empty()
-                    || route.target_port == 0
-                    || route.target_port > 65535
-                    || !matches!(route.authorization_mode, 0..=2)
-                    || (!route.name.is_empty()
-                        && (!openshell_core::app_listener::valid_dns_label(&route.name)
-                            || route.name.contains("--")))
-                {
-                    self.suspend();
-                    return;
-                }
-                if routes.insert(route.name.clone(), route.clone()).is_some() {
-                    self.suspend();
-                    return;
-                }
-            }
-        }
-        if routes.len() > 1024
-            || !openshell_core::app_listener::valid_dns_label(&result.workspace)
+        if !openshell_core::app_listener::valid_dns_label(&result.workspace)
             || result.workspace.contains("--")
         {
-            self.suspend();
+            self.reject(result, InstallRejection::InvalidWorkspace);
+            return;
+        }
+        for route in &result.service_routes {
+            if route.endpoint_id.is_empty()
+                || route.target_port == 0
+                || route.target_port > 65535
+                || !matches!(route.authorization_mode, 0..=2)
+                || (!route.name.is_empty()
+                    && (!openshell_core::app_listener::valid_dns_label(&route.name)
+                        || route.name.contains("--")))
+            {
+                self.reject(result, InstallRejection::InvalidRoute);
+                return;
+            }
+            if routes.insert(route.name.clone(), route.clone()).is_some() {
+                self.reject(result, InstallRejection::DuplicateServiceName);
+                return;
+            }
+        }
+        if routes.len() > 1024 {
+            self.reject(result, InstallRejection::TooManyRoutes);
             return;
         }
         if let Some(registration) = &self.registration
-            && !registration.bind(&result.workspace, &routes, &self.stopped)
+            && let Err(reason) = registration.bind(&result.workspace, &routes, &self.stopped)
         {
-            self.suspend();
+            self.reject(result, reason);
             return;
         }
-        let changed = self.sender.borrow().routes != routes;
+        let changed = {
+            let snapshot = self.sender.borrow();
+            snapshot.routes != routes || snapshot.rejection.is_some()
+        };
         self.sender.send_modify(|snapshot| {
             // Renewal after a lapse cannot revive a connection whose lease expired.
             if snapshot
@@ -313,6 +363,7 @@ impl Routes {
                 .configuration_instance_id
                 .clone_from(&result.configuration_instance_id);
             snapshot.config_revision = result.config_revision;
+            snapshot.rejection = None;
             snapshot.routes = routes;
             snapshot.generations = generations;
             snapshot.expires = Some(Instant::now() + FRESHNESS);
@@ -325,6 +376,45 @@ impl Routes {
                     .message("App listener service routes updated")
                     .build()
             );
+        }
+    }
+
+    fn reject(&self, result: &SettingsPollResult, reason: InstallRejection) {
+        let rejection = RejectedConfiguration {
+            instance_id: result.configuration_instance_id.clone(),
+            revision: result.config_revision,
+            reason,
+        };
+        let mut changed = false;
+        self.sender.send_modify(|snapshot| {
+            snapshot.suspend();
+            if reason != InstallRejection::Stopped
+                && !self.stopped.load(Ordering::Acquire)
+                && snapshot.rejection.as_ref() != Some(&rejection)
+            {
+                snapshot.rejection = Some(rejection);
+                changed = true;
+            }
+        });
+        if changed {
+            let mut event = ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .unmapped("reason", reason.reason())
+                .unmapped("config_revision", result.config_revision)
+                .message(format!(
+                    "App listener service routes rejected: {}",
+                    reason.reason()
+                ));
+            if let Some(registration) = &self.registration {
+                event = event.unmapped("sandbox", registration.sandbox.as_str());
+            }
+            if openshell_core::app_listener::valid_dns_label(&result.workspace)
+                && !result.workspace.contains("--")
+            {
+                event = event.unmapped("workspace", result.workspace.as_str());
+            }
+            ocsf_emit!(event.build());
         }
     }
 
@@ -345,13 +435,7 @@ impl Routes {
     }
 
     pub(crate) fn suspend(&self) {
-        self.sender.send_modify(|snapshot| {
-            snapshot.routes.clear();
-            snapshot.generations.clear();
-            snapshot.expires = None;
-            snapshot.authority_expires = None;
-            snapshot.epoch = snapshot.epoch.wrapping_add(1);
-        });
+        self.sender.send_modify(Snapshot::suspend);
     }
 
     fn resolve(
@@ -441,7 +525,7 @@ impl Registration {
         workspace: &str,
         routes: &BTreeMap<String, SandboxServiceRoute>,
         stopped: &AtomicBool,
-    ) -> bool {
+    ) -> std::result::Result<(), InstallRejection> {
         let next = format!("{workspace}--{}", self.sandbox);
         let mut names = vec![next.clone()];
         for route in routes.values() {
@@ -452,18 +536,18 @@ impl Registration {
                 .application_hostname
                 .strip_suffix(&format!(".{}", self.router.domain))
             else {
-                return false;
+                return Err(InstallRejection::HostnameOutsideDomain);
             };
             if !openshell_core::app_listener::valid_dns_label(label)
                 || route.application_hostname.len() > 253
             {
-                return false;
+                return Err(InstallRejection::InvalidHostname);
             }
             names.push(route.application_hostname.clone());
         }
         names.sort();
         if names.windows(2).any(|pair| pair[0] == pair[1]) {
-            return false;
+            return Err(InstallRejection::DuplicateHostname);
         }
         let mut prefix = self
             .prefix
@@ -473,7 +557,7 @@ impl Registration {
         // the registration. An install that passed its first check must not
         // reinsert the old sender after that removal.
         if stopped.load(Ordering::Acquire) {
-            return false;
+            return Err(InstallRejection::Stopped);
         }
         let mut hostnames = self
             .hostnames
@@ -491,7 +575,7 @@ impl Registration {
                 .get(name)
                 .is_some_and(|sender| !sender.same_channel(&self.sender))
         }) {
-            return false;
+            return Err(InstallRejection::HostnameInUse);
         }
         for name in hostnames.iter() {
             if entries
@@ -506,7 +590,7 @@ impl Registration {
         }
         *prefix = next;
         *hostnames = names;
-        true
+        Ok(())
     }
 
     fn remove(&self) {
@@ -993,6 +1077,7 @@ mod tests {
     use super::*;
     use futures::{SinkExt as _, StreamExt as _};
     use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream};
+    use openshell_ocsf::test_support::OcsfCapture;
     use openshell_sandbox_backend::test_support as rpc_test;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1149,6 +1234,131 @@ mod tests {
             policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode::default(),
             extension_authentication_enabled: false,
         }
+    }
+
+    #[test]
+    fn rejected_installations_emit_reasons_and_withdraw_routes() {
+        for reason in [
+            InstallRejection::ConfigurationNotAdmitted,
+            InstallRejection::InvalidWorkspace,
+            InstallRejection::InvalidRoute,
+            InstallRejection::DuplicateServiceName,
+            InstallRejection::HostnameOutsideDomain,
+            InstallRejection::InvalidHostname,
+            InstallRejection::DuplicateHostname,
+            InstallRejection::HostnameInUse,
+        ] {
+            let router = Router {
+                domain: "apps.example.com".into(),
+                ..Default::default()
+            };
+            let instance = router.instance("sandbox-a").unwrap();
+            let route = SandboxServiceRoute {
+                endpoint_id: "endpoint-a".into(),
+                name: "web".into(),
+                target_port: 8080,
+                application_hostname: "web.apps.example.com".into(),
+                ..Default::default()
+            };
+            let initial = installed(vec![SandboxServiceRoute {
+                application_hostname: "initial.apps.example.com".into(),
+                ..route.clone()
+            }]);
+            instance.routes.install(&initial);
+            let owner = router.instance("sandbox-b").unwrap();
+            let mut rejected = installed(vec![route.clone()]);
+            match reason {
+                InstallRejection::ConfigurationNotAdmitted => {
+                    rejected.configuration_admitted = false;
+                    rejected.configuration_error = "unvalidated-error-details".into();
+                }
+                InstallRejection::InvalidWorkspace => {
+                    rejected.workspace = "invalid/workspace".into();
+                }
+                InstallRejection::InvalidRoute => rejected.service_routes[0].target_port = 0,
+                InstallRejection::DuplicateServiceName => {
+                    rejected.service_routes.push(route.clone());
+                }
+                InstallRejection::HostnameOutsideDomain => {
+                    rejected.service_routes[0].application_hostname =
+                        "web.other.example.com".into();
+                }
+                InstallRejection::InvalidHostname => {
+                    rejected.service_routes[0].application_hostname =
+                        "bad.label.apps.example.com".into();
+                }
+                InstallRejection::DuplicateHostname => {
+                    rejected.service_routes.push(SandboxServiceRoute {
+                        name: "other".into(),
+                        endpoint_id: "endpoint-b".into(),
+                        ..route.clone()
+                    });
+                }
+                InstallRejection::HostnameInUse => owner.routes.install(&installed(vec![route])),
+                _ => unreachable!("only tested rejections"),
+            }
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            instance.routes.install(&rejected);
+            instance.routes.install(&rejected);
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{reason:?}");
+            let event = &events[0];
+            assert_eq!(event["class_uid"], 5019);
+            assert_eq!(event["status_id"], StatusId::Failure as u8);
+            assert_eq!(event["severity_id"], SeverityId::Low as u8);
+            assert_eq!(event["unmapped"]["reason"], reason.reason());
+            assert_eq!(event["unmapped"]["sandbox"], "sandbox-a");
+            if reason == InstallRejection::InvalidWorkspace {
+                assert!(event["unmapped"].get("workspace").is_none());
+            } else {
+                assert_eq!(event["unmapped"]["workspace"], "default");
+            }
+            assert_eq!(
+                event["unmapped"]["config_revision"],
+                rejected.config_revision
+            );
+            assert_eq!(
+                event["message"],
+                format!("App listener service routes rejected: {}", reason.reason())
+            );
+            assert!(!event.to_string().contains("unvalidated-error-details"));
+            let snapshot = instance.routes.sender.borrow();
+            assert!(snapshot.routes.is_empty());
+            assert!(snapshot.expires.is_none());
+            drop(snapshot);
+            if reason == InstallRejection::HostnameInUse {
+                assert!(
+                    router.registrations.lock().unwrap()["web.apps.example.com"]
+                        .same_channel(&owner.routes.registration.as_ref().unwrap().sender)
+                );
+            }
+            rejected.config_revision += 1;
+            instance.routes.install(&rejected);
+            assert_eq!(capture.events().len(), 2);
+            rejected.configuration_instance_id = "runtime-b".into();
+            instance.routes.install(&rejected);
+            assert_eq!(capture.events().len(), 3);
+        }
+    }
+
+    #[test]
+    fn successful_installation_resets_rejection_logging() {
+        let routes = Routes::default();
+        let accepted = installed(Vec::new());
+        let mut rejected = accepted.clone();
+        rejected.configuration_admitted = false;
+        let capture = OcsfCapture::default();
+        let _guard = capture.install();
+        routes.install(&rejected);
+        routes.install(&rejected);
+        routes.install(&accepted);
+        routes.install(&rejected);
+        let events = capture.json_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["status_id"], StatusId::Failure as u8);
+        assert_eq!(events[1]["status_id"], StatusId::Success as u8);
+        assert_eq!(events[2]["status_id"], StatusId::Failure as u8);
     }
 
     struct Connector {
@@ -1594,13 +1804,22 @@ mod tests {
         let mut route = f.route.clone();
         route.application_hostname.clone_from(&hostname);
         let snapshot = installed(vec![route.clone()]);
-        let installer = std::thread::spawn(move || installing_routes.install(&snapshot));
+        let capture = OcsfCapture::default();
+        let thread_capture = capture.clone();
+        let installer = std::thread::spawn(move || {
+            let _guard = thread_capture.install();
+            installing_routes.install(&snapshot);
+        });
         probe.checked_running.wait();
         // Complete shutdown after install's optimistic stopped check but
         // before its registration insertion, rather than relying on timing.
         drop(f.handle);
         probe.resume.wait();
         installer.join().unwrap();
+        assert!(
+            capture.events().is_empty(),
+            "shutdown is not a configuration failure"
+        );
         assert!(
             !f.host
                 .router()

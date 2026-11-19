@@ -1782,7 +1782,11 @@ App traffic uses application/edge authentication independently of gateway
 user authentication. The discovery API publishes accepted listener installations. CLI URLs use the
 configured application origin when `base_url` is set, otherwise the gateway path.
 
-When enabled application routes are not published, check the authenticated
+When enabled application routes are not published, inspect supervisor OCSF events
+whose message starts with `App listener service routes rejected` for the reason
+and configuration revision. Identical rejections are suppressed until the
+configuration instance/revision or reason changes, or installation succeeds.
+Then check the authenticated
 supervisor session and installed configuration before checking ingress. The
 gateway requests installation evidence every five seconds with a fifteen-second
 lease measured from challenge issuance. Instances report only when their serving

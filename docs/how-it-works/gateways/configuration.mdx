@@ -2280,6 +2280,10 @@ seconds so healthy routes retain their 30-second freshness lease. Failed polls
 do not renew the lease; expiry closes affected application connections. Disabling
 the listener preserves the configured polling interval.
 
+If services disappear from discovery after a configuration change, check
+supervisor OCSF events named `App listener service routes rejected` for the
+rejection reason and configuration revision.
+
 On Kubernetes, provide a TLS Secret with `tls.crt` and `tls.key` matching
 `*.services.example.com` in each supervisor namespace, and allow your ingress
 clients to reach the app port through NetworkPolicy. The driver mounts the Secret

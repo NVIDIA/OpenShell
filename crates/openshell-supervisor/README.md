@@ -294,6 +294,11 @@ With the listener enabled, both polling and push maintenance cap their sleep at
 five seconds, even if the configured polling interval is longer. Failed polls
 do not renew routes. Ending the configuration loop suspends routes.
 
+Rejected route installations emit an OCSF configuration-change failure with
+the reason, configuration revision, and sandbox/workspace identity when available.
+Identical rejections are logged once per configuration instance/revision and
+reason until installation succeeds. Normal shutdown does not emit a rejection.
+
 `OPENSHELL_APP_LISTENER_ENABLED=true` explicitly enables the process listener.
 `OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_BASE_URL`,
 `OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. The domain
