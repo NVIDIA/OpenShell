@@ -920,6 +920,10 @@ They keep working and print a warning on every connection. Replace each pasted
 entry with new `openshell sandbox ssh-config` output, or use `--editor` on
 `sandbox connect` again for that sandbox.
 
+Set `OPENSHELL_SSH_REQUIRE_HOST_KEY=1` to refuse every unverified connection,
+to a sandbox with no published fingerprint or through such an entry, instead
+of connecting with a warning.
+
 ## Transfer Files
 
 Upload files from your host into the sandbox:

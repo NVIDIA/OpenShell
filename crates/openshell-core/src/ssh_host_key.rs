@@ -9,6 +9,7 @@
 //! fingerprint format, the pin location and file format, the `ssh` options,
 //! the `ssh-proxy` flags, and the scan of the server's key exchange reply.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
@@ -21,7 +22,11 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 
 use crate::forward::shell_escape;
 use crate::proto::CreateSshSessionResponse;
+use crate::settings::parse_bool_like;
 
+/// Set to refuse every SSH connection whose host key is not verified. Unset,
+/// such a connection goes ahead with a warning.
+pub const REQUIRE_HOST_KEY_ENV: &str = "OPENSHELL_SSH_REQUIRE_HOST_KEY";
 const FINGERPRINT_PREFIX: &str = "SHA256:";
 const UNVERIFIED: &str = "unverified";
 const HOST_KEY_ALGORITHM: &str = "ssh-ed25519";
@@ -122,6 +127,28 @@ impl HostKeyExpectation {
     }
 }
 
+/// Whether the user set [`REQUIRE_HOST_KEY_ENV`]. Only a value that reads as
+/// "no" turns it back off.
+fn host_key_required() -> bool {
+    requires_host_key(std::env::var_os(REQUIRE_HOST_KEY_ENV).as_deref())
+}
+
+fn requires_host_key(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| {
+        !value.is_empty() && value.to_str().and_then(parse_bool_like) != Some(false)
+    })
+}
+
+/// For a caller that just warned that nothing verifies the host key of its
+/// connection.
+pub fn permit_unverified() -> Result<(), HostKeyError> {
+    if host_key_required() {
+        Err(HostKeyError::Required)
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostKeyError {
     #[error("SSH host key fingerprint is not 'SHA256:' followed by 43 unpadded base64 characters")]
@@ -142,6 +169,17 @@ pub enum HostKeyError {
         expected: HostKeyFingerprint,
         presented: HostKeyFingerprint,
     },
+    #[error(
+        "SSH connection to sandbox '{sandbox}' (workspace '{workspace}') refused: {} is set and the gateway published no host key fingerprint.\n\
+         Upgrade a gateway that predates sandbox SSH identities; otherwise stop and start the sandbox.",
+        REQUIRE_HOST_KEY_ENV
+    )]
+    Unpublished { sandbox: String, workspace: String },
+    #[error(
+        "the SSH connection is refused because {} is set and its host key is not verified",
+        REQUIRE_HOST_KEY_ENV
+    )]
+    Required,
     #[error("malformed SSH stream from the sandbox: {0}")]
     Malformed(&'static str),
     #[error(
@@ -382,6 +420,12 @@ impl HostKeyCheck {
             HostKeyExpectation::Fingerprint(fingerprint) => Some(fingerprint),
             HostKeyExpectation::AcceptAny => None,
         })?;
+        if matches!(expectation, HostKeyExpectation::AcceptAny) && host_key_required() {
+            return Err(HostKeyError::Unpublished {
+                sandbox: pin.sandbox,
+                workspace: pin.workspace,
+            });
+        }
         Ok(Self { expectation, pin })
     }
 
@@ -923,6 +967,25 @@ mod tests {
                 fs::read_to_string(pin.path()).unwrap(),
                 PIN_HEADER,
                 "{content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_key_is_required_by_any_value_but_a_no() {
+        for (value, required) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("False"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("strict"), true),
+        ] {
+            assert_eq!(
+                requires_host_key(value.map(OsStr::new)),
+                required,
+                "{value:?}"
             );
         }
     }

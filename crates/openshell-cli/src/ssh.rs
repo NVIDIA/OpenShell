@@ -24,7 +24,7 @@ use openshell_core::proto::{
 };
 use openshell_core::ssh_host_key::{
     HostKeyCheck, HostKeyExpectation, HostKeyGate, KnownHostsPin, SandboxSshTarget,
-    host_key_alias as host_alias,
+    host_key_alias as host_alias, permit_unverified,
 };
 use openshell_core::upload::{
     DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
@@ -2202,6 +2202,7 @@ pub async fn sandbox_ssh_proxy_by_name(
             "{}",
             stale_ssh_config_warning(gateway_name, workspace, name)
         );
+        permit_unverified().into_diagnostic()?;
         None
     };
     let server = grpc_server_from_ssh_gateway_url(&session.gateway_url)?;

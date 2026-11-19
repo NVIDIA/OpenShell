@@ -9,6 +9,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use openshell_core::proto::{
     CreateSshSessionResponse, Sandbox, SandboxResponse, TcpForwardFrame, tcp_forward_frame,
 };
+use openshell_core::ssh_host_key::REQUIRE_HOST_KEY_ENV;
 use prost::Message;
 use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::{HashAlg, PrivateKey};
@@ -190,8 +191,18 @@ fn old_name_mode(gateway: SocketAddr) -> String {
     format!("ssh-proxy --server http://{gateway} --name {SANDBOX} --workspace {WORKSPACE}")
 }
 
-/// Runs `command` to completion.
-async fn finished(mut command: tokio::process::Command, config: &Path) -> Output {
+/// Runs `command` to completion. `require_host_key` is whether the user set
+/// `OPENSHELL_SSH_REQUIRE_HOST_KEY`.
+async fn finished(
+    mut command: tokio::process::Command,
+    config: &Path,
+    require_host_key: bool,
+) -> Output {
+    if require_host_key {
+        command.env(REQUIRE_HOST_KEY_ENV, "1");
+    } else {
+        command.env_remove(REQUIRE_HOST_KEY_ENV);
+    }
     let run = command
         .env("XDG_CONFIG_HOME", config)
         .env("OPENSHELL_TELEMETRY_ENABLED", "false")
@@ -208,10 +219,10 @@ async fn finished(mut command: tokio::process::Command, config: &Path) -> Output
 }
 
 /// Runs `openshell` with `args`, which are separated by single spaces.
-async fn openshell(args: &str, config: &Path) -> Output {
+async fn openshell(args: &str, config: &Path, require_host_key: bool) -> Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
     command.args(args.split(' '));
-    finished(command, config).await
+    finished(command, config, require_host_key).await
 }
 
 fn mismatch_message(published: &PrivateKey, presented: &PrivateKey) -> String {
@@ -272,7 +283,7 @@ async fn name_mode_proxy_withholds_a_key_the_gateway_did_not_publish() {
     let scratch = tempfile::tempdir().unwrap();
     let pin = scratch.path().join("known_hosts/pin");
 
-    let proxy = openshell(&name_mode(gateway, &pin), scratch.path()).await;
+    let proxy = openshell(&name_mode(gateway, &pin), scratch.path(), false).await;
 
     let stderr = String::from_utf8_lossy(&proxy.stderr);
     assert_eq!(proxy.status.code(), Some(1), "{stderr}");
@@ -301,7 +312,7 @@ async fn name_mode_proxy_warns_and_relays_when_the_gateway_published_no_key() {
     let scratch = tempfile::tempdir().unwrap();
     let pin = scratch.path().join("known_hosts/pin");
 
-    let proxy = openshell(&name_mode(gateway, &pin), scratch.path()).await;
+    let proxy = openshell(&name_mode(gateway, &pin), scratch.path(), false).await;
 
     let stderr = String::from_utf8_lossy(&proxy.stderr);
     assert!(proxy.status.success(), "{stderr}");
@@ -314,6 +325,16 @@ async fn name_mode_proxy_warns_and_relays_when_the_gateway_published_no_key() {
         std::fs::read_to_string(&pin).unwrap(),
         pin_content(Some(&key))
     );
+
+    let refused = openshell(&name_mode(gateway, &pin), scratch.path(), true).await;
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert_eq!(refused.stdout, b"");
+    // The error is wrapped to the terminal width.
+    assert!(stderr.contains("fingerprint"), "{stderr}");
+    assert!(stderr.contains(REQUIRE_HOST_KEY_ENV), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&pin).unwrap(), pin_content(None));
 }
 
 /// An `ssh` started by a client or a config entry from before host-key
@@ -339,7 +360,7 @@ async fn proxy_warns_and_relays_for_a_caller_that_predates_host_key_verification
             "SSH config entry for sandbox 'my-sb'",
         ),
     ] {
-        let proxy = openshell(&args, scratch.path()).await;
+        let proxy = openshell(&args, scratch.path(), false).await;
 
         let stderr = String::from_utf8_lossy(&proxy.stderr);
         assert!(proxy.status.success(), "{stderr}");
@@ -349,6 +370,14 @@ async fn proxy_warns_and_relays_for_a_caller_that_predates_host_key_verification
             stderr.contains("the SSH host key is NOT verified"),
             "{stderr}"
         );
+
+        let refused = openshell(&args, scratch.path(), true).await;
+
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{stderr}");
+        assert_eq!(refused.stdout, b"");
+        assert!(stderr.contains(caller), "{stderr}");
+        assert!(stderr.contains(REQUIRE_HOST_KEY_ENV), "{stderr}");
     }
 }
 
@@ -457,11 +486,12 @@ mod openssh {
             .args(overrides.iter().flat_map(|option| ["-o", option]))
             .args(sandbox_ssh_args(&proxy_command, "ERROR"))
             .args(["sandbox", COMMAND]);
-        finished(ssh, config).await
+        finished(ssh, config, false).await
     }
 
     /// Runs [`COMMAND`] through the config entry `sandbox ssh-config`
-    /// prints, with no other configuration and no options of its own.
+    /// prints, with no other configuration and no options of its own, for
+    /// a user who requires a verified host key.
     async fn ssh_through_config_entry(gateway: SocketAddr, config: &Path) -> Output {
         let gateway_dir = config.join("openshell/gateways").join(GATEWAY);
         std::fs::create_dir_all(&gateway_dir).unwrap();
@@ -476,7 +506,7 @@ mod openssh {
 
         let print_entry =
             format!("--gateway {GATEWAY} --workspace {WORKSPACE} sandbox ssh-config {SANDBOX}");
-        let printed = openshell(&print_entry, config).await;
+        let printed = openshell(&print_entry, config, false).await;
         assert!(
             printed.status.success(),
             "{}",
@@ -490,7 +520,7 @@ mod openssh {
             .arg(entry)
             .args(["-o", "BatchMode=yes"])
             .args([format!("openshell-{SANDBOX}.{WORKSPACE}").as_str(), COMMAND]);
-        finished(ssh, config).await
+        finished(ssh, config, true).await
     }
 
     /// The proxy accepts and forwards any key here, so the refusal is `ssh`'s

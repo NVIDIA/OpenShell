@@ -21,7 +21,9 @@ use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
-use openshell_core::ssh_host_key::{HostKeyCheck, HostKeyExpectation, KnownHostsPin};
+use openshell_core::ssh_host_key::{
+    HostKeyCheck, HostKeyExpectation, KnownHostsPin, permit_unverified,
+};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -4211,6 +4213,7 @@ async fn run_async() -> Result<()> {
                                 "openshell: warning: this SSH connection was started by an OpenShell client that predates host-key verification, so the SSH host key is NOT verified.\n\
                                  Restart that client (the openshell command or openshell term)."
                             );
+                            permit_unverified().map_err(|err| miette::miette!("{err}"))?;
                             None
                         }
                         // Nothing would pin a key for the `ssh` that reads the file.
