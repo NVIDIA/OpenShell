@@ -2,9 +2,11 @@
 
 The `conformance` crate holds the testkit suites for sandbox behavior that every
 compute driver must provide. The family is this one crate, its own workspace.
-It is a library: each module in `src/` is one suite, and `cargo test` and
-nextest run the tests as the library's unit tests. The crate also builds the
-`openshell-conformance` program, which runs the same tests.
+It is a library of suites, one module each in `src/`, and the
+`openshell-conformance` program that runs them. The program is the crate's test
+target (`harness = false`), so `openshell-conformance run`,
+`cargo test --bin openshell-conformance` and
+`cargo nextest run --bin openshell-conformance` all run the same code.
 
 | Suite | Covers |
 |---|---|
@@ -65,6 +67,11 @@ Feature and driver suites are not part of it. The
 [testkit README](../../testkit/README.md#test-programs) describes the commands
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
+
+To skip a test your environment does not support yet, set
+`OPENSHELL_TEST_UNSUPPORTED` to `conformance::<test>=<issue url>` entries (see
+the [testkit README](../../testkit/README.md#unsupported-tests)). It applies the
+same way under `run`, `cargo test` and nextest.
 
 ## Adding a test
 

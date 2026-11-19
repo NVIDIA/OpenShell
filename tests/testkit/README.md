@@ -259,6 +259,34 @@ Without a subcommand, the program takes libtest's arguments instead. A
 and nextest. In that mode tests run in one process, one at a time unless
 `--test-threads` says otherwise.
 
+### Unsupported tests
+
+An environment that cannot pass a test yet lists it in
+`OPENSHELL_TEST_UNSUPPORTED`, instead of putting `#[ignore]` on the test, which
+turns it off everywhere. The value is `<test>=<issue>` entries separated by
+commas and/or whitespace:
+
+```shell
+OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVIDIA/OpenShell/issues/1234"
+```
+
+`<test>` is the crate name (`_` for `-`), then the name libtest shows. The
+program reads the variable under every interface, so `openshell-conformance
+run`, `cargo test` and nextest agree: the test is ignored, so each shows SKIP,
+and `list` marks it `[unsupported: <issue>]`. A run prints the entries to
+stderr, so a forgotten variable is visible. `run`'s summary lists each
+unsupported test with its issue, and its JUnit report marks it `skipped` with
+an `unsupported` property. `run` passes the variable on to its test processes.
+
+A program applies only the entries for crates it links and ignores the rest, so
+one value can serve several programs. For those entries, the program exits 2
+before it lists or runs anything if an entry names no test, names one twice,
+names an `#[ignore]`d test, has an issue that is not an `https://` URL, or has
+no `=`. A malformed entry exits 2 in every program. Forcing an unsupported test
+to run (`--include-ignored`, `--ignored`, nextest's `--run-ignored`, or
+`run --include-ignored`) fails it with `unsupported: <issue>; remove the entry
+from OPENSHELL_TEST_UNSUPPORTED to run it`.
+
 A test's name is its module path without the crate name, then its function
 name, as in nextest. Its family, which groups tests in the JUnit report, is
 the first directory under the last `suites` directory in the crate's path:
