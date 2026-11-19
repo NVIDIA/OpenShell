@@ -192,8 +192,8 @@ conformance suite. See
 [tests/suites/conformance/README.md](tests/suites/conformance/README.md).
 
 Suites live under `tests/suites/`, in Cargo workspaces with their own
-lockfiles: `conformance`, `features`, and one workspace per driver suite under
-`drivers/<driver>`. Run the `conformance` suites against a local Docker
+lockfiles: `conformance`, `features`, `workloads`, and one workspace per driver
+suite under `drivers/<driver>`. Run the `conformance` suites against a local Docker
 gateway with:
 
 ```shell
@@ -220,7 +220,9 @@ contract and nothing a driver is free to change.
   sleep and hope.
 - If a behavior isn't documented, open an issue to document it. Don't write a
   test for it. A behavior that only some drivers have belongs in
-  `tests/suites/features` or `tests/suites/drivers`.
+  `tests/suites/features` or `tests/suites/drivers`. A real tool doing a
+  realistic task, such as a build with `make`, belongs in
+  `tests/suites/workloads` ([README](tests/suites/workloads/README.md)).
 - The only way to skip a test is `#[ignore = "<issue link>"]`, for a broken or
   flaky test.
 
