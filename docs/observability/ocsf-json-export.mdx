@@ -66,7 +66,7 @@ The gateway also emits an API Activity event for each call a user or mTLS operat
 
 `resources` names the workspace and the resources the call acted on.
 
-Records never include request or response bodies.
+Records never include credentials, tokens, environment variables, or standard input. Setting values appear only when [enabled](/how-it-works/gateways/configuration#gateway-mutation-records).
 
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 

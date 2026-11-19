@@ -268,6 +268,20 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
 
+### Partial gRPC test services
+
+With `test-support`, import mock server traits and servers from
+`openshell_server::test_support::grpc::open_shell_server`. These are generated
+from the public protobuf schema with the production message types and RPC paths.
+Omitted methods return `UNIMPLEMENTED`, so new RPCs need no edits to unrelated
+mocks. The production traits in `openshell_core::proto` still require every
+handler.
+
+The [mTLS fixture](../openshell-cli/tests/mtls_integration.rs) implements its
+successful responses, and the [streaming fixture](../openshell-cli/tests/sandbox_exec_streaming_integration.rs)
+implements only its three exercised RPCs. Streaming overrides return
+`tonic::codegen::BoxStream<T>` rather than declaring associated stream types.
+
 ## Sandbox identity broker
 
 `openshell.gateway.spiffe_broker` enables gateway-owned SPIFFE Broker API
