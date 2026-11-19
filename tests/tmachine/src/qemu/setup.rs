@@ -18,7 +18,7 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
         return Ok(machine.base_image.clone());
     }
 
-    let hash = setup_hash(machine, environment)?;
+    let hash = setup_layer_key(machine, environment)?;
     cached_layer(
         SETUP_DISKS,
         &machine.base_image,
@@ -30,7 +30,8 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
     .await
 }
 
-fn setup_hash(machine: &Machine, environment: &Environment) -> Result<String> {
+/// The hash that names the environment's setup layer (`disks/setup/<hash>.qcow2`).
+pub fn setup_layer_key(machine: &Machine, environment: &Environment) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(SETUP_CACHE_VERSION);
     hash_file(&mut hasher, &machine.base_image)
