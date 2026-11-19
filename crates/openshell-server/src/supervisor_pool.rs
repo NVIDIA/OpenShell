@@ -95,6 +95,8 @@ const CAPACITY_OBJECT_TYPE: &str = "supervisor_pool_capacity";
 /// Attempts of one owner change against concurrent changes of the same
 /// members' capacity.
 const TRANSITION_ATTEMPTS: usize = 16;
+const CAPACITY_REACHED: &str = "sandbox capacity reached; add supervisors or gateway replicas, \
+                                or raise the supervisor pool limits";
 /// Credential key of an instance's launch material in the credential store.
 const LAUNCH_MATERIAL_KEY: &str = "SHARED_INSTANCE_LAUNCH_MATERIAL";
 
@@ -1957,10 +1959,11 @@ impl SupervisorPool {
             .map_err(|error| format!("read supervisor instance owners: {error}"))?;
         let max_pool_instances = self.controller.max_pool_instances();
         if owners.len() >= max_pool_instances && !owners.contains_key(&assignment.route) {
-            return Err(format!(
-                "sandbox capacity reached: the cluster runs its limit of {max_pool_instances} \
-                 sandboxes; add gateway replicas or raise the supervisor pool limits"
-            ));
+            warn!(
+                max_pool_instances,
+                "supervisor pool is at its sandbox limit"
+            );
+            return Err(CAPACITY_REACHED.to_string());
         }
         let charges = charges_of(
             &self
@@ -1983,10 +1986,8 @@ impl SupervisorPool {
             max_instances,
         );
         let no_room = || {
-            format!(
-                "sandbox capacity reached: every supervisor runs its limit of {max_instances} \
-                 sandboxes; add supervisors or raise the per-supervisor limit"
-            )
+            warn!(max_instances, "every supervisor is at its sandbox limit");
+            CAPACITY_REACHED.to_string()
         };
         if targets.is_empty() {
             return Err(no_room());
