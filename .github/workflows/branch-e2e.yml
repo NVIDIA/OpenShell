@@ -21,8 +21,9 @@ jobs:
       pull-requests: read
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
-      run_integration: ${{ steps.labels.outputs.run_core_e2e }}
+      run_integration: ${{ steps.labels.outputs.run_integration }}
       run_core_e2e: ${{ steps.labels.outputs.run_core_e2e }}
+      run_workloads_e2e: ${{ steps.labels.outputs.run_workloads_e2e }}
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
       run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
@@ -47,22 +48,32 @@ jobs:
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              run_workloads_e2e="$(jq -r 'index("test:e2e-workloads") != null' <<< "$LABELS_JSON")"
               ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
+              run_workloads_e2e=true
               ;;
           esac
-          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
+          # The tmachine suites need the integration inputs.
+          if [ "$run_core_e2e" = "true" ] || [ "$run_workloads_e2e" = "true" ]; then
+            run_integration=true
+          else
+            run_integration=false
+          fi
+          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ] || [ "$run_workloads_e2e" = "true" ]; then
             run_any_e2e=true
           else
             run_any_e2e=false
           fi
 
           {
+            echo "run_integration=$run_integration"
             echo "run_core_e2e=$run_core_e2e"
+            echo "run_workloads_e2e=$run_workloads_e2e"
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
             echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
@@ -217,7 +228,7 @@ jobs:
   build-e2e-bundles:
     name: E2E suite bundles (x86_64-unknown-linux-musl)
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.run_integration == 'true'
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       contents: read
     runs-on: linux-amd64-cpu8
@@ -267,7 +278,7 @@ jobs:
   build-external-drivers:
     name: ${{ matrix.binary }} (${{ matrix.triple }})
     needs: [pr_metadata, version]
-    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       contents: read
     strategy:
@@ -305,7 +316,7 @@ jobs:
 
   build-vm-driver-linux:
     needs: [pr_metadata, version, build-binaries-linux]
-    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/build-vm-driver-linux.yml
@@ -414,7 +425,8 @@ jobs:
 
   # Run driver-independent conformance tests.
   conformance-integration:
-    needs: [prepare-integration, build-conformance]
+    needs: [pr_metadata, prepare-integration, build-conformance]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -432,7 +444,8 @@ jobs:
   # Run the testkit feature suites (tests/suites/features) on tmachine. The
   # environments and suites are listed in e2e-suites.yml.
   feature-specific-integration:
-    needs: [prepare-integration, build-e2e-bundles]
+    needs: [pr_metadata, prepare-integration, build-e2e-bundles]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -449,7 +462,8 @@ jobs:
   # Run the testkit driver suites (tests/suites/drivers) on tmachine. The
   # environments and suites are listed in e2e-suites.yml.
   driver-specific-integration:
-    needs: [prepare-integration, build-e2e-bundles]
+    needs: [pr_metadata, prepare-integration, build-e2e-bundles]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -465,7 +479,8 @@ jobs:
 
   # Run the Podman e2e suite on tmachine against the packaged gateway.
   podman-e2e-integration:
-    needs: prepare-integration
+    needs: [pr_metadata, prepare-integration]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -479,6 +494,24 @@ jobs:
         [
           {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"e2e-podman"}
         ]
+
+  # Run the testkit workloads suite (tests/suites/workloads) on tmachine, only
+  # with the test:e2e-workloads label or a manual run. The rows build the suite
+  # themselves, so other runs don't build it.
+  workloads-integration:
+    needs: [pr_metadata, prepare-integration]
+    if: needs.pr_metadata.outputs.run_workloads_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-suites.yml
+    with:
+      family: workloads
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   docker-e2e:
     needs: [pr_metadata, build-binaries-linux, build-conformance, build-images]
@@ -770,6 +803,19 @@ jobs:
       - kubernetes-workspace-operator-e2e
       - kubernetes-tracing-e2e
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
+
+  workloads-e2e-result:
+    name: Workloads E2E result
+    needs: [pr_metadata, workloads-integration]
+    if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_workloads_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
