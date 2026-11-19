@@ -1508,6 +1508,11 @@ fn is_filesystem_root(path: &str) -> bool {
                 rest = tail;
                 continue;
             }
+            // This well-known link names the Windows directory, not its
+            // containing volume. Preserve it and its subdirectories.
+            if dir.eq_ignore_ascii_case("SystemRoot") {
+                return false;
+            }
             // Other object paths can be links to whole volumes.
             return !dir.eq_ignore_ascii_case("Device") || is_device_root(tail, literal);
         }
@@ -3808,6 +3813,21 @@ network_policies:
             "/tmp/...",
         ] {
             assert!(!is_filesystem_root(path), "{path} is not a filesystem root");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_systemroot_directory_aliases() {
+        for prefix in ["//?/", "//./", "/??/", "//?/Global/"] {
+            for directory in ["SystemRoot", "systemroot"] {
+                for suffix in ["", "/", "/Temp"] {
+                    let path = format!("{prefix}GLOBALROOT/{directory}{suffix}");
+                    assert!(
+                        validate_filesystem_paths(&[], std::slice::from_ref(&path)).is_ok(),
+                        "{path} names the Windows directory or a subdirectory"
+                    );
+                }
+            }
         }
     }
 
