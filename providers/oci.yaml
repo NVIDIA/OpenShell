@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci.yaml
+#   openshell provider profile import -f providers/oci.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   none declared — this profile grants no egress.
+# Reference layout:  any image with the OCI CLI, an OCI SDK, or curl. The
+#                    sandbox never signs anything itself: it sends unsigned
+#                    requests and the proxy signs them at endpoints that set
+#                    `credential_signing: oci`.
+# Credential scope:  OCI_KEY_ID and OCI_PRIVATE_KEY. The key id is either
+#                    `<tenancy-ocid>/<user-ocid>/<fingerprint>` for an API key
+#                    or `ST$<security-token>` for a session, instance, resource,
+#                    or workload principal. The private key is the unencrypted
+#                    PKCS#1 or PKCS#8 PEM that pairs with it, stored on one
+#                    line as standard base64 (`base64 -w0 < oci_api_key.pem`);
+#                    PEM text with `\n` escapes is also accepted. Both values
+#                    stay at the gateway; the sandbox sees placeholders.
+#                      openshell provider create --name oci-prod --type oci \
+#                        --credential OCI_KEY_ID="$TENANCY/$USER/$FINGERPRINT" \
+#                        --credential OCI_PRIVATE_KEY="$(base64 -w0 < ~/.oci/oci_api_key.pem)"
+# Endpoint access:   none. Pair this profile with a sandbox policy or another
+#                    profile (see oci-object-storage.yaml and
+#                    oci-genai-native.yaml) that names the OCI hosts the
+#                    workload needs and selects it with
+#                    `credential_binding.provider`.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS https://identity.<region>.oraclecloud.com/20160918/users/<user-ocid>
+#                    with a sandbox policy endpoint for identity.<region>.oraclecloud.com
+#                    that sets credential_signing: oci.
+
+id: oci
+display_name: OCI
+description: Generic Oracle Cloud Infrastructure API access with proxy-side request signing
+category: other
+credentials:
+  - name: key_id
+    description: OCI signing key id (tenancy/user/fingerprint for an API key, or ST$<token> for a principal)
+    env_vars: [OCI_KEY_ID]
+    required: true
+  - name: private_key
+    description: Base64 of the unencrypted RSA private key PEM that pairs with the key id (single line, `base64 -w0 < key.pem`)
+    env_vars: [OCI_PRIVATE_KEY]
+    required: true

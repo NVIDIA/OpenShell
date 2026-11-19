@@ -497,6 +497,7 @@ declaration. Older supervisors keep their previous behavior.
 | Declared query parameter value | Agent uses the profile's `query_param`. | `GET /api?key=<placeholder>` |
 | Declared URL path slot | Agent uses the profile's `path_template`, including concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
 | AWS SigV4 signing | An endpoint configures `credential_signing`, and the proxy signs with the endpoint-bound AWS credentials. | `credential_signing: sigv4` |
+| OCI request signing | An endpoint configures `credential_signing: oci`, and the proxy signs with the endpoint-bound `OCI_KEY_ID` and `OCI_PRIVATE_KEY`. Bodies of POST, PUT, and PATCH requests are hashed into the signature. | `credential_signing: oci` |
 
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
