@@ -103,7 +103,9 @@ No additional profile flag is required. Header credentials resolve only in the
 declared header, query credentials only in the declared parameter, and path
 credentials only in the `{credential}` slot of their path template. Header names
 are case-insensitive. An `Authorization` binding accepts Bearer, token, and Basic
-authentication.
+authentication. For Basic authentication, the client base64-encodes
+`user:<placeholder>` in an `Authorization: Basic` header; the proxy decodes it,
+resolves the placeholder, and re-encodes the header.
 
 The credential's `auth_style` selects its placement. Fields for other styles are
 ignored, so a bearer credential with unused `query_param` or `path_template`
