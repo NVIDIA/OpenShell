@@ -465,7 +465,10 @@ principals. Certificate expiry and grant removal are rechecked on active watches
 All-workspaces collection includes future active workspaces and omits terminating
 ones, with a 64-workspace scan bound. Selected-workspace collection does not scan
 unrelated workspaces. Combined snapshots retain the 4,096-route/4-MiB output bound
-and ten-second collection deadline; each workspace scan retains its existing
+and ten-second deadline covering setup, collection, and final reauthorization.
+Caller/global capacity is reserved before workspace lookups. Watches retain
+caller capacity while updating workspace reservations, and each refresh has
+the same ten-second deadline. Each workspace scan retains its existing
 1,000-record/4-MiB input bounds. Overflow and storage failures are errors, never
 partial successful views. A workspace-set change during collection requires a
 retry; this is not a cross-resource transactional snapshot.

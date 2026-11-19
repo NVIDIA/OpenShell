@@ -106,10 +106,9 @@ impl DiscoveryState {
             .map_err(|_| Status::resource_exhausted("discovery caller or workspace limit exceeded"))
     }
 
-    pub(crate) fn admit(
+    fn admit_caller(
         &self,
         principal: &Principal,
-        workspaces: &[String],
         watch: bool,
     ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, Status> {
         let kind = if watch { "watch" } else { "snapshot" };
@@ -125,12 +124,34 @@ impl DiscoveryState {
             format!("{kind}:{}", principal_key(principal)?),
             WATCHES_PER_PRINCIPAL,
         )?);
+        Ok(permits)
+    }
+
+    fn admit_workspaces(
+        &self,
+        workspaces: &[String],
+        watch: bool,
+    ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, Status> {
+        let kind = if watch { "watch" } else { "snapshot" };
+        let mut permits = Vec::new();
         for workspace in workspaces {
             permits.push(self.share(
                 format!("{kind}:workspace:{workspace}"),
                 if watch { WATCHES_PER_WORKSPACE } else { 8 },
             )?);
         }
+        Ok(permits)
+    }
+
+    #[cfg(test)]
+    fn admit(
+        &self,
+        principal: &Principal,
+        workspaces: &[String],
+        watch: bool,
+    ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, Status> {
+        let mut permits = self.admit_caller(principal, watch)?;
+        permits.extend(self.admit_workspaces(workspaces, watch)?);
         Ok(permits)
     }
 
@@ -446,6 +467,40 @@ fn require_enabled(state: &ServerState) -> Result<(), Status> {
     Ok(())
 }
 
+struct PreparedSnapshot {
+    snapshot: ServiceRouteSnapshot,
+    workspaces: Vec<String>,
+    workspace_permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Caller/global capacity must be held before doing any authorization or
+/// workspace I/O. One deadline covers preparation through final reauthorization.
+async fn prepare_snapshot(
+    state: &ServerState,
+    principal: &mut Principal,
+    selection: &Selection,
+    recheck: Option<&BearerRecheck>,
+    watch: bool,
+) -> Result<PreparedSnapshot, Status> {
+    tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
+        authorize_selection(state, principal, selection).await?;
+        let workspaces = selection_workspaces(state, selection).await?;
+        let workspace_permits = state.discovery.admit_workspaces(&workspaces, watch)?;
+        let snapshot = selected_snapshot(state, principal, selection, &workspaces).await?;
+        if let Some(recheck) = recheck {
+            *principal = recheck.check(principal).await?;
+        }
+        authorize_selection(state, principal, selection).await?;
+        Ok(PreparedSnapshot {
+            snapshot,
+            workspaces,
+            workspace_permits,
+        })
+    })
+    .await
+    .map_err(|_| Status::unavailable("service discovery preparation timed out"))?
+}
+
 pub async fn get_snapshot(
     state: &Arc<ServerState>,
     request: Request<GetServiceRouteSnapshotRequest>,
@@ -456,16 +511,17 @@ pub async fn get_snapshot(
         request.get_ref().workspace_scope.as_ref(),
         &request.get_ref().workspaces,
     )?;
-    authorize_selection(state, &principal, &selection).await?;
-    let names = selection_workspaces(state, &selection).await?;
-    let _permits = state.discovery.admit(&principal, &names, false)?;
-    let snapshot = selected_snapshot(state, &principal, &selection, &names).await?;
-    if let Some(recheck) = request.extensions().get::<BearerRecheck>() {
-        principal = recheck.check(&principal).await?;
-    }
-    authorize_selection(state, &principal, &selection).await?;
+    let _caller_permits = state.discovery.admit_caller(&principal, false)?;
+    let prepared = prepare_snapshot(
+        state,
+        &mut principal,
+        &selection,
+        request.extensions().get::<BearerRecheck>(),
+        false,
+    )
+    .await?;
     Ok(Response::new(GetServiceRouteSnapshotResponse {
-        snapshot: Some(snapshot),
+        snapshot: Some(prepared.snapshot),
     }))
 }
 
@@ -479,25 +535,18 @@ pub async fn watch(
         request.get_ref().workspace_scope.as_ref(),
         &request.get_ref().workspaces,
     )?;
-    tokio::time::timeout(
-        SNAPSHOT_TIMEOUT,
-        authorize_selection(state, &principal, &selection),
-    )
-    .await
-    .map_err(|_| Status::unavailable("discovery authorization timed out"))??;
-    let mut admitted_names = selection_workspaces(state, &selection).await?;
-    let shares = state.discovery.admit(&principal, &admitted_names, true)?;
-    let recheck = request.extensions().get::<BearerRecheck>().cloned();
+    let caller_permits = state.discovery.admit_caller(&principal, true)?;
     let permit = state
         .discovery_watches
         .clone()
         .try_acquire_owned()
         .map_err(|_| Status::resource_exhausted("too many service discovery watches"))?;
-    let initial = selected_snapshot(state, &principal, &selection, &admitted_names).await?;
-    if let Some(recheck) = &recheck {
-        principal = recheck.check(&principal).await?;
-    }
-    authorize_selection(state, &principal, &selection).await?;
+    let recheck = request.extensions().get::<BearerRecheck>().cloned();
+    let PreparedSnapshot {
+        snapshot: initial,
+        workspaces: mut admitted_names,
+        workspace_permits: shares,
+    } = prepare_snapshot(state, &mut principal, &selection, recheck.as_ref(), true).await?;
     let mut revision = initial.revision.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.try_send(Ok(WatchServiceRoutesResponse {
@@ -507,6 +556,7 @@ pub async fn watch(
     let state = state.clone();
     tokio::spawn(async move {
         let _permit = permit;
+        let _caller_permits = caller_permits;
         let mut shares = Some(shares);
         let run = async {
             let mut interval = tokio::time::interval(REFRESH_INTERVAL);
@@ -517,11 +567,11 @@ pub async fn watch(
                     () = tx.closed() => return,
                     _ = interval.tick() => {}
                 }
-                let refresh = async {
+                let refresh = tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
                     let names = selection_workspaces(&state, &selection).await?;
                     if names != admitted_names {
                         drop(shares.take());
-                        shares = Some(state.discovery.admit(&principal, &names, true)?);
+                        shares = Some(state.discovery.admit_workspaces(&names, true)?);
                         admitted_names = names;
                     }
                     let snapshot =
@@ -531,10 +581,12 @@ pub async fn watch(
                     }
                     authorize_selection(&state, &principal, &selection).await?;
                     Ok::<_, Status>(snapshot)
-                };
+                });
                 let result = tokio::select! {
                     () = tx.closed() => return,
-                    result = refresh => result,
+                    result = refresh => result.unwrap_or_else(|_| {
+                        Err(Status::unavailable("service discovery refresh timed out"))
+                    }),
                 };
                 let message = match result {
                     Ok(next) if next.revision == revision => continue,
@@ -1838,6 +1890,152 @@ mod tests {
         let mut request = Request::new(body);
         request.extensions_mut().insert(principal.clone());
         request
+    }
+
+    #[tokio::test]
+    async fn exhausted_capacity_rejects_before_finite_or_all_workspace_lookups() {
+        for is_watch in [false, true] {
+            for global in [false, true] {
+                for all in [false, true] {
+                    let (state, principal, _dir) = reader_fixture(true).await;
+                    let blockers = if global {
+                        vec![vec![if is_watch {
+                            state
+                                .discovery_watches
+                                .clone()
+                                .try_acquire_many_owned(32)
+                                .unwrap()
+                        } else {
+                            state
+                                .discovery
+                                .unary
+                                .clone()
+                                .try_acquire_many_owned(u32::try_from(MAX_UNARY).unwrap())
+                                .unwrap()
+                        }]]
+                    } else {
+                        (0..WATCHES_PER_PRINCIPAL)
+                            .map(|_| state.discovery.admit_caller(&principal, is_watch).unwrap())
+                            .collect()
+                    };
+                    // Any workspace lookup would fail with a storage error instead
+                    // of the expected admission error, even for a granted reader.
+                    state.store.close().await;
+                    let body = GetServiceRouteSnapshotRequest {
+                        workspace_scope: all.then(openshell_core::proto::all_workspaces_selector),
+                        workspaces: if all {
+                            Vec::new()
+                        } else {
+                            (0..64).map(|n| format!("team-{n}")).collect()
+                        },
+                    };
+                    let result = if is_watch {
+                        watch(
+                            &state,
+                            reader_request(
+                                WatchServiceRoutesRequest {
+                                    workspace_scope: body.workspace_scope,
+                                    workspaces: body.workspaces,
+                                },
+                                &principal,
+                            ),
+                        )
+                        .await
+                        .map(|_| ())
+                    } else {
+                        get_snapshot(&state, reader_request(body, &principal))
+                            .await
+                            .map(|_| ())
+                    };
+                    assert_eq!(result.unwrap_err().code(), tonic::Code::ResourceExhausted);
+                    drop(blockers);
+                    assert_eq!(state.discovery.unary.available_permits(), MAX_UNARY);
+                    assert_eq!(state.discovery_watches.available_permits(), 32);
+                    let _callers = (0..WATCHES_PER_PRINCIPAL)
+                        .map(|_| state.discovery.admit_caller(&principal, is_watch).unwrap())
+                        .collect::<Vec<_>>();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_deadline_bounds_final_authentication_and_releases_capacity() {
+        use crate::auth::authenticator::{
+            AuthRejection, Authentication, Authenticator, AuthenticatorChain,
+        };
+        struct PendingCredential(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl Authenticator for PendingCredential {
+            async fn authenticate(
+                &self,
+                _: &http::HeaderMap,
+                _: &str,
+            ) -> Result<Authentication, AuthRejection> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        for is_watch in [false, true] {
+            let (state, _, _) = installed_fixture().await;
+            let principal = authed_request(())
+                .extensions()
+                .get::<Principal>()
+                .unwrap()
+                .clone();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let recheck = BearerRecheck {
+                chain: AuthenticatorChain::new(vec![Arc::new(PendingCredential(started.clone()))]),
+                headers: http::HeaderMap::new(),
+                policy: None,
+                path: if is_watch {
+                    "/openshell.v1.ServiceDiscovery/WatchServiceRoutes"
+                } else {
+                    "/openshell.v1.ServiceDiscovery/GetServiceRouteSnapshot"
+                }
+                .into(),
+            };
+            let server = state.clone();
+            let task = tokio::spawn(async move {
+                if is_watch {
+                    let mut req = authed_request(WatchServiceRoutesRequest {
+                        workspace_scope: request().workspace_scope,
+                        workspaces: Vec::new(),
+                    });
+                    req.extensions_mut().insert(recheck);
+                    watch(&server, req).await.map(|_| ())
+                } else {
+                    let mut req = authed_request(request());
+                    req.extensions_mut().insert(recheck);
+                    get_snapshot(&server, req).await.map(|_| ())
+                }
+            });
+            // Pause only after database/file work completes, so simulated time
+            // cannot race SQLite's blocking worker during fixture preparation.
+            tokio::time::timeout(Duration::from_secs(5), started.notified())
+                .await
+                .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(SNAPSHOT_TIMEOUT).await;
+            let error = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            tokio::time::resume();
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert_eq!(error.message(), "service discovery preparation timed out");
+            assert_eq!(state.discovery.unary.available_permits(), MAX_UNARY);
+            assert_eq!(state.discovery_watches.available_permits(), 32);
+            let _callers = (0..WATCHES_PER_PRINCIPAL)
+                .map(|_| {
+                    state
+                        .discovery
+                        .admit(&principal, &["default".into()], is_watch)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+        }
     }
 
     #[tokio::test]
