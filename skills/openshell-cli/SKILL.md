@@ -866,7 +866,7 @@ openshell sandbox exec work-session -- <client-command>
 The application owns the native base URL, model, request shape, and timeout.
 Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
 
-For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
+For an ordinary static provider update, wait for readiness and use `openshell sandbox exec` to launch a new client with the new reference, or recreate the sandbox to restart its main process. The update command includes this reminder in table output for credential updates with attached sandboxes. Do not claim that readiness updates the environment of an existing process or retargets its old reference. For live value-only rotation, configure `stable_placeholder: true` before starting the workload, or use gateway-managed refresh. Acknowledged detach revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 

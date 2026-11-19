@@ -23,6 +23,12 @@ uv add openshell
 
 The `openshell` package contains the SDK. It does not install the OpenShell CLI.
 
+For source builds, use `setuptools>=84.1.0`, which includes the fix for
+[GHSA-xmj3-9gf7-h52w](https://github.com/pypa/setuptools/security/advisories/GHSA-xmj3-9gf7-h52w).
+The declared build minimum remains `setuptools>=80` for compatibility with
+existing build environments. If you use a constrained package index or disable
+build isolation, upgrade the build environment to the patched version.
+
 ## Connect to a Registered Gateway
 
 Register and select a gateway with the CLI first. Then construct the client from

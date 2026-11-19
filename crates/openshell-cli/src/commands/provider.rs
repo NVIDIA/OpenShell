@@ -2820,6 +2820,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
         }
     }
 
+    let credentials_updated = !credential_map.is_empty();
     let response = client
         .update_provider(UpdateProviderRequest {
             request_id: String::new(),
@@ -2869,6 +2870,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             "gateway did not return a provider mutation receipt; saved credentials cannot establish readiness"
         ));
     }
+    let has_attached_sandboxes = !response.target_receipts.is_empty();
     finish_provider_mutation(
         &client,
         &response.mutation_id,
@@ -2882,7 +2884,22 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
         },
         readiness,
     )
-    .await
+    .await?;
+
+    // Explain the delivery contract without requiring profile-read permission
+    // or assuming every updated credential uses ordinary static references.
+    if credentials_updated && has_attached_sandboxes && readiness.output == "table" {
+        println!(
+            "  Ordinary static credentials: existing processes keep their old references, even with --wait."
+        );
+        println!(
+            "  After readiness, use `openshell sandbox exec` to launch a new client, or recreate the sandbox to restart its main process."
+        );
+        println!(
+            "  For live value-only rotation, configure stable_placeholder: true in the credential profile before starting the workload, or use gateway-managed refresh."
+        );
+    }
+    Ok(())
 }
 
 pub async fn provider_delete(

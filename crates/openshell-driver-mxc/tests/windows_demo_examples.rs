@@ -262,6 +262,21 @@ if (Test-Path -LiteralPath $cliStateRoot) { throw "temporary state not removed" 
 }
 
 #[test]
+fn windows_static_runtime_and_dependency_selection() {
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(examples().join("../../../tasks/scripts/windows-runtime-tests.ps1"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Windows dependency/runtime regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn windows_build_stages_only_unambiguous_target_matching_z3() {
     // Synthetic PE headers exercise packaging checks, not MXC containment.
     let root = tempfile::tempdir().unwrap();

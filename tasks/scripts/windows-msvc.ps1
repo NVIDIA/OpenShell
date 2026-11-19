@@ -6,14 +6,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "package-z3", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
     [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "native", "all")]
     [string] $Target = "all",
 
-    [string] $LogDir
+    [string] $LogDir,
+
+    [switch] $StaticRuntime = ($env:OPENSHELL_WINDOWS_STATIC_RUNTIME -ne '0'),
+
+    [switch] $Z3Source = ($env:OPENSHELL_WINDOWS_Z3_SOURCE -eq '1')
 )
 
 Set-StrictMode -Version Latest
@@ -24,6 +28,8 @@ if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Syst
 }
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+. (Join-Path $PSScriptRoot 'windows-runtime.ps1')
+. (Join-Path $PSScriptRoot 'windows-z3.ps1')
 if (-not $LogDir) {
     $LogDir = $RepoRoot
 }
@@ -36,6 +42,7 @@ $TargetDir = $env:CARGO_TARGET_DIR
 if ([string]::IsNullOrWhiteSpace($TargetDir)) {
     $TargetDir = Join-Path $RepoRoot "target"
 }
+$TargetDir = [IO.Path]::GetFullPath($TargetDir)
 
 $BuildJobsValue = $env:OPENSHELL_WINDOWS_BUILD_JOBS
 if ([string]::IsNullOrWhiteSpace($BuildJobsValue)) {
@@ -53,12 +60,16 @@ $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindo
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
-$PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
-$PrebuiltZ3ServerFeatures = "--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3"
-$PrebuiltZ3Version = "5.1.0"
-$Z3WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
-$Z3ServerFeatures = $PrebuiltZ3ServerFeatures
-$Z3GatewayFeatures = "--features prebuilt-z3"
+$Z3Pin = Get-Content -LiteralPath (Join-Path $RepoRoot 'tasks/windows-z3.json') -Raw | ConvertFrom-Json
+$Z3Version = $Z3Pin.version
+$Z3SourceSha256 = $Z3Pin.sourceSha256
+$PrebuiltZ3Version = $Z3Version
+# Each Cargo invocation restores the caller's overrides before resolving its
+# target. A preceding x64 build must never supply its library to ARM64.
+$UserZ3Environment = @{}
+foreach ($name in @('Z3_LIBRARY_PATH_OVERRIDE', 'Z3_SYS_Z3_HEADER', 'Z3_SRC_SOURCE_DIR', 'Z3_SYS_Z3_VERSION')) {
+    $UserZ3Environment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
 
 function Get-VsInstallRoots {
     $programFiles = @(
@@ -294,7 +305,7 @@ function Configure-Arm64CrossBuild([string[]] $RustTargets) {
     Write-Host "==> ARM64 cross-build toolchain"
     Write-Host "    clang-cl: $clangCl"
     Write-Host "    ninja:    $ninja"
-    Write-Host "    Z3:       MSVC cl.exe with the Visual Studio generator"
+    Write-Host "    Z3:       pinned prebuilt, or MSVC cl.exe with Ninja for source builds"
 }
 
 function Get-HostArch {
@@ -361,14 +372,118 @@ function Resolve-Z3HeaderPath([string] $HeaderPath) {
     return (Resolve-Path $HeaderPath).Path
 }
 
-function Configure-Z3 {
+function Resolve-Z3Source {
+    if ($env:Z3_SRC_SOURCE_DIR) {
+        $source = (Resolve-Path -LiteralPath $env:Z3_SRC_SOURCE_DIR).Path
+    } else {
+        # rust-cache prunes non-Cargo files under target, including VERSION.txt.
+        # Keep the complete source tree outside that cache's ownership.
+        $sourceRoot = Join-Path $RepoRoot '.cache/windows-z3-source'
+        $source = Join-Path $sourceRoot "z3-z3-$Z3Version"
+        if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+            $staging = Join-Path $sourceRoot ("download-" + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $staging -Force | Out-Null
+            try {
+                $archive = Join-Path $staging 'source.zip'
+                # Keep the existing Windows solver version. The z3-src crate's
+                # bundled source can advance independently of this release pin.
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/Z3Prover/z3/archive/refs/tags/z3-$Z3Version.zip" -OutFile $archive
+                if ((Get-Sha256 $archive) -ne $Z3SourceSha256) { throw 'Z3 source archive checksum mismatch.' }
+                # Hosted ARM64 runners can expose a PowerShell 7 archive module
+                # to Windows PowerShell 5.1. Use the .NET API shared by both.
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [IO.Compression.ZipFile]::ExtractToDirectory($archive, $staging)
+                New-Item -ItemType Directory -Path (Split-Path $source) -Force | Out-Null
+                Move-Item -LiteralPath (Join-Path $staging "z3-z3-$Z3Version") -Destination $source
+            } finally { Remove-Item -LiteralPath $staging -Recurse -Force }
+        }
+    }
+    $versionFile = Join-Path $source 'scripts/VERSION.txt'
+    if (-not (Test-Path -LiteralPath $versionFile) -or ([version](Get-Content -LiteralPath $versionFile -Raw).Trim()).ToString(3) -ne $Z3Version) {
+        throw "Z3 source must be version $Z3Version at $source."
+    }
+    return $source
+}
+
+function Test-PinnedZ3Available([string] $RustTarget) {
+    foreach ($profile in @('debug', 'release')) {
+        $cached = Join-Path $TargetDir "$RustTarget/$profile/build/z3-sys-*/out/z3-$Z3Version/bin/libz3.lib"
+        if (Get-Item -Path $cached -ErrorAction SilentlyContinue) { return $true }
+    }
+    $arch = switch ($RustTarget) {
+        'aarch64-pc-windows-msvc' { 'arm64' }
+        'x86_64-pc-windows-msvc' { 'x64' }
+        default { return $false }
+    }
+    # z3-sys still owns downloading and caching the release. Only probe a cold
+    # target so a genuinely missing release asset can select the source fallback.
+    $url = "https://github.com/Z3Prover/z3/releases/download/z3-$Z3Version/z3-$Z3Version-$arch-win.zip"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -UseBasicParsing -Method Head -Uri $url -TimeoutSec 30 | Out-Null
+        return $true
+    } catch {
+        $response = $_.Exception.PSObject.Properties['Response']
+        if ($response -and $response.Value -and [int]$response.Value.StatusCode -eq 404) { return $false }
+        # Keep the original z3-sys download/error handling for inconclusive
+        # probes. HEAD may be blocked even when GET works, and commands whose
+        # Cargo graph does not use Z3 must still work offline.
+        return $true
+    }
+}
+
+function Configure-Z3([string[]] $RustTargets) {
+    $sourceRequested = $Z3Source -or ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE) -and -not [string]::IsNullOrWhiteSpace($env:Z3_SRC_SOURCE_DIR))
+    if ($sourceRequested) {
+        $env:Z3_LIBRARY_PATH_OVERRIDE = $null
+        $env:Z3_SYS_Z3_HEADER = $null
+    }
+    if ($StaticRuntime -and $env:Z3_LIBRARY_PATH_OVERRIDE -and (Test-Path -LiteralPath (Join-Path $env:Z3_LIBRARY_PATH_OVERRIDE 'libz3.dll'))) {
+        Write-Warning 'Ignoring the legacy shared Z3 override for the default static build. Set OPENSHELL_WINDOWS_STATIC_RUNTIME=0 to use shared CRT/Z3 explicitly.'
+        $env:Z3_LIBRARY_PATH_OVERRIDE = $null
+        $env:Z3_SYS_Z3_HEADER = $null
+    }
     if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
-        Write-Host "==> Z3: prebuilt release"
-        $env:Z3_SYS_Z3_VERSION = $PrebuiltZ3Version
-        Write-Host "    Z3_SYS_Z3_VERSION=$env:Z3_SYS_Z3_VERSION"
-        return [pscustomobject]@{
-            WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
-            ServerFeatures = $PrebuiltZ3ServerFeatures
+        $useSource = $sourceRequested
+        if ($StaticRuntime -and -not $useSource) {
+            if ($RustTargets.Count -ne 1) { throw 'Resolve static Z3 separately for each Cargo target.' }
+            $package = Resolve-Z3Package $RustTargets[0]
+            if ($package) {
+                $env:Z3_LIBRARY_PATH_OVERRIDE = Join-Path $package 'lib'
+                $env:Z3_SYS_Z3_HEADER = Join-Path $package 'include/z3.h'
+                $env:Z3_SYS_Z3_VERSION = $Z3Version
+            } else { $useSource = $true }
+        }
+        if (-not $StaticRuntime -and -not $useSource) {
+            foreach ($rustTarget in $RustTargets) {
+                if (-not (Test-PinnedZ3Available $rustTarget)) {
+                    Write-Warning "Pinned Z3 $Z3Version prebuilt unavailable for $rustTarget; building pinned source."
+                    $useSource = $true
+                }
+            }
+        }
+        if (-not $useSource -and -not $env:Z3_LIBRARY_PATH_OVERRIDE) {
+            $env:Z3_SYS_Z3_VERSION = $Z3Version
+            Write-Host "==> Z3: pinned prebuilt $Z3Version (z3-sys download/cache)"
+            return [pscustomobject]@{
+                WorkspaceFeatures = '--features openshell-prover/prebuilt-z3'
+                ServerFeatures = '--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3'
+                GatewayFeatures = '--features prebuilt-z3'
+                FromSource = $false
+            }
+        }
+        if ($useSource) {
+            $env:Z3_SRC_SOURCE_DIR = Resolve-Z3Source
+            $env:Z3_SYS_Z3_VERSION = $Z3Version
+            $env:CMAKE_BUILD_PARALLEL_LEVEL = "$WindowsBuildJobs"
+            Write-Host "==> Z3: source $env:Z3_SRC_SOURCE_DIR (static CRT: $StaticRuntime)"
+            return [pscustomobject]@{
+                WorkspaceFeatures = '--features openshell-prover/vendored-z3'
+                ServerFeatures = '--features openshell-server/vendored-z3,openshell-prover/vendored-z3'
+                GatewayFeatures = '--features vendored-z3'
+                FromSource = $true
+            }
         }
     }
 
@@ -384,27 +499,164 @@ function Configure-Z3 {
 
     $env:Z3_LIBRARY_PATH_OVERRIDE = $libDir
     $env:Z3_SYS_Z3_HEADER = Resolve-Z3HeaderPath $env:Z3_SYS_Z3_HEADER
+    if ($StaticRuntime -and (Test-Path -LiteralPath (Join-Path $libDir 'libz3.dll'))) {
+        throw 'StaticRuntime requires a genuine static libz3.lib built with /MT. Remove the shared override to build pinned source, or supply a static library.'
+    }
 
     if (($env:PATH -split ";") -notcontains $libDir) {
         $env:PATH = "$libDir;$env:PATH"
     }
 
-    Write-Host "==> Z3: system"
+    Write-Host "==> Z3: supplied MSVC library (static packages require /MT)"
     Write-Host "    Z3_LIBRARY_PATH_OVERRIDE=$env:Z3_LIBRARY_PATH_OVERRIDE"
     Write-Host "    Z3_SYS_Z3_HEADER=$env:Z3_SYS_Z3_HEADER"
 
     return [pscustomobject]@{
         WorkspaceFeatures = ""
         ServerFeatures = ""
+        GatewayFeatures = ""
+        FromSource = $false
     }
+}
+
+function Reset-WindowsCMakeGeneratorCache([string] $RustTarget) {
+    foreach ($profile in @('debug', 'release')) {
+        $buildRoot = Join-Path $TargetDir "$RustTarget/$profile/build"
+        if (-not (Test-Path -LiteralPath $buildRoot)) { continue }
+        $stale = @(Get-ChildItem -LiteralPath $buildRoot -Filter 'z3-sys-*' -Directory | Where-Object {
+            $cache = Join-Path $_.FullName 'out/build/CMakeCache.txt'
+            if (Test-Path -LiteralPath $cache) {
+                Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=(?!Ninja$)' -Quiet
+            } else {
+                # A pruned cache can retain the archive without its build rules.
+                Test-Path -LiteralPath (Join-Path $_.FullName 'out/lib/libz3.lib')
+            }
+        })
+        if ($stale.Count) {
+            # Cargo must invalidate its build-script fingerprint and the linked
+            # archive too; deleting only CMake files can reuse an old solver.
+            $cargoProfile = if ($profile -eq 'debug') { 'dev' } else { 'release' }
+            Write-Host "==> Rebuilding cached $cargoProfile Z3 with Ninja"
+            & cargo clean -p z3-sys --target $RustTarget --profile $cargoProfile --target-dir $TargetDir
+            if ($LASTEXITCODE -ne 0) { throw 'Could not invalidate the old Z3 build cache.' }
+        }
+    }
+}
+
+function Invoke-Z3Package([string] $RustTarget) {
+    $source = Resolve-Z3Source
+    $vsDevCmd = Resolve-VsDevCmd $RustTarget
+    $ninja = Resolve-NinjaPath
+    $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    $cmakePath = if ($cmake) { $cmake.Source } else { Join-Path (Split-Path (Split-Path $ninja)) 'CMake/bin/cmake.exe' }
+    if (-not (Test-Path -LiteralPath $cmakePath)) { throw 'Install Visual Studio CMake tools to package Z3.' }
+    $build = Join-Path $TargetDir "z3-build/$Z3Version-msvc$($Z3Pin.msvcToolset)-v$($Z3Pin.packageRevision)/$RustTarget"
+    $output = Join-Path $TargetDir 'windows-z3-packages'
+    $install = Join-Path $build 'install'
+    $package = Join-Path $build 'package'
+    $toolsetRecord = Join-Path $build 'msvc-toolset.txt'
+    New-Item -ItemType Directory -Path $build, $output -Force | Out-Null
+    if (Test-Path -LiteralPath $package) { Remove-Item -LiteralPath $package -Recurse -Force }
+    $flags = @(
+        '-G Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_COMPILER=cl.exe', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
+        '-DZ3_BUILD_LIBZ3_SHARED=OFF', '-DZ3_BUILD_LIBZ3_MSVC_STATIC=ON',
+        '-DZ3_LINK_TIME_OPTIMIZATION=OFF', '-DZ3_BUILD_EXECUTABLE=ON',
+        '-DZ3_BUILD_TEST_EXECUTABLES=OFF', '-DZ3_ENABLE_EXAMPLE_TARGETS=OFF',
+        '-DZ3_BUILD_PYTHON_BINDINGS=OFF', '-DZ3_BUILD_DOTNET_BINDINGS=OFF', '-DZ3_BUILD_JAVA_BINDINGS=OFF'
+    )
+    $log = Join-Path $LogDir "package-z3-$RustTarget.log"
+    $cmd = @(
+        "call `"$vsDevCmd`" -arch=$(Get-VsTargetArch $RustTarget) -host_arch=$(Get-HostArch) -vcvars_ver=$($Z3Pin.msvcToolset)",
+        "set VCToolsVersion>`"$toolsetRecord`"",
+        "findstr /i /b /l /c:`"VCToolsVersion=$($Z3Pin.msvcToolset).`" `"$toolsetRecord`"",
+        "`"$cmakePath`" -S `"$source`" -B `"$build`" $($flags -join ' ') -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_INSTALL_PREFIX=`"$install`"",
+        "`"$cmakePath`" --build `"$build`" --target install --parallel $WindowsBuildJobs"
+    ) -join ' && '
+    Write-Host "==> Building pinned Z3 $Z3Version /MT package for $RustTarget (one-time dependency build)"
+    & cmd /d /c "$cmd > `"$log`" 2>&1"
+    if ($LASTEXITCODE -ne 0) {
+        if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 100 }
+        throw "Z3 package build requires MSVC $($Z3Pin.msvcToolset), CMake, and Ninja. See $log"
+    }
+    $solver = Join-Path $install 'bin/z3.exe'
+    Assert-StaticWindowsRuntime $solver $RustTarget
+    $version = & $solver -version
+    if ($LASTEXITCODE -ne 0 -or $version -notmatch "^Z3 version $([regex]::Escape($Z3Version))( |$)") { throw "Wrong packaged Z3 version: $version" }
+    $query = Join-Path $build 'smoke.smt2'
+    Set-Content -LiteralPath $query -Encoding ASCII -Value '(declare-const x Int) (assert (> x 0)) (check-sat) (assert (< x 0)) (check-sat)'
+    $answers = @(& $solver $query)
+    if ($LASTEXITCODE -ne 0 -or ($answers -join ',') -ne 'sat,unsat') { throw "Z3 solver smoke failed: $answers" }
+    if (Select-String -LiteralPath (Join-Path $build 'build.ninja') -Pattern '(?i)(?:/GL|-flto)(?:\s|$)' -Quiet) { throw 'Portable Z3 archives must not contain compiler-specific LTO objects.' }
+    New-Item -ItemType Directory -Path $package -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $install 'lib'), (Join-Path $install 'include') -Destination $package -Recurse
+    Copy-Item -LiteralPath (Join-Path $source 'LICENSE.txt') -Destination $package
+    $files = @(Get-ChildItem -LiteralPath $package -File -Recurse | ForEach-Object {
+        [ordered]@{ path = $_.FullName.Substring($package.Length + 1).Replace('\', '/'); sha256 = (Get-Sha256 $_.FullName).ToLowerInvariant(); size = $_.Length }
+    })
+    [ordered]@{
+        version = $Z3Version; target = $RustTarget; runtime = 'MT'; configuration = 'Release'; lto = $false
+        msvcToolset = (Get-Content -LiteralPath $toolsetRecord -Raw).Trim().Split('=')[1]
+        sourceUrl = "https://github.com/Z3Prover/z3/archive/refs/tags/z3-$Z3Version.zip"
+        sourceSha256 = $Z3SourceSha256; buildRevision = (& git -C $RepoRoot rev-parse HEAD)
+        cmakeFlags = $flags; solverSmoke = $answers; staticRuntimeAudit = 'passed'; files = $files
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $package 'build.json') -Encoding UTF8
+    $archive = Join-Path $output "z3-$Z3Version-$RustTarget-mt-v$($Z3Pin.packageRevision).zip"
+    if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::CreateFromDirectory($package, $archive, [IO.Compression.CompressionLevel]::Optimal, $false)
+    "$(Get-Sha256 $archive)  $(Split-Path -Leaf $archive)" | Set-Content -LiteralPath "$archive.sha256" -Encoding ASCII
+    Write-Host "==> Z3 package: $archive ($((Get-Item -LiteralPath $archive).Length) bytes)"
 }
 
 function Invoke-VsCargo {
     param(
         [Parameter(Mandatory = $true)] [string] $RustTarget,
         [Parameter(Mandatory = $true)] [string] $CargoArgs,
-        [Parameter(Mandatory = $true)] [string] $LogName
+        [Parameter(Mandatory = $true)] [string] $LogName,
+        [ValidateSet('Workspace', 'Server', 'Gateway', 'None')] [string] $Z3Scope = 'Workspace'
     )
+
+    $Z3FromSource = $false
+    foreach ($name in $UserZ3Environment.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $UserZ3Environment[$name], 'Process')
+    }
+    if ($Z3Scope -ne 'None') {
+        $z3 = Configure-Z3 @($RustTarget)
+        $Z3FromSource = $z3.FromSource
+        $features = $z3."${Z3Scope}Features"
+        if ($features) {
+            # Cargo feature options must precede test-harness arguments.
+            $separator = $CargoArgs.IndexOf(' -- ')
+            if ($separator -ge 0) { $CargoArgs = $CargoArgs.Insert($separator, " $features") }
+            else { $CargoArgs += " $features" }
+        }
+    }
+    # cmake-rs clears MSVC's configuration optimization flags when it selects
+    # the Visual Studio generator implicitly. Ninja preserves /O2 for Release
+    # Z3, including the dependency profile used by development/test builds.
+    if ($Z3FromSource) {
+        $ninja = Resolve-NinjaPath
+        Add-PathEntry (Split-Path -Parent $ninja)
+    }
+
+    if (($Z3FromSource -or $StaticRuntime) -and $CargoArgs.StartsWith('cargo ')) {
+        # The old prebuilt solver was optimized even in debug/test builds.
+        # An unoptimized native Z3 can exhaust otherwise unchanged solver budgets.
+        $configs = @()
+        if ($Z3FromSource -and $CargoArgs -notmatch '--manifest-path') {
+            $configs += '--config "' + (Join-Path $RepoRoot '.cargo/windows-msvc.toml') + '"'
+        }
+        if ($StaticRuntime) {
+            $configs += '--config "' + (Join-Path $RepoRoot '.cargo/windows-static.toml') + '"'
+        }
+        $configArgs = $configs -join ' '
+        if ($CargoArgs.StartsWith('cargo nextest run ')) {
+            # Nextest starts Cargo itself; global Cargo options are not forwarded.
+            $CargoArgs = 'cargo nextest run ' + $configArgs + ' ' + $CargoArgs.Substring(18)
+        } else {
+            $CargoArgs = 'cargo ' + $configArgs + ' ' + $CargoArgs.Substring(6)
+        }
+    }
 
     & rustup target add $RustTarget
     if ($LASTEXITCODE -ne 0) {
@@ -430,6 +682,13 @@ function Invoke-VsCargo {
         "set `"CARGO_INCREMENTAL=0`"",
         "set `"RUSTC_WRAPPER=$rustcWrapper`""
     )
+    if ($Z3FromSource) {
+        $environmentSetup += @(
+            'set "CMAKE_GENERATOR=Ninja"',
+            # z3-src otherwise adds MSBuild's -m argument to Ninja.
+            'if not defined CMAKE_CXX_COMPILER_LAUNCHER (set "CMAKE_CXX_COMPILER_LAUNCHER=cmake;-E;env")'
+        )
+    }
     if ($hostArch -eq "amd64" -and $RustTarget -eq "aarch64-pc-windows-msvc") {
         # Native ARM64 dependencies select their own compilers. Clear inherited
         # overrides so AWS-LC can select clang-cl inside its build script.
@@ -463,6 +722,7 @@ function Invoke-VsCargo {
             throw "Timed out waiting for another Windows Cargo task to finish."
         }
 
+        if ($Z3FromSource) { Reset-WindowsCMakeGeneratorCache $RustTarget }
         $cmdWithLog = "$cmd > `"$logPath`" 2>&1"
         & cmd /v:on /d /c $cmdWithLog
         $exitCode = $LASTEXITCODE
@@ -482,7 +742,7 @@ function Invoke-VsCargo {
 function Invoke-Check([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $Z3WorkspaceFeatures" `
+        -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget" `
         -LogName "build-$RustTarget-check.log"
     Assert-GatewayExcludesUnsupportedDriverCrates $RustTarget
 }
@@ -491,7 +751,7 @@ function Assert-GatewayExcludesUnsupportedDriverCrates([string] $RustTarget) {
     $logName = "build-$RustTarget-driver-tree.log"
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo tree -p openshell-gateway --target $RustTarget --prefix none" `
+        -Z3Scope None -CargoArgs "cargo tree -p openshell-gateway --target $RustTarget --prefix none" `
         -LogName $logName
 
     $logPath = Join-Path $LogDir $logName
@@ -507,24 +767,35 @@ function Assert-GatewayExcludesUnsupportedDriverCrates([string] $RustTarget) {
 function Invoke-Lint([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo clippy --workspace --all-targets --no-deps $WindowsClippyPackageExcludes --target $RustTarget $Z3WorkspaceFeatures -- $WindowsClippyLintArgs" `
+        -CargoArgs "cargo clippy --workspace --all-targets --no-deps $WindowsClippyPackageExcludes --target $RustTarget -- $WindowsClippyLintArgs" `
         -LogName "lint-$RustTarget-workspace.log"
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets --no-deps --target $RustTarget -- $WindowsClippyLintArgs" `
+        -Z3Scope None -CargoArgs "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets --no-deps --target $RustTarget -- $WindowsClippyLintArgs" `
         -LogName "lint-$RustTarget-e2e.log"
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets --target $RustTarget" `
+        -Z3Scope None -CargoArgs "cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets --target $RustTarget" `
         -LogName "lint-$RustTarget-governance-interceptor.log"
 }
 
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor --bin openshell-windows-sandbox $Z3WorkspaceFeatures" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor --bin openshell-windows-sandbox" `
         -LogName "build-$RustTarget-release.log"
-    Stage-Z3Runtime $RustTarget
+    if ($StaticRuntime) {
+        foreach ($binary in @('openshell-gateway.exe', 'openshell.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe')) {
+            Assert-StaticWindowsRuntime (Join-Path $TargetDir "$RustTarget/release/$binary") $RustTarget
+        }
+    }
+    if (Test-SharedWindowsZ3 (Join-Path $TargetDir "$RustTarget/release/openshell-gateway.exe")) {
+        Stage-Z3Runtime $RustTarget
+        return
+    }
+    # Do not leave a previously staged DLL in a directory used for ZIP packages.
+    $staleDll = Join-Path $TargetDir "$RustTarget/release/libz3.dll"
+    if (Test-Path -LiteralPath $staleDll) { Remove-Item -LiteralPath $staleDll }
 }
 
 function Stage-Z3Runtime([string] $RustTarget) {
@@ -563,7 +834,7 @@ function Invoke-Test([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $Z3WorkspaceFeatures" `
+        -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget" `
         -LogName "test-$RustTarget.log"
 }
 
@@ -571,7 +842,7 @@ function Invoke-PreCommitTest([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --features openshell-server/test-support $Z3ServerFeatures" `
+        -Z3Scope Server -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --features openshell-server/test-support" `
         -LogName "test-$RustTarget-precommit.log"
 }
 
@@ -585,7 +856,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3GatewayFeatures" `
+            -Z3Scope Gateway -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 
@@ -594,7 +865,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
         $variant = if ($features) { $features.Replace(",", "-") } else { "protocol-only" }
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3GatewayFeatures" `
+            -Z3Scope Gateway -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs" `
             -LogName "test-$RustTarget-selective-$variant.log"
     }
 }
@@ -603,7 +874,7 @@ function Invoke-MxcRealTests([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
+        -Z3Scope None -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
         -LogName "test-$RustTarget-mxc-real.log"
 }
 
@@ -658,10 +929,6 @@ if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")
 }
 
 if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "ci")) {
-    $z3Features = Configure-Z3
-    $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
-    $Z3ServerFeatures = $z3Features.ServerFeatures
-    $Z3GatewayFeatures = if ($z3Features.WorkspaceFeatures) { "--features prebuilt-z3" } else { "" }
     $env:LIBCLANG_PATH = Resolve-LibclangPath
     Add-PathEntry $env:LIBCLANG_PATH
     Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
@@ -669,6 +936,9 @@ if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-
 }
 
 switch ($Action) {
+    "package-z3" {
+        foreach ($rustTarget in $targets) { Invoke-Z3Package $rustTarget }
+    }
     "check" {
         foreach ($rustTarget in $targets) {
             Invoke-Check $rustTarget
@@ -688,7 +958,7 @@ switch ($Action) {
     "build-mxc-fixtures" {
         foreach ($rustTarget in $targets) {
             Invoke-VsCargo -RustTarget $rustTarget `
-                -CargoArgs "cargo build --release -p openshell-driver-mxc --example mxc-forwarding-agent --target $rustTarget" `
+                -Z3Scope None -CargoArgs "cargo build --release -p openshell-driver-mxc --example mxc-forwarding-agent --target $rustTarget" `
                 -LogName "build-$rustTarget-mxc-fixtures.log"
         }
     }
@@ -711,7 +981,7 @@ switch ($Action) {
         foreach ($rustTarget in $targets) {
             Assert-NativeTestTarget $rustTarget
             Invoke-VsCargo -RustTarget $rustTarget `
-                -CargoArgs "cargo test --release -p openshell-mxc-boundary --lib --target $rustTarget -- --test-threads=1" `
+                -Z3Scope None -CargoArgs "cargo test --release -p openshell-mxc-boundary --lib --target $rustTarget -- --test-threads=1" `
                 -LogName "test-$rustTarget-mxc-boundary.log"
         }
     }
@@ -719,7 +989,7 @@ switch ($Action) {
         foreach ($rustTarget in $targets) {
             Assert-NativeTestTarget $rustTarget
             Invoke-VsCargo -RustTarget $rustTarget `
-                -CargoArgs "cargo test --release -p openshell-mxc-boundary --lib --target $rustTarget native_same_container_loopback -- --ignored --nocapture --test-threads=1" `
+                -Z3Scope None -CargoArgs "cargo test --release -p openshell-mxc-boundary --lib --target $rustTarget native_same_container_loopback -- --ignored --nocapture --test-threads=1" `
                 -LogName "test-$rustTarget-mxc-loopback.log"
         }
     }
@@ -728,7 +998,7 @@ switch ($Action) {
             Assert-NativeTestTarget $rustTarget
             foreach ($testName in @('pc_https_egress_reads_injected_ca_bundle', 'pc_proxy_scopes_network_policy_to_socket_owner')) {
                 Invoke-VsCargo -RustTarget $rustTarget `
-                    -CargoArgs "cargo test --release -p openshell-driver-mxc --test wxc_exec_real --target $rustTarget $testName -- --ignored --exact --test-threads=1 --nocapture" `
+                    -Z3Scope None -CargoArgs "cargo test --release -p openshell-driver-mxc --test wxc_exec_real --target $rustTarget $testName -- --ignored --exact --test-threads=1 --nocapture" `
                     -LogName "test-$rustTarget-$testName.log"
             }
         }
@@ -737,18 +1007,23 @@ switch ($Action) {
         foreach ($rustTarget in $targets) {
             Assert-NativeTestTarget $rustTarget
             Invoke-VsCargo -RustTarget $rustTarget `
-                -CargoArgs "cargo test --release -p openshell-driver-mxc --lib --target $rustTarget etw_consumer::tests -- --test-threads=1 --nocapture" `
+                -Z3Scope None -CargoArgs "cargo test --release -p openshell-driver-mxc --lib --target $rustTarget etw_consumer::tests -- --test-threads=1 --nocapture" `
                 -LogName "test-$rustTarget-mxc-audit-attribution.log"
             Invoke-VsCargo -RustTarget $rustTarget `
-                -CargoArgs "cargo test --release -p openshell-server --lib --target $rustTarget $Z3ServerFeatures mxc_audit_example -- --nocapture" `
+                -Z3Scope Server -CargoArgs "cargo test --release -p openshell-server --lib --target $rustTarget mxc_audit_example -- --nocapture" `
                 -LogName "test-$rustTarget-mxc-audit-config.log"
             Invoke-VsCargo -RustTarget $rustTarget `
-                -CargoArgs "cargo test --release -p openshell-driver-mxc --test windows_demo_examples --target $rustTarget -- --test-threads=1 --nocapture" `
+                -Z3Scope None -CargoArgs "cargo test --release -p openshell-driver-mxc --test windows_demo_examples --target $rustTarget -- --test-threads=1 --nocapture" `
                 -LogName "test-$rustTarget-mxc-audit-examples.log"
             $package = Join-Path $TargetDir "mxc-ocsf-qualification-$rustTarget"
             New-Item -ItemType Directory -Force $package | Out-Null
-            foreach ($binary in @('openshell-gateway.exe', 'openshell.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe', 'libz3.dll')) {
+            foreach ($binary in @('openshell-gateway.exe', 'openshell.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe')) {
                 Copy-Item -LiteralPath (Join-Path $TargetDir "$rustTarget/release/$binary") -Destination $package -Force
+            }
+            if (Test-SharedWindowsZ3 (Join-Path $package 'openshell-gateway.exe')) {
+                Copy-Item -LiteralPath (Join-Path $TargetDir "$rustTarget/release/libz3.dll") -Destination $package -Force
+            } elseif (Test-Path -LiteralPath (Join-Path $package 'libz3.dll')) {
+                Remove-Item -LiteralPath (Join-Path $package 'libz3.dll')
             }
             foreach ($artifact in @('run-ocsf-audit.ps1', 'mxc-ocsf-audit.toml', 'ocsf-audit.yaml')) {
                 Copy-Item -LiteralPath (Join-Path $RepoRoot "crates/openshell-driver-mxc/examples/$artifact") -Destination $package -Force

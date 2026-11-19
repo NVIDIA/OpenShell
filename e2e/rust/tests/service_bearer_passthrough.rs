@@ -6,6 +6,8 @@
 //! Verifies application bearer authorization behavior through an exposed
 //! `OpenShell` service.
 
+use rustls::pki_types::pem::PemObject as _;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::net::Ipv4Addr;
@@ -129,7 +131,7 @@ fn load_certificates(
     let file = File::open(path)
         .map_err(|error| format!("open {description} '{}': {error}", path.display()))?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("parse {description} '{}': {error}", path.display()))
 }
@@ -138,7 +140,9 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     let file = File::open(path)
         .map_err(|error| format!("open client TLS key '{}': {error}", path.display()))?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
+    rustls::pki_types::PrivateKeyDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
         .map_err(|error| format!("parse client TLS key '{}': {error}", path.display()))?
         .ok_or_else(|| format!("client TLS key '{}' is empty", path.display()))
 }

@@ -242,9 +242,9 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 prost = "0.14"
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"
 sha1 = "0.10"
@@ -252,7 +252,6 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = { package = "noyalib", version = "0.0.53", default-features = false, features = ["std", "compat-serde-yaml"] }

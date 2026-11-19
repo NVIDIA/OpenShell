@@ -295,11 +295,13 @@ yet.
 
 ## Validation
 
-Windows release build tasks stage the pinned, target-matching `libz3.dll` beside
-the gateway and verify its architecture and copied SHA256. Conflicting cached
-DLLs fail the build instead of selecting an arbitrary runtime. Local E2E requires
-this adjacent DLL; rebuild for the native architecture if preflight reports it
-missing.
+Windows build tasks embed the CRT in all four executables and Z3 in the
+gateway by default. They download and cache the pinned Z3 5.1.0 static `/MT`
+package from GHCR, with source fallback when unavailable. Release builds reject
+Z3 or redistributable CRT DLL imports. The resulting executables need neither
+`libz3.dll` nor the Visual C++ redistributable. See
+[Windows build options](../../CONTRIBUTING.md#windows-full-build) for explicit
+source, library, and legacy shared-mode overrides.
 
 ### Remote Windows host
 
@@ -323,11 +325,11 @@ architecture before testing. `-BuildDirectory` selects a dedicated Cargo cache.
 `-SkipBuild` reuses existing artifacts without claiming they match current
 sources. `-Scenario` selects an existing harness scenario.
 
-The package includes `libz3.dll` from the target-specific Cargo build cache.
-Windows prebuilt Z3 uses a dynamic runtime DLL. Supply `-Z3DllPath` if multiple
-different cached versions exist or when using a custom Z3 build. The remote
-host needs the native Visual C++ runtime; the runner validates DLL architecture
-and gateway startup before invoking E2E.
+The remote helper reads gateway imports and includes `libz3.dll` only for
+shared builds. `-Z3DllPath` can select a matching DLL for those builds; their
+runtime host also needs the native Visual C++ runtime. The helper checks DLL
+architecture and gateway startup before E2E. Default static builds omit the DLL.
+The separate MXC executor retains its own prerequisites.
 
 The example gateway explicitly enables caller driver config so tests can submit
 their workload command and directory. MXC does not implement external-resource
@@ -474,10 +476,24 @@ binaries. This requires elevation or Performance Log Users membership. It checks
 the shipped config and coverage classifier before requiring all seven event types
 in the durable JSONL output; the ordinary E2E scenarios do not check this path.
 
-On the ARM64 test host (Windows build 28120, MXC 1.0.0), Sandboxing ETW records
-come from the shared Appinfo broker rather than the driver-owned executor.
-The consumer cannot correlate these records using the executor's PID and process
-generation, so live audit qualification currently fails even though the workload
-completes. The executor diagnostic log redacts its container identity. A trusted
-broker-to-launch correlation is needed; treating the shared broker PID as a
-sandbox identity would misattribute concurrent sandboxes and is not supported.
+On some Windows builds (observed on ARM64, Windows build 28000), Sandboxing ETW records
+come from the shared Appinfo broker rather than the driver-owned executor, so they
+cannot be matched to a sandbox by the executor's PID and process generation. The
+consumer attributes them through the `ProcessLaunched` record instead. That record
+names the process the OS started inside the sandbox, and it is attributed to a
+sandbox only when that process is a child of a live, registered executor (checked by
+the executor's process start key) and was created no later than the record was
+emitted. The record carries no start key for the child, so the creation-time bound
+is what rules out a PID that was reused before the record reached the consumer
+(records arrive about a second after they are emitted); when the bound cannot be
+established, the record is not attributed. The record's activity id then attributes
+the rest of the create burst. On a host that shows this behaviour, live audit
+qualification passes with all seven event types. Treating the shared broker PID as a sandbox identity would
+misattribute concurrent sandboxes and is not supported.
+
+Records that cannot be attributed are counted. The provider is system-wide, so some
+may belong to another gateway or consumer: a record that waited while this gateway
+had a live sandbox counts as possible loss and raises a warning that does not claim
+a confirmed gap, and one that arrived while it had none is counted separately and
+never warned about. Pending records are replayed and counted when the session stops,
+before the final warning.

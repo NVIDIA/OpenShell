@@ -32,16 +32,15 @@ flate2 = "1"
 futures = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-hickory-proto = "0.26.1"
+hickory-proto = "0.26.2"
 ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }
 rcgen = { workspace = true }
-regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }

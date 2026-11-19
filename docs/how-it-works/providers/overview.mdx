@@ -228,7 +228,7 @@ The update records which sandboxes are attached before saving the new credential
 
 Credential refresh status tells you whether OpenShell obtained credentials. [Provider readiness](/how-it-works/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
 
-After a static credential update completes, launch a new client process to use the updated reference. An existing process keeps its revision-scoped reference; readiness does not make that old reference resolve the new value. Acknowledged detach revokes retained references and removes them from environments for future launches.
+After an ordinary static credential update reaches readiness, use `openshell sandbox exec` to launch a new client process with the updated reference, or recreate the sandbox to restart its main process. An existing process keeps its revision-scoped reference, even with `--wait`. The update command reminds you of this in its default table output when credentials change on an attached provider. For live value-only rotation, configure a [stable placeholder](/how-it-works/providers/profiles#keep-an-externally-updated-placeholder-stable) before starting the workload, or use [gateway-managed refresh](/how-it-works/providers/profiles#configure-credential-refresh). Acknowledged detach revokes retained references and removes them from environments for future launches.
 
 Set or clear a credential expiry timestamp:
 

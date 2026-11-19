@@ -10,4 +10,4 @@ edition = "2024"
 openshell-conformance = { path = "../../../../crates/openshell-conformance" }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1.43", features = ["macros", "rt"] }
+tokio = { version = "1.53.3", features = ["macros", "rt"] }

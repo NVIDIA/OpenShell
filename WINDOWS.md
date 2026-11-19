@@ -82,14 +82,20 @@ mise run --skip-tools windows:build:arm64
 The tasks produce `openshell.exe`, `openshell-gateway.exe`,
 `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe` under
 `target/<target-triple>/release/`. Keep these binaries from the same build
-together with the matching `libz3.dll` staged by the build task. The target
-triples are `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
-`CARGO_TARGET_DIR` can override the output root.
-The runtime host also needs the matching Visual C++ runtime.
+together. The target triples are `x86_64-pc-windows-msvc` and
+`aarch64-pc-windows-msvc`. `CARGO_TARGET_DIR` can override the output root.
 
-The build uses pinned prebuilt Z3 by default. Compile and test hosts do not
-need a working MXC runtime; running native sandboxes does. These tasks do not
-install an MSI, register a Windows service, or publish a release.
+Windows tasks embed the CRT in all four executables and Z3 in the gateway by
+default. They reuse the pinned Z3 5.1.0 static `/MT` package from
+`ghcr.io/nvidia/openshell/z3`, verify its digests, and cache it locally. Downloads
+use HTTPS; Docker and a GHCR login are not required. Z3 builds from source only
+when its package is unavailable or source is explicitly requested. These
+executables do not need `libz3.dll` or the Visual C++ redistributable.
+See [Windows build options](CONTRIBUTING.md#windows-full-build) for overrides.
+
+Compile and test hosts do not need a working MXC runtime; running native
+sandboxes does. These tasks do not install an MSI, register a Windows service,
+or publish a release.
 
 ## Prepare and run MXC
 

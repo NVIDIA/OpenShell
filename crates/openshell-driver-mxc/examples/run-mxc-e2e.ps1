@@ -44,6 +44,8 @@
 #                      still there but its workload is not recovered, and the
 #                      record can be deleted and its name reused. processcontainer only.
 #   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
+#   socket-owner-normalized         - opt in to equivalent Windows policy paths.
+#   socket-owner-normalized-default - equivalent spelling is denied by default.
 
 [CmdletBinding()]
 param(
@@ -85,7 +87,7 @@ if (-not $BinaryDir) {
 }
 $savedEnv = @{}
 $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
-foreach ($name in @("OPENSHELL_MXC_MOCK_WXC", "OPENSHELL_WXC_EXEC_PATH", "OPENSHELL_COMPUTE_DRIVER", "OPENSHELL_MXC_SHARE_DIR")) {
+foreach ($name in @("OPENSHELL_MXC_MOCK_WXC", "OPENSHELL_WXC_EXEC_PATH", "OPENSHELL_COMPUTE_DRIVER", "OPENSHELL_MXC_SHARE_DIR", "OPENSHELL_WINDOWS_BINARY_PATH_NORMALIZATION")) {
     $exists = $processEnvironment.Contains($name)
     $savedEnv[$name] = [pscustomobject]@{
         Exists = $exists
@@ -809,9 +811,6 @@ try {
     if (-not (Test-Path $policyDir)) {
         throw "e2e-policies/ directory not found at $policyDir"
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $BinaryDir 'libz3.dll') -PathType Leaf)) {
-        throw "Missing libz3.dll beside the gateway. Re-run windows:build for this architecture, or package the matching Z3 runtime with these binaries."
-    }
 
     # Capture the pristine TOML once; every scenario renders a fresh copy from this.
     $tomlBase = Get-Content $tomlTemplate -Raw
@@ -943,14 +942,14 @@ try {
             Description = 'curl trusts the injected CA and observes the OpenShell HTTPS proxy certificate'
         }
     }
-    if ($Scenario -in @('socket-owner-allow', 'socket-owner-deny')) {
+    if ($Scenario -in @('socket-owner-allow', 'socket-owner-normalized', 'socket-owner-normalized-default', 'socket-owner-deny')) {
         $allScenarios += @{
             Name = $Scenario; PolicyFile = Join-Path $policyDir 'https-ca.yaml'
             SandboxId = 'own'; Backends = 'process_container'; Kind = 'socket-owner'
             PosTarget = Join-Path $DemoDir 'example.html'
             ControlTarget = Join-Path $DemoDir 'owner-launched.txt'
             ErrorTarget = Join-Path $DemoDir 'curl-stderr.txt'
-            ExpectAllowed = ($Scenario -eq 'socket-owner-allow')
+            ExpectAllowed = ($Scenario -in @('socket-owner-allow', 'socket-owner-normalized'))
             Description = 'network policy follows child curl rather than parent cmd'
         }
     }
@@ -1027,10 +1026,18 @@ try {
                 }
                 $policyText = $policyText.Replace('__HOST_SERVICE_PORT__', "$hostPort")
             }
-            # Preserve the exact Windows executable path used in the launch;
-            # network binary identities are compared as strings, not FS paths.
-            $policyText = $policyText.Replace('__CURL_EXE__', $curlExe.Replace("'", "''"))
-            if ($sc.Kind -eq 'socket-owner' -and -not $sc.ExpectAllowed) {
+            # The normalization regression changes only the policy spelling;
+            # the launched executable and its hash retain their original path.
+            $policyCurlExe = $curlExe
+            Remove-Item Env:OPENSHELL_WINDOWS_BINARY_PATH_NORMALIZATION -ErrorAction SilentlyContinue
+            if ($sc.Name -eq 'socket-owner-normalized') {
+                $env:OPENSHELL_WINDOWS_BINARY_PATH_NORMALIZATION = '1'
+            }
+            if ($sc.Name -in @('socket-owner-normalized', 'socket-owner-normalized-default')) {
+                $policyCurlExe = $curlExe.Replace('\', '/').ToUpperInvariant()
+            }
+            $policyText = $policyText.Replace('__CURL_EXE__', $policyCurlExe.Replace("'", "''"))
+            if ($sc.Name -eq 'socket-owner-deny') {
                 $policyText = $policyText.Replace($curlExe, $cmdExe)
             }
             Set-Content -Path $policyUsed -Value $policyText -Encoding UTF8

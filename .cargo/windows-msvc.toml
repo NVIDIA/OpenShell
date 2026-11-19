@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Loaded only by the Windows MSVC wrapper. Keep native Z3 optimized, as the
+# previous prebuilt DLL was, without changing Rust application debug profiles.
+# z3-sys forwards its OPT_LEVEL/DEBUG settings to the native CMake build.
+[profile.dev.package.z3-sys]
+opt-level = 3
+debug = false
+
+[profile.test.package.z3-sys]
+opt-level = 3
+debug = false
