@@ -706,13 +706,14 @@ Supervisor memory grows with the sandboxes it runs. Size
 `supervisor.resources` for `maxInstancesPerMember`; the defaults request
 `250m` CPU and `768Mi` memory, with a `1.5Gi` memory limit.
 
-The chart ships `values-scale-100k.yaml` as a starting point for a large
-cluster: 25 gateway replicas and a supervisor HPA from 50 to 800 replicas at
-128 sandboxes each. It needs an external database:
+The chart ships `values-scale-10k.yaml` as a starting point for about 10,000
+sandboxes: 2 gateway replicas with up to 40 supervisors each, and a supervisor
+HPA from 10 to 80 replicas at 128 sandboxes each. It needs an external
+database:
 
 ```shell
 helm install openshell <chart> -n openshell \
-  -f values-scale-100k.yaml --set server.externalDbSecret=<secret>
+  -f values-scale-10k.yaml --set server.externalDbSecret=<secret>
 ```
 
 ## Next Steps
