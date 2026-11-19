@@ -83,8 +83,8 @@ bug, keep the test and mark it unsupported there:
 CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`; the
 [testkit README](../../testkit/README.md#unsupported-tests) describes what the
 program does with it. Branch Checks runs the program with each environment's
-entries, so an unknown test or a bad issue URL fails there. A misspelled
-environment name isn't caught and never applies.
+entries, so an unknown test, a bad issue URL or an unknown environment name
+fails there.
 
 ## Adding a test
 
