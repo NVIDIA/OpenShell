@@ -194,8 +194,8 @@ OpenShell validates policies before they take effect.
 |---|---|
 | Paths must be absolute (start with `/`). | Rejected with `INVALID_ARGUMENT`. |
 | Paths must not contain `..` traversal. | Rejected with `INVALID_ARGUMENT`. |
-| Read-write paths must not be overly broad (for example, `/` alone). | Rejected with `INVALID_ARGUMENT`. |
-| Each path must not exceed 4096 characters. | Rejected with `INVALID_ARGUMENT`. |
+| Read-write paths must not name a filesystem root, including Windows drive, share, and device-namespace roots. | Rejected with `INVALID_ARGUMENT`. |
+| Each path must not exceed 4096 bytes. | Rejected with `INVALID_ARGUMENT`. |
 | Combined `read_only` + `read_write` paths must not exceed 256. | Rejected with `INVALID_ARGUMENT`. |
 
 ## Process Controls

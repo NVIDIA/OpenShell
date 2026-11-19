@@ -1431,6 +1431,10 @@ pub fn validate_filesystem_paths(
     }
 
     for path_str in read_write {
+        // Oversized paths already have a violation; do not parse them again.
+        if path_str.len() > MAX_PATH_LENGTH {
+            continue;
+        }
         if is_filesystem_root(path_str) {
             violations.push(PolicyViolation::OverlyBroadPath {
                 path: path_str.clone(),
@@ -1476,34 +1480,41 @@ fn is_filesystem_root(path: &str) -> bool {
     // `rest` follows a `\\?\`, `\\.\` or `\??\` prefix, which all name the
     // `\??` object directory: drive letters, `UNC`, `Global` (a link to
     // `\GLOBAL??`) and `GLOBALROOT` (a link to the object namespace root).
-    fn is_namespace_root(rest: &str, literal: bool) -> bool {
-        let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        if name.eq_ignore_ascii_case("Global") {
-            is_namespace_root(tail, literal)
-        } else if name.eq_ignore_ascii_case("GLOBALROOT") {
-            is_object_root(tail, literal)
-        } else if name.eq_ignore_ascii_case("UNC") {
-            only_root_components(skip_names(tail, 2), literal)
-        } else {
-            only_root_components(tail, literal)
+    fn is_namespace_root(mut rest: &str, literal: bool) -> bool {
+        // Namespace links can repeat. Consume them iteratively so stack usage
+        // does not depend on the number of components in an authored path.
+        loop {
+            let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            if name.eq_ignore_ascii_case("Global") {
+                rest = tail;
+                continue;
+            }
+            if !name.eq_ignore_ascii_case("GLOBALROOT") {
+                return if name.eq_ignore_ascii_case("UNC") {
+                    only_root_components(skip_names(tail, 2), literal)
+                } else {
+                    only_root_components(tail, literal)
+                };
+            }
+
+            // GLOBALROOT enters the object namespace. Drive-letter
+            // directories lead back to this loop; Device names a volume.
+            let object_path = tail.trim_start_matches('/');
+            let (dir, tail) = object_path.split_once('/').unwrap_or((object_path, ""));
+            if ["??", "GLOBAL??", "DosDevices"]
+                .iter()
+                .any(|name| dir.eq_ignore_ascii_case(name))
+            {
+                rest = tail;
+                continue;
+            }
+            // Other object paths can be links to whole volumes.
+            return !dir.eq_ignore_ascii_case("Device") || is_device_root(tail, literal);
         }
     }
-    // `rest` is an object path below `\`, such as `Device\HarddiskVolume4\`.
-    // A path outside `\Device` and the drive-letter directories is treated as
-    // a root, because a link there can name a whole volume.
-    fn is_object_root(rest: &str, literal: bool) -> bool {
-        let rest = rest.trim_start_matches('/');
-        let (dir, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        if ["??", "GLOBAL??", "DosDevices"]
-            .iter()
-            .any(|name| dir.eq_ignore_ascii_case(name))
-        {
-            return is_namespace_root(tail, literal);
-        }
-        if !dir.eq_ignore_ascii_case("Device") {
-            return true;
-        }
-        let (device, mut tail) = tail.split_once('/').unwrap_or((tail, ""));
+    // `rest` follows `\Device\`, such as `HarddiskVolume4\`.
+    fn is_device_root(rest: &str, literal: bool) -> bool {
+        let (device, mut tail) = rest.split_once('/').unwrap_or((rest, ""));
         // A disk is `Harddisk0\Partition2`; a network redirector is followed
         // by optional `;`-prefixed connection names, a server and a share.
         let names = if device
@@ -3876,6 +3887,28 @@ network_policies:
     #[test]
     fn validate_accepts_read_only_filesystem_root() {
         assert!(validate_filesystem_paths(&["/".to_string()], &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_namespace_paths_without_parsing() {
+        for segment in ["Global/", "GLOBALROOT/??/"] {
+            let path = format!("//?/{}C:/", segment.repeat(20_000));
+            let length = path.len();
+            let violations = validate_filesystem_paths(&[], &[path]).unwrap_err();
+            assert!(
+                matches!(violations.as_slice(), [PolicyViolation::FieldTooLong { length: actual, .. }] if *actual == length),
+                "oversized namespace path must return only its length violation"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_root_detection_handles_deep_namespace_links() {
+        for segment in ["Global/", "GLOBALROOT/??/", "GLOBALROOT/GLOBAL??/Global/"] {
+            let root = format!("//?/{}C:/", segment.repeat(20_000));
+            assert!(is_filesystem_root(&root));
+            assert!(!is_filesystem_root(&format!("{root}work")));
+        }
     }
 
     #[test]
