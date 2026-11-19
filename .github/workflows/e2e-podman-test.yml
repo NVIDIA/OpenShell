@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      unsupported:
+        description: "Conformance tests this lane can't pass yet, as comma-separated <test>=<issue url> entries (OPENSHELL_TEST_UNSUPPORTED)"
+        required: false
+        type: string
+        default: ""
       external-driver-binary:
         required: false
         type: string
@@ -78,6 +83,8 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Run tests
+        env:
+          OPENSHELL_TEST_UNSUPPORTED: ${{ inputs.unsupported }}
         run: ${{ matrix.cmd }}
 
       - name: Print AppArmor denials

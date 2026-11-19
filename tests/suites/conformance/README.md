@@ -68,10 +68,26 @@ Feature and driver suites are not part of it. The
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
 
-To skip a test your environment does not support yet, set
-`OPENSHELL_TEST_UNSUPPORTED` to `conformance::<test>=<issue url>` entries (see
-the [testkit README](../../testkit/README.md#unsupported-tests)). It applies the
-same way under `run`, `cargo test` and nextest.
+### Marking a test unsupported in CI
+
+When a test can't pass in one environment yet, for example because of a driver
+bug, keep the test and mark it unsupported there:
+
+1. File an issue for the bug.
+2. Add an entry that names the test and the issue, where the environment runs:
+   - tmachine rows: an `unsupported` list on the row in
+     `.github/workflows/e2e-suites.yml`, such as
+     `"unsupported":[{"test":"conformance::lifecycle::<name>","issue":"https://github.com/NVIDIA/OpenShell/issues/<n>"}]`.
+     The runner passes it to the program in the guest.
+   - Host lanes (`e2e-docker-test.yml`, `e2e-podman-test.yml`,
+     `e2e-kubernetes-test.yml`, `e2e-vm-test.yml`): the `unsupported` input
+     from the caller, as comma-separated `<test>=<issue url>` entries.
+3. Delete the entry in the PR that fixes the bug.
+
+The program skips the test in every way of running it; see the
+[testkit README](../../testkit/README.md#unsupported-tests). Locally, set
+`OPENSHELL_TEST_UNSUPPORTED` to the same `conformance::<test>=<issue url>`
+entries.
 
 ## Adding a test
 

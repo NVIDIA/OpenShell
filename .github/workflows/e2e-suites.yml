@@ -84,7 +84,12 @@ jobs:
           # installer registers with the CLI: `openshell` for the packages,
           # `tmachine` for the k3s and binaries installers. A row without a
           # package runs every package in the workspace; each driver suite is a
-          # workspace of its own.
+          # workspace of its own. A row may list tests its environment can't
+          # pass yet as "unsupported":[{"test":"conformance::<module>::<name>",
+          # "issue":"https://github.com/NVIDIA/OpenShell/issues/<n>"}]; the
+          # program skips them (OPENSHELL_TEST_UNSUPPORTED in the testkit
+          # README). Open an issue for the bug and add an entry on each row
+          # that hits it; delete the entry in the PR that fixes it.
           rows='[
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb-external-docker-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true},
@@ -121,6 +126,7 @@ jobs:
               select($family == "" or .family == $family or (.family | startswith($family + "/")))
               | select((.external_driver // false) == false or $external == "true")
               | .package //= ""
+              | .unsupported //= []
               | .suite = (if .package == "" then .family else "\(.family)/\(.package)" end)
               | .artifact = ([.suite, .environment, .installer] | join("-") | gsub("/"; "-"))
               | .bundle = "openshell-e2e-bundle-\(.family | gsub("/"; "-"))-x86_64-unknown-linux-musl"
@@ -211,7 +217,20 @@ jobs:
           FAMILY: ${{ matrix.family }}
           PACKAGE: ${{ matrix.package }}
           GATEWAY: ${{ matrix.gateway }}
+          UNSUPPORTED: ${{ toJSON(matrix.unsupported) }}
         run: |
+          # The runner passes the variable on to the guest.
+          OPENSHELL_TEST_UNSUPPORTED="$(jq -r 'map("\(.test)=\(.issue)") | join(",")' <<< "${UNSUPPORTED}")"
+          export OPENSHELL_TEST_UNSUPPORTED
+          # The program ignores entries for crates it doesn't link, so a typo
+          # in the crate would silently run the test. Catch it here.
+          if [ -n "${OPENSHELL_TEST_UNSUPPORTED}" ]; then
+            bad="$(jq -r --arg package "${PACKAGE:-${FAMILY}}" '.[] | select(.test | startswith($package + "::") | not) | .test' <<< "${UNSUPPORTED}")"
+            if [ -n "${bad}" ]; then
+              echo "::error::unsupported entries must start with '${PACKAGE:-${FAMILY}}::': ${bad}"
+              exit 1
+            fi
+          fi
           # Retry dependency preparation, then run the suites once. Without
           # prebuilt tests, the runner builds the suites for the guest, so it
           # needs no prepared archives.
