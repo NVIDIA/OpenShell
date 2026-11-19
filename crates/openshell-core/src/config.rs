@@ -520,6 +520,9 @@ pub struct ServiceRoutingConfig {
     /// Opt in to gateway authentication for proxied application requests.
     /// Independent of the supervisor application listener.
     pub auth_enabled: bool,
+    /// Exact trusted HTTPS control-plane origins for browser service login.
+    /// Empty disables browser login without affecting bearer or mTLS access.
+    pub auth_login_origins: Vec<String>,
 
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
@@ -577,6 +580,23 @@ impl ServiceRoutingConfig {
     /// deploying platform is responsible for, since a single gateway cannot
     /// observe its siblings.
     pub fn validate(&self, installation_name: &str) -> crate::error::Result<()> {
+        for value in &self.auth_login_origins {
+            let valid = url::Url::parse(value).is_ok_and(|origin| {
+                origin.scheme() == "https"
+                    && origin.host_str().is_some_and(|host| !host.contains('*'))
+                    && origin.username().is_empty()
+                    && origin.password().is_none()
+                    && origin.path() == "/"
+                    && origin.query().is_none()
+                    && origin.fragment().is_none()
+                    && origin.port() != Some(0)
+            });
+            if !valid {
+                return Err(crate::error::Error::Config {
+                    message: "service_auth_login_origins must contain HTTPS origins without credentials, paths, queries, or fragments".into(),
+                });
+            }
+        }
         if self.service_hostname_format == ServiceHostnameFormat::Hashed
             && !is_dns_label(installation_name)
         {
@@ -1516,6 +1536,7 @@ impl Default for ServiceRoutingConfig {
         Self {
             enabled: true,
             auth_enabled: false,
+            auth_login_origins: Vec::new(),
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
             service_hostname_format: ServiceHostnameFormat::default(),
@@ -2045,6 +2066,30 @@ mod tests {
                 .grpc_rate_limit(),
             Some((10, Duration::from_mins(1)))
         );
+    }
+
+    #[test]
+    fn browser_service_login_requires_exact_https_origins() {
+        let mut config = super::ServiceRoutingConfig::default();
+        assert!(config.auth_login_origins.is_empty());
+        for invalid in [
+            "http://gateway.example.com",
+            "https://*.example.com",
+            "https://user:password@gateway.example.com",
+            "https://gateway.example.com/login",
+            "https://gateway.example.com?query=1",
+            "https://gateway.example.com#fragment",
+            "https://gateway.example.com:0",
+            "not-an-origin",
+        ] {
+            config.auth_login_origins = vec![invalid.into()];
+            assert!(config.validate("gateway").is_err());
+        }
+        config.auth_login_origins = vec![
+            "https://gateway.example.com".into(),
+            "https://127.0.0.1:8443".into(),
+        ];
+        config.validate("gateway").unwrap();
     }
 
     #[test]

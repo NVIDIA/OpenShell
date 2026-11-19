@@ -2035,6 +2035,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.config.bind_address = addr;
+        inner.config.service_routing.auth_login_origins =
+            vec![format!("https://gateway.example.test:{}", addr.port())];
         inner.config.tls = Some(openshell_core::TlsConfig {
             cert_path: dir.path().join("server-cert.pem"),
             key_path: dir.path().join("server-key.pem"),

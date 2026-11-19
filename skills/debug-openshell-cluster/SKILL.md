@@ -1865,7 +1865,9 @@ WebSocket upgrades require configured gateway authentication and workspace user
 access with the app listener disabled or enabled. OIDC scope enforcement requires `sandbox:write` (or `openshell:all`),
 as for TCP forwarding. Check HTTP 401 for missing/invalid/expired/revoked
 credentials and 403 for role/scope/membership/origin denial. Browser login starts
-at the control-plane `/auth/services?service_origin=...`; the app host receives
+at the control-plane `/auth/services?service_origin=...`. Configure exact trusted control-plane origins in
+`openshell.gateway.service_auth_login_origins`. An empty list disables browser
+login; include the public port and use the same list on every replica. The app host receives
 only a single-use code and a Secure/HttpOnly cookie. Check shared database and
 credential-driver availability across replicas. Browser sessions expire within
 ten minutes and reauthorize on every request. DELETE the same-origin app paths

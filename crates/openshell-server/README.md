@@ -414,14 +414,17 @@ role/scope policy (`sandbox:write` when enforced) and current workspace membersh
 operators retain their platform grant. Internal principals are rejected. Only
 explicit local-development unauthenticated access bypasses this gate.
 
-`/auth/services` hosts browser login on the control-plane origin. The application
+`/auth/services` hosts browser login on an exact control-plane origin allowed by
+`[openshell.gateway].service_auth_login_origins`. The empty default disables
+browser login without affecting bearer or mTLS application access. The application
 origin receives a single-use bootstrap code bound to a browser login nonce, then
 a distinct host-only, Secure/HttpOnly session cookie. Shared metadata contains
 only credential-driver handles and hashes; the configured credential driver
 stores the access token. Login codes expire after two minutes, sessions after
 at most ten minutes or token expiry. Every request revalidates the token and
 workspace authorization. Session deletion, credential revocation, and redemption
-CAS use the shared database. Expired metadata cleanup and admission are bounded.
+CAS use the shared database. Redemption atomically replaces the pending record
+without consuming another session slot. Expired metadata cleanup and admission are bounded.
 The application path consumes standard gateway bearer headers, or authenticates
 through a separate `X-OpenShell-Authorization`, browser session, or mTLS identity
 while preserving application bearer passthrough and cookies. Gateway headers and
