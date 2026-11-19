@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Run Gator's review team: the generalist reviewer plus focused members chosen
+# by review mode and changed code, in parallel through the harness sub-agent
+# adapter, then merge their findings into one review-findings envelope.
+# Exits nonzero without writing output if any member or the merge fails.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: review-team --task TASK.md --ledger LEDGER.json --diff REVIEW.diff --out REVIEW_FINDINGS.raw.json
+
+Environment:
+  OPENSHELL_AGENT_PAYLOAD_DIR  Agent payload (default: /etc/openshell/agent-payload)
+  REVIEW_TEAM_WORKDIR          Keep member prompts and outputs here (default: temporary)
+  REVIEW_TEAM_SUBAGENT         Sub-agent command, called as `CMD ID < PROMPT`
+                               (default: bash $PAYLOAD/runtime/subagent.sh)
+  REVIEW_TEAM_MEMBERS          Space-separated focused members to consider instead
+                               of the config's default members
+  REVIEW_TEAM_MEMBER_REASONING Reasoning effort for focused members, overriding
+                               the config's member_reasoning; passed to the
+                               sub-agent adapter as OPENSHELL_SUBAGENT_REASONING
+EOF
+    exit 2
+}
+
+task="" ledger="" diff="" out=""
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --task) task="${2:?}"; shift 2 ;;
+        --ledger) ledger="${2:?}"; shift 2 ;;
+        --diff) diff="${2:?}"; shift 2 ;;
+        --out) out="${2:?}"; shift 2 ;;
+        *) usage ;;
+    esac
+done
+[[ -r "$task" && -r "$ledger" && -r "$diff" && -n "$out" ]] || usage
+
+payload="${OPENSHELL_AGENT_PAYLOAD_DIR:-/etc/openshell/agent-payload}"
+refs="$payload/skills/gator-gate/references"
+config="$refs/review-team.json"
+[[ -r "$config" ]] || { echo "review-team: missing $config" >&2; exit 1; }
+subagent="${REVIEW_TEAM_SUBAGENT:-bash $(printf '%q' "$payload/runtime/subagent.sh")}"
+
+if [[ -n "${REVIEW_TEAM_WORKDIR:-}" ]]; then
+    work="$REVIEW_TEAM_WORKDIR"
+    mkdir -p "$work"
+else
+    work="$(mktemp -d "${TMPDIR:-/tmp}/review-team.XXXXXX")"
+    trap 'rm -rf "$work"' EXIT
+fi
+work="$(cd "$work" && pwd)"
+
+mode="$(jq -r '.review_scope.mode' "$ledger")"
+head_sha="$(jq -r '.review_scope.current_head_sha' "$ledger")"
+[[ "$mode" =~ ^(initial|follow_up|critical_only)$ ]] || {
+    echo "review-team: ledger review mode '$mode' does not need a review" >&2
+    exit 1
+}
+[[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "review-team: ledger has no head SHA" >&2; exit 1; }
+
+# Choose members by mode, changed paths, and added lines. Members with
+# "default": false run only when REVIEW_TEAM_MEMBERS names them.
+sed -n 's|^diff --git a/.* b/||p' "$diff" | sort -u > "$work/changed-paths.txt"
+grep '^+' "$diff" | grep -v '^+++' > "$work/added-lines.txt" || true
+jq -r --arg mode "$mode" --arg only "${REVIEW_TEAM_MEMBERS:-}" \
+    --rawfile paths "$work/changed-paths.txt" --rawfile added "$work/added-lines.txt" '
+    ($paths | split("\n") | map(select(. != ""))) as $p |
+    ($only | split(" ") | map(select(. != ""))) as $o |
+    .members[] | select(.modes | index($mode)) |
+    select(if $o == [] then .default != false else (.id as $id | $o | index($id)) end) |
+    select(
+        .when == null or
+        (.when.paths // [] | any(. as $re | $p | any(test($re)))) or
+        (.when.added_lines as $re | $re != null and ($added | test($re)))
+    ) | .id' "$config" > "$work/members.txt"
+generalist="$(jq -r .generalist "$config")"
+members=("$generalist")
+while read -r m; do
+    members+=("$m")
+done < "$work/members.txt"
+echo "review-team: mode=$mode members=${members[*]}" >&2
+
+envelope_ok() {
+    jq -e --arg head "$head_sha" --arg mode "$mode" '
+        .schema_version == 1 and .reviewed_head_sha == $head and
+        .review_mode == $mode and (.findings | type == "array") and
+        all(.findings[]; (.id | type == "string" and length > 0))
+    ' "$1" >/dev/null 2>&1
+}
+
+# Focused members must show the scenarios they checked, and checklist members
+# must give a verdict for every rule; otherwise the member is retried.
+member_ok() {
+    local id="$1" output="$2" rules=0 checklist
+    envelope_ok "$output" || return 1
+    [[ "$id" != "$generalist" ]] || return 0
+    checklist="$(jq -r --arg id "$id" '.members[] | select(.id == $id) | .checklist // empty' "$config")"
+    [[ -z "$checklist" ]] || rules="$(grep -cE '^[0-9]+\. ' "$refs/$checklist")"
+    jq -e --argjson rules "$rules" '
+        (.analysis | type == "array" and length > 0) and
+        all(.analysis[]; (.scenarios | type == "array" and length > 0) and
+            all(.scenarios[]; (.checked_at | type == "array" and length > 0) and
+                (.verdict | IN("ok", "defect", "unclear")))) and
+        ($rules == 0 or (
+            (.checklist | type == "array") and
+            ([.checklist[].rule] | sort) == [range(1; $rules + 1)]
+        ))
+    ' "$output" >/dev/null 2>&1
+}
+
+run_member() {
+    local id="$1" prompt="$2" output="$3" log="$4" attempt
+    local retries reasoning=""
+    retries="$(jq -r '.retries // 0' "$config")"
+    if [[ "$id" != "$generalist" ]]; then
+        reasoning="${REVIEW_TEAM_MEMBER_REASONING:-$(jq -r '.member_reasoning // empty' "$config")}"
+    fi
+    for (( attempt = 0; attempt <= retries; attempt++ )); do
+        rm -f "$output"
+        if ( [[ -z "$reasoning" ]] || export OPENSHELL_SUBAGENT_REASONING="$reasoning"
+             bash -c "$subagent $(printf '%q' "$id") < $(printf '%q' "$prompt")" ) \
+            >> "$log" 2>&1 && member_ok "$id" "$output"; then
+            return 0
+        fi
+        echo "review-team: $id attempt $((attempt + 1)) failed" >> "$log"
+    done
+    return 1
+}
+
+member_prompt() {
+    local id="$1" output="$2"
+    {
+        printf '# Review team assignment\n\n'
+        printf 'You are the `%s` member of the Gator review team.\n\n' "$id"
+        printf 'Write your JSON envelope to `%s`. This replaces any output path named\n' "$output"
+        printf 'in the task below. Do not write any other file.\n\n'
+        if [[ "$id" == "$generalist" ]]; then
+            printf 'Use final Gator finding IDs as the task describes.\n\n'
+        else
+            printf 'Use the provisional finding ID prefix `%s`.\n\n' \
+                "$(jq -r --arg id "$id" '.members[] | select(.id == $id) | .prefix' "$config")"
+            cat "$refs/$(jq -r .member_rules "$config")"
+            while read -r ref; do
+                printf '\n'
+                cat "$refs/$ref"
+            done < <(jq -r --arg id "$id" '.members[] | select(.id == $id) | .references // [] | .[]' "$config")
+            printf '\n'
+        fi
+        printf -- '---\n\n'
+        cat "$task"
+    } > "$work/$id.prompt.md"
+}
+
+pids=()
+for id in "${members[@]}"; do
+    member_prompt "$id" "$work/$id.json"
+    run_member "$id" "$work/$id.prompt.md" "$work/$id.json" "$work/$id.log" &
+    pids+=("$!")
+done
+failed=()
+for i in "${!members[@]}"; do
+    wait "${pids[$i]}" || failed+=("${members[$i]}")
+done
+for id in "${members[@]}"; do
+    printf '== review-team member %s\n' "$id" >&2
+    cat "$work/$id.log" >&2
+done
+if (( ${#failed[@]} )); then
+    echo "review-team: members failed: ${failed[*]}" >&2
+    exit 1
+fi
+
+# Skip the merge when no focused member found anything.
+focused_findings=0
+for id in "${members[@]:1}"; do
+    focused_findings=$(( focused_findings + $(jq '.findings | length' "$work/$id.json") ))
+done
+if (( focused_findings == 0 )); then
+    cp "$work/$generalist.json" "$out"
+    exit 0
+fi
+
+merge="$(jq -r .merge "$config")"
+merge_out="$work/$merge.json"
+{
+    printf '# Review merge task\n\n'
+    printf 'Head SHA: %s\nReview mode: `%s`\n\n' "$head_sha" "$mode"
+    printf 'Write the merged envelope to `%s`. Do not write any other file.\n\n' "$merge_out"
+    printf '## Feedback ledger\n\n```json\n'
+    cat "$ledger"
+    printf '\n```\n'
+    for id in "${members[@]}"; do
+        printf '\n## Member `%s`\n\n```json\n' "$id"
+        cat "$work/$id.json"
+        printf '\n```\n'
+    done
+} > "$work/$merge.prompt.md"
+
+for id in "${members[@]}"; do
+    jq -r --arg m "$id" '.findings[] | "\($m):\(.id)"' "$work/$id.json"
+done | sort > "$work/merge-inputs.txt"
+
+merge_ok() {
+    envelope_ok "$merge_out" && jq -e --rawfile inputs "$work/merge-inputs.txt" '
+        ($inputs | split("\n") | map(select(. != "")) | sort) as $in |
+        ([.merge_report.merged[]?.sources[]?] + [.merge_report.dropped[]?.source]) as $seen |
+        ($seen | sort) == $in and
+        ([.merge_report.merged[]?.id] | sort) == ([.findings[].id] | sort)
+    ' "$merge_out" >/dev/null 2>&1
+}
+
+retries="$(jq -r '.retries // 0' "$config")"
+for (( attempt = 0; attempt <= retries; attempt++ )); do
+    rm -f "$merge_out"
+    if bash -c "$subagent $(printf '%q' "$merge") < $(printf '%q' "$work/$merge.prompt.md")" \
+        >> "$work/$merge.log" 2>&1 && merge_ok; then
+        printf '== review-team merge\n' >&2
+        cat "$work/$merge.log" >&2
+        cp "$merge_out" "$out"
+        exit 0
+    fi
+    echo "review-team: merge attempt $((attempt + 1)) failed or did not account for every finding" >> "$work/$merge.log"
+done
+printf '== review-team merge\n' >&2
+cat "$work/$merge.log" >&2
+echo "review-team: merge failed" >&2
+exit 1

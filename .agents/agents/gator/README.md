@@ -152,3 +152,6 @@ The test suite requires Bash, Ruby, Node.js, jq, and ripgrep on the host. It moc
 ```shell
 mise run test:gator
 ```
+
+To measure reviewer changes against past review misses, see
+[`evals/README.md`](evals/README.md).
