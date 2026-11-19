@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATOR_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-RESOLVER="$SCRIPT_DIR/resolve-gator-review-threads"
+RESOLVER="$SCRIPT_DIR/../bin/resolve-gator-review-threads"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

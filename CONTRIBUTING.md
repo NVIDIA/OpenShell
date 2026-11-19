@@ -436,7 +436,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
-| `.agents/`      | Contributor skills and persona definitions    |
+| `.agents/`      | Contributor skills and [agents](.agents/agents/README.md) |
 
 ## RFCs
 

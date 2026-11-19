@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATOR_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-LEDGER="$SCRIPT_DIR/review-feedback-ledger"
+LEDGER="$SCRIPT_DIR/../bin/review-feedback-ledger"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -406,14 +406,14 @@ rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
   "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-   abort unless manifest.fetch("payload_version") == 13
+   abort unless manifest.fetch("payload_version") == 14
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }
   abort unless resource.fetch("destination") ==
     "skills/gator-gate/references/review-findings-schema.md"
 ' "$GATOR_DIR/agent.yaml"
-rg -Fq 'manifest.fetch("resources", [])' "$GATOR_DIR/../run.sh"
+rg -Fq 'manifest.fetch("resources", [])' "$GATOR_DIR/../../../scripts/agents/run.sh"
 rg -Fq 'Gator payload version: {{PAYLOAD_VERSION}}' \
     "$GATOR_DIR/prompts/gator.md"
 rg -q 'review-feedback-ledger NVIDIA OpenShell <pr-number>' \

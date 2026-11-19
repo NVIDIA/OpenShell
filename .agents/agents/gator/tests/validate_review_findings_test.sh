@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VALIDATOR="$SCRIPT_DIR/validate-review-findings"
+VALIDATOR="$SCRIPT_DIR/../bin/validate-review-findings"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
