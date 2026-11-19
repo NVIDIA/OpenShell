@@ -18,6 +18,10 @@ The four executables embed the CRT and the gateway embeds Z3. The build audits
 normal and delayed PE imports and excludes standalone Z3 DLLs. Preserve the Z3
 license and pinned dependency record. Path-remapping rustflags must also include
 `-C target-feature=+crt-static` because environment flags override Cargo config.
+These release builds use `OPENSHELL_WINDOWS_Z3_SOURCE=1` with MSVC C++ path
+remapping. The default pinned prebuilt libraries embed their producer's absolute
+source paths, which fail the release privacy check. Source mode retains the
+repository's Z3 version and verified source checksum.
 
 Authenticode signing changes binary hashes. After signing all EXEs, PowerShell
 scripts, and SDK JavaScript files,

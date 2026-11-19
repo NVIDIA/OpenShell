@@ -71,6 +71,7 @@ for arch, machine in (('arm64', 0xAA64), ('x64', 0x8664)):
     assert record['source'] == SOURCE and record['architecture'] == arch
     assert record['launchChecks'] == 'passed' and record['version'] == VERSION
     assert record['runtime'] == 'static-crt-and-z3'
+    assert record['z3BuildMode'] == 'pinned-source-with-path-remapping'
     assert {p.name for p in native.iterdir()} == set(PE_FILES) | {'build-record.json'}
     z3_pin = json.loads((ROOT / 'source/tasks/windows-z3.json').read_text())
     assert record['z3Pin'] == z3_pin
@@ -99,7 +100,7 @@ Version: {VERSION}, stamped in the workspace manifest. This is different from th
 Workflow: {RUN}
 Automation commit: `{os.environ['GITHUB_SHA']}`.
 
-The four executables were compiled on a native GitHub-hosted {arch} Windows runner using `{record['rust']}`, Visual Studio MSVC, and `mise run --skip-tools windows:build:{arch}`. The separately built validation fixture is excluded. Rust and native crypto source paths were remapped. All four executables embed the C runtime, and the gateway embeds Z3. Normal and delayed imports were audited for external Z3 and redistributable CRT dependencies. The pinned Z3 dependency record is in dependencies/windows-z3.json; its license remains in licenses/Z3-LICENSE.txt. No Z3 DLL is distributed. Both SDKs were built from the same pinned source in this workflow.
+The four executables were compiled on a native GitHub-hosted {arch} Windows runner using `{record['rust']}`, Visual Studio MSVC, and `mise run --skip-tools windows:build:{arch}`. The separately built validation fixture is excluded. Rust and native crypto source paths were remapped. All four executables embed the C runtime, and the gateway embeds Z3. Normal and delayed imports were audited for external Z3 and redistributable CRT dependencies. Z3 was built with the repository's explicit source mode using its pinned version and verified source checksum, with C++ source paths remapped. The source pin is in dependencies/windows-z3.json; that record also lists the default prebuilt package digests, which this release build did not consume. The Z3 license remains in licenses/Z3-LICENSE.txt. No Z3 DLL is distributed. Both SDKs were built from the same pinned source in this workflow.
 
 The source SBOM was regenerated from this exact source commit in this workflow. It covers the broader source tree and is not an exact linked-binary inventory. License declarations require compliance review. Source locations are normalized.
 ''')
@@ -127,7 +128,7 @@ For finalization, obtain valid timestamped Authenticode signatures on all four E
         'schemaVersion': 1, 'version': VERSION, 'architecture': arch,
         'packageStatus': 'unsigned-candidate-not-release-ready',
         'source': {'repository': 'https://github.com/NVIDIA/OpenShell', 'branch': 'windows', 'commit': SOURCE, 'versionStamp': VERSION},
-        'build': {'workflowRun': RUN, 'automationCommit': os.environ['GITHUB_SHA'], 'builtByThisWorkflow': True, 'runtime': 'static-crt-and-z3', 'staticRuntimeAudit': 'passed'},
+        'build': {'workflowRun': RUN, 'automationCommit': os.environ['GITHUB_SHA'], 'builtByThisWorkflow': True, 'runtime': 'static-crt-and-z3', 'staticRuntimeAudit': 'passed', 'z3BuildMode': record['z3BuildMode']},
         'intendedRelease': {'repository': 'NVIDIA/OpenShell', 'tag': 'v0.1.9', 'matchesReleaseTagSource': False},
         'signing': {'authenticode': 'pending', 'githubArchiveAttestation': 'detached-verify-after-download'},
         'validation': {'nativeLaunchChecks': 'passed', 'runtimeReport': 'external-bound-to-sha256', 'finalSignedBytesValidated': False},

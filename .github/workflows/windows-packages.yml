@@ -30,6 +30,7 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       OPENSHELL_WINDOWS_STATIC_RUNTIME: '1'
+      OPENSHELL_WINDOWS_Z3_SOURCE: '1'
     defaults:
       run:
         shell: pwsh
@@ -59,6 +60,7 @@ jobs:
           $toolchain = ((rustup show active-toolchain) -split ' ')[0]
           if ($LASTEXITCODE -ne 0 -or -not $toolchain) { throw 'Rust toolchain discovery failed' }
           "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
       - name: Install cargo-nextest
         run: mise install --locked github:nextest-rs/nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

@@ -6,6 +6,7 @@ $env:CARGO_TARGET_DIR = Join-Path $source 'target'
 $env:CARGO_INCREMENTAL = '0'
 $env:OPENSHELL_WINDOWS_BUILD_JOBS = '4'
 $env:OPENSHELL_WINDOWS_STATIC_RUNTIME = '1'
+$env:OPENSHELL_WINDOWS_Z3_SOURCE = '1'
 $env:OPENSHELL_IMAGE_TAG = '0.1.9'
 $env:MISE_TRUSTED_CONFIG_PATHS = $source
 $env:CARGO_HOME = Join-Path $env:USERPROFILE '.cargo'
@@ -31,6 +32,10 @@ foreach ($pair in $pairs) {
 # Environment flags override target rustflags, including windows-static.toml.
 $rustFlags = @('-C', 'target-feature=+crt-static') + @($maps | ForEach-Object { "--remap-path-prefix=$($_.Prefix)=$($_.Replacement)" })
 $env:CARGO_ENCODED_RUSTFLAGS = $rustFlags -join [char]31
+# The pinned prebuilt Z3 libraries embed their producer's absolute source paths.
+# Use the repository's checksum-verified source mode and remap C++ __FILE__ too.
+$env:CXXFLAGS = '/experimental:deterministic ' + (($maps | ForEach-Object { "/pathmap:$($_.Prefix)=$($_.Replacement)" }) -join ' ')
+"CXXFLAGS=$env:CXXFLAGS" >> $env:GITHUB_ENV
 $env:AWS_LC_SYS_CFLAGS = if ($Architecture -eq 'arm64') {
     ($maps | ForEach-Object { "/clang:-ffile-prefix-map=$($_.Prefix)=$($_.Replacement)" }) -join ' '
 } else {
@@ -74,7 +79,7 @@ foreach ($name in @('openshell.exe','openshell-gateway.exe','openshell-superviso
     $signature = Get-AuthenticodeSignature $path
     $files += @{ file=$name; sha256=(Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant(); signature=$signature.Status.ToString(); dependencies=@((Get-WindowsImageDependencies $path).Dependencies); staticRuntimeAudit='passed' }
 }
-@{architecture=$Architecture; source=$env:SOURCE_SHA; rust=(& rustc --version); runner=$env:RUNNER_ARCH; version='0.1.9'; launchChecks='passed'; runtime='static-crt-and-z3'; z3Pin=(Get-Content -Raw (Join-Path $source 'tasks/windows-z3.json') | ConvertFrom-Json); files=$files} | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $out 'build-record.json')
+@{architecture=$Architecture; source=$env:SOURCE_SHA; rust=(& rustc --version); runner=$env:RUNNER_ARCH; version='0.1.9'; launchChecks='passed'; runtime='static-crt-and-z3'; z3BuildMode='pinned-source-with-path-remapping'; z3Pin=(Get-Content -Raw (Join-Path $source 'tasks/windows-z3.json') | ConvertFrom-Json); files=$files} | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $out 'build-record.json')
 $validation = Join-Path $env:GITHUB_WORKSPACE "validation-$Architecture"
 New-Item -ItemType Directory -Force $validation | Out-Null
 $fixture = Join-Path $env:CARGO_TARGET_DIR "$target/release/examples/mxc-forwarding-agent.exe"
