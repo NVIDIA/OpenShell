@@ -32,13 +32,9 @@ depends = [
 ]
 
 ["test:gator"]
-description = "Test the Gator entry point, guarded tools, and shared sandbox runtime"
+description = "Test the Gator guarded tools and shared sandbox runtime"
 run = [
-  "bash .agents/agents/gator/tests/run_test.sh",
-  "bash .agents/agents/gator/tests/gh_guard_test.sh",
-  "bash .agents/agents/gator/tests/review_feedback_ledger_test.sh",
-  "bash .agents/agents/gator/tests/resolve_gator_review_threads_test.sh",
-  "bash .agents/agents/gator/tests/validate_review_findings_test.sh",
+  "for test in .agents/agents/gator/tests/*_test.sh; do bash \"$test\" || exit; done",
   "bash scripts/agents/run_test.sh",
   "bash scripts/agents/image_test.sh",
   "bash scripts/agents/runtime/launch_test.sh",

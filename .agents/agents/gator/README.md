@@ -2,7 +2,7 @@
 
 Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShell issues and pull requests. The default and currently only supported harness is Codex.
 
-The agent-root entry point is `.agents/agents/gator/run.sh`. Gator retains its existing name, provider identities, and workflow labels. Payload version 14 uses the relocated manifest; rebuild the tooling image and relaunch watchers after updating.
+The agent-root entry point is `.agents/agents/gator/run.sh`.
 
 ## Prerequisites
 

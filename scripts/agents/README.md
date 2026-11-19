@@ -1,26 +1,35 @@
 # OpenShell Agents
 
-`scripts/agents/` contains the shared OpenShell sandbox launcher and harness runtime. Agent-specific bundles live in `.agents/agents/<name>/`; see the [agent layout](../../.agents/agents/README.md).
+`scripts/agents/` contains repository-owned agent launchers. An agent is a
+manifest plus prompt assets that the shared launcher turns into an OpenShell
+sandbox run. Agents do not own harness implementations. Harness-specific setup
+and execution live in `runtime/harnesses/<name>/`.
+
+Agent-specific bundles live in `.agents/agents/<name>/`; see the
+[agent layout](../../.agents/agents/README.md).
 
 ## Directory Layout
 
 ```text
-.agents/agents/
-  gator/
-    run.sh                  # Agent entry point
-    agent.yaml              # Sandbox launcher manifest
-    bin/                    # Guarded commands
-    prompts/
-    providers/
-    skills/
-    tests/
 scripts/agents/
-  run.sh                    # Shared manifest-driven sandbox launcher
-  image.sh                  # Image transport
-  runtime/                  # Shared in-sandbox supervisor and harness adapters
+  run.sh                    # Generic manifest-driven launcher
+  runtime/                  # Shared in-sandbox runtime
+    entrypoint.sh           # Starts the in-sandbox supervisor
+    supervisor.sh           # Runs bounded harness cycles in once/watch mode
+    subagent.sh             # Generic subagent dispatcher
+    harnesses/
+      codex/                # Codex install and execution adapter
+  <agent>/
+    agent.yaml              # Agent manifest
+    prompts/                # Prompt templates rendered at launch
+    providers/              # Provider profile YAML files for this agent
+    policy.yaml             # Optional image policy source
 ```
 
-Invoke Gator through `.agents/agents/gator/run.sh`. The shared launcher also accepts `--agent gator` or an explicit manifest directory. Agent bundles own their payloads, not harness implementations.
+Agent directories should contain agent-specific intent and payloads: manifests,
+prompt templates, provider profiles, policies, and references to skills or
+subagents. They should not contain `harnesses/codex`, `harnesses/opencode`, or
+similar runtime code.
 
 Sandbox names supplied through `--name`, `GATOR_SANDBOX_NAME`, or generated
 from the manifest prefix must be DNS-1123 labels of at most 19 characters.
