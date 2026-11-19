@@ -34,10 +34,10 @@ TLS.
 
 # OPTIONS
 
-**--service-auth-enabled** *BOOL*
+**--enable-gateway-service-auth** *BOOL*
 :   Opt in to configured gateway authentication for sandbox application HTTP
     requests and WebSocket upgrades. Default: **false**. Independent of the
-    supervisor application listener. Environment: **OPENSHELL_SERVICE_AUTH_ENABLED**.
+    supervisor application listener. Environment: **OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH**.
 
 **--bind-address** *IP*
 :   IP address to bind all listeners to. Default: **127.0.0.1**.

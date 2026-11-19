@@ -1860,7 +1860,7 @@ an app domain need distinct gateway names; replicas of one installation share
 its name. Changing the mode or installation name requires fresh route
 installation before discovery can advertise the replacement.
 
-When `service_auth_enabled` is true, gateway-mediated service HTTP requests and
+When `enable_gateway_service_auth` is true, gateway-mediated service HTTP requests and
 WebSocket upgrades require configured gateway authentication and workspace user
 access with the app listener disabled or enabled. OIDC scope enforcement requires `sandbox:write` (or `openshell:all`),
 as for TCP forwarding. Check HTTP 401 for missing/invalid/expired/revoked
@@ -1879,9 +1879,9 @@ Direct listener authentication belongs to the ingress provider.
 
 ### Gateway-mediated application authentication
 
-Gateway service auth is opt-in with `[openshell.gateway].service_auth_enabled = true`,
-`--service-auth-enabled true`, or `OPENSHELL_SERVICE_AUTH_ENABLED=true`. Helm uses
-`server.serviceAuthEnabled` or canonical `gatewayConfig."openshell.gateway".service_auth_enabled`.
+Gateway service auth is opt-in with `[openshell.gateway].enable_gateway_service_auth = true`,
+`--enable-gateway-service-auth true`, or `OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH=true`. Helm uses
+`gatewayConfig."openshell.gateway".enable_gateway_service_auth`.
 It defaults to false and is independent of `supervisor_app_listener.enabled`.
 When debugging unexpected application 401/403 responses or browser login, check
 this flag before inspecting the configured gateway authentication and workspace
