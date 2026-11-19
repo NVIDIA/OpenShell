@@ -255,7 +255,7 @@ A test that is stopped does not clean up: sandboxes it created stay on the
 gateway. Run against a gateway you can throw away, or delete them by hand.
 
 Without a subcommand, the program takes libtest's arguments instead. A
-`[[test]]` target with `harness = false` therefore also runs under `cargo test`
+test target with `harness = false` therefore also runs under `cargo test`
 and nextest. In that mode tests run in one process, one at a time unless
 `--test-threads` says otherwise.
 
@@ -264,6 +264,32 @@ name, as in nextest. Its family, which groups tests in the JUnit report, is
 the first directory under the last `suites` directory in the crate's path:
 `conformance` for `tests/suites/conformance`, `features` for
 `tests/suites/features/<name>`.
+
+### Unsupported tests
+
+An environment that cannot pass a test yet lists it in
+`OPENSHELL_TEST_UNSUPPORTED`, instead of putting `#[ignore]` on the test, which
+turns it off everywhere. The value is `<test>=<issue>` entries separated by
+commas and/or whitespace, so an issue URL can't contain either:
+
+```shell
+OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVIDIA/OpenShell/issues/1234"
+```
+
+`<test>` is the crate name (`_` for `-`), then the name libtest shows. The
+program reads the variable under every interface, so `openshell-conformance
+run`, `cargo test` and nextest agree: the test is ignored, so each shows SKIP,
+and `list` marks it `[unsupported: <issue>]`. `run` prints the entries to stderr
+and lists them in its summary and JUnit report; under `cargo test` and nextest
+the program stays quiet, so whatever starts them should print the entries.
+
+A program applies only the entries for crates it links, so one value can serve
+several programs, and a misspelled crate name is ignored. A bad entry for a
+crate it links exits 2 before anything is listed or run (nextest exits 104,
+because its listing fails). Forcing an unsupported test to run
+(`--include-ignored`, `--ignored`, nextest's `--run-ignored`) fails it with
+`unsupported: <issue>; remove the entry from OPENSHELL_TEST_UNSUPPORTED to run
+it`.
 
 ## Checks
 

@@ -219,6 +219,10 @@ jobs:
           PACKAGE: ${{ matrix.package }}
           GATEWAY: ${{ matrix.gateway }}
         run: |
+          # The tests this environment can't pass yet; the runner passes the
+          # variable on to the guest.
+          OPENSHELL_TEST_UNSUPPORTED="$(tasks/scripts/conformance-unsupported.sh "${ENVIRONMENT}/${INSTALLER}")"
+          export OPENSHELL_TEST_UNSUPPORTED
           # Retry dependency preparation, then run the suites once. Without
           # prebuilt tests, the runner builds the suites for the guest, so it
           # needs no prepared archives.
