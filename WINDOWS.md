@@ -28,7 +28,16 @@ under development and is not a production-qualified security boundary:
   Treat the gateway host as trusted.
 - Foreground main-process attachment and ConPTY resize are unavailable. Create
   command workloads with `--detach`.
-- Gateway restart recovery for live MXC generations is not supported.
+- Gateway exit ends sandbox workloads, and there is no restart recovery. When
+  the gateway process ends (a graceful stop with Ctrl-C, a crash, or a kill), the
+  sandbox processes it started end with it, workloads included. After the gateway
+  restarts on the same database, each sandbox record is still listed but its
+  workload is not restarted, and its phase is not updated to show that the
+  workload ended (for example `Provisioning` after a graceful stop, `Ready` after
+  a hard kill). Delete the record to reuse its name. The Docker, Podman and VM
+  drivers stop sandboxes on a graceful gateway stop and recover them on restart;
+  MXC does not provide that recovery. See
+  [gateway exit and restart](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md#gateway-exit-and-restart).
 
 See the Windows branch's [MXC driver documentation](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md)
 for the current capabilities and enforcement limits, and its

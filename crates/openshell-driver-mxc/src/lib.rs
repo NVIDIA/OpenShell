@@ -18,11 +18,15 @@
 #![allow(clippy::result_large_err)]
 
 #[cfg(target_os = "windows")]
+mod child;
+#[cfg(target_os = "windows")]
 mod driver;
 #[cfg(target_os = "windows")]
 mod grpc;
 #[cfg(target_os = "windows")]
 mod isolation;
+#[cfg(target_os = "windows")]
+mod job;
 #[cfg(target_os = "windows")]
 mod mxc;
 #[cfg(target_os = "windows")]
