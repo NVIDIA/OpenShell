@@ -31,3 +31,25 @@ mod smoke;
 mod ssh;
 mod templates;
 mod workspaces;
+
+/// Names the number of gateway replicas when an environment runs more than
+/// one.
+const GATEWAY_REPLICAS_ENV: &str = "OPENSHELL_TEST_GATEWAY_REPLICAS";
+
+/// Whether sandbox log reads can miss a sandbox's logs: a gateway replica
+/// holds only the logs of the sandboxes connected to it, and a read can reach
+/// another one (#5462). Says so when they can, so the test can skip its log
+/// check.
+fn sandbox_logs_unreliable(test: &str) -> bool {
+    let replicas = std::env::var(GATEWAY_REPLICAS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    if replicas > 1 {
+        eprintln!(
+            "[{test}] skipping the log check: the gateway has {replicas} replicas and \
+             sandbox logs are read from only one (#5462)"
+        );
+    }
+    replicas > 1
+}
