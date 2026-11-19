@@ -65,7 +65,8 @@ jobs:
       - uses: ./.github/actions/setup-nix
 
       # The hash tmachine names the environment's setup layer after. See
-      # e2e-suites.yml.
+      # e2e-suites.yml. The retry covers dependency preparation for the run
+      # step too.
       - name: Compute the tmachine setup layer key
         id: layer-key
         env:
@@ -96,8 +97,6 @@ jobs:
           INSTALLER: ${{ matrix.installer }}
           TESTSUITE: ${{ matrix.testsuite }}
         run: |
-          # Retry dependency preparation, then execute the test suite once.
-          nix build --no-link .#tmachine || nix build --no-link .#tmachine
           nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"
 
       - name: Upload tmachine diagnostics

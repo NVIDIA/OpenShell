@@ -161,17 +161,18 @@ jobs:
         with:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      # The hash tmachine names the environment's setup layer after. It reads
-      # the base image, which the run step needs anyway, so this mostly moves
-      # that download earlier.
+      # The hash tmachine names the environment's setup layer after. The run
+      # step needs the test runner and the base images it reads anyway, so
+      # this mostly moves their download earlier. The retry covers dependency
+      # preparation for both steps.
       - name: Compute the tmachine setup layer key
         id: layer-key
         env:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
-          nix build --no-link .#tmachine || nix build --no-link .#tmachine
-          key=$(nix run .#tmachine -- layer-key "${ENVIRONMENT}")
+          nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
+          key=$(nix run .#openshell-test-runner -- layer-key --environment "${ENVIRONMENT}")
           echo "key=${key}" >> "$GITHUB_OUTPUT"
 
       - name: Cache tmachine disks
@@ -219,10 +220,8 @@ jobs:
           PACKAGE: ${{ matrix.package }}
           GATEWAY: ${{ matrix.gateway }}
         run: |
-          # Retry dependency preparation, then run the suites once. Without
-          # prebuilt tests, the runner builds the suites for the guest, so it
-          # needs no prepared archives.
-          nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
+          # Without prebuilt tests, the runner builds the suites for the guest,
+          # so it needs no prepared archives.
           # A prebuilt program replaces the build, and so the package choice.
           # A prebuilt bundle holds the whole family; the package selects the
           # tests to run from it.

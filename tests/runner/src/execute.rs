@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use tmachine::Session;
-use tmachine::config::Config;
+use tmachine::config::{Config, Environment, Machine};
 
 use crate::bundle::{Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY};
 use crate::test_env;
@@ -182,9 +182,25 @@ pub async fn run(config: &Config, run: &Run<'_>) -> Status {
 /// Boot a tmachine environment by name, with OpenShell installed by the named
 /// installer.
 async fn provision(config: &Config, environment: &str, installer: &str) -> Result<Session> {
-    let names = |names: &mut dyn Iterator<Item = &String>| {
-        names.map(String::as_str).collect::<Vec<_>>().join(", ")
-    };
+    let (machine, environment) = find_environment(config, environment)?;
+    let installer = config
+        .installers
+        .iter()
+        .find(|candidate| candidate.name == installer)
+        .with_context(|| {
+            format!(
+                "tmachine installer {installer:?} is not defined; choose one of: {}",
+                names(&mut config.installers.iter().map(|i| &i.name))
+            )
+        })?;
+    Session::up(machine, environment, installer).await
+}
+
+/// Look up a tmachine environment by name, with the machine it runs on.
+pub fn find_environment<'a>(
+    config: &'a Config,
+    environment: &str,
+) -> Result<(&'a Machine, &'a Environment)> {
     let environment = config
         .environments
         .iter()
@@ -200,17 +216,11 @@ async fn provision(config: &Config, environment: &str, installer: &str) -> Resul
         .iter()
         .find(|candidate| candidate.name == environment.machine)
         .with_context(|| format!("tmachine machine {:?} is not defined", environment.machine))?;
-    let installer = config
-        .installers
-        .iter()
-        .find(|candidate| candidate.name == installer)
-        .with_context(|| {
-            format!(
-                "tmachine installer {installer:?} is not defined; choose one of: {}",
-                names(&mut config.installers.iter().map(|i| &i.name))
-            )
-        })?;
-    Session::up(machine, environment, installer).await
+    Ok((machine, environment))
+}
+
+fn names(names: &mut dyn Iterator<Item = &String>) -> String {
+    names.map(String::as_str).collect::<Vec<_>>().join(", ")
 }
 
 /// Create the results directory, and remove an earlier run's results so they

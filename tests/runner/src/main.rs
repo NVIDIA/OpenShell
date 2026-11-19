@@ -35,6 +35,16 @@ enum Command {
     /// Boot a tmachine environment with OpenShell installed, run a test
     /// family in it, and check the results.
     Run(RunArgs),
+    /// Print the hash that names a tmachine environment's setup layer,
+    /// without starting a VM. CI keys its disk cache on it.
+    LayerKey(LayerKeyArgs),
+}
+
+#[derive(Args)]
+struct LayerKeyArgs {
+    /// The tmachine environment, e.g. `ubuntu-docker-rootful`.
+    #[arg(long)]
+    environment: String,
 }
 
 /// The tests to build or run.
@@ -103,6 +113,7 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Build(args) => tmachine::until_signal(build(args)).await,
         Command::Run(args) => tmachine::until_signal(run(args)).await,
+        Command::LayerKey(args) => Ok(layer_key(&args)),
     };
     match result {
         // Exit at once: a blocking build or stdin read would otherwise hold
@@ -185,6 +196,13 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
         Status::Error(_) => annotate("E2E suites: runner error", &format!("{label}: {status}")),
     }
     Ok(status.exit_code())
+}
+
+fn layer_key(args: &LayerKeyArgs) -> Result<ExitCode> {
+    let tmachine = load_tmachine(&repo_root()?)?;
+    let (machine, environment) = execute::find_environment(&tmachine, &args.environment)?;
+    println!("{}", tmachine::setup_layer_key(machine, environment)?);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The workspace directory of `family`, a relative path under
