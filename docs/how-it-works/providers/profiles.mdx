@@ -655,11 +655,11 @@ the gateway's credential backend, and the app JWT stays at the gateway.
 
 The logical credential name `api_token` selects the configured alias, or
 `GITHUB_TOKEN` when neither alias has a refresh configuration. Configure, rotate,
-delete, and credential-filtered status use this resolution. Status responses
-report the selected environment alias. A second refresh configuration under the
-other alias is rejected, including when the existing configuration is pending or has
-failed. Update the selected alias, or delete its refresh configuration before
-switching aliases.
+delete, `inline-secrets`, and credential-filtered status use this resolution.
+Status responses report the selected environment alias. A second refresh
+configuration under the other alias is rejected, including when the existing
+configuration is pending or has failed. Update the selected alias, or delete
+its refresh configuration before switching aliases.
 
 Older gateways allowed refresh states under `api_token` or both environment
 aliases. If these states cause a conflict, run
