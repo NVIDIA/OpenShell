@@ -69,8 +69,8 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, require_gateway_cedar_support, source_matches,
-    validate_and_canonicalize_policy_report, validate_dns1123_label, validate_exec_request_fields,
+    level_matches, require_gateway_cedar_support, source_matches, validate_and_canonicalize_policy,
+    validate_dns1123_label, validate_exec_request_fields,
     validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_sandbox_governance_spec, validate_sandbox_spec,
 };
@@ -582,15 +582,11 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    let policy_warnings = if let Some(ref mut policy) = spec.policy {
+    if let Some(ref mut policy) = spec.policy {
         super::policy::clear_provider_credentialed_markers(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
-        let validated = validate_and_canonicalize_policy_report(policy.clone())?;
-        *policy = validated.policy;
-        validated.warnings
-    } else {
-        Vec::new()
-    };
+        *policy = validate_and_canonicalize_policy(policy.clone())?;
+    }
 
     // Process identity and MCP default materialization can increase the
     // protobuf size. Recheck the exact canonical spec before any middleware or
@@ -783,7 +779,6 @@ async fn handle_create_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls,
-        policy_warnings: super::policy_warnings(policy_warnings),
     }))
 }
 
@@ -965,7 +960,6 @@ pub(super) async fn handle_get_sandbox(
     let mut response = Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-        policy_warnings: Vec::new(),
     });
     if let Some(value) = owner.and_then(|owner| owner.parse().ok()) {
         response
@@ -1789,7 +1783,6 @@ async fn handle_stop_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-        policy_warnings: Vec::new(),
     }))
 }
 
@@ -1848,7 +1841,6 @@ async fn handle_start_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-        policy_warnings: Vec::new(),
     }))
 }
 
@@ -1890,7 +1882,6 @@ async fn handle_suspend_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-        policy_warnings: Vec::new(),
     }))
 }
 
@@ -1950,7 +1941,6 @@ async fn handle_resume_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-        policy_warnings: Vec::new(),
     }))
 }
 
@@ -4204,7 +4194,6 @@ async fn run_exec_with_russh(
 
 #[cfg(test)]
 mod tests {
-    use super::super::validation::validate_and_canonicalize_policy;
     use super::*;
     use crate::auth::audit::test_support::{
         assert_authentication_failure, assert_boundary_finding, assert_logon, assert_origin,
@@ -4352,28 +4341,6 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
         assert!(error.message().contains("without Cedar"), "{error:?}");
         assert!(driver.calls().is_empty(), "{:?}", driver.calls());
-    }
-
-    #[cfg(feature = "experimental")]
-    #[tokio::test]
-    async fn create_returns_cedar_load_time_warnings() {
-        let state = test_server_state().await;
-        let response = handle_create_sandbox(
-            &state,
-            create_request_with_policy(
-                "cedar-warnings",
-                crate::grpc::test_support::cedar_policy_with_warning(),
-            ),
-        )
-        .await
-        .expect("policy is valid")
-        .into_inner();
-        assert_eq!(
-            response.policy_warnings.len(),
-            1,
-            "{:?}",
-            response.policy_warnings
-        );
     }
 
     #[tokio::test]

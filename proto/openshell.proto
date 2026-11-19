@@ -1538,17 +1538,6 @@ message SandboxResponse {
   // Service URLs created by CreateSandbox, keyed by service name. The empty
   // key identifies the unnamed service. Other sandbox RPCs return an empty map.
   map<string, string> service_urls = 2;
-  // Load-time warnings for the policy CreateSandbox accepted. Other sandbox
-  // RPCs return none.
-  repeated PolicyWarning policy_warnings = 3;
-}
-
-// A policy shape the gateway accepted that is likely not what the author
-// meant, such as an audit-only path beside enforced rules for the same
-// endpoint. Warnings never change enforcement.
-message PolicyWarning {
-  // One-line description for display.
-  string message = 1;
 }
 
 // List sandboxes response.
@@ -2979,9 +2968,6 @@ message UpdateConfigResponse {
   bool deleted = 4;
   // Sandbox metadata annotations after the update. Empty for global updates.
   map<string, string> annotations = 5;
-  // Load-time warnings for the submitted sandbox policy. Empty for global
-  // and settings updates.
-  repeated PolicyWarning policy_warnings = 6;
 }
 
 // Get sandbox policy status request.

@@ -1049,16 +1049,8 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
 pub(super) fn validate_and_canonicalize_policy(
     policy: ProtoSandboxPolicy,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    validate_and_canonicalize_policy_report(policy).map(|validated| validated.policy)
-}
-
-/// Like [`validate_and_canonicalize_policy`], also returning the policy's
-/// load-time warnings for the caller to return to the client.
-pub(super) fn validate_and_canonicalize_policy_report(
-    policy: ProtoSandboxPolicy,
-) -> Result<openshell_policy::ValidatedPolicy, Status> {
     require_gateway_cedar_support(&policy)?;
-    openshell_policy::validate_and_canonicalize_sandbox_policy_report(policy).map_err(|error| {
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
         Status::invalid_argument(format!("policy contains unsafe content: {error}"))
     })
 }
@@ -1220,6 +1212,7 @@ mod tests {
     use std::collections::HashMap;
     use tonic::Code;
 
+    #[cfg(not(feature = "experimental"))]
     use crate::grpc::test_support::cedar_policy;
 
     #[cfg(not(feature = "experimental"))]
@@ -1239,22 +1232,6 @@ mod tests {
             );
         }
         assert!(require_gateway_cedar_support(&ProtoSandboxPolicy::default()).is_ok());
-    }
-
-    #[cfg(feature = "experimental")]
-    #[test]
-    fn cedar_policy_validation_returns_load_time_warnings() {
-        let validated = validate_and_canonicalize_policy_report(
-            crate::grpc::test_support::cedar_policy_with_warning(),
-        )
-        .expect("policy is valid");
-        assert_eq!(validated.warnings.len(), 1, "{:?}", validated.warnings);
-        assert!(
-            validate_and_canonicalize_policy_report(cedar_policy())
-                .expect("policy is valid")
-                .warnings
-                .is_empty()
-        );
     }
 
     #[test]

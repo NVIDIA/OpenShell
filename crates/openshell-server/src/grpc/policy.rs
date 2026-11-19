@@ -113,8 +113,7 @@ use tracing::{debug, info, warn};
 
 use super::validation::{
     level_matches, require_gateway_cedar_support, source_matches, validate_and_canonicalize_policy,
-    validate_and_canonicalize_policy_report, validate_caller_annotations,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_caller_annotations, validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
 use super::{StoredSettingValue, StoredSettings};
@@ -2693,7 +2692,6 @@ fn update_config_response(
         settings_revision,
         deleted,
         annotations,
-        policy_warnings: Vec::new(),
     })
 }
 
@@ -4766,9 +4764,7 @@ async fn handle_update_config_inner(
         true
     };
 
-    let validated = validate_and_canonicalize_policy_report(new_policy)?;
-    new_policy = validated.policy;
-    let policy_warnings = super::policy_warnings(validated.warnings);
+    new_policy = validate_and_canonicalize_policy(new_policy)?;
     let backfill_policy = should_backfill_policy.then(|| new_policy.clone());
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
@@ -4836,18 +4832,13 @@ async fn handle_update_config_inner(
                     );
                     publish_sandbox_config_update(state, &sandbox_id);
                 }
-                let mut response = update_config_response(
+                return Ok(update_config_response(
                     u32::try_from(current.version).unwrap_or(0),
                     hash,
                     0,
                     false,
                     response_annotations,
-                );
-                response
-                    .get_mut()
-                    .policy_warnings
-                    .clone_from(&policy_warnings);
-                return Ok(response);
+                ));
             }
 
             let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
@@ -4917,15 +4908,13 @@ async fn handle_update_config_inner(
     spawn_pending_chunk_refresh(state, &workspace, &sandbox);
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    let mut response = update_config_response(
+    Ok(update_config_response(
         u32::try_from(next_version).unwrap_or(0),
         hash,
         0,
         false,
         response_annotations,
-    );
-    response.get_mut().policy_warnings = policy_warnings;
-    Ok(response)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -5187,6 +5176,7 @@ pub(super) async fn handle_report_sandbox_configuration(
             ],
             name: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
+            ..Default::default()
         });
         *config_request.extensions_mut() = request.extensions().clone();
         let config = handle_get_sandbox_config(state, config_request)
@@ -5208,6 +5198,7 @@ pub(super) async fn handle_report_sandbox_configuration(
             ],
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             name: sandbox_name,
+            ..Default::default()
         });
         *config_request.extensions_mut() = request.extensions().clone();
         admission.error = match handle_get_sandbox_config(state, config_request).await {
@@ -8795,13 +8786,11 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
-                    supported_capabilities: vec![
-                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                    ],
                     name: "admission".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -8985,13 +8974,11 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
-                    supported_capabilities: vec![
-                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                    ],
                     name: "image-admission".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9020,13 +9007,11 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
-                    supported_capabilities: vec![
-                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                    ],
                     name: "image-admission".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9290,11 +9275,9 @@ mod tests {
                 &state,
                 with_sandbox(
                     Request::new(GetSandboxConfigRequest {
-                        supported_capabilities: vec![
-                            openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                        ],
                         name: sandbox_id.clone(),
                         workspace_scope: None,
+                        ..Default::default()
                     }),
                     &sandbox_id,
                 ),
@@ -9341,11 +9324,9 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
-                    supported_capabilities: vec![
-                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                    ],
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9408,11 +9389,9 @@ mod tests {
                 &state,
                 with_sandbox(
                     Request::new(GetSandboxConfigRequest {
-                        supported_capabilities: vec![
-                            openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                        ],
                         name: sandbox_id.clone(),
                         workspace_scope: None,
+                        ..Default::default()
                     }),
                     &sandbox_id,
                 ),
@@ -9567,11 +9546,9 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
-                    supported_capabilities: vec![
-                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                    ],
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9681,11 +9658,9 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
-                    supported_capabilities: vec![
-                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                    ],
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9753,11 +9728,9 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
-                    supported_capabilities: vec![
-                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                    ],
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -11623,11 +11596,9 @@ mod tests {
         }
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "sb-b".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-a",
         );
@@ -11642,11 +11613,9 @@ mod tests {
         let state = test_server_state().await;
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "missing-sandbox".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-a",
         );
@@ -11683,11 +11652,9 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "self".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-self",
         );
@@ -11701,11 +11668,9 @@ mod tests {
         let state = test_server_state().await;
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "self".to_string(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                ..Default::default()
             }),
             "sb-self",
         );
@@ -11919,13 +11884,11 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_user(Request::new(GetSandboxConfigRequest {
-            supported_capabilities: vec![
-                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-            ],
             name: "x".to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            ..Default::default()
         }));
         handle_get_sandbox_config(&state, req)
             .await
@@ -12158,13 +12121,11 @@ mod tests {
         handle_get_sandbox_config(
             state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: sandbox.object_name().to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -12278,13 +12239,11 @@ mod tests {
         let first = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "snapshot-consistency".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -12306,13 +12265,11 @@ mod tests {
         let second = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "snapshot-consistency".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -13044,13 +13001,11 @@ mod tests {
         let response = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "mcp-default-composed".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -13883,13 +13838,11 @@ mod tests {
         let error = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "invalid-composed-policy".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -14715,13 +14668,11 @@ mod tests {
         let config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "policy-binding".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -14843,13 +14794,11 @@ mod tests {
         let next_config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "policy-binding".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -14912,13 +14861,11 @@ mod tests {
         let unbound_config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "policy-binding".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -16221,13 +16168,11 @@ mod tests {
         let response = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "global-profile-sandbox".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -23375,44 +23320,6 @@ mod tests {
         assert!(config.policy.is_none(), "{config:?}");
     }
 
-    /// Load-time warnings reach the client on a policy update, including an
-    /// identical update that changes nothing.
-    #[cfg(feature = "experimental")]
-    #[tokio::test]
-    async fn sandbox_policy_update_returns_cedar_load_time_warnings() {
-        let state = test_server_state().await;
-        state
-            .store
-            .put_message(&test_sandbox(
-                "sb-cedar-warnings",
-                "cedar-warnings",
-                crate::grpc::test_support::cedar_policy(),
-                vec![],
-            ))
-            .await
-            .unwrap();
-        let update = || {
-            with_user(Request::new(UpdateConfigRequest {
-                sandbox: "cedar-warnings".to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                policy: Some(crate::grpc::test_support::cedar_policy_with_warning()),
-                ..Default::default()
-            }))
-        };
-
-        let first = handle_update_config(&state, update())
-            .await
-            .expect("policy is valid")
-            .into_inner();
-        assert_eq!(first.policy_warnings.len(), 1, "{first:?}");
-        let repeat = handle_update_config(&state, update())
-            .await
-            .expect("an identical update is a no-op")
-            .into_inner();
-        assert_eq!(repeat.version, first.version, "the repeat must be a no-op");
-        assert_eq!(repeat.policy_warnings, first.policy_warnings);
-    }
-
     #[test]
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = StoredSettings {
@@ -24366,11 +24273,9 @@ mod tests {
 
         let alpha_req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "work".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-alpha",
         );
@@ -24382,11 +24287,9 @@ mod tests {
 
         let beta_req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "work".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-beta",
         );
@@ -26167,13 +26070,11 @@ mod tests {
         let err = handle_get_sandbox_config(
             &state,
             non_member_request(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: "other".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "other-workspace".to_string(),
                 )),
+                ..Default::default()
             }),
         )
         .await

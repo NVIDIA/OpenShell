@@ -597,11 +597,9 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: sandbox_id.to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             sandbox_id,
         ),
@@ -2122,11 +2120,9 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supported_capabilities: vec![
-                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
-                ],
                 name: sandbox_id.to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             sandbox_id,
         ),

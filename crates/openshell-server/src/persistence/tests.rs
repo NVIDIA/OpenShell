@@ -2389,14 +2389,11 @@ async fn sqlite_concurrent_writes_return_their_own_resource_version() {
         .await
         .unwrap();
 
-    let mut seen = BTreeSet::new();
-    // Race a fresh cohort each round so fast writers cannot run many rounds
-    // ahead while another connection waits for SQLite's single writer lock.
-    for write in 0..WRITES {
-        let writers = (0..WRITERS).map(|writer| {
-            let store = Arc::clone(&store);
-            tokio::spawn(async move {
-                let mut versions = Vec::new();
+    let writers = (0..WRITERS).map(|writer| {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut versions = Vec::new();
+            for write in 0..WRITES {
                 let payload = format!("{writer}-{write}");
                 let unconditional = put_sandbox_1(&store, &payload, WriteCondition::Unconditional)
                     .await
@@ -2416,14 +2413,15 @@ async fn sqlite_concurrent_writes_return_their_own_resource_version() {
                         Err(err) => panic!("unexpected error: {err}"),
                     }
                 }
-                versions
-            })
-        });
-
-        for handle in futures::future::join_all(writers).await {
-            for version in handle.unwrap() {
-                assert!(seen.insert(version), "version {version} returned twice");
             }
+            versions
+        })
+    });
+
+    let mut seen = BTreeSet::new();
+    for handle in futures::future::join_all(writers).await {
+        for version in handle.unwrap() {
+            assert!(seen.insert(version), "version {version} returned twice");
         }
     }
 

@@ -164,8 +164,6 @@ mod tests {
     // Cedar policies keep their current behavior.
     // SupervisorHello and GetSandboxConfigRequest negotiate Cedar support with
     // public-only capability fields; durable schemas remain unchanged.
-    // SandboxResponse and UpdateConfigResponse return policy warnings in the
-    // new public-only PolicyWarning message; durable schemas remain unchanged.
     // Supervisor middleware binding policy and selectors are public-only. An
     // absent policy preserves dynamic discovery; older supervisors ignore both fields.
     // Suspend/resume adds two public request messages without durable request
@@ -174,7 +172,7 @@ mod tests {
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "0128adb550d8a576c994196b7399b18d975d4d433f544422621e21164c820580";
+        "33fba7293d14fdf6d8279ca0ca620cfde059418c1c6900818dde639f0c819410";
     const DURABLE_SCHEMA_SHA256: &str =
         "c916749a87e6ec66d3cb46c57de4ae669ac71ca1123d4af118739a2131e0e6fb";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -712,7 +710,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (333, 31),
+                (332, 31),
                 (97, 22),
                 (85, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

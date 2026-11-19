@@ -111,14 +111,6 @@ pub fn persistence_error_to_status(
     }
 }
 
-/// Wraps a policy's load-time warnings for a response.
-fn policy_warnings(warnings: Vec<String>) -> Vec<openshell_core::proto::PolicyWarning> {
-    warnings
-        .into_iter()
-        .map(|message| openshell_core::proto::PolicyWarning { message })
-        .collect()
-}
-
 /// Apply the public missing-target contract after authorization and parent checks.
 fn deletion_outcome(deleted: bool, allow_missing: bool, resource: &str) -> Result<i32, Status> {
     use openshell_core::proto::DeletionOutcome;
@@ -768,7 +760,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveAllDraftChunksRequest>,
     ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
-        Box::pin(mutation_replay::run(&self.state, request)).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn edit_draft_chunk(
@@ -1301,6 +1293,7 @@ pub mod test_support {
 
     /// A Cedar policy that permits one network endpoint and loads without
     /// warnings.
+    #[cfg(not(feature = "experimental"))]
     pub fn cedar_policy() -> openshell_core::proto::SandboxPolicy {
         openshell_core::proto::SandboxPolicy {
             version: 1,
@@ -1310,27 +1303,6 @@ pub mod test_support {
                     .to_string(),
             }),
             ..Default::default()
-        }
-    }
-
-    /// A valid Cedar policy whose audit-only `@path` forbid produces one
-    /// load-time warning.
-    #[cfg(feature = "experimental")]
-    pub fn cedar_policy_with_warning() -> openshell_core::proto::SandboxPolicy {
-        openshell_core::proto::SandboxPolicy {
-            cedar_policy: Some(openshell_core::proto::CedarPolicy {
-                source: r#"
-permit (principal, action == Sandbox::Action::"HttpRequest",
-        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
-when { context.method == "GET" };
-@path("/admin/**") @enforcement("audit")
-forbid (principal, action == Sandbox::Action::"HttpRequest",
-        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
-when { context.method == "DELETE" };
-"#
-                .to_string(),
-            }),
-            ..cedar_policy()
         }
     }
 }
@@ -1352,8 +1324,6 @@ mod tests {
         ResourceCapabilities as DriverResourceCapabilities,
     };
 
-    /// Clients decide whether to offer Cedar from the health response, so it
-    /// reports exactly what this build of the gateway accepts.
     #[test]
     fn public_resource_capabilities_preserves_reported_fields() {
         let driver_capabilities = DriverResourceCapabilities {

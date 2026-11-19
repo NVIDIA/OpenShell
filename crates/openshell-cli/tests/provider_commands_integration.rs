@@ -379,7 +379,6 @@ impl OpenShell for TestOpenShell {
                 ..Sandbox::default()
             }),
             service_urls: HashMap::new(),
-            ..Default::default()
         }))
     }
 
