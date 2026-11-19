@@ -669,10 +669,10 @@ jobs:
       - name: Test release qualification summary
         run: mise run test:qualification-summary
 
-      - name: Test accepted-work library, review-readiness, and issue labeling
-        run: "mise run test:accepted-work ::: test:review-readiness ::: test:label-issue"
+      - name: Test review readiness and stale closure provenance
+        run: "mise run test:review-readiness ::: test:stale-closure"
 
-      - name: Test labeling agent runtime
+      - name: Test labeling agent
         run: mise run test:labeling-agent
 
   python-sdk-freeze:

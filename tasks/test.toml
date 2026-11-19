@@ -27,8 +27,7 @@ depends = [
   "test:cargo-lockfile-alignment",
   "test:review-readiness",
   "test:merge-gateway-toml",
-  "test:accepted-work",
-  "test:label-issue",
+  "test:stale-closure",
   "test:labeling-agent",
 ]
 
@@ -111,32 +110,16 @@ description = "Test PR review readiness and reviewer reconciliation"
 run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
 hide = true
 
-["test:accepted-work"]
-description = "Test the shared accepted-work library"
+["test:stale-closure"]
+description = "Test stale closure provenance"
 env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
-run = "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p acceptance_test.py"
-hide = true
-
-["test:label-issue"]
-description = "Test issue labeling and stale closure provenance"
-env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
-run = [
-  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p reconciliation_test.py",
-  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p evidence_test.py",
-  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p policy_test.py",
-  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p checkpoint_test.py",
-  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p github_test.py",
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p stale_closure_test.py",
-]
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p stale_closure_test.py"
 hide = true
 
 ["test:labeling-agent"]
-description = "Test managed labeling classifier and invocation routing offline"
+description = "Test the labeler offline"
 env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
-run = [
-  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p classifier_test.py",
-  "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p events_test.py",
-]
+run = "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p '*_test.py'"
 hide = true
 
 [e2e]
