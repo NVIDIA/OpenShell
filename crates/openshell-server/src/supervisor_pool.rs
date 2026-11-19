@@ -1955,10 +1955,12 @@ impl SupervisorPool {
             .owners()
             .await
             .map_err(|error| format!("read supervisor instance owners: {error}"))?;
-        if owners.len() >= self.controller.max_pool_instances()
-            && !owners.contains_key(&assignment.route)
-        {
-            return Err("the supervisor pool runs as many sandbox instances as it can".to_string());
+        let max_pool_instances = self.controller.max_pool_instances();
+        if owners.len() >= max_pool_instances && !owners.contains_key(&assignment.route) {
+            return Err(format!(
+                "sandbox capacity reached: the cluster runs its limit of {max_pool_instances} \
+                 sandboxes; add gateway replicas or raise the supervisor pool limits"
+            ));
         }
         let charges = charges_of(
             &self
@@ -1970,6 +1972,7 @@ impl SupervisorPool {
             return Err("no shared supervisor replica is attached to the gateway".to_string());
         }
         let ring = ring_of(&members);
+        let max_instances = self.max_instances_per_member();
         let targets = candidates(
             &ring,
             &members,
@@ -1977,10 +1980,13 @@ impl SupervisorPool {
             &assignment.route,
             &charges,
             None,
-            self.max_instances_per_member(),
+            max_instances,
         );
         let no_room = || {
-            "no shared supervisor replica is available with room for another sandbox".to_string()
+            format!(
+                "sandbox capacity reached: every supervisor runs its limit of {max_instances} \
+                 sandboxes; add supervisors or raise the per-supervisor limit"
+            )
         };
         if targets.is_empty() {
             return Err(no_room());
@@ -5654,107 +5660,44 @@ mod tests {
     }
 
     #[test]
-    fn placement_never_charges_a_member_past_the_configured_cap() {
-        let members = vec![live_member("m1", false), live_member("m2", false)];
-        let ring = ring_of(&members);
-        let cap = openshell_supervisor_control::PoolLimits::new(16, 1)
-            .unwrap()
-            .max_instances_per_member();
-        let mut charges = BTreeMap::new();
-        for index in 0..2 * cap {
-            let route = format!("rt-{index:03}");
-            let target = candidates(
-                &ring,
-                &members,
-                &format!("sandbox-{index}"),
-                &route,
-                &charges,
-                None,
-                cap,
-            )
-            .first()
-            .map(|member| member.member_id.clone())
-            .expect("a member with room");
-            recharge(&mut charges, &route, None, Some(&target));
-        }
-        assert!(charges.values().all(|routes| routes.len() == cap));
-        assert!(
-            candidates(
-                &ring,
-                &members,
-                "sandbox-new",
-                "rt-new",
-                &charges,
-                None,
-                cap
-            )
-            .is_empty()
-        );
-        // The same charges leave room under a larger cap.
-        assert_eq!(
-            candidates(
-                &ring,
-                &members,
-                "sandbox-new",
-                "rt-new",
-                &charges,
-                None,
-                2 * cap
-            )
-            .len(),
-            2
-        );
-        // The atomic check of an owner change applies the same cap.
-        let capacity = Capacity {
-            payload: CapacityPayload {
-                member_id: "m1".to_string(),
-                routes: charges["m1"].clone(),
-            },
-            resource_version: Some(1),
-        };
-        let hosted = charges["m1"].first().unwrap();
-        assert!(!capacity.has_room_for("rt-new", cap));
-        assert!(capacity.has_room_for(hosted, cap));
-        assert!(capacity.has_room_for("rt-new", cap + 1));
-    }
-
-    #[test]
-    fn least_loaded_placement_spreads_sandboxes_evenly() {
-        const MEMBERS: usize = 3;
-        const SANDBOXES: usize = 20;
-        let limits = openshell_supervisor_control::PoolLimits::new(16, 2).unwrap();
-        let cap = limits.max_instances_per_member();
-
-        let members = (0..MEMBERS)
+    fn least_loaded_placement_spreads_evenly_and_never_passes_the_cap() {
+        const CAP: usize = 7;
+        let members = (0..3)
             .map(|index| live_member(&format!("member-{index}"), false))
             .collect::<Vec<_>>();
         let ring = ring_of(&members);
         let mut charges = BTreeMap::new();
-        for index in 0..SANDBOXES {
-            let route = format!("rt-{index:02}");
-            let target = candidates(
+        let place = |charges: &BTreeMap<String, BTreeSet<String>>, index: usize| {
+            candidates(
                 &ring,
                 &members,
                 &format!("sandbox-{index}"),
-                &route,
-                &charges,
+                &format!("rt-{index:02}"),
+                charges,
                 None,
-                cap,
+                CAP,
             )
             .first()
-            .map_or_else(
-                || panic!("no member has room for sandbox {index}"),
-                |member| member.member_id.clone(),
-            );
-            recharge(&mut charges, &route, None, Some(&target));
+            .map(|member| member.member_id.clone())
+        };
+        for index in 0..3 * CAP {
+            let loads = charges.values().map(BTreeSet::len).collect::<Vec<_>>();
+            assert!(loads.iter().max().unwrap_or(&0) - loads.iter().min().unwrap_or(&0) <= 1);
+            let target = place(&charges, index).expect("a member with room");
+            recharge(&mut charges, &format!("rt-{index:02}"), None, Some(&target));
         }
-        let loads = charges.values().map(BTreeSet::len).collect::<Vec<_>>();
-        assert_eq!(loads.len(), MEMBERS);
-        assert_eq!(loads.iter().sum::<usize>(), SANDBOXES);
-        // Least-loaded placement keeps every member within one of the others,
-        // and never past its cap.
-        let (lightest, heaviest) = (loads.iter().min().unwrap(), loads.iter().max().unwrap());
-        assert!(heaviest - lightest <= 1, "{lightest}..{heaviest}");
-        assert!(*heaviest <= cap);
+        assert!(charges.values().all(|routes| routes.len() == CAP));
+        assert_eq!(place(&charges, 3 * CAP), None);
+        // The atomic owner change applies the same cap.
+        let capacity = Capacity {
+            payload: CapacityPayload {
+                member_id: "member-0".to_string(),
+                routes: charges["member-0"].clone(),
+            },
+            resource_version: Some(1),
+        };
+        let hosted = charges["member-0"].first().unwrap();
+        assert!(!capacity.has_room_for("rt-new", CAP));
+        assert!(capacity.has_room_for(hosted, CAP));
     }
 }

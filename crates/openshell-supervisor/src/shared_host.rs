@@ -171,9 +171,9 @@ pub struct SharedHostConfig {
     pub attach_request_timeout: Duration,
     /// This process's identity as a member of the supervisor pool.
     pub pool: PoolIdentity,
-    /// Most sandbox instances this member runs. The gateway enforces the
-    /// same cap before it assigns.
-    pub max_instances: usize,
+    /// This member's cap of sandbox instances, which also sizes its stream's
+    /// message bounds. The gateway enforces the same cap before it assigns.
+    pub limits: PoolLimits,
 }
 
 /// The sandbox instance registry and the routed runtime listener its
@@ -292,11 +292,6 @@ impl From<SandboxInstanceHostError> for ControlError {
 impl SharedHost {
     /// Bind the routed runtime listener and prepare the instance root.
     pub fn start(config: SharedHostConfig) -> Result<Arc<Self>> {
-        let limits = PoolLimits::new(
-            config.max_instances,
-            openshell_supervisor_control::DEFAULT_MAX_MEMBERS_PER_GATEWAY,
-        )
-        .map_err(|error| miette::miette!("{error}"))?;
         let app_listener = crate::app_listener::Config::from_env()?
             .map(crate::app_listener::Config::bind)
             .transpose()?
@@ -314,7 +309,7 @@ impl SharedHost {
             rejected: Mutex::new(BTreeMap::new()),
             desired_routes: Mutex::new(None),
             pool: config.pool,
-            limits,
+            limits: config.limits,
             stop_routes: Mutex::new(std::collections::BTreeSet::new()),
             deferred: Mutex::new(None),
             deferred_reports: Mutex::new(BTreeMap::new()),
@@ -331,12 +326,6 @@ impl SharedHost {
     #[must_use]
     pub fn pool(&self) -> &PoolIdentity {
         &self.pool
-    }
-
-    /// Most sandbox instances this member runs.
-    #[must_use]
-    pub fn max_instances(&self) -> usize {
-        self.limits.max_instances_per_member()
     }
 
     /// Whether this pool member announced that it is leaving.
@@ -561,7 +550,8 @@ impl SharedHost {
             .into_iter()
             .map(|status| status.route)
             .collect::<std::collections::BTreeSet<_>>();
-        let (admitted, unstarted) = within_capacity(snapshot, &hosted, self.max_instances());
+        let (admitted, unstarted) =
+            within_capacity(snapshot, &hosted, self.limits.max_instances_per_member());
         if !unstarted.is_empty() {
             tracing::warn!(
                 assigned = snapshot.instances.len(),
@@ -966,21 +956,11 @@ pub struct GatewayLink {
     /// connection attempt, so the gateway's renewals take effect at the next
     /// reconnect without a restart.
     pub token_file: PathBuf,
-    /// Sizes the stream's message bounds; [`attach_to_gateway`] sets it from
-    /// the host's cap.
-    limits: PoolLimits,
+    /// Sizes the stream's message bounds; the host's limits.
+    pub limits: PoolLimits,
 }
 
 impl GatewayLink {
-    #[must_use]
-    pub fn new(endpoint: String, token_file: PathBuf) -> Self {
-        Self {
-            endpoint,
-            token_file,
-            limits: PoolLimits::default(),
-        }
-    }
-
     /// Read the current supervisor token. A missing, empty, malformed, or
     /// already expired token is an error; the gateway keeps the file fresh,
     /// so the caller retries later.
@@ -1108,10 +1088,9 @@ impl GatewayConnector for GatewayLink {
 /// disconnects.
 pub async fn attach_to_gateway(
     host: Arc<SharedHost>,
-    mut link: GatewayLink,
+    link: GatewayLink,
     shutdown: impl Future<Output = ()>,
 ) {
-    link.limits = host.limits;
     attach_with(host, Arc::new(link), shutdown).await;
 }
 
@@ -1640,27 +1619,10 @@ mod tests {
     use openshell_core::jwt::CredentialEpoch;
     use openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId;
 
-    /// The smallest per-member cap a member accepts.
     const TEST_MAX_INSTANCES: usize = 16;
 
-    #[test]
-    fn hosts_refuse_caps_outside_the_allowed_range() {
-        for max_instances in [0, 1025] {
-            let root = tempfile::tempdir().unwrap();
-            let started = SharedHost::start(SharedHostConfig {
-                gateway_endpoint: "https://gateway.invalid".to_string(),
-                instance_root: root.path().join("instances"),
-                runtime_listen: "127.0.0.1:0".parse().unwrap(),
-                removal_grace: Duration::from_secs(1),
-                attach_request_timeout: Duration::from_secs(1),
-                pool: PoolIdentity {
-                    member_id: "member-1".to_string(),
-                    runtime_address: "127.0.0.1:5500".parse().unwrap(),
-                },
-                max_instances,
-            });
-            assert!(started.is_err(), "{max_instances}");
-        }
+    fn test_limits() -> PoolLimits {
+        PoolLimits::new(TEST_MAX_INSTANCES, 1).unwrap()
     }
 
     #[test]
@@ -1753,7 +1715,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
-            max_instances: TEST_MAX_INSTANCES,
+            limits: test_limits(),
         })
         .unwrap();
         for (revision, (offered, kept)) in [
@@ -1791,7 +1753,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
-            max_instances: TEST_MAX_INSTANCES,
+            limits: test_limits(),
         })
         .unwrap();
         let routes = [
@@ -1914,7 +1876,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
-            max_instances: TEST_MAX_INSTANCES,
+            limits: test_limits(),
         })
         .unwrap();
         let (released, stopped) = ("rt-released-0123456789", "rt-stopped-0123456789");
@@ -2012,7 +1974,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
-            max_instances: TEST_MAX_INSTANCES,
+            limits: test_limits(),
         })
         .unwrap();
         let (hosted_route, stopped_route) = ("rt-hosted-0123456789", "rt-stopped-0123456789");
@@ -2236,7 +2198,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
-            max_instances: TEST_MAX_INSTANCES,
+            limits: test_limits(),
         })
         .unwrap();
         let (opened, streams) = tokio::sync::mpsc::unbounded_channel();
@@ -2674,7 +2636,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
-            max_instances: TEST_MAX_INSTANCES,
+            limits: test_limits(),
         })
         .unwrap();
         let reconciler = Reconciler::start(host.clone());

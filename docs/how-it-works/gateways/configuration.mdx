@@ -779,7 +779,7 @@ max_members_per_gateway = 32
 |---|---|---|---|
 | `recovery_timeout_secs` | `60` | `30` to `300` | `supervisor.recoveryTimeoutSeconds` |
 | `max_instances_per_member` | `128` | `1` to `1024` | `supervisor.pool.maxInstancesPerMember` |
-| `max_members_per_gateway` | `32` | `1` to `64` | `supervisor.pool.maxMembersPerGateway` |
+| `max_members_per_gateway` | `32` | `1` or more | `supervisor.pool.maxMembersPerGateway` |
 
 The gateway never places more than `max_instances_per_member` sandboxes on one supervisor and refuses a create when every supervisor is full. The pool runs at most live gateway replicas × `max_members_per_gateway` × `max_instances_per_member` sandboxes, never more than 131,072. Start each supervisor with the same cap through `--pool-max-instances` or `OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`; the chart sets it. Values outside the ranges fail at startup.
 

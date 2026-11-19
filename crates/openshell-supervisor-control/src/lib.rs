@@ -53,9 +53,8 @@ pub use credential::deliver_credentials;
 /// Recovery deadlines, in seconds, a supervisor may offer a sandbox runtime.
 pub use openshell_sandbox_backend::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE;
 pub use pool_limits::{
-    DEFAULT_MAX_INSTANCES_PER_MEMBER, DEFAULT_MAX_MEMBERS_PER_GATEWAY,
-    MAX_INSTANCES_PER_MEMBER_RANGE, MAX_MEMBERS_PER_GATEWAY_RANGE, MAX_POOL_INSTANCES_CEILING,
-    PoolLimits, PoolLimitsError,
+    DEFAULT_MAX_INSTANCES_PER_MEMBER, DEFAULT_MAX_MEMBERS_PER_GATEWAY, MAX_INSTANCES_PER_MEMBER,
+    MAX_POOL_INSTANCES_CEILING, PoolLimits, PoolLimitsError,
 };
 pub use registration::{
     INSTANCE_REMOVAL_GRACE, MAX_LAUNCH_MATERIAL_BYTES, ProxyCaMaterial, RegistrationError,

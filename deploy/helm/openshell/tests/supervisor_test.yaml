@@ -788,18 +788,33 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: supervisor.pool.maxInstancesPerMember must be an integer between 1 and 1024
-  - it: rejects members per gateway outside 1 to 64
+  - it: rejects zero members per gateway
     template: templates/supervisor.yaml
     set:
       supervisor:
         pool:
-          maxMembersPerGateway: 65
+          maxMembersPerGateway: 0
       gatewayConfig:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.pool.maxMembersPerGateway must be an integer between 1 and 64
+          errorMessage: supervisor.pool.maxMembersPerGateway must be an integer of at least 1
+  - it: accepts any number of members per gateway
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 500
+        pool:
+          maxMembersPerGateway: 500
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 500
+        documentIndex: 0
   - it: rejects more supervisor replicas than the gateways serve
     template: templates/supervisor.yaml
     set:

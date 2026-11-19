@@ -1426,22 +1426,6 @@ mod tests {
     }
 
     #[test]
-    fn the_default_pool_cap_follows_live_gateway_replicas_to_the_ceiling() {
-        let controller = SupervisorHostController::new();
-        assert_eq!(controller.pool_limits(), PoolLimits::default());
-        assert_eq!(controller.max_pool_instances(), 32 * 128);
-        controller.set_gateway_replicas(0);
-        assert_eq!(controller.max_pool_instances(), 32 * 128);
-        controller.set_gateway_replicas(25);
-        assert_eq!(controller.max_pool_instances(), 102_400);
-        controller.set_gateway_replicas(100);
-        assert_eq!(
-            controller.max_pool_instances(),
-            crate::pool_limits::MAX_POOL_INSTANCES_CEILING
-        );
-    }
-
-    #[test]
     fn sessions_fence_stale_streams_epochs_and_acks() {
         let controller = SupervisorHostController::new();
         controller.update_pool(

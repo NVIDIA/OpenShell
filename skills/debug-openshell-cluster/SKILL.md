@@ -1379,14 +1379,15 @@ shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
 `max_instances_per_member` (Helm `supervisor.pool.maxInstancesPerMember`,
 1 to 1024, default 128, also passed to each member as
 `OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`), and `max_members_per_gateway`
-(`supervisor.pool.maxMembersPerGateway`, 1 to 64, default 32); the driver's
+(`supervisor.pool.maxMembersPerGateway`, 1 or more, default 32); the driver's
 `shared_supervisor` table carries no pool settings. Rendering fails when
 `supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds the
 gateway replica count times `maxMembersPerGateway`. A create that finds every
 member at its cap, or the pool at gateway replicas × members × instances
-(never above 131072), fails with "no shared supervisor replica is available
-with room for another sandbox" or "the supervisor pool runs as many sandbox
-instances as it can"; raise the cap or add members. Supervisor container
+(never above 131072), fails with `FAILED_PRECONDITION` "sandbox capacity
+reached: every supervisor runs its limit of N sandboxes" or "sandbox capacity
+reached: the cluster runs its limit of N sandboxes"; raise the cap or add
+members. Supervisor container
 resources come from `supervisor.resources` (default requests 250m and 768Mi,
 memory limit 1.5Gi). The chart rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control

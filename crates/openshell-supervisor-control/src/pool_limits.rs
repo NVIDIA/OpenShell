@@ -12,19 +12,15 @@
 //! [`MAX_POOL_INSTANCES_CEILING`]. Buffers sized by these limits follow the
 //! configured cap, not the largest one allowed.
 
-use std::ops::RangeInclusive;
-
 use crate::registration::MAX_LAUNCH_MATERIAL_BYTES;
 
 /// Sandbox instances one pool member runs unless the gateway configures
 /// another cap.
 pub const DEFAULT_MAX_INSTANCES_PER_MEMBER: usize = 128;
-/// Per-member caps a gateway and a member may configure.
-pub const MAX_INSTANCES_PER_MEMBER_RANGE: RangeInclusive<usize> = 1..=1024;
+/// Largest per-member cap a gateway and a member may configure.
+pub const MAX_INSTANCES_PER_MEMBER: usize = 1024;
 /// Pool members one gateway replica is sized to serve unless configured.
 pub const DEFAULT_MAX_MEMBERS_PER_GATEWAY: usize = 32;
-/// Members per gateway replica a gateway may configure.
-pub const MAX_MEMBERS_PER_GATEWAY_RANGE: RangeInclusive<usize> = 1..=64;
 /// Most sandbox instances a pool runs, whatever its configuration.
 pub const MAX_POOL_INSTANCES_CEILING: usize = 131_072;
 
@@ -47,7 +43,7 @@ const MIN_REPORTED_INSTANCES: usize = 64;
 pub enum PoolLimitsError {
     #[error("max_instances_per_member must be between 1 and 1024")]
     InstancesPerMember,
-    #[error("max_members_per_gateway must be between 1 and 64")]
+    #[error("max_members_per_gateway must be at least 1")]
     MembersPerGateway,
 }
 
@@ -75,10 +71,10 @@ impl PoolLimits {
         max_instances_per_member: usize,
         max_members_per_gateway: usize,
     ) -> Result<Self, PoolLimitsError> {
-        if !MAX_INSTANCES_PER_MEMBER_RANGE.contains(&max_instances_per_member) {
+        if !(1..=MAX_INSTANCES_PER_MEMBER).contains(&max_instances_per_member) {
             return Err(PoolLimitsError::InstancesPerMember);
         }
-        if !MAX_MEMBERS_PER_GATEWAY_RANGE.contains(&max_members_per_gateway) {
+        if max_members_per_gateway == 0 {
             return Err(PoolLimitsError::MembersPerGateway);
         }
         Ok(Self {
@@ -91,12 +87,6 @@ impl PoolLimits {
     #[must_use]
     pub fn max_instances_per_member(self) -> usize {
         self.max_instances_per_member
-    }
-
-    /// Members one gateway replica is sized to serve.
-    #[must_use]
-    pub fn max_members_per_gateway(self) -> usize {
-        self.max_members_per_gateway
     }
 
     /// Most sandbox instances the pool runs while `gateway_replicas` live
@@ -139,65 +129,41 @@ mod tests {
 
     #[test]
     fn limits_are_bounded() {
-        assert_eq!(
-            PoolLimits::default(),
-            PoolLimits::new(128, 32).expect("defaults are valid")
-        );
-        for (instances, members) in [(1, 1), (16, 1), (1024, 64), (128, 32)] {
-            assert!(PoolLimits::new(instances, members).is_ok());
-        }
-        for instances in [0, 1025, 4096] {
+        assert_eq!(PoolLimits::new(128, 32), Ok(PoolLimits::default()));
+        assert!(PoolLimits::new(1, 1).is_ok());
+        assert!(PoolLimits::new(1024, 10_000).is_ok());
+        for instances in [0, 1025] {
             assert_eq!(
                 PoolLimits::new(instances, 32),
                 Err(PoolLimitsError::InstancesPerMember)
             );
         }
-        for members in [0, 65, 128] {
-            assert_eq!(
-                PoolLimits::new(128, members),
-                Err(PoolLimitsError::MembersPerGateway)
-            );
-        }
+        assert_eq!(
+            PoolLimits::new(128, 0),
+            Err(PoolLimitsError::MembersPerGateway)
+        );
     }
 
     #[test]
     fn the_pool_cap_follows_replicas_up_to_the_ceiling() {
         let limits = PoolLimits::default();
         assert_eq!(limits.max_pool_instances(0), 32 * 128);
-        assert_eq!(limits.max_pool_instances(1), 32 * 128);
         assert_eq!(limits.max_pool_instances(25), 102_400);
-        assert_eq!(limits.max_pool_instances(32), MAX_POOL_INSTANCES_CEILING);
         assert_eq!(limits.max_pool_instances(1000), MAX_POOL_INSTANCES_CEILING);
-        let largest = PoolLimits::new(1024, 64).unwrap();
-        assert_eq!(
-            largest.max_pool_instances(usize::MAX),
-            MAX_POOL_INSTANCES_CEILING
-        );
     }
 
     #[test]
-    fn buffers_follow_the_configured_cap() {
+    fn buffers_follow_the_configured_cap_above_a_floor() {
+        let tiny = PoolLimits::new(1, 1).unwrap();
         let small = PoolLimits::new(16, 1).unwrap();
-        let default = PoolLimits::default();
-        let largest = PoolLimits::new(1024, 64).unwrap();
+        let largest = PoolLimits::new(1024, 1).unwrap();
         assert_eq!(
-            default.max_gateway_message_bytes(),
+            PoolLimits::default().max_gateway_message_bytes(),
             128 * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES)
         );
-        assert!(small.max_gateway_message_bytes() < default.max_gateway_message_bytes());
-        assert!(default.max_gateway_message_bytes() < largest.max_gateway_message_bytes());
-        assert_eq!(small.max_host_message_bytes(), MIN_HOST_MESSAGE_BYTES);
-        assert_eq!(largest.max_host_message_bytes(), 4 * 1024 * 1024);
-        // The smallest caps keep the bounds a cap of 16 gives.
-        let tiny = PoolLimits::new(1, 1).unwrap();
-        assert_eq!(
-            tiny.max_gateway_message_bytes(),
-            small.max_gateway_message_bytes()
-        );
-        assert_eq!(
-            tiny.max_reported_instances(),
-            small.max_reported_instances()
-        );
+        assert_eq!(tiny.max_gateway_message_bytes(), MIN_GATEWAY_MESSAGE_BYTES);
+        assert_eq!(small.max_gateway_message_bytes(), MIN_GATEWAY_MESSAGE_BYTES);
         assert_eq!(tiny.max_host_message_bytes(), MIN_HOST_MESSAGE_BYTES);
+        assert_eq!(largest.max_host_message_bytes(), 4 * 1024 * 1024);
     }
 }

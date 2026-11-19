@@ -488,9 +488,10 @@ default.
 {{- end }}
 
 {{/*
-One supervisor.pool limit as a whole number in [min, max]. A missing value
-(for example after `helm upgrade --reuse-values` from a release that predates
-it) means the default. Takes a dict of root, key, min, max, and default.
+One supervisor.pool limit as a whole number of at least 1, and at most max
+when given. A missing value (for example after `helm upgrade --reuse-values`
+from a release that predates it) means the default. Takes a dict of root,
+key, default, and optionally max.
 */}}
 {{- define "openshell.supervisorPoolLimit" -}}
 {{- $pool := get (.root.Values.supervisor | default dict) "pool" | default dict -}}
@@ -502,8 +503,12 @@ it) means the default. Takes a dict of root, key, min, max, and default.
 {{- .default -}}
 {{- else -}}
 {{- $limit := include "openshell.wholeNumber" $value -}}
-{{- if or (eq $limit "") (lt (int64 $limit) (int64 .min)) (gt (int64 $limit) (int64 .max)) -}}
-{{- fail (printf "supervisor.pool.%s must be an integer between %d and %d" .key (int .min) (int .max)) -}}
+{{- if hasKey . "max" -}}
+{{- if or (eq $limit "") (lt (int64 $limit) 1) (gt (int64 $limit) (int64 .max)) -}}
+{{- fail (printf "supervisor.pool.%s must be an integer between 1 and %d" .key (int .max)) -}}
+{{- end -}}
+{{- else if or (eq $limit "") (lt (int64 $limit) 1) -}}
+{{- fail (printf "supervisor.pool.%s must be an integer of at least 1" .key) -}}
 {{- end -}}
 {{- $limit -}}
 {{- end -}}
@@ -511,12 +516,12 @@ it) means the default. Takes a dict of root, key, min, max, and default.
 
 {{/* Most sandboxes one supervisor runs (supervisor.pool.maxInstancesPerMember). */}}
 {{- define "openshell.supervisorMaxInstancesPerMember" -}}
-{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxInstancesPerMember" "min" 1 "max" 1024 "default" 128) -}}
+{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxInstancesPerMember" "max" 1024 "default" 128) -}}
 {{- end }}
 
 {{/* Most supervisors one gateway replica serves (supervisor.pool.maxMembersPerGateway). */}}
 {{- define "openshell.supervisorMaxMembersPerGateway" -}}
-{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxMembersPerGateway" "min" 1 "max" 64 "default" 32) -}}
+{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxMembersPerGateway" "default" 32) -}}
 {{- end }}
 
 {{/*

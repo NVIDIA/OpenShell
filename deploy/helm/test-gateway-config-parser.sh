@@ -139,7 +139,7 @@ done
 # profile must pass the Rust loader, and the loader must refuse values the
 # chart would never render.
 supervisor_topology='gatewayConfig.openshell\.drivers\.kubernetes.supervisor_topology=gateway'
-for limits in "1 1" "128 32" "1024 64"; do
+for limits in "1 1" "128 32" "1024 500"; do
   read -r instances members <<<"${limits}"
   name="pool-${instances}-${members}"
   render "${work_dir}/${name}.yaml" --set-string "${supervisor_topology}" \
@@ -166,7 +166,7 @@ for valid in "max_instances_per_member = 64" "max_members_per_gateway = 8"; do
   preflight "${work_dir}/pool-edited.toml"
 done
 for invalid in "max_instances_per_member = 0" "max_instances_per_member = 1025" \
-  "max_members_per_gateway = 0" "max_members_per_gateway = 65"; do
+  "max_members_per_gateway = 0"; do
   pool_with "${invalid}"
   if preflight "${work_dir}/pool-edited.toml" >"${work_dir}/pool-edited.err" 2>&1; then
     echo "the gateway loader accepted ${invalid}" >&2
