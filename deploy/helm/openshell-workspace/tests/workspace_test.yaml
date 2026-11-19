@@ -12,6 +12,16 @@ release:
   namespace: app-a
 
 tests:
+  - it: requires no Secret reads for warm pool creation recovery or draining
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+
   - it: grants supervisor lifecycle and complete stopped-update pod inspection
     template: templates/role.yaml
     asserts:

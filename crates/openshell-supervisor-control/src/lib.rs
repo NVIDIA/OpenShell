@@ -30,6 +30,7 @@ pub mod credential;
 pub mod pool_timing;
 pub mod registration;
 pub mod status;
+pub mod warm_pool;
 
 /// The private gateway-to-shared-supervisor protocol
 /// (`openshell.supervisor.host.v1`).
@@ -44,14 +45,18 @@ pub use controller::{
     SupervisorCredential, SupervisorHostController,
 };
 pub use coordinator::{
-    InstancePlacement, InstanceSupervision, LaunchError, PlacementFuture, PlacementRequest,
-    RecoverableInstance, RecoveryBaseline, RecoveryOutcome, SharedSupervision,
+    ActivationRequest, InstancePlacement, InstanceSupervision, LaunchError, PendingWarmClaim,
+    PlacementFuture, PlacementRequest, PreparationRelease, PreparationRequest,
+    PreparationRetirement, PreparationRevision, PreparedRuntime, PreparedRuntimeOwner,
+    RecoverableInstance, RecoveryBaseline, RecoveryOutcome, SharedSupervision, WarmClaimIntent,
+    WarmClaimInventories, WarmClaimInventory, WarmClaimLookup, WarmClaimReservation,
 };
 pub use credential::deliver_credentials;
 /// Recovery deadlines, in seconds, a supervisor may offer a sandbox runtime.
 pub use openshell_sandbox_backend::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE;
 pub use registration::{
-    INSTANCE_REMOVAL_GRACE, MAX_LAUNCH_MATERIAL_BYTES, ProxyCaMaterial, RegistrationError,
-    RegistrationTraceContext, SandboxInstanceRegistration, SecretPem,
+    INSTANCE_REMOVAL_GRACE, MAX_LAUNCH_MATERIAL_BYTES, PreparedRuntimeRegistration,
+    ProxyCaMaterial, RegistrationError, RegistrationTraceContext, SandboxInstanceRegistration,
+    SecretPem,
 };
 pub use status::{SandboxInstancePhaseReport, SandboxInstanceStatusReport};

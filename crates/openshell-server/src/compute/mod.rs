@@ -962,6 +962,7 @@ pub struct ComputeRuntime {
     /// Desired assignments of the shared supervisor host, when the gateway
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
+    dedicated_warm_supervision: Option<openshell_supervisor_control::SharedSupervision>,
     service_route_index: Arc<OnceLock<Arc<crate::service_routing::ServiceRouteIndex>>>,
 }
 
@@ -1079,6 +1080,7 @@ impl ComputeRuntime {
             supervisor_otlp_headers: Arc::new(OnceLock::new()),
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            dedicated_warm_supervision: None,
             service_route_index: Arc::new(OnceLock::new()),
         })
     }
@@ -1091,6 +1093,20 @@ impl ComputeRuntime {
     ) -> Self {
         self.supervisor_host = supervisor_host;
         self
+    }
+
+    pub(crate) fn with_dedicated_warm_supervision(
+        mut self,
+        supervision: Option<openshell_supervisor_control::SharedSupervision>,
+    ) -> Self {
+        self.dedicated_warm_supervision = supervision;
+        self
+    }
+
+    pub(crate) fn dedicated_warm_supervision(
+        &self,
+    ) -> Option<&openshell_supervisor_control::SharedSupervision> {
+        self.dedicated_warm_supervision.as_ref()
     }
 
     /// Gateway-owned assignments of the shared supervisor host, if any.
@@ -1413,6 +1429,15 @@ impl ComputeRuntime {
         &self,
         credential: &str,
     ) -> Result<openshell_core::proto::compute::v1::AuthenticateSandboxResponse, Status> {
+        self.authenticate_compute_credential(credential, false)
+            .await
+    }
+
+    pub(crate) async fn authenticate_compute_credential(
+        &self,
+        credential: &str,
+        supervisor_registration: bool,
+    ) -> Result<openshell_core::proto::compute::v1::AuthenticateSandboxResponse, Status> {
         if !self.supports_sandbox_authentication() {
             return Err(Status::unimplemented(
                 "selected compute driver does not authenticate sandbox credentials",
@@ -1420,6 +1445,7 @@ impl ComputeRuntime {
         }
         let request = AuthenticateSandboxRequest {
             credential: credential.to_string(),
+            supervisor_registration,
         };
         self.driver
             .call(
@@ -1828,6 +1854,12 @@ impl ComputeRuntime {
                 | ProvisioningOperationError::Unsettled(status),
             ) => return Err(status),
             Err(ProvisioningOperationError::Driver { status, settled }) => {
+                // A warm activation may have committed before the driver's response
+                // was lost. Settlement has already checked this operation and launch.
+                if committed_warm_binding(&settled).is_some() {
+                    provisioning_operation::ensure_current_result(&settled, &settled)?;
+                    return Ok(*settled);
+                }
                 let status = match status.code() {
                     Code::AlreadyExists => Status::already_exists("sandbox already exists"),
                     Code::FailedPrecondition => {
@@ -1858,13 +1890,18 @@ impl ComputeRuntime {
             ));
         }
         let runtime_identity = response.into_inner().runtime_identity;
-        if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
+        if let Some(committed) = committed_warm_binding(&sandbox) {
+            if committed != runtime_identity {
+                return Err(Status::internal(
+                    "driver response differs from the committed warm runtime",
+                ));
+            }
+        } else if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
             let status = Status::internal("compute driver did not return a runtime identity");
             return Err(self
                 .compensate_failed_create(&sandbox, lifecycle_guard, Some(sandbox_guard), status)
                 .await);
-        }
-        if self.supports_sandbox_authentication() {
+        } else if self.supports_sandbox_authentication() {
             let persisted = self
                 .persist_runtime_binding(
                     &sandbox_id,
@@ -7237,7 +7274,7 @@ pub async fn connect_remote_compute_driver(
     ))
 }
 
-fn driver_sandbox_from_public(
+pub fn driver_sandbox_from_public(
     sandbox: &Sandbox,
     driver_name: &str,
 ) -> Result<DriverSandbox, Box<Status>> {
@@ -7258,7 +7295,9 @@ fn driver_sandbox_from_public(
     })
 }
 
-fn driver_sandbox_spec_from_public(
+pub const WORKLOAD_TEMPLATE_ID_ANNOTATION: &str = "internal.openshell.ai/workload-template-id";
+
+pub fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
@@ -7624,6 +7663,18 @@ fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
         .metadata
         .as_ref()
         .map_or(0, |metadata| metadata.resource_version)
+}
+
+/// Warm activation settles CREATE and binds compute in the same transaction.
+fn committed_warm_binding(sandbox: &Sandbox) -> Option<&str> {
+    let annotations = &sandbox.metadata.as_ref()?.annotations;
+    crate::auth::sandbox_session::PersistedSandboxIdentity::read(annotations)
+        .ok()?
+        .prepared_runtime?;
+    annotations
+        .get(COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+        .map(String::as_str)
+        .filter(|identity| !identity.is_empty())
 }
 
 fn sandbox_compute_runtime_identity(sandbox: &Sandbox) -> String {
@@ -8152,6 +8203,20 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>) {
     );
 }
 
+pub fn record_warm_create_failure(sandbox: &mut Sandbox) {
+    sandbox.set_phase(SandboxPhase::Error as i32);
+    upsert_ready_condition(
+        &mut sandbox.status,
+        SandboxCondition {
+            r#type: "Ready".into(),
+            status: "False".into(),
+            reason: "WarmClaimCancelled".into(),
+            message: "The reserved warm runtime was lost before activation".into(),
+            ..Default::default()
+        },
+    );
+}
+
 fn upsert_ready_condition(status: &mut Option<SandboxStatus>, condition: SandboxCondition) {
     let status = status.get_or_insert_with(SandboxStatus::default);
 
@@ -8543,6 +8608,7 @@ impl ComputeDriver for NoopTestDriver {
                 openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
                     sandbox_id: sandbox_id.clone(),
                     runtime_identity: runtime_identity.clone(),
+                    supervisor_registration: None,
                 },
             )),
             Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
@@ -8812,6 +8878,7 @@ pub fn new_test_runtime_with_driver(
         supervisor_otlp_headers: Arc::new(OnceLock::new()),
         supervisor_otlp_tls: Arc::new(OnceLock::new()),
         supervisor_host: None,
+        dedicated_warm_supervision: None,
         service_route_index: Arc::new(OnceLock::new()),
     }
 }
@@ -10111,6 +10178,7 @@ mod tests {
             supervisor_otlp_headers: Arc::new(OnceLock::new()),
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            dedicated_warm_supervision: None,
             service_route_index: Arc::new(OnceLock::new()),
         }
     }
@@ -11183,6 +11251,7 @@ mod tests {
             auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test auth epoch"),
             gateway_token_id: uuid::Uuid::new_v4(),
             refresh_replay: None,
+            prepared_runtime: None,
         }
         .write(&mut annotations);
         let mut sandbox = Sandbox {

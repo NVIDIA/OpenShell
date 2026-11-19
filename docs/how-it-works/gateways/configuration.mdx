@@ -1679,6 +1679,98 @@ releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress
 `NetworkPolicy` in every sandbox namespace; the Kubernetes API does not verify
 enforcement.
 
+#### Experimental warm capacity
+
+Warm pooling is enabled by default for Kubernetes in `managed`, `shared` or `operator`
+workspace mode, with dedicated or shared supervisors. It requires gateway TLS and
+JWT signing. No capacity is created until a sandbox template sets both
+`desired_service_level.startup.ready_within` and a positive `max_burst`.
+See [Sandbox Templates](/how-it-works/sandboxes/templates) for the CLI configuration.
+A create from that template claims a ready spare with matching Pod configuration
+and environment, or uses cold creation when none is available. Temporary pool
+discovery failures also allow cold creation after the gateway confirms that no
+warm claim owns the launch. Permission and claim recovery errors still fail the
+request. Creates without a
+template do not consume template pools. `ready_within` is a requested service level,
+not a guaranteed startup deadline.
+
+The following optional driver settings control operator limits, not pool definitions:
+
+```toml
+[openshell.drivers.kubernetes.warm_pool]
+enabled = true
+revision = 1
+max_size = 16
+max_age_secs = 3600
+preparation_timeout_secs = 300
+```
+
+The target count is the template's `max_burst`, capped by `max_size`. Pending and
+deleting spares count against this per-template maximum (1–256).
+Each gateway replica accepts up to 4096 pending dedicated supervisor registrations
+across templates and workspaces. Supervisors retry with backoff when that limit is
+reached.
+`max_age_secs` accepts 60–86400 seconds; `preparation_timeout_secs` accepts
+30–3600 seconds and must not exceed the maximum age. Increase `revision` when
+changing these limits or the effective runtime configuration, including runtime
+images and gateway verification keys. Gateway upgrades can change the default
+OpenShell runtime images, so include a revision increase in those deployments.
+Use a higher revision for rollbacks too; older replicas cannot overwrite a newer
+plan.
+
+A revision increase retains compatible spares and applies the new capacity and
+expiry limits. It replaces unclaimed spares only when their effective workload,
+supervisor, bootstrap, or trust configuration changes. Unused defaults and
+unrelated driver settings do not affect compatibility. For example, changing the
+default workload image does not invalidate a template with an explicit image.
+On OpenShift, increase the revision when a namespace annotation changes the
+UID or GID used by its warm workloads.
+Image references are compared without querying registries. Changing the contents
+behind an unchanged tag does not trigger replacement.
+
+If effective configuration changes without a revision increase, the gateway logs
+`warm provisioning suspended`. That replica stops preparing and selecting
+incompatible spares, while recorded expiry and retirement work continues. Deploy
+a higher revision with consistent settings across replicas to resume provisioning.
+
+Deleting a template drains its unclaimed capacity automatically, including after
+a gateway restart. Recreating the same template name creates a distinct pool.
+Set `warm_pool.enabled = false` on all gateway replicas to stop claims and drain
+all pools, even if runtime configuration no longer matches. Disabling is recorded
+in the pool journal so another replica cannot refill it. Set `enabled = true` with
+a higher `revision` to re-enable pooling. Claimed sandboxes continue through their
+normal lifecycle.
+
+Warm pooling supports managed, operator and shared workspaces without additional
+workspace Secret-read permissions. The gateway persists preparation and claim
+records for recovery. Incomplete unclaimed preparations expire and are replaced;
+claims recover their original identity, including when a gateway restarts before
+the Kubernetes resource is bound to the sandbox. Pool draining leaves runtimes
+reserved by an in-progress create alone. If a reserved runtime is lost, that launch
+fails rather than starting a second workload.
+
+The gateway reserves shared-supervisor capacity, or creates a dedicated supervisor
+Pod, before releasing each runtime Pod. A dedicated spare consumes both Pods.
+Readiness requires an authenticated connection to the assigned supervisor;
+a running Pod or released scheduling gate is insufficient. Runtimes that fail
+to connect within the preparation timeout, lose their supervisor, exceed their
+maximum age, or lack a healthy observation for 60 seconds are retired and replaced.
+Shared supervisors report current parked connections; dedicated supervisors use
+the original Pod's startup and readiness probes. Before claim, readiness requires
+both the parked runtime and an accepted gateway registration.
+Gateway replicas share durable creation intents, so a restart or lost API
+response reuses the pending identity.
+
+Dedicated supervisors require gateway TLS and keep a registration stream open
+until claimed. The response supplies the assigned identity and credentials, so
+claims do not wait for Kubernetes Secret projection. The runtime makes no bootstrap
+request to the gateway. Shared supervisors receive claims through their existing
+assignment stream. Drain warm pools before changing supervisor topology.
+
+A claim keeps the existing Pod and supervisor connection. Policy, credentials,
+and the main process are assigned at claim time. A stopped sandbox starts with
+a fresh runtime generation; claimed runtimes never return to the pool.
+
 In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace
 namespace on sandbox creation. Shared and operator modes require the Secret to

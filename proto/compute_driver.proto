@@ -162,6 +162,9 @@ message GetCapabilitiesResponse {
 message AuthenticateSandboxRequest {
   // Opaque credential whose format and verification are owned by the driver.
   string credential = 1 [(openshell.options.v1.secret) = true];
+  // Authenticate only a physical warm supervisor, never a logical sandbox.
+  // Used exclusively by the private deferred RegisterSupervisor exchange.
+  bool supervisor_registration = 2;
 }
 
 message AuthenticateSandboxResponse {
@@ -171,6 +174,16 @@ message AuthenticateSandboxResponse {
   // The gateway compares this with the identity recorded when the sandbox was
   // created to authorize the bootstrap exchange.
   string runtime_identity = 2;
+  // Present only for supervisor_registration requests. No sandbox authority
+  // is granted by this binding, even after the physical runtime is claimed.
+  SupervisorRegistrationIdentity supervisor_registration = 3;
+}
+
+message SupervisorRegistrationIdentity {
+  string route = 1;
+  string generation = 2;
+  string session_id = 3;
+  map<string, string> resource_claims = 4;
 }
 
 // Static portable resource request forms supported by a compute driver.

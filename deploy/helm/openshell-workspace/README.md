@@ -32,6 +32,9 @@ Keep `sandboxServiceAccount.name` aligned with the gateway chart's
 `gateway.allowDriverConfig=true` in every workspace release so caller-selected
 PVCs can be admitted.
 
+Warm pooling requires no additional workspace Secret-read permissions.
+Preparation and claim recovery use gateway persistence.
+
 ## Values
 
 | Key | Type | Default | Description |

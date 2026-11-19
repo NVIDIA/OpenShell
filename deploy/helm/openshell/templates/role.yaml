@@ -64,8 +64,7 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact
-    # name.
+    # Warm pooling uses gateway persistence for recovery.
     verbs: ["create", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]

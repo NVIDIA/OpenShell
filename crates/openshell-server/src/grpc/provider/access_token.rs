@@ -703,6 +703,7 @@ mod tests {
         use openshell_core::jwt::{CredentialEpoch, SandboxId};
         let session = AuthenticatedSandboxSession {
             sandbox_id: SandboxId::parse(uuid::Uuid::new_v4().to_string()).unwrap(),
+            resource_binding: std::collections::BTreeMap::new(),
             runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
                 "g1",
             )

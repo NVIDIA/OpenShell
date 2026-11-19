@@ -134,6 +134,16 @@ pub struct ObjectRecord {
     pub resource_version: u64,
 }
 
+/// Identifies one persisted object revision, including replacement of its row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStamp {
+    pub id: String,
+    pub resource_version: u64,
+}
+
+/// Keep version observations below both backends' bind-parameter limits.
+const OBJECT_STAMPS_BATCH_SIZE: usize = 256;
+
 /// Stable position in the global object-listing order.
 ///
 /// Keyset consumers must use the matching store method for the total
@@ -919,6 +929,22 @@ impl Store {
         name: &str,
     ) -> PersistenceResult<Option<ObjectRecord>> {
         store_dispatch_traced!(self.get_by_name(object_type, workspace, name))
+    }
+
+    /// Read only row identities and versions for the requested names. Missing
+    /// names are omitted; a failed batch fails the entire observation.
+    #[tracing::instrument(
+        name = "store", level = "debug", skip_all,
+        fields(otel.name = "store.object_stamps", otel.status_code = tracing::field::Empty,
+            object_type = %object_type, workspace = %workspace)
+    )]
+    pub(crate) async fn object_stamps(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        names: &[String],
+    ) -> PersistenceResult<HashMap<String, ObjectStamp>> {
+        store_dispatch_traced!(self.object_stamps(object_type, workspace, names))
     }
 
     /// Delete an object by id.

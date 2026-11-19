@@ -59,14 +59,21 @@ use openshell_supervisor_control::proto::{
     SandboxInstanceAssignment, SandboxInstancePhase, SandboxInstanceStatus, SandboxInstanceTakeover,
 };
 use openshell_supervisor_control::{
-    ConnectedMember, InstanceOwner, InstancePlacement, MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES,
-    MemberReport, MemberView, PlacementFuture, PlacementRequest, PoolView,
-    SupervisorHostController,
+    ActivationRequest, ConnectedMember, InstanceOwner, InstancePlacement, MAX_ASSIGNED_INSTANCES,
+    MAX_POOL_INSTANCES, MemberReport, MemberView, PlacementFuture, PlacementRequest, PoolView,
+    PreparationRelease, PreparationRequest, PreparationRetirement, PreparationRevision,
+    PreparedRuntime, PreparedRuntimeOwner, SupervisorHostController,
 };
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+mod prepared;
+#[cfg(test)]
+mod prepared_tests;
+mod registration_watch;
+mod warm_pool;
 
 use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
 use crate::auth::sandbox_session::{
@@ -236,6 +243,9 @@ enum RecordPhase {
     Admitting,
     /// The pool must run the instance, with this launch material.
     Published,
+    /// A permanently retired physical warm runtime. Keep the route reserved so
+    /// delayed preparation cannot recreate capacity after infrastructure cleanup.
+    Retired,
 }
 
 /// A pool instance the gateway must run, or a recording's reservation of its
@@ -243,6 +253,8 @@ enum RecordPhase {
 /// holds its handle. Material candidates have the same shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AssignmentPayload {
+    #[serde(default)]
+    dedicated: bool,
     route: String,
     sandbox_id: String,
     generation: String,
@@ -255,6 +267,29 @@ struct AssignmentPayload {
     /// Credential handle of the launch material (encoded `CredentialHandle`);
     /// empty in a reservation.
     material_handle: Vec<u8>,
+    /// No logical Sandbox has activated; a claim intent may already reserve it.
+    #[serde(default)]
+    prepared: bool,
+    /// Original bootstrap epoch of a warm runtime, retained after activation so
+    /// its physical route remains single-use after the assigned Sandbox stops.
+    #[serde(default)]
+    prepared_epoch: u64,
+    /// Journal identity retained after activation and retirement.
+    #[serde(default)]
+    prepared_session: Option<openshell_core::SandboxSessionId>,
+    /// A material candidate whose version fences an in-flight activation.
+    #[serde(default)]
+    activation_candidate: bool,
+    /// Credential-store handle of the immutable warm claim intent. Kept through
+    /// activation and collected atomically with retirement.
+    #[serde(default)]
+    claim_handle: Vec<u8>,
+    /// Older assignments lack the pool ID and recover through workspace inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_id: Option<String>,
+    /// Gateway CREATE owning this reservation, captured in the claim CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +422,8 @@ enum Reconciled {
 
 /// One gateway replica's view and maintenance of the pool.
 pub struct SupervisorPool {
+    dedicated: bool,
+    pub(crate) registrations: Arc<registration_watch::RegistrationWatch>,
     store: Arc<Store>,
     controller: SupervisorHostController,
     authority: Arc<SandboxSessionJwtAuthority>,
@@ -451,6 +488,8 @@ type TransitionGate = (
 #[cfg(test)]
 #[derive(Default)]
 struct TestHooks {
+    /// Pauses preparation after reading its journal, before reserving the route.
+    preparation_gate: Mutex<Option<Gate>>,
     /// Pauses the next listing of an object type after its first page.
     listing_gate: Mutex<Option<(String, Gate)>>,
     /// Routes dropped from assignment and owner listings, as a listing that
@@ -709,7 +748,8 @@ fn reports_of_owners(
                 owner.payload.auth_epoch,
             ))?;
             (report.member_id == owner.payload.member_id
-                && report.process_id == owner.payload.process_id)
+                && report.process_id == owner.payload.process_id
+                && report.sandbox_id == owner.payload.sandbox_id)
                 .then(|| {
                     (
                         report.route.clone(),
@@ -746,7 +786,14 @@ fn decode_report(record: &ObjectRecord) -> Option<ReportPayload> {
 
 /// The credential owner of one sandbox assignment's launch material.
 fn material_owner(payload: &AssignmentPayload) -> SecretOwner<'_> {
-    SecretOwner::supervisor_instance(&payload.workspace, &payload.sandbox_id)
+    SecretOwner::supervisor_instance(
+        &payload.workspace,
+        if payload.prepared {
+            &payload.route
+        } else {
+            &payload.sandbox_id
+        },
+    )
 }
 
 /// Whether `generation` of `sandbox` can still run: the sandbox exists,
@@ -765,6 +812,27 @@ fn generation_runs(sandbox: Option<&Sandbox>, generation: &str) -> bool {
 }
 
 impl SupervisorPool {
+    pub fn new_dedicated(
+        store: Arc<Store>,
+        controller: SupervisorHostController,
+        authority: Arc<SandboxSessionJwtAuthority>,
+        credentials: CredentialRuntime,
+        replica_id: String,
+    ) -> Arc<Self> {
+        let mut pool = Self::new(
+            store,
+            controller,
+            authority,
+            credentials,
+            replica_id,
+            Arc::default(),
+        );
+        Arc::get_mut(&mut pool)
+            .expect("new pool is uniquely owned")
+            .dedicated = true;
+        pool
+    }
+
     #[must_use]
     pub fn new(
         store: Arc<Store>,
@@ -775,6 +843,8 @@ impl SupervisorPool {
         spread: Arc<SupervisorSpread>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            dedicated: false,
+            registrations: Arc::default(),
             store,
             controller,
             authority,
@@ -925,7 +995,12 @@ impl SupervisorPool {
     pub fn start(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         self.controller
             .install_placement(Arc::new(PoolPlacement(self.clone())));
-        self.start_membership_heartbeat(shutdown.clone());
+        if self.dedicated {
+            self.registrations
+                .start(self.store.clone(), shutdown.clone());
+        } else {
+            self.start_membership_heartbeat(shutdown.clone());
+        }
         let pool = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
@@ -939,6 +1014,19 @@ impl SupervisorPool {
                         }
                         continue;
                     }
+                }
+                if pool.dedicated {
+                    // Dedicated Pods own their own lifetime; there is no shared
+                    // host membership, placement, or takeover stream.
+                    pool.remove_stale_candidates().await;
+                    if let Ok(records) = pool.all_assignments().await {
+                        pool.cancel_abandoned_warm_claims(&records).await;
+                        pool.fence_stale_reservations(&records).await;
+                        pool.sweep_ended_instances(&records).await;
+                        pool.remove_retired_assignments(&records).await;
+                        pool.remove_withdrawn().await;
+                    }
+                    continue;
                 }
                 if let Err(error) = pool.reconcile_once().await {
                     warn!(%error, "supervisor pool reconciliation failed; retrying");
@@ -1418,6 +1506,7 @@ impl SupervisorPool {
             .await?
             .iter()
             .filter_map(decode_assignment)
+            .filter(|record| record.payload.dedicated == self.dedicated)
             .map(|record| (record.payload.route.clone(), record))
             .collect())
     }
@@ -1431,12 +1520,16 @@ impl SupervisorPool {
 
     /// The record or reservation of `route`.
     async fn assignment(&self, route: &str) -> Result<Option<AssignmentRecord>, PersistenceError> {
-        Ok(self
-            .store
+        self.store
             .get_by_name(ASSIGNMENT_OBJECT_TYPE, "", route)
             .await?
             .as_ref()
-            .and_then(decode_assignment))
+            .map(|row| {
+                decode_assignment(row).ok_or_else(|| {
+                    PersistenceError::Decode("invalid supervisor runtime assignment".into())
+                })
+            })
+            .transpose()
     }
 
     /// Keep `material` in the credential store under a fresh path, so a
@@ -1553,11 +1646,25 @@ impl SupervisorPool {
         assignment: &SandboxInstanceAssignment,
         phase: RecordPhase,
     ) -> Result<Recording, String> {
+        self.record_assignment_scoped(assignment, phase, None).await
+    }
+
+    async fn record_assignment_scoped(
+        &self,
+        assignment: &SandboxInstanceAssignment,
+        phase: RecordPhase,
+        preparation: Option<(&str, u64, &str)>,
+    ) -> Result<Recording, String> {
         let read = |error: PersistenceError| format!("read supervisor pool instance: {error}");
         let existing = |record: AssignmentRecord| match record.payload.phase {
             RecordPhase::Published | RecordPhase::Admitting
                 if record.payload.generation == assignment.generation
-                    && record.payload.sandbox_id == assignment.sandbox_id =>
+                    && record.payload.sandbox_id == assignment.sandbox_id
+                    && record.payload.prepared == assignment.prepared
+                    && preparation.is_none_or(|(workspace, epoch, _)| {
+                        record.payload.workspace == workspace
+                            && record.payload.prepared_epoch == epoch
+                    }) =>
             {
                 Ok(Recording {
                     record,
@@ -1570,46 +1677,95 @@ impl SupervisorPool {
             RecordPhase::Reserved => {
                 Err("the sandbox instance is being recorded by another gateway task".to_string())
             }
+            RecordPhase::Retired => Err("the physical runtime has been retired".into()),
         };
         if let Some(record) = self.assignment(&assignment.route).await.map_err(read)? {
+            if record.payload.dedicated != self.dedicated {
+                return Err(
+                    "runtime preparation belongs to a different supervisor topology".into(),
+                );
+            }
+            if record.payload.phase == RecordPhase::Retired {
+                return existing(record);
+            }
+            if record.payload.prepared != assignment.prepared
+                || (assignment.prepared
+                    && (preparation.map(|(workspace, epoch, _)| (workspace, epoch))
+                        != Some((
+                            record.payload.workspace.as_str(),
+                            record.payload.prepared_epoch,
+                        ))
+                        || self.load_material(&record.payload).await?
+                            != assignment.launch_material))
+            {
+                return Err("the runtime route is already reserved with different material".into());
+            }
             return existing(record);
         }
-        let sandbox = self
-            .store
-            .get_message::<Sandbox>(&assignment.sandbox_id)
-            .await
-            .map_err(read)?
-            .ok_or_else(|| "the sandbox of the instance does not exist".to_string())?;
+        let workspace = if let Some((workspace, _, _)) = preparation {
+            workspace.to_string()
+        } else {
+            let sandbox = self
+                .store
+                .get_message::<Sandbox>(&assignment.sandbox_id)
+                .await
+                .map_err(read)?
+                .ok_or_else(|| "the sandbox of the instance does not exist".to_string())?;
+            sandbox.object_workspace().to_string()
+        };
         let mut payload = AssignmentPayload {
+            dedicated: self.dedicated,
             route: assignment.route.clone(),
             sandbox_id: assignment.sandbox_id.clone(),
             generation: assignment.generation.clone(),
-            workspace: sandbox.object_workspace().to_string(),
+            workspace,
             phase: RecordPhase::Reserved,
             writer: Uuid::new_v4().to_string(),
             material_handle: Vec::new(),
+            prepared: assignment.prepared,
+            prepared_epoch: preparation.map_or(0, |(_, epoch, _)| epoch),
+            prepared_session: if preparation.is_some() {
+                Some(
+                    openshell_supervisor_control::PreparedRuntimeRegistration::from_assignment(
+                        assignment,
+                    )
+                    .map_err(|e| e.to_string())?
+                    .runtime_descriptor
+                    .session_id,
+                )
+            } else {
+                None
+            },
+            activation_candidate: false,
+            claim_handle: Vec::new(),
+            pool_id: preparation.map(|(_, _, pool_id)| pool_id.to_string()),
+            claim_operation_id: None,
         };
         let id = assignment_object_id(&payload.route, &payload.writer);
         let encode = |payload: &AssignmentPayload| {
             serde_json::to_vec(payload)
                 .map_err(|error| format!("encode supervisor pool instance: {error}"))
         };
-        let reservation = match self
-            .store
-            .put_if(
-                ASSIGNMENT_OBJECT_TYPE,
-                &id,
-                &payload.route,
-                "",
-                &encode(&payload)?,
-                None,
-                WriteCondition::MustCreate,
-            )
-            .await
-        {
+        let reservation_write = if let Some((workspace, epoch, pool_id)) = preparation {
+            Box::pin(self.reserve_warm_assignment(workspace, pool_id, epoch, assignment, &payload))
+                .await
+        } else {
+            self.store
+                .put_if(
+                    ASSIGNMENT_OBJECT_TYPE,
+                    &id,
+                    &payload.route,
+                    "",
+                    &encode(&payload)?,
+                    None,
+                    WriteCondition::MustCreate,
+                )
+                .await
+        };
+        let reservation = match reservation_write {
             Ok(written) => written.resource_version,
             // Another recording reserved or published the route first.
-            Err(PersistenceError::UniqueViolation { .. }) => {
+            Err(PersistenceError::UniqueViolation { .. } | PersistenceError::Conflict { .. }) => {
                 return existing(
                     self.assignment(&payload.route)
                         .await
@@ -1700,7 +1856,9 @@ impl SupervisorPool {
                 // outlives this is released by collection.
                 self.release_candidate(&record.payload.route, &candidate)
                     .await;
-                lock(&self.materials).insert(record.payload.route.clone(), assignment.clone());
+                if !self.dedicated {
+                    lock(&self.materials).insert(record.payload.route.clone(), assignment.clone());
+                }
                 Ok(Recording {
                     record,
                     candidate: None,
@@ -1772,6 +1930,14 @@ impl SupervisorPool {
             })
             .take(CLEANUP_PER_PASS);
         for record in stale {
+            if record.payload.prepared {
+                // A physical warm identity is single use even if recording its
+                // material stalled before publication.
+                if let Err(error) = self.retire_assignment(record).await {
+                    warn!(route = %record.payload.route, %error, "could not retire a stalled warm preparation");
+                }
+                continue;
+            }
             info!(
                 route = %record.payload.route,
                 phase = ?record.payload.phase,
@@ -1829,6 +1995,10 @@ impl SupervisorPool {
                     .await;
                 continue;
             };
+            if payload.activation_candidate {
+                self.collect_activation_candidate(&candidate, payload).await;
+                continue;
+            }
             let record = match self.assignment(&payload.route).await {
                 Ok(record) => record,
                 Err(error) => {
@@ -1859,13 +2029,14 @@ impl SupervisorPool {
     /// Remove an instance record and its launch material, or a reservation or
     /// admitting record, which fences its recording or launch (the material
     /// of those stays with their candidate, which collection deletes). A
-    /// published record's material goes first, so a failure leaves the record
-    /// to retry from.
+    /// published record is atomically replaced by a material cleanup candidate,
+    /// so withdrawal cannot delete material while activation still uses it.
     async fn delete_assignment(&self, record: &AssignmentRecord) -> Result<(), String> {
+        if record.payload.phase == RecordPhase::Retired {
+            return Ok(());
+        }
         if record.payload.phase == RecordPhase::Published {
-            let handle = CredentialHandle::decode(record.payload.material_handle.as_slice())
-                .map_err(|_| "invalid launch material credential handle".to_string())?;
-            self.delete_material(&record.payload, handle).await?;
+            return self.retire_assignment(record).await;
         }
         match self
             .store
@@ -1894,6 +2065,8 @@ impl SupervisorPool {
             .await
             .map_err(|error| format!("list supervisor pool instances: {error}"))?
             .into_iter()
+            // Assigned-generation recovery must not prune warm-pool reservations.
+            .filter(|(_, record)| !record.payload.prepared)
             .map(|(route, record)| (route, record.updated_at_ms))
             .collect())
     }
@@ -1929,6 +2102,17 @@ impl SupervisorPool {
     /// material is collected with its candidate. A failed write that may have
     /// applied keeps the record, so a retry of the launch admits it.
     async fn place_launch(&self, request: PlacementRequest) -> Result<(), String> {
+        if request.assignment.prepared {
+            return Err("use runtime preparation to reserve an unassigned runtime".into());
+        }
+        self.place_scoped(request, None).await
+    }
+
+    async fn place_scoped(
+        &self,
+        request: PlacementRequest,
+        preparation: Option<(&str, &str)>,
+    ) -> Result<(), String> {
         let assignment = &request.assignment;
         let members = self
             .live_members()
@@ -1954,7 +2138,11 @@ impl SupervisorPool {
         let targets = candidates(
             &ring,
             &members,
-            &assignment.sandbox_id,
+            if assignment.prepared {
+                &assignment.route
+            } else {
+                &assignment.sandbox_id
+            },
             &assignment.route,
             &charges,
             None,
@@ -1965,7 +2153,21 @@ impl SupervisorPool {
         if targets.is_empty() {
             return Err(no_room());
         }
-        let recording = self.record_admitting(assignment).await?;
+        let recording = if preparation.is_some() {
+            self.record_assignment_scoped(
+                assignment,
+                RecordPhase::Admitting,
+                preparation.map(|(workspace, pool)| (workspace, request.auth_epoch, pool)),
+            )
+            .await?
+        } else {
+            self.record_admitting(assignment).await?
+        };
+        if assignment.prepared
+            && self.load_material(&recording.record.payload).await? != assignment.launch_material
+        {
+            return Err("the runtime route is already reserved with different material".into());
+        }
         let admitting =
             (recording.record.payload.phase == RecordPhase::Admitting).then_some(&recording.record);
         let mut placed = None;
@@ -2153,9 +2355,13 @@ impl SupervisorPool {
             .pool_withdrawals()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let records = self.all_assignments().await?;
+        let mut records = self.all_assignments().await?;
+        if self.cancel_abandoned_warm_claims(&records).await {
+            records = self.all_assignments().await?;
+        }
         self.fence_stale_reservations(&records).await;
         self.remove_stale_candidates().await;
+        self.remove_retired_assignments(&records).await;
         let mut desired = records
             .into_iter()
             .filter(|(route, record)| {
@@ -2175,6 +2381,12 @@ impl SupervisorPool {
         let mut gone = BTreeSet::new();
         for (route, instance) in &desired {
             if stopping.contains(route) {
+                continue;
+            }
+            // Prepared runtimes have no sandbox credential epoch to fence a
+            // takeover. Keep their original reservation; the warm-pool owner
+            // must withdraw and replace a runtime whose process was lost.
+            if instance.payload.prepared {
                 continue;
             }
             let takeovers_allowed = tokio::time::Instant::now() >= self.takeovers_from;
@@ -2352,6 +2564,9 @@ impl SupervisorPool {
             .cloned()
             .collect::<Vec<_>>();
         for record in batch {
+            if record.payload.prepared {
+                continue;
+            }
             let sandbox = match self
                 .store
                 .get_message::<Sandbox>(&record.payload.sandbox_id)
@@ -2424,6 +2639,7 @@ impl SupervisorPool {
                     && owner.payload.member_id == report.member_id
                     && owner.payload.process_id == report.process_id
                     && owner.payload.auth_epoch == report.auth_epoch
+                    && owner.payload.sandbox_id == report.status.sandbox_id
             }) {
                 continue;
             }
@@ -2526,9 +2742,11 @@ impl SupervisorPool {
         let missing = {
             let mut materials = lock(&self.materials);
             materials.retain(|route, assignment| {
-                wanted
-                    .get(route)
-                    .is_some_and(|record| record.payload.generation == assignment.generation)
+                wanted.get(route).is_some_and(|record| {
+                    record.payload.generation == assignment.generation
+                        && record.payload.sandbox_id == assignment.sandbox_id
+                        && record.payload.prepared == assignment.prepared
+                })
             });
             wanted
                 .iter()
@@ -2548,6 +2766,7 @@ impl SupervisorPool {
                             generation: record.payload.generation,
                             launch_material,
                             takeover: None,
+                            prepared: record.payload.prepared,
                         },
                     );
                 }
@@ -2987,6 +3206,190 @@ async fn detached<T: Send + 'static>(
 }
 
 impl InstancePlacement for PoolPlacement {
+    fn reserve_warm_claim(
+        &self,
+        workspace: String,
+        intent: openshell_supervisor_control::WarmClaimIntent,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimReservation> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.reserve_warm_claim(&workspace, intent).await
+        }))
+    }
+
+    fn choose_cold_launch(
+        &self,
+        lookup: openshell_supervisor_control::WarmClaimLookup,
+    ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
+        let pool = self.0.clone();
+        Box::pin(detached(
+            async move { pool.choose_cold_launch(lookup).await },
+        ))
+    }
+
+    fn pending_warm_claims(
+        &self,
+        pools: Vec<(String, String)>,
+        route: Option<String>,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventories> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.pending_warm_claims(pools, route).await
+        }))
+    }
+
+    fn dedicated_claim_started(
+        &self,
+        sandbox_id: String,
+        session: openshell_core::SandboxSessionId,
+    ) -> PlacementFuture<bool> {
+        let pool = self.0.clone();
+        Box::pin(async move {
+            let Some(sandbox) = pool
+                .store
+                .get_message::<Sandbox>(&sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(false);
+            };
+            let annotations = &sandbox
+                .metadata
+                .as_ref()
+                .ok_or("missing sandbox metadata")?
+                .annotations;
+            let identity =
+                PersistedSandboxIdentity::read(annotations).map_err(|e| e.to_string())?;
+            Ok(identity
+                .prepared_runtime
+                .is_some_and(|binding| binding.session_id() == session)
+                && sandbox.status.is_some_and(|status| {
+                    // An admission report can precede main-process startup.
+                    !status.main_process_instance_id.is_empty()
+                        || status
+                            .configuration_admission
+                            .is_some_and(|report| !report.instance_id.is_empty())
+                }))
+        })
+    }
+
+    fn cancel_warm_claim(&self, workspace: String, route: String) -> PlacementFuture<bool> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.cancel_warm_claim(&workspace, &route).await
+        }))
+    }
+
+    fn warm_claim_for_launch(
+        &self,
+        lookup: openshell_supervisor_control::WarmClaimLookup,
+    ) -> PlacementFuture<Option<openshell_supervisor_control::WarmClaimIntent>> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.warm_claim_for_launch(lookup).await })
+    }
+
+    fn record_warm_claim(
+        &self,
+        workspace: String,
+        intent: openshell_supervisor_control::WarmClaimIntent,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimIntent> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.record_warm_claim(&workspace, intent).await
+        }))
+    }
+
+    fn warm_claim(
+        &self,
+        workspace: String,
+        route: String,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimIntent> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.warm_claim(&workspace, &route).await })
+    }
+
+    fn runtime_assignment(
+        &self,
+        workspace: String,
+        route: String,
+    ) -> PlacementFuture<Option<SandboxInstanceAssignment>> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.runtime_assignment(&workspace, &route).await })
+    }
+
+    fn warm_runtime_trust(
+        &self,
+    ) -> PlacementFuture<openshell_supervisor_control::warm_pool::WarmRuntimeTrust> {
+        let trust = self.0.authority.warm_runtime_trust();
+        Box::pin(async move { Ok(trust) })
+    }
+
+    fn warm_pool_targets(
+        &self,
+        sandbox_id: Option<String>,
+    ) -> PlacementFuture<Vec<openshell_supervisor_control::warm_pool::WarmPoolTarget>> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.warm_pool_targets(sandbox_id.as_deref()).await })
+    }
+
+    fn warm_pool_state(
+        &self,
+        workspace: String,
+        pool_id: String,
+    ) -> PlacementFuture<Option<openshell_supervisor_control::warm_pool::WarmPoolSnapshot>> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.warm_pool_state(&workspace, &pool_id).await })
+    }
+
+    fn update_warm_pool(
+        &self,
+        update: openshell_supervisor_control::warm_pool::WarmPoolUpdate,
+    ) -> PlacementFuture<bool> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move { pool.update_warm_pool(update).await }))
+    }
+    fn retire_preparation(
+        &self,
+        retirement: PreparationRetirement,
+    ) -> PlacementFuture<PreparationRelease> {
+        let pool = self.0.clone();
+        Box::pin(detached(async move {
+            pool.retire_preparation(retirement).await
+        }))
+    }
+    fn prepare_runtime(&self, request: PreparationRequest) -> PlacementFuture {
+        let pool = self.0.clone();
+        Box::pin(detached(async move { pool.prepare_runtime(request).await }))
+    }
+
+    fn prepared_runtimes(
+        &self,
+        workspace: String,
+        routes: Vec<String>,
+    ) -> PlacementFuture<Vec<PreparedRuntime>> {
+        let pool = self.0.clone();
+        Box::pin(async move { pool.prepared_runtimes(&workspace, routes).await })
+    }
+
+    fn release_preparation(
+        &self,
+        revision: PreparationRevision,
+    ) -> PlacementFuture<PreparationRelease> {
+        let pool = self.0.clone();
+        Box::pin(detached(
+            async move { pool.release_preparation(revision).await },
+        ))
+    }
+
+    fn activate_runtime(
+        &self,
+        request: ActivationRequest,
+    ) -> PlacementFuture<SandboxInstanceAssignment> {
+        let pool = self.0.clone();
+        Box::pin(detached(
+            async move { pool.activate_runtime(request).await },
+        ))
+    }
     fn place_launch(&self, request: PlacementRequest) -> PlacementFuture {
         let pool = self.0.clone();
         Box::pin(detached(async move { pool.place_launch(request).await }))
@@ -3016,19 +3419,19 @@ mod tests {
     use openshell_core::sandbox_generation::SandboxGenerationId;
     use openshell_supervisor_control::proto::SandboxInstanceAssignment;
 
-    struct Fixture {
+    pub(super) struct Fixture {
         store: Arc<Store>,
         authority: Arc<SandboxSessionJwtAuthority>,
         credentials: CredentialRuntime,
     }
 
     impl Fixture {
-        async fn new() -> Self {
+        pub(super) async fn new() -> Self {
             Self::with_store(crate::persistence::test_store().await)
         }
 
         /// A fixture over `store`, such as one connected to `PostgreSQL`.
-        fn with_store(store: Store) -> Self {
+        pub(super) fn with_store(store: Store) -> Self {
             let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
             let store = Arc::new(store);
             let config = crate::Config::new(None)
@@ -3052,7 +3455,7 @@ mod tests {
         }
 
         /// A gateway replica's pool over this store, with its own controller.
-        fn replica(&self, replica_id: &str) -> Arc<SupervisorPool> {
+        pub(super) fn replica(&self, replica_id: &str) -> Arc<SupervisorPool> {
             let controller = SupervisorHostController::new();
             let mut pool = SupervisorPool::new(
                 self.store.clone(),
@@ -3097,12 +3500,18 @@ mod tests {
             )
         }
 
-        async fn sandbox(&self, sandbox_id: &str, generation: &str, phase: SandboxPhase) {
+        pub(super) async fn sandbox(
+            &self,
+            sandbox_id: &str,
+            generation: &str,
+            phase: SandboxPhase,
+        ) {
             let identity = PersistedSandboxIdentity {
                 runtime_generation: SandboxGenerationId::parse(generation).unwrap(),
                 auth_epoch: CredentialEpoch::new(1).unwrap(),
                 gateway_token_id: Uuid::new_v4(),
                 refresh_replay: None,
+                prepared_runtime: None,
             };
             let mut metadata = ObjectMeta {
                 id: sandbox_id.to_string(),
@@ -3124,7 +3533,7 @@ mod tests {
                 .expect("persist sandbox");
         }
 
-        async fn identity(&self, sandbox_id: &str) -> PersistedSandboxIdentity {
+        pub(super) async fn identity(&self, sandbox_id: &str) -> PersistedSandboxIdentity {
             let sandbox = self
                 .store
                 .get_message::<Sandbox>(sandbox_id)
@@ -3134,7 +3543,7 @@ mod tests {
             PersistedSandboxIdentity::read(&sandbox.metadata.unwrap().annotations).unwrap()
         }
 
-        async fn set_phase(&self, sandbox_id: &str, phase: SandboxPhase) {
+        pub(super) async fn set_phase(&self, sandbox_id: &str, phase: SandboxPhase) {
             self.store
                 .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
                     sandbox.set_phase(phase as i32);
@@ -3183,7 +3592,7 @@ mod tests {
             assert!(launching.await.unwrap().is_err(), "{route} is refused");
         }
 
-        async fn member(&self, member_id: &str, process_id: &str, leaving: bool) {
+        pub(super) async fn member(&self, member_id: &str, process_id: &str, leaving: bool) {
             let pool = self.replica("membership-writer");
             pool.write_member(&ConnectedMember {
                 member_id: member_id.to_string(),
@@ -3203,14 +3612,14 @@ mod tests {
                 .unwrap();
         }
 
-        async fn remove_member(&self, member_id: &str) {
+        pub(super) async fn remove_member(&self, member_id: &str) {
             self.store
                 .delete(MEMBER_OBJECT_TYPE, &member_object_id(member_id))
                 .await
                 .unwrap();
         }
 
-        async fn owner(&self, route: &str) -> Option<OwnerPayload> {
+        pub(super) async fn owner(&self, route: &str) -> Option<OwnerPayload> {
             self.store
                 .get(OWNER_OBJECT_TYPE, &owner_object_id(route))
                 .await
@@ -3219,7 +3628,7 @@ mod tests {
                 .map(|record| record.payload)
         }
 
-        async fn candidates(&self) -> usize {
+        pub(super) async fn candidates(&self) -> usize {
             self.store
                 .list_by_type(MATERIAL_CANDIDATE_OBJECT_TYPE, 100, 0)
                 .await
@@ -3231,6 +3640,7 @@ mod tests {
         /// would.
         async fn publish(&self, route: &str, sandbox_id: &str, generation: &str) {
             let payload = AssignmentPayload {
+                dedicated: false,
                 route: route.to_string(),
                 sandbox_id: sandbox_id.to_string(),
                 generation: generation.to_string(),
@@ -3238,6 +3648,13 @@ mod tests {
                 phase: RecordPhase::Published,
                 writer: Uuid::new_v4().to_string(),
                 material_handle: b"handle".to_vec(),
+                prepared: false,
+                prepared_epoch: 0,
+                prepared_session: None,
+                activation_candidate: false,
+                claim_handle: Vec::new(),
+                pool_id: None,
+                claim_operation_id: None,
             };
             self.store
                 .put_if(
@@ -3277,7 +3694,7 @@ mod tests {
 
         /// `count` running instances owned by `member`'s `process`, each
         /// with its sandbox and published record.
-        async fn fill(&self, member: &str, process: &str, count: usize) -> Vec<String> {
+        pub(super) async fn fill(&self, member: &str, process: &str, count: usize) -> Vec<String> {
             let mut routes = Vec::with_capacity(count);
             for index in 0..count {
                 let route = format!("rt-{member}-{index:05}");
@@ -3356,6 +3773,7 @@ mod tests {
             generation: generation.to_string(),
             launch_material: format!("{{\"launch\":\"{route}\"}}").into_bytes(),
             takeover: None,
+            prepared: false,
         }
     }
 
@@ -3456,6 +3874,7 @@ mod tests {
         // Every credential of the replaced term is refused by the gateway,
         // and refresh cannot carry it into the new term.
         let stale = AuthenticatedSandboxSession {
+            resource_binding: BTreeMap::new(),
             sandbox_id: SandboxId::parse("sandbox-a").unwrap(),
             runtime_generation: launch_identity.runtime_generation.clone(),
             auth_epoch: launch_identity.auth_epoch,

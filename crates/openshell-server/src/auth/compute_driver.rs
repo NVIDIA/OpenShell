@@ -12,6 +12,8 @@ use tonic::{Code, Status};
 
 /// The only public gateway method on which driver-native credentials apply.
 pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandboxToken";
+pub const REGISTER_SUPERVISOR_PATH: &str =
+    "/openshell.supervisor.host.v1.SupervisorHost/RegisterSupervisor";
 
 #[derive(Clone, Debug)]
 pub struct ComputeDriverAuthenticator {
@@ -31,7 +33,7 @@ impl Authenticator for ComputeDriverAuthenticator {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Authentication, AuthRejection> {
-        if path != ISSUE_SANDBOX_TOKEN_PATH {
+        if path != ISSUE_SANDBOX_TOKEN_PATH && path != REGISTER_SUPERVISOR_PATH {
             return Ok(Authentication::NotApplicable);
         }
 
@@ -39,11 +41,36 @@ impl Authenticator for ComputeDriverAuthenticator {
             return Ok(Authentication::NotApplicable);
         };
 
-        let authenticated = self
-            .compute
-            .authenticate_sandbox(credential)
-            .await
-            .map_err(|status| reject(driver_failure_reason(status.code()), status))?;
+        let authenticated = if path == REGISTER_SUPERVISOR_PATH {
+            self.compute
+                .authenticate_compute_credential(credential, true)
+                .await
+        } else {
+            self.compute.authenticate_sandbox(credential).await
+        }
+        .map_err(|status| reject(driver_failure_reason(status.code()), status))?;
+        if path == REGISTER_SUPERVISOR_PATH {
+            let identity = authenticated
+                .supervisor_registration
+                .filter(|identity| {
+                    !identity.route.is_empty()
+                        && !identity.generation.is_empty()
+                        && !identity.session_id.is_empty()
+                        && !identity.resource_claims.is_empty()
+                        && authenticated.sandbox_id.is_empty()
+                })
+                .ok_or_else(|| {
+                    reject(
+                        AuthFailureReason::UnknownIdentity,
+                        Status::permission_denied(
+                            "driver did not authenticate a physical supervisor",
+                        ),
+                    )
+                })?;
+            return Ok(Authentication::Accepted(Principal::SupervisorRegistration(
+                identity,
+            )));
+        }
         let sandbox_id = authenticated.sandbox_id;
         if sandbox_id.is_empty() {
             return Err(reject(
@@ -136,6 +163,22 @@ mod tests {
                 if driver_name == "external-kubernetes"
                     && runtime_identity == "test-runtime"
         ));
+    }
+
+    #[tokio::test]
+    async fn logical_sandbox_authentication_cannot_register_a_physical_supervisor() {
+        let auth = authenticator(NoopTestDriver::authenticating_sandbox("sandbox-a")).await;
+        assert_eq!(
+            auth.authenticate(
+                &bearer_headers("driver-credential"),
+                REGISTER_SUPERVISOR_PATH
+            )
+            .await
+            .unwrap_err()
+            .status
+            .code(),
+            Code::PermissionDenied
+        );
     }
 
     #[tokio::test]

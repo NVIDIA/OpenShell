@@ -30,11 +30,13 @@ use tonic::Status;
 pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> Result<(), Status> {
     match principal {
         Principal::User(_) | Principal::Operator(_) => Ok(()),
-        Principal::Peer(_) | Principal::Supervisor(_) => Err(deny(
-            principal,
-            AuthzDenial::MethodNotPermitted,
-            "gateway peer and supervisor principals may not call sandbox-scoped methods",
-        )),
+        Principal::Peer(_) | Principal::Supervisor(_) | Principal::SupervisorRegistration(_) => {
+            Err(deny(
+                principal,
+                AuthzDenial::MethodNotPermitted,
+                "gateway peer and supervisor principals may not call sandbox-scoped methods",
+            ))
+        }
         Principal::Sandbox(p) => {
             if p.sandbox_id == claimed_sandbox_id {
                 Ok(())
@@ -91,7 +93,8 @@ pub fn ensure_sandbox_principal_scope(
         Principal::User(_)
         | Principal::Operator(_)
         | Principal::Peer(_)
-        | Principal::Supervisor(_) => Err(deny(
+        | Principal::Supervisor(_)
+        | Principal::SupervisorRegistration(_) => Err(deny(
             principal,
             AuthzDenial::MethodNotPermitted,
             "supervisor RPCs require a sandbox principal",

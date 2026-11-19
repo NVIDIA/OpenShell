@@ -487,6 +487,7 @@ pub struct GatewayVerificationKey {
 #[serde(deny_unknown_fields)]
 pub struct SandboxRuntimeDescriptor {
     /// Stable identity of the boundary, normally the sandbox ID.
+    /// Empty only while a physical runtime is prepared before assignment.
     pub boundary_id: String,
     /// Immutable driver-owned workload generation.
     pub generation: String,
@@ -544,6 +545,7 @@ impl SandboxRuntimeDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct BoundaryConfig {
     /// Stable identity expected in every authenticated request.
+    /// Empty for a prepared runtime awaiting a physically bound gateway token.
     pub boundary_id: String,
     /// Immutable driver-owned workload generation.
     pub generation: String,

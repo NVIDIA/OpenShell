@@ -12,6 +12,7 @@ mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
 pub mod secret;
+pub use sandbox::sandbox_spec_from_stored_workload_template;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;

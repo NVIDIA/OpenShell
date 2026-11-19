@@ -38,6 +38,7 @@ mod lifecycle_reconciliation {
             network_trust_bundle: None,
             operator_allowlist: None,
             shared_supervisor: None,
+            warm_supervision: None,
         };
         (driver, steps, Arc::default())
     }

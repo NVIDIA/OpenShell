@@ -188,6 +188,8 @@ mod session {
         runtime_generation: SandboxGenerationId,
         auth_epoch: CredentialEpoch,
         component: SessionComponent,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        resource_binding: BTreeMap<String, String>,
     }
 
     /// Claims of the supervisor token. It names no sandbox, generation, or
@@ -890,6 +892,26 @@ mod session {
             sandbox_token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionTokenPair, SessionJwtError> {
+            self.mint_bound_pair_with_token_metadata(
+                identity,
+                gateway_token_id,
+                sandbox_token_id,
+                issued_at,
+                BTreeMap::new(),
+            )
+        }
+
+        /// Mint a reproducible pair, binding only the Sandbox Protocol token
+        /// to a prepared runtime's physical resources. Gateway authorization
+        /// continues to use the persisted logical identity and token lineage.
+        pub fn mint_bound_pair_with_token_metadata(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+            gateway_token_id: Uuid,
+            sandbox_token_id: Uuid,
+            issued_at: i64,
+            resource_binding: BTreeMap<String, String>,
+        ) -> Result<MintedSessionTokenPair, SessionJwtError> {
             Ok(MintedSessionTokenPair {
                 gateway: self.mint(
                     SessionTokenProfile::Gateway,
@@ -897,11 +919,12 @@ mod session {
                     gateway_token_id,
                     issued_at,
                 )?,
-                sandbox: self.mint(
+                sandbox: self.mint_bound(
                     SessionTokenProfile::Sandbox,
                     identity,
                     sandbox_token_id,
                     issued_at,
+                    resource_binding,
                 )?,
                 auth_epoch: identity.auth_epoch,
             })
@@ -991,6 +1014,32 @@ mod session {
             token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionToken, SessionJwtError> {
+            self.mint_bound(profile, identity, token_id, issued_at, BTreeMap::new())
+        }
+
+        /// Authorize initial assignment to an exact driver-provisioned runtime.
+        pub fn mint_bound_sandbox_token(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+            resource_binding: BTreeMap<String, String>,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            self.mint_bound(
+                SessionTokenProfile::Sandbox,
+                identity,
+                Uuid::new_v4(),
+                self.clock.now_unix_seconds(),
+                resource_binding,
+            )
+        }
+
+        fn mint_bound(
+            &self,
+            profile: SessionTokenProfile,
+            identity: &SandboxRuntimeIdentity,
+            token_id: Uuid,
+            issued_at: i64,
+            resource_binding: BTreeMap<String, String>,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
             let expires_at = self.ttl.map_or(0, |ttl| {
                 issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
             });
@@ -1005,6 +1054,7 @@ mod session {
                 runtime_generation: identity.runtime_generation.clone(),
                 auth_epoch: identity.auth_epoch,
                 component: SessionComponent::OpenShellSupervisor,
+                resource_binding,
             };
             let mut header = Header::new(Algorithm::EdDSA);
             header.kid = Some(self.key_id.clone());
@@ -1048,6 +1098,8 @@ mod session {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct AuthenticatedSandboxSession {
+        /// Signed physical-runtime binding, required for initial late assignment.
+        pub resource_binding: BTreeMap<String, String>,
         pub sandbox_id: SandboxId,
         pub runtime_generation: SandboxGenerationId,
         pub auth_epoch: CredentialEpoch,
@@ -1152,6 +1204,7 @@ mod session {
             let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
             validate_lifetime(claims.iat, claims.exp, self.clock.now_unix_seconds())?;
             Ok(AuthenticatedSandboxSession {
+                resource_binding: claims.resource_binding,
                 sandbox_id: claims.sandbox_id,
                 runtime_generation: claims.runtime_generation,
                 auth_epoch: claims.auth_epoch,
