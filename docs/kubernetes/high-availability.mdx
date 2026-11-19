@@ -670,6 +670,37 @@ window. If your release uses older values, upgrade with
 [Autoscale with a HorizontalPodAutoscaler](#autoscale-with-a-horizontalpodautoscaler).
 When you disable the HPA, set `supervisor.replicas` in the same upgrade.
 
+### Size Sandbox Capacity
+
+Three values set how many sandboxes the cluster can run:
+
+| Value | Default | Range | Meaning |
+|---|---|---|---|
+| `supervisor.pool.maxInstancesPerMember` | `128` | `16` to `1024` | Sandboxes one supervisor runs. |
+| `supervisor.pool.maxMembersPerGateway` | `32` | `1` to `64` | Supervisors one gateway replica serves. |
+| `replicaCount` | `1` | | Gateway replicas. |
+
+The pool runs at most `replicaCount` × `maxMembersPerGateway` ×
+`maxInstancesPerMember` sandboxes, and never more than 131,072. The gateway
+places each new sandbox on the supervisor running the fewest, and refuses the
+create when every supervisor is full. Rendering fails when
+`supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds
+`replicaCount` × `maxMembersPerGateway`; with gateway autoscaling, the chart
+uses `autoscaling.minReplicas`.
+
+Supervisor memory grows with the sandboxes it runs. Size
+`supervisor.resources` for `maxInstancesPerMember`; the defaults request
+`250m` CPU and `768Mi` memory, with a `1.5Gi` memory limit.
+
+The chart ships `values-scale-100k.yaml` as a starting point for a large
+cluster: 25 gateway replicas and a supervisor HPA from 50 to 800 replicas at
+128 sandboxes each. It needs an external database:
+
+```shell
+helm install openshell <chart> -n openshell \
+  -f values-scale-100k.yaml --set server.externalDbSecret=<secret>
+```
+
 ## Next Steps
 
 - To expose the gateway through a highly available data path, refer to
