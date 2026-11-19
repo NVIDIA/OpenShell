@@ -154,16 +154,23 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_DB_URL")]
     db_url: Option<String>,
 
+    /// Database identity source: default or azure-workload-identity.
+    #[arg(long, env = "OPENSHELL_DB_AUTH")]
+    db_auth: Option<openshell_core::config::DatabaseAuthMode>,
+
     /// Connection ceiling for the database pool, shared by every
     /// database-backed request.
     ///
     /// When unset, the gateway uses its backend default: 10 with Postgres,
     /// 5 with an on-disk `SQLite` database. An in-memory `SQLite` database is
-    /// always a single connection. Postgres needs at least 2, because the SSH
-    /// identity lock keeps one connection while it queries the pool, so the
-    /// gateway rejects 1 there at startup. Each replica opens its own pool,
-    /// plus a mutation lock pool on Postgres (`--db-lock-max-connections`), so
-    /// keep the total below what the database server itself admits.
+    /// always a single connection. Postgres needs at least 2, so the gateway
+    /// rejects 1 there at startup: an SSH identity or provider-refresh lock
+    /// holder keeps one data connection for its lock and queries the pool on
+    /// another, and the gateway caps those holders at half of
+    /// `database_max_connections` per replica. Each replica opens its own
+    /// pool, plus a mutation lock pool on Postgres
+    /// (`--db-lock-max-connections`), so keep the total below what the
+    /// database server itself admits.
     #[arg(
         long,
         env = "OPENSHELL_DB_MAX_CONNECTIONS",
@@ -629,6 +636,7 @@ fn prepare_server_config_with_drivers(
 
     config = config
         .with_database_url(db_url)
+        .with_database_auth(args.db_auth.unwrap_or_default())
         .with_database_max_connections(args.db_max_connections)
         .with_database_lock_max_connections(args.db_lock_max_connections);
     if let Some(driver) = &args.compute_driver {
@@ -799,6 +807,30 @@ fn prepare_server_config_with_drivers(
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
     config.gateway_jwt = gateway_jwt;
+    config.spiffe_broker = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.spiffe_broker.clone());
+
+    if let Some(kubernetes) = file
+        .as_ref()
+        .and_then(|file| file.openshell.drivers.get("kubernetes"))
+        && kubernetes
+            .get("supervisor_topology")
+            .and_then(toml::Value::as_str)
+            == Some("gateway")
+        && kubernetes
+            .get("provider_spiffe_workload_api_socket_path")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|socket| !socket.is_empty())
+        && config.spiffe_broker.is_none()
+    {
+        return Err(miette::miette!(
+            "shared supervisor SPIFFE grants require spiffe_broker; remove provider_spiffe_workload_api_socket_path from the shared supervisor"
+        ));
+    }
+
+    // Reject invalid broker before startup; gateway state parses it later.
+    crate::spiffe_broker::validate_config(&config).map_err(|error| miette::miette!("{error}"))?;
 
     if let Some(normalized) = normalized_network_trust.as_ref() {
         // Use the same resolver as runtime construction, with the explicit
@@ -914,8 +946,15 @@ async fn run_from_args(
         &prepared.compute_driver,
         &prepared.config.compute_driver_endpoints,
     );
-    let (otlp_export, otlp_error) =
+    let (mut otlp_export, otlp_error) =
         crate::otel_tracing::OtlpExport::start(otlp_config, gateway_resource);
+    let (metrics_recorder, metrics_error) = match (otlp_export.as_mut(), otlp_config) {
+        (Some(export), Some(config)) => match export.start_metrics(config, gateway_resource) {
+            Ok(recorder) => (recorder, None),
+            Err(error) => (None, Some(error)),
+        },
+        _ => (None, None),
+    };
     let (tracing_handle, driver_otlp_error) = crate::tracing_setup::install(
         &EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
@@ -982,6 +1021,9 @@ async fn run_from_args(
     if has_oidc {
         info!("OIDC authentication enabled");
     }
+    if let Some(error) = metrics_error {
+        error!(%error, "OTLP metrics could not be started; continuing without metric export");
+    }
     if let Some(err) = otlp_error.as_ref().or(driver_otlp_error.as_ref()) {
         error!(
             error = %err,
@@ -997,6 +1039,7 @@ async fn run_from_args(
             ocsf_protocol = otlp.ocsf_protocol().map(tracing::field::display),
             agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
             agent_protocol = otlp.agent_protocol().map(tracing::field::display),
+            metrics_endpoint = otlp.metrics_endpoint().map(tracing::field::display),
             "OTLP exporting enabled"
         );
     }
@@ -1006,7 +1049,13 @@ async fn run_from_args(
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    let result = Box::pin(run_server(prepared, tracing_log_bus, compute_drivers)).await;
+    let result = Box::pin(run_server(
+        prepared,
+        tracing_log_bus,
+        compute_drivers,
+        metrics_recorder,
+    ))
+    .await;
 
     tracing_handle.shutdown();
 
@@ -1698,6 +1747,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.grpc_rate_limit_window_seconds = Some(window);
     }
+    if let Some(mode) = file.database_auth
+        && args.db_auth.is_none()
+        && arg_defaulted(matches, "db_auth")
+    {
+        args.db_auth = Some(mode);
+    }
     if let Some(max_connections) = file.database_max_connections
         && args.db_max_connections.is_none()
         && arg_defaulted(matches, "db_max_connections")
@@ -1801,7 +1856,7 @@ mod tests {
     use super::{Cli, command};
     use crate::test_environment::Environment;
     use clap::Parser;
-    use openshell_core::config::ServiceHostnameFormat;
+    use openshell_core::config::{DatabaseAuthMode, ServiceHostnameFormat};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4466,6 +4521,33 @@ grpc_rate_limit_window_seconds = 30
 
         assert_eq!(args.grpc_rate_limit_requests, Some(20));
         assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
+    }
+
+    #[test]
+    fn database_auth_file_and_explicit_overrides() {
+        Environment::new().remove("OPENSHELL_DB_AUTH").run(|| {
+            let file = config_file_from_toml(
+                "[openshell.gateway]\ndatabase_auth = \"azure-workload-identity\"\n",
+            );
+            let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+            assert_eq!(args.db_auth, None);
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert_eq!(args.db_auth, Some(DatabaseAuthMode::AzureWorkloadIdentity));
+            let (mut args, matches) =
+                parse_with_args(&["openshell-gateway", "--db-auth", "default"]);
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert_eq!(args.db_auth, Some(DatabaseAuthMode::Default));
+        });
+        Environment::new()
+            .set("OPENSHELL_DB_AUTH", "default")
+            .run(|| {
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\ndatabase_auth = \"azure-workload-identity\"\n",
+                );
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert_eq!(args.db_auth, Some(DatabaseAuthMode::Default));
+            });
     }
 
     #[test]

@@ -9,7 +9,7 @@ use blake3::Hasher;
 use crate::config::{Environment, Machine};
 
 use super::ansible_hash::hash_sources;
-use super::layer::{cached_layer, hash_file, hash_files, hash_inputs};
+use super::layer::{SETUP_DISKS, cached_layer, hash_file, hash_files, hash_inputs};
 
 const SETUP_CACHE_VERSION: &[u8] = b"tmachine-disk-blake3-v1";
 
@@ -20,6 +20,7 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
 
     let hash = setup_hash(machine, environment)?;
     cached_layer(
+        SETUP_DISKS,
         &machine.base_image,
         &hash,
         environment.setup.use_galaxy,

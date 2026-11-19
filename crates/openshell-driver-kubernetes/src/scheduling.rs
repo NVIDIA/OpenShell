@@ -404,7 +404,7 @@ pub fn scheduling_wait(pod: &Pod, now_ms: i64, grace: Duration) -> bool {
                 && condition
                     .last_transition_time
                     .as_ref()
-                    .is_some_and(|time| now_ms.saturating_sub(time.0.timestamp_millis()) < grace_ms)
+                    .is_some_and(|time| now_ms.saturating_sub(time.0.as_millisecond()) < grace_ms)
         })
     })
 }

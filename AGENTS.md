@@ -44,6 +44,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
+| `crates/openshell-spiffe/` | SPIFFE identity types | Dependency-light SPIFFE ID mapping, claim parsing, and the sandbox identity provider interface |
+| `crates/openshell-spire/` | SPIRE adapter | Gateway-owned SPIFFE Broker API client that issues and verifies stable sandbox JWT-SVIDs |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
 | `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
 | `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
@@ -153,7 +155,7 @@ ocsf_emit!(event);
 
 - `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
-- In `openshell-supervisor-network`, emit with `crate::telemetry::egress_emit!` instead, or `crate::telemetry::emit_decision` for the records of one decision, so denied HTTP decisions get a deny span. Clippy rejects `ocsf_emit!` there.
+- In `openshell-supervisor-network`, the inspected request scope automatically correlates all OCSF records at emission, including findings, and uses the request span without creating a denial-only span. Emit through `crate::telemetry::egress_emit!` or `crate::telemetry::emit_decision`; Clippy rejects direct `ocsf_emit!` calls there.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
 - Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.

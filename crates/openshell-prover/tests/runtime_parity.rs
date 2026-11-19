@@ -50,6 +50,40 @@ fn runtime_engine_with_identity(policy: &str, require_binary_identity: bool) -> 
         )
         .expect("runtime endpoint path matcher should register");
     engine
+        .add_extension(
+            "openshell.selected_l7_protocol".into(),
+            2,
+            Box::new(|params: Vec<Value>| {
+                // These fixtures use validated endpoint modes. Share route
+                // matching, ranking, and tie behavior with the runtime without
+                // depending on the supervisor's networking implementation.
+                let configs = params[0]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|config| {
+                        let protocol = config["protocol"].as_string().ok()?.to_ascii_lowercase();
+                        if !matches!(
+                            protocol.as_str(),
+                            "rest" | "websocket" | "graphql" | "sql" | "json-rpc" | "mcp"
+                        ) {
+                            return None;
+                        }
+                        let path = config["path"]
+                            .as_string()
+                            .map_or("", |value| value.as_ref());
+                        Some((protocol, path))
+                    })
+                    .collect::<Vec<_>>();
+                let selected = openshell_core::endpoint_path::select_most_specific(
+                    &configs,
+                    params[1].as_string()?,
+                    |config| config.1,
+                );
+                Ok(selected.map_or(Value::Undefined, |config| Value::from(config.0.as_str())))
+            }),
+        )
+        .expect("runtime route protocol selector should register");
+    engine
         .add_policy("sandbox-policy.rego".into(), SANDBOX_POLICY_REGO.into())
         .expect("runtime Rego should compile");
     engine

@@ -31,9 +31,9 @@ const NEXTEST_LOG: &str = "nextest.log";
 // Matches the installers' own wait: an HA k3s gateway booted from a cached
 // disk can take minutes to report healthy.
 const READY_TIMEOUT_SECS: u64 = 300;
-/// How long the nextest run may take in total. Individual tests are bounded
-/// by the nextest profile's slow-timeout; this catches a run that stops
-/// making progress some other way.
+/// How long the test run may take in total. Individual tests are bounded by
+/// the nextest profile's slow-timeout, or by a program's own `run --timeout`
+/// default; this catches a run that stops making progress some other way.
 const RUN_TIMEOUT: Duration = Duration::from_mins(45);
 /// Slack beyond the readiness check's own timeout for SSH and process start.
 const READY_SLACK: Duration = Duration::from_mins(1);

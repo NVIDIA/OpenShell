@@ -8,7 +8,11 @@
 //! layers intercept this target, clone the event, and format it.
 //! After dispatch, `emit_ocsf_event` clears the thread-local.
 
-use crate::events::OcsfEvent;
+use std::sync::OnceLock;
+
+use crate::events::{BaseEventData, OcsfEvent};
+
+static EVENT_ENRICHER: OnceLock<fn(&mut BaseEventData)> = OnceLock::new();
 
 std::thread_local! {
     // Thread-local storage for the current OCSF event being emitted.
@@ -18,6 +22,27 @@ std::thread_local! {
 
 /// Target string used to identify OCSF tracing events.
 pub const OCSF_TARGET: &str = "ocsf";
+
+/// Register optional process-wide event enrichment at startup.
+///
+/// The callback runs once per emission, before any output layer receives the
+/// record, independently of trace sampling or export. It receives the common
+/// base fields for every event class and should add only contextual fields,
+/// preserving the record's content, classification, and timestamp. It must not
+/// block, panic, or emit another OCSF event.
+///
+/// Returns `false` if an enricher is already registered. Without an enricher,
+/// emission does not add application-specific context.
+pub fn register_event_enricher(enricher: fn(&mut BaseEventData)) -> bool {
+    EVENT_ENRICHER.set(enricher).is_ok()
+}
+
+fn enrich(event: &mut OcsfEvent) {
+    crate::trace::enrich(event);
+    if let Some(enrich) = EVENT_ENRICHER.get() {
+        enrich(event.base_mut());
+    }
+}
 
 /// Clone the current thread-local OCSF event, if any.
 ///
@@ -35,7 +60,7 @@ pub fn clone_current_event() -> Option<OcsfEvent> {
 ///
 /// Both layers receive the event — `clone_current_event()` is non-consuming.
 pub fn emit_ocsf_event(mut event: OcsfEvent) {
-    crate::trace::enrich(&mut event);
+    enrich(&mut event);
     // Store the event in thread-local so layers can access it
     set_current_event(event);
 
@@ -83,7 +108,7 @@ pub fn clear_current_event() {
 /// per-event `sandbox_id` field here instead. One tracing event feeds both the
 /// JSONL audit file and the routing bus.
 pub fn emit_ocsf_event_routed(sandbox_id: &str, mut event: OcsfEvent) {
-    crate::trace::enrich(&mut event);
+    enrich(&mut event);
     let message = event.format_shorthand();
     set_current_event(event);
     tracing::info!(target: "ocsf", sandbox_id = %sandbox_id, message = %message);
@@ -110,6 +135,22 @@ mod tests {
     use crate::events::base_event::BaseEventData;
     use crate::events::{BaseEvent, OcsfEvent};
     use crate::objects::{Metadata, Product};
+
+    std::thread_local! {
+        // Registration is process-wide, but this test's callback must be inert
+        // for unrelated tests running in parallel or reusing this thread later.
+        static TEST_ENRICHER_SEQUENCE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn test_enricher(event: &mut BaseEventData) {
+        TEST_ENRICHER_SEQUENCE.with(|sequence| {
+            if let Some(next) = sequence.get() {
+                sequence.set(Some(next + 1));
+                event.metadata.correlation_uid = Some("emit-time-request".into());
+                event.add_unmapped("request_sequence", next);
+            }
+        });
+    }
 
     fn test_event() -> OcsfEvent {
         OcsfEvent::Base(BaseEvent {
@@ -237,5 +278,79 @@ mod tests {
             bare_json, routed_json,
             "routed emit must match the bare path JSON"
         );
+    }
+
+    #[test]
+    fn event_enrichment_runs_once_for_every_class_and_output_path() {
+        use crate::test_support::OcsfCapture;
+        use crate::tracing_layers::OcsfJsonlLayer;
+        use tracing_subscriber::prelude::*;
+
+        assert!(register_event_enricher(test_enricher));
+        assert!(!register_event_enricher(test_enricher));
+        let capture = OcsfCapture::default();
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .with(OcsfJsonlLayer::new(SharedWriter(bytes.clone())));
+        let context = crate::builders::test_sandbox_context();
+        let mut expected = Vec::new();
+
+        tracing::subscriber::with_default(subscriber, || {
+            struct ResetEnricher;
+            impl Drop for ResetEnricher {
+                fn drop(&mut self) {
+                    TEST_ENRICHER_SEQUENCE.with(|sequence| sequence.set(None));
+                }
+            }
+            let plain = test_event();
+            expected.push(plain.clone());
+            emit_ocsf_event(plain);
+
+            {
+                let _reset = ResetEnricher;
+                TEST_ENRICHER_SEQUENCE.with(|sequence| sequence.set(Some(1)));
+                let mut sequence = 1;
+                for routed in [false, true] {
+                    for (_, mut event) in crate::builders::sample_events(&context) {
+                        event.base_mut().add_unmapped("source_detail", "keep");
+                        event
+                            .base_mut()
+                            .add_unmapped("http_event_kind", "original_kind");
+                        let mut enriched = event.clone();
+                        enriched.base_mut().metadata.correlation_uid =
+                            Some("emit-time-request".into());
+                        enriched
+                            .base_mut()
+                            .add_unmapped("request_sequence", sequence);
+                        expected.push(enriched);
+                        if routed {
+                            emit_ocsf_event_routed("test-sandbox", event);
+                        } else {
+                            emit_ocsf_event(event);
+                        }
+                        assert!(clone_current_event().is_none());
+                        sequence += 1;
+                    }
+                }
+                TEST_ENRICHER_SEQUENCE.with(|next| assert_eq!(next.get(), Some(sequence)));
+            }
+
+            let plain = test_event();
+            expected.push(plain.clone());
+            emit_ocsf_event_routed("test-sandbox", plain);
+        });
+
+        assert_eq!(capture.events(), expected);
+        let expected_json: Vec<_> = expected
+            .iter()
+            .map(|event| event.to_json().unwrap())
+            .collect();
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let json: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(json, expected_json);
     }
 }

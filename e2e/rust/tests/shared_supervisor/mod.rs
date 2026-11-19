@@ -57,6 +57,208 @@ pub const EXEC_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound on one policy-mediated network probe from a sandbox.
 pub const NETWORK_PROBE_TIMEOUT: Duration = Duration::from_secs(40);
 
+/// Run `command` in a cluster node's container; k3d and kind name node
+/// containers after their nodes.
+async fn node_exec(node: &str, command: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("docker")
+        .arg("exec")
+        .arg(node)
+        .args(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| format!("docker exec {node} {command:?}: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!(
+            "docker exec {node} {command:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// SIGKILL the supervisor container of `pod` through its node's container
+/// runtime, so it cannot announce that it is leaving, then force-delete the
+/// Pod so its member does not come back in place. Kills the task with
+/// `ctr`, or failing that the container's process with `kill -KILL`; panics
+/// when neither succeeds. Returns how the container was killed.
+pub async fn kill_abruptly(pod: &str) -> String {
+    let namespace = release_namespace();
+    if std::env::var("OPENSHELL_E2E_SUPERVISOR_PROCESS_CONTROL").as_deref() == Ok("1") {
+        kill_with_process_control(&namespace, pod).await;
+        force_delete_supervisor(&namespace, pod).await;
+        return "SIGKILL from the test Pod's process-control sidecar".into();
+    }
+    let description = kubectl_json(&["-n", &namespace, "get", "pod", pod, "-o", "json"]).await;
+    let node = description["spec"]["nodeName"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{pod} has no node: {description}"))
+        .to_string();
+    let container = description["status"]["containerStatuses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|status| status["name"] == SUPERVISOR_CONTAINER)
+        .and_then(|status| status["containerID"].as_str())
+        .and_then(|id| id.split_once("://").map(|(_, id)| id.to_string()))
+        .unwrap_or_else(|| panic!("{pod} has no running {SUPERVISOR_CONTAINER} container"));
+    let mut failures = Vec::new();
+    let mut killed = None;
+    // k3s ships `ctr` as a multi-call alias; kind ships it on its own.
+    for ctr in [&["ctr"][..], &["k3s", "ctr"][..]] {
+        let kill = [
+            ctr,
+            &[
+                "-n", "k8s.io", "tasks", "kill", "--signal", "SIGKILL", &container,
+            ],
+        ]
+        .concat();
+        match node_exec(&node, &kill).await {
+            Ok(_) => {
+                killed = Some(format!("ctr tasks kill --signal SIGKILL on {node}"));
+                break;
+            }
+            Err(error) => failures.push(error),
+        }
+    }
+    if killed.is_none() {
+        for ctr in [&["ctr"][..], &["k3s", "ctr"][..]] {
+            let list = [ctr, &["-n", "k8s.io", "tasks", "ls"]].concat();
+            let pid = match node_exec(&node, &list).await {
+                Ok(tasks) => tasks.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    (fields.next() == Some(container.as_str()))
+                        .then(|| fields.next())
+                        .flatten()
+                        .filter(|pid| pid.parse::<u32>().is_ok_and(|pid| pid > 1))
+                        .map(str::to_string)
+                }),
+                Err(error) => {
+                    failures.push(error);
+                    continue;
+                }
+            };
+            let Some(pid) = pid else {
+                failures.push(format!("no running task {container} on {node}"));
+                continue;
+            };
+            match node_exec(&node, &["kill", "-KILL", &pid]).await {
+                Ok(_) => {
+                    killed = Some(format!("kill -KILL {pid} on {node}"));
+                    break;
+                }
+                Err(error) => failures.push(error),
+            }
+        }
+    }
+    let killed = killed.unwrap_or_else(|| {
+        panic!(
+            "could not hard-kill supervisor {pod}; a graceful stop proves nothing: {failures:#?}"
+        )
+    });
+    force_delete_supervisor(&namespace, pod).await;
+    killed
+}
+
+async fn force_delete_supervisor(namespace: &str, pod: &str) {
+    kubectl(&[
+        "-n",
+        namespace,
+        "delete",
+        "pod",
+        pod,
+        "--grace-period=0",
+        "--force",
+        "--wait=false",
+    ])
+    .await;
+}
+
+/// An unprivileged test sidecar shares only its Pod's process namespace.
+/// PID 1 is the Pod sandbox, so the same UID can send SIGKILL to the supervisor
+/// without access to the host PID namespace or container runtime socket.
+async fn kill_with_process_control(namespace: &str, pod: &str) {
+    kubectl(&[
+        "-n",
+        namespace,
+        "exec",
+        pod,
+        "-c",
+        "e2e-process-control",
+        "--",
+        "sh",
+        "-ec",
+        r#"for process in /proc/[0-9]*; do
+          if [ "$(cat "$process/comm" 2>/dev/null)" = openshell-super ]; then
+            pid=${process#/proc/}
+            test "$pid" -gt 1
+            kill -KILL "$pid"
+            exit 0
+          fi
+        done
+        echo 'supervisor process not found' >&2
+        exit 1"#,
+    ])
+    .await;
+}
+
+/// Opt-in process control for remote clusters where node-container exec is
+/// unavailable. Apply before creating sandboxes; the default image stays intact.
+pub async fn enable_process_control() {
+    if std::env::var("OPENSHELL_E2E_SUPERVISOR_PROCESS_CONTROL").as_deref() != Ok("1") {
+        return;
+    }
+    let namespace = release_namespace();
+    let deployments = kubectl_json(&[
+        "-n",
+        &namespace,
+        "get",
+        "deployments",
+        "-l",
+        SUPERVISOR_COMPONENT,
+        "-o",
+        "json",
+    ])
+    .await;
+    let [deployment] = deployments["items"]
+        .as_array()
+        .expect("supervisor deployments")
+        .as_slice()
+    else {
+        panic!("expected one supervisor deployment");
+    };
+    let name = deployment["metadata"]["name"].as_str().unwrap();
+    let patch = serde_json::json!({"spec": {"template": {"spec": {
+        "shareProcessNamespace": true,
+        "containers": [{"name": "e2e-process-control", "image": "busybox:1.37.0-musl", "command": ["sleep", "infinity"],
+            "securityContext": {"runAsNonRoot": true, "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL"]}, "seccompProfile": {"type": "RuntimeDefault"}},
+            "resources": {"requests": {"cpu": "10m", "memory": "8Mi"}, "limits": {"cpu": "100m", "memory": "32Mi"}}
+        }]
+    }}}});
+    kubectl(&[
+        "-n",
+        &namespace,
+        "patch",
+        "deployment",
+        name,
+        "--type=strategic",
+        "-p",
+        &patch.to_string(),
+    ])
+    .await;
+    kubectl(&[
+        "-n",
+        &namespace,
+        "rollout",
+        "status",
+        &format!("deployment/{name}"),
+        "--timeout=180s",
+    ])
+    .await;
+}
+
 pub fn release_namespace() -> String {
     std::env::var("OPENSHELL_E2E_KUBE_NAMESPACE").unwrap_or_else(|_| "openshell".to_string())
 }

@@ -346,8 +346,9 @@ impl MultiplexService {
         .with_operator(operator)
         .with_connection_source(source)
         .with_logons(self.state.logons.clone());
-        let grpc_service =
+        let mut grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
+        grpc_service.provider_token_limiter = self.state.provider_token_rate_limiter.clone();
         let http_service = http_router(self.state.clone());
 
         let grpc_service = request_id_middleware!(grpc_service);
@@ -545,7 +546,7 @@ where
             if grpc_status_from_response(&response) != "0"
                 || response
                     .headers()
-                    .get("openshell-replayed")
+                    .get(crate::grpc::mutation_replay::REPLAYED_HEADER)
                     .is_some_and(|value| value == "true")
                 || !interceptors.has_post_commit(&intercepted)
             {
@@ -928,6 +929,7 @@ impl GrpcRateLimiter {
 struct GrpcRateLimitService<S> {
     inner: S,
     limiter: Option<GrpcRateLimiter>,
+    provider_token_limiter: Option<GrpcRateLimiter>,
     /// Set by `poll_ready` when it reports synthetic readiness for an
     /// exhausted limiter without polling the inner service. The paired `call`
     /// must then reject with `RESOURCE_EXHAUSTED` instead of forwarding to an
@@ -942,6 +944,7 @@ impl<S> GrpcRateLimitService<S> {
         Self {
             inner,
             limiter,
+            provider_token_limiter: None,
             rate_limited: false,
         }
     }
@@ -972,6 +975,10 @@ where
             .limiter
             .as_ref()
             .is_some_and(|limiter| !limiter.has_capacity())
+            && self
+                .provider_token_limiter
+                .as_ref()
+                .is_none_or(|limiter| !limiter.has_capacity())
         {
             self.rate_limited = true;
             return Poll::Ready(Ok(()));
@@ -991,11 +998,15 @@ where
                 tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
             return Box::pin(async move { Ok(response) });
         }
-        if self
-            .limiter
-            .as_ref()
-            .is_some_and(|limiter| !limiter.allow())
+        let limiter = if req.uri().path() == "/openshell.v1.OpenShell/GetSandboxProviderAccessToken"
         {
+            self.provider_token_limiter
+                .as_ref()
+                .or(self.limiter.as_ref())
+        } else {
+            self.limiter.as_ref()
+        };
+        if limiter.is_some_and(|limiter| !limiter.allow()) {
             let response =
                 tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
             return Box::pin(async move { Ok(response) });
@@ -2423,6 +2434,55 @@ mod tests {
             0,
             "inner service must not be called when poll_ready short-circuited the limiter",
         );
+    }
+
+    #[tokio::test]
+    async fn provider_token_budget_is_shared_across_connections_and_isolated_from_control() {
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let control = GrpcRateLimiter::from_config(&config);
+        let tokens = GrpcRateLimiter::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = GrpcRateLimitService::new(CountingGrpcService { calls }, control);
+        service.provider_token_limiter = tokens;
+        let mut other_connection = service.clone();
+        let token_request = || {
+            Request::builder()
+                .uri("/openshell.v1.OpenShell/GetSandboxProviderAccessToken")
+                .body(())
+                .unwrap()
+        };
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(token_request())
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&first), "0");
+        let exhausted = other_connection
+            .ready()
+            .await
+            .unwrap()
+            .call(token_request())
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&exhausted), "8");
+        let control = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&control), "0");
+        let exhausted = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&exhausted), "8");
     }
 
     #[tokio::test]
@@ -4774,6 +4834,52 @@ mod tests {
                 .unwrap();
 
             assert!(authorization_events(&capture).is_empty());
+        }
+
+        /// Answers every request with a stored result replayed by request ID.
+        #[derive(Clone)]
+        struct ReplayHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for ReplayHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                Box::pin(async move {
+                    let mut response = Response::new(tonic::body::Body::empty());
+                    response.headers_mut().insert(
+                        crate::grpc::mutation_replay::REPLAYED_HEADER,
+                        "true".parse().unwrap(),
+                    );
+                    Ok(response)
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn replayed_mutation_records_a_no_op() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            user_router(ReplayHandler)
+                .call(request_with_id("/openshell.v1.OpenShell/CreateWorkspace"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_mutation(&events[0], "CreateWorkspace", 1);
+            assert_eq!(events[0]["status_id"], 1, "{}", events[0]);
+            assert_eq!(
+                events[0]["status_detail"], "no_op:replayed",
+                "{}",
+                events[0]
+            );
         }
 
         /// Assert that `event` is a gateway mutation record for `operation`.

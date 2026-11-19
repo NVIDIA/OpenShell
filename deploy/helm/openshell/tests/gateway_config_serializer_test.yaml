@@ -44,6 +44,20 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^metrics_bind_address = "0\.0\.0\.0:19090"$'
 
+  - it: brackets an IPv6 listen address
+    set:
+      gateway.listenAddress: "::"
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^bind_address = "\[::\]:8080"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^health_bind_address = "\[::\]:8081"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address = "\[::\]:9090"$'
+
   - it: aligns runtime namespace and ServiceAccount with chart-owned resources
     set:
       server.sandboxNamespace: chart-sandboxes
