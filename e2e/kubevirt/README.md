@@ -231,7 +231,7 @@ Created sandbox: kvpoc-demo
 objects:
 virtualmachine.kubevirt.io/default--kvpoc-demo   Running   True
 virtualmachineinstance.kubevirt.io/default--kvpoc-demo   Running   10.42.0.63   True
-secret/default--kvpoc-demo-bootstrap   Opaque   1   21s
+secret/default--kvpoc-demo-boot-abc123   Opaque   1   21s   # <vm>-boot-<generation>
 persistentvolumeclaim/default--kvpoc-demo-workspace   Bound   2Gi   RWO   local-path
 pod/os-supervisor-50f1d5b4-...   1/1   Running
 supervisor Pod UID matches the kubevirt.supervisor_pod_uid claim (e7c477ac-...)
@@ -453,10 +453,16 @@ material); delete it to fully reset.
   virt-launcher fence plays the workload role, so the namespace-wide
   workload policy is not created for KubeVirt sandboxes.
 - Single (shared) workspace mode; managed/operator modes are rejected.
-- No Helm chart / RBAC changes for the gateway itself: the PoC gateway runs
-  on the host with the cluster-admin kubeconfig. A real deployment needs
-  VM/VMI/PVC/Secret/NetworkPolicy rules added to the chart's
-  Role/ClusterRole (the shared supervisor *is* rendered from the chart).
+- The chart's sandbox Role (and the managed-mode ClusterRole) now carry
+  the least-privilege KubeVirt rules: Secrets create/delete only (the
+  bootstrap Secret is immutable per generation — `<vm>-boot-<generation>`
+  — and its exact name and UID are recorded on the VM, so the driver
+  never reads, lists, or patches a Secret), no listing of pods, Services,
+  PVCs, or NetworkPolicies (companions are derived from the VM's name and
+  recorded generation), and the fence reconciler restores drift with
+  delete-and-recreate. The PoC gateway itself still runs on the host with
+  the cluster-admin kubeconfig; step 5b proves the chart's RBAC is
+  sufficient.
 - Networking: masquerade pod network only; the guest clamps its MTU to 1400
   in `guest-init.sh` because the k3d flannel-vxlan pod network is 1450.
 - No GPU passthrough (a GPU request is rejected at admission with a clear

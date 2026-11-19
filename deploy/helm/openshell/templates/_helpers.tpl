@@ -888,3 +888,15 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- toYaml $app -}}
 {{- end -}}
+
+{{/*
+The effective Kubernetes driver runtime, normalized: "kubevirt" (both the
+canonical spelling and the "kube-virt" alias) or "pod". Templates compare
+against this single value so a values file using either spelling renders
+the same Role, RoleBinding, and preflight.
+*/}}
+{{- define "openshell.kubernetesRuntime" -}}
+{{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $runtime := get $kubernetesConfig "runtime" | default "" -}}
+{{- if or (eq $runtime "kubevirt") (eq $runtime "kube-virt") -}}kubevirt{{- else -}}pod{{- end -}}
+{{- end -}}

@@ -173,7 +173,17 @@ VM_UID="$(vm_jsonpath '{.items[0].metadata.uid}')"
 # (SandboxRuntimeNames::new lowercases it).
 SBX_LC="$(printf '%s' "${SBX_ID}" | tr '[:upper:]' '[:lower:]')"
 SUPERVISOR_POD="os-supervisor-${SBX_LC}"
-BOOTSTRAP_SECRET="default--${NAME}-bootstrap"
+# The bootstrap Secret is generation-scoped (<vm>-boot-<generation>, the
+# generation is opaque), so it is found by label.
+BOOTSTRAP_SECRET="$(kubectl get secrets -n "${SANDBOX_NAMESPACE}" \
+    -l "openshell.ai/sandbox-id=${SBX_ID},openshell.ai/managed-by=openshell" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" \
+    || fail "could not find the sandbox's bootstrap Secret by label"
+[ -n "${BOOTSTRAP_SECRET}" ] || fail "no labelled bootstrap Secret found"
+case "${BOOTSTRAP_SECRET}" in
+    default--${NAME}-boot-*) ;;
+    *) fail "unexpected bootstrap Secret name ${BOOTSTRAP_SECRET}" ;;
+esac
 
 echo "dedicated supervisor generation:"
 kubectl get pod,svc,secret -n "${SANDBOX_NAMESPACE}" \
@@ -372,6 +382,13 @@ NEW_SUPERVISOR_POD_UID="$(kubectl get pod -n "${SANDBOX_NAMESPACE}" "${SUPERVISO
 [ -n "${NEW_SUPERVISOR_POD_UID}" ] || fail "restarted supervisor Pod has no UID"
 [ "${NEW_SUPERVISOR_POD_UID}" != "${SUPERVISOR_POD_UID}" ] \
     || fail "supervisor Pod UID did not rotate across stop/start"
+# The start created a NEW generation's bootstrap Secret (<vm>-boot-<gen2>)
+# and deleted the old one; re-resolve the current Secret by label.
+BOOTSTRAP_SECRET="$(kubectl get secrets -n "${SANDBOX_NAMESPACE}" \
+    -l "openshell.ai/sandbox-id=${SBX_ID},openshell.ai/managed-by=openshell" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" \
+    || fail "could not find the restarted sandbox's bootstrap Secret by label"
+[ -n "${BOOTSTRAP_SECRET}" ] || fail "no labelled bootstrap Secret after start"
 CLAIMED_UID="$(kubectl get secret -n "${SANDBOX_NAMESPACE}" "${BOOTSTRAP_SECRET}" \
     -o jsonpath='{.data.userData}' | base64 -d \
     | grep "^OPENSHELL_BOUNDARY_CONFIG_B64=" | cut -d= -f2- | base64 -d \

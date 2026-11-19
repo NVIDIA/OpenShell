@@ -784,10 +784,13 @@ impl KubernetesComputeConfig {
         if self.kubevirt.memory.trim().is_empty() {
             return Err("kubevirt.memory must be set (e.g. \"1Gi\")".to_string());
         }
-        if self.workspace_mode != WorkspaceMode::Shared {
+        if !matches!(
+            self.workspace_mode,
+            WorkspaceMode::Shared | WorkspaceMode::Managed
+        ) {
             return Err(format!(
-                "kubevirt runtime (PoC) supports only the shared workspace mode; \
-                 configured mode is {}",
+                "kubevirt runtime supports the shared and managed workspace \
+                 modes; configured mode is {}",
                 self.workspace_mode
             ));
         }

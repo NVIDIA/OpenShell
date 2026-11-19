@@ -10,3 +10,21 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "Agent Sandbox is required but neither agents.x-k8s.io/v1beta1 nor agents.x-k8s.io/v1alpha1 is served"
+
+  - it: does not block a KubeVirt-only install without the Agent Sandbox CRDs
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          runtime: kubevirt
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not block a KubeVirt-only install with the kube-virt alias
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          runtime: kube-virt
+    asserts:
+      - hasDocuments:
+          count: 0

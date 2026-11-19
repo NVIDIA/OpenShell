@@ -307,6 +307,8 @@ pub struct KubeVirtSandboxParams<'a> {
     pub namespace: &'a str,
     /// `KubeVirt` resource name (`{workspace}--{name}` in shared mode).
     pub kube_name: &'a str,
+    /// The launch generation scoping the bootstrap Secret's name.
+    pub generation: &'a str,
 }
 
 /// The `KubeVirt` domain resources mapped from a sandbox's typed
@@ -529,6 +531,39 @@ pub fn render_workspace_pvc(params: &KubeVirtSandboxParams<'_>) -> PersistentVol
 }
 
 /// Render the `VirtualMachine`.
+/// The VM's `volumes` array: the root containerDisk, the bootstrap
+/// Secret's cloudInitNoCloud volume (named for the launch generation),
+/// and the workspace virtio-fs share. Start re-renders this array to
+/// point the config disk at a new generation's Secret.
+pub fn render_volumes(
+    kube_name: &str,
+    generation: &str,
+    kubevirt: &crate::config::KubeVirtConfig,
+) -> Vec<serde_json::Value> {
+    let mut container_disk = serde_json::json!({
+        "image": kubevirt.guest_image,
+    });
+    if !kubevirt.guest_image_pull_policy.is_empty() {
+        container_disk["imagePullPolicy"] = serde_json::json!(kubevirt.guest_image_pull_policy);
+    }
+    let mut volumes = vec![
+        serde_json::json!({"name": "rootdisk", "containerDisk": container_disk}),
+        serde_json::json!({
+            "name": "cloudinit",
+            "cloudInitNoCloud": {
+                "secretRef": {"name": bootstrap_secret_name(kube_name, generation)}
+            }
+        }),
+    ];
+    if kubevirt.workspace_pvc {
+        volumes.push(serde_json::json!({
+            "name": "workspace",
+            "persistentVolumeClaim": {"claimName": workspace_pvc_name(kube_name)}
+        }));
+    }
+    volumes
+}
+
 pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObject {
     let sandbox = params.sandbox;
     let kubevirt = &params.config.kubevirt;
@@ -551,15 +586,7 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
         serde_json::json!({"name": "rootdisk", "disk": {"bus": "virtio"}}),
         serde_json::json!({"name": "cloudinit", "disk": {"bus": "virtio"}}),
     ];
-    let mut volumes = vec![
-        serde_json::json!({"name": "rootdisk", "containerDisk": container_disk}),
-        serde_json::json!({
-            "name": "cloudinit",
-            "cloudInitNoCloud": {
-                "secretRef": {"name": bootstrap_secret_name(params.kube_name)}
-            }
-        }),
-    ];
+    let volumes = render_volumes(params.kube_name, params.generation, &params.config.kubevirt);
     // The workspace PVC is a filesystem volume (the cluster's default
     // storage class provisions filesystem PVCs), which KubeVirt shares
     // with the guest via virtio-fs rather than as a block disk.
@@ -568,10 +595,6 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
         filesystems.push(serde_json::json!({
             "name": "workspace",
             "virtiofs": {}
-        }));
-        volumes.push(serde_json::json!({
-            "name": "workspace",
-            "persistentVolumeClaim": {"claimName": workspace_pvc_name(params.kube_name)}
         }));
     }
 
@@ -753,8 +776,84 @@ fn kubevirt_create_in_flight_since(obj: &DynamicObject) -> Option<i64> {
         .ok()
 }
 
-pub fn bootstrap_secret_name(kube_name: &str) -> String {
-    format!("{kube_name}-bootstrap")
+/// The bootstrap Secret for one generation: immutable per generation
+/// (`<vm>-boot-<generation>`), so a start creates the new generation's
+/// Secret and deletes the previous one by exact name with a UID
+/// precondition instead of rewriting (patching) a live Secret. The
+/// generation is the launch authentication's runtime generation, the
+/// same value that scopes the supervisor Pod's bootstrap Secret.
+pub fn bootstrap_secret_name(kube_name: &str, generation: &str) -> String {
+    // The same generation normalization `SandboxRuntimeNames` applies
+    // (alphanumeric, lowercase, bounded), so the name stays DNS-safe and
+    // matches the supervisor Secret's generation suffix.
+    let normalized = generation
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("{kube_name}-boot-{normalized}")
+}
+
+/// A companion recorded on the VM: its exact name and the UID from its
+/// create response, so later deletes need no read and no search.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompanionRecord {
+    pub name: String,
+    pub uid: String,
+}
+
+/// The VM annotation carrying the current generation's recorded
+/// companions (name → UID), so teardown and generation turnover never
+/// list or read the objects themselves.
+pub const COMPANIONS_ANNOTATION: &str = "openshell.ai/kubevirt-companions";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordedCompanions {
+    pub boot_secret: CompanionRecord,
+    pub supervisor_secret: Option<CompanionRecord>,
+}
+
+impl RecordedCompanions {
+    /// Parse the annotation value. `None` when the annotation is absent
+    /// or malformed (a pre-annotation VM): callers treat that as "no
+    /// recorded companion" and rely on owner-reference garbage
+    /// collection rather than guessing.
+    pub fn from_annotation(value: &str) -> Option<Self> {
+        let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
+        let boot_secret = CompanionRecord {
+            name: parsed["boot_secret"]["name"].as_str()?.to_string(),
+            uid: parsed["boot_secret"]["uid"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let supervisor_secret =
+            parsed["supervisor_secret"]["name"]
+                .as_str()
+                .map(|name| CompanionRecord {
+                    name: name.to_string(),
+                    uid: parsed["supervisor_secret"]["uid"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+        Some(Self {
+            boot_secret,
+            supervisor_secret,
+        })
+    }
+
+    /// Render the annotation value.
+    pub fn to_annotation(&self) -> String {
+        serde_json::json!({
+            "boot_secret": {"name": self.boot_secret.name, "uid": self.boot_secret.uid},
+            "supervisor_secret": self.supervisor_secret.as_ref().map(|record| {
+                serde_json::json!({"name": record.name, "uid": record.uid})
+            }),
+        })
+        .to_string()
+    }
 }
 
 pub fn workspace_pvc_name(kube_name: &str) -> String {
@@ -1091,15 +1190,84 @@ pub fn is_kubevirt_mode(config: &KubernetesComputeConfig) -> bool {
     config.runtime == KubernetesRuntimeMode::KubeVirt
 }
 
-/// Shared-mode namespace the VM resources render into.
+/// Shared-mode namespace the VM resources render into. Managed mode
+/// resolves per-workspace namespaces through the config's
+/// `namespace_for_workspace` (create) and cluster-wide label lookups
+/// (every other entry point).
 pub fn kubevirt_namespace(config: &KubernetesComputeConfig) -> Result<String, String> {
     if config.workspace_mode != WorkspaceMode::Shared {
         return Err(format!(
-            "kubevirt runtime (PoC) supports only the shared workspace mode; configured mode is {}",
+            "kubevirt namespace resolution requires the workspace; the \
+             configured mode is {}",
             config.workspace_mode
         ));
     }
     Ok(config.namespace.clone())
+}
+
+/// The API scope the `KubeVirt` driver lists and watches VMs over: the
+/// sandbox namespace in shared mode, the whole cluster in managed mode
+/// (sandbox VMs live in per-workspace namespaces the sandbox id alone
+/// does not name).
+pub fn kubevirt_list_api(
+    client: &Client,
+    config: &KubernetesComputeConfig,
+) -> Result<Api<DynamicObject>, String> {
+    match config.workspace_mode {
+        WorkspaceMode::Shared => {
+            let namespace = kubevirt_namespace(config)?;
+            Ok(virtual_machine_api(client, &namespace))
+        }
+        WorkspaceMode::Managed | WorkspaceMode::Operator => Ok(Api::all_with(
+            client.clone(),
+            &virtual_machine_api_resource(),
+        )),
+    }
+}
+
+/// Timeout for the managed-mode namespace discovery lookup.
+const NAMESPACE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Discover the namespace of the single VM carrying the sandbox-id label.
+/// Shared mode reads the configured namespace; managed mode looks
+/// cluster-wide (the sandbox id alone does not name the per-workspace
+/// namespace). More than one match is an ambiguous identity.
+pub async fn discover_kubevirt_namespace(
+    client: &Client,
+    config: &KubernetesComputeConfig,
+    sandbox_id: &str,
+    selector: &str,
+) -> Result<String, KubernetesDriverError> {
+    if config.workspace_mode == WorkspaceMode::Shared {
+        return kubevirt_namespace(config).map_err(KubernetesDriverError::Precondition);
+    }
+    let api = kubevirt_list_api(client, config).map_err(KubernetesDriverError::Precondition)?;
+    let list = tokio::time::timeout(
+        NAMESPACE_DISCOVERY_TIMEOUT,
+        api.list(&ListParams::default().labels(selector)),
+    )
+    .await
+    .map_err(|_| {
+        KubernetesDriverError::Message(format!(
+            "timed out after {}s waiting for Kubernetes API",
+            NAMESPACE_DISCOVERY_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(KubernetesDriverError::from_kube)?;
+    let items = list.items;
+    if items.is_empty() {
+        return Err(KubernetesDriverError::NotFound);
+    }
+    if items.len() > 1 {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "sandbox id {sandbox_id} matches VirtualMachines in multiple namespaces"
+        )));
+    }
+    items[0]
+        .metadata
+        .namespace
+        .clone()
+        .ok_or_else(|| KubernetesDriverError::Message("VirtualMachine has no namespace".into()))
 }
 
 /// List driver-owned VMs by label selector.
@@ -1108,8 +1276,24 @@ pub async fn list_virtual_machines(
     config: &KubernetesComputeConfig,
     selector: &str,
 ) -> Result<ObjectList<DynamicObject>, KubernetesDriverError> {
-    let namespace = kubevirt_namespace(config).map_err(KubernetesDriverError::Message)?;
-    let api = virtual_machine_api(client, &namespace);
+    // Shared mode lists the sandbox namespace; managed mode lists
+    // cluster-wide (the VMs live in per-workspace namespaces).
+    let api = match config.workspace_mode {
+        WorkspaceMode::Shared => {
+            let namespace = kubevirt_namespace(config).map_err(KubernetesDriverError::Message)?;
+            virtual_machine_api(client, &namespace)
+        }
+        WorkspaceMode::Managed | WorkspaceMode::Operator => Api::all_with(
+            client.clone(),
+            &ApiResource {
+                group: KUBEVIRT_GROUP.to_string(),
+                version: KUBEVIRT_VERSION.to_string(),
+                api_version: format!("{KUBEVIRT_GROUP}/{KUBEVIRT_VERSION}"),
+                kind: "VirtualMachine".to_string(),
+                plural: "virtualmachines".to_string(),
+            },
+        ),
+    };
     api.list(&ListParams::default().labels(selector))
         .await
         .map_err(KubernetesDriverError::from_kube)
@@ -1170,6 +1354,7 @@ mod tests {
             config,
             namespace: "openshell-e2e-ns",
             kube_name: "default--demo",
+            generation: "1",
         }
     }
 
@@ -1216,7 +1401,7 @@ mod tests {
         assert_eq!(names, vec!["rootdisk", "cloudinit", "workspace"]);
         assert_eq!(
             volumes[1]["cloudInitNoCloud"]["secretRef"]["name"],
-            "default--demo-bootstrap"
+            "default--demo-boot-1"
         );
         assert_eq!(
             volumes[2]["persistentVolumeClaim"]["claimName"],
@@ -1406,6 +1591,16 @@ pub fn kubevirt_start_plan(
 }
 
 /// Namespaced API for `kubevirt.io/v1` `virtualmachineinstances`.
+pub fn virtual_machine_instance_api_resource() -> ApiResource {
+    ApiResource {
+        group: KUBEVIRT_GROUP.to_string(),
+        version: KUBEVIRT_VERSION.to_string(),
+        api_version: format!("{KUBEVIRT_GROUP}/{KUBEVIRT_VERSION}"),
+        kind: "VirtualMachineInstance".to_string(),
+        plural: "virtualmachineinstances".to_string(),
+    }
+}
+
 pub fn virtual_machine_instance_api(client: &Client, namespace: &str) -> Api<DynamicObject> {
     Api::namespaced_with(
         client.clone(),
@@ -1556,6 +1751,7 @@ mod kubevirt_review_tests {
             config,
             namespace: "openshell-e2e-ns",
             kube_name: "default--demo",
+            generation: "1",
         }
     }
 
