@@ -23,6 +23,7 @@ use kube::core::ObjectMeta;
 use openshell_isolation_interface::contract::{
     BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
+use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -408,6 +409,7 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub host_gateway_ip: Option<IpAddr>,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
+    pub gpu_requested: bool,
 }
 
 /// Protected workload-pod config and matching sandbox-runtime descriptor.
@@ -448,6 +450,9 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.egress_policy_resource_version,
             ),
         ]);
+        if self.gpu_requested {
+            resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
+        }
         let mut supervisor_namespace = None;
         let mut shared_port = None;
         let (listener, transport) = match self.control_path {
@@ -676,7 +681,33 @@ mod tests {
             )
             .unwrap(),
             child_env: HashMap::new(),
+            gpu_requested: false,
         }
+    }
+
+    #[test]
+    fn gpu_claim_is_set_only_when_requested() {
+        let cpu = spec().provision().unwrap();
+        assert!(
+            !cpu.boundary_config
+                .resource_claims
+                .contains_key(GPU_RESOURCE_CLAIM)
+        );
+
+        let gpu = KubernetesSandboxRuntimeBoundarySpec {
+            gpu_requested: true,
+            ..spec()
+        }
+        .provision()
+        .unwrap();
+        assert_eq!(
+            gpu.boundary_config.resource_claims[GPU_RESOURCE_CLAIM],
+            "true"
+        );
+        assert_eq!(
+            gpu.boundary_config.resource_claims,
+            gpu.runtime_descriptor.resource_claims
+        );
     }
 
     #[test]
