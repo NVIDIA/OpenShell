@@ -3192,8 +3192,6 @@ message SupervisorHello {
   // ConfigUpdate payloads, and answers each with its result and admission.
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
-  reserved 8;
-  reserved "supports_cedar_policy";
   // Versioned capabilities of the supervisor's compiled policy backends.
   // Missing capabilities never authorize a policy requiring that backend.
   repeated string supported_capabilities = 9;

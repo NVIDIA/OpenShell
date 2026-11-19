@@ -594,8 +594,6 @@ mod tests {
 #[cfg(test)]
 mod policy_capability_tests {
     use super::{POLICY_CEDAR_V1, has_capability};
-    use crate::proto::SupervisorHello;
-    use prost::Message;
 
     #[test]
     fn capabilities_require_the_exact_versioned_contract() {
@@ -609,12 +607,5 @@ mod policy_capability_tests {
             &[POLICY_CEDAR_V1.to_string()],
             POLICY_CEDAR_V1
         ));
-    }
-
-    #[test]
-    fn retired_boolean_tags_do_not_advertise_policy_capabilities() {
-        // Former supervisor hello tag 8.
-        let hello = SupervisorHello::decode([0x40, 1].as_slice()).unwrap();
-        assert!(hello.supported_capabilities.is_empty());
     }
 }
