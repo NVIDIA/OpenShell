@@ -9,10 +9,7 @@ use crate::persistence::{Store, current_time_ms};
 pub use crate::refresh_store::{get_refresh_state, list_refresh_states_for_provider};
 #[cfg(test)]
 pub use crate::refresh_store::{list_all_refresh_states, put_refresh_state};
-use crate::storage_proto::{
-    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredRefreshMaterialDeletion,
-};
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion};
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
@@ -134,6 +131,25 @@ pub fn refresh_status_from_state(
     }
 }
 
+/// Compare with the live provider inside its conditional write so independently
+/// updated expiries survive deletion of a refresh grant.
+pub fn clear_refresh_owned_expiries(
+    provider: &mut Provider,
+    refresh_expires_at_ms: i64,
+    owned_keys: &[String],
+) {
+    for key in owned_keys {
+        if provider
+            .credential_expiration_times
+            .get(key)
+            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+            .is_some_and(|expires_at_ms| expires_at_ms == refresh_expires_at_ms)
+        {
+            provider.credential_expiration_times.remove(key);
+        }
+    }
+}
+
 /// Whether a refresh expiration was explicitly provided.
 ///
 /// Legacy records infer presence from a nonzero millisecond value. New records
@@ -236,6 +252,8 @@ pub fn new_refresh_state(
         authorization_epoch: uuid::Uuid::new_v4().to_string(),
         secret_material_handles: HashMap::new(),
         pending_secret_deletions: Vec::new(),
+        retired_output_handles: Vec::new(),
+        first_mint_provider_version: 0,
         recovery_action: ProviderCredentialRefreshRecoveryAction::Unspecified as i32,
         failure_code: String::new(),
         provider_error_subtype: String::new(),
@@ -434,8 +452,10 @@ async fn apply_minted_credential(
         attempt.as_ref(),
         key,
         minted,
+        None,
     )
     .await
+    .map(|_| ())
 }
 #[cfg(test)]
 use openshell_credential_issuer::refresh::minter::MintedCredential;
@@ -506,7 +526,7 @@ mod tests {
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
-    use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+    use crate::storage_proto::StoredProviderCredentialRefreshState;
 
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;

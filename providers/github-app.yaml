@@ -7,7 +7,7 @@
 # Choose GITHUB_TOKEN or GH_TOKEN as the refresh credential key; only the chosen
 # key is injected. api_token selects the configured alias, defaulting to
 # GITHUB_TOKEN. Only one alias can have refresh configured at a time.
-# The app key and JWT remain at the gateway.
+# The gateway keeps the app key and sends the signed JWT to GitHub.
 id: github-app
 display_name: GitHub App
 description: GitHub App installation tokens with gateway-managed rotation

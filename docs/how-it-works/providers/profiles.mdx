@@ -665,7 +665,8 @@ Configuration stores refresh material and schedules minting. The explicit
 `rotate` command mints immediately, so check its result before creating a sandbox.
 Choose either `GITHUB_TOKEN` or `GH_TOKEN` as the credential key. Only the chosen
 environment variable is injected, as a placeholder. The private key remains in
-the gateway's credential backend, and the app JWT stays at the gateway.
+the gateway's credential backend. The gateway sends the app JWT to GitHub to mint
+the installation token.
 
 The logical credential name `api_token` selects the configured alias, or
 `GITHUB_TOKEN` when neither alias has a refresh configuration. Configure, rotate,
@@ -673,7 +674,10 @@ delete, `inline-secrets`, and credential-filtered status use this resolution.
 Status responses report the selected environment alias. A second refresh
 configuration under the other alias is rejected, including when the existing
 configuration is pending or has failed. Update the selected alias, or delete
-its refresh configuration before switching aliases.
+its refresh configuration before switching aliases. Deletion retires the minted
+token from that provider alias. If you already switched aliases on an older gateway
+and the retired alias is still present, clear it explicitly. For example, after
+switching to `GITHUB_TOKEN`, run `openshell provider update repo-reader --credential GH_TOKEN=`.
 
 Older gateways allowed refresh states under `api_token` or both environment
 aliases. If these states cause a conflict, run
@@ -701,11 +705,12 @@ support every operation that requires a GitHub user identity.
 
 For inline key replacement or a scope change, configure refresh again with all material,
 rotate, and restart processes holding the previous workload handle.
-Reconfiguration starts a new authorization epoch. Transient issuer failures retry
-through the existing refresh worker; configuration failures appear in refresh
-status. Previously minted credentials remain subject to their recorded expiry,
-and expired tokens fail closed. Revoking a key does not constitute explicit
-revocation of already minted tokens in OpenShell.
+Reconfiguration immediately withdraws the previous token from gateway delivery.
+New callers need a successful mint with the new scope. Grants created before
+the gateway tracked token epochs also need one successful mint after upgrade.
+Use `refresh rotate` to mint immediately. The worker honors GitHub's rate-limit
+retry deadlines. Configuration failures appear in refresh status.
+A token already exported to a caller remains subject to GitHub's expiry and revocation.
 
 If rotation reports `github_token_endpoint_unavailable`, the gateway could not
 complete the token endpoint request or read its response. Request failures

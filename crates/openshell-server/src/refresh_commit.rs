@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openshell_core::proto::Provider;
-use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::refresh::{
-    GatewayRefreshCommit, RefreshAttempt, RefreshChange, RefreshCommitSink, RefreshOutputs,
-    RefreshStateStore,
+    CommittedRefreshOutputs, GatewayRefreshCommit, RefreshAttempt, RefreshChange,
+    RefreshCommitSink, RefreshOutputs, RefreshStateStore,
 };
 use openshell_credential_issuer::{Handles, SecretOwner};
 use tonic::Status;
@@ -69,10 +69,8 @@ impl RefreshAttempt for ProviderAttempt {
         Ok(())
     }
 
-    async fn commit(&self, outputs: RefreshOutputs<'_>) -> Result<Handles, Status> {
+    async fn commit(&self, outputs: RefreshOutputs<'_>) -> Result<CommittedRefreshOutputs, Status> {
         let workspace = self.provider.object_workspace();
-        let mut updated = self.provider.clone();
-        apply_outputs(&mut updated, &outputs, &mut Handles::new());
         // Network exchange and staging have already completed. Preserve the
         // short workspace guard around attachment validation and provider CAS.
         let _guard = if let Some(compute) = &self.integration.compute {
@@ -90,26 +88,63 @@ impl RefreshAttempt for ProviderAttempt {
         } else {
             None
         };
+        // Refresh grants can change while the endpoint call is in flight. Read
+        // the provider revision before the epoch check: changing a GitHub grant
+        // also bumps that revision, so its old mint cannot win the provider CAS.
+        let mut current = if outputs.grant_epoch.is_some() {
+            self.integration
+                .store
+                .get_message::<Provider>(self.provider.object_id())
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider for refresh commit: {e}")))?
+                .ok_or_else(|| Status::aborted("provider was deleted"))?
+        } else {
+            self.provider.clone()
+        };
+        let expected_version = if let Some(epoch) = outputs.grant_epoch {
+            let grant = self
+                .integration
+                .refresh_store
+                .get(workspace, self.provider.object_id(), outputs.credential_key)
+                .await?
+                .ok_or_else(|| Status::aborted("provider refresh was deleted"))?;
+            if openshell_credential_issuer::refresh::effective_authorization_epoch(&grant)? != epoch
+            {
+                return Err(Status::aborted("provider refresh was reconfigured"));
+            }
+            current.get_resource_version()
+        } else {
+            0
+        };
+        apply_outputs(&mut current, &outputs, &mut Handles::new());
         crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
             &self.integration.store,
             crate::provider_refresh::RefreshStateReader::CommitStore(
                 self.integration.refresh_store.as_ref(),
             ),
             workspace,
-            &updated,
+            &current,
         )
         .await?;
         let mut replaced = Handles::new();
-        self.integration
+        let published = self
+            .integration
             .store
-            .update_message_cas::<Provider, _>(self.provider.object_id(), 0, |current| {
-                apply_outputs(current, &outputs, &mut replaced);
-            })
+            .update_message_cas::<Provider, _>(
+                self.provider.object_id(),
+                expected_version,
+                |current| {
+                    apply_outputs(current, &outputs, &mut replaced);
+                },
+            )
             .await
             .map_err(|e| {
                 Status::internal(format!("persist refreshed provider credential failed: {e}"))
             })?;
-        Ok(replaced)
+        Ok(CommittedRefreshOutputs {
+            replaced,
+            provider_version: published.get_resource_version(),
+        })
     }
 }
 
@@ -200,6 +235,7 @@ mod tests {
             attempt.as_ref(),
             "TOKEN",
             &minted,
+            None,
         )
         .await
         .unwrap_err();

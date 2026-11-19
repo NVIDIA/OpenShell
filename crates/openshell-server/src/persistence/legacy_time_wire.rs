@@ -46,7 +46,7 @@ fn root_message_name(object_type: &str) -> Option<&'static str> {
         "workspace_member" => Some("openshell.v1.WorkspaceMember"),
         "provider_profile" => Some("openshell.storage.v1.StoredProviderProfile"),
         "provider_credential_refresh_state" => {
-            Some("openshell.storage.v1.StoredProviderCredentialRefreshStateV2")
+            Some("openshell.storage.v2.StoredProviderCredentialRefreshState")
         }
         "service_endpoint" => Some("openshell.v1.ServiceEndpoint"),
         "ssh_session" => Some("openshell.v1.SshSession"),
@@ -235,10 +235,10 @@ fn conversion(message: &str, field: u32) -> Option<Conversion> {
             4,
         ) => Some(D { new_tag: 104 }),
         ("openshell.v1.ProviderCredentialRefresh", 5) => Some(D { new_tag: 105 }),
-        ("openshell.storage.v1.StoredProviderCredentialRefreshStateV2", 15) => {
+        ("openshell.storage.v2.StoredProviderCredentialRefreshState", 15) => {
             Some(D { new_tag: 115 })
         }
-        ("openshell.storage.v1.StoredProviderCredentialRefreshStateV2", 16) => {
+        ("openshell.storage.v2.StoredProviderCredentialRefreshState", 16) => {
             Some(D { new_tag: 116 })
         }
         ("openshell.sandbox.v1.MiddlewareBinding", 4) => Some(DS { new_tag: 104 }),
@@ -332,9 +332,7 @@ fn require_wire_type(actual: u8, expected: u8) -> PersistenceResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_proto::{
-        StoredProviderCredentialRefreshState, StoredProviderCredentialRefreshStateV2,
-    };
+    use crate::storage_proto::{StoredProviderCredentialRefreshState, v1};
     use openshell_core::proto::{
         EndpointStatus, Provider, SandboxCondition, SandboxWorkloadTemplate, SshSession,
     };
@@ -571,8 +569,8 @@ mod tests {
     }
 
     #[test]
-    fn migrates_refresh_state_durations_to_v2() {
-        let legacy = StoredProviderCredentialRefreshState {
+    fn migrates_legacy_refresh_state_durations() {
+        let legacy = v1::StoredProviderCredentialRefreshState {
             provider_id: "provider-id".into(),
             refresh_before_seconds: 30,
             max_lifetime_seconds: 3600,
@@ -581,7 +579,7 @@ mod tests {
 
         let migrated =
             migrate("provider_credential_refresh_state", &legacy.encode_to_vec()).unwrap();
-        let state = StoredProviderCredentialRefreshStateV2::decode(migrated.as_slice()).unwrap();
+        let state = StoredProviderCredentialRefreshState::decode(migrated.as_slice()).unwrap();
 
         assert_eq!(
             state.refresh_before,
@@ -604,6 +602,7 @@ mod tests {
         let private_storage_messages = [
             "openshell.storage.v1.StoredProviderCredentialRefreshState",
             "openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
+            "openshell.storage.v2.StoredProviderCredentialRefreshState",
             "openshell.storage.v1.PolicyRevisionPayload",
             "openshell.storage.v1.DraftChunkPayload",
             "openshell.storage.v1.StoredPolicyRevision",

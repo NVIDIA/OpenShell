@@ -114,11 +114,10 @@ pub(super) fn installation_url<S: std::hash::BuildHasher>(
     Ok(url)
 }
 
-pub fn validate_configuration<S: std::hash::BuildHasher>(
+fn installation_parameters<S: std::hash::BuildHasher>(
     material: &HashMap<String, String, S>,
     token_url: &str,
-    private_key_referenced: bool,
-) -> Result<(), Status> {
+) -> Result<(Url, InstallationRequest), Status> {
     // Reject misspelled scope fields and endpoint overrides rather than silently
     // ignoring them. Repository and permission restrictions are always explicit.
     if material.keys().any(|key| {
@@ -138,29 +137,31 @@ pub fn validate_configuration<S: std::hash::BuildHasher>(
         ));
     }
     required_material(material, "client_id")?;
-    installation_request(material)?;
-    installation_url(token_url, material)?;
-    // Referenced keys are resolved and validated at mint time.
-    if private_key_referenced && !material.contains_key("private_key") {
-        return Ok(());
+    Ok((
+        installation_url(token_url, material)?,
+        installation_request(material)?,
+    ))
+}
+
+pub fn validate_configuration<S: std::hash::BuildHasher>(
+    material: &HashMap<String, String, S>,
+    token_url: &str,
+    private_key_referenced: bool,
+) -> Result<(), Status> {
+    installation_parameters(material, token_url)?;
+    if !private_key_referenced || material.contains_key("private_key") {
+        sign_assertion(material)?;
     }
-    let private_key = required_material(material, "private_key")?;
-    jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes()).map_err(|_| {
-        Status::invalid_argument("github_app_installation private_key must be RSA PEM")
-    })?;
     Ok(())
 }
 
-pub(super) async fn mint(state: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
-    validate_configuration(&state.material, &state.token_url, false)?;
-    let url = installation_url(&state.token_url, &state.material)?;
-    super::ensure_endpoint_allowed(url.as_str(), &state.secret_endpoint_allowlists)?;
-    let body = installation_request(&state.material)?;
-    let client_id = required_material(&state.material, "client_id")?;
-    let private_key = required_material(&state.material, "private_key")?;
-    openshell_crypto::install_jwt_provider();
+fn sign_assertion<S: std::hash::BuildHasher>(
+    material: &HashMap<String, String, S>,
+) -> Result<String, Status> {
+    let client_id = required_material(material, "client_id")?;
+    let private_key = required_material(material, "private_key")?;
     let now_secs = current_time_ms() / 1000;
-    let assertion = openshell_crypto::jwt::encode(
+    openshell_crypto::jwt::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &AppClaims {
             iss: &client_id,
@@ -171,7 +172,13 @@ pub(super) async fn mint(state: &MintRequest) -> Result<MintedCredential, Refres
             Status::invalid_argument("github_app_installation private_key must be RSA PEM")
         })?,
     )
-    .map_err(|_| Status::invalid_argument("could not sign GitHub App JWT with private_key"))?;
+    .map_err(|_| Status::invalid_argument("could not sign GitHub App JWT with private_key"))
+}
+
+pub(super) async fn mint(state: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
+    let (url, body) = installation_parameters(&state.material, &state.token_url)?;
+    super::ensure_endpoint_allowed(url.as_str(), &state.secret_endpoint_allowlists)?;
+    let assertion = sign_assertion(&state.material)?;
 
     openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
@@ -286,18 +293,36 @@ fn invalid_response() -> RefreshFailure {
 }
 
 fn classify_error(status: StatusCode, headers: &HeaderMap) -> RefreshFailure {
-    if status == StatusCode::TOO_MANY_REQUESTS
-        || (status == StatusCode::FORBIDDEN
-            && (headers.contains_key("retry-after")
-                || headers
-                    .get("x-ratelimit-remaining")
-                    .is_some_and(|value| value == "0")))
-        || status.is_server_error()
-    {
-        return RefreshFailure::retryable(
+    let exhausted = headers
+        .get("x-ratelimit-remaining")
+        .is_some_and(|v| v == "0");
+    let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (headers.contains_key("retry-after") || exhausted));
+    if rate_limited || status.is_server_error() {
+        let mut failure = RefreshFailure::retryable(
             Status::unavailable("GitHub token minting is temporarily unavailable or rate limited"),
             "github_token_endpoint_retryable",
         );
+        let seconds = |name: &str| {
+            headers
+                .get(name)?
+                .to_str()
+                .ok()?
+                .parse::<u64>()
+                .ok()
+                .and_then(|n| i64::try_from(n).ok())
+        };
+        let retry_after = seconds("retry-after")
+            .and_then(|n| current_time_ms().checked_add(n.checked_mul(1000)?));
+        let reset = if exhausted && rate_limited {
+            seconds("x-ratelimit-reset").and_then(|n| n.checked_mul(1000))
+        } else {
+            None
+        };
+        if let Some(deadline) = retry_after.into_iter().chain(reset).max() {
+            failure.retry_schedule = super::RefreshRetrySchedule::NotBefore(deadline);
+        }
+        return failure;
     }
     let (message, code) = match status {
         StatusCode::UNAUTHORIZED => (
@@ -680,6 +705,17 @@ mod tests {
             );
         }
         let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "2000000000".parse().unwrap());
+        assert_eq!(
+            classify_error(StatusCode::FORBIDDEN, &headers).retry_schedule,
+            super::super::RefreshRetrySchedule::NotBefore(2_000_000_000_000)
+        );
+        headers.insert("x-ratelimit-remaining", "1".parse().unwrap());
+        assert_eq!(
+            classify_error(StatusCode::TOO_MANY_REQUESTS, &headers).retry_schedule,
+            super::super::RefreshRetrySchedule::Short
+        );
         headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
         assert_eq!(
             classify_error(StatusCode::FORBIDDEN, &headers).recovery_action,
