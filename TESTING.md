@@ -350,6 +350,41 @@ can run the suite. The expectations characterize the sandbox's behavior today,
 not a specification, and the `echo-socket` check needs `perl` in the workload
 image, which the default image has.
 
+### Continuity suites (`tests/suites/continuity/`)
+
+A continuity scenario checks that state created before a disruption survives it.
+Each scenario is a module with a `seed` test and a `verify` test that share a
+run id through `CONTINUITY_RUN_ID` and derive resource names from it
+(`scenario::name`). `seed` creates state through the CLI, so testkit's cleanup
+leaves it in place. `verify` adopts it and checks it, then does something new.
+
+`openshell-test-runner run --disruption <name>` runs the `seed` tests, applies the
+disruption in the guest, waits for the gateway, and runs the `verify` tests.
+Scenarios run under every disruption. The installer provides each disruption as an
+executable in `/var/lib/openshell-qualification/disruptions/<name>`, because how to
+restart or upgrade OpenShell depends on how it is installed. The runner stops
+before seeding if the installer doesn't provide the one you ask for.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family continuity --disruption gateway-restart
+```
+
+The `upgrade` disruption installs the candidate over a released package. Use the
+`deb-upgrade-source` installer, which installs the latest release as the baseline.
+The candidate is this checkout's `nix run .#build-artifacts` output, which CI also
+builds. CI downloads the baseline; locally, put the release's Debian package at
+`artifacts/upgrade/deb/source/openshell.deb` and its sandbox and supervisor images,
+saved with `docker save`, at
+`artifacts/upgrade/source-images/openshell-{sandbox,supervisor}-tmachine.tar`.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb-upgrade-source \
+  --family continuity --disruption upgrade
+```
+
 ### Python E2E (`e2e/python/`)
 
 `mise run e2e:python` builds `openshell/e2e-python:dev` from

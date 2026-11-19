@@ -41,6 +41,11 @@ on:
         required: false
         type: boolean
         default: false
+      upgrade-source:
+        description: Also run the rows that upgrade from a released package; each downloads the latest release as its baseline
+        required: false
+        type: boolean
+        default: false
       prebuilt:
         description: Run the rows with this run's prebuilt tests instead of building them in every job; conformance rows take the openshell-conformance-x86_64-unknown-linux-musl artifact, other rows their family's openshell-e2e-bundle-<family>-x86_64-unknown-linux-musl artifact
         required: false
@@ -71,12 +76,14 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.rows.outputs.matrix }}
+      upgrade_source_tag: ${{ steps.baseline.outputs.tag }}
     steps:
       - name: Select the rows to run
         id: rows
         env:
           FAMILY: ${{ inputs.family }}
           EXTERNAL_DRIVERS: ${{ inputs.external-drivers }}
+          UPGRADE_SOURCE: ${{ inputs.upgrade-source }}
         run: |
           set -euo pipefail
           # Only amd64 for now: CI has no arm64 runner with KVM for tmachine,
@@ -115,12 +122,14 @@ jobs:
             {"environment":"fedora-podman-rootless-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"continuity","disruption":"gateway-restart","gateway":"openshell","runner":"ubuntu-24.04"}
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"continuity","disruption":"gateway-restart","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","family":"continuity","disruption":"upgrade","gateway":"openshell","runner":"ubuntu-24.04","upgrade_source":true,"upgrade_package":"deb"}
           ]'
           # `suite` names the row's tests in the job and artifact names.
-          matrix=$(jq -c --arg family "${FAMILY}" --arg external "${EXTERNAL_DRIVERS}" '{include: map(
+          matrix=$(jq -c --arg family "${FAMILY}" --arg external "${EXTERNAL_DRIVERS}" --arg upgrade "${UPGRADE_SOURCE}" '{include: map(
               select($family == "" or .family == $family or (.family | startswith($family + "/")))
               | select((.external_driver // false) == false or $external == "true")
+              | select((.upgrade_source // false) == false or $upgrade == "true")
               | .package //= ""
               | .disruption //= ""
               | .suite = ([.family, .package, .disruption] | map(select(. != "")) | join("/"))
@@ -133,6 +142,18 @@ jobs:
           fi
           echo "$matrix"
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+      # Resolve the latest release once, so every upgrade row tests against the
+      # same baseline. A failure leaves the tag empty and fails only the upgrade
+      # rows, instead of every row.
+      - name: Resolve the upgrade baseline
+        id: baseline
+        if: inputs.upgrade-source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName || true)
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
   suites:
     name: E2E suites (${{ matrix.suite }}, ${{ matrix.environment }}, ${{ matrix.installer }})
@@ -194,6 +215,16 @@ jobs:
         with:
           artifact-ids: ${{ inputs['integration-inputs-artifact-id'] }}
           path: artifacts
+
+      # The baseline of an upgrade row. It is prepared here, not in the shared
+      # input preparation, so a failure to fetch it affects only this row.
+      - name: Prepare the upgrade baseline
+        if: matrix.upgrade_source
+        uses: ./.github/actions/prepare-upgrade-source
+        with:
+          tag: ${{ needs.select.outputs.upgrade_source_tag }}
+          package: ${{ matrix.upgrade_package }}
+          github-token: ${{ github.token }}
 
       # The program and the bundles are built once per run (see
       # build-conformance and build-e2e-bundles in branch-e2e.yml), so the rows

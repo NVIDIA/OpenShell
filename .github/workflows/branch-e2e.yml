@@ -26,6 +26,7 @@ jobs:
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
       run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
+      run_continuity_e2e: ${{ steps.labels.outputs.run_continuity_e2e }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,12 +48,14 @@ jobs:
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              run_continuity_e2e="$(jq -r 'index("test:e2e:continuity") != null' <<< "$LABELS_JSON")"
               ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
+              run_continuity_e2e=true
               ;;
           esac
           if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
@@ -66,6 +69,7 @@ jobs:
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
             echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
+            echo "run_continuity_e2e=$run_continuity_e2e"
             echo "run_any_e2e=$run_any_e2e"
           } >> "$GITHUB_OUTPUT"
 
@@ -458,6 +462,26 @@ jobs:
     with:
       family: drivers
       prebuilt: true
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  # Run the continuity suites (tests/suites/continuity) on tmachine: state
+  # seeded before a disruption, such as a gateway restart or an upgrade from the
+  # latest release, must survive it. The label adds to test:e2e, whose builds it
+  # reuses.
+  continuity-integration:
+    needs: [pr_metadata, prepare-integration]
+    if: needs.pr_metadata.outputs.run_integration == 'true' && needs.pr_metadata.outputs.run_continuity_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-suites.yml
+    with:
+      family: continuity
+      upgrade-source: true
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
