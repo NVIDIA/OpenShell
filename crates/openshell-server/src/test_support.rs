@@ -3,6 +3,30 @@
 
 //! Test fixtures for exercising gateway integration points.
 
+/// Test-only gRPC services whose unused methods return `UNIMPLEMENTED`.
+///
+/// These use the production message types and RPC paths. Implement only the
+/// methods the test exercises; the production server trait stays exhaustive.
+///
+/// ```compile_fail
+/// struct IncompleteGateway;
+/// #[tonic::async_trait]
+/// impl openshell_core::proto::open_shell_server::OpenShell for IncompleteGateway {}
+/// ```
+#[cfg(feature = "test-support")]
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    dead_code,
+    unused_imports,
+    unused_qualifications,
+    rust_2018_idioms
+)]
+pub mod grpc {
+    include!(concat!(env!("OUT_DIR"), "/test_grpc/openshell.v1.rs"));
+}
+
 use crate::ServerState;
 use crate::auth::identity::{Identity, IdentityProvider};
 use crate::auth::principal::{Principal, UserPrincipal};

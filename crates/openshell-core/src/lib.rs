@@ -65,7 +65,6 @@ pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
-pub mod spiffe;
 pub mod ssh_host_key;
 pub mod telemetry;
 pub mod time;
@@ -74,7 +73,7 @@ pub mod transport_errors;
 pub mod upload;
 
 pub use config::{
-    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
+    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuditConfig, GatewayAuthConfig,
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,

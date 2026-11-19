@@ -231,8 +231,26 @@ _policy_allowed_l7_endpoints(policy) := [ep |
 	some ep
 	ep := policy.endpoints[_]
 	endpoint_matches_l7_request(ep, input.network, input.request)
+	endpoint_uses_selected_request_protocol(ep)
 	request_allowed_for_endpoint(input.request, ep)
 ]
+
+# HTTP authorization uses the same parser selection as the relay. A sibling
+# endpoint can contribute an allow only when it uses the selected protocol;
+# all matching endpoints of that protocol retain additive allow semantics.
+# The native selector shares config parsing and path ranking with Rust.
+_selected_l7_request_protocol := openshell.selected_l7_protocol(_matching_endpoint_configs, object.get(input.request, "path", ""))
+
+endpoint_uses_selected_request_protocol(endpoint) if {
+	object.get(input.request, "command", "") == ""
+	lower(endpoint.protocol) == _selected_l7_request_protocol
+}
+
+# SQL commands do not use HTTP request-path routing.
+endpoint_uses_selected_request_protocol(_) if {
+	command := object.get(input.request, "command", "")
+	command != ""
+}
 
 # Forwarding and credential selection share endpoint admission. A deny rule
 # on any matching endpoint removes every otherwise admitted endpoint.

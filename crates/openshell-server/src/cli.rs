@@ -572,6 +572,12 @@ fn prepare_server_config_with_drivers(
     if let Some(auth) = file.as_ref().and_then(|f| f.openshell.gateway.auth.clone()) {
         config.auth = auth;
     }
+    if let Some(audit) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.audit.clone())
+    {
+        config.audit = audit;
+    }
     config.mtls_auth.enabled = mtls_auth_enabled;
     config.mtls_auth.operator_enabled = args.enable_operator_auth;
 
@@ -807,6 +813,30 @@ fn prepare_server_config_with_drivers(
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
     config.gateway_jwt = gateway_jwt;
+    config.spiffe_broker = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.spiffe_broker.clone());
+
+    if let Some(kubernetes) = file
+        .as_ref()
+        .and_then(|file| file.openshell.drivers.get("kubernetes"))
+        && kubernetes
+            .get("supervisor_topology")
+            .and_then(toml::Value::as_str)
+            == Some("gateway")
+        && kubernetes
+            .get("provider_spiffe_workload_api_socket_path")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|socket| !socket.is_empty())
+        && config.spiffe_broker.is_none()
+    {
+        return Err(miette::miette!(
+            "shared supervisor SPIFFE grants require spiffe_broker; remove provider_spiffe_workload_api_socket_path from the shared supervisor"
+        ));
+    }
+
+    // Reject invalid broker before startup; gateway state parses it later.
+    crate::spiffe_broker::validate_config(&config).map_err(|error| miette::miette!("{error}"))?;
 
     if let Some(normalized) = normalized_network_trust.as_ref() {
         // Use the same resolver as runtime construction, with the explicit
@@ -922,8 +952,15 @@ async fn run_from_args(
         &prepared.compute_driver,
         &prepared.config.compute_driver_endpoints,
     );
-    let (otlp_export, otlp_error) =
+    let (mut otlp_export, otlp_error) =
         crate::otel_tracing::OtlpExport::start(otlp_config, gateway_resource);
+    let (metrics_recorder, metrics_error) = match (otlp_export.as_mut(), otlp_config) {
+        (Some(export), Some(config)) => match export.start_metrics(config, gateway_resource) {
+            Ok(recorder) => (recorder, None),
+            Err(error) => (None, Some(error)),
+        },
+        _ => (None, None),
+    };
     let (tracing_handle, driver_otlp_error) = crate::tracing_setup::install(
         &EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
@@ -990,6 +1027,9 @@ async fn run_from_args(
     if has_oidc {
         info!("OIDC authentication enabled");
     }
+    if let Some(error) = metrics_error {
+        error!(%error, "OTLP metrics could not be started; continuing without metric export");
+    }
     if let Some(err) = otlp_error.as_ref().or(driver_otlp_error.as_ref()) {
         error!(
             error = %err,
@@ -1005,6 +1045,7 @@ async fn run_from_args(
             ocsf_protocol = otlp.ocsf_protocol().map(tracing::field::display),
             agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
             agent_protocol = otlp.agent_protocol().map(tracing::field::display),
+            metrics_endpoint = otlp.metrics_endpoint().map(tracing::field::display),
             "OTLP exporting enabled"
         );
     }
@@ -1014,7 +1055,13 @@ async fn run_from_args(
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    let result = Box::pin(run_server(prepared, tracing_log_bus, compute_drivers)).await;
+    let result = Box::pin(run_server(
+        prepared,
+        tracing_log_bus,
+        compute_drivers,
+        metrics_recorder,
+    ))
+    .await;
 
     tracing_handle.shutdown();
 

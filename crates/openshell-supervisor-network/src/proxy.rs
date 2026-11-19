@@ -2588,6 +2588,13 @@ async fn handle_tcp_connection(
 /// Adapt a transparent application stream to the existing CONNECT pipeline.
 /// The synthetic CONNECT request is supervisor-owned and its successful 200
 /// response is consumed before bytes are returned to the workload.
+fn transparent_connect_authority(host: &str, port: u16) -> String {
+    host.parse::<IpAddr>().map_or_else(
+        |_| format!("{host}:{port}"),
+        |ip| SocketAddr::new(ip, port).to_string(),
+    )
+}
+
 fn virtual_connect_stream(
     workload: BoundaryDuplexStream,
     authority: String,
@@ -2682,7 +2689,7 @@ async fn handle_mediated_connection(
                     .map_or((None, None), |(decision, connector)| {
                         (Some(decision), Some(connector))
                     });
-                let authority = format!("{host}:{}", destination.port());
+                let authority = transparent_connect_authority(&host, destination.port());
                 client = tokio::io::BufReader::new(virtual_connect_stream(
                     client.into_inner(),
                     authority,
@@ -5488,6 +5495,7 @@ where
         client,
         upstream,
         crate::l7::rest::RelayRequestOptions {
+            request_id: None,
             resolver: options.secret_resolver,
             body_classifier: options.body_classifier,
             mcp_request_validation: None,
@@ -7254,39 +7262,64 @@ async fn handle_forward_proxy_inner(
     .await;
     let outcome_result = match outcome_result {
         Err(report) => {
-            if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+            if let Some(error) = report.downcast_ref::<crate::l7::rest::UpstreamHttpError>() {
+                correlation.record_failure(
+                    HttpOutcome::UpstreamError,
+                    "upstream_http_transport_failure",
+                );
                 if let Some(session) = middleware_session.take() {
                     session
-                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                         .await;
                 }
-                let _ = upstream.shutdown().await;
-                crate::l7::relay::reject_body_credential(
+                crate::l7::relay::handle_upstream_http_error(
                     client,
-                    *error,
-                    &l7_ctx,
-                    request_correlation,
-                )
-                .await?;
-                return Ok(());
-            }
-            if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
-                if let Some(session) = middleware_session.take() {
-                    session
-                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
-                        .await;
-                }
-                crate::l7::relay::reject_credential_resolution(
-                    client,
+                    &mut upstream,
                     &l7_ctx,
                     method,
+                    Some(&request_id),
                     error,
-                    request_correlation,
                 )
                 .await?;
-                return Ok(());
+                if !error.response_started {
+                    correlation.record_response_status(502);
+                }
+                Ok(crate::l7::provider::RelayOutcome::Consumed)
+            } else {
+                if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                            .await;
+                    }
+                    let _ = upstream.shutdown().await;
+                    crate::l7::relay::reject_body_credential(
+                        client,
+                        *error,
+                        &l7_ctx,
+                        request_correlation,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                            .await;
+                    }
+                    crate::l7::relay::reject_credential_resolution(
+                        client,
+                        &l7_ctx,
+                        method,
+                        error,
+                        request_correlation,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(report)
             }
-            Err(report)
         }
         outcome => outcome,
     };
@@ -10344,6 +10377,92 @@ network_policies:
                 .starts_with("FORWARD allowed")
         );
         assert!(!record.to_string().contains("not-logged"));
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_eof_returns_502_and_preserves_allow_activity() {
+        let Some(ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no non-loopback IPv4 address");
+            return;
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind((ip, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let data = serde_json::json!({"network_policies":{"upstream":{
+                "name":"upstream", "endpoints":[{"host":ip.to_string(),"port":port,"allowed_ips":[format!("{ip}/32")]}],
+                "binaries":[{"path":"/usr/bin/python3"}]
+            }}});
+            let engine = Arc::new(
+                native_identity_engine(
+                    include_str!("../data/sandbox-policy.rego"),
+                    &data.to_string(),
+                )
+                .unwrap(),
+            );
+            let identity = Ok(ContractBinaryIdentity {
+                executable: ContractExecutableIdentity {
+                    path: executable_path("/usr/bin/python3"),
+                    digest: Some("00".repeat(32).parse().unwrap()),
+                },
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            });
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(request.starts_with(b"GET /mcp HTTP/1.1"));
+                // Accept the allowed request, then close before its response.
+            });
+            let target = format!("http://{ip}:{port}/mcp");
+            let request = format!("GET {target} HTTP/1.1\r\nHost: {ip}:{port}\r\n\r\n");
+            let (mut app, client) = tokio::io::duplex(8192);
+            let mut client: ProxyClient = tokio::io::BufReader::new(Box::new(client));
+            let (activity, mut events) = mpsc::channel(4);
+            Box::pin(handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut client,
+                Some(&identity),
+                None,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(0)),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                Some(&activity),
+                None,
+            ))
+            .await
+            .unwrap();
+            drop(client);
+            let mut response = String::new();
+            app.read_to_string(&mut response).await.unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{response}"
+            );
+            assert!(response.contains("x-openshell-request-id:"));
+            assert!(response.contains("Connection: close\r\n"));
+            assert!(
+                !events.try_recv().unwrap().denied,
+                "allowed decision must survive upstream EOF"
+            );
+            server.await.unwrap();
+        })
+        .await
+        .expect("forward EOF must yield a response");
     }
 
     #[tokio::test]
@@ -14588,6 +14707,18 @@ network_policies:
     }
 
     // -- parse_target: CONNECT target parser regression tests --
+
+    #[test]
+    fn transparent_connect_authority_round_trips_through_parse_target() {
+        for (host, port) in [
+            ("fd00:10:96::5", 8081),
+            ("10.96.0.5", 8081),
+            ("echo.svc", 8080),
+        ] {
+            let authority = transparent_connect_authority(host, port);
+            assert_eq!(parse_target(&authority).unwrap(), (host.to_string(), port));
+        }
+    }
 
     #[test]
     fn test_parse_target_valid_baseline() {

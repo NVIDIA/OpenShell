@@ -3,4 +3,4 @@
 
 [workspace]
 resolver = "2"
-members = ["cdi", "connect-ssh-supervision", "host-gateway", "keycloak-provider-refresh", "kubernetes-updates", "oci-image"]
+members = ["cdi", "connect-ssh-supervision", "docker-updates", "host-gateway", "keycloak-provider-refresh", "kubernetes-updates", "oci-image"]
