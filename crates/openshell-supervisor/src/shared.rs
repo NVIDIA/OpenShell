@@ -115,10 +115,10 @@ from sandbox runtimes)",
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                 .into_diagnostic()?;
-        let link = openshell_supervisor::shared_host::GatewayLink {
-            endpoint: gateway_endpoint.clone(),
+        let link = openshell_supervisor::shared_host::GatewayLink::new(
+            gateway_endpoint.clone(),
             token_file,
-        };
+        );
         let host = openshell_supervisor::shared_host::SharedHost::start(
             openshell_supervisor::shared_host::SharedHostConfig {
                 gateway_endpoint,
@@ -129,6 +129,7 @@ from sandbox runtimes)",
                     args.attach_request_timeout_seconds,
                 ),
                 pool,
+                max_instances: args.pool_max_instances as usize,
             },
         )?;
         let health = tokio::net::TcpListener::bind(address)
@@ -139,6 +140,7 @@ from sandbox runtimes)",
             runtime = %host.runtime_addr(),
             health = %address,
             pool_member = %host.pool().member_id,
+            max_instances = host.max_instances(),
             "Shared supervisor ready for sandbox instance assignments"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);

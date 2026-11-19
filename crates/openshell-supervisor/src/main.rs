@@ -102,6 +102,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP")]
     pool_advertise_ip: Option<std::net::IpAddr>,
 
+    /// Most sandbox instances this pool member runs, from 16 to 1024. Set it
+    /// to the gateway's `[openshell.gateway.supervisor_pool]`
+    /// `max_instances_per_member`; it also sizes the gateway stream's message
+    /// bounds.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES",
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u32).range(16..=1024)
+    )]
+    pool_max_instances: u32,
+
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
     role: SupervisorRole,
