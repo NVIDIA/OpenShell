@@ -13,7 +13,7 @@ describes.
 
 | Workload | Test | Covers |
 |---|---|---|
-| `make` | `make_builds_a_c_program` | `make -j4` builds a small C project, the program runs, and `make -q` finds nothing to rebuild |
+| `make` | `make_builds_a_c_program` | `make -j4` builds a small C project, the program runs, and `make -q` finds nothing to rebuild. Fails until [#4102](https://github.com/NVIDIA/OpenShell/issues/4102) is fixed: the sandbox denies the no-op `setresuid` make 4.3 makes before each recipe |
 
 ## What belongs here
 
