@@ -594,7 +594,7 @@ mod tests {
 #[cfg(test)]
 mod policy_capability_tests {
     use super::{POLICY_CEDAR_V1, has_capability};
-    use crate::proto::{HealthResponse, SupervisorHello};
+    use crate::proto::SupervisorHello;
     use prost::Message;
 
     #[test]
@@ -613,10 +613,8 @@ mod policy_capability_tests {
 
     #[test]
     fn retired_boolean_tags_do_not_advertise_policy_capabilities() {
-        // Former health tag 3 and supervisor hello tag 8.
-        let health = HealthResponse::decode([0x18, 1].as_slice()).unwrap();
+        // Former supervisor hello tag 8.
         let hello = SupervisorHello::decode([0x40, 1].as_slice()).unwrap();
-        assert!(health.supported_capabilities.is_empty());
         assert!(hello.supported_capabilities.is_empty());
     }
 }

@@ -316,7 +316,6 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::HealthResponse {
             status: proto::ServiceStatus::Healthy.into(),
             version: "test-1.2.3".to_string(),
-            ..Default::default()
         }))
     }
 

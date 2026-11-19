@@ -1193,21 +1193,6 @@ async fn sync_policy_with_client(
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<()> {
-    if policy.is_cedar() {
-        let info = client
-            .health(crate::proto::HealthRequest {})
-            .await
-            .map_err(grpc_status_error)?
-            .into_inner();
-        if !crate::extension_protocol::has_capability(
-            &info.supported_capabilities,
-            crate::extension_protocol::POLICY_CEDAR_V1,
-        ) {
-            return Err(grpc_status_error(Status::failed_precondition(
-                "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor",
-            )));
-        }
-    }
     client
         .update_config(UpdateConfigRequest {
             sandbox: sandbox.to_string(),

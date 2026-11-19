@@ -170,7 +170,6 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
-            ..Default::default()
         }))
     }
 
@@ -4343,10 +4342,14 @@ async fn policy_update_rejects_a_cedar_sandbox_before_merging() {
 }
 
 #[tokio::test]
-async fn cedar_discovery_sync_rejects_legacy_gateway_before_policy_mutation() {
+async fn cedar_discovery_sync_surfaces_gateway_rejection_without_preflight() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let gateway = TestOpenShell::default();
+    gateway
+        .state
+        .reject_cedar_policy
+        .store(true, Ordering::SeqCst);
     let service = gateway.clone();
     let server = tokio::spawn(async move {
         Server::builder()
@@ -4379,13 +4382,16 @@ async fn cedar_discovery_sync_rejects_legacy_gateway_before_policy_mutation() {
             .await
             .unwrap_err();
             assert!(
-                error.to_string().contains("Cedar policy support"),
+                error.chain().any(|cause| cause
+                    .to_string()
+                    .contains("this gateway was built without Cedar policy support")),
                 "{error}"
             );
             assert_eq!(
                 gateway.state.policy_update_requests.load(Ordering::SeqCst),
-                0
+                1
             );
+            assert_eq!(gateway.state.health_requests.load(Ordering::SeqCst), 0);
         })
         .await;
     server.abort();

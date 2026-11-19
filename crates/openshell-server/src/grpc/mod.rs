@@ -257,7 +257,6 @@ impl OpenShell for OpenShellService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
-            supported_capabilities: validation::supported_policy_capabilities(),
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
         }))
@@ -1355,23 +1354,6 @@ mod tests {
 
     /// Clients decide whether to offer Cedar from the health response, so it
     /// reports exactly what this build of the gateway accepts.
-    #[tokio::test]
-    async fn health_reports_whether_this_build_supports_cedar() {
-        let service = OpenShellService::new(test_support::test_server_state().await);
-        let health = service
-            .health(Request::new(HealthRequest {}))
-            .await
-            .expect("health succeeds")
-            .into_inner();
-        assert_eq!(
-            openshell_core::extension_protocol::has_capability(
-                &health.supported_capabilities,
-                openshell_core::extension_protocol::POLICY_CEDAR_V1
-            ),
-            cfg!(feature = "experimental")
-        );
-    }
-
     #[test]
     fn public_resource_capabilities_preserves_reported_fields() {
         let driver_capabilities = DriverResourceCapabilities {

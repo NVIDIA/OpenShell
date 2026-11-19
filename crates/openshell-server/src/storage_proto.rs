@@ -162,7 +162,7 @@ mod tests {
     // Cedar endpoint settings add the repeated endpoint_settings field to
     // SandboxPolicy in both closures. Existing rows decode it empty, so stored
     // Cedar policies keep their current behavior.
-    // HealthResponse and GetSandboxConfigRequest negotiate Cedar support with
+    // SupervisorHello and GetSandboxConfigRequest negotiate Cedar support with
     // public-only capability fields; durable schemas remain unchanged.
     // SandboxResponse and UpdateConfigResponse return policy warnings in the
     // new public-only PolicyWarning message; durable schemas remain unchanged.

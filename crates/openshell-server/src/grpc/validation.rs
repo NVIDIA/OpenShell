@@ -1013,25 +1013,10 @@ pub(super) fn validate_object_metadata(
 // Policy validation
 // ---------------------------------------------------------------------------
 
-/// Versioned policy capabilities compiled into this gateway.
-pub(super) fn supported_policy_capabilities() -> Vec<String> {
-    openshell_core::extension_protocol::capabilities_if(
-        openshell_core::extension_protocol::POLICY_CEDAR_V1,
-        cfg!(feature = "experimental"),
-    )
-}
-
-/// Rejects a Cedar policy when this gateway was built without Cedar support.
-///
-/// Keyed to this crate's own feature, so the gateway rejects exactly what its
-/// health response says it cannot handle, whatever features other crates in
-/// the same build enable.
+/// Rejects policies unavailable in this gateway's build, independently of
+/// features unified into dependencies by other workspace members.
 pub(super) fn require_gateway_cedar_support(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    if !openshell_core::extension_protocol::has_capability(
-        &supported_policy_capabilities(),
-        openshell_core::extension_protocol::POLICY_CEDAR_V1,
-    ) && policy.is_cedar()
-    {
+    if !cfg!(feature = "experimental") && policy.is_cedar() {
         return Err(Status::failed_precondition(
             "this gateway was built without Cedar policy support; Cedar policies require a \
              development build of the gateway and supervisor",
