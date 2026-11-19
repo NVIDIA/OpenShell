@@ -185,7 +185,9 @@ bash /etc/openshell/agent-payload/runtime/subagent.sh <subagent-id> < task.md
 
 The shared subagent dispatcher forwards the task to the active harness adapter.
 For Codex, this runs a separate bounded `codex exec` invocation using the same
-model and reasoning defaults as the parent harness.
+model and reasoning defaults as the parent harness. Set
+`OPENSHELL_SUBAGENT_REASONING` (for example `high`) to override the reasoning
+effort for one subagent call; adapters map it to their harness setting.
 
 ## Providers
 

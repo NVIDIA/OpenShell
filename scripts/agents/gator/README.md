@@ -142,9 +142,14 @@ The launcher preserves existing gateway-owned Codex refresh material by default 
 bash scripts/agents/gator/bin/gh_guard_test.sh
 bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
 bash scripts/agents/gator/bin/resolve_gator_review_threads_test.sh
+bash scripts/agents/gator/bin/review_team_test.sh
+bash scripts/agents/gator/replay/replay_test.sh
 bash scripts/agents/runtime/harnesses/codex/exec_test.sh
 bash scripts/agents/run_test.sh
 bash scripts/agents/image_test.sh
 bash scripts/agents/runtime/launch_test.sh
 bash scripts/agents/runtime/supervisor_test.sh
 ```
+
+To measure reviewer changes against past review misses, see
+[`replay/README.md`](replay/README.md).

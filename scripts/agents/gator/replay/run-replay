@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Replay historical pull requests through Gator's reviewer and score how many
+# known defects it finds. Runs on the host with local harness credentials and
+# never writes to GitHub. See README.md.
+
+set -euo pipefail
+
+REPLAY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATOR_DIR="$(cd "$REPLAY_DIR/.." && pwd)"
+AGENTS_DIR="$(cd "$GATOR_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$AGENTS_DIR/../.." && pwd)"
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: run-replay [options]
+
+Options:
+  --case ID            Replay only this case (repeatable).
+  --tag TAG            Replay only cases with this tag (repeatable).
+  --cases FILE         Case file (default: replay/cases.jsonl).
+  --manifest FILE      Agent manifest that defines the reviewer payload
+                       (default: gator/agent.yaml).
+  --expose NAME        Manifest expose_as variable to replay (default: REVIEWER_COMMAND).
+  --team               Replay bin/review-team instead of a single reviewer.
+  --reviewer-command C Run C instead of the manifest reviewer. It runs in the case
+                       directory with task.md there and must write
+                       review-findings.raw.json. $REPLAY_PAYLOAD is the staged payload.
+  --judge-command C    Judge command; called as `C PROMPT OUTPUT SCHEMA`.
+  --label LABEL        Name for this run (default: reviewer id).
+  --out DIR            Run directory (default: $TMPDIR/gator-replay/<time>-<label>).
+  --jobs N             Cases to run in parallel (default: 3).
+  --timeout SECONDS    Per-case reviewer timeout (default: 2700).
+  --list               List cases and exit.
+  --rejudge DIR        Grade the reviews in an existing run directory again
+                       (with the current judge), then rescore it.
+
+Environment:
+  GATOR_REPLAY_CACHE   Bare git cache for replayed commits
+                       (default: ~/.cache/openshell-gator-replay/repo.git).
+  GATOR_REPLAY_REMOTE  Remote for commits missing from the cache
+                       (default: https://github.com/NVIDIA/OpenShell.git).
+  CODEX_MODEL, CODEX_REASONING
+                       Reviewer model; defaults come from the manifest harness.
+  GATOR_REPLAY_JUDGE_MODEL
+                       Judge model for the default Codex judge
+                       (default: the manifest harness model).
+EOF
+    exit 2
+}
+
+cases_file="$REPLAY_DIR/cases.jsonl"
+manifest="$GATOR_DIR/agent.yaml"
+expose="REVIEWER_COMMAND"
+reviewer_command=""
+judge_command=""
+label=""
+out=""
+jobs=3
+timeout=2700
+list=0
+team=0
+rejudge=""
+case_ids=()
+tags=()
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --case) case_ids+=("${2:?}"); shift 2 ;;
+        --tag) tags+=("${2:?}"); shift 2 ;;
+        --cases) cases_file="${2:?}"; shift 2 ;;
+        --manifest) manifest="${2:?}"; shift 2 ;;
+        --expose) expose="${2:?}"; shift 2 ;;
+        --reviewer-command) reviewer_command="${2:?}"; shift 2 ;;
+        --judge-command) judge_command="${2:?}"; shift 2 ;;
+        --label) label="${2:?}"; shift 2 ;;
+        --out) out="${2:?}"; shift 2 ;;
+        --jobs) jobs="${2:?}"; shift 2 ;;
+        --timeout) timeout="${2:?}"; shift 2 ;;
+        --list) list=1; shift ;;
+        --team) team=1; shift ;;
+        --rejudge) rejudge="${2:?}"; shift 2 ;;
+        -h|--help) usage ;;
+        *) echo "unknown option: $1" >&2; usage ;;
+    esac
+done
+
+[[ -r "$cases_file" ]] || { echo "missing case file: $cases_file" >&2; exit 2; }
+[[ "$jobs" =~ ^[1-9][0-9]*$ && "$timeout" =~ ^[1-9][0-9]*$ ]] || usage
+
+select_filter='
+    (($ids | length) == 0 or (.id as $id | $ids | index($id))) and
+    (($tags | length) == 0 or (.tags as $t | $tags | any(. as $x | $t | index($x))))
+'
+selected="$(jq -r \
+    --argjson ids "$(printf '%s\n' "${case_ids[@]+"${case_ids[@]}"}" | jq -R 'select(. != "")' | jq -s .)" \
+    --argjson tags "$(printf '%s\n' "${tags[@]+"${tags[@]}"}" | jq -R 'select(. != "")' | jq -s .)" \
+    "select($select_filter) | .id" "$cases_file")"
+[[ -n "$selected" ]] || { echo "no cases selected" >&2; exit 2; }
+
+if (( list )); then
+    jq -r --arg ids "$selected" \
+        'select(.id as $id | $ids | split("\n") | index($id)) |
+         "\(.id)\t\(.kind)\t\(.tags | join(","))\t#\(.pr) \(.title)"' "$cases_file"
+    exit 0
+fi
+
+# Stage the payload the way run.sh does: runtime plus manifest uploads.
+manifest_dir="$(cd "$(dirname "$manifest")" && pwd)"
+manifest_json="$(ruby -ryaml -rjson -e 'puts JSON.generate(YAML.safe_load(File.read(ARGV[0])))' "$manifest")"
+[[ -n "$label" || "$team" -eq 0 ]] || label="review-team"
+[[ -n "$label" ]] || label="$(jq -r --arg e "$expose" \
+    '[.subagents[]? | select(.expose_as == $e) | .id][0] // "custom"' <<<"$manifest_json")"
+[[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid label: $label" >&2; exit 2; }
+if [[ -n "$rejudge" ]]; then
+    [[ -f "$rejudge/run.json" ]] || { echo "not a replay run: $rejudge" >&2; exit 2; }
+    out="$rejudge/.rejudge"
+fi
+[[ -n "$out" ]] || out="${TMPDIR:-/tmp}/gator-replay/$(date +%Y%m%dT%H%M%S)-$label"
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+
+payload="$out/payload"
+rm -rf "$payload"
+mkdir -p "$payload"
+cp -R "$AGENTS_DIR/runtime" "$payload/runtime"
+resolve_manifest_path() {
+    case "$1" in
+        repo://*) printf '%s/%s' "$ROOT_DIR" "${1#repo://}" ;;
+        agent://*) printf '%s/%s' "$manifest_dir" "${1#agent://}" ;;
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$manifest_dir" "$1" ;;
+    esac
+}
+while IFS=$'\t' read -r source destination; do
+    src="$(resolve_manifest_path "$source")"
+    [[ -f "$src" ]] || { echo "missing payload source: $src" >&2; exit 1; }
+    mkdir -p "$(dirname "$payload/$destination")"
+    cp "$src" "$payload/$destination"
+done < <(jq -r '(.skills // []) + (.subagents // []) + (.resources // []) | .[] | "\(.source)\t\(.destination)"' <<<"$manifest_json")
+
+harness="$(jq -r '.harness.default // "codex"' <<<"$manifest_json")"
+model="${CODEX_MODEL:-$(jq -r --arg h "$harness" '.harness.supported[$h].model // empty' <<<"$manifest_json")}"
+reasoning="${CODEX_REASONING:-$(jq -r --arg h "$harness" '.harness.supported[$h].reasoning // empty' <<<"$manifest_json")}"
+
+if [[ -z "$reviewer_command" && "$team" -eq 1 ]]; then
+    reviewer_command='REVIEW_TEAM_WORKDIR="$PWD/team" OPENSHELL_AGENT_PAYLOAD_DIR="$REPLAY_PAYLOAD" review-team --task task.md --ledger ledger.json --diff pr.diff --out review-findings.raw.json'
+fi
+if [[ -z "$reviewer_command" ]]; then
+    reviewer_id="$(jq -r --arg e "$expose" '[.subagents[]? | select(.expose_as == $e) | .id][0] // empty' <<<"$manifest_json")"
+    [[ -n "$reviewer_id" ]] || { echo "no subagent exposes $expose in $manifest" >&2; exit 2; }
+    reviewer_command="bash $(printf '%q' "$payload/runtime/subagent.sh") $(printf '%q' "$reviewer_id") < task.md"
+fi
+if [[ -z "$judge_command" ]]; then
+    judge_command='codex exec --skip-git-repo-check --ephemeral --sandbox read-only'
+    judge_model="${GATOR_REPLAY_JUDGE_MODEL:-$model}"
+    if [[ -n "$judge_model" ]]; then
+        judge_command+=" -c $(printf '%q' "model=\"$judge_model\"")"
+    fi
+    judge_command+=' --output-schema "$3" -o "$2" - < "$1"'
+fi
+
+# Tools the reviewer may call. gh is stubbed so a replay can never touch GitHub.
+bin="$out/bin"
+mkdir -p "$bin"
+ln -sf "$GATOR_DIR/bin/validate-review-findings" "$bin/validate-review-findings"
+ln -sf "$GATOR_DIR/bin/review-feedback-ledger" "$bin/review-feedback-ledger"
+ln -sf "$GATOR_DIR/bin/review-team" "$bin/review-team"
+printf '#!/bin/sh\necho "gh is disabled during Gator replay" >&2\nexit 1\n' > "$bin/gh"
+chmod +x "$bin/gh"
+
+cache="${GATOR_REPLAY_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/openshell-gator-replay/repo.git}"
+remote="${GATOR_REPLAY_REMOTE:-https://github.com/NVIDIA/OpenShell.git}"
+if [[ ! -d "$cache" ]]; then
+    mkdir -p "$(dirname "$cache")"
+    git clone -q --bare "$ROOT_DIR" "$cache"
+fi
+cache="$(cd "$cache" && pwd)"
+missing=()
+while read -r sha; do
+    git -C "$cache" cat-file -e "$sha^{commit}" 2>/dev/null || missing+=("$sha")
+done < <(jq -r --arg ids "$selected" \
+    'select(.id as $id | $ids | split("\n") | index($id)) | .base_sha, .head_sha' "$cases_file" | sort -u)
+if (( ${#missing[@]} )); then
+    echo "fetching ${#missing[@]} commits from $remote" >&2
+    git -C "$cache" fetch -q --no-tags "$remote" "${missing[@]}"
+fi
+
+jq -n \
+    --arg label "$label" --arg manifest "$manifest" --arg expose "$expose" \
+    --arg reviewer_command "$reviewer_command" --arg harness "$harness" \
+    --arg judge_command "$judge_command" \
+    --arg model "$model" --arg reasoning "$reasoning" \
+    --arg gator_rev "$(git -C "$GATOR_DIR" rev-parse HEAD 2>/dev/null || echo unknown)" \
+    --arg dirty "$(git -C "$GATOR_DIR" status --porcelain -- . 2>/dev/null | wc -l | tr -d ' ')" \
+    --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg cases "$selected" '{
+        label: $label, manifest: $manifest, expose: $expose,
+        reviewer_command: $reviewer_command, harness: $harness,
+        model: $model, reasoning: $reasoning,
+        gator_rev: $gator_rev, gator_dirty_files: ($dirty | tonumber),
+        judge_command: $judge_command,
+        started: $started, cases: ($cases | split("\n"))
+    }' > "$out/run.json"
+
+# Isolate Codex from the operator's skills, rules, and config, as in the
+# sandbox. Only the login is shared.
+if [[ "$harness" == codex ]]; then
+    codex_home="$out/codex-home"
+    mkdir -p "$codex_home"
+    src_home="${CODEX_HOME:-$HOME/.codex}"
+    [[ -r "$src_home/auth.json" ]] || { echo "missing Codex login: $src_home/auth.json" >&2; exit 1; }
+    ln -sf "$src_home/auth.json" "$codex_home/auth.json"
+    export CODEX_HOME="$codex_home"
+fi
+
+echo "replay run: $out" >&2
+export REPLAY_RUN_DIR="$out" REPLAY_CASES="$(cd "$(dirname "$cases_file")" && pwd)/$(basename "$cases_file")"
+export REPLAY_CACHE="$cache" REPLAY_BIN="$bin" REPLAY_PAYLOAD="$payload"
+export REPLAY_REVIEWER_COMMAND="$reviewer_command" REPLAY_JUDGE_COMMAND="$judge_command"
+export REPLAY_TIMEOUT_SECONDS="$timeout" OPENSHELL_AGENT_HARNESS="$harness"
+[[ -z "$model" ]] || export CODEX_MODEL="$model"
+[[ -z "$reasoning" ]] || export CODEX_REASONING="$reasoning"
+
+if [[ -n "$rejudge" ]]; then
+    REPLAY_RUN_DIR="$(cd "$rejudge" && pwd)"
+    export REPLAY_RUN_DIR REPLAY_REJUDGE=1
+    jq --arg judge "$judge_command" '.judge_command = $judge' "$REPLAY_RUN_DIR/run.json" > "$REPLAY_RUN_DIR/run.json.tmp"
+    mv "$REPLAY_RUN_DIR/run.json.tmp" "$REPLAY_RUN_DIR/run.json"
+    jq -r '.cases[]' "$REPLAY_RUN_DIR/run.json" | xargs -P "$jobs" -n 1 "$REPLAY_DIR/run-case"
+    "$REPLAY_DIR/score" "$REPLAY_RUN_DIR"
+    rm -rf "$out"
+    exit 0
+fi
+printf '%s\n' "$selected" | xargs -P "$jobs" -n 1 "$REPLAY_DIR/run-case"
+"$REPLAY_DIR/score" "$out"

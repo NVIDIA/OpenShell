@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build the reviewer task.md for one replay case, following the reviewer task
+# requirements in skills/gator-gate/SKILL.md (Step 8). Replays always use
+# initial review mode against an empty feedback ledger.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: build-task CASE.json REPO_DIR OUT_DIR" >&2
+    exit 2
+}
+
+[[ "$#" -eq 3 && -r "$1" && -d "$2" && -d "$3" ]] || usage
+
+CASE_FILE="$1"
+REPO_DIR="$2"
+OUT_DIR="$3"
+GATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SKILL="$GATOR_DIR/skills/gator-gate/SKILL.md"
+SCHEMA="$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"
+LEDGER="$GATOR_DIR/bin/review-feedback-ledger"
+# Inline the diff up to this size; larger diffs are left in pr.diff for the
+# reviewer to read in chunks, as Gator does for large pull requests.
+INLINE_DIFF_LIMIT="${GATOR_REPLAY_INLINE_DIFF_BYTES:-200000}"
+
+field() { jq -r "$1" "$CASE_FILE"; }
+
+pr="$(field .pr)"
+base_sha="$(field .base_sha)"
+head_sha="$(field .head_sha)"
+
+git -C "$REPO_DIR" diff --no-ext-diff --no-color "$base_sha" "$head_sha" > "$OUT_DIR/pr.diff"
+diff_bytes="$(wc -c < "$OUT_DIR/pr.diff" | tr -d ' ')"
+
+jq -n --arg head "$head_sha" --arg base "$base_sha" '{
+    thread_pages: [{data: {repository: {pullRequest: {
+        author: {login: "replay-author"},
+        headRefOid: $head,
+        baseRefOid: $base,
+        reviewThreads: {nodes: [], pageInfo: {hasNextPage: false, endCursor: null}}
+    }}}}],
+    review_pages: [[]],
+    issue_comment_pages: [[]],
+    current_tree: {head_sha: $head, base_sha: $base, merge_base_sha: $base, patch_id: null}
+}' > "$OUT_DIR/raw-ledger-input.json"
+"$LEDGER" --input "$OUT_DIR/raw-ledger-input.json" > "$OUT_DIR/ledger.json"
+
+calibration="$(awk '
+    /^### Pragmatic review calibration/ { on = 1 }
+    on && /^### / && !/Pragmatic review calibration/ { exit }
+    on { print }
+' "$SKILL")"
+[[ -n "$calibration" ]] || {
+    echo "build-task: calibration section not found in $SKILL" >&2
+    exit 1
+}
+
+{
+    cat <<EOF
+# Gator review task
+
+Review mode: \`initial\`
+Repository: NVIDIA/OpenShell
+Pull request: #$pr
+Base SHA: $base_sha
+Head SHA: $head_sha
+
+The repository checkout at \`repo/\` in the current working directory is at the
+head SHA. Read any file there for context. Do not run tests, and do not use the
+network or \`gh\`.
+
+## Pull request
+
+Title: $(field .title)
+
+$(field .body)
+
+## Changed files
+
+\`\`\`text
+$(git -C "$REPO_DIR" diff --stat=200 "$base_sha" "$head_sha")
+\`\`\`
+
+## Review feedback ledger
+
+\`\`\`json
+$(cat "$OUT_DIR/ledger.json")
+\`\`\`
+
+## Instructions
+
+- Review every change in the diff. Focus on correctness, regressions,
+  security, maintainability, and missing tests.
+- Check whether direct UX changes update the Fern docs under \`docs/\` and
+  navigation when needed.
+- Apply the pragmatic review calibration below.
+- Classify each finding as blocking Critical, blocking Warning, or
+  non-blocking Suggestion.
+- Assign each new blocker a stable \`GATOR-${head_sha:0:8}-<NN>\` finding ID.
+- Group semantically equivalent examples under one invariant.
+- For each blocker, return the complete evidence contract described below,
+  including the exact repository path and current-head line.
+- Do not rely on local test execution.
+
+$calibration
+
+## Output contract
+
+$(cat "$SCHEMA")
+
+Write only the JSON envelope, with \`review_mode\` \`initial\` and
+\`reviewed_head_sha\` \`$head_sha\`, to \`review-findings.raw.json\` in the
+current working directory.
+
+## Diff
+
+EOF
+    if (( diff_bytes <= INLINE_DIFF_LIMIT )); then
+        printf '```diff\n'
+        cat "$OUT_DIR/pr.diff"
+        printf '```\n'
+    else
+        printf 'The diff is %s bytes, too large to inline. Read it from `pr.diff` in\n' "$diff_bytes"
+        printf 'the current working directory, in chunks if needed, and review every file.\n'
+    fi
+} > "$OUT_DIR/task.md"

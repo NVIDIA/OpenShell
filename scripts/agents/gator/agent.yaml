@@ -84,11 +84,35 @@ resources:
   - id: gator-review-findings-schema
     source: agent://skills/gator-gate/references/review-findings-schema.md
     destination: skills/gator-gate/references/review-findings-schema.md
+  - id: gator-review-team-config
+    source: agent://skills/gator-gate/references/review-team.json
+    destination: skills/gator-gate/references/review-team.json
+  - id: gator-review-team-member-rules
+    source: agent://skills/gator-gate/references/review-team-member.md
+    destination: skills/gator-gate/references/review-team-member.md
+  - id: gator-networking-checklist
+    source: agent://skills/gator-gate/references/networking-checklist.md
+    destination: skills/gator-gate/references/networking-checklist.md
 
 subagents:
   - id: principal-engineer-reviewer
     source: repo://.claude/agents/principal-engineer-reviewer.md
     destination: subagents/principal-engineer-reviewer.md
     expose_as: REVIEWER_COMMAND
+  - id: review-correctness
+    source: agent://subagents/review-correctness.md
+    destination: subagents/review-correctness.md
+  - id: review-security
+    source: agent://subagents/review-security.md
+    destination: subagents/review-security.md
+  - id: review-contracts
+    source: agent://subagents/review-contracts.md
+    destination: subagents/review-contracts.md
+  - id: review-networking
+    source: agent://subagents/review-networking.md
+    destination: subagents/review-networking.md
+  - id: review-merge
+    source: agent://subagents/review-merge.md
+    destination: subagents/review-merge.md
 
 prompt_template: prompts/gator.md
