@@ -37,7 +37,6 @@ bytes = { workspace = true }
 hex = "0.4"
 ipnet = "2"
 rand = "0.10"
-sha2 = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

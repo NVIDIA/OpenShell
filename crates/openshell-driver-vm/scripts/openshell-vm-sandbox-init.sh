@@ -258,6 +258,10 @@ setup_overlay_root() {
         fi
     fi
 
+    # The host makes upper under the gateway's umask and uid, and it becomes /.
+    chown 0:0 /overlay/upper
+    chmod 0755 /overlay/upper
+
     mount -t overlay overlay \
         -o lowerdir="$lower_root",upperdir=/overlay/upper,workdir=/overlay/work \
         /newroot

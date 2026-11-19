@@ -4,6 +4,7 @@
 //! Fixtures for tests that assert on gateway audit events.
 
 use super::{ConnectionSource, RequestOrigin};
+use crate::auth::principal::Principal;
 use openshell_ocsf::test_support::OcsfCapture;
 use serde_json::Value;
 use std::future::Future;
@@ -38,6 +39,69 @@ pub async fn audited<F: Future>(path: &str, handler: F) -> (F::Output, Vec<Value
         super::with_request(path.to_string(), origin(), handler).await
     };
     (output, capture.json_events())
+}
+
+/// Run a gateway service `call` as a routed request to `path` by
+/// `principal`, returning its result and the mutation records it produced.
+pub async fn audited_mutation<T, F>(
+    path: &str,
+    principal: &Principal,
+    call: F,
+) -> (Result<tonic::Response<T>, tonic::Status>, Vec<Value>)
+where
+    F: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    let capture = OcsfCapture::default();
+    let mut result = None;
+    {
+        let _guard = capture.install();
+        let routed = async {
+            let output = call.await;
+            let response = match &output {
+                Ok(response) => {
+                    let mut http = http::Response::new(tonic::body::Body::empty());
+                    *http.headers_mut() = response.metadata().clone().into_headers();
+                    http
+                }
+                Err(status) => status.clone().into_http(),
+            };
+            result = Some(output);
+            Ok::<_, std::convert::Infallible>(response)
+        };
+        let _ = super::with_audited_request(path.to_string(), origin(), principal, routed).await;
+    }
+    let events = capture
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 6003)
+        .collect();
+    (result.expect("call completed"), events)
+}
+
+/// Start a gateway service `call` as a routed request to `path` by
+/// `principal`, drop it before it finishes, and return the mutation records
+/// it produced.
+pub async fn cancelled_mutation<T, F>(path: &str, principal: &Principal, call: F) -> Vec<Value>
+where
+    F: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    let capture = OcsfCapture::default();
+    {
+        let _guard = capture.install();
+        let routed = async {
+            let _ = call.await;
+            Ok::<_, std::convert::Infallible>(http::Response::new(tonic::body::Body::empty()))
+        };
+        let routed = super::with_audited_request(path.to_string(), origin(), principal, routed);
+        tokio::time::timeout(std::time::Duration::from_millis(10), routed)
+            .await
+            .expect_err("call finished");
+    }
+    capture
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 6003)
+        .collect()
 }
 
 /// Assert that `event` records the request from [`origin`].

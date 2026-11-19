@@ -3,15 +3,18 @@
 
 //! Backend-neutral crypto operations and library-specific protocol adapters.
 //!
-//! AWS-LC is the only production implementation in this first stage. This crate
+//! AWS-LC is the default; an opt-in system-OpenSSL backend supports explicit selection. This crate
 //! does not enable FIPS mode, change algorithms, or attest dependency-owned crypto.
-//! The extension target is a system-OpenSSL backend for regulated deployments
-//! (<https://github.com/NVIDIA/OpenShell/issues/900>). See the crate README for
+//! See the crate README for
 //! initialization, key ownership, and dependency coverage boundaries.
 
 pub mod aead;
 #[cfg(feature = "aws-lc")]
 mod aws_lc;
+#[cfg(feature = "openssl")]
+mod openssl_backend;
+#[cfg(feature = "openssl")]
+pub use openssl_backend::OpenSsl;
 pub mod jwt;
 pub mod pki;
 pub mod tls;
@@ -46,6 +49,10 @@ pub enum FipsState {
 }
 
 /// Operations implemented by a backend. Protocol coverage is documented separately.
+///
+/// These lists describe each backend individually, not a common set required of
+/// every backend. Host provider policy can still reject a listed operation;
+/// capabilities do not guarantee runtime availability or FIPS compliance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     /// Stable backend identifier.
@@ -56,7 +63,8 @@ pub struct Capabilities {
     pub fips: FipsState,
     /// Primitive operations supported by this implementation.
     pub primitives: &'static [&'static str],
-    /// Key generation algorithms available through the PKI adapter.
+    /// Key algorithms implemented by this backend's PKI and JWT adapters.
+    /// Listing an algorithm does not imply support for every operation or variant.
     pub key_algorithms: &'static [&'static str],
 }
 

@@ -685,9 +685,12 @@ async fn stale_resume_compensation_cannot_clear_a_newer_operation_intent() {
     let driver = ControlledDriver::new();
     let runtime = suspend_capable_runtime(driver.clone()).await;
     let mut sandbox = sandbox_record("sb-resume-owner", "resume-owner", SandboxPhase::Starting);
-    sandbox.status.as_mut().unwrap().provisioning = Some(
-        provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1800),
-    );
+    sandbox.status.as_mut().unwrap().provisioning =
+        Some(provisioning_deadline::new_preparation_record(
+            openshell_core::time::now_ms(),
+            1800,
+            300_000,
+        ));
     let generation = sandbox_runtime_generation(&sandbox).unwrap();
     write_start_intent(
         &mut sandbox.metadata.as_mut().unwrap().annotations,

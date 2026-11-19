@@ -121,7 +121,9 @@ impl SandboxCa {
             .wrap_err("parse proxy CA private key")?
             .ok_or_else(|| miette!("proxy CA private key file contains no private key"))?;
         let ca_der = certificates[0].clone();
-        openshell_crypto::tls::server_builder()
+        openshell_crypto::tls::try_server_builder()
+            .into_diagnostic()
+            .wrap_err("configure proxy CA TLS validation")?
             .with_no_client_auth()
             .with_single_cert(certificates, private_key)
             .into_diagnostic()
@@ -221,7 +223,9 @@ impl ProxyTlsState {
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
     fn acceptor_for(&self, hostname: &str) -> Result<TlsAcceptor> {
         let leaf = self.cert_cache.get_or_generate(hostname)?;
-        let mut server_config = openshell_crypto::tls::server_builder()
+        let mut server_config = openshell_crypto::tls::try_server_builder()
+            .into_diagnostic()
+            .wrap_err("configure proxy TLS server")?
             .with_no_client_auth()
             .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
             .into_diagnostic()?;
@@ -278,7 +282,9 @@ pub async fn tls_connect_upstream(
 /// `system_ca_bundle` is ignored because the native store already reflects all
 /// operator-installed trust anchors.
 pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
-    let mut config = openshell_crypto::tls::client_builder()
+    let mut config = openshell_crypto::tls::try_client_builder()
+        .into_diagnostic()
+        .wrap_err("configure upstream TLS client")?
         .with_root_certificates(build_upstream_root_store(system_ca_bundle)?)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -614,7 +620,9 @@ mod tests {
         // policy-allowed, private-CA-signed destination. ---
         let addr = serve_one(acceptor.clone()).await;
         let client_without = build_upstream_client_config("").unwrap();
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let result = tls_connect_upstream(tcp, hostname, &client_without).await;
         assert!(
             result.is_err(),
@@ -627,7 +635,9 @@ mod tests {
         // fix. ---
         let addr = serve_one(acceptor).await;
         let client_with = build_upstream_client_config(&private_ca_pem).unwrap();
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let result = tls_connect_upstream(tcp, hostname, &client_with).await;
         assert!(
             result.is_ok(),

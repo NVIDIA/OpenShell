@@ -11,8 +11,7 @@ The `google-cloud` provider gives sandboxes native GCP credentials so
 any Google Cloud SDK works out of the box — Cloud Storage, BigQuery, Drive,
 Maps, Discovery Engine, or any other GCP API. A GCE metadata server emulator
 on loopback provides credential placeholders that the
-sandbox proxy resolves to real tokens at request time. The sandbox process
-never holds a real GCP credential.
+sandbox proxy resolves to real tokens at request time.
 
 ## Quick Start
 
@@ -131,7 +130,7 @@ When a sandbox starts with the `google-cloud` provider attached:
 2. The sandbox relays HTTP requests to the reserved `127.0.0.1:8174`
    metadata endpoint over its authenticated supervisor connection. The
    supervisor emulates the GCE instance metadata API and serves credential
-   placeholders to GCP SDKs. Real access tokens remain in the supervisor.
+   placeholders to GCP SDKs. The emulator does not return real access tokens.
 3. When the SDK makes an API call, it sends the placeholder in the
    `Authorization` header. The sandbox proxy TLS-terminates the
    outbound connection, resolves the placeholder to the real token,
@@ -143,8 +142,11 @@ When a sandbox starts with the `google-cloud` provider attached:
 Configuration values (`project_id`, `region`, `service_account_email`)
 are **visible in plain text** inside the sandbox — they appear as
 environment variables and are served by the metadata endpoint. These are
-non-secret identifiers, not credentials. Access tokens are never exposed;
-only placeholders reach the sandbox process.
+non-secret identifiers, not credentials. The metadata endpoint returns
+placeholders in place of access tokens. Credential injection does not
+automatically scrub tokens from upstream responses. See
+[How Credential Injection Works](/how-it-works/providers/overview#how-credential-injection-works)
+for credential delivery and response-handling limits.
 
 The emulator supports Linux sandboxes using the Docker, Podman, Kubernetes,
 and VM runtimes. Windows/MXC does not provide this metadata endpoint. SDKs must

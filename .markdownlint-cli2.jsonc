@@ -18,6 +18,7 @@
     "plans/**",
     "architecture/plans/**",
     "**/node_modules/**",
+    "deploy/openshell-mixin/vendor/**",
     "target/**",
     ".pytest_cache/**",
     "THIRD-PARTY-NOTICES/**",

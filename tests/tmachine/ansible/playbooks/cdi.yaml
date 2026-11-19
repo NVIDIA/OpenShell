@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Prepare hardware-free CDI fixtures in supported environments
+  hosts: all
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+  roles:
+    - cdi_fixtures
+  tasks:
+    - name: Publish CDI test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: cdi
+        test_env_vars:
+          OPENSHELL_TEST_CDI_SCENARIOS: "{{ cdi_fixture_root }}/scenarios.json"

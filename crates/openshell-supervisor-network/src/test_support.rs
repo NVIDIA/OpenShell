@@ -1,7 +1,46 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Executable identity and socket-owner subprocess fixtures.
+//! Credential, identity, socket-owner and request-tracing fixtures.
+
+pub mod request_tracing;
+
+pub fn response_request_id(response: &[u8]) -> &str {
+    let end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("complete response headers");
+    std::str::from_utf8(&response[..end])
+        .expect("ASCII response headers")
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("x-openshell-request-id")
+                .then(|| value.trim())
+        })
+        .expect("response carries a request receipt")
+}
+
+pub fn header_placement_metadata(
+    keys: &[&str],
+) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
+    keys.iter()
+        .map(|key| {
+            (
+                format!(
+                    "{}{key}",
+                    openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX
+                ),
+                openshell_core::proto::ProviderProfileCredential {
+                    env_vars: vec![(*key).to_string()],
+                    auth_style: "bearer".to_string(),
+                    header_name: "Authorization".to_string(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
 
 #[cfg(target_os = "linux")]
 use std::net::TcpStream;

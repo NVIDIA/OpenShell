@@ -51,6 +51,29 @@ TLS.
 :   Port for Prometheus metrics (/metrics). Set to 0 to disable.
     Default: **0**. Environment: **OPENSHELL_METRICS_PORT**.
 
+**--metrics-tls-cert** *PATH*
+:   Path to the TLS certificate served by the metrics listener. Pair with
+    **--metrics-tls-key** and enable a metrics port.
+    Environment: **OPENSHELL_METRICS_TLS_CERT**.
+
+**--metrics-tls-key** *PATH*
+:   Path to the TLS private key served by the metrics listener. Pair with
+    **--metrics-tls-cert** and enable a metrics port.
+    Environment: **OPENSHELL_METRICS_TLS_KEY**.
+
+**--metrics-tls-client-ca** *PATH*
+:   Path to the CA certificate used to verify metrics scraper client
+    certificates. Use a CA distinct from the gateway client CA.
+    Environment: **OPENSHELL_METRICS_TLS_CLIENT_CA**.
+
+**--metrics-require-client-auth**[=*BOOL*]
+:   Require metrics clients to present a certificate trusted by
+    **--metrics-tls-client-ca**. Defaults to **false**. When enabled, a
+    metrics client CA is required. Pass the flag alone for **true**, or a
+    value with an equals sign, as in
+    **--metrics-require-client-auth=false**.
+    Environment: **OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH**.
+
 **--log-level** *LEVEL*
 :   Log level: trace, debug, info, warn, error. Default: **info**.
     Environment: **OPENSHELL_LOG_LEVEL**.
@@ -63,10 +86,12 @@ TLS.
 **--db-max-connections** *N*
 :   Connection ceiling for the database pool, shared by every
     database-backed request. Must be at least 1, and at least 2 with
-    Postgres, because the SSH identity lock keeps one connection while it
-    queries the pool. When unset, the gateway uses the backend default:
-    **10** for Postgres, **5** for on-disk SQLite. An in-memory SQLite
-    database is always one connection.
+    Postgres: an SSH identity or provider-refresh lock holder keeps one
+    data connection for its lock and queries the pool on another, and the
+    gateway caps those holders at half of `database_max_connections` per
+    replica. When unset, the gateway uses
+    the backend default: **10** for Postgres, **5** for on-disk SQLite. An
+    in-memory SQLite database is always one connection.
     TOML key: `database_max_connections`.
     Environment: **OPENSHELL_DB_MAX_CONNECTIONS**.
 

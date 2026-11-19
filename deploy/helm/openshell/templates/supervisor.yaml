@@ -9,6 +9,17 @@
 # SPDX-License-Identifier: Apache-2.0
 {{- $shared := get $kubernetes "shared_supervisor" }}
 {{- $name := include "openshell.supervisorName" . }}
+{{- $app := include "openshell.appListenerConfig" . | fromYaml }}
+{{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml }}
+{{- $appPort := get $app "port" | default 8443 }}
+{{- $listenHost := include "openshell.listenHost" .Values.supervisor.listenAddress }}
+{{- if get $app "enabled" }}
+{{- $_ := required "supervisor app listener requires domain" (get $app "domain") }}
+{{- $_ := required "supervisor app listener requires tls_secret_name" (get $appDeployment "tls_secret_name") }}
+{{- if or (lt (int $appPort) 1024) (gt (int $appPort) 65535) (eq (int $appPort) 5501) (eq (int $appPort) (int (get $shared "runtime_port"))) }}
+{{- fail "supervisor app listener port must be in 1024..65535 and distinct from runtime and health ports" }}
+{{- end }}
+{{- end }}
 {{- $endpoint := get $kubernetes "grpc_endpoint" }}
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
@@ -78,14 +89,26 @@ spec:
             - --gateway-endpoint
             - {{ $endpoint | quote }}
             - --address
-            - 0.0.0.0:5501
+            - {{ printf "%s:5501" $listenHost | quote }}
             - --token-file
             - /etc/openshell/supervisor-token/token
             - --runtime-listen
-            - 0.0.0.0:{{ get $shared "runtime_port" }}
+            - {{ printf "%s:%v" $listenHost (get $shared "runtime_port") | quote }}
             - --session-root
             - /run/openshell/sessions
           env:
+            {{- if get $app "enabled" }}
+            - name: OPENSHELL_APP_LISTENER_ENABLED
+              value: "true"
+            - name: OPENSHELL_APP_LISTEN_ADDRESS
+              value: {{ printf "%s:%v" $listenHost $appPort | quote }}
+            - name: OPENSHELL_APP_SERVICE_DOMAIN
+              value: {{ get $app "domain" | quote }}
+            - name: OPENSHELL_APP_TLS_CERT
+              value: /etc/openshell/app-tls/tls.crt
+            - name: OPENSHELL_APP_TLS_KEY
+              value: /etc/openshell/app-tls/tls.key
+            {{- end }}
             - name: OPENSHELL_ENDPOINT
               value: {{ $endpoint | quote }}
             - name: OPENSHELL_LOG_LEVEL
@@ -110,6 +133,11 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
           ports:
+            {{- if get $app "enabled" }}
+            - name: app
+              containerPort: {{ $appPort }}
+              protocol: TCP
+            {{- end }}
             - name: runtime
               containerPort: {{ get $shared "runtime_port" }}
               protocol: TCP
@@ -137,6 +165,11 @@ spec:
             tcpSocket:
               port: health
           volumeMounts:
+            {{- if get $app "enabled" }}
+            - name: app-tls
+              mountPath: /etc/openshell/app-tls
+              readOnly: true
+            {{- end }}
             - name: run
               mountPath: /run/openshell
             - name: logs
@@ -150,6 +183,11 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if get $app "enabled" }}
+        - name: app-tls
+          secret:
+            secretName: {{ get $appDeployment "tls_secret_name" | quote }}
+        {{- end }}
         - name: run
           emptyDir: {}
         - name: logs

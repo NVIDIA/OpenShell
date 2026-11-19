@@ -3,6 +3,12 @@
 
 //! Shared OTLP collector fixture for `OpenShell` tracing tests.
 
+mod http;
+mod tls;
+
+pub use http::{HttpExport, OtlpHttpTestServer};
+pub use tls::{PemIdentity, ServerTls, TestPki};
+
 /// Helpers for tests that exercise the supervisor's agent trace relay from
 /// the agent side: the attribution keys the relay sets and a builder for the
 /// protobuf export request an SDK would send.
@@ -68,6 +74,10 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
 };
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    metrics_service_server::{MetricsService, MetricsServiceServer},
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
     trace_service_server::{TraceService, TraceServiceServer},
@@ -104,6 +114,7 @@ pub async fn assert_compute_driver_tracing(
     let collector = OtlpTestServer::start().await;
     let (provider, error) = descriptor.provider_for(
         Some(collector.endpoint()),
+        &openshell_otel::CollectorTransport::default(),
         service_version,
         Some("test-gateway"),
         Some(descriptor.compute_driver()),
@@ -134,9 +145,15 @@ pub async fn assert_compute_driver_tracing(
 
 #[derive(Clone, Debug, Default)]
 pub struct ReceivedTraces {
+    /// Raw metric export requests, including resources and aggregation data.
+    pub metric_exports: Vec<ExportMetricsServiceRequest>,
+    /// `authorization` metadata of each metric export request.
+    pub metric_authorizations: Vec<String>,
     pub spans: Vec<Span>,
     /// String bodies of exported log records.
     pub log_bodies: Vec<String>,
+    /// `authorization` metadata of each trace export request.
+    pub trace_authorizations: Vec<String>,
     /// `authorization` metadata of each log export request.
     pub log_authorizations: Vec<String>,
     pub service_names: Vec<String>,
@@ -211,6 +228,15 @@ impl TraceService for Collector {
             {
                 received.encodings.push(encoding.to_string());
             }
+            if let Some(authorization) = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+            {
+                received
+                    .trace_authorizations
+                    .push(authorization.to_string());
+            }
             for resource_span in request.into_inner().resource_spans {
                 let attributes = received.record_resource(resource_span.resource);
                 for scope_span in resource_span.scope_spans {
@@ -263,6 +289,38 @@ impl LogsService for Collector {
     }
 }
 
+#[tonic::async_trait]
+impl MetricsService for Collector {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+        {
+            let mut received = self
+                .received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(authorization) = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+            {
+                received
+                    .metric_authorizations
+                    .push(authorization.to_string());
+            }
+            let request = request.into_inner();
+            for metrics in &request.resource_metrics {
+                let attributes = received.record_resource(metrics.resource.clone());
+                received.resource_attributes.push(attributes);
+            }
+            received.metric_exports.push(request);
+        }
+        self.exported.notify_one();
+        Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
+    }
+}
+
 /// Loopback OTLP/gRPC server that captures exported spans, logs, and resources.
 pub struct OtlpTestServer {
     endpoint: String,
@@ -280,7 +338,18 @@ impl OtlpTestServer {
 
     /// Serve over TLS at `https://localhost:<port>` using `identity`.
     pub async fn start_tls(identity: tonic::transport::Identity) -> Self {
-        Self::try_start_with(LOOPBACK_EPHEMERAL, Some(identity))
+        Self::try_start_with(
+            LOOPBACK_EPHEMERAL,
+            Some(tonic::transport::ServerTlsConfig::new().identity(identity)),
+        )
+        .await
+        .expect("OTLP test collector should bind a loopback listener")
+    }
+
+    /// Serve over TLS at `https://localhost:<port>` with `tls`, which can
+    /// require client certificates.
+    pub async fn start_with_tls(tls: &ServerTls) -> Self {
+        Self::try_start_with(LOOPBACK_EPHEMERAL, Some(tls.tonic_config()))
             .await
             .expect("OTLP test collector should bind a loopback listener")
     }
@@ -301,13 +370,13 @@ impl OtlpTestServer {
 
     async fn try_start_with(
         addr: SocketAddr,
-        identity: Option<tonic::transport::Identity>,
+        tls: Option<tonic::transport::ServerTlsConfig>,
     ) -> std::io::Result<Self> {
         let received = Arc::new(Mutex::new(ReceivedTraces::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
-        let endpoint = if identity.is_some() {
+        let endpoint = if tls.is_some() {
             format!("https://localhost:{}", local_addr.port())
         } else {
             format!("http://{local_addr}")
@@ -317,20 +386,23 @@ impl OtlpTestServer {
             exported: Arc::clone(&exported),
         };
         let mut server = tonic::transport::Server::builder();
-        if let Some(identity) = identity {
+        if let Some(tls) = tls {
             server = server
-                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .tls_config(tls)
                 .expect("OTLP test collector should accept its TLS identity");
         }
         let trace_service = TraceServiceServer::new(collector.clone())
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-        let logs_service = LogsServiceServer::new(collector)
+        let logs_service = LogsServiceServer::new(collector.clone())
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let metrics_service = MetricsServiceServer::new(collector)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             server
                 .add_service(trace_service)
                 .add_service(logs_service)
+                .add_service(metrics_service)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {

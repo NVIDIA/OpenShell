@@ -463,6 +463,59 @@ explicitly. Existing sandboxes stay on their owners when scaling up, and
 memory-based scaling does not guarantee spare capacity for handoff. See the
 [shared supervisor autoscaling guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#autoscale-shared-supervisors-by-memory).
 
+## Secure metrics scraping
+
+Metrics are enabled by default on `service.metricsPort: 9090`. Set
+`metrics.enabled=false` to disable the dedicated listener and its container
+and Service ports while retaining the configured port. This does not disable
+OpenTelemetry export. `service.metricsPort` must remain an integer from 1 to
+65535, even when metrics are disabled.
+
+The dedicated metrics endpoint is plaintext by default for compatibility with
+existing Prometheus deployments. Enable `metrics.tls.enabled` to serve it over
+HTTPS; this requires `metrics.enabled=true`. The initial implementation uses
+operator-provided Kubernetes Secrets; it does not generate metrics PKI or
+create a `ServiceMonitor`.
+
+A metrics TLS Secret that exists with malformed contents leaves the metrics
+listener disabled at startup while the gateway keeps serving; it never falls
+back to plaintext. A Secret that is missing entirely, or a client CA Secret
+without a `ca.crt` key, never reaches the gateway: kubelet fails the
+non-optional volume mounts and the pod does not start (`FailedMount`).
+Correct the Secret and restart the gateway to restore scraping.
+
+```yaml
+metrics:
+  tls:
+    enabled: true
+    # Empty uses server.tls.certSecretName instead.
+    certSecretName: openshell-metrics-server-tls
+    clientCaSecretName: openshell-metrics-scraper-ca
+    requireClientCert: true
+```
+
+The server Secret must provide `tls.crt` and `tls.key`; the scraper CA Secret
+must provide `ca.crt`. When `requireClientCert` is true, the chart rejects a
+render without `clientCaSecretName`. The metrics client CA must be separate
+from the gateway client credentials: sandbox workloads receive them for the
+control plane, and trusting that CA on the metrics listener would grant those
+workloads scraping access. The chart fails the render when
+`metrics.tls.clientCaSecretName` reuses `server.tls.clientCaSecretName` or
+`server.tls.clientTlsSecretName` (the sandbox client Secret; certgen seeds it
+with the gateway CA when the chart manages PKI). The comparison is by Secret
+name only; the chart cannot detect a different Secret holding the same CA.
+
+The metrics server certificate may reuse the gateway server TLS Secret when its
+SANs cover the Service DNS name used by the scraper. The gateway reloads valid
+certificate changes in place and preserves the last known-good configuration on
+an invalid replacement. Logs and OCSF events identify these reloads with
+`listener=metrics`.
+
+Configure your monitoring resource separately. A Prometheus Operator
+`ServiceMonitor` or `PodMonitor` that uses mTLS must reference its client
+certificate, key, and CA from Secrets in the monitoring resource's namespace.
+Do not disable server verification with `insecureSkipVerify`.
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
@@ -480,7 +533,7 @@ JWT signing Secret.
 ## SPIFFE/SPIRE provider token grants
 
 Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
-to let sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
+to let dedicated sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
 grants. The chart keeps supervisor-to-gateway authentication on gateway-minted
 sandbox JWTs and passes the configured socket path to the Kubernetes driver.
 
@@ -496,6 +549,17 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this path does not require access to the SPIRE OIDC
 discovery endpoint or its TLS CA.
+
+For `supervisor_topology: gateway`, configure
+`gatewayConfig.openshell.gateway.spiffe_broker` instead. Only the gateway mounts
+the CSI Workload API socket and obtains stable sandbox identities through the
+Broker API; shared supervisors receive final access tokens.
+Set `node_local_port: 8443` instead of `endpoint` to use the gateway's local
+agent directly. The chart injects its node address from `status.hostIP`;
+the agent must expose its Broker port on that address. This path needs no
+Broker Service. See
+[gateway configuration](https://docs.nvidia.com/openshell/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api)
+for peer identity policies, multi-node registrations, and authorization.
 
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

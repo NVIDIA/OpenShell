@@ -20,14 +20,10 @@ on:
         required: false
         default: false
         type: boolean
-      fail-on-findings:
-        description: Fail on HIGH/CRITICAL security findings
-        default: false
-        type: boolean
-      upload_sarif:
-        description: Upload results to Code Scanning when called from a manual workflow
-        default: true
-        type: boolean
+      diagnostics_public_key:
+        description: Optional armored GPG public key for encrypted reports and scanner output
+        default: ""
+        type: string
     outputs:
       base_sha:
         description: Previous stable commit, empty for a full bootstrap scan
@@ -44,32 +40,13 @@ on:
     secrets:
       CODEX_SECURITY_API_KEY:
         required: true
-  workflow_dispatch:
-    inputs:
-      candidate_ref:
-        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
-        required: true
-        type: string
-      stable_ref:
-        description: Optional previous stable tag override
-        required: false
-        type: string
-      upload_sarif:
-        description: Upload manual-run results to Code Scanning
-        required: false
-        default: false
-        type: boolean
-      allow_full_bootstrap:
-        description: Allow a full scan when no previous stable tag exists
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   actions: read
   contents: read
   security-events: write
 
+# Shared with codex-compatibility.yml to serialize inference requests.
 concurrency:
   group: codex-release-review
   cancel-in-progress: false
@@ -83,11 +60,13 @@ env:
 
 jobs:
   analyze:
-    name: Codex Security (${{ inputs.candidate_ref || github.ref_name }})
+    name: Codex Security (${{ inputs.candidate_ref }})
     # The agent executes no shell commands on the repository self-hosted runner,
     # so its preflight never scopes the diff and it seals no draft.
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Keep scanner failures visible without blocking prerelease qualification.
+    continue-on-error: true
     outputs:
       base_sha: ${{ steps.range.outputs.base_sha }}
       candidate_sha: ${{ steps.range.outputs.candidate_sha }}
@@ -126,7 +105,7 @@ jobs:
             --ignore-scripts \
             --no-audit \
             --no-fund \
-            @openai/codex-security@0.1.24
+            @openai/codex-security@0.8.3
 
       - name: Verify Codex Security
         env:
@@ -136,12 +115,28 @@ jobs:
           test -x "$CODEX_SECURITY_BIN"
           "$CODEX_SECURITY_BIN" --version
 
+      - name: Prepare encrypted diagnostics recipient
+        if: inputs.diagnostics_public_key != ''
+        id: private
+        env:
+          DIAGNOSTICS_PUBLIC_KEY: ${{ inputs.diagnostics_public_key }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir "$RUNNER_TEMP/codex-security-gpg"
+          printf '%s\n' "$DIAGNOSTICS_PUBLIC_KEY" > "$RUNNER_TEMP/codex-security-recipient.asc"
+          gpg --batch --homedir "$RUNNER_TEMP/codex-security-gpg" \
+            --trust-model always --recipient-file "$RUNNER_TEMP/codex-security-recipient.asc" \
+            --encrypt --output "$RUNNER_TEMP/codex-security-recipient-check.gpg" /dev/null
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+
       # The range resolver has to come from the workflow's own revision. A
       # scanned candidate predates it, and running the resolver from the
       # revision under scan would let that revision pick its own scan range.
       - name: Check out the workflow revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.workflow_sha }}
           path: workflow-revision
           sparse-checkout: tasks/scripts
           persist-credentials: false
@@ -159,7 +154,7 @@ jobs:
       - name: Check out the pre-release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.candidate_ref || github.ref }}
+          ref: ${{ inputs.candidate_ref }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -167,7 +162,7 @@ jobs:
         id: range
         env:
           ALLOW_FULL_BOOTSTRAP: ${{ inputs.allow_full_bootstrap || false }}
-          CANDIDATE_REF: ${{ inputs.candidate_ref || github.ref_name }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
           STABLE_REF: ${{ inputs.stable_ref || '' }}
         run: |
           set -euo pipefail
@@ -197,9 +192,14 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
           SCAN_DIR: ${{ runner.temp }}/codex-security-results-${{ github.run_id }}-${{ github.run_attempt }}
           SCAN_SCOPE: ${{ steps.range.outputs.scan_scope }}
+          PRIVATE_DIAGNOSTICS: ${{ steps.private.outputs.enabled }}
         run: |
           set -euo pipefail
           install -d -m 700 "$CODEX_SECURITY_STATE_DIR" "$SCAN_DIR"
+          diagnostic_args=()
+          if [ "$PRIVATE_DIAGNOSTICS" = true ]; then
+            diagnostic_args=(--private-log "$RUNNER_TEMP/codex-security-private.log")
+          fi
 
           target_args=()
           if [ "$SCAN_SCOPE" = "diff" ]; then
@@ -212,6 +212,7 @@ jobs:
           python3 "$RUNNER_TEMP/range-resolver/codex_security_diagnostics.py" \
             --scan-dir "$SCAN_DIR" \
             --output "$RUNNER_TEMP/codex-security-diagnostics.json" \
+            "${diagnostic_args[@]}" \
             -- "$CODEX_SECURITY_BIN" scan . \
             "${target_args[@]}" \
             --auth api-key \
@@ -229,7 +230,38 @@ jobs:
             --headless
 
       # Actions artifacts in this public repository are publicly downloadable.
-      # Publish only the helper's allowlisted projection, never SCAN_DIR or state.
+      # Raw reports and logs may only be retained inside the encrypted archive.
+      - name: Encrypt private diagnostics
+        if: ${{ !cancelled() && steps.private.outputs.enabled == 'true' && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure') }}
+        id: encrypted
+        env:
+          SCAN_DIR: ${{ runner.temp }}/codex-security-results-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          reports=()
+          for report in coverage.json scan-manifest.json report.md findings.json; do
+            if [ -f "$SCAN_DIR/$report" ] && [ ! -L "$SCAN_DIR/$report" ]; then
+              reports+=("$report")
+            fi
+          done
+          tar -cz \
+            -C "$SCAN_DIR" "${reports[@]}" \
+            -C "$RUNNER_TEMP" codex-security-private.log |
+            gpg --batch --homedir "$RUNNER_TEMP/codex-security-gpg" \
+              --trust-model always --recipient-file "$RUNNER_TEMP/codex-security-recipient.asc" \
+              --cipher-algo AES256 --encrypt \
+              --output "$RUNNER_TEMP/codex-security-private.tar.gz.gpg"
+
+      - name: Retain encrypted private diagnostics
+        if: ${{ !cancelled() && steps.encrypted.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-security-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-security-private.tar.gz.gpg
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload public execution diagnostics on failure
         if: ${{ failure() && steps.scan.outcome == 'failure' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -252,7 +284,6 @@ jobs:
             --output "$SARIF_FILE"
 
       - name: Summarize findings
-        id: findings
         env:
           BASE_TAG: ${{ steps.range.outputs.base_tag }}
           CANDIDATE_TAG: ${{ steps.range.outputs.candidate_tag }}
@@ -260,7 +291,6 @@ jobs:
           SARIF_FILE: ${{ runner.temp }}/codex-security.sarif
           SCAN_SCOPE: ${{ steps.range.outputs.scan_scope }}
           TRAIN: ${{ steps.range.outputs.train }}
-          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
         run: |
           set -euo pipefail
           finding_count=$(jq '[.runs[].results[]] | length' "$SARIF_FILE")
@@ -270,7 +300,6 @@ jobs:
               | select(.properties.severity | ascii_downcase | IN("high", "critical"))
             ] | length
           ' "$SARIF_FILE")
-          echo "high_count=$high_count" >> "$GITHUB_OUTPUT"
           {
             echo "### Codex Security release qualification"
             echo
@@ -283,15 +312,13 @@ jobs:
             else
               echo "- Scope: approved full bootstrap scan"
             fi
-            echo "- Coverage: complete"
+            echo "- Scanner execution: completed"
+            echo "- Scope limitations and deferred investigations may remain."
             echo "- Findings: $finding_count"
             echo "- HIGH/CRITICAL: $high_count"
-            echo
-            echo "Fail on HIGH/CRITICAL: $FAIL_ON_FINDINGS"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SARIF to Code Scanning
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.upload_sarif }}
         uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: ${{ runner.temp }}/codex-security.sarif
@@ -299,34 +326,8 @@ jobs:
           sha: ${{ steps.range.outputs.candidate_sha }}
           category: ${{ steps.range.outputs.category }}
 
-      - name: Enforce HIGH/CRITICAL threshold
-        if: ${{ !cancelled() && steps.findings.outcome == 'success' }}
-        env:
-          HIGH_COUNT: ${{ steps.findings.outputs.high_count }}
-          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
+      - name: Report incomplete advisory review
+        if: ${{ failure() }}
         run: |
-          if [ "$HIGH_COUNT" -gt 0 ]; then
-            if [ "$FAIL_ON_FINDINGS" = "true" ]; then
-              echo "::error::Codex reported $HIGH_COUNT HIGH/CRITICAL findings."
-              exit 1
-            fi
-            echo "::warning::Codex reported $HIGH_COUNT HIGH/CRITICAL findings; enforcement is disabled."
-          fi
-
-  result:
-    name: ${{ inputs.fail-on-findings && 'OpenShell / Codex Security' || 'OpenShell / Codex Security (informational)' }}
-    if: ${{ always() }}
-    needs: analyze
-    runs-on: ubuntu-latest
-    permissions: {}
-    steps:
-      - name: Evaluate scanner execution
-        env:
-          ANALYZE_RESULT: ${{ needs.analyze.result }}
-        run: |
-          set -euo pipefail
-          if [ "$ANALYZE_RESULT" != "success" ]; then
-            echo "::error::Codex Security release qualification did not complete successfully."
-            exit 1
-          fi
-          echo "Codex Security completed and the configured finding threshold passed."
+          echo '::warning::Codex Security review failed; no successful assessment is available. Prerelease qualification is unchanged.'
+          echo '### Codex Security review unavailable (advisory)' >> "$GITHUB_STEP_SUMMARY"

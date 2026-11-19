@@ -39,6 +39,8 @@ gateway:
     tag: ""
     # -- Gateway image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Gateway listener IP. Use `::` for IPv6.
+  listenAddress: 0.0.0.0
 
 # Trusted workload-side runtime image.
 sandboxRuntime:
@@ -69,6 +71,8 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Shared supervisor listener IP. Use `::` for IPv6.
+  listenAddress: 0.0.0.0
   # -- Shared supervisor pool members, used only when gatewayConfig selects
   # supervisor_topology = "gateway". The gateway always coordinates the shared
   # supervisor as a high-availability pool: when a member fails or leaves,
@@ -268,8 +272,25 @@ service:
   port: 8080
   # -- Gateway health service port.
   healthPort: 8081
-  # -- Gateway metrics service port.
+  # -- Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false.
   metricsPort: 9090
+
+# Optional TLS and mTLS configuration for the dedicated metrics listener.
+# Plaintext metrics remain the default for compatibility with existing
+# Prometheus deployments. Secrets are supplied by the operator; the chart does
+# not generate metrics-specific PKI in this initial integration.
+metrics:
+  # -- Enable the dedicated Prometheus metrics listener and its container and Service ports.
+  enabled: true
+  tls:
+    # -- Enable TLS for the dedicated metrics listener.
+    enabled: false
+    # -- Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName.
+    certSecretName: ""
+    # -- Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. The chart rejects reusing the gateway client CA and client TLS Secret names; the check is by name only and cannot detect a different Secret holding the same CA. Required when requireClientCert is true.
+    clientCaSecretName: ""
+    # -- Require a client certificate signed by clientCaSecretName to scrape metrics.
+    requireClientCert: false
 
 # Agent Sandbox is a cluster-scoped prerequisite for the Kubernetes compute
 # driver. OpenShell deliberately does not install its CRDs or controller.
@@ -374,6 +395,15 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- PriorityClass for the gateway pod. The gateway is a control-plane
+# component; when it shares nodes with the workloads it serves, the default
+# priority gives it no advantage under node pressure. Empty = omit the field.
+priorityClassName: ""
+
+# -- Topology spread constraints for the gateway pod, used to spread replicas
+# across zones or nodes. Empty = omit the field.
+topologySpreadConstraints: []
+
 # -- Non-secret gateway application configuration. Top-level keys name TOML
 # tables and are rendered into the mounted gateway.toml file. Kubernetes
 # resource inputs remain outside this map; template expressions derive the
@@ -381,6 +411,10 @@ affinity: {}
 gatewayConfig:
   openshell:
     version: 2
+  # openshell.gateway.spiffe_broker enables gateway-owned sandbox JWT-SVID
+  # acquisition over mTLS. Configure node_local_port or endpoint, an exact or
+  # cluster-scoped peer identity, the Workload API socket, and the stable sandbox
+  # SPIFFE ID prefix. SPIRE must authorize the gateway and attest its Sandbox references.
 
 # Server configuration
 server:
@@ -390,9 +424,11 @@ server:
   name: ""
   # -- Gateway log level.
   logLevel: info
-  # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
+  # OpenTelemetry trace export over OTLP. Leave endpoint empty to disable.
   otlp:
-    # -- OTLP/gRPC collector endpoint, conventionally using port 4317.
+    # -- OTLP/gRPC collector endpoint, conventionally port 4317. For an
+    # `http/protobuf` collector, also set protocol under
+    # gatewayConfig."openshell.gateway.otlp".
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
@@ -406,8 +442,8 @@ server:
     # When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME)
     # on the mount so each replica writes its own file.
     path: /tmp/gateway-ocsf.jsonl
-    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
-    # Supported values: "1.1", "1.3".
+    # -- Deprecated and ignored: the gateway emits native OCSF 1.8.0 and logs
+    # a warning at startup when this is set.
     schemaVersion: ""
     # -- Rotate the active file daily in UTC, or never.
     rotation: daily
@@ -683,7 +719,8 @@ server:
     # -- Dot-separated path to the scopes array in the JWT claims.
     scopesClaim: ""
     # -- Name of a ConfigMap containing a CA certificate bundle (key: ca.crt)
-    # for verifying the OIDC issuer's TLS certificate. Required when the
+    # for verifying the OIDC issuer's TLS certificate. These certificates
+    # augment platform trust roots for OIDC requests only. Required when the
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 

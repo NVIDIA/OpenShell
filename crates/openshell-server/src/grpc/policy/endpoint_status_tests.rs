@@ -1940,6 +1940,7 @@ async fn replacement_reset_timeout_invalidates_superseded_evidence() {
 
     let hello = SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+            supports_service_advertisements: false,
             sandbox_id: sandbox_id.to_string(),
             instance_id: "instance-b".to_string(),
             connection_epoch: 1,
@@ -2014,6 +2015,7 @@ async fn replacement_reset_retry_does_not_hold_gateway_shutdown() {
 
     let hello = SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+            supports_service_advertisements: false,
             sandbox_id: sandbox_id.to_string(),
             instance_id: "instance-b".to_string(),
             connection_epoch: 1,

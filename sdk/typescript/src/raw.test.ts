@@ -3,10 +3,55 @@
 
 import type { MessageInitShape } from '@bufbuild/protobuf';
 import { timestampFromDate } from '@bufbuild/protobuf/wkt';
-import { createRouterTransport } from '@connectrpc/connect';
+import { createClient, createRouterTransport } from '@connectrpc/connect';
 import { describe, expect, it } from 'vitest';
 import { SandboxClient } from './index.js';
-import { EndpointResult, type EndpointStatusSchema, OpenShell, SandboxPhase } from './raw.js';
+import { EndpointResult, type EndpointStatusSchema, OpenShell, SandboxPhase, SandboxUpdates } from './raw.js';
+
+describe('raw sandbox image updates', () => {
+  it.each([true, false])('uses a separate service on the existing transport (binary: %s)', async (useBinaryFormat) => {
+    const transport = createRouterTransport(
+      (router) => {
+        router.service(OpenShell, {
+          getSandbox: () => ({ sandbox: { metadata: { id: 'stable-id' } } }),
+        });
+        router.service(SandboxUpdates, {
+          updateSandbox: (request) => {
+            expect(request.workspaceScope?.selection).toEqual({ case: 'workspace', value: 'team' });
+            expect(request.name).toBe('sandbox');
+            expect(request.expectedResourceVersion).toBe(42n);
+            expect(request.requestId).toBe('550e8400-e29b-41d4-a716-446655440000');
+            return {
+              sandbox: {
+                metadata: { id: 'stable-id', name: request.name, workspace: 'team' },
+                spec: { template: { image: request.image } },
+                status: { phase: SandboxPhase.STOPPED },
+              },
+            };
+          },
+        });
+      },
+      { transport: { useBinaryFormat } },
+    );
+    const legacy = new SandboxClient(transport);
+    const updates = createClient(SandboxUpdates, legacy.transport);
+    expect(Object.hasOwn(OpenShell.method, 'updateSandbox')).toBe(false);
+    expect(SandboxUpdates.typeName).toBe('openshell.v1.SandboxUpdates');
+    const before = await legacy.raw.getSandbox({ name: 'sandbox' });
+    const response = await updates.updateSandbox({
+      workspaceScope: { selection: { case: 'workspace', value: 'team' } },
+      name: 'sandbox',
+      image: 'example/workload:new',
+      expectedResourceVersion: 42n,
+      requestId: '550e8400-e29b-41d4-a716-446655440000',
+    });
+    expect(response.sandbox?.metadata?.id).toBe(before.sandbox?.metadata?.id);
+    expect(response.sandbox?.spec?.template?.image).toBe('example/workload:new');
+    expect(response.sandbox?.status?.phase).toBe(SandboxPhase.STOPPED);
+    expect(response.sandbox?.status).not.toHaveProperty('imageUpdate');
+    expect(response.sandbox?.status).not.toHaveProperty('imageRevision');
+  });
+});
 
 describe('raw sandbox endpoint status', () => {
   it.each([true, false])(

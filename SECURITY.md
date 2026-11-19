@@ -4,7 +4,7 @@
 
 Report OpenShell vulnerabilities through [GitHub's private reporting form](https://github.com/NVIDIA/OpenShell/security/advisories/new). Submitting a report does not publish an advisory. Do not disclose vulnerabilities in public issues, discussions, or pull requests.
 
-Every report must use the [advisory template](.agents/skills/create-security-advisory/assets/advisory-template.md). Keep its core headings and include:
+Every report must use the [advisory template](.agents/skills/create-security-advisory/assets/advisory-template.md). The [private reporting form](.github/VULNERABILITY_REPORT.yml) requires its three core sections. Keep its core headings and include:
 
 - Affected component and version, commit, or image digest.
 - Description, impact, and prerequisites for exploitation.

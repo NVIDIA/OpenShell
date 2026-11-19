@@ -28,20 +28,24 @@ account="$(jq -r '.tokens.account_id' "$HOME/.codex/auth.json")"
 [[ "$account" != openshell:resolve:* ]]
 [[ "$(jq -r '.tokens.refresh_token' "$HOME/.codex/auth.json")" == "gateway-managed-refresh-token" ]]
 [[ "$(node -e 'console.log((require("fs").statSync(process.env.HOME + "/.codex/auth.json").mode & 0o777).toString(8))')" == 600 ]]
+[[ "$(cat)" == 'test prompt' ]]
 printf '%s\n' 'ok - Codex auth preserves token placeholders and uses a literal account ID'
 MOCK
 chmod +x "$TMP_DIR/codex"
 printf '%s\n' 'test prompt' > "$TMP_DIR/prompt.md"
 
-OPENSHELL_AGENT_HOME="$TMP_DIR/home" \
-CODEX_BIN="$TMP_DIR/codex" \
-CODEX_AUTH_ACCESS_TOKEN="$ACCESS_PLACEHOLDER" \
-CODEX_AUTH_ACCOUNT_ID="$ACCOUNT_PLACEHOLDER" \
-CODEX_ACCOUNT_ID="$ACCOUNT_ID" \
-GITHUB_TOKEN="openshell:resolve:env:v42_GITHUB_TOKEN" \
-EXPECTED_ACCESS_PLACEHOLDER="$ACCESS_PLACEHOLDER" \
-EXPECTED_ACCOUNT_ID="$ACCOUNT_ID" \
-    bash "$SCRIPT_DIR/exec.sh" "$TMP_DIR/prompt.md"
+for prompt_source in "$TMP_DIR/prompt.md" /dev/stdin; do
+    OPENSHELL_AGENT_HOME="$TMP_DIR/home" \
+        CODEX_BIN="$TMP_DIR/codex" \
+        CODEX_AUTH_ACCESS_TOKEN="$ACCESS_PLACEHOLDER" \
+        CODEX_AUTH_ACCOUNT_ID="$ACCOUNT_PLACEHOLDER" \
+        CODEX_ACCOUNT_ID="$ACCOUNT_ID" \
+        GITHUB_TOKEN="openshell:resolve:env:v42_GITHUB_TOKEN" \
+        EXPECTED_ACCESS_PLACEHOLDER="$ACCESS_PLACEHOLDER" \
+        EXPECTED_ACCOUNT_ID="$ACCOUNT_ID" \
+        bash "$SCRIPT_DIR/exec.sh" "$prompt_source" < "$TMP_DIR/prompt.md"
+done
+printf '%s\n' 'ok - Codex receives prompts from both a file and supervisor stdin'
 
 # Fail before launching Codex when the routing identity is absent or opaque.
 for invalid_account_id in "" "$ACCOUNT_PLACEHOLDER"; do

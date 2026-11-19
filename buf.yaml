@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Repo-level buf module. Declares proto/ as the single module so buf generate,
+# Repo-level buf workspace. Declares public and storage modules so buf generate,
 # buf lint, buf breaking, and the editor LSP all resolve imports the same way.
-# Code generation lives with each consumer (see sdk/go/buf.gen.yaml,
-# sdk/typescript/buf.gen.yaml); this file owns the module boundary and proto
-# validation policy.
+# Code generation lives with each consumer (see sdk/typescript/buf.gen.yaml;
+# the Go SDK in ai-openshell/sdk-go generates from a release tag); this file
+# owns the module boundaries and proto validation policy.
 version: v2
 modules:
   - path: proto
+    name: buf.build/openshell/core
   - path: crates/openshell-server/proto
 lint:
   use:

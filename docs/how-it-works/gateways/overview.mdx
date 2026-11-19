@@ -128,6 +128,15 @@ passed the gateway authentication layer. If authentication fails while status
 remains connected, run `openshell gateway login <name>` to refresh the stored
 credentials.
 
+When you select a gateway by name with `--gateway <name>` or
+`OPENSHELL_GATEWAY`, `status` exits nonzero if that name is not registered.
+With no gateway configured and no selector, `status` exits 0 and prints a
+registration hint.
+
+Exit 0 alone does not guarantee a successful health check. A registered gateway
+can return 0 even when its health endpoint reports an error. Check the `status`
+field in structured output to determine reachability.
+
 For automation or scripting, use `--output json` or `--output yaml` to get machine-readable output:
 
 ```shell

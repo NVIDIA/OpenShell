@@ -114,6 +114,14 @@ pub(crate) fn build_validation_plan(
         .first()
         .and_then(|raw| raw.parse::<IpAddr>().ok())
     {
+        if is_internal_ip(ip) && !exact_declared_endpoint_host {
+            return Err(DestinationDenial::new(
+                DestinationDenialKind::InternalAddress,
+                format!(
+                    "{host} is an internal IP literal without an exact declared endpoint or allowed_ips"
+                ),
+            ));
+        }
         AddressAuthorization::ImplicitIpLiteral(ip)
     } else if exact_declared_endpoint_host {
         AddressAuthorization::ExactDeclaredHost

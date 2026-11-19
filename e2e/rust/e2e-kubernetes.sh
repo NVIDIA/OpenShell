@@ -74,12 +74,18 @@ is_operator_workspace_mode() {
 }
 
 run_conformance() {
+  if [ "${OPENSHELL_E2E_KUBE_CONFORMANCE:-1}" = "0" ]; then
+    echo "note: skipping conformance suites (OPENSHELL_E2E_KUBE_CONFORMANCE=0)."
+    return 0
+  fi
   if is_operator_workspace_mode; then
     echo "note: skipping conformance suites in Kubernetes operator workspace mode; default workspace is not operator-allowlisted (see #2971)."
     return 0
   fi
 
-  e2e_run_openshell_conformance "Kubernetes"
+  OPENSHELL_CONFORMANCE_JUNIT="${OPENSHELL_CONFORMANCE_JUNIT:-${ROOT}/results/${OPENSHELL_E2E_REPORT_NAME:-e2e-kubernetes}-conformance.xml}" \
+    OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
+    e2e_run_openshell_conformance "Kubernetes"
 }
 
 # `OPENSHELL_E2E_REPORT_NAME` (default `e2e-kubernetes`) names the report
@@ -98,10 +104,20 @@ run_suite() {
 }
 
 run_e2e() {
+  if [ "${OPENSHELL_E2E_KUBE_TEST:-}" = "kubernetes_image_update" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
+    return
+  fi
   run_conformance
   if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
     echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
+  fi
+
+  if [ -z "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
   fi
 
   # Pin `--target-dir` so the profile `junit.path` resolves regardless of `CARGO_TARGET_DIR`.

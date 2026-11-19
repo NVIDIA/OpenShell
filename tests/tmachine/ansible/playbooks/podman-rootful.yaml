@@ -27,3 +27,12 @@
         name: podman.socket
         enabled: true
         state: started
+
+    # Tests run as tmachine and reach root's image store through sudo. See
+    # tests/support/container-engine.
+    - name: Publish container engine test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: container-engine
+        test_env_vars:
+          OPENSHELL_TEST_CONTAINER_ENGINE: sudo -n podman

@@ -192,7 +192,8 @@ response = client.chat.completions.create(
 
 For an authenticated alternate endpoint, declare a credential in the custom
 profile, bind it to that endpoint, and create the provider from the original
-credential source. OpenShell never exports stored credential values.
+credential source. The workload receives an opaque placeholder. Separately, an
+explicitly enabled [mTLS operator can retrieve runtime credential values](/how-it-works/providers/overview#retrieve-runtime-credentials).
 
 ## Verify Access
 
@@ -264,8 +265,8 @@ openshell provider create \
 openshell sandbox provider attach inference-demo nvidia-native-prod --wait
 ```
 
-OpenShell does not export stored credential values or change a provider's
-profile type in place. If the original credential source is unavailable, import
+Provider inspection commands do not export stored credential values, and you
+cannot change a provider's profile type in place. If the original credential source is unavailable, import
 the original profile at its own ID so the preserved provider keeps resolving
 while you arrange credential rotation into the replacement provider.
 
@@ -308,8 +309,8 @@ Special cases require additional work:
 
 ## Security Differences
 
-Provider attachment preserves credential non-disclosure: workloads receive
-opaque placeholders, and the proxy substitutes a real credential only after
+Provider attachment delivers opaque placeholders to workloads, and the proxy
+substitutes a real credential only after
 network policy and endpoint binding both pass. Native requests are no longer
 filtered or rewritten by a model-specific router. The provider profile's L7
 rules therefore define the allowed API surface, and the workload controls

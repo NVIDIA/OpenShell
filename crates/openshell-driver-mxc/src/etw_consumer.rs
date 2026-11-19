@@ -1679,6 +1679,7 @@ impl EtwEventProcessor {
             sandbox_id: sandbox_id.to_string(),
             sandbox_name: sandbox_name.to_string(),
             container_image: "mxc/appcontainer".to_string(),
+            container_image_uid: None,
             origin: openshell_ocsf::EventOrigin::Gateway {
                 name: self.gateway_name.clone(),
             },
@@ -2106,8 +2107,8 @@ mod tests {
         assert_eq!(json["device"]["name"], "production");
         assert_eq!(json["device"]["uid"], "production");
         assert_eq!(json["device"]["type"], "Server");
-        assert_eq!(json["container"]["name"], "agent-01");
-        assert_eq!(json["container"]["uid"], "sbx-123");
+        assert_eq!(json["unmapped"]["sandbox_name"], "agent-01");
+        assert_eq!(json["unmapped"]["sandbox_id"], "sbx-123");
     }
 
     #[test]

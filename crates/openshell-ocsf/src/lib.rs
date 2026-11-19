@@ -31,6 +31,9 @@ pub mod events;
 pub mod format;
 pub mod objects;
 pub mod sanitize;
+mod trace;
+
+pub use trace::{TraceCorrelation, register_trace_correlation_extractor};
 pub mod tracing_layers;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -60,8 +63,6 @@ pub use objects::{
 // --- Sanitizers ---
 pub use sanitize::sanitize_reason_for_audit;
 
-pub use format::downgrade::OcsfSchemaVersion;
-
 // --- Builders ---
 pub use builders::{
     ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
@@ -73,5 +74,5 @@ pub use builders::{
 pub use tracing_layers::{
     OCSF_TARGET, OcsfJsonSettings, OcsfJsonlLayer, OcsfShorthandLayer, bind_thread_json_settings,
     clear_current_event, clone_current_event, emit_ocsf_event, emit_ocsf_event_routed,
-    set_current_event,
+    register_event_enricher, set_current_event,
 };

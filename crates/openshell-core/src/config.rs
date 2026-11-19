@@ -13,6 +13,35 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Database credential source. The default preserves URL/SQLite behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseAuthMode {
+    #[default]
+    Default,
+    AzureWorkloadIdentity,
+}
+
+impl fmt::Display for DatabaseAuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::AzureWorkloadIdentity => "azure-workload-identity",
+        })
+    }
+}
+
+impl FromStr for DatabaseAuthMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "azure-workload-identity" => Ok(Self::AzureWorkloadIdentity),
+            _ => Err("database authentication must be default or azure-workload-identity"),
+        }
+    }
+}
+
 // ── Public default constants ────────────────────────────────────────────
 //
 // Canonical source for default values used across multiple crates.
@@ -45,6 +74,22 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
+
+/// Default per-sandbox cap for each relay budget (SSH and service forwards).
+pub const DEFAULT_MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
+/// Default durable mutation admissions one caller identity can hold.
+pub const DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER: u32 = 1000;
+
+/// Accepted per-caller admission limits. The ceiling bounds the rows one caller
+/// can retain.
+pub const MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE: std::ops::RangeInclusive<u32> = 1..=1_000_000;
+
+/// Default replay window for successful durable mutation admissions.
+pub const DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS: u32 = 24 * 60 * 60;
+
+/// Accepted replay windows, from one minute to seven days.
+pub const MUTATION_REPLAY_WINDOW_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 60..=604_800;
 
 /// Gateway delivery path for supervisor configuration.
 ///
@@ -205,6 +250,91 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Gateway-owned SPIFFE Broker API issuance for Kubernetes sandbox identities.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpiffeBrokerConfig {
+    pub spiffe_id_prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    /// Connect to the gateway's node IP supplied through the Downward API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_local_port: Option<std::num::NonZeroU16>,
+    #[serde(default)]
+    pub server_spiffe_id: Option<String>,
+    #[serde(default)]
+    pub server_spiffe_id_prefix: Option<String>,
+    pub workload_api_socket_path: String,
+}
+
+impl SpiffeBrokerConfig {
+    /// Resolve the selected transport without making Kubernetes API calls.
+    /// Node-local mode requires the Pod's trusted Downward API node address.
+    pub fn endpoint_for_node(&self, node_ip: Option<&str>) -> Result<String, String> {
+        match (self.endpoint.is_empty(), self.node_local_port) {
+            (false, None) => Ok(self.endpoint.clone()),
+            (true, Some(port)) => {
+                let ip: std::net::IpAddr = node_ip
+                    .ok_or("spiffe_broker.node_local_port requires OPENSHELL_NODE_IP from status.hostIP")?
+                    .parse()
+                    .map_err(|_| "OPENSHELL_NODE_IP must be an IPv4 or IPv6 address")?;
+                Ok(format!("https://{}", SocketAddr::new(ip, port.get())))
+            }
+            _ => Err("spiffe_broker requires exactly one of endpoint and node_local_port".into()),
+        }
+    }
+
+    /// Validate the identity and authenticated transport before use.
+    pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
+        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
+            .sandbox_spiffe_id(gateway_id, "sandbox")?;
+        // Validate the mode independently of the startup environment. The
+        // adapter requires and resolves the actual node IP before serving.
+        let endpoint = self.endpoint_for_node(Some("127.0.0.1"))?;
+        let endpoint = url::Url::parse(&endpoint)
+            .map_err(|_| "spiffe_broker.endpoint must be an HTTPS endpoint")?;
+        let socket = std::path::Path::new(&self.workload_api_socket_path);
+        let valid_socket = socket.is_absolute()
+            && !self.workload_api_socket_path.ends_with('/')
+            && socket.file_name().is_some()
+            && socket
+                .parent()
+                .is_some_and(|parent| parent != std::path::Path::new("/"))
+            && self.workload_api_socket_path.trim() == self.workload_api_socket_path
+            && !self
+                .workload_api_socket_path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."));
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.path() != "/"
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !valid_socket
+        {
+            return Err(
+                "spiffe_broker requires an HTTPS endpoint and absolute Workload API socket path"
+                    .into(),
+            );
+        }
+        match (&self.server_spiffe_id, &self.server_spiffe_id_prefix) {
+            (Some(id), None) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(id)?;
+            }
+            (None, Some(prefix)) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(prefix)?;
+                if !prefix.trim_start_matches("spiffe://").contains('/') {
+                    return Err("spiffe_broker.server_spiffe_id_prefix requires an agent path, not a whole trust domain".into());
+                }
+            }
+            _ => return Err("spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix".into()),
+        }
+        Ok(())
+    }
+}
+
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -230,6 +360,13 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     pub metrics_bind_address: Option<SocketAddr>,
 
+    /// TLS configuration for the dedicated metrics listener.
+    ///
+    /// When `None`, the metrics listener retains its plaintext HTTP behavior.
+    /// This configuration is intentionally separate from [`Self::tls`] so
+    /// metrics clients can use their own client CA trust boundary.
+    pub metrics_tls: Option<MetricsTlsConfig>,
+
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
@@ -252,6 +389,11 @@ pub struct Config {
     /// Disabled for local gateways by default.
     pub enable_websocket_tunnel: bool,
 
+    /// Operator activation after all gateways and outstanding legacy driver
+    /// operations have been drained onto the configuration-update-compatible protocol.
+    /// Disabled by default; not a license to run mixed-version writers.
+    pub enable_sandbox_updates: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -264,14 +406,22 @@ pub struct Config {
     /// sandbox identity is always carried by gateway-minted sandbox JWTs.
     pub mtls_auth: MtlsAuthConfig,
 
+    /// Optional details gateway mutation records capture.
+    pub audit: GatewayAuditConfig,
+
     /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
     /// loads the signing key from disk and accepts gateway-issued sandbox
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
     /// flow (issue #1354).
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
+    pub spiffe_broker: Option<SpiffeBrokerConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
+
+    /// Explicit database identity mode; independent of provider credentials.
+    pub database_auth: DatabaseAuthMode,
 
     /// Connection ceiling for the persistence pool.
     ///
@@ -312,9 +462,31 @@ pub struct Config {
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
+    /// Maximum concurrent SSH relays per sandbox. Must be at least 1.
+    pub max_ssh_connections_per_sandbox: u32,
+
+    /// Maximum concurrent service forward relays per sandbox. Must be at
+    /// least 1. Kept apart from the SSH budget so open forwards cannot block
+    /// SSH access.
+    pub max_service_connections_per_sandbox: u32,
+
     /// Absolute image preparation and initial supervisor startup budget for new
     /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
     pub image_preparation_timeout_seconds: u32,
+
+    /// Provisioning repair window, in seconds. The first authenticated
+    /// supervisor configuration report starts admission repair, which stays
+    /// armed until Ready. Must be between 1 and 86400, inclusive.
+    pub provisioning_repair_window_seconds: i64,
+
+    /// Durable mutation admissions one caller can hold across every replica
+    /// sharing the database. Replicas must use the same value. Must be within
+    /// [`MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE`].
+    pub mutation_admission_limit_per_caller: u32,
+
+    /// Seconds a successful mutation admission stays replayable. Must be within
+    /// [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
+    pub mutation_replay_window_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -332,6 +504,7 @@ pub struct Config {
 
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
+    pub supervisor_app_listener: crate::app_listener::AppListenerConfig,
 }
 
 /// Browser-facing sandbox service routing configuration.
@@ -461,6 +634,27 @@ pub struct TlsConfig {
     pub external_server_names: Vec<String>,
 }
 
+/// TLS configuration for the dedicated metrics listener.
+///
+/// Unlike [`TlsConfig`], metrics TLS does not support external certificates
+/// or SNI routing. The metrics listener has one narrow HTTPS/mTLS contract
+/// with an optional, metrics-specific client CA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsTlsConfig {
+    /// Path to the TLS certificate file served by the metrics listener.
+    pub cert_path: PathBuf,
+
+    /// Path to the TLS private key file served by the metrics listener.
+    pub key_path: PathBuf,
+
+    /// Path to the CA certificate file used to verify metrics clients.
+    pub client_ca_path: Option<PathBuf>,
+
+    /// Whether metrics clients must present a certificate trusted by
+    /// [`Self::client_ca_path`].
+    pub require_client_auth: bool,
+}
+
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
 ///
 /// When configured, the server validates `authorization: Bearer <JWT>`
@@ -475,6 +669,12 @@ pub struct TlsConfig {
 pub struct OidcConfig {
     /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
+
+    /// Optional PEM CA bundle for an issuer signed by a private CA. It must be
+    /// a regular file no larger than 1 MiB. These certificates augment the
+    /// platform trust roots for OIDC discovery and JWKS requests only.
+    #[serde(default)]
+    pub ca_bundle: Option<PathBuf>,
 
     /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
     /// addresses. This is a development-only escape hatch and never permits
@@ -514,6 +714,17 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+}
+
+/// `[openshell.gateway.audit]`: optional details gateway mutation records
+/// capture. Secrets are never captured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAuditConfig {
+    /// Record the values of gateway and sandbox settings that `UpdateConfig`
+    /// sets. Bytes values are never recorded.
+    #[serde(default)]
+    pub capture_setting_values: bool,
 }
 
 /// mTLS user authentication for gateway users.
@@ -992,6 +1203,7 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
+            metrics_tls: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             config_delivery_mode: ConfigDeliveryMode::default(),
@@ -999,11 +1211,15 @@ impl Config {
             oidc: None,
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
+            enable_sandbox_updates: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
+            audit: GatewayAuditConfig::default(),
             gateway_jwt: None,
+            spiffe_broker: None,
             database_url: String::new(),
+            database_auth: DatabaseAuthMode::default(),
             database_max_connections: None,
             database_lock_max_connections: None,
             compute_driver: None,
@@ -1011,10 +1227,16 @@ impl Config {
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            max_ssh_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
+            max_service_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
             image_preparation_timeout_seconds: 1800,
+            provisioning_repair_window_seconds: 300,
+            mutation_admission_limit_per_caller: DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER,
+            mutation_replay_window_seconds: DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
+            supervisor_app_listener: crate::app_listener::AppListenerConfig::default(),
         }
     }
 
@@ -1044,10 +1266,24 @@ impl Config {
         self
     }
 
+    /// Create a new configuration with TLS for the dedicated metrics listener.
+    #[must_use]
+    pub fn with_metrics_tls(mut self, tls: MetricsTlsConfig) -> Self {
+        self.metrics_tls = Some(tls);
+        self
+    }
+
     /// Create a new configuration with the given log level.
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
+        self
+    }
+
+    /// Select database credentials independently of the connection URL.
+    #[must_use]
+    pub fn with_database_auth(mut self, mode: DatabaseAuthMode) -> Self {
+        self.database_auth = mode;
         self
     }
 
@@ -1317,12 +1553,12 @@ mod tests {
     use super::{
         AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
         GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
-        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig,
         PolicyValidationFailureMode, ServiceHostnameFormat, UpstreamProxyConfig,
         default_sandbox_pids_limit, normalize_compute_driver_name,
     };
-    use std::net::SocketAddr;
     use std::time::Duration;
+    use std::{net::SocketAddr, path::PathBuf};
 
     #[test]
     fn policy_validation_failure_mode_is_secure_by_default() {
@@ -1891,6 +2127,23 @@ mod tests {
     }
 
     #[test]
+    fn metrics_tls_is_disabled_by_default_and_can_be_configured() {
+        assert!(Config::new(None).metrics_tls.is_none());
+
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/etc/openshell-metrics/tls.crt"),
+            key_path: PathBuf::from("/etc/openshell-metrics/tls.key"),
+            client_ca_path: Some(PathBuf::from("/etc/openshell-metrics/ca.crt")),
+            require_client_auth: true,
+        };
+
+        assert_eq!(
+            Config::new(None).with_metrics_tls(tls.clone()).metrics_tls,
+            Some(tls)
+        );
+    }
+
+    #[test]
     fn supervisor_image_tag_prefers_explicit_build_tags() {
         use super::resolve_supervisor_image_tag;
         assert_eq!(
@@ -1946,5 +2199,79 @@ mod tests {
             runtime_image_default(None, "compiled:default".to_string()),
             "compiled:default"
         );
+    }
+    #[test]
+    fn broker_configuration_rejects_ambiguous_transport() {
+        let mut config = super::SpiffeBrokerConfig {
+            spiffe_id_prefix: "spiffe://example.org/openshell".into(),
+            endpoint: "https://spire-broker.spire.svc:8443".into(),
+            node_local_port: None,
+            server_spiffe_id: Some("spiffe://example.org/spire/agent/node".into()),
+            server_spiffe_id_prefix: None,
+            workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock".into(),
+        };
+        config.validate("gw").unwrap();
+        let mut local = config.clone();
+        local.endpoint.clear();
+        local.node_local_port = std::num::NonZeroU16::new(8443);
+        local.validate("gw").unwrap();
+        assert_eq!(
+            local.endpoint_for_node(Some("10.20.0.2")).unwrap(),
+            "https://10.20.0.2:8443"
+        );
+        assert_eq!(
+            local.endpoint_for_node(Some("2001:db8::2")).unwrap(),
+            "https://[2001:db8::2]:8443"
+        );
+        for address in [
+            None,
+            Some(""),
+            Some("agent.example.org"),
+            Some("10.20.0.2:8443"),
+        ] {
+            assert!(local.endpoint_for_node(address).is_err());
+        }
+        local.endpoint.clone_from(&config.endpoint);
+        assert!(local.validate("gw").is_err());
+        local.endpoint.clear();
+        local.node_local_port = None;
+        assert!(local.validate("gw").is_err());
+        let encoded = serde_json::to_value(&config).unwrap();
+        for port in [0, 65536] {
+            let mut invalid = encoded.clone();
+            invalid["node_local_port"] = port.into();
+            assert!(serde_json::from_value::<super::SpiffeBrokerConfig>(invalid).is_err());
+        }
+        config.server_spiffe_id = None;
+        config.server_spiffe_id_prefix =
+            Some("spiffe://example.org/spire/agent/k8s_psat/cluster".into());
+        config.validate("gw").unwrap();
+        config.server_spiffe_id_prefix = Some("spiffe://example.org".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id = Some("spiffe://example.org/spire/agent/node".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id_prefix = None;
+        for endpoint in [
+            "http://broker:8443",
+            "https://user:password@broker",
+            "https://broker/path",
+            "https://broker/?query",
+            "https://broker/#fragment",
+        ] {
+            config.endpoint = endpoint.into();
+            assert!(config.validate("gw").is_err());
+        }
+        config.endpoint = "https://broker:8443".into();
+        for socket in [
+            "tcp:broker:1234",
+            "/",
+            "/agent.sock",
+            "/run/../agent.sock",
+            "/run/spire/",
+            " /run/spire/agent.sock",
+        ] {
+            config.workload_api_socket_path = socket.into();
+            assert!(config.validate("gw").is_err(), "{socket}");
+        }
     }
 }

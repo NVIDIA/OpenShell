@@ -54,6 +54,20 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+  codex-security:
+    name: Codex Security (advisory)
+    if: inputs.is-prerelease
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/codex-security.yml
+    with:
+      candidate_ref: ${{ inputs.release-tag }}
+      diagnostics_public_key: ${{ vars.CODEX_SECURITY_DIAGNOSTICS_PUBLIC_KEY }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
   prepare-integration:
     permissions:
       actions: read
@@ -71,19 +85,13 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-suites.yml
     with:
-      category: conformance
+      family: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
-        ]
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   feature-specific-integration:
     needs: prepare-integration
@@ -91,19 +99,13 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-suites.yml
     with:
-      category: feature-specific
+      family: features
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
-        ]
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   docker-e2e:
     permissions:

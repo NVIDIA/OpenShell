@@ -12,8 +12,18 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
+
+PRIVATE_LOG_LIMIT = 4 * 1024 * 1024
+
+
+def write_private_log(source, destination) -> None:
+    remaining = PRIVATE_LOG_LIMIT
+    while chunk := source.read(64 * 1024):
+        destination.write(chunk[:remaining])
+        remaining = max(0, remaining - len(chunk))
 
 
 def read_document(path: Path) -> tuple[dict, str]:
@@ -80,6 +90,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scan-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--private-log", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -92,12 +103,26 @@ def main() -> int:
     started = time.monotonic()
     next_progress = started + 60
     exit_code = 127
-    # Raw output may contain findings or provider errors with sensitive text.
-    # Discard it without consuming disk space or populating SCAN_DIR.
+    # The caller must encrypt private output before retention. Keep it outside
+    # SCAN_DIR, which the scanner expects to be empty.
+    private_log = (
+        os.fdopen(
+            os.open(args.private_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+        )
+        if args.private_log
+        else None
+    )
     try:
         with subprocess.Popen(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            command,
+            stdout=subprocess.PIPE if private_log else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
         ) as process:
+            if private_log:
+                reader = threading.Thread(
+                    target=write_private_log, args=(process.stdout, private_log)
+                )
+                reader.start()
             while True:
                 try:
                     exit_code = process.wait(timeout=5)
@@ -115,8 +140,13 @@ def main() -> int:
                         next_progress = time.monotonic() + 60
             if exit_code < 0:
                 exit_code = 128 - exit_code
+            if private_log:
+                reader.join()
     except OSError:
         print("::error::Could not execute the security scanner.")
+    finally:
+        if private_log:
+            private_log.close()
 
     after = shutil.disk_usage(args.scan_dir)
     report = {

@@ -105,6 +105,8 @@ Registration is static. Restart the gateway after adding, removing, or changing 
 
 Start with the invariant the interceptor must preserve, then identify every gateway RPC that can establish or weaken it. For example, an interceptor that owns sandbox policy can use `modify_operation` on `CreateSandbox` to apply an approved initial policy and `validate` on `UpdateConfig` to reject unauthorized changes.
 
+To gate sandbox activation, bind `validate` to `CreateSandbox`, `StartSandbox`, and `ResumeSandbox`. Bind `post_commit` to `StopSandbox` and `SuspendSandbox` to observe successful stop and suspend requests.
+
 The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
 
 Choose a phase by intent:

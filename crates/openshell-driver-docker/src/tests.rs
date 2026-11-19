@@ -49,7 +49,7 @@ fn startup_error_log_tails_fit_grpc_header_budget() {
     assert!(format_log_tail("").is_empty());
 }
 
-fn test_launch_authentication() -> Vec<u8> {
+pub fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
             session_id: openshell_core::SandboxSessionId::new(),
@@ -64,7 +64,13 @@ fn test_launch_authentication() -> Vec<u8> {
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
             ssh_host_private_key: None,
+            traces_otlp_headers: None,
             ocsf_otlp_headers: None,
+            agent_otlp_headers: None,
+            otlp_tls: Vec::new(),
+            traces_otlp_tls: None,
+            ocsf_otlp_tls: None,
+            agent_otlp_tls: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {
@@ -143,6 +149,21 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
 
     let bootstrap: BoundaryConfig =
         serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    // A restart keeps the original image identity even if the mutable
+    // template reference now names another image in the registry.
+    let sandbox = test_sandbox();
+    let image_env = docker_workload_image_environment(&sandbox, &directory)
+        .await
+        .unwrap();
+    assert!(image_env.contains(&format!(
+        "{}=image-test",
+        openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+    )));
+    assert!(image_env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::CONTAINER_IMAGE,
+        sandbox_image(&sandbox).unwrap()
+    )));
     let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
         .await
         .unwrap()
@@ -186,7 +207,7 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
     fs::remove_dir_all(directory).unwrap();
 }
 
-fn test_sandbox() -> DriverSandbox {
+pub fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
     // longer carries `namespace`, so the gateway elides the field and the
     // driver must source it from its own runtime config.
@@ -308,7 +329,7 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
     }
 }
 
-fn runtime_config() -> DockerDriverRuntimeConfig {
+pub fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         // Existing lifecycle fixtures exercise the explicitly opted-out contract.
         allow_driver_config: true,
@@ -324,13 +345,11 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
-        supervisor_otlp_endpoint: None,
         supervisor_network_mode: DockerSupervisorNetworkMode::Host,
         supervisor_endpoint_explicit: true,
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         host_gateway_ip: None,
-        supervisor_ocsf_export: None,
-        supervisor_otlp_agent_endpoint: None,
+        supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
         supervisor_gateway_name: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
@@ -342,6 +361,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         },
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
+        workspace_storage: workspace::Storage::WritableLayer,
         upstream_proxy: UpstreamProxyConfig::default(),
         proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
@@ -512,7 +532,7 @@ fn sandbox_driver_config_cannot_override_proxy_ca_bundle() {
     assert!(error.message().contains("proxy_ca_bundle"), "{error}");
 }
 
-fn test_workload_identity() -> ResolvedWorkloadIdentity {
+pub fn test_workload_identity() -> ResolvedWorkloadIdentity {
     ResolvedWorkloadIdentity::new(
         1234,
         1235,
@@ -546,7 +566,7 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
     }
 }
 
-fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
+pub fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
     let wsl_all_gpu_fallback_enabled = config.gpu.wsl_all_gpu_fallback_enabled;
     DockerComputeDriver {
         docker: Arc::new(
@@ -563,6 +583,7 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
         lifecycle_event_fences: DockerLifecycleEventFences::default(),
         control_processes: Arc::new(Mutex::new(HashMap::new())),
         runtime_failures: Arc::new(Mutex::new(HashMap::new())),
+        image_update_gates: Arc::new(image_update::Gates::default()),
     }
 }
 
@@ -1517,37 +1538,64 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 #[test]
 fn supervisor_otlp_environment_carries_only_configured_signals() {
     use openshell_core::sandbox_env::{
-        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
-        OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+        OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol,
+    };
+    let export = |endpoint: &str, protocol| {
+        Some(OtlpExport {
+            endpoint: endpoint.to_string(),
+            protocol,
+        })
     };
 
     let mut config = runtime_config();
     assert!(supervisor_otlp_environment(&config).is_empty());
 
-    config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    config.supervisor_otlp.traces = export("http://127.0.0.1:4317", OtlpProtocol::Grpc);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [format!("{OTLP_ENDPOINT}=http://127.0.0.1:4317")]
     );
 
-    config.supervisor_otlp_endpoint = None;
-    config.supervisor_ocsf_export = Some(OcsfOtlpExport {
-        endpoint: "http://siem:4317".to_string(),
-        schema_version: Some("1.3".to_string()),
-    });
+    config.supervisor_otlp.traces = export("http://127.0.0.1:4318", OtlpProtocol::HttpProtobuf);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [
-            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317"),
-            format!("{OTLP_OCSF_SCHEMA_VERSION}=1.3"),
+            format!("{OTLP_ENDPOINT}=http://127.0.0.1:4318"),
+            format!("{OTLP_PROTOCOL}=http/protobuf"),
         ]
     );
 
-    config.supervisor_ocsf_export = None;
-    config.supervisor_otlp_agent_endpoint = Some("http://agents:4317".to_string());
+    config.supervisor_otlp.traces = None;
+    config.supervisor_otlp.ocsf = export("http://siem:4317", OtlpProtocol::Grpc);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317")]
+    );
+
+    config.supervisor_otlp.ocsf = export("http://siem:4318", OtlpProtocol::HttpProtobuf);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4318"),
+            format!("{OTLP_OCSF_PROTOCOL}=http/protobuf"),
+        ]
+    );
+
+    config.supervisor_otlp.ocsf = None;
+    config.supervisor_otlp.agent = export("http://agents:4317", OtlpProtocol::Grpc);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [format!("{OTLP_AGENT_ENDPOINT}=http://agents:4317")]
+    );
+
+    config.supervisor_otlp.agent = export("http://agents:4318", OtlpProtocol::HttpProtobuf);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_AGENT_ENDPOINT}=http://agents:4318"),
+            format!("{OTLP_AGENT_PROTOCOL}=http/protobuf"),
+        ]
     );
 
     config.supervisor_gateway_name = Some("prod-west".to_string());
@@ -2577,6 +2625,56 @@ fn managed_container_label_filters_include_gateway_namespace() {
 }
 
 #[test]
+fn persistent_workspace_config_defaults_off_and_round_trips() {
+    let default: DockerComputeConfig = toml::from_str("").unwrap();
+    assert!(!default.persist_workspace);
+    let enabled: DockerComputeConfig = toml::from_str("persist_workspace = true").unwrap();
+    assert!(enabled.persist_workspace);
+    let saved = toml::to_string(&enabled).unwrap();
+    assert!(
+        toml::from_str::<DockerComputeConfig>(&saved)
+            .unwrap()
+            .persist_workspace
+    );
+}
+
+#[test]
+fn persistent_workspace_create_mounts_only_the_owned_default_workspace() {
+    let sandbox = test_sandbox();
+    let mut config = runtime_config();
+    let old = build_container_create_body(&sandbox, &config).unwrap();
+    assert!(
+        old.host_config
+            .unwrap()
+            .mounts
+            .unwrap()
+            .iter()
+            .all(|mount| mount.target.as_deref() != Some("/sandbox"))
+    );
+    config.workspace_storage = workspace::Storage::Persistent;
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let mounts = body.host_config.unwrap().mounts.unwrap();
+    let mounts = mounts
+        .iter()
+        .filter(|mount| mount.target.as_deref() == Some("/sandbox"))
+        .collect::<Vec<_>>();
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[0].read_only, Some(false));
+    assert_eq!(
+        mounts[0].volume_options.as_ref().unwrap().no_copy,
+        Some(true)
+    );
+    assert!(
+        mounts[0]
+            .source
+            .as_ref()
+            .unwrap()
+            .starts_with("openshell-workspace-")
+    );
+}
+
+#[test]
 fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 
@@ -3228,6 +3326,38 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
     );
 }
 
+fn engine_version(name: &str, version: &str) -> SystemVersion {
+    SystemVersion {
+        components: Some(vec![bollard::models::SystemVersionComponents {
+            name: name.to_string(),
+            version: version.to_string(),
+            details: None,
+        }]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn warns_on_docker_engine_older_than_minimum() {
+    let warning = unsupported_docker_engine_warning(&engine_version("Engine", "26.1.5+dfsg1"))
+        .expect("old engine warns");
+    assert!(warning.contains("26.1.5+dfsg1"), "{warning}");
+    assert!(warning.contains("28.0"), "{warning}");
+}
+
+#[test]
+fn no_warning_for_supported_unknown_or_other_engines() {
+    for version in [
+        engine_version("Engine", "28.0.0"),
+        engine_version("Engine", "29.9.3"),
+        engine_version("Engine", "garbage"),
+        engine_version("Other Engine", "5.8.2"),
+        SystemVersion::default(),
+    ] {
+        assert!(unsupported_docker_engine_warning(&version).is_none());
+    }
+}
+
 #[test]
 fn docker_info_reports_wsl2_from_kernel_version() {
     let info = SystemInfo {
@@ -3705,6 +3835,50 @@ fn build_container_create_body_limits_writable_runtime_storage_to_supervisor_ca(
         Some(&"rw,noexec,nosuid,nodev,size=1m,uid=1000,gid=1000,mode=0755".to_string())
     );
     assert!(!tmpfs.contains_key("/run"));
+}
+
+#[test]
+fn legacy_workspace_template_labels_are_preserved() {
+    let mut sandbox = test_sandbox();
+    let labels = &mut sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .labels;
+    labels.insert(
+        "openshell.ai/workspace-storage".into(),
+        "caller-layout".into(),
+    );
+    labels.insert(
+        "openshell.ai/workspace-volume-identity".into(),
+        "caller-identity".into(),
+    );
+    labels.insert(
+        "openshell.ai/docker-workspace-storage".into(),
+        "caller-value".into(),
+    );
+    labels.insert(
+        "openshell.ai/docker-workspace-volume-identity".into(),
+        "not-json".into(),
+    );
+    let expected = labels.clone();
+    for storage in [
+        workspace::Storage::WritableLayer,
+        workspace::Storage::Persistent,
+    ] {
+        let mut config = runtime_config();
+        config.workspace_storage = storage;
+        let labels = build_container_create_body(&sandbox, &config)
+            .unwrap()
+            .labels
+            .unwrap();
+        for (key, value) in &expected {
+            assert_eq!(labels.get(key), Some(value));
+        }
+    }
 }
 
 #[test]

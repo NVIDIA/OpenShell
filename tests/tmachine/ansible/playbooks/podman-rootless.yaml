@@ -25,3 +25,12 @@
         HOME: /home/tmachine
         XDG_RUNTIME_DIR: /run/user/1000
         DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus
+
+    # Tests run as tmachine, the user whose image store the gateway uses. See
+    # tests/support/container-engine.
+    - name: Publish container engine test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: container-engine
+        test_env_vars:
+          OPENSHELL_TEST_CONTAINER_ENGINE: podman

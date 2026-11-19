@@ -10,6 +10,7 @@
 
 use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
+use openshell_core::proto::sandbox_updates_server::{SandboxUpdates, SandboxUpdatesServer};
 use openshell_core::replica_routing;
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
@@ -60,6 +61,8 @@ struct MockState {
     last_start: Mutex<Option<proto::StartSandboxRequest>>,
     last_suspend: Mutex<Option<proto::SuspendSandboxRequest>>,
     last_resume: Mutex<Option<proto::ResumeSandboxRequest>>,
+
+    last_update: Mutex<Option<proto::UpdateSandboxRequest>>,
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
     list_requests: Mutex<Vec<proto::ListSandboxesRequest>>,
     last_exec_request: Mutex<Option<proto::ExecSandboxRequest>>,
@@ -242,6 +245,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_sandbox_provider_access_token(
+        &self,
+        _request: tonic::Request<proto::GetSandboxProviderAccessTokenRequest>,
+    ) -> Result<Response<proto::GetSandboxProviderAccessTokenResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_notify_config_update(
         &self,
         _request: tonic::Request<proto::PeerNotifyConfigUpdateRequest>,
@@ -1172,16 +1182,73 @@ impl OpenShell for TestOpenShell {
     }
 }
 
+#[tonic::async_trait]
+impl SandboxUpdates for TestOpenShell {
+    async fn update_sandbox(
+        &self,
+        request: tonic::Request<proto::UpdateSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        if let Some(expected) = &self.state.require_bearer {
+            let got = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok());
+            if got != Some(expected.as_str()) {
+                return Err(Status::unauthenticated("invalid or missing bearer token"));
+            }
+        }
+        *self.state.last_update.lock().await = Some(request.into_inner());
+        Ok(Response::new(proto::SandboxResponse::default()))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::service_discovery_server::ServiceDiscovery for TestOpenShell {
+    async fn get_service_route_snapshot(
+        &self,
+        request: tonic::Request<proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<proto::GetServiceRouteSnapshotResponse>, Status> {
+        if let Some(expected) = &self.state.require_bearer
+            && request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                != Some(expected.as_str())
+        {
+            return Err(Status::unauthenticated("invalid or missing bearer token"));
+        }
+        Ok(Response::new(proto::GetServiceRouteSnapshotResponse {
+            snapshot: Some(proto::ServiceRouteSnapshot::default()),
+        }))
+    }
+    type WatchServiceRoutesStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::WatchServiceRoutesResponse, Status>>;
+    async fn watch_service_routes(
+        &self,
+        _: tonic::Request<proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+}
+
 /// Spin up the mock gateway, return its endpoint URL.
 async fn start_mock(state: Arc<MockState>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let endpoint = format!("http://{addr}");
     let stream = TcpListenerStream::new(listener);
+    let updates = SandboxUpdatesServer::new(TestOpenShell {
+        state: state.clone(),
+    });
+    let discovery = proto::service_discovery_server::ServiceDiscoveryServer::new(TestOpenShell {
+        state: state.clone(),
+    });
     let svc = OpenShellServer::new(TestOpenShell { state });
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(svc)
+            .add_service(updates)
+            .add_service(discovery)
             .serve_with_incoming(stream)
             .await;
     });
@@ -2369,6 +2436,117 @@ async fn raw_grpc_fresh_refreshes_before_raw_call() {
         1,
         "raw_grpc_fresh must refresh the near-expiry token exactly once"
     );
+}
+
+#[tokio::test]
+async fn raw_sandbox_updates_shares_transport_and_live_auth_slot() {
+    let state = Arc::new(MockState {
+        require_bearer: Some("Bearer fresh-token".to_string()),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let mut config = ClientConfig::new(&endpoint);
+    config.auth = Some(AuthConfig::Oidc {
+        token: "stale-token".to_string(),
+        expires_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 5,
+        ),
+        refresh: Some(Arc::new(OneShotRefresher {
+            calls: calls.clone(),
+        })),
+    });
+    let client = OpenShellClient::connect(config).await.unwrap();
+    let mut updates = client.raw_sandbox_updates();
+    let request = proto::UpdateSandboxRequest {
+        workspace_scope: Some(proto::workspace_selector("team")),
+        name: "sandbox".into(),
+        image: Some("example/workload:new".into()),
+        expected_resource_version: 42,
+        request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        updates
+            .update_sandbox(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    client
+        .raw_sandbox_updates_fresh()
+        .await
+        .unwrap()
+        .update_sandbox(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Previously created raw clients read the same refreshed bearer slot.
+    updates.update_sandbox(request.clone()).await.unwrap();
+    client
+        .raw_grpc()
+        .health(proto::HealthRequest {})
+        .await
+        .unwrap();
+    assert_eq!(*state.last_update.lock().await, Some(request));
+}
+
+#[tokio::test]
+async fn raw_discovery_shares_transport_and_refreshes_the_live_auth_slot() {
+    let state = Arc::new(MockState {
+        require_bearer: Some("Bearer fresh-token".into()),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state).await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let mut config = ClientConfig::new(&endpoint);
+    config.auth = Some(AuthConfig::Oidc {
+        token: "stale-token".into(),
+        expires_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 5,
+        ),
+        refresh: Some(Arc::new(OneShotRefresher {
+            calls: calls.clone(),
+        })),
+    });
+    let client = OpenShellClient::connect(config).await.unwrap();
+    let mut discovery = client.raw_service_discovery();
+    let request = proto::GetServiceRouteSnapshotRequest {
+        workspace_scope: Some(proto::workspace_selector("team")),
+    };
+    assert_eq!(
+        discovery
+            .get_service_route_snapshot(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    client
+        .raw_service_discovery_fresh()
+        .await
+        .unwrap()
+        .get_service_route_snapshot(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    discovery.get_service_route_snapshot(request).await.unwrap();
+    client
+        .raw_grpc()
+        .health(proto::HealthRequest {})
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

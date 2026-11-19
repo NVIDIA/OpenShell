@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::accept_errors::{
+    RESOURCE_ERROR_BACKOFF, ResourceBackoffLogger, is_peer_reset, is_pending_network_error,
+    is_transient_resource_error,
+};
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::socket_registry::{
     InetFamily, InetKind, SocketIdentity, SocketMetadata, SocketRegistry, SocketState,
@@ -416,6 +420,118 @@ impl NetworkBroker {
     }
 }
 
+/// What the DNS TCP relay accept loop does with an accept error.
+#[derive(Debug, PartialEq, Eq)]
+enum DnsTcpAcceptErrorAction {
+    /// Retry immediately: the call was interrupted, or the peer reset before
+    /// the accepted connection could be served.
+    Skip,
+    /// Retry after a short backoff: transient resource exhaustion.
+    Backoff,
+    /// Unrecoverable: stop serving TCP DNS.
+    Stop,
+}
+
+fn dns_tcp_accept_error_action(error: &io::Error) -> DnsTcpAcceptErrorAction {
+    if error.kind() == io::ErrorKind::Interrupted
+        || is_peer_reset(error)
+        || is_pending_network_error(error)
+    {
+        DnsTcpAcceptErrorAction::Skip
+    } else if is_transient_resource_error(error) {
+        DnsTcpAcceptErrorAction::Backoff
+    } else {
+        DnsTcpAcceptErrorAction::Stop
+    }
+}
+
+/// Serve accepted DNS TCP streams until an unrecoverable accept error.
+///
+/// A transient resource error, or a peer that resets before its accept
+/// completes, must not stop the relay: TCP DNS keeps serving for the rest of
+/// the sandbox's life.
+fn dns_tcp_accept_loop(
+    address: SocketAddr,
+    mut accept: impl FnMut() -> io::Result<(TcpStream, SocketAddr)>,
+    tcp_admissions: Arc<Mutex<HashMap<SocketAddr, SocketIdentity>>>,
+    active_workers: Arc<AtomicUsize>,
+    pending: mpsc::Sender<PendingDnsQuery>,
+) {
+    // Warn once per exhaustion episode plus a bounded re-warn cadence, not on
+    // every backoff retry.
+    let mut resource_backoff_log = ResourceBackoffLogger::new();
+    loop {
+        let (stream, peer) = match accept() {
+            Ok(accepted) => {
+                resource_backoff_log.reset();
+                accepted
+            }
+            Err(error) => match dns_tcp_accept_error_action(&error) {
+                DnsTcpAcceptErrorAction::Skip => {
+                    tracing::debug!(%error, "skipping DNS TCP accept of a reset peer");
+                    continue;
+                }
+                DnsTcpAcceptErrorAction::Backoff => {
+                    if resource_backoff_log.should_log(&error) {
+                        tracing::warn!(
+                            %error,
+                            "DNS TCP accept hit a transient resource limit; retrying"
+                        );
+                    }
+                    std::thread::sleep(RESOURCE_ERROR_BACKOFF);
+                    continue;
+                }
+                DnsTcpAcceptErrorAction::Stop => {
+                    // Dual-emit: the relay stopping is a security finding
+                    // (an unavailable control), not just an operational one.
+                    openshell_ocsf::ocsf_emit!(
+                        openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(openshell_ocsf::ActivityId::Fail)
+                            .severity(openshell_ocsf::SeverityId::High)
+                            .status(openshell_ocsf::StatusId::Failure)
+                            .src_endpoint_addr(address.ip(), address.port())
+                            .connection_info(openshell_ocsf::ConnectionInfo::new("tcp"))
+                            .status_detail(error.to_string())
+                            .message("DNS TCP relay stopped serving; TCP DNS mediation unavailable")
+                            .build()
+                    );
+                    openshell_ocsf::ocsf_emit!(
+                        openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(openshell_ocsf::ActivityId::Open)
+                            .severity(openshell_ocsf::SeverityId::High)
+                            .confidence(openshell_ocsf::ConfidenceId::High)
+                            .is_alert(true)
+                            .finding_info(openshell_ocsf::FindingInfo::new(
+                                "sandbox-dns-tcp-relay-stopped",
+                                "Sandbox DNS TCP Relay Stopped",
+                            ))
+                            .message("DNS TCP relay stopped serving; TCP DNS mediation unavailable")
+                            .build()
+                    );
+                    return;
+                }
+            },
+        };
+        // One admission authorizes exactly one accepted TCP stream;
+        // no peer mapping needs to outlive this accept.
+        if lock(&tcp_admissions).remove(&peer).is_none() {
+            tracing::warn!(%peer, "dropping DNS stream from unregistered socket");
+            continue;
+        }
+        let Ok(worker_slot) = acquire_pending_dns_slot(&active_workers) else {
+            tracing::warn!(%peer, "dropping DNS stream because the worker quota is full");
+            continue;
+        };
+        let tcp_pending = pending.clone();
+        let _ = std::thread::Builder::new()
+            .name("openshell-dns-tcp-query".to_string())
+            .spawn(move || {
+                let _worker_slot = worker_slot;
+                serve_dns_tcp(stream, tcp_pending);
+            });
+    }
+}
+
 fn start_dns_relay(
     address: SocketAddr,
     pending: mpsc::Sender<PendingDnsQuery>,
@@ -476,31 +592,18 @@ fn start_dns_relay(
     std::thread::Builder::new()
         .name("openshell-dns-tcp".to_string())
         .spawn(move || {
-            for accepted in tcp.incoming() {
-                let Ok((stream, peer)) = accepted.and_then(|stream| {
-                    let peer = stream.peer_addr()?;
-                    Ok((stream, peer))
-                }) else {
-                    break;
-                };
-                // One admission authorizes exactly one accepted TCP stream;
-                // no peer mapping needs to outlive this accept.
-                if lock(&tcp_admissions).remove(&peer).is_none() {
-                    tracing::warn!(%peer, "dropping DNS stream from unregistered socket");
-                    continue;
-                }
-                let Ok(worker_slot) = acquire_pending_dns_slot(&tcp_active_workers) else {
-                    tracing::warn!(%peer, "dropping DNS stream because the worker quota is full");
-                    continue;
-                };
-                let tcp_pending = pending.clone();
-                let _ = std::thread::Builder::new()
-                    .name("openshell-dns-tcp-query".to_string())
-                    .spawn(move || {
-                        let _worker_slot = worker_slot;
-                        serve_dns_tcp(stream, tcp_pending);
-                    });
-            }
+            dns_tcp_accept_loop(
+                address,
+                || {
+                    tcp.accept().and_then(|(stream, _)| {
+                        let peer = stream.peer_addr()?;
+                        Ok((stream, peer))
+                    })
+                },
+                tcp_admissions,
+                tcp_active_workers,
+                pending,
+            );
         })
         .map_err(|error| io::Error::other(format!("start TCP DNS relay: {error}")))?;
     Ok(relay)
@@ -615,6 +718,9 @@ fn dispatch_notification(
             std::process::id(),
             &queues.workload_frozen,
         );
+    }
+    if crate::linux::process_sched::is_mediated(syscall) {
+        return crate::linux::process_sched::mediate_process_sched(&listener, notification);
     }
     if syscall == libc::SYS_socket {
         return create_socket(
@@ -1588,10 +1694,12 @@ fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let changed_flags = original_flags & libc::O_NONBLOCK == 0;
-    if changed_flags
-        && unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0
-    {
-        return Err(io::Error::last_os_error());
+    if changed_flags {
+        // SAFETY: F_SETFL operates on the live retained socket descriptor
+        // with the flag word read by the documented F_GETFL above.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     let result = with_sockaddr(address, |pointer, length| {
         // SAFETY: pointer/length describe a live native sockaddr and `fd` is
@@ -1609,8 +1717,8 @@ fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
             events: libc::POLLOUT,
             revents: 0,
         };
-        // SAFETY: poll points to one live pollfd.
         let timeout = i32::try_from(RELAY_CONNECT_TIMEOUT.as_millis()).map_err(io::Error::other)?;
+        // SAFETY: poll points to one live pollfd.
         if unsafe { libc::poll(&raw mut poll, 1, timeout) } <= 0 {
             return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
         }
@@ -1635,9 +1743,16 @@ fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
             Err(io::Error::from_raw_os_error(socket_error))
         }
     });
-    let restore = if changed_flags && unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) } < 0
-    {
-        Err(io::Error::last_os_error())
+    let restore = if changed_flags {
+        // SAFETY: F_SETFL restores the original flag word read by the
+        // documented F_GETFL; the restore runs even when the connect
+        // attempt failed.
+        let restore_result = unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) };
+        if restore_result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     } else {
         Ok(())
     };
@@ -1779,6 +1894,10 @@ fn error_to_errno(error: &io::Error) -> i32 {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests dial from the confined workload, where socket options are not under test"
+)]
 mod tests {
     use super::*;
     use crate::linux::socket_confinement;
@@ -2377,6 +2496,168 @@ mod tests {
             runtime
                 .block_on(pending.complete(TcpOpenDecision::RelayReady))
                 .is_err()
+        );
+    }
+
+    /// Runs `child` in a forked process and returns the bytes it writes to a
+    /// pipe. Assertions belong in the parent: a panic in the child would
+    /// unwind into a copy of the test harness.
+    #[allow(unsafe_code)]
+    fn fork_capture(child: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create probe pipe");
+        // SAFETY: fork isolates the rlimit and seccomp changes the callers
+        // make. The child writes one result and exits without running
+        // inherited destructors or the test harness.
+        match unsafe { nix::unistd::fork() }.expect("fork should succeed") {
+            nix::unistd::ForkResult::Child => {
+                drop(read_fd);
+                let result = child();
+                let _ = rustix::io::write(&write_fd, &result);
+                drop(write_fd);
+                // SAFETY: terminate the fork child without unwinding through
+                // the parent's test harness state.
+                unsafe { libc::_exit(0) };
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                drop(write_fd);
+                let mut result = Vec::new();
+                let mut buffer = [0_u8; 512];
+                loop {
+                    match rustix::io::read(&read_fd, &mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => result.extend_from_slice(&buffer[..read]),
+                        Err(error) if error == rustix::io::Errno::INTR => {}
+                        Err(error) => panic!("read probe result: {error}"),
+                    }
+                }
+                drop(read_fd);
+                match nix::sys::wait::waitpid(child, None).expect("waitpid should succeed") {
+                    nix::sys::wait::WaitStatus::Exited(_, 0) => {}
+                    status => panic!("probe child exited unexpectedly: {status:?}"),
+                }
+                result
+            }
+        }
+    }
+
+    #[test]
+    fn connect_exact_returns_a_failed_nonblocking_transition() {
+        // O_PATH descriptors support F_GETFL but reject F_SETFL with EBADF.
+        // That reaches the set-failure return without invalidating a
+        // descriptor that is also being connected.
+        let path = std::ffi::CString::new("/").expect("static path is NUL-free");
+        // SAFETY: path is a live NUL-terminated directory path; a successful
+        // open returns one newly owned descriptor.
+        let descriptor = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(
+            descriptor >= 0,
+            "open O_PATH: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: the successful open transferred ownership of the descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+
+        let error = connect_exact(descriptor.as_raw_fd(), "127.0.0.1:9".parse().unwrap())
+            .expect_err("an O_PATH descriptor rejects F_SETFL");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// Denies only the `F_SETFL` restore that `connect_exact` performs after a
+    /// bounded connect: the initial transition carries `O_NONBLOCK`, the restore
+    /// does not. The connect itself still succeeds, so the restore error is
+    /// the one the caller observes.
+    fn flag_restore_failure_filter() -> seccompiler::BpfProgram {
+        use seccompiler::{
+            SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+            SeccompRule,
+        };
+        use std::collections::BTreeMap;
+
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(
+            libc::SYS_fcntl,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        u64::from(libc::F_SETFL.cast_unsigned()),
+                    )
+                    .expect("valid fcntl command condition"),
+                    SeccompCondition::new(
+                        2,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::MaskedEq(u64::from(libc::O_NONBLOCK.cast_unsigned())),
+                        0,
+                    )
+                    .expect("valid fcntl flag condition"),
+                ])
+                .expect("valid fcntl rule"),
+            ],
+        );
+        let architecture = std::env::consts::ARCH
+            .try_into()
+            .expect("supported target architecture");
+        SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM.cast_unsigned()),
+            architecture,
+        )
+        .expect("build restore filter")
+        .try_into()
+        .expect("compile restore filter")
+    }
+
+    #[test]
+    fn connect_exact_returns_the_flag_restore_failure() {
+        // Nothing can invalidate the retained descriptor between the two fcntl
+        // calls, so a filter that denies only the restore transition is the
+        // way to reach the restore-failure arm.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let filter = flag_restore_failure_filter();
+        let result = fork_capture(move || {
+            // SAFETY: PR_SET_NO_NEW_PRIVS is a one-way scalar transition
+            // required before loading an unprivileged seccomp filter.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+                return i32::MIN.to_ne_bytes().to_vec();
+            }
+            if seccompiler::apply_filter(&filter).is_err() {
+                return i32::MIN.to_ne_bytes().to_vec();
+            }
+            // SAFETY: socket returns one newly owned descriptor on success.
+            let descriptor = unsafe {
+                libc::socket(
+                    libc::AF_INET,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    libc::IPPROTO_TCP,
+                )
+            };
+            if descriptor < 0 {
+                return i32::MIN.to_ne_bytes().to_vec();
+            }
+            // SAFETY: the successful socket call returned one owned descriptor.
+            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            match connect_exact(descriptor.as_raw_fd(), address) {
+                Ok(()) => 0_i32.to_ne_bytes().to_vec(),
+                Err(error) => error
+                    .raw_os_error()
+                    .unwrap_or(i32::MAX)
+                    .to_ne_bytes()
+                    .to_vec(),
+            }
+        });
+        let errno = i32::from_ne_bytes(
+            result
+                .try_into()
+                .expect("probe child writes one i32 status"),
+        );
+        assert_eq!(
+            errno,
+            libc::EPERM,
+            "restore failure must be returned to the caller"
         );
     }
 
@@ -3355,5 +3636,845 @@ mod tests {
             client.join().expect("join client").expect("DNS client"),
             [0, 3, 4, 5, 6]
         );
+    }
+
+    #[test]
+    fn dns_tcp_accept_errors_map_to_keep_serving_actions() {
+        for error in [
+            io::Error::from_raw_os_error(libc::EMFILE),
+            io::Error::from_raw_os_error(libc::ENFILE),
+        ] {
+            assert_eq!(
+                dns_tcp_accept_error_action(&error),
+                DnsTcpAcceptErrorAction::Backoff
+            );
+        }
+        for error in [
+            io::Error::new(io::ErrorKind::Interrupted, "interrupted"),
+            io::Error::from_raw_os_error(libc::ECONNABORTED),
+            io::Error::from_raw_os_error(libc::ENOTCONN),
+            io::Error::from_raw_os_error(libc::EPROTO),
+            io::Error::from_raw_os_error(libc::ENETUNREACH),
+        ] {
+            assert_eq!(
+                dns_tcp_accept_error_action(&error),
+                DnsTcpAcceptErrorAction::Skip
+            );
+        }
+        assert_eq!(
+            dns_tcp_accept_error_action(&io::Error::from_raw_os_error(libc::EBADF)),
+            DnsTcpAcceptErrorAction::Stop
+        );
+    }
+
+    #[test]
+    fn dns_tcp_relay_stop_emits_network_failure_and_finding() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _capture = capture.install();
+        let address = SocketAddr::from(([127, 0, 0, 1], 1053));
+        let error = io::Error::from_raw_os_error(libc::EBADF);
+        let (pending, _pending_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
+
+        dns_tcp_accept_loop(
+            address,
+            || Err(io::Error::from_raw_os_error(libc::EBADF)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicUsize::new(0)),
+            pending,
+        );
+
+        let events = capture.json_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["class_uid"], 4001);
+        assert_eq!(events[0]["activity_id"], 4);
+        assert_eq!(events[0]["status_id"], 2);
+        assert_eq!(events[0]["src_endpoint"]["ip"], "127.0.0.1");
+        assert_eq!(events[0]["src_endpoint"]["port"], 1053);
+        assert_eq!(events[0]["connection_info"]["protocol_name"], "tcp");
+        assert_eq!(events[0]["status_detail"], error.to_string());
+        assert_eq!(events[1]["class_uid"], 2004);
+        assert_eq!(events[0]["message"], events[1]["message"]);
+        assert_eq!(
+            events[1]["finding_info"]["uid"],
+            "sandbox-dns-tcp-relay-stopped"
+        );
+    }
+
+    #[test]
+    fn dns_tcp_relay_survives_transient_accept_errors() {
+        use std::io::{Read as _, Write as _};
+
+        // A real accepted TCP pair, so the loop serves an actual stream.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay peer");
+        let address = listener.local_addr().expect("relay address");
+        let mut client = TcpStream::connect(address).expect("connect client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let (stream, peer) = listener.accept().expect("accept client");
+
+        let tcp_admissions = Arc::new(Mutex::new(HashMap::new()));
+        lock(&tcp_admissions).insert(
+            peer,
+            SocketIdentity {
+                listener_generation: 0,
+                inode: 0,
+                cookie: 0,
+            },
+        );
+        let (pending_tx, mut pending_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
+        let mut accepts = 0_u32;
+        let mut stream = Some(stream);
+        let relay = std::thread::spawn(move || {
+            dns_tcp_accept_loop(
+                address,
+                || {
+                    accepts += 1;
+                    match accepts {
+                        1 => Err(io::Error::from_raw_os_error(libc::EMFILE)),
+                        2 => Err(io::Error::from_raw_os_error(libc::ECONNABORTED)),
+                        3 => Ok((
+                            stream
+                                .take()
+                                .expect("accept source served its stream twice"),
+                            peer,
+                        )),
+                        4 => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                        _ => panic!("DNS TCP accept loop kept accepting past its stop error"),
+                    }
+                },
+                tcp_admissions,
+                Arc::new(AtomicUsize::new(0)),
+                pending_tx,
+            );
+        });
+
+        // Both earlier accept errors were survived: the query still round-trips.
+        client
+            .write_all(&[0, 3, b'a', b'b', b'c'])
+            .expect("write DNS query");
+        let query = pending_rx
+            .blocking_recv()
+            .expect("relay queued the DNS query after transient accept errors");
+        assert_eq!(query.request, [0, 3, b'a', b'b', b'c']);
+        query
+            .response
+            .send(Ok(vec![0, 2, 0x01, 0x02]))
+            .expect("answer the DNS query");
+        let mut answer = [0_u8; 4];
+        client.read_exact(&mut answer).expect("read DNS answer");
+        assert_eq!(answer, [0, 2, 0x01, 0x02]);
+        relay.join().expect("accept loop thread panicked");
+    }
+
+    #[test]
+    fn dns_tcp_relay_survives_a_peer_that_resets_before_peer_addr() {
+        use std::io::{Read as _, Write as _};
+
+        // The accept source reproduces the production wiring of
+        // start_dns_relay: accept the stream, then resolve the peer with
+        // peer_addr, which fails once the peer reset while its connection
+        // was still queued.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay listener");
+        let address = listener.local_addr().expect("relay address");
+        let reset_client = socket2::Socket::new(
+            socket2::Domain::for_address(address),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("reset client socket");
+        reset_client
+            .connect(&address.into())
+            .expect("connect reset client");
+        // Zero linger makes the close an RST while the connection is still
+        // queued, which is what makes `peer_addr` fail with ENOTCONN.
+        reset_client
+            .set_linger(Some(Duration::ZERO))
+            .expect("zero linger");
+        drop(reset_client);
+        // Let the RST land before the accept loop starts, so the first
+        // accepted stream is the reset one.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut client = TcpStream::connect(address).expect("connect healthy client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let peer = client.local_addr().expect("healthy peer address");
+        let tcp_admissions = Arc::new(Mutex::new(HashMap::new()));
+        lock(&tcp_admissions).insert(
+            peer,
+            SocketIdentity {
+                listener_generation: 0,
+                inode: 0,
+                cookie: 0,
+            },
+        );
+        let (pending_tx, mut pending_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
+        let first_peer_addr_error = Arc::new(Mutex::new(None::<io::ErrorKind>));
+        let observed_error = first_peer_addr_error.clone();
+        // Test-only stop signal: once set, the accept source reports an
+        // unrecoverable error so the loop ends instead of leaking its thread.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_relay = stop.clone();
+        let relay = std::thread::spawn(move || {
+            dns_tcp_accept_loop(
+                address,
+                || {
+                    if stop_relay.load(Ordering::Relaxed) {
+                        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                    }
+                    listener
+                        .accept()
+                        .and_then(|(stream, _)| match stream.peer_addr() {
+                            Ok(peer) => Ok((stream, peer)),
+                            Err(error) => {
+                                *lock(&observed_error) = Some(error.kind());
+                                Err(error)
+                            }
+                        })
+                },
+                tcp_admissions,
+                Arc::new(AtomicUsize::new(0)),
+                pending_tx,
+            );
+        });
+
+        // The reset peer reached the production wiring: accept succeeded and
+        // peer_addr failed, so the loop must have hit its skip path.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&first_peer_addr_error).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let kind = lock(&first_peer_addr_error).expect("reset peer produced a peer_addr error");
+        assert_eq!(
+            kind,
+            io::ErrorKind::NotConnected,
+            "the reset peer's peer_addr error must be a skip-not-stop kind"
+        );
+
+        // The relay outlived the reset peer: the healthy query round-trips.
+        client
+            .write_all(&[0, 3, b'x', b'y', b'z'])
+            .expect("write DNS query");
+        let query = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), pending_rx.recv())
+                    .await
+                    .expect("relay queued the DNS query after the reset peer")
+                    .expect("pending DNS queue stayed open")
+            });
+        assert_eq!(query.request, [0, 3, b'x', b'y', b'z']);
+        query
+            .response
+            .send(Ok(vec![0, 2, 0x01, 0x02]))
+            .expect("answer the DNS query");
+        let mut answer = [0_u8; 4];
+        client.read_exact(&mut answer).expect("read DNS answer");
+        assert_eq!(answer, [0, 2, 0x01, 0x02]);
+        assert!(
+            !relay.is_finished(),
+            "the DNS TCP accept loop stopped after the reset peer"
+        );
+
+        // Stop the relay without leaking its thread into later tests.
+        stop.store(true, Ordering::Relaxed);
+        let _wakeup = TcpStream::connect(address).expect("wake the accept loop");
+        relay.join().expect("accept loop thread panicked");
+    }
+
+    /// Linux `struct rlimit64` used by the raw `prlimit64` probes.
+    #[repr(C)]
+    struct Rlimit64 {
+        current: u64,
+        maximum: u64,
+    }
+
+    /// Linux `struct sched_attr` version 0 used by the raw `sched_setattr` probe.
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        sched_policy: u32,
+        sched_flags: u64,
+        sched_nice: i32,
+        sched_priority: u32,
+        sched_runtime: u64,
+        sched_deadline: u64,
+        sched_period: u64,
+    }
+
+    /// Errno of one failed libc result, or `None` when it succeeded.
+    fn errno(result: libc::c_long) -> Option<i32> {
+        if result == -1 {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        }
+    }
+
+    /// Read one task's current nice value, distinguishing `-1` from an error.
+    ///
+    /// The selector is always `PRIO_PROCESS`.
+    ///
+    /// `getpriority` returns `-1` for both a valid nice level and a failure, so
+    /// `errno` decides. The caller must not feed an ambiguous failure into
+    /// `setpriority`, where it would surface as a mediation error instead.
+    fn read_priority(who: libc::id_t) -> Result<libc::c_int, i32> {
+        // SAFETY: `__errno_location` returns this thread's live errno storage
+        // and `getpriority` reads only scalar arguments.
+        unsafe {
+            *libc::__errno_location() = 0;
+            let nice = libc::getpriority(libc::PRIO_PROCESS, who);
+            let error = *libc::__errno_location();
+            if nice == -1 && error != 0 {
+                Err(error)
+            } else {
+                Ok(nice)
+            }
+        }
+    }
+
+    /// Run `operation` on a filtered launcher thread that a live broker serves.
+    ///
+    /// The launcher thread inherits the workload listener, so every mediated
+    /// syscall inside `operation` blocks until the broker answers it.
+    fn mediated<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> T {
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        launcher.execute(operation).expect("launcher result")
+    }
+
+    /// Re-apply the caller's current CPU affinity to `pid`.
+    ///
+    /// Re-applying the current mask always succeeds in the kernel and needs no
+    /// capability, so the result reports only whether mediation let the call
+    /// through.
+    fn affinity_errno(pid: libc::pid_t) -> Option<i32> {
+        // SAFETY: the mask is live storage of the declared size and the call
+        // runs on the launcher thread while the broker answers it.
+        unsafe {
+            let mut mask: libc::cpu_set_t = std::mem::zeroed();
+            let size = size_of::<libc::cpu_set_t>();
+            assert_eq!(
+                libc::sched_getaffinity(0, size, &raw mut mask),
+                0,
+                "sched_getaffinity: {}",
+                io::Error::last_os_error()
+            );
+            errno(libc::c_long::from(libc::sched_setaffinity(
+                pid,
+                size,
+                &raw const mask,
+            )))
+        }
+    }
+
+    /// Every mediated call re-applies the caller's current settings, read back
+    /// first, so the continued syscall changes nothing and needs no capability.
+    /// The `pid == 0` calls stay in the kernel and the named ones are continued
+    /// by the broker; both must succeed.
+    #[test]
+    fn scheduling_and_limit_calls_allow_the_callers_thread_group() {
+        let results = mediated(|| {
+            // SAFETY: all buffers passed to the kernel are live for the call
+            // and the launcher thread blocks until the broker answers.
+            unsafe {
+                let tid = libc::pid_t::try_from(libc::syscall(libc::SYS_gettid))
+                    .expect("thread ID fits pid_t");
+                let mut param: libc::sched_param = std::mem::zeroed();
+                assert_eq!(libc::sched_getparam(0, &raw mut param), 0);
+                let policy = libc::sched_getscheduler(0);
+                assert!(policy >= 0, "sched_getscheduler call failed");
+                let mut attr: SchedAttr = std::mem::zeroed();
+                attr.size = u32::try_from(size_of::<SchedAttr>()).expect("attribute size fits u32");
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_sched_getattr,
+                        0,
+                        &raw mut attr,
+                        size_of::<SchedAttr>(),
+                        0,
+                    ),
+                    0,
+                    "sched_getattr: {}",
+                    io::Error::last_os_error()
+                );
+                let mut limits = Rlimit64 {
+                    current: 0,
+                    maximum: 0,
+                };
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_prlimit64,
+                        0,
+                        libc::c_long::from(libc::RLIMIT_CORE),
+                        std::ptr::null::<Rlimit64>(),
+                        &raw mut limits,
+                    ),
+                    0,
+                    "prlimit64 query: {}",
+                    io::Error::last_os_error()
+                );
+                (
+                    affinity_errno(0),
+                    affinity_errno(tid),
+                    affinity_errno(libc::getpid()),
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        0,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        0,
+                        policy,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        0,
+                        &raw const attr,
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_prlimit64,
+                        0,
+                        libc::c_long::from(libc::RLIMIT_CORE),
+                        &raw const limits,
+                        std::ptr::null::<Rlimit64>(),
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_prlimit64,
+                        libc::getpid(),
+                        libc::c_long::from(libc::RLIMIT_CORE),
+                        &raw const limits,
+                        std::ptr::null::<Rlimit64>(),
+                    )),
+                )
+            }
+        });
+        assert_eq!(results, (None, None, None, None, None, None, None, None));
+    }
+
+    #[test]
+    fn setpriority_allows_the_callers_group() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (hold_tx, hold_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let sibling = std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments or side effects.
+            ready_tx
+                .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                .expect("report sibling tid");
+            let _ = hold_rx.recv();
+        });
+        let sibling_tid = libc::id_t::try_from(ready_rx.recv().expect("sibling tid"))
+            .expect("sibling tid fits id_t");
+        let results = mediated(move || {
+            // SAFETY: each call names a live task in the caller's thread group
+            // and re-applies that task's current nice value. A failed read
+            // fails the test here rather than masquerading as a filter error.
+            unsafe {
+                let leader_nice =
+                    read_priority(libc::getpid().cast_unsigned()).expect("read leader nice value");
+                let sibling_nice = read_priority(sibling_tid).expect("read sibling nice value");
+                let self_nice = read_priority(0).expect("read self nice value");
+                (
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        0,
+                        self_nice,
+                    ))),
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        libc::getpid().cast_unsigned(),
+                        leader_nice,
+                    ))),
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        sibling_tid,
+                        sibling_nice,
+                    ))),
+                )
+            }
+        });
+        drop(hold_tx);
+        sibling.join().expect("join sibling");
+        assert_eq!(results, (None, None, None));
+    }
+
+    /// A call that names only the caller never reaches the broker.
+    ///
+    /// No broker serves this listener. A watcher answers ENOSYS to whatever
+    /// the filter notifies, so a `pid == 0` call that left the native path
+    /// fails here instead of hanging. A group selector and a named target must
+    /// still be notified, or the filter would let them run unchecked.
+    #[test]
+    fn caller_only_scheduling_and_limit_calls_stay_in_the_kernel() {
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let (notified_tx, notified_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(notification) = listener.receive() {
+                let _ = notified_tx.send(i64::from(notification.syscall));
+                let _ = listener.respond_errno(notification.id, libc::ENOSYS);
+            }
+        });
+        let results = launcher
+            .execute(|| {
+                // SAFETY: all buffers passed to the kernel are live for the
+                // call, and every native call re-applies settings read back
+                // from this launcher thread.
+                unsafe {
+                    let tid = libc::pid_t::try_from(libc::syscall(libc::SYS_gettid))
+                        .expect("thread ID fits pid_t");
+                    let mut param: libc::sched_param = std::mem::zeroed();
+                    assert_eq!(libc::sched_getparam(0, &raw mut param), 0, "sched_getparam");
+                    let policy = libc::sched_getscheduler(0);
+                    assert!(policy >= 0, "sched_getscheduler");
+                    let mut attr: SchedAttr = std::mem::zeroed();
+                    attr.size =
+                        u32::try_from(size_of::<SchedAttr>()).expect("attribute size fits u32");
+                    assert_eq!(
+                        libc::syscall(
+                            libc::SYS_sched_getattr,
+                            0,
+                            &raw mut attr,
+                            size_of::<SchedAttr>(),
+                            0,
+                        ),
+                        0,
+                        "sched_getattr: {}",
+                        io::Error::last_os_error()
+                    );
+                    let mut limits = Rlimit64 {
+                        current: 0,
+                        maximum: 0,
+                    };
+                    assert_eq!(
+                        libc::syscall(
+                            libc::SYS_prlimit64,
+                            0,
+                            libc::c_long::from(libc::RLIMIT_CORE),
+                            std::ptr::null::<Rlimit64>(),
+                            &raw mut limits,
+                        ),
+                        0,
+                        "prlimit64 query: {}",
+                        io::Error::last_os_error()
+                    );
+                    let nice = read_priority(0).expect("read self nice value");
+                    (
+                        affinity_errno(0),
+                        errno(libc::c_long::from(libc::sched_setparam(
+                            0,
+                            &raw const param,
+                        ))),
+                        errno(libc::c_long::from(libc::sched_setscheduler(
+                            0,
+                            policy,
+                            &raw const param,
+                        ))),
+                        errno(libc::syscall(
+                            libc::SYS_sched_setattr,
+                            0,
+                            &raw const attr,
+                            0,
+                        )),
+                        errno(libc::syscall(
+                            libc::SYS_prlimit64,
+                            0,
+                            libc::c_long::from(libc::RLIMIT_CORE),
+                            &raw const limits,
+                            std::ptr::null::<Rlimit64>(),
+                        )),
+                        errno(libc::c_long::from(libc::setpriority(
+                            libc::PRIO_PROCESS,
+                            0,
+                            nice,
+                        ))),
+                        errno(libc::c_long::from(libc::setpriority(libc::PRIO_PGRP, 0, 0))),
+                        affinity_errno(tid),
+                    )
+                }
+            })
+            .expect("launcher result");
+        assert_eq!(
+            results,
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(libc::ENOSYS),
+                Some(libc::ENOSYS)
+            )
+        );
+        assert_eq!(
+            notified_rx.try_iter().collect::<Vec<_>>(),
+            [libc::SYS_setpriority, libc::SYS_sched_setaffinity]
+        );
+    }
+
+    #[test]
+    fn scheduling_and_limit_calls_deny_another_thread_group() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::pid_t::try_from(target.id()).expect("target PID fits pid_t");
+        let (affinity, limits) = mediated(move || {
+            // SAFETY: the target is this test's live disposable child, the
+            // affinity mask is the caller's own, and both limit pointers are
+            // null, so the continued call would only validate the target.
+            unsafe {
+                (
+                    affinity_errno(target_tgid),
+                    errno(libc::syscall(
+                        libc::SYS_prlimit64,
+                        target_tgid,
+                        libc::c_long::from(libc::RLIMIT_CORE),
+                        std::ptr::null::<Rlimit64>(),
+                        std::ptr::null::<Rlimit64>(),
+                    )),
+                )
+            }
+        });
+        let _ = target.kill();
+        let _ = target.wait();
+        assert_eq!(affinity, Some(libc::EPERM));
+        assert_eq!(limits, Some(libc::EPERM));
+    }
+
+    /// The broker resolves every `sched_set*` target against the caller's
+    /// thread group, not only affinity.
+    ///
+    /// Both halves run on one notification stream: the caller's own settings
+    /// are re-applied to its own TID, which is notified unlike `pid 0`, and to
+    /// a disposable child that shares the
+    /// test's real user ID. Each continued call would therefore succeed in the
+    /// kernel, so a syscall missing from the notified set lets the foreign call
+    /// through, and one missing from the dispatch match fails the self call.
+    #[test]
+    fn scheduling_calls_distinguish_own_and_foreign_thread_groups() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::pid_t::try_from(target.id()).expect("target PID fits pid_t");
+        let results = mediated(move || {
+            // SAFETY: the parameter, policy, and attributes are read back from
+            // the launcher thread, and every pointer is live for the call.
+            unsafe {
+                let mut param: libc::sched_param = std::mem::zeroed();
+                assert_eq!(libc::sched_getparam(0, &raw mut param), 0, "sched_getparam");
+                let policy = libc::sched_getscheduler(0);
+                assert!(policy >= 0, "sched_getscheduler");
+                let mut attr: SchedAttr = std::mem::zeroed();
+                attr.size = u32::try_from(size_of::<SchedAttr>()).expect("attribute size fits u32");
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_sched_getattr,
+                        0,
+                        &raw mut attr,
+                        size_of::<SchedAttr>(),
+                        0,
+                    ),
+                    0,
+                    "sched_getattr: {}",
+                    io::Error::last_os_error()
+                );
+                let tid = libc::pid_t::try_from(libc::syscall(libc::SYS_gettid))
+                    .expect("thread ID fits pid_t");
+                (
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        tid,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        tid,
+                        policy,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        tid,
+                        &raw const attr,
+                        0,
+                    )),
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        target_tgid,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        target_tgid,
+                        policy,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        target_tgid,
+                        &raw const attr,
+                        0,
+                    )),
+                )
+            }
+        });
+        let _ = target.kill();
+        let _ = target.wait();
+        assert_eq!(
+            results,
+            (
+                None,
+                None,
+                None,
+                Some(libc::EPERM),
+                Some(libc::EPERM),
+                Some(libc::EPERM)
+            )
+        );
+    }
+
+    #[test]
+    fn setpriority_denies_other_groups_and_group_selectors() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::id_t::try_from(target.id()).expect("target PID fits id_t");
+        let (process, group, user) = mediated(move || {
+            // SAFETY: scalar arguments only; the broker decides before the
+            // kernel resolves any of the targets.
+            unsafe {
+                (
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        target_tgid,
+                        0,
+                    ))),
+                    errno(libc::c_long::from(libc::setpriority(libc::PRIO_PGRP, 0, 0))),
+                    errno(libc::c_long::from(libc::setpriority(libc::PRIO_USER, 0, 0))),
+                )
+            }
+        });
+        let _ = target.kill();
+        let _ = target.wait();
+        assert_eq!(process, Some(libc::EPERM));
+        assert_eq!(group, Some(libc::EPERM));
+        assert_eq!(user, Some(libc::EPERM));
+    }
+
+    /// Invalid `setpriority` arguments keep the errno the kernel returns.
+    ///
+    /// An unknown selector is a usage error the kernel rejects with EINVAL, and
+    /// a negative PID names no process, so neither is a policy denial. Both
+    /// calls are decided by the broker before the kernel resolves a target.
+    #[test]
+    fn setpriority_reports_native_errno_for_invalid_arguments() {
+        let results = mediated(|| {
+            // SAFETY: scalar arguments only; the broker decides before any
+            // target is resolved, so no call can be applied to a task.
+            unsafe {
+                (
+                    errno(libc::syscall(
+                        libc::SYS_setpriority,
+                        42,
+                        libc::c_long::from(libc::getpid()),
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_setpriority,
+                        libc::c_long::from(libc::PRIO_PROCESS),
+                        -1,
+                        0,
+                    )),
+                )
+            }
+        });
+        assert_eq!(results, (Some(libc::EINVAL), Some(libc::ESRCH)));
+    }
+
+    /// A negative target keeps each mediated syscall's native errno.
+    ///
+    /// The `sched_setparam`/`sched_setscheduler`/`sched_setattr` trio rejects a
+    /// negative PID with EINVAL before any process lookup, while affinity,
+    /// priority, and limit calls fail their lookup with ESRCH. Both are usage
+    /// errors the broker must not turn into a policy denial.
+    #[test]
+    fn negative_targets_keep_each_syscalls_native_errno() {
+        let results = mediated(|| {
+            // SAFETY: scalar arguments and live stack buffers only; a negative
+            // target resolves to no task, so nothing is reconfigured.
+            unsafe {
+                let param: libc::sched_param = std::mem::zeroed();
+                let mut attr: SchedAttr = std::mem::zeroed();
+                attr.size = u32::try_from(size_of::<SchedAttr>()).expect("attribute size fits u32");
+                let mask: libc::cpu_set_t = std::mem::zeroed();
+                let mask_size = size_of::<libc::cpu_set_t>();
+                (
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        -1,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        -1,
+                        libc::SCHED_OTHER,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        libc::c_long::from(-1),
+                        &raw const attr,
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setaffinity,
+                        libc::c_long::from(-1),
+                        mask_size,
+                        &raw const mask,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_setpriority,
+                        libc::c_long::from(libc::PRIO_PROCESS),
+                        libc::c_long::from(-1),
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_prlimit64,
+                        libc::c_long::from(-1),
+                        0,
+                        0,
+                        0,
+                    )),
+                )
+            }
+        });
+        assert_eq!(
+            results,
+            (
+                Some(libc::EINVAL),
+                Some(libc::EINVAL),
+                Some(libc::EINVAL),
+                Some(libc::ESRCH),
+                Some(libc::ESRCH),
+                Some(libc::ESRCH),
+            )
+        );
+    }
+
+    #[test]
+    fn scheduling_calls_report_esrch_for_a_vanished_target() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::pid_t::try_from(target.id()).expect("target PID fits pid_t");
+        target.kill().expect("kill target");
+        target.wait().expect("reap target");
+        let result = mediated(move || affinity_errno(target_tgid));
+        assert_eq!(result, Some(libc::ESRCH));
     }
 }

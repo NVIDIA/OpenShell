@@ -221,7 +221,7 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=TIMEOUT,
             )
             log(f"client exited {result.returncode} for {server_url}")
-            body = {
+            body: dict[str, object] = {
                 "exit_code": result.returncode,
                 "stdout": result.stdout,
                 "stderr": result.stderr,

@@ -30,7 +30,7 @@ def read_workflow(name: str) -> dict:
 
 def test_release_workflows_sync_and_publish_docs_once() -> None:
     dev = read_workflow("release-dev.yml")
-    tag = read_workflow("release-publish.yml")
+    tag = read_workflow("release.yml")
     dev_job = dev["jobs"]["publish-fern-docs"]
     tag_job = tag["jobs"]["publish-fern-docs"]
 
@@ -38,7 +38,6 @@ def test_release_workflows_sync_and_publish_docs_once() -> None:
         "compute-versions",
         "release-dev",
         "release-helm",
-        "trigger-wheel-publish",
     ]
     assert dev_job["uses"] == "./.github/workflows/sync-docs.yml"
     assert dev_job["with"]["channel"] == "dev"
@@ -51,19 +50,20 @@ def test_release_workflows_sync_and_publish_docs_once() -> None:
     assert "availability" not in dev_job["with"]
 
     assert tag_job["needs"] == [
-        "release",
-        "publish-sdk-typescript",
-        "trigger-wheel-publish",
+        "build",
+        "publish",
     ]
     assert tag_job["uses"] == "./.github/workflows/sync-docs.yml"
     assert tag_job["with"]["channel"] == "stable"
-    assert tag_job["with"]["release_version"] == "${{ inputs.semver }}"
-    assert tag_job["with"]["version_slug"] == "v${{ inputs.semver }}"
-    assert tag_job["with"]["display_name"] == "Latest (v${{ inputs.semver }})"
+    assert tag_job["with"]["release_version"] == "${{ needs.build.outputs.semver }}"
+    assert tag_job["with"]["version_slug"] == "v${{ needs.build.outputs.semver }}"
+    assert (
+        tag_job["with"]["display_name"] == "Latest (v${{ needs.build.outputs.semver }})"
+    )
     assert tag_job["with"]["publish"] == "true"
-    assert tag_job["if"] == "${{ !inputs.is-prerelease }}"
+    assert "publish-fern-docs" not in read_workflow("release-publish.yml")["jobs"]
 
-    for workflow_name in ("release-dev.yml", "release-publish.yml"):
+    for workflow_name in ("release-dev.yml", "release.yml"):
         workflow_path = (
             Path(__file__).resolve().parents[2]
             / ".github"

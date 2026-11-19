@@ -106,6 +106,7 @@ fn probe_accept_inherits_binding() -> io::Result<()> {
         };
         confine_to_loopback(&listener)
             .map_err(|error| probe_error("confine probe listener", &error))?;
+        #[allow(clippy::disallowed_methods, reason = "probe stream carries no data")]
         let _client = std::net::TcpStream::connect(listener.local_addr()?)?;
         let (accepted, _) = listener.accept()?;
         if bound_device(&accepted)?.as_deref() != Some(LOOPBACK_DEVICE) {

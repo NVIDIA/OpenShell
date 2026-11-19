@@ -29,6 +29,7 @@ openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-mid
 openshell-supervisor-network = { path = "../openshell-supervisor-network", default-features = false }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
+axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
@@ -70,10 +71,7 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 bytes = { workspace = true }
-http = { workspace = true }
 http-body-util = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = "0.3"

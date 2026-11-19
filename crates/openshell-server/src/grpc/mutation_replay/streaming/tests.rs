@@ -4,8 +4,8 @@
 use super::*;
 use crate::grpc::mutation_replay::tests::{reason, state_for};
 use crate::grpc::mutation_replay::{
-    Admission, AuthorizationBarrier, Completion, OBJECT_TYPE, OriginalMutation, SUCCESS_TTL_MS,
-    fingerprint, run,
+    Admission, AuthorizationBarrier, Completion, OBJECT_TYPE, OriginalMutation, fingerprint,
+    replay_window_ms, run,
 };
 use crate::grpc::test_support::authed_request;
 use crate::persistence::{ObjectType, WriteCondition, current_time_ms};
@@ -323,7 +323,7 @@ async fn timeout_and_lost_exit_status_never_finalize_or_expire_pending_launches(
     );
     let mut admission: Admission = serde_json::from_slice(&owner.admission).unwrap();
     assert!(admission.success.is_none());
-    admission.completed_at_ms = Some(current_time_ms() - SUCCESS_TTL_MS - 1);
+    admission.completed_at_ms = Some(current_time_ms() - replay_window_ms(&state.config) - 1);
     state
         .store
         .put_if(

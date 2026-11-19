@@ -191,6 +191,21 @@ stays `Ready` through a graceful handoff. Supervisors reconnect with
 exponential backoff that restarts after each accepted session, so repeated
 gateway restarts do not lengthen later reconnects.
 
+A sandbox on a shared supervisor keeps its session on the gateway replica that
+serves its supervisor, and reconnects there when the supervisor moves to
+another replica.
+
+Shared supervisors spread across gateway replicas. A supervisor that starts,
+restarts, or loses its replica goes to the first replica on the gateway ring
+that serves fewer than its even share of supervisors, and a stopping replica
+hands its supervisors over the same way. Spreading is best effort: each
+replica places supervisors on its own, so after many supervisors reconnect at
+once a replica can serve about 20% more than its share until they reconnect
+again. A supervisor that reconnects after a
+token refresh or a short interruption stays on its replica, and supervisors
+never move when a replica joins, so a replica added without a rollout fills
+only as supervisors restart.
+
 Established streams do not move between gateway replicas. An interrupted exec,
 forwarding, or service stream must reconnect. File sync retries with a new SSH
 session instead of resuming the interrupted byte stream. Rolling updates can
@@ -208,6 +223,7 @@ configuration, and access control.
 | Signal | Metrics | Use |
 |---|---|---|
 | Sessions per replica | `openshell_server_supervisor_sessions` | Placement and skew. Do not scale on it. |
+| Shared supervisors per replica | `openshell_server_supervisor_hosts`, `openshell_server_supervisor_host_instances_max` | Supervisor spread across replicas, and the busiest supervisor's sandbox count against the 256 per-supervisor limit. |
 | Relay utilization | `openshell_server_relay_pending`, `openshell_server_relay_pending_capacity` | Graph it. It is transient and usually near 0, so alert on rejections instead. |
 | Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
 | Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds are missing from the histogram and count as expired, so alert on any increase. |
@@ -481,9 +497,13 @@ fleet. Sandbox start, stop, and delete lock only on the replica that runs them,
 and only a gateway-global change on that replica blocks them directly.
 Provider, workspace-profile, and other replicas' gateway-global changes delay
 them only while another operation on the same sandbox waits behind the change.
-Sandbox create, start, restart, and delete also take one fleet-wide lock while
-they provision or remove the sandbox's SSH host identity, so that step runs for
-one sandbox at a time across all replicas. For other
+Sandbox create, start, restart, and delete also lock the sandbox's SSH host
+identity while they provision or remove it, so that step runs for different
+sandboxes at once. During a rollout, replicas from an earlier release still
+take a fleet-wide lock for that step, so it can wait on other sandboxes' steps
+until the rollout finishes. Each replica runs at most half of
+`database_max_connections` of these steps and provider refreshes at once, and a
+step that can't start within 10 seconds returns `UNAVAILABLE`. For other
 mutations, a lock wait longer than 10 seconds returns `UNAVAILABLE` with the
 reason `MUTATION_LOCK_TIMEOUT`, and clients can retry the request. A request
 that carried a `request_id` leaves its admission unresolved, like any other
@@ -503,6 +523,45 @@ While gateways from the earlier release and the new release run together
 during the upgrade, the older replicas serialize every mutation across the
 fleet. Mutations can be slower and can briefly fail under load until the
 rollout finishes.
+
+### Activate Sandbox Updates
+
+Sandbox configuration updates default to disabled. Setting
+`[openshell.gateway] enable_sandbox_updates = true` is an operator
+attestation that the deployment uniformly supports the image-update protocol.
+Use this sequence before activating the
+[separate update service](/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox).
+
+1. Keep the setting false throughout the rolling upgrade. Drain and retire
+   every incompatible gateway, including unregistered processes and Jobs, and
+   settle all outstanding driver operations they started. A completed
+   Kubernetes rollout alone does not establish this.
+2. Prevent incompatible gateways from returning. Pin compatible images and
+   retire old rollback targets, Jobs, and other launch configurations that could
+   reconnect to the database.
+3. Confirm live gateway membership records advertise sandbox-update protocol 1.
+   Missing or incompatible capabilities, malformed records, and truncated
+   membership reads reject updates. These observations are not durable proof
+   of fleet compatibility. Expiry or absence of a membership record does not
+   prove that its process and driver work have stopped.
+4. Activate the flag only after completing retirement and preventing old
+   gateways from returning. See the exact
+   [TOML, environment, process flag, and Helm forms](/how-it-works/gateways/configuration#sandbox-updates).
+
+A pending image update atomically sets the existing
+`provisioning.driver_operation_pending` and `provisioning.driver_operation_id`
+fields alongside private image intent. Start, stop, and provisioning-retry paths honor this per-sandbox barrier, including after a
+legacy public record round-trip. Successful reconciliation preserves current
+provisioning diagnostics and clocks, clears the pending flag, and retains the
+new operation ID to fence delayed callbacks. Previously absent provisioning
+remains absent unless concurrent writes added diagnostics or clocks. This
+barrier does not replace the deployment activation checklist.
+Image intent and revision are not new public `SandboxStatus` fields.
+
+Do not downgrade while updates are pending or retained sandboxes require the
+private revision protocol. SQLite supports one gateway process only. For a
+SQLite gateway, activation attests that the old process has stopped; a shared
+SQLite file is not an HA deployment.
 
 ## (Experimental) Multi-tenant supervisor
 

@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Opt-in fixture. Provision openshell-app-tls and an app-ingress NetworkPolicy
+# before sending traffic. This does not deploy discovery or a proxy.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+  openshell.supervisor.app_listener:
+    enabled: true
+    port: 9443
+    domain: services.example.com
+  openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+    tls_secret_name: openshell-app-tls

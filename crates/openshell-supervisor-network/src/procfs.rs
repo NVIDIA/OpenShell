@@ -901,12 +901,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_tcp_peer_socket_owners_returns_all_descendant_socket_holders() {
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let proxy_addr = listener.local_addr().unwrap();
-        let stream = TcpStream::connect(proxy_addr).expect("connect");
+        let stream =
+            openshell_core::net::connect_std_tcp_nodelay_best_effort(proxy_addr).expect("connect");
         let workload_addr = stream.local_addr().unwrap();
         let connection = WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");

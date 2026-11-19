@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Portable dashboard generation and structural checks; no telemetry stack.
+
+["monitoring:deps"]
+description = "Install the monitoring mixin's locked Grafonnet dependencies"
+dir = "deploy/openshell-mixin"
+tools = { go = "1.26.7", "go:github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb" = "0.6.0" }
+run = "jb install"
+
+["monitoring:generate"]
+description = "Render OpenShell Grafana dashboards and empty rule exports"
+dir = "deploy/openshell-mixin"
+tools = { go = "1.26.7", "go:github.com/google/go-jsonnet/cmd/jsonnet" = "0.22.0" }
+depends = ["monitoring:deps"]
+run = '''
+set -eu
+mixin="${MIXIN:-mixin.libsonnet}"
+out="${OUT:-build}"
+mkdir -p "$out/dashboards"
+jsonnet -J vendor -m "$out/dashboards" -e "(import \"$mixin\").grafanaDashboards"
+jsonnet -J vendor -S -e "std.manifestYamlDoc((import \"$mixin\").prometheusAlerts)" > "$out/prometheus_alerts.yaml"
+jsonnet -J vendor -S -e "std.manifestYamlDoc((import \"$mixin\").prometheusRules)" > "$out/prometheus_rules.yaml"
+'''
+
+["monitoring:format"]
+description = "Format the OpenShell monitoring mixin"
+dir = "deploy/openshell-mixin"
+tools = { go = "1.26.7", "go:github.com/google/go-jsonnet/cmd/jsonnetfmt" = "0.22.0" }
+run = "jsonnetfmt -i *.libsonnet dashboards/*.libsonnet examples/*.jsonnet"
+
+["monitoring:format:check"]
+description = "Check OpenShell monitoring mixin formatting"
+dir = "deploy/openshell-mixin"
+tools = { go = "1.26.7", "go:github.com/google/go-jsonnet/cmd/jsonnetfmt" = "0.22.0" }
+run = "jsonnetfmt --test *.libsonnet dashboards/*.libsonnet examples/*.jsonnet"
+
+["monitoring:test"]
+description = "Check dashboard exports, portability, and configuration overrides"
+dir = "deploy/openshell-mixin"
+tools = { go = "1.26.7", "go:github.com/google/go-jsonnet/cmd/jsonnet" = "0.22.0", "go:github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb" = "0.6.0" }
+depends = ["monitoring:deps"]
+run = "uv run --no-project --with promql-parser==0.12.0 python tests/test_mixin.py"
+
+["monitoring:check"]
+description = "Check and render the OpenShell monitoring mixin"
+depends = ["monitoring:format:check", "monitoring:test", "monitoring:generate"]

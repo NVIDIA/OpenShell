@@ -16,8 +16,10 @@ use http::StatusCode;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
-    ActivityId, HttpActivityBuilder, HttpRequest, SeverityId, StatusId, ocsf_emit,
+    ActionId, ActivityId, DispositionId, HttpActivityBuilder, HttpRequest, SeverityId, StatusId,
 };
+
+use crate::telemetry::egress_emit;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 type MetadataResponse = (u16, &'static str, String);
@@ -311,7 +313,7 @@ fn emit_metadata_event(
     status: StatusId,
     message: &str,
 ) {
-    ocsf_emit!(build_metadata_event(
+    egress_emit!(build_metadata_event(
         method,
         response_code,
         severity,
@@ -327,7 +329,7 @@ fn build_metadata_event(
     status: StatusId,
     message: &str,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut builder = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::for_http_method(method))
         .http_request(HttpRequest {
             http_method: method.parse().expect("HTTP method parsing is infallible"),
@@ -338,14 +340,39 @@ fn build_metadata_event(
         })
         .severity(severity)
         .status(status)
-        .message(message.to_string())
-        .build()
+        .message(message.to_string());
+    if matches!(response_code, 403 | 405) {
+        builder = builder
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked);
+    }
+    builder.build()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_rejections_have_deny_traces_but_operational_failures_do_not() {
+        use crate::telemetry::tests::{assert_deny_resolves, exported};
+
+        let (events, received) = exported("warn", || {
+            let ctx = make_context(HashMap::new());
+            route_request(&ctx, "GET", PATH_TOKEN, &[]);
+            route_request(&ctx, "POST", PATH_TOKEN, &flavor_headers());
+            route_request(&ctx, "GET", "/unknown", &flavor_headers());
+            route_request(&ctx, "GET", PATH_TOKEN, &flavor_headers());
+        })
+        .await;
+        assert_eq!(events.len(), 4);
+        assert_deny_resolves(&events[..2], &received, true);
+        for event in &events[2..] {
+            assert!(event.get("trace").is_none());
+        }
+        assert_eq!(received.spans.len(), 2);
+    }
 
     fn token_binding() -> openshell_core::proto::StaticCredentialBinding {
         openshell_core::proto::StaticCredentialBinding {

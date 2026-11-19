@@ -28,6 +28,32 @@ MAX_SLEEP_SECONDS=86400
 [[ -f "$PROMPT_FILE" ]] || { echo "missing agent prompt: $PROMPT_FILE" >&2; exit 1; }
 [[ -x "$ADAPTER" ]] || { echo "missing harness adapter: $ADAPTER" >&2; exit 1; }
 
+# Capture the run assignment once in supervisor memory. Do not write it to the
+# image or a writable prompt file that a review cycle could alter for later
+# cycles. Replacement is single-pass: task text is data, not another template.
+AGENT_PROMPT_CONTENT="$(node - "$PROMPT_FILE" <<'NODE'
+const fs = require("fs");
+const values = {
+  HARNESS: process.env.OPENSHELL_AGENT_HARNESS,
+  RUN_MODE: process.env.OPENSHELL_AGENT_RUN_MODE || "once",
+  POLL_INTERVAL_SECONDS: process.env.OPENSHELL_AGENT_POLL_INTERVAL_SECONDS || "900",
+  USER_PROMPT: process.env.OPENSHELL_AGENT_TASK,
+};
+const template = fs.readFileSync(process.argv[2], "utf8");
+const prompt = template.replace(/\{\{([A-Z0-9_]+)\}\}/g, (_, key) => {
+  if (!Object.hasOwn(values, key) || !values[key]) {
+    throw new Error(`Missing or unsupported runtime prompt variable: ${key}`);
+  }
+  return values[key];
+});
+process.stdout.write(prompt);
+NODE
+)"
+readonly AGENT_PROMPT_CONTENT
+# The harness receives the assembled instructions on stdin, not through its
+# environment. The long-lived supervisor retains the original assignment.
+unset OPENSHELL_AGENT_TASK
+
 case "$RUN_MODE" in
     once|watch) ;;
     *) echo "unsupported agent run mode: $RUN_MODE" >&2; exit 2 ;;
@@ -283,7 +309,7 @@ run_cycle() {
     fi
 
     set +e
-    bash "$ADAPTER" "$PROMPT_FILE" 2>&1 | tee "$output_file"
+    bash "$ADAPTER" /dev/stdin <<< "$AGENT_PROMPT_CONTENT" 2>&1 | tee "$output_file"
     local status=${PIPESTATUS[0]}
     set -e
 

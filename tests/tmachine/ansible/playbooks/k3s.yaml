@@ -8,7 +8,7 @@
   gather_facts: false
   vars:
     helm_version: 4.2.0
-    k3s_version: 1.29.15+k3s1
+    k3s_version: 1.33.13+k3s2
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -21,10 +21,12 @@
         state: present
         update_cache: true
 
+    # get.k3s.io serves the latest script, so pin the one from the k3s_version
+    # release tag. Update the checksum whenever k3s_version changes.
     - name: Download K3s installer
       ansible.builtin.get_url:
-        url: https://get.k3s.io
-        checksum: sha256:e5cc3b3d9dfc1662c2d9be6da5abc9a4cd317d6abc3a5ffc02e3dd3248207fee
+        url: "https://raw.githubusercontent.com/k3s-io/k3s/v{{ k3s_version | urlencode }}/install.sh"
+        checksum: sha256:9ca7930c31179d83bc13de20078fd8ad3e1ee00875b31f39a7e524ca4ef7d9de
         dest: /tmp/install-k3s.sh
         mode: "0755"
 
@@ -69,3 +71,31 @@
         creates: /usr/local/bin/helm
       environment:
         DESIRED_VERSION: "v{{ helm_version }}"
+
+    # This layer is cached across runs, so it must not carry cluster
+    # credentials: every disk built on it would share one CA, token and admin
+    # kubeconfig. Stop K3s and delete the state it created on first start,
+    # keeping the containerd image store (agent/containerd) and the K3s data
+    # directory. The next start generates fresh credentials.
+    - name: Stop K3s and its containers
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s-killall.sh]
+      changed_when: true
+
+    - name: Remove the K3s credentials and cluster state
+      ansible.builtin.shell: |
+        set -eu
+        cd /var/lib/rancher/k3s
+        rm -rf server/tls server/cred server/db server/token server/agent-token server/node-token
+        find agent -maxdepth 1 -type f \( -name '*.crt' -o -name '*.key' -o -name '*.kubeconfig' \) -delete
+        rm -rf /etc/rancher/node/password /etc/rancher/k3s/k3s.yaml /var/lib/kubelet/pods /var/lib/cni
+      changed_when: true
+
+    - name: Check no K3s credentials remain
+      ansible.builtin.shell: |
+        find /var/lib/rancher/k3s/server /var/lib/rancher/k3s/agent /etc/rancher/k3s /etc/rancher/node \
+          -maxdepth 1 \( -name '*.crt' -o -name '*.key' -o -name '*.kubeconfig' -o -name token -o -name password \
+             -o -name 'k3s.yaml' -o -name '*.db' -o -name tls -o -name cred \) -print
+      register: k3s_leftover_credentials
+      changed_when: false
+      failed_when: k3s_leftover_credentials.stdout | length > 0

@@ -1149,8 +1149,8 @@ impl CredentialRefreshProfile {
 /// Whether the gateway can mint credentials for this refresh strategy (as
 /// opposed to strategies resolved elsewhere, e.g. `Static`/`External`).
 ///
-/// Single source of truth shared with `openshell-server`; keep in sync with the
-/// dispatch in `provider_refresh::mint_credential`.
+/// Profile capability predicate. Gateway parity tests keep this aligned with the
+/// embedded issuer's built-in minter registry without a catalog dependency.
 #[must_use]
 pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
     matches!(
@@ -2759,6 +2759,7 @@ pub fn validate_profile_set(
             }
 
             let l7_fields = L7EndpointFields {
+                websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
                 protocol: &endpoint.protocol,
                 access: &endpoint.access,
                 has_rules: endpoint.rules.as_ref().is_some_and(|r| !r.is_empty()),
@@ -6328,6 +6329,42 @@ binaries: ["", /usr/bin/broken]
                 .any(|message| message.starts_with("invalid endpoint"))
         );
         assert!(messages.contains(&"binary path must not be empty"));
+    }
+
+    #[test]
+    fn validate_profile_rejects_rest_websocket_credential_rewrite() {
+        for protocol in ["rest", "REST", "Rest"] {
+            let profile = parse_profile_yaml(
+                r"
+id: rest-rewrite
+display_name: REST rewrite
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-only
+    websocket_credential_rewrite: true
+binaries:
+  - /usr/bin/curl
+"
+                .replace("protocol: rest", &format!("protocol: {protocol}"))
+                .as_str(),
+            )
+            .unwrap();
+            let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("use protocol: websocket"))
+            );
+        }
     }
 
     #[test]

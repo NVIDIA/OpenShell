@@ -94,7 +94,6 @@ from sandbox runtimes)",
             std::path::Path::new("/var/log"),
             console_filter,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(std::sync::Mutex::new(String::new())),
         );
         tracing_subscriber::registry()
             .with(logging_layers)
@@ -126,6 +125,9 @@ from sandbox runtimes)",
                 instance_root,
                 runtime_listen,
                 removal_grace: openshell_supervisor_control::INSTANCE_REMOVAL_GRACE,
+                attach_request_timeout: std::time::Duration::from_secs(
+                    args.attach_request_timeout_seconds,
+                ),
                 pool,
             },
         )?;

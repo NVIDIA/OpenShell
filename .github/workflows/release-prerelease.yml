@@ -99,6 +99,7 @@ jobs:
     name: Preview Release Notes
     needs: [resolve, build]
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     uses: ./.github/workflows/release-notes.yml
@@ -114,7 +115,6 @@ jobs:
     permissions:
       actions: read
       contents: write
-      pull-requests: read
       packages: write
       id-token: write
       attestations: write
@@ -124,7 +124,6 @@ jobs:
       release-tag: ${{ needs.resolve.outputs.tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       semver: ${{ needs.build.outputs.semver }}
-      python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: true
     secrets:

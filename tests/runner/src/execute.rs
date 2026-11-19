@@ -7,7 +7,9 @@
 //!
 //! Tests find the gateway the way the CLI does, so the runner points them at
 //! the one the installer registered with `OPENSHELL_GATEWAY` and at the
-//! installed CLI with `OPENSHELL_BIN`.
+//! installed CLI with `OPENSHELL_BIN`. Anything else the environment provides,
+//! such as Keycloak, the tests learn from the variables it publishes (see
+//! [`crate::test_env`]).
 
 use std::fmt;
 use std::path::Path;
@@ -18,18 +20,20 @@ use anyhow::{Context, Result, ensure};
 use tmachine::Session;
 use tmachine::config::Config;
 
-use crate::bundle::{Bundle, PROFILE, READY_BINARY};
+use crate::bundle::{Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY};
+use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
-/// The nextest log's name, in the guest directory and in the results.
+/// The test log's name, in the guest directory and in the results. A program
+/// bundle's log keeps the name, so consumers of the results see one layout.
 const NEXTEST_LOG: &str = "nextest.log";
 /// How long the gateway has to become healthy after the environment is up.
 // Matches the installers' own wait: an HA k3s gateway booted from a cached
 // disk can take minutes to report healthy.
 const READY_TIMEOUT_SECS: u64 = 300;
-/// How long the nextest run may take in total. Individual tests are bounded
-/// by the nextest profile's slow-timeout; this catches a run that stops
-/// making progress some other way.
+/// How long the test run may take in total. Individual tests are bounded by
+/// the nextest profile's slow-timeout, or by a program's own `run --timeout`
+/// default; this catches a run that stops making progress some other way.
 const RUN_TIMEOUT: Duration = Duration::from_mins(45);
 /// Slack beyond the readiness check's own timeout for SSH and process start.
 const READY_SLACK: Duration = Duration::from_mins(1);
@@ -38,6 +42,9 @@ const READY_SLACK: Duration = Duration::from_mins(1);
 const NEXTEST_TEST_FAILED: i32 = 100;
 /// nextest's exit code when `--no-tests fail` found no tests to run.
 const NEXTEST_NO_TESTS_RUN: i32 = 4;
+/// A testkit program's exit code when a test failed. It exits 2 when tests
+/// could not run.
+const PROGRAM_TEST_FAILED: i32 = 1;
 /// How much of the end of the nextest log to print after a failure. nextest
 /// ends its output with a summary that names the failed tests.
 const LOG_TAIL_LINES: usize = 40;
@@ -88,6 +95,18 @@ impl Status {
             )),
         }
     }
+
+    /// The status of a testkit program's `run` that exited with `status`.
+    fn of_program(status: ExitStatus, log: &Path) -> Self {
+        match status.code() {
+            Some(0) => Self::Passed,
+            Some(PROGRAM_TEST_FAILED) => Self::Failed,
+            _ => Self::Error(format!(
+                "the test program exited with {status}; see {}",
+                log.display()
+            )),
+        }
+    }
 }
 
 impl fmt::Display for Status {
@@ -109,8 +128,9 @@ pub struct Run<'a> {
     /// The gateway name the installer registers with the CLI.
     pub gateway: &'a str,
     pub bundle: &'a Bundle,
-    /// A nextest filterset (`-E`) narrowing the tests in the bundle.
-    pub filter: Option<&'a str>,
+    /// Narrowing the tests in the bundle: nextest filtersets (`-E`) for a
+    /// nextest bundle, parts of test names for a program bundle.
+    pub filters: &'a [String],
     /// Where `junit.xml`, `nextest.log` and, after a failure, the guest's
     /// `diagnostics/` go.
     pub results: &'a Path,
@@ -225,6 +245,9 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         format!("OPENSHELL_GATEWAY={}", run.gateway),
         format!("OPENSHELL_BIN={openshell_bin}"),
     ];
+    test_env::check(session)
+        .await
+        .context("check the variables the environment publishes for tests")?;
 
     let guest = GUEST_DIR;
     checked(
@@ -238,15 +261,20 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
             .exec(&["mkdir", "-p", &format!("{guest}/extract")])
             .await?,
     )?;
+    let kind = run.bundle.kind();
 
     // A booted guest restarts its gateway, so wait for it once here rather
     // than in every test. Failing here is an environment error, not a test
     // failure.
+    let program = format!("{guest}/{PROGRAM_BINARY}");
     let ready_binary = format!("{guest}/{READY_BINARY}");
     let ready_timeout = READY_TIMEOUT_SECS.to_string();
     let mut ready = vec!["env"];
     ready.extend(env.iter().map(String::as_str));
-    ready.extend([ready_binary.as_str(), ready_timeout.as_str()]);
+    match kind {
+        Kind::Nextest => ready.extend([ready_binary.as_str(), ready_timeout.as_str()]),
+        Kind::Program => ready.extend([program.as_str(), "ready", "--timeout", &ready_timeout]),
+    }
     checked(
         "wait for the gateway",
         session
@@ -257,47 +285,89 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
             .await?,
     )?;
 
+    // A booted guest also restarts k3s and the Agent Sandbox controller, and
+    // a gateway that is healthy doesn't show the controller is reconciling.
+    if session
+        .exec(&["test", "-x", K3S_BINARY])
+        .await?
+        .status
+        .success()
+    {
+        checked(
+            "wait for the Agent Sandbox controller",
+            session
+                .exec_timeout(
+                    &["sudo", "-n", "bash", "-c", WAIT_K3S_CONTROLLER],
+                    WAIT_K3S_CONTROLLER_TIMEOUT,
+                )
+                .await?,
+        )?;
+    }
+
+    let junit = format!("{guest}/junit.xml");
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
-    let mut nextest = vec!["env"];
-    nextest.extend(env.iter().map(String::as_str));
-    nextest.extend([
-        "cargo-nextest",
-        "nextest",
-        "run",
-        "--archive-file",
-        &archive,
-        "--workspace-remap",
-        guest,
-        "--extract-to",
-        &extract,
-        "--extract-overwrite",
-        "--config-file",
-        &config,
-        "--profile",
-        PROFILE,
-        "--no-capture",
-        // Tests share one gateway and the guest has 4 GiB; run them serially
-        // whatever --no-capture implies.
-        "--test-threads",
-        "1",
-        "--no-tests",
-        "fail",
-    ]);
-    if let Some(filter) = run.filter {
-        nextest.extend(["-E", filter]);
+    let mut tests = vec!["env"];
+    tests.extend(env.iter().map(String::as_str));
+    match kind {
+        Kind::Nextest => {
+            tests.extend([
+                "cargo-nextest",
+                "nextest",
+                "run",
+                "--archive-file",
+                &archive,
+                "--workspace-remap",
+                guest,
+                "--extract-to",
+                &extract,
+                "--extract-overwrite",
+                "--config-file",
+                &config,
+                "--profile",
+                PROFILE,
+                "--no-capture",
+                // Tests share one gateway and the guest has 4 GiB; run them
+                // serially whatever --no-capture implies.
+                "--test-threads",
+                "1",
+                "--no-tests",
+                "fail",
+            ]);
+            for filter in run.filters {
+                tests.extend(["-E", filter]);
+            }
+        }
+        // The program runs its tests one at a time, and writes the report
+        // where `collect_results` looks for it.
+        Kind::Program => {
+            tests.extend([program.as_str(), "run", "--junit", &junit]);
+            // `run` takes name filters as arguments, after `--` so that one
+            // starting with a dash isn't read as an option.
+            if !run.filters.is_empty() {
+                tests.push("--");
+                tests.extend(run.filters.iter().map(String::as_str));
+            }
+        }
     }
     // nextest writes its output to a file in the guest, so a run that times
-    // out or loses SSH still leaves a log for `collect_results`.
+    // out or loses SSH still leaves a log for `collect_results`. The guest
+    // shell exports the published variables itself, so their values, which
+    // can be credentials, never appear in the command (or its errors).
     let log = format!("{guest}/{NEXTEST_LOG}");
-    let mut command = vec!["sh", "-c", r#"exec "$@" >"$0" 2>&1"#, &log];
-    command.extend(nextest);
+    let script = format!(
+        r#"exec >"$0" 2>&1; {}; exec "$@""#,
+        test_env::export_script(test_env::ENV_DIR)
+    );
+    let mut command = vec!["sh", "-c", &script, &log];
+    command.extend(tests);
     let output = session.exec_timeout(&command, RUN_TIMEOUT).await?;
-    Ok(Status::of_nextest(
-        output.status,
-        &run.results.join(NEXTEST_LOG),
-    ))
+    let log = run.results.join(NEXTEST_LOG);
+    Ok(match kind {
+        Kind::Nextest => Status::of_nextest(output.status, &log),
+        Kind::Program => Status::of_program(output.status, &log),
+    })
 }
 
 /// Copy the nextest log and the JUnit report out of the guest, whether or not
@@ -346,9 +416,40 @@ fn print_log_tail(log: &Path) {
     }
 }
 
-/// Write the OpenShell gateway's journal to `dir/gateway.log`.
+/// The diagnostics to print from a k3s guest: the script the tmachine
+/// conformance playbook ran, with its output on stdout.
+const COLLECT_K3S: &str = include_str!("collect-k3s.sh");
+/// Where the k3s installers put the k3s binary; its presence marks a k3s guest.
+const K3S_BINARY: &str = "/usr/local/bin/k3s";
+/// The check that the Agent Sandbox controller reconciles Sandboxes, run on a
+/// k3s guest after it boots.
+const WAIT_K3S_CONTROLLER: &str = include_str!("wait-k3s-controller.sh");
+/// The script retries for up to ten minutes; this catches one that stalls.
+const WAIT_K3S_CONTROLLER_TIMEOUT: Duration = Duration::from_mins(12);
+
+/// Where the guest keeps the script's output until it is copied out.
+const COLLECT_K3S_OUTPUT: &str = "/var/tmp/openshell-k3s-diagnostics.txt";
+/// How long the guest lets the script run before stopping it. The script
+/// bounds each command itself; this bounds the whole run, so a stalled API
+/// server leaves partial output instead of nothing.
+const COLLECT_K3S_GUEST_LIMIT: Duration = Duration::from_mins(4);
+/// Slack beyond the guest's limit for SSH and process start.
+const COLLECT_K3S_SLACK: Duration = Duration::from_secs(60);
+
+/// Write the OpenShell gateway's journal to `dir/gateway.log`, and on a k3s
+/// guest the k3s diagnostics to `dir/k3s.txt`. Each is collected even if the
+/// other fails; a k3s failure is reported, and a journal failure returned.
 async fn collect_diagnostics(session: &Session, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let journal = collect_gateway_journal(session, dir).await;
+    if let Err(error) = collect_k3s_diagnostics(session, dir).await {
+        eprintln!("==> collecting k3s diagnostics failed: {error:#}");
+    }
+    journal
+}
+
+/// Write the OpenShell gateway's journal to `dir/gateway.log`.
+async fn collect_gateway_journal(session: &Session, dir: &Path) -> Result<()> {
     let output = session
         .exec(&[
             "sudo",
@@ -366,6 +467,36 @@ async fn collect_diagnostics(session: &Session, dir: &Path) -> Result<()> {
     let mut contents = output.stdout;
     contents.extend_from_slice(&output.stderr);
     std::fs::write(&log, contents).with_context(|| format!("write {}", log.display()))
+}
+
+/// Write the k3s diagnostics to `dir/k3s.txt` when the guest runs k3s. The
+/// script writes to a file in the guest, which is copied out even when the
+/// script ran out of time.
+async fn collect_k3s_diagnostics(session: &Session, dir: &Path) -> Result<()> {
+    let probe = session.exec(&["test", "-x", K3S_BINARY]).await?;
+    if !probe.status.success() {
+        return Ok(());
+    }
+    let guest_limit = COLLECT_K3S_GUEST_LIMIT.as_secs().to_string();
+    let run = session
+        .exec_timeout(
+            &[
+                "sh",
+                "-c",
+                r#"timeout "$1" sudo -n bash -c "$2" >"$0" 2>&1"#,
+                COLLECT_K3S_OUTPUT,
+                &guest_limit,
+                COLLECT_K3S,
+            ],
+            COLLECT_K3S_GUEST_LIMIT + COLLECT_K3S_SLACK,
+        )
+        .await;
+    if let Err(error) = &run {
+        eprintln!("==> running the k3s diagnostics failed: {error:#}");
+    }
+    session
+        .copy_out(COLLECT_K3S_OUTPUT, &dir.join("k3s.txt"))
+        .await
 }
 
 fn checked(step: &str, output: Output) -> Result<String> {
@@ -394,6 +525,52 @@ mod tests {
             Status::Error("no test ran; see log".to_string())
         );
         assert!(matches!(status(1), Status::Error(_)));
+    }
+
+    #[test]
+    fn status_follows_the_program_exit_code() {
+        let status = |code| Status::of_program(ExitStatus::from_raw(code << 8), Path::new("log"));
+        assert_eq!(status(0), Status::Passed);
+        assert_eq!(status(PROGRAM_TEST_FAILED), Status::Failed);
+        // Exit 2: tests could not run.
+        assert!(matches!(status(2), Status::Error(_)));
+    }
+
+    #[test]
+    fn k3s_diagnostics_keep_everything_the_old_playbook_collected() {
+        for wanted in [
+            "systemctl show k3s.service",
+            "journalctl -b --no-pager --lines=500 -u k3s.service",
+            "iptables-nft-save",
+            "--version",
+            "get --raw=/readyz",
+            "get nodes -o wide",
+            "get deployment agent-sandbox-controller",
+            "-n agent-sandbox-system get pods",
+            "-n agent-sandbox-system get leases",
+            "-n agent-sandbox-system get events",
+            "get sandboxes.agents.x-k8s.io",
+            "-n agent-sandbox-system logs",
+            "-n openshell get pods",
+            "-n openshell get services",
+            "openshell gateway list --output json",
+            "openshell status --output json",
+            "-n openshell get endpointslices",
+            "-n openshell get events",
+            "-n openshell logs",
+            "--previous",
+            "free -m",
+            "df -h",
+            "[REDACTED]",
+        ] {
+            assert!(COLLECT_K3S.contains(wanted), "missing {wanted:?}");
+        }
+        for unwanted in ["get secret", "--kubeconfig", "-o yaml", "-o json"] {
+            assert!(
+                !COLLECT_K3S.contains(unwanted),
+                "must not collect {unwanted:?}"
+            );
+        }
     }
 
     #[test]

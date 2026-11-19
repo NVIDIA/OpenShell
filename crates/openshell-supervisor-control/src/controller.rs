@@ -40,7 +40,7 @@ use tonic::{Status, Streaming};
 
 use crate::proto::{
     AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
-    HostMessage, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
+    HostMessage, HostRedirect, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
     SandboxInstanceStatus, SandboxInstanceTakeover, host_gateway_message, host_message,
 };
 
@@ -114,7 +114,7 @@ pub enum ObservedInstance {
     /// assigned this route.
     Pending,
     /// The host reconciled to that snapshot (or the route is not assigned)
-    /// and does not host the route.
+    /// and does not host the route, or the pool reports the route expired.
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
@@ -187,6 +187,9 @@ pub struct PoolView {
     /// gateway replica that serves the owner, for judging instances whose
     /// owner streams to another replica.
     pub reports: BTreeMap<String, SandboxInstanceStatus>,
+    /// Routes whose owner's process has been gone past the runtime's
+    /// recovery deadline, so the runtime has ended their workloads.
+    pub expired: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for PoolView {
@@ -198,6 +201,7 @@ impl std::fmt::Debug for PoolView {
             .field("desired", &self.desired)
             .field("assignments", &self.assignments.keys().collect::<Vec<_>>())
             .field("reports", &self.reports.keys().collect::<Vec<_>>())
+            .field("expired", &self.expired)
             .finish()
     }
 }
@@ -356,6 +360,8 @@ struct Inner {
     /// stream attached or ended, or a member announced leaving.
     membership: watch::Sender<u64>,
     observed: Mutex<Observed>,
+    /// This replica's peer endpoint, sent in every `HostAccepted`.
+    peer_endpoint: Mutex<String>,
 }
 
 /// Gateway-owned desired assignments and observed status of the shared
@@ -406,8 +412,15 @@ impl SupervisorHostController {
                 revision: watch::Sender::new(0),
                 membership: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
+                peer_endpoint: Mutex::new(String::new()),
             }),
         }
+    }
+
+    /// Tell attaching hosts to dial their sandbox sessions to `peer_endpoint`.
+    /// Call it before any host attaches.
+    pub fn set_peer_endpoint(&self, peer_endpoint: String) {
+        *lock(&self.inner.peer_endpoint) = peer_endpoint;
     }
 
     /// Offer every instance's runtime `recovery_timeout_secs` instead of
@@ -757,6 +770,9 @@ impl SupervisorHostController {
         let desired = lock(&self.inner.desired);
         let pool = lock(&self.inner.pool);
         let observed = lock(&self.inner.observed);
+        if pool.view.expired.contains(route) {
+            return ObservedInstance::Absent;
+        }
         let Some(owner) = pool.view.owners.get(route) else {
             return ObservedInstance::NoHost;
         };
@@ -803,12 +819,16 @@ impl SupervisorHostController {
     }
 
     /// Serve one authenticated host stream. Reads the hello, supersedes any
-    /// session it replaces, and returns the gateway-to-host stream.
+    /// session it replaces, and returns the host's member ID and the
+    /// gateway-to-host stream. `home` sees every member and whether its host
+    /// accepts a redirect; a host that does is redirected, without a session,
+    /// to the peer endpoint `home` names.
     pub async fn attach(
         &self,
         identity: HostIdentity,
         mut inbound: Streaming<HostMessage>,
-    ) -> Result<ReceiverStream<Result<HostGatewayMessage, Status>>, Status> {
+        home: impl FnOnce(&str, bool) -> Option<String>,
+    ) -> Result<(String, ReceiverStream<Result<HostGatewayMessage, Status>>), Status> {
         let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
             Ok(Some(Ok(HostMessage {
                 payload: Some(host_message::Payload::Hello(hello)),
@@ -839,10 +859,20 @@ impl SupervisorHostController {
             return Err(Status::failed_precondition(MISSING_MEMBER));
         };
         validate_member(member).map_err(Status::invalid_argument)?;
-        let heartbeat = POOL_HEARTBEAT_INTERVAL;
+        let member_id = member.member_id.clone();
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let home = home(&member_id, hello.accepts_redirect);
+        if hello.accepts_redirect
+            && let Some(peer_endpoint) = home
+        {
+            tracing::info!(member_id, peer_endpoint, "redirecting supervisor host");
+            let _ = tx.try_send(Ok(redirect(peer_endpoint)));
+            return Ok((member_id, ReceiverStream::new(rx)));
+        }
+        let heartbeat = POOL_HEARTBEAT_INTERVAL;
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
+        let peer_endpoint = lock(&self.inner.peer_endpoint).clone();
         tx.send(Ok(HostGatewayMessage {
             payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
                 session_id: session_id.to_string(),
@@ -850,6 +880,7 @@ impl SupervisorHostController {
                     seconds: i64::try_from(heartbeat.as_secs()).unwrap_or(15),
                     nanos: 0,
                 }),
+                peer_endpoint,
             })),
         }))
         .await
@@ -861,7 +892,7 @@ impl SupervisorHostController {
                 .await;
             controller.end_session(session_id);
         });
-        Ok(ReceiverStream::new(rx))
+        Ok((member_id, ReceiverStream::new(rx)))
     }
 
     /// Start a session for `hello`, superseding the same member's session. A
@@ -1258,6 +1289,16 @@ const MISSING_MEMBER: &str = "the shared supervisor did not name its pool member
 OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to a stable member ID and \
 OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to an IP reachable from sandbox runtimes";
 
+/// Sends a host to another gateway replica.
+#[must_use]
+pub fn redirect(peer_endpoint: String) -> HostGatewayMessage {
+    HostGatewayMessage {
+        payload: Some(host_gateway_message::Payload::Redirect(HostRedirect {
+            peer_endpoint,
+        })),
+    }
+}
+
 /// Check a pool member's identity, naming the setting that is wrong.
 fn validate_member(member: &PoolMember) -> Result<(), &'static str> {
     let valid = |value: &str| {
@@ -1427,6 +1468,7 @@ mod tests {
                 member_id: member.to_string(),
                 runtime_address: format!("10.0.0.{}:5500", member.len()),
             }),
+            accepts_redirect: false,
         }
     }
 
@@ -1480,6 +1522,7 @@ mod tests {
                 .collect(),
             owners,
             reports: BTreeMap::new(),
+            expired: BTreeSet::new(),
         }
     }
 
@@ -1944,6 +1987,7 @@ mod tests {
                     instance_id: "p1".to_string(),
                     connection_epoch: 1,
                     member: None,
+                    accepts_redirect: false,
                 },
             )
             .unwrap_err();

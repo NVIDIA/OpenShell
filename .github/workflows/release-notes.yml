@@ -17,16 +17,27 @@ on:
         description: Keep notes failures from failing the calling workflow
         default: false
         type: boolean
+      preview-run-id:
+        description: Optional Pre-release run whose release-notes preview is reused instead of generating notes
+        default: ""
+        type: string
+      preview-tag:
+        description: Prerelease tag in the reused preview, replaced with release-tag
+        default: ""
+        type: string
     secrets:
       LLM_INFERENCE_API_KEY:
         description: NVIDIA Inference Hub API key
         required: true
 
 permissions:
+  actions: read
   contents: read
   pull-requests: read
 
 jobs:
+  # Callers depend on this job, so choose reuse or generation with step
+  # conditions; a skipped job would skip every job that depends on it.
   release-notes:
     name: Write Release Notes
     runs-on: ubuntu-latest
@@ -36,7 +47,30 @@ jobs:
       ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
       ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
     steps:
+      # Without a preview (missing or expired), the notes are generated instead.
+      - name: Reuse the prerelease notes preview
+        id: preview
+        if: ${{ inputs.preview-run-id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.preview-run-id }}
+          PREVIEW_TAG: ${{ inputs.preview-tag }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          set -euo pipefail
+          : "${PREVIEW_TAG:?preview-tag is required with preview-run-id}"
+          if gh run download "${RUN_ID}" -R "${GITHUB_REPOSITORY}" -n release-notes -D preview; then
+            sed "s/${PREVIEW_TAG//./\\.}\b/${RELEASE_TAG}/g" preview/release-notes.md > release-notes.md
+            rm -rf preview
+            echo "reused=true" >> "${GITHUB_OUTPUT}"
+            echo "Release notes are reused from the \`${PREVIEW_TAG}\` preview." >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Release notes will be regenerated; the \`${PREVIEW_TAG}\` preview is unavailable." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
       - name: Check out release source
+        if: ${{ steps.preview.outputs.reused != 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -45,6 +79,7 @@ jobs:
 
       - name: Prepare release notes
         id: comparison
+        if: ${{ steps.preview.outputs.reused != 'true' }}
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release-tag }}
@@ -63,6 +98,7 @@ jobs:
           echo "url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_TAG}...${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Write notes with Claude
+        if: ${{ steps.preview.outputs.reused != 'true' }}
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
         env:
           GH_TOKEN: ${{ github.token }}

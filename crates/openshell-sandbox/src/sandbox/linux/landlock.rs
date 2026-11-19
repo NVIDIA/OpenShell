@@ -3,13 +3,19 @@
 
 //! Landlock filesystem sandboxing.
 
+#[cfg(test)]
+use landlock::PathFd;
 use landlock::{
-    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError,
-    Ruleset, RulesetAttr, RulesetCreatedAttr,
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
+    RulesetCreatedAttr,
 };
 use miette::{IntoDiagnostic, Result};
 use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -186,7 +192,10 @@ fn capability_free_baseline_entries(
     )
     .into_diagnostic()?;
     // The reserved root itself must not redirect private child mounts into an
-    // allowed subtree. Pin and validate it independently of the public entries.
+    // allowed subtree. Validate it eagerly and independently of the public
+    // entries: when present it must be a real directory. The descriptor only
+    // backs this check and is dropped before any per-entry descriptor is
+    // opened; exclusion during enumeration is by name plus O_NOFOLLOW.
     // Absence is allowed for qualification before driver bootstrap is staged.
     let _private_root = match openat(
         &root_fd,
@@ -315,6 +324,19 @@ fn prepare_with_path_open_mode(
             .build()
     );
 
+    // Path admission is independent of kernel compatibility. In particular, an
+    // unsafe policy anchor must never reach the best-effort ruleset fallback.
+    let read_only = open_policy_paths(&read_only, compatibility, path_open_mode)?;
+    let read_write = open_policy_paths(&read_write, compatibility, path_open_mode)?;
+    let rules_applied = read_only.len() + read_write.len();
+    if rules_applied == 0 {
+        return Err(miette::miette!(
+            "Landlock ruleset has zero valid paths — all {} path(s) failed to open. \
+             Refusing to continue without filesystem restrictions.",
+            total_paths,
+        ));
+    }
+
     let result: Result<PreparedRuleset> = (|| {
         let access_all = AccessFs::from_all(abi);
         let access_read = AccessFs::from_read(abi);
@@ -326,36 +348,20 @@ fn prepare_with_path_open_mode(
             .into_diagnostic()?;
 
         let mut ruleset = ruleset.create().into_diagnostic()?;
-        let mut rules_applied: usize = 0;
-
-        for path in &read_only {
-            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
-                let allowed_access = access_for_path_fd(&path_fd, access_read, abi)?;
-                debug!(path = %path.display(), "Landlock allow read-only");
-                ruleset = ruleset
-                    .add_rule(PathBeneath::new(path_fd, allowed_access))
-                    .into_diagnostic()?;
-                rules_applied += 1;
-            }
+        for (path, path_fd) in read_only {
+            let allowed_access = access_for_path_fd(&path_fd, access_read, abi)?;
+            debug!(path = %path.display(), "Landlock allow read-only");
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(path_fd, allowed_access))
+                .into_diagnostic()?;
         }
 
-        for path in &read_write {
-            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
-                let allowed_access = access_for_path_fd(&path_fd, access_all, abi)?;
-                debug!(path = %path.display(), "Landlock allow read-write");
-                ruleset = ruleset
-                    .add_rule(PathBeneath::new(path_fd, allowed_access))
-                    .into_diagnostic()?;
-                rules_applied += 1;
-            }
-        }
-
-        if rules_applied == 0 {
-            return Err(miette::miette!(
-                "Landlock ruleset has zero valid paths — all {} path(s) failed to open. \
-                 Refusing to apply an empty ruleset that would block all filesystem access.",
-                total_paths,
-            ));
+        for (path, path_fd) in read_write {
+            let allowed_access = access_for_path_fd(&path_fd, access_all, abi)?;
+            debug!(path = %path.display(), "Landlock allow read-write");
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(path_fd, allowed_access))
+                .into_diagnostic()?;
         }
 
         let skipped = total_paths - rules_applied;
@@ -466,11 +472,119 @@ fn access_for_path_fd(
     })
 }
 
+/// A path-opening failure that must not be confused with compatibility errors.
+#[derive(Debug)]
+enum PolicyPathError {
+    Io(std::io::Error),
+    UnsafeSymlink,
+}
+
+impl From<rustix::io::Errno> for PolicyPathError {
+    fn from(error: rustix::io::Errno) -> Self {
+        Self::Io(error.into())
+    }
+}
+
+/// Whether a directory's entries can be changed by this workload identity.
+/// Ownership counts even without current write permission: owners can chmod.
+/// An unrecognized access-check failure is conservatively treated as mutable.
+fn workload_can_modify_directory(directory: &OwnedFd) -> Result<bool, PolicyPathError> {
+    use rustix::fs::{Access, AtFlags, accessat, fstat};
+    let stat = fstat(directory)?;
+    if stat.st_uid == rustix::process::geteuid().as_raw() {
+        return Ok(true);
+    }
+    // A read-only image mount is also immutable to the capability-free
+    // workload. Unknown failures remain untrusted rather than granting access.
+    Ok(!matches!(
+        accessat(directory, ".", Access::WRITE_OK, AtFlags::EACCESS),
+        Err(rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS)
+    ))
+}
+
+fn path_components(path: &Path) -> VecDeque<OsString> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::RootDir | Component::CurDir => None,
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::Normal(name) => Some(name.to_owned()),
+            Component::Prefix(_) => unreachable!("Linux paths have no prefix"),
+        })
+        .collect()
+}
+
+/// Resolve policy anchors through pinned descriptors, following only symlinks
+/// beneath directories the workload cannot modify. This preserves immutable
+/// image aliases while refusing mutable aliases at every path component.
+fn open_policy_path(path: &Path) -> Result<OwnedFd, PolicyPathError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat, readlinkat};
+    if !path.is_absolute() {
+        return Err(PolicyPathError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Landlock policy paths must be absolute",
+        )));
+    }
+    let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = open("/", flags | OFlags::DIRECTORY, Mode::empty())?;
+    let mut mutable_ancestor = workload_can_modify_directory(&directory)?;
+    let mut pending = path_components(path);
+    let mut symlinks = 0;
+    while let Some(component) = pending.pop_front() {
+        let fd = openat(&directory, &component, flags, Mode::empty())?;
+        match FileType::from_raw_mode(fstat(&fd)?.st_mode) {
+            FileType::Symlink => {
+                // A non-writable immediate parent is insufficient: an ancestor
+                // may allow renaming that parent or replacing its entire tree.
+                if mutable_ancestor {
+                    return Err(PolicyPathError::UnsafeSymlink);
+                }
+                symlinks += 1;
+                if symlinks > 40 {
+                    return Err(rustix::io::Errno::LOOP.into());
+                }
+                // Empty-path readlinkat reads the opened link, not a possibly
+                // replaced directory entry. Magic links are never opened.
+                let target = PathBuf::from(OsString::from_vec(
+                    readlinkat(&fd, "", Vec::new())?.into_bytes(),
+                ));
+                if target.is_absolute() {
+                    directory = open("/", flags | OFlags::DIRECTORY, Mode::empty())?;
+                    mutable_ancestor |= workload_can_modify_directory(&directory)?;
+                }
+                let mut target_components = path_components(&target);
+                target_components.append(&mut pending);
+                pending = target_components;
+            }
+            FileType::Directory => {
+                mutable_ancestor |= workload_can_modify_directory(&fd)?;
+                directory = fd;
+            }
+            _ if pending.is_empty() => return Ok(fd),
+            _ => return Err(rustix::io::Errno::NOTDIR.into()),
+        }
+    }
+    Ok(directory)
+}
+
+fn open_policy_paths(
+    paths: &[PathBuf],
+    compatibility: &LandlockCompatibility,
+    path_open_mode: PathOpenMode,
+) -> Result<Vec<(PathBuf, OwnedFd)>> {
+    let mut opened = Vec::new();
+    for path in paths {
+        if let Some(fd) = try_open_path(path, compatibility, path_open_mode)? {
+            opened.push((path.clone(), fd));
+        }
+    }
+    Ok(opened)
+}
+
 /// Attempt to open a path for Landlock rule creation.
 ///
-/// In `BestEffort` mode, inaccessible paths (missing, permission denied, symlink
-/// loops, etc.) are skipped with a warning and `Ok(None)` is returned so the
-/// caller can continue building the ruleset from the remaining valid paths.
+/// Mutable symlink traversal is always fatal. In `BestEffort` mode, ordinary
+/// inaccessible paths are skipped with `Ok(None)` so the caller can continue
+/// building the ruleset from the remaining valid paths.
 ///
 /// In `HardRequirement` mode, any failure is fatal — the caller propagates the
 /// error, which ultimately aborts sandbox startup.
@@ -478,16 +592,16 @@ fn try_open_path(
     path: &Path,
     compatibility: &LandlockCompatibility,
     path_open_mode: PathOpenMode,
-) -> Result<Option<PathFd>> {
-    match PathFd::new(path) {
+) -> Result<Option<OwnedFd>> {
+    match open_policy_path(path) {
         Ok(fd) => Ok(Some(fd)),
-        Err(err) => {
-            let reason = classify_path_fd_error(&err);
-            let is_not_found = matches!(
-                &err,
-                PathFdError::OpenCall { source, .. }
-                    if source.kind() == std::io::ErrorKind::NotFound
-            );
+        Err(PolicyPathError::UnsafeSymlink) => Err(miette::miette!(
+            "Landlock policy path traverses a symlink beneath a workload-modifiable directory: {}",
+            path.display()
+        )),
+        Err(PolicyPathError::Io(err)) => {
+            let reason = classify_io_error(&err);
+            let is_not_found = err.kind() == std::io::ErrorKind::NotFound;
             if matches!(path_open_mode, PathOpenMode::CurrentUser) {
                 if is_not_found {
                     debug!(
@@ -550,19 +664,6 @@ fn try_open_path(
                 )),
             }
         }
-    }
-}
-
-/// Classify a [`PathFdError`] into a human-readable reason.
-///
-/// `PathFd::new()` wraps `open(path, O_PATH | O_CLOEXEC)` which can fail for
-/// several reasons beyond simple non-existence. The `PathFdError::OpenCall`
-/// variant wraps the underlying `std::io::Error`.
-fn classify_path_fd_error(err: &PathFdError) -> &'static str {
-    match err {
-        PathFdError::OpenCall { source, .. } => classify_io_error(source),
-        // PathFdError is #[non_exhaustive], handle future variants gracefully.
-        _ => "unexpected error",
     }
 }
 
@@ -882,6 +983,171 @@ mod tests {
     }
 
     #[test]
+    fn policy_path_rejects_mutable_symlink_in_every_compatibility_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("workspace");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        for compatibility in [
+            LandlockCompatibility::BestEffort,
+            LandlockCompatibility::HardRequirement,
+        ] {
+            for mode in [PathOpenMode::CurrentUser, PathOpenMode::Privileged] {
+                let error = try_open_path(&link, &compatibility, mode).unwrap_err();
+                assert!(error.to_string().contains("workload-modifiable"));
+            }
+        }
+    }
+
+    #[test]
+    fn policy_path_rejects_mutable_ancestor_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        let link = root.path().join("workspace");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(matches!(
+            open_policy_path(&link.join("nested")),
+            Err(PolicyPathError::UnsafeSymlink)
+        ));
+    }
+
+    #[test]
+    fn policy_path_owned_readonly_directory_is_mutable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let fd = rustix::fs::open(
+            root.path(),
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        assert!(workload_can_modify_directory(&fd).unwrap());
+        // Restore permissions for TempDir cleanup.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn policy_path_descriptor_stays_on_admitted_inode_after_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fd = open_policy_path(&workspace).unwrap();
+        let admitted = rustix::fs::fstat(&fd).unwrap();
+        std::fs::remove_dir(&workspace).unwrap();
+        std::os::unix::fs::symlink("/", &workspace).unwrap();
+        let retained = rustix::fs::fstat(&fd).unwrap();
+        assert_eq!(
+            (retained.st_dev, retained.st_ino),
+            (admitted.st_dev, admitted.st_ino)
+        );
+        assert!(matches!(
+            open_policy_path(&workspace),
+            Err(PolicyPathError::UnsafeSymlink)
+        ));
+    }
+
+    #[test]
+    fn policy_path_rejects_relative_paths() {
+        assert!(matches!(
+            open_policy_path(Path::new("workspace")),
+            Err(PolicyPathError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn policy_path_trusted_image_aliases_and_mutable_ancestry() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        // Exercise the actual DAC check as an unprivileged workload. Root owns
+        // every containing system directory and is not an admitted workload UID.
+        if rustix::process::geteuid().is_root() {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let immutable = fixture.path().join("immutable");
+            std::fs::create_dir(&immutable).unwrap();
+            std::os::unix::fs::symlink("/", immutable.join("alias")).unwrap();
+            std::fs::set_permissions(&immutable, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "sandbox::linux::landlock::tests::policy_path_trusted_image_aliases_and_mutable_ancestry",
+                "--nocapture",
+            ]).env("OPENSHELL_LANDLOCK_MUTABLE_ANCESTRY", immutable.join("alias"));
+            // SAFETY: these credential operations execute only in the forked
+            // test child before exec and do not change the test runner identity.
+            #[allow(unsafe_code)]
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setgid(65534) != 0
+                        || libc::setuid(65534) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let status = command.status().unwrap();
+            std::fs::set_permissions(&immutable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(status.success());
+            return;
+        }
+        for alias in ["/bin", "/lib"] {
+            if std::fs::symlink_metadata(alias).is_ok() {
+                open_policy_path(Path::new(alias)).unwrap();
+            }
+        }
+        if let Some(path) = std::env::var_os("OPENSHELL_LANDLOCK_MUTABLE_ANCESTRY") {
+            assert!(matches!(
+                open_policy_path(Path::new(&path)),
+                Err(PolicyPathError::UnsafeSymlink)
+            ));
+        }
+    }
+
+    #[test]
+    fn prepare_mutable_policy_anchor_never_uses_best_effort_fallback() {
+        if !matches!(probe_availability(), LandlockAvailability::Available { .. }) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("workspace");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        for compatibility in [
+            LandlockCompatibility::BestEffort,
+            LandlockCompatibility::HardRequirement,
+        ] {
+            for mode in [PathOpenMode::CurrentUser, PathOpenMode::Privileged] {
+                let mut policy =
+                    hard_requirement_policy(vec![root.path().to_path_buf()], vec![link.clone()]);
+                policy.landlock.compatibility = compatibility.clone();
+                let error = prepare_with_path_open_mode(&policy, None, mode)
+                    .err()
+                    .expect("unsafe anchor must abort preparation");
+                assert!(error.to_string().contains("workload-modifiable"));
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_zero_usable_paths_never_uses_best_effort_fallback() {
+        if !matches!(probe_availability(), LandlockAvailability::Available { .. }) {
+            return;
+        }
+        let mut policy = hard_requirement_policy(
+            vec![],
+            vec![PathBuf::from("/nonexistent/openshell/test/path")],
+        );
+        policy.landlock.compatibility = LandlockCompatibility::BestEffort;
+        let error = prepare_current_user(&policy, None)
+            .err()
+            .expect("empty allowlist must fail closed");
+        assert!(error.to_string().contains("zero valid paths"));
+    }
+
+    #[test]
     fn classify_not_found() {
         let err = std::io::Error::from_raw_os_error(libc::ENOENT);
         assert_eq!(classify_io_error(&err), "path does not exist");
@@ -915,14 +1181,6 @@ mod tests {
     fn classify_unknown_error() {
         let err = std::io::Error::from_raw_os_error(libc::EIO);
         assert_eq!(classify_io_error(&err), "unexpected error");
-    }
-
-    #[test]
-    fn classify_path_fd_error_extracts_io_error() {
-        // Use PathFd::new on a non-existent path to get a real PathFdError
-        // (the OpenCall variant is #[non_exhaustive] and can't be constructed directly).
-        let err = PathFd::new("/nonexistent/openshell/classify/test").unwrap_err();
-        assert_eq!(classify_path_fd_error(&err), "path does not exist");
     }
 
     #[test]
