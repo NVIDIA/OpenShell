@@ -459,13 +459,17 @@ material); delete it to fully reset.
   Role/ClusterRole (the shared supervisor *is* rendered from the chart).
 - Networking: masquerade pod network only; the guest clamps its MTU to 1400
   in `guest-init.sh` because the k3d flannel-vxlan pod network is 1450.
-- No GPU, no live-migration/VMI-replacement semantics.
-- The virt-launcher compute container runs without CPU or memory limits
-  (the KubeVirt default when the VM spec carries no resource requests;
-  the sandbox's `cpu_cores`/`memory` shape the domain, not the container).
-  Follow-up for multi-tenant nodes: set launcher resource
-  requests/limits so a runaway guest cannot starve co-located workloads.
-  Single-tenant PoC nodes make this informational.
+- No GPU passthrough (a GPU request is rejected at admission with a clear
+  message — use the pod runtime for GPU workloads), no
+  live-migration/VMI-replacement semantics.
+- The sandbox's CPU and memory requests and limits map onto the VM: the
+  effective CPU (limit, else request, else `cpu_cores`) rounded up to
+  whole vCPUs the guest sees, the effective memory as the guest's RAM,
+  and the requests/limits verbatim on the virt-launcher container (with
+  the pod path's mirroring of an omitted request to the limit). Resource
+  admission runs exactly as in the pod path, and a limit below its
+  request or memory below the safe guest minimum (256Mi) is rejected at
+  admission.
 - A create interrupted between the Halted VM creation and its `Once` patch
   leaves the VM with the in-flight annotation; after ten minutes the driver
   maps it to a terminal create timeout (public `Error`), so it is visible

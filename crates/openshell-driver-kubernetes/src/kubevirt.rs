@@ -309,6 +309,192 @@ pub struct KubeVirtSandboxParams<'a> {
     pub kube_name: &'a str,
 }
 
+/// The `KubeVirt` domain resources mapped from a sandbox's typed
+/// resource requirements.
+///
+/// Mapping rules (validated by [`domain_resources`], enforced at
+/// admission before anything is created):
+///
+/// - **vCPU cores**: the effective CPU limit (or request when no limit is
+///   set, or the global `kubevirt.cpu_cores` when neither is) rounded
+///   **up** to a whole number of vCPUs — a VM's vCPU count is integral.
+///   A fractional limit keeps its exact value on the virt-launcher
+///   container (`limits.cpu`), so the guest sees the rounded vCPU count
+///   while the launcher is throttled to the fraction.
+/// - **Guest memory**: the effective memory limit (or request when no
+///   limit is set, or the global `kubevirt.memory` when neither is) —
+///   `domain.memory.guest`, what the guest OS sees.
+/// - **virt-launcher requests/limits** (`domain.resources`): the sandbox's
+///   CPU and memory requests and limits verbatim, with the pod path's
+///   mirroring (an omitted request defaults to the limit, and the guest
+///   memory stands in for an omitted memory request). These make the
+///   launcher container enforceable and leave headroom for `KubeVirt`'s
+///   overhead.
+/// - **Validation**: a limit below its request, a memory below the safe
+///   guest minimum ([`MIN_GUEST_MEMORY_BYTES`]), or an unparsable
+///   quantity is an `InvalidArgument` at admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubeVirtDomainResources {
+    /// Whole vCPUs the guest sees.
+    pub cores: u32,
+    /// `domain.memory.guest` quantity string.
+    pub guest_memory: String,
+    /// `domain.resources.requests.cpu`, when the sandbox asked for CPU.
+    pub cpu_request: Option<String>,
+    /// `domain.resources.limits.cpu`, when the sandbox set a CPU limit.
+    pub cpu_limit: Option<String>,
+    /// `domain.resources.requests.memory`, when the sandbox asked for
+    /// memory.
+    pub memory_request: Option<String>,
+    /// `domain.resources.limits.memory`, when the sandbox set a memory
+    /// limit.
+    pub memory_limit: Option<String>,
+}
+
+/// The smallest guest memory the purpose-built image boots with: the
+/// kernel, the Alpine userland, and the in-guest boundary need headroom
+/// below this before the workload starts.
+pub const MIN_GUEST_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Parse a Kubernetes CPU quantity into millicores (`"2"` → 2000,
+/// `"500m"` → 500, `"1.5"` → 1500). Zero and negative values are
+/// invalid.
+fn parse_cpu_millis(quantity: &str) -> Result<u64, String> {
+    let trimmed = quantity.trim();
+    if let Some(millis_str) = trimmed.strip_suffix('m') {
+        let millis: u64 = millis_str.parse().map_err(|_| {
+            format!("invalid CPU quantity {quantity:?}: expected <millis>m or <cores>")
+        })?;
+        if millis == 0 {
+            return Err(format!("invalid CPU quantity {quantity:?}: zero"));
+        }
+        return Ok(millis);
+    }
+    let cores: f64 = trimmed
+        .parse()
+        .map_err(|_| format!("invalid CPU quantity {quantity:?}: expected <millis>m or <cores>"))?;
+    if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
+        return Err(format!(
+            "invalid CPU quantity {quantity:?}: must be positive"
+        ));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let millis = (cores * 1000.0) as u64;
+    if millis == 0 {
+        return Err(format!("invalid CPU quantity {quantity:?}: rounds to zero"));
+    }
+    Ok(millis)
+}
+
+/// Parse a Kubernetes memory quantity into bytes (binary `Ki`..`Ei` and
+/// decimal `k`..`E` suffixes, or plain bytes).
+fn parse_memory_bytes(quantity: &str) -> Result<u64, String> {
+    let trimmed = quantity.trim();
+    let suffixes: &[(&str, u64)] = &[
+        ("Ei", 1_u64 << 60),
+        ("Pi", 1 << 50),
+        ("Ti", 1 << 40),
+        ("Gi", 1 << 30),
+        ("Mi", 1 << 20),
+        ("Ki", 1 << 10),
+        ("E", 1_000_000_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("G", 1_000_000_000),
+        ("M", 1_000_000),
+        ("k", 1_000),
+        ("K", 1_000),
+    ];
+    for (suffix, multiplier) in suffixes {
+        if let Some(number) = trimmed.strip_suffix(suffix) {
+            let value: u64 = number.parse().map_err(|_| {
+                format!("invalid memory quantity {quantity:?}: expected <number>{suffix}")
+            })?;
+            return value
+                .checked_mul(*multiplier)
+                .ok_or_else(|| format!("invalid memory quantity {quantity:?}: overflow"));
+        }
+    }
+    trimmed
+        .parse()
+        .map_err(|_| format!("invalid memory quantity {quantity:?}: expected <number>[suffix]"))
+}
+
+/// Map a sandbox's typed resource requirements onto the `KubeVirt`
+/// domain resources. See [`KubeVirtDomainResources`] for the rules;
+/// errors are admission-time `InvalidArgument`s.
+pub fn domain_resources(
+    template: Option<&openshell_core::proto::compute::v1::DriverSandboxTemplate>,
+    kubevirt: &crate::config::KubeVirtConfig,
+) -> Result<KubeVirtDomainResources, String> {
+    let default_requirements =
+        openshell_core::proto::compute::v1::DriverResourceRequirements::default();
+    let requirements = template
+        .and_then(|template| template.resources.as_ref())
+        .unwrap_or(&default_requirements);
+    let cpu_request =
+        (!requirements.cpu_request.is_empty()).then(|| requirements.cpu_request.clone());
+    let cpu_limit = (!requirements.cpu_limit.is_empty()).then(|| requirements.cpu_limit.clone());
+    let memory_request =
+        (!requirements.memory_request.is_empty()).then(|| requirements.memory_request.clone());
+    let memory_limit =
+        (!requirements.memory_limit.is_empty()).then(|| requirements.memory_limit.clone());
+
+    // A limit below its request is a contradiction in any mapping.
+    if let (Some(request), Some(limit)) = (&cpu_request, &cpu_limit)
+        && parse_cpu_millis(request)? > parse_cpu_millis(limit)?
+    {
+        return Err(format!(
+            "cpu limit {limit:?} is below the cpu request {request:?}"
+        ));
+    }
+    if let (Some(request), Some(limit)) = (&memory_request, &memory_limit)
+        && parse_memory_bytes(request)? > parse_memory_bytes(limit)?
+    {
+        return Err(format!(
+            "memory limit {limit:?} is below the memory request {request:?}"
+        ));
+    }
+
+    // vCPU count: the effective CPU, rounded up to whole vCPUs.
+    let effective_cpu = cpu_limit
+        .clone()
+        .or_else(|| cpu_request.clone())
+        .unwrap_or_else(|| kubevirt.cpu_cores.to_string());
+    let cores = parse_cpu_millis(&effective_cpu)?
+        .div_ceil(1000)
+        .try_into()
+        .map_err(|_| format!("cpu quantity {effective_cpu:?} maps to too many vCPUs"))?;
+
+    // Guest memory: the effective memory, floored at the safe minimum.
+    let guest_memory = memory_limit
+        .clone()
+        .or_else(|| memory_request.clone())
+        .unwrap_or_else(|| kubevirt.memory.clone());
+    let guest_bytes = parse_memory_bytes(&guest_memory)?;
+    if guest_bytes < MIN_GUEST_MEMORY_BYTES {
+        return Err(format!(
+            "memory {guest_memory:?} is below the safe guest minimum of 256Mi \
+             (the guest kernel, userland, and boundary need it before the workload starts)"
+        ));
+    }
+
+    // The launcher's requests mirror the pod path's rule: an omitted
+    // request defaults to the limit (and the guest memory stands in for
+    // an omitted memory request).
+    let cpu_request = cpu_request.or_else(|| cpu_limit.clone());
+    let memory_request = memory_request.or_else(|| memory_limit.clone());
+
+    Ok(KubeVirtDomainResources {
+        cores,
+        guest_memory,
+        cpu_request,
+        cpu_limit,
+        memory_request,
+        memory_limit,
+    })
+}
+
 /// Render the workspace PVC. The guest init formats it on first boot (sentinel
 /// guarded, same pattern as the pod path's init-container seeding) and mounts
 /// it at `/sandbox`.
@@ -427,6 +613,40 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
             serde_json::json!(kubevirt.guest_image_pull_policy);
     }
 
+    // The sandbox's typed resource requirements map onto the domain (see
+    // `domain_resources`); admission validated them before the VM was
+    // rendered, so the mapping here cannot fail.
+    let resources = domain_resources(
+        params
+            .sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref()),
+        kubevirt,
+    )
+    .expect("admission validated the domain resources before rendering");
+    let mut domain_resources_json = serde_json::Map::new();
+    if resources.cpu_request.is_some() || resources.memory_request.is_some() {
+        let mut requests = serde_json::Map::new();
+        if let Some(cpu) = &resources.cpu_request {
+            requests.insert("cpu".to_string(), serde_json::json!(cpu));
+        }
+        if let Some(memory) = &resources.memory_request {
+            requests.insert("memory".to_string(), serde_json::json!(memory));
+        }
+        domain_resources_json.insert("requests".to_string(), serde_json::Value::Object(requests));
+    }
+    if resources.cpu_limit.is_some() || resources.memory_limit.is_some() {
+        let mut limits = serde_json::Map::new();
+        if let Some(cpu) = &resources.cpu_limit {
+            limits.insert("cpu".to_string(), serde_json::json!(cpu));
+        }
+        if let Some(memory) = &resources.memory_limit {
+            limits.insert("memory".to_string(), serde_json::json!(memory));
+        }
+        domain_resources_json.insert("limits".to_string(), serde_json::Value::Object(limits));
+    }
+
     let data = serde_json::json!({
         "spec": {
             "runStrategy": KUBEVIRT_RUN_STRATEGY,
@@ -440,8 +660,9 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
                                 "kernelArgs": kernel_args
                             }
                         },
-                        "cpu": {"cores": kubevirt.cpu_cores},
-                        "resources": {"requests": {"memory": kubevirt.memory}},
+                        "cpu": {"cores": resources.cores},
+                        "memory": {"guest": resources.guest_memory},
+                        "resources": domain_resources_json,
                         "devices": {
                             "disks": disks,
                             "filesystems": filesystems,
@@ -969,7 +1190,7 @@ mod tests {
 
         let domain = &vm.data["spec"]["template"]["spec"]["domain"];
         assert_eq!(domain["cpu"]["cores"], 2);
-        assert_eq!(domain["resources"]["requests"]["memory"], "2Gi");
+        assert_eq!(domain["memory"]["guest"], "2Gi");
         // Direct kernel boot from the purpose-built image.
         assert_eq!(
             domain["firmware"]["kernelBoot"]["container"]["image"],
@@ -1336,6 +1557,156 @@ mod kubevirt_review_tests {
             namespace: "openshell-e2e-ns",
             kube_name: "default--demo",
         }
+    }
+
+    fn template_with_resources(
+        cpu_request: &str,
+        cpu_limit: &str,
+        memory_request: &str,
+        memory_limit: &str,
+    ) -> openshell_core::proto::compute::v1::DriverSandboxTemplate {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxTemplate,
+        };
+        DriverSandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                cpu_request: cpu_request.to_string(),
+                cpu_limit: cpu_limit.to_string(),
+                memory_request: memory_request.to_string(),
+                memory_limit: memory_limit.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn domain_resources_default_when_the_sandbox_asks_for_nothing() {
+        let resources = domain_resources(None, &review_config().kubevirt).expect("defaults map");
+        assert_eq!(resources.cores, 2, "the global cpu_cores default");
+        assert_eq!(resources.guest_memory, "2Gi", "the global memory default");
+        assert_eq!(resources.cpu_request, None);
+        assert_eq!(resources.cpu_limit, None);
+        assert_eq!(resources.memory_request, None);
+        assert_eq!(resources.memory_limit, None);
+    }
+
+    #[test]
+    fn domain_resources_requests_only() {
+        let template = template_with_resources("1500m", "", "1Gi", "");
+        let resources =
+            domain_resources(Some(&template), &review_config().kubevirt).expect("requests map");
+        // Fractional request rounds up to whole vCPUs.
+        assert_eq!(resources.cores, 2);
+        assert_eq!(
+            resources.guest_memory, "1Gi",
+            "guest memory from the request"
+        );
+        assert_eq!(resources.cpu_request.as_deref(), Some("1500m"));
+        assert_eq!(resources.cpu_limit, None);
+        assert_eq!(resources.memory_request.as_deref(), Some("1Gi"));
+        assert_eq!(resources.memory_limit, None);
+    }
+
+    #[test]
+    fn domain_resources_limits_only() {
+        let template = template_with_resources("", "4", "", "4Gi");
+        let resources =
+            domain_resources(Some(&template), &review_config().kubevirt).expect("limits map");
+        assert_eq!(resources.cores, 4);
+        assert_eq!(resources.guest_memory, "4Gi", "guest memory from the limit");
+        // An omitted request mirrors the limit, exactly as the pod path.
+        assert_eq!(resources.cpu_request.as_deref(), Some("4"));
+        assert_eq!(resources.cpu_limit.as_deref(), Some("4"));
+        assert_eq!(resources.memory_request.as_deref(), Some("4Gi"));
+        assert_eq!(resources.memory_limit.as_deref(), Some("4Gi"));
+    }
+
+    #[test]
+    fn domain_resources_both_requests_and_limits() {
+        let template = template_with_resources("1", "2", "1Gi", "2Gi");
+        let resources =
+            domain_resources(Some(&template), &review_config().kubevirt).expect("both map");
+        assert_eq!(resources.cores, 2, "the limit sizes the vCPU count");
+        assert_eq!(resources.guest_memory, "2Gi");
+        assert_eq!(resources.cpu_request.as_deref(), Some("1"));
+        assert_eq!(resources.cpu_limit.as_deref(), Some("2"));
+        assert_eq!(resources.memory_request.as_deref(), Some("1Gi"));
+        assert_eq!(resources.memory_limit.as_deref(), Some("2Gi"));
+    }
+
+    #[test]
+    fn domain_resources_fractional_cpu_limit_rounds_up() {
+        let template = template_with_resources("", "1500m", "", "1Gi");
+        let resources =
+            domain_resources(Some(&template), &review_config().kubevirt).expect("fractional maps");
+        // The guest sees 2 vCPUs; the launcher is limited to 1500m.
+        assert_eq!(resources.cores, 2);
+        assert_eq!(resources.cpu_limit.as_deref(), Some("1500m"));
+    }
+
+    #[test]
+    fn domain_resources_rejects_a_limit_below_the_request() {
+        let template = template_with_resources("2", "1", "1Gi", "2Gi");
+        let error = domain_resources(Some(&template), &review_config().kubevirt)
+            .expect_err("cpu limit below request");
+        assert!(error.contains("below"), "{error}");
+
+        let template = template_with_resources("1", "2", "2Gi", "1Gi");
+        let error = domain_resources(Some(&template), &review_config().kubevirt)
+            .expect_err("memory limit below request");
+        assert!(error.contains("below"), "{error}");
+    }
+
+    #[test]
+    fn domain_resources_rejects_memory_below_the_guest_minimum() {
+        let template = template_with_resources("", "", "", "128Mi");
+        let error = domain_resources(Some(&template), &review_config().kubevirt)
+            .expect_err("memory below the guest minimum");
+        assert!(error.contains("256Mi"), "{error}");
+    }
+
+    #[test]
+    fn domain_resources_rejects_unparsable_quantities() {
+        let template = template_with_resources("fast", "", "", "");
+        assert!(domain_resources(Some(&template), &review_config().kubevirt).is_err());
+        let template = template_with_resources("", "", "lots", "");
+        assert!(domain_resources(Some(&template), &review_config().kubevirt).is_err());
+    }
+
+    #[test]
+    fn rendered_vm_carries_the_mapped_domain_resources() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        let mut sandbox = review_sandbox();
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(template_with_resources("1", "1500m", "1Gi", "2Gi")),
+            ..Default::default()
+        });
+        let cfg = review_config();
+        let vm = render_virtual_machine(&review_params(&sandbox, &cfg));
+        assert_eq!(
+            vm.data["spec"]["template"]["spec"]["domain"]["cpu"]["cores"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            vm.data["spec"]["template"]["spec"]["domain"]["memory"]["guest"],
+            serde_json::json!("2Gi")
+        );
+        assert_eq!(
+            vm.data["spec"]["template"]["spec"]["domain"]["resources"]["requests"]["cpu"],
+            serde_json::json!("1")
+        );
+        assert_eq!(
+            vm.data["spec"]["template"]["spec"]["domain"]["resources"]["limits"]["cpu"],
+            serde_json::json!("1500m")
+        );
+        assert_eq!(
+            vm.data["spec"]["template"]["spec"]["domain"]["resources"]["requests"]["memory"],
+            serde_json::json!("1Gi")
+        );
+        assert_eq!(
+            vm.data["spec"]["template"]["spec"]["domain"]["resources"]["limits"]["memory"],
+            serde_json::json!("2Gi")
+        );
     }
 
     #[test]

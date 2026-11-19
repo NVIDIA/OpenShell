@@ -2115,8 +2115,10 @@ impl KubernetesComputeDriver {
                     limit_supported: true,
                 }),
                 gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: true,
-                    count_selection_supported: true,
+                    // KubeVirt VM sandboxes do not support GPU passthrough
+                    // yet (H6); the pod runtime keeps full GPU selection.
+                    default_selection_supported: !crate::kubevirt::is_kubevirt_mode(&self.config),
+                    count_selection_supported: !crate::kubevirt::is_kubevirt_mode(&self.config),
                 }),
             }),
             rootfs_tar_staging_dir: String::new(),
@@ -3439,6 +3441,33 @@ impl KubernetesComputeDriver {
         })?;
 
         if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            // GPU passthrough is not supported for VM sandboxes yet (H6):
+            // reject the request at admission, before anything is created.
+            if let Some(gpu) = gpu_requirements {
+                return Err(KubernetesDriverError::InvalidArgument(format!(
+                    "KubeVirt VM sandboxes do not support GPU passthrough yet \
+                     (requested: {} GPU{}); use the pod runtime for GPU workloads",
+                    gpu.count.unwrap_or(1),
+                    if gpu.count == Some(1) { "" } else { "s" }
+                )));
+            }
+            // H6: the same resource admission as the pod path — driver-config
+            // policy, workspace namespace rules, and referenced-resource
+            // admission all apply before anything is created.
+            self.admit_requested_resources(sandbox)
+                .await
+                .map_err(admission_error)?;
+            // H6: validate the typed CPU/memory mapping onto the VM domain
+            // before anything is created (limit below request, memory below
+            // the safe guest minimum, unparsable quantities).
+            crate::kubevirt::domain_resources(
+                sandbox
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.template.as_ref()),
+                &self.config.kubevirt,
+            )
+            .map_err(KubernetesDriverError::InvalidArgument)?;
             let runtime_identity = self.create_kubevirt_sandbox(sandbox).await?;
             return Ok(runtime_identity);
         }
@@ -12911,6 +12940,127 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    /// H6: a GPU request in `KubeVirt` mode is rejected at admission, before
+    /// anything is created.
+    #[tokio::test]
+    async fn kubevirt_gpu_requests_are_rejected_before_create() {
+        use openshell_core::proto::compute::v1::{
+            DriverSandboxSpec, GpuResourceRequirements, ResourceRequirements,
+        };
+        let state = MockKube::default();
+        seed_kubevirt_namespace(&state);
+        let driver = kubevirt_mock_driver(mock_kube_client(state.clone()));
+        let mut sandbox = kubevirt_test_sandbox();
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(ResourceRequirements {
+                gpu: Some(GpuResourceRequirements { count: Some(2) }),
+            }),
+            ..Default::default()
+        });
+        let error = driver
+            .create_sandbox(&sandbox)
+            .await
+            .expect_err("a GPU request must be refused in KubeVirt mode");
+        assert!(
+            error.to_string().contains("GPU"),
+            "the error must name the GPU refusal: {error}"
+        );
+        assert!(
+            !state.exists(MOCK_VM_PATH),
+            "nothing may be created for a refused GPU request"
+        );
+    }
+
+    /// H6: resource admission runs in `KubeVirt` mode too — a sandbox whose
+    /// template carries caller driver config while the gateway disallows
+    /// it is refused before anything is created.
+    #[tokio::test]
+    async fn kubevirt_create_runs_resource_admission() {
+        use openshell_core::proto::compute::v1::DriverSandboxTemplate;
+        use prost_types::{Struct, Value, value::Kind};
+        let state = MockKube::default();
+        seed_kubevirt_namespace(&state);
+        let driver = kubevirt_mock_driver(mock_kube_client(state.clone()));
+        assert!(
+            !driver.config.allow_driver_config,
+            "the mock gateway disallows caller driver config"
+        );
+        let mut sandbox = kubevirt_test_sandbox();
+        sandbox.spec = Some(SandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(Struct {
+                    fields: std::iter::once((
+                        "key".to_string(),
+                        Value {
+                            kind: Some(Kind::StringValue("value".to_string())),
+                        },
+                    ))
+                    .collect(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let error = driver
+            .create_sandbox(&sandbox)
+            .await
+            .expect_err("driver config must be refused by admission");
+        assert!(
+            error.to_string().contains("driver config"),
+            "the error must come from resource admission: {error}"
+        );
+        assert!(
+            !state.exists(MOCK_VM_PATH),
+            "nothing may be created when admission refuses"
+        );
+    }
+
+    /// H6: capabilities report GPU selection as unsupported in `KubeVirt`
+    /// mode and unchanged in pod mode.
+    #[tokio::test]
+    async fn kubevirt_capabilities_report_gpu_support_per_mode() {
+        let state = MockKube::default();
+        let _ = state; // the capabilities call needs no cluster
+        let driver = kubevirt_mock_driver(mock_kube_client(state));
+        let capabilities = driver.capabilities().expect("capabilities build");
+        let gpu = capabilities
+            .resource_capabilities
+            .as_ref()
+            .and_then(|resources| resources.gpu.as_ref())
+            .expect("gpu capabilities are reported");
+        assert!(
+            !gpu.default_selection_supported && !gpu.count_selection_supported,
+            "KubeVirt mode must not advertise GPU selection: {gpu:?}"
+        );
+        let cpu = capabilities
+            .resource_capabilities
+            .as_ref()
+            .and_then(|resources| resources.cpu.as_ref())
+            .expect("cpu capabilities are reported");
+        assert!(cpu.limit_supported, "CPU limits stay supported");
+        let memory = capabilities
+            .resource_capabilities
+            .as_ref()
+            .and_then(|resources| resources.memory.as_ref())
+            .expect("memory capabilities are reported");
+        assert!(memory.limit_supported, "memory limits stay supported");
+
+        let mut pod_config = kubevirt_mock_config();
+        pod_config.runtime = crate::config::KubernetesRuntimeMode::Pod;
+        let mut pod_driver = kubevirt_mock_driver(mock_kube_client(MockKube::default()));
+        pod_driver.config = pod_config;
+        let pod_capabilities = pod_driver.capabilities().expect("capabilities build");
+        let pod_gpu = pod_capabilities
+            .resource_capabilities
+            .as_ref()
+            .and_then(|resources| resources.gpu.as_ref())
+            .expect("gpu capabilities are reported");
+        assert!(
+            pod_gpu.default_selection_supported && pod_gpu.count_selection_supported,
+            "pod mode keeps GPU selection: {pod_gpu:?}"
+        );
     }
 
     const MOCK_VM_PATH: &str =

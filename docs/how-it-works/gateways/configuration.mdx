@@ -1531,8 +1531,13 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 
 # guest_image is the containerDisk providing the bootable guest filesystem
 # (Alpine + supervisor + kernel, built by `e2e/kubevirt/build-guest-image.sh`);
-# it is NOT an arbitrary sandbox OCI image. cpu_cores and memory size the
-# guest. workspace_pvc attaches a per-sandbox PVC at /sandbox (virtio-fs),
+# it is NOT an arbitrary sandbox OCI image. cpu_cores and memory are the
+# defaults when a sandbox requests no CPU/memory of its own: a sandbox's
+# requests and limits map onto the VM (the effective CPU rounded up to
+# whole vCPUs the guest sees, the effective memory as the guest's RAM,
+# and the requests/limits on the virt-launcher container). GPU requests
+# are rejected — use the pod runtime for GPU workloads.
+# workspace_pvc attaches a per-sandbox PVC at /sandbox (virtio-fs),
 # surviving stop/start. Guest egress is fenced by a per-sandbox
 # NetworkPolicy to the sandbox's supervisor only — no DNS, no gateway: the
 # boundary's in-guest DNS relay forwards through the supervisor's network
