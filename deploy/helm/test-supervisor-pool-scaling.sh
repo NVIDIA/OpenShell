@@ -144,11 +144,11 @@ render two-gateways --set supervisor.replicas=4 --set supervisor.pool.maxMembers
   --set replicaCount=2 --set workload.kind=deployment --set server.externalDbSecret=scaling-pg
 [[ "$(supervisor_replicas two-gateways)" == "4" ]] || fail "two gateways do not serve 4 supervisors at 2 each"
 
-# The large-cluster profile renders 25 gateways and a 50..800 supervisor HPA.
-render scale-100k --values "${chart}/values-scale-100k.yaml" --set server.externalDbSecret=scaling-pg
-yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell") | .spec.replicas == 25' \
-  "${work_dir}/scale-100k.yaml" >/dev/null || fail "the scale profile does not run 25 gateways"
+# The 10k profile renders 2 gateways and a 10..80 supervisor HPA.
+render scale-10k --values "${chart}/values-scale-10k.yaml" --set server.externalDbSecret=scaling-pg
+yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell") | .spec.replicas == 2' \
+  "${work_dir}/scale-10k.yaml" >/dev/null || fail "the scale profile does not run 2 gateways"
 yq ea -e 'select(.kind == "HorizontalPodAutoscaler" and .metadata.name == "scaling-openshell-supervisor")
-  | (.spec.minReplicas == 50 and .spec.maxReplicas == 800)' \
-  "${work_dir}/scale-100k.yaml" >/dev/null || fail "the scale profile does not autoscale supervisors from 50 to 800"
+  | (.spec.minReplicas == 10 and .spec.maxReplicas == 80)' \
+  "${work_dir}/scale-10k.yaml" >/dev/null || fail "the scale profile does not autoscale supervisors from 10 to 80"
 echo "supervisor pool limits: defaults stay small, limits reach gateway and supervisors, and oversized pools fail"

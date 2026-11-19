@@ -151,10 +151,10 @@ for limits in "1 1" "128 32" "1024 500"; do
   grep -Fx "max_instances_per_member = ${instances}" "${work_dir}/${name}.toml" >/dev/null
   grep -Fx "max_members_per_gateway = ${members}" "${work_dir}/${name}.toml" >/dev/null
 done
-render "${work_dir}/scale-100k.yaml" \
-  --values "${chart}/values-scale-100k.yaml" --set server.externalDbSecret=parser-database
-extract_toml "${work_dir}/scale-100k.yaml" "${work_dir}/scale-100k.toml"
-preflight "${work_dir}/scale-100k.toml"
+render "${work_dir}/scale-10k.yaml" \
+  --values "${chart}/values-scale-10k.yaml" --set server.externalDbSecret=parser-database
+extract_toml "${work_dir}/scale-10k.yaml" "${work_dir}/scale-10k.toml"
+preflight "${work_dir}/scale-10k.toml"
 pool_with() {
   local line="$1"
   grep -v "^${line%% =*} = " "${work_dir}/pool-128-32.toml" \
