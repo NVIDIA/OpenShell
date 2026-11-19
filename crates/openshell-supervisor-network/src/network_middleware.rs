@@ -108,7 +108,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn commit_advances_the_generation_before_publishing() {
         let state = MiddlewareState::new(MiddlewareConfigs::default());
@@ -138,7 +138,7 @@ mod tests {
 
     /// A failed preparation commits nothing: the guard stays current and the
     /// middleware stays on the previous configs.
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn commit_changes_nothing_when_preparation_fails() {
         let state = MiddlewareState::new(MiddlewareConfigs::default());
@@ -162,7 +162,7 @@ mod tests {
         assert!(chain.is_empty());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn change_configuration_advances_only_when_changed() {
         let state = MiddlewareState::new(MiddlewareConfigs::default());

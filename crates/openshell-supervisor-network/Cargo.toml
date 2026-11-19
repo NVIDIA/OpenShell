@@ -65,8 +65,8 @@ webpki-roots = { workspace = true, optional = true }
 default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 # Enables shared Cedar validation and the Cedar parity tests. The runtime
-# backend is selected by `openshell-supervisor/cedar`.
-cedar = ["openshell-policy/cedar"]
+# backend is selected by `openshell-supervisor/experimental`.
+experimental = ["openshell-policy/experimental"]
 
 [dev-dependencies]
 openshell-policy = { path = "../openshell-policy", features = ["test-support"] }

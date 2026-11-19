@@ -45,6 +45,6 @@ credential publication without inspecting concrete engine variants.
 
 `policy_types`, `policy_data`, `binary_resolution`, and `network_middleware`
 reexport shared runtime helpers. `policy_validation` reexports the policy
-composition layer's bounded validation diagnostics. The `cedar` feature enables
+composition layer's bounded validation diagnostics. The `experimental` feature enables
 Cedar validation and the parity tests; it does not import the Cedar runtime into
 production networking code.

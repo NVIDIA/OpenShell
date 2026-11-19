@@ -11,14 +11,14 @@ use std::sync::Arc;
 
 pub fn from_proto(policy: &SandboxPolicy) -> Result<PolicyEngine> {
     if policy.is_cedar() {
-        #[cfg(feature = "cedar")]
+        #[cfg(feature = "experimental")]
         return Ok(
             Arc::new(openshell_policy_cedar_runtime::CedarOnlyEngine::from_proto(
                 policy,
             )?)
             .into(),
         );
-        #[cfg(not(feature = "cedar"))]
+        #[cfg(not(feature = "experimental"))]
         return Err(miette::miette!(
             "Cedar policy support is not enabled in this supervisor build"
         ));

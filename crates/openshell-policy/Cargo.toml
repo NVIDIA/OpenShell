@@ -26,10 +26,10 @@ default = []
 test-support = []
 # Validates and interprets Cedar-authored policies (`cedar_policy.source`).
 # Without it, any policy with Cedar source fails validation as unsupported.
-# Only the gateway and supervisor enable it, through their own `cedar`
-# features in per-package builds; workspace selection can unify this feature.
+# Enabled by gateway and supervisor experimental builds; workspace selection
+# can unify this feature.
 # Shipped clients carry Cedar documents without linking the engine.
-cedar = ["dep:openshell-policy-cedar-adapter"]
+experimental = ["dep:openshell-policy-cedar-adapter"]
 
 [lints]
 workspace = true

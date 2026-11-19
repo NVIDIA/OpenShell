@@ -486,7 +486,7 @@ async fn report_endpoint_status_does_not_wait_for_unrelated_sandbox_guard() {
     drop(unrelated_guard);
 }
 
-#[cfg(feature = "cedar")]
+#[cfg(feature = "experimental")]
 #[test]
 fn cedar_endpoint_statuses_accept_configured_wildcard_observation() {
     let policy = ProtoSandboxPolicy {

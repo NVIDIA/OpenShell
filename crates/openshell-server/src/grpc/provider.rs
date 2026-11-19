@@ -6511,7 +6511,7 @@ mod tests {
 
     /// A sandbox a Cedar-enabled gateway created must not fail profile imports
     /// for its whole workspace on a gateway built without Cedar.
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
     async fn import_provider_profile_skips_attached_cedar_sandbox_without_cedar_support() {
         let state = test_server_state().await;

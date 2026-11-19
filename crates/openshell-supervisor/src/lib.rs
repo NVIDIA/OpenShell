@@ -2057,7 +2057,7 @@ async fn flush_activity_to_gateway(
 fn supported_policy_capabilities() -> Vec<String> {
     openshell_core::extension_protocol::capabilities_if(
         openshell_core::extension_protocol::POLICY_CEDAR_V1,
-        cfg!(feature = "cedar"),
+        cfg!(feature = "experimental"),
     )
 }
 
@@ -6970,7 +6970,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         }
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     pub fn cedar_engine() -> Arc<openshell_policy_cedar_runtime::CedarOnlyEngine> {
         Arc::new(
             openshell_policy_cedar_runtime::CedarOnlyEngine::from_proto(&cedar_proto_policy(
@@ -7000,7 +7000,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         .await
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn yaml_reload_of_a_cedar_sandbox_is_rejected_and_keeps_previous_policy() {
         let cedar = cedar_engine();
@@ -7040,7 +7040,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert_eq!(engine.current_generation(), opa_generation);
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn invalid_cedar_reload_leaves_the_previous_configuration_active() {
         let cedar = cedar_engine();
@@ -7059,7 +7059,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     /// A Cedar policy's middleware gets the same validation a YAML policy's
     /// does; a rejected candidate commits no policy, middleware, or
     /// credentials.
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn invalid_cedar_middleware_reload_commits_nothing() {
         let cedar = cedar_engine();
@@ -7112,7 +7112,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     /// generation, so inspected tunnels stay open; a middleware-only change
     /// publishes a new configuration generation and advances Cedar's, so
     /// tunnels close before they run the old chain again, as for YAML.
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn cedar_middleware_only_reload_advances_the_cedar_generation() {
         let cedar = cedar_engine();
@@ -7180,7 +7180,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn valid_cedar_reload_commits_cedar_and_ends_its_quarantine() {
         let cedar = cedar_engine();
@@ -7202,7 +7202,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(cedar.current_generation() > quarantined_generation);
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     /// A Cedar sandbox's startup configuration is the Cedar engine alone; no
     /// OPA engine is built for it.
     #[test]
@@ -7220,7 +7220,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     }
 
     /// A supervisor built without Cedar refuses a Cedar policy at startup.
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[test]
     fn cedar_startup_configuration_fails_without_cedar_support() {
         let policy = cedar_proto_policy(CEDAR_RELOAD_POLICY);
@@ -7239,7 +7239,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     /// As YAML adds baseline paths only to a policy with network rules, a
     /// Cedar policy gets them only when it can permit `NetworkConnect`.
     #[test]
@@ -7275,7 +7275,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(filesystem.read_write.contains(&tmp), "{filesystem:?}");
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn policy_rejection_quarantines_the_cedar_engine_of_a_cedar_sandbox() {
         let cedar = cedar_engine();

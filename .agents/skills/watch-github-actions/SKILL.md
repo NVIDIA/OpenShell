@@ -126,7 +126,7 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 ## View Job Logs
 
 For `Verify policy builds without Cedar` in the Linux Rust test job, use
-`mise run rust:verify:cedar-off` to reproduce package-graph, compile, YAML policy,
+`bash tasks/scripts/verify-cedar-off.sh` to reproduce package-graph, compile, YAML policy,
 and unsupported-Cedar checks. Run it separately from workspace tests: selecting
 the Cedar runtime workspace member unifies the shared policy feature.
 

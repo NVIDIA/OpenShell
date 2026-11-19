@@ -1316,7 +1316,7 @@ pub mod test_support {
 
     /// A valid Cedar policy whose audit-only `@path` forbid produces one
     /// load-time warning.
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     pub fn cedar_policy_with_warning() -> openshell_core::proto::SandboxPolicy {
         openshell_core::proto::SandboxPolicy {
             cedar_policy: Some(openshell_core::proto::CedarPolicy {
@@ -1368,7 +1368,7 @@ mod tests {
                 &health.supported_capabilities,
                 openshell_core::extension_protocol::POLICY_CEDAR_V1
             ),
-            cfg!(feature = "cedar")
+            cfg!(feature = "experimental")
         );
     }
 

@@ -797,7 +797,7 @@ async fn config_and_clear_receipts_preserve_revision_and_parent_lifetime() {
     );
 }
 
-#[cfg(feature = "cedar")]
+#[cfg(feature = "experimental")]
 #[tokio::test]
 async fn sandbox_and_config_replays_return_stored_policy_warnings() {
     let (_directory, state) = protected_state().await;

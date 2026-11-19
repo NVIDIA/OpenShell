@@ -1017,7 +1017,7 @@ pub(super) fn validate_object_metadata(
 pub(super) fn supported_policy_capabilities() -> Vec<String> {
     openshell_core::extension_protocol::capabilities_if(
         openshell_core::extension_protocol::POLICY_CEDAR_V1,
-        cfg!(feature = "cedar"),
+        cfg!(feature = "experimental"),
     )
 }
 
@@ -1237,7 +1237,7 @@ mod tests {
 
     use crate::grpc::test_support::cedar_policy;
 
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[test]
     fn cedar_policies_are_rejected_without_the_cedar_feature() {
         let policy = cedar_policy();
@@ -1256,7 +1256,7 @@ mod tests {
         assert!(require_gateway_cedar_support(&ProtoSandboxPolicy::default()).is_ok());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_policy_validation_returns_load_time_warnings() {
         let validated = validate_and_canonicalize_policy_report(
@@ -2403,7 +2403,7 @@ mod tests {
         assert!(error.message().contains("provider_credential_rules"));
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn validate_and_canonicalize_policy_checks_endpoint_settings() {
         use openshell_core::proto::{McpOptions, NetworkEndpoint};
@@ -2547,14 +2547,14 @@ mod tests {
 
     /// A Cedar sandbox's process identity comes from its policy API fields, and
     /// `policy set` with a different one is rejected as for a YAML policy.
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     const CONNECT_PYPI: &str = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
         resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#;
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     const CONNECT_EXAMPLE: &str = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
         resource == Sandbox::NetworkEndpoint::"example.com:443");"#;
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn validate_static_fields_rejects_process_change_within_cedar() {
         use openshell_core::proto::ProcessPolicy;
@@ -2605,7 +2605,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn validate_static_fields_allows_cedar_policy_source_change_within_cedar() {
         let baseline = ProtoSandboxPolicy {
@@ -2625,7 +2625,7 @@ mod tests {
         assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     fn cedar_policy_granting(paths: &[&str]) -> ProtoSandboxPolicy {
         let cedar_policy_source = paths
             .iter()
@@ -2646,7 +2646,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn validate_static_fields_rejects_removing_a_cedar_filesystem_grant() {
         let baseline = cedar_policy_granting(&["/usr", "/etc"]);
@@ -2656,7 +2656,7 @@ mod tests {
         assert!(error.message().contains("/etc"), "{}", error.message());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn validate_static_fields_allows_adding_a_cedar_filesystem_grant() {
         let baseline = cedar_policy_granting(&["/usr"]);

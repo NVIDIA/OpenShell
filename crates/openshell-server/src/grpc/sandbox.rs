@@ -4227,7 +4227,7 @@ mod tests {
         GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
     };
 
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     /// A test state whose compute driver records provisioning calls.
     async fn test_server_state_with_fake_driver() -> (
         Arc<ServerState>,
@@ -4286,7 +4286,7 @@ mod tests {
 
     /// Stores a stopped sandbox whose spec holds a Cedar policy, as a
     /// Cedar-enabled gateway with a supervisor-enforced driver created it.
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     async fn put_stopped_cedar_sandbox(state: &ServerState, name: &str) {
         let mut sandbox = test_sandbox(name, Vec::new());
         sandbox.spec.as_mut().unwrap().policy = Some(crate::grpc::test_support::cedar_policy());
@@ -4294,7 +4294,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
     }
 
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     fn start_request(name: &str) -> Request<StartSandboxRequest> {
         authed_request(StartSandboxRequest {
             name: name.to_string(),
@@ -4303,7 +4303,7 @@ mod tests {
         })
     }
 
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
     async fn create_rejects_cedar_without_cedar_support() {
         let (state, driver) = test_server_state_with_fake_driver().await;
@@ -4318,7 +4318,7 @@ mod tests {
         assert!(driver.calls().is_empty(), "{:?}", driver.calls());
     }
 
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
     async fn start_rejects_a_stored_cedar_sandbox_without_cedar_support() {
         let (state, driver) = test_server_state_with_fake_driver().await;
@@ -4333,7 +4333,7 @@ mod tests {
     }
 
     /// Resuming starts the workload again, so it applies the start checks.
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
     async fn resume_rejects_a_stored_cedar_sandbox_without_cedar_support() {
         let (state, driver) = test_server_state_with_fake_driver().await;
@@ -4354,7 +4354,7 @@ mod tests {
         assert!(driver.calls().is_empty(), "{:?}", driver.calls());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn create_returns_cedar_load_time_warnings() {
         let state = test_server_state().await;

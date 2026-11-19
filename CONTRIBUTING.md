@@ -392,8 +392,8 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
-| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the `cedar` feature and included in the development `experimental` feature |
-| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names, linked only with the `cedar` feature |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the development `experimental` feature |
+| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names, linked only with the `experimental` feature |
 | `crates/openshell-policy-cedar-adapter/` | Cedar analysis adapted to policy messages for gateway and runtime composition |
 | `crates/openshell-policy-cedar-runtime/` | Cedar implementation of the shared runtime contracts, selected by supervisor composition |
 | `crates/openshell-policy-runtime-interface/` | Shared policy decisions, request metadata, snapshots, and staged reload contracts; no engine implementations |

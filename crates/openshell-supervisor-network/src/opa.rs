@@ -289,7 +289,7 @@ impl OpaEngine {
     ///
     /// For tests of the Rego rules' defense in depth against policies that
     /// validation would reject.
-    #[cfg(all(test, feature = "cedar"))]
+    #[cfg(all(test, feature = "experimental"))]
     pub(crate) fn from_strings_unvalidated(policy: &str, data_yaml: &str) -> Result<Self> {
         let data: serde_json::Value = serde_yml::from_str(data_yaml)
             .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;

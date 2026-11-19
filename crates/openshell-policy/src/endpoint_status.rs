@@ -23,10 +23,10 @@ pub fn configured_mcp_endpoints(policy: &SandboxPolicy) -> Result<Vec<NetworkEnd
             .cloned()
             .collect());
     }
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     {
         openshell_policy_cedar_adapter::endpoint_status::configured_mcp_endpoints(policy)
     }
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     Err(miette::miette!("Cedar policy support is unavailable"))
 }

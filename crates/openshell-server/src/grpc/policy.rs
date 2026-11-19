@@ -12856,7 +12856,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn cedar_config_requires_supervisor_support_on_every_fetch() {
         let state = test_server_state().await;
@@ -12932,7 +12932,7 @@ mod tests {
         assert!(legacy_yaml.policy.unwrap().cedar_source().is_empty());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn sandbox_config_delivers_provider_rules_separately_for_a_cedar_policy() {
         let state = test_server_state().await;
@@ -14428,7 +14428,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn provider_environment_delivers_bound_credentials_to_a_cedar_sandbox() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
@@ -22975,7 +22975,7 @@ mod tests {
             // revision before it reaches the merge.
             assert!(
                 err.message().contains("openshell policy set")
-                    || (!cfg!(feature = "cedar")
+                    || (!cfg!(feature = "experimental")
                         && sandbox == "cedar-revision"
                         && err.message().contains("without Cedar policy support")),
                 "{sandbox}: {}",
@@ -23231,7 +23231,7 @@ mod tests {
 
     /// A gateway built without Cedar serves no stored Cedar policy, and names
     /// the stored policy it refused.
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[test]
     fn stored_cedar_policies_are_not_served_without_cedar_support() {
         let status = validate_and_canonicalize_stored_policy(
@@ -23250,7 +23250,7 @@ mod tests {
     /// A sandbox a Cedar-enabled gateway created fails closed on its own, so
     /// it must not stop a gateway built without Cedar from starting or from
     /// re-enabling provider composition, nor hide other sandboxes' errors.
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
     async fn provider_composition_checks_skip_a_cedar_sandbox_without_cedar_support() {
         let state = test_server_state().await;
@@ -23302,7 +23302,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
     async fn sandbox_policy_update_rejects_cedar_without_cedar_support() {
         let state = test_server_state().await;
@@ -23334,7 +23334,7 @@ mod tests {
 
     /// A user reading the config gets the reason; the sandbox's own supervisor
     /// gets an unadmitted configuration with no policy, and fails closed.
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
     async fn sandbox_config_is_not_served_for_a_stored_cedar_policy_without_cedar_support() {
         let state = test_server_state().await;
@@ -23377,7 +23377,7 @@ mod tests {
 
     /// Load-time warnings reach the client on a policy update, including an
     /// identical update that changes nothing.
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn sandbox_policy_update_returns_cedar_load_time_warnings() {
         let state = test_server_state().await;

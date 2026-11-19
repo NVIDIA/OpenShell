@@ -1192,7 +1192,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_mcp_inventory_uses_configured_wildcard_identity() {
         let policy = SandboxPolicy {

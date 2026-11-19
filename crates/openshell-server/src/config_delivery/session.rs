@@ -2585,7 +2585,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         state
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn push_bootstrap_withholds_cedar_from_a_supervisor_without_cedar_support() {
         let sandbox_id = "sb-push-cedar";

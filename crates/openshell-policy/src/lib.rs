@@ -9,7 +9,7 @@
 //! `openshell-policy-schema`; this crate adapts that representation to the
 //! runtime protobuf model and owns runtime-dependent validation.
 
-#[cfg(feature = "cedar")]
+#[cfg(feature = "experimental")]
 mod cedar;
 
 mod compose;
@@ -1411,7 +1411,7 @@ pub enum PolicyViolation {
     /// `cedar_policy.source` failed to parse or validate, or uses a policy
     /// shape Cedar cannot enforce exactly.
     InvalidCedarPolicy { reason: String },
-    /// `cedar_policy` is set in a build without the `cedar` feature.
+    /// `cedar_policy` is set in a build without the `experimental` feature.
     CedarUnsupported,
     /// `endpoint_settings` is set on a policy that is not a Cedar policy.
     EndpointSettingsRequireCedar,
@@ -1748,7 +1748,7 @@ enum McpVersionPresence {
 /// Checks mutual exclusivity with `network_policies`, that the Cedar engine
 /// accepts the policy (parse, strict schema validation, and supported
 /// shapes), and that the derived Landlock grants pass the same path checks
-/// as YAML `filesystem` paths. Builds without the `cedar` feature reject every
+/// as YAML `filesystem` paths. Builds without the `experimental` feature reject every
 /// Cedar policy. A no-op when the Cedar message is absent (the YAML path).
 fn validate_cedar_policy_source(
     policy: &SandboxPolicy,
@@ -1773,13 +1773,13 @@ fn validate_cedar_policy_source(
                 .to_string(),
         });
     }
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     {
         ValidationOutput {
             warnings: cedar::validate(policy.cedar_source(), &policy.endpoint_settings, violations),
         }
     }
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     {
         violations.push(PolicyViolation::CedarUnsupported);
         ValidationOutput::default()
@@ -1802,7 +1802,7 @@ pub use openshell_core::policy_l7::EffectiveFilesystem;
 /// # Errors
 ///
 /// Returns the violation when a Cedar policy does not load, including in
-/// builds without the `cedar` feature.
+/// builds without the `experimental` feature.
 pub fn effective_filesystem(
     policy: &SandboxPolicy,
 ) -> std::result::Result<EffectiveFilesystem, PolicyViolation> {
@@ -1812,11 +1812,11 @@ pub fn effective_filesystem(
             needs_proxy_baseline: false,
         });
     }
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     {
         cedar::effective_filesystem(policy.cedar_source())
     }
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     Err(PolicyViolation::CedarUnsupported)
 }
 
@@ -2975,7 +2975,7 @@ when { context.binary_path == "/usr/bin/curl" };
         }
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn endpoint_settings_reject_gateway_managed_fields() {
         // These fields have no YAML spelling; the gateway stamps them on
@@ -3103,7 +3103,7 @@ when { context.binary_path == "/usr/bin/curl" };
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn tls_skip_endpoint_setting_on_an_inspected_cedar_endpoint_is_rejected() {
         let mut policy = cedar_sourced_policy(
@@ -3143,7 +3143,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_policy_accepts_middleware_and_rejects_filesystem_paths() {
         let mut policy = cedar_sourced_policy(
@@ -3179,7 +3179,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         );
     }
 
-    #[cfg(not(feature = "cedar"))]
+    #[cfg(not(feature = "experimental"))]
     #[test]
     fn cedar_policy_source_is_rejected_without_the_cedar_feature() {
         let policy = cedar_sourced_policy(
@@ -3196,7 +3196,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(effective_filesystem(&policy).is_err());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_policy_source_passes_validation() {
         let policy = cedar_sourced_policy(
@@ -3212,7 +3212,7 @@ when { context.binary_path == "/usr/bin/curl" };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn validation_report_returns_cedar_load_time_warnings() {
         let http = |annotations: &str, effect: &str, condition: &str| {
@@ -3266,7 +3266,7 @@ when { context.binary_path == "/usr/bin/curl" };
         assert_eq!(defaulted.filesystem, None);
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn effective_filesystem_of_a_cedar_policy_derives_its_grants() {
         let read_usr = r#"permit (principal, action == Sandbox::Action::"ReadFile",
@@ -3298,7 +3298,7 @@ when { context.binary_path == "/usr/bin/curl" };
         ));
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_policy_source_rejects_unparsable_policy() {
         let policy = cedar_sourced_policy("this is not valid cedar syntax {{{");
@@ -3311,7 +3311,7 @@ when { context.binary_path == "/usr/bin/curl" };
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_policy_source_rejects_forbid_on_filesystem_path() {
         let policy = cedar_sourced_policy(
@@ -3333,7 +3333,7 @@ when { resource == Sandbox::FilesystemPath::"/etc/shadow" };
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_policy_source_applies_filesystem_path_checks_to_grants() {
         let policy = cedar_sourced_policy(

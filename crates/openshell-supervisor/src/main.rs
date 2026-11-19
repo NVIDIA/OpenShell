@@ -427,7 +427,7 @@ fn main() -> Result<()> {
                 &raw_args[2..],
                 openshell_core::extension_protocol::capabilities_if(
                     openshell_core::extension_protocol::POLICY_CEDAR_V1,
-                    cfg!(feature = "cedar"),
+                    cfg!(feature = "experimental"),
                 ),
             )
             .await?;

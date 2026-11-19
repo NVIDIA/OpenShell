@@ -11,11 +11,11 @@
 //! aggregate them.
 
 mod binary_resolution;
-#[cfg(all(test, feature = "cedar"))]
+#[cfg(all(test, feature = "experimental"))]
 pub use openshell_policy_cedar_runtime::{cedar_only, cedar_provider_rules};
-#[cfg(all(test, feature = "cedar"))]
+#[cfg(all(test, feature = "experimental"))]
 mod cedar_parity_tests;
-#[cfg(all(test, feature = "cedar"))]
+#[cfg(all(test, feature = "experimental"))]
 mod cedar_runtime_tests;
 mod google_cloud_metadata;
 #[cfg(target_os = "windows")]

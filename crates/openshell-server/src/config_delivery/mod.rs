@@ -1663,7 +1663,7 @@ mod tests {
         assert!(is_config_update(&update));
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn reconciliation_withholds_cedar_from_a_session_without_cedar_support() {
         let cedar = openshell_core::proto::SandboxPolicy {

@@ -14,7 +14,7 @@ layer enforces it:
 | Filesystem | `policy.template.cedar` | A `WriteFile` grant makes `/sandbox` writable, a `ReadFile` grant makes `/opt` readable, and `/srv` stays unreadable. |
 | Syscalls | sandbox runtime | `memfd_create`, `ptrace`, user-namespace `unshare`, `mount`, `io_uring_setup`, raw netlink sockets, and direct TCP connects that bypass the proxy return `EPERM`. |
 
-Cedar policies need a gateway and supervisor built with the `cedar` feature:
+Cedar policies need a gateway and supervisor built with the `experimental` feature:
 use published Release Dev artifacts, or explicitly build and deploy both binaries
 with `--features experimental`. The suite does not build or start a gateway.
 

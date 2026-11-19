@@ -79,10 +79,9 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
 
 - `openshell-policy-cedar-adapter` converts Cedar analysis to filesystem grants,
   TLS inspection checks, and MCP inventory without depending on shared policy
-  composition. `openshell-policy` validates Cedar sources behind its opt-in `cedar`
-  feature. This crate is linked only when `openshell-gateway` and
-  `openshell-supervisor` are built with their `cedar` feature. Release Dev
-  builds enable it; source builds opt in with `--features experimental`. Stable and
+  composition. Gateway and supervisor composition enable Cedar validation and
+  enforcement through `experimental`. Release Dev builds enable it; source builds
+  opt in with `--features experimental`. Stable and
   prerelease builds exclude it, and their gateways reject Cedar policies. The
   CLI sends Cedar text without linking this crate. The gateway validates it.
 - The gateway rejects format switches on update, Cedar global policies, and

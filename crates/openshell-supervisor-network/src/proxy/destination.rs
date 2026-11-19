@@ -816,7 +816,7 @@ mod tests {
         assert!(denial.reason.contains("blocked control-plane port"));
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     /// The destination rules of `binary`'s allowed Cedar connection.
     fn destination_policy(policy: &str, host: &str, port: u16) -> DestinationPolicy {
         let engine = crate::cedar_only::CedarOnlyEngine::from_policy_str(policy)
@@ -835,14 +835,14 @@ mod tests {
             .expect("the connection is allowed")
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     fn addrs(ips: &[&str], port: u16) -> Vec<SocketAddr> {
         ips.iter()
             .map(|ip| SocketAddr::new(ip.parse().unwrap(), port))
             .collect()
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     const HOSTLESS_8080: &str = r#"
 permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
 when {
@@ -852,7 +852,7 @@ when {
 };
 "#;
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn destination_policy_replaces_the_yaml_modes() {
         let cedar = destination_policy(HOSTLESS_8080, "svc.example", 8080);
@@ -872,7 +872,7 @@ when {
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     /// Sandbox hosts entries may take part only where YAML consults them: when
     /// fixed address ranges check every resolved address. A permit that
     /// authorizes by name alone, exact or glob, resolves through the
@@ -908,7 +908,7 @@ when {
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_must_allow_the_host_gateway_address() {
         let trusted_ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
@@ -950,7 +950,7 @@ when {
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_forbids_reading_the_address_reject_resolved_addresses() {
         let policy = r#"
@@ -986,7 +986,7 @@ when { context has destination_ip && context.destination_ip.isInRange(ip("10.9.0
         assert_eq!(kept, ["10.8.1.1".parse::<IpAddr>().unwrap()]);
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn policy_blocks_control_plane_ports_where_yaml_does() {
         let glob = destination_policy(
@@ -1021,7 +1021,7 @@ when { context has destination_ip && context.destination_ip.isInRange(ip("10.9.0
         assert!(error.contains("control-plane port"), "{error}");
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn cedar_admits_private_addresses_only_through_ranges_or_exact_hosts() {
         let policy = r#"
@@ -1060,7 +1060,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         );
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     /// The destination rules of curl's allowed Cedar connection to
     /// `host:port` on a sandbox with one provider endpoint for `host:port`
     /// whose `allowed_ips` are `ranges`.
@@ -1105,13 +1105,13 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
             .expect("the connection is allowed")
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     const EXACT_CORP: &str = r#"
 permit (principal, action == Sandbox::Action::"NetworkConnect",
         resource == Sandbox::NetworkEndpoint::"api.corp.example:443");
 "#;
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     /// Regression test: a credentialed provider endpoint's `allowed_ips`
     /// keep restricting the addresses its connections reach.
     #[test]
@@ -1150,7 +1150,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert_eq!(kept, ["10.5.0.1".parse::<IpAddr>().unwrap()]);
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     /// Provider ranges never admit a private address Cedar's own rules
     /// reject, and block control-plane ports as YAML `allowed_ips` do.
     #[test]
@@ -1172,7 +1172,7 @@ when { resource.host like("*.corp.example", ".") && (resource.port == 443 || res
         assert!(error.contains("control-plane port"), "{error}");
     }
 
-    #[cfg(feature = "cedar")]
+    #[cfg(feature = "experimental")]
     #[test]
     fn invalid_provider_ranges_reject_every_address() {
         let host = "api.corp.example";
