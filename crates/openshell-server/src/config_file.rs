@@ -173,6 +173,12 @@ pub struct GatewayFileSection {
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
     pub enable_sandbox_updates: Option<bool>,
+    /// Explicit activation only after every serving gateway supports workspace secrets.
+    #[serde(default)]
+    pub enable_workspace_secrets: Option<bool>,
+    /// Allow control-plane callers to read workspace secret values.
+    #[serde(default)]
+    pub enable_secret_reveal: Option<bool>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]

@@ -864,6 +864,55 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn create_secret(
+        &self,
+        _: tonic::Request<proto::CreateSecretRequest>,
+    ) -> Result<Response<proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_secret(
+        &self,
+        _: tonic::Request<proto::GetSecretRequest>,
+    ) -> Result<Response<proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_secrets(
+        &self,
+        _: tonic::Request<proto::ListSecretsRequest>,
+    ) -> Result<Response<proto::ListSecretsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn update_secret(
+        &self,
+        _: tonic::Request<proto::UpdateSecretRequest>,
+    ) -> Result<Response<proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_secret(
+        &self,
+        _: tonic::Request<proto::DeleteSecretRequest>,
+    ) -> Result<Response<proto::DeleteSecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn reveal_secret(
+        &self,
+        _: tonic::Request<proto::RevealSecretRequest>,
+    ) -> Result<Response<proto::RevealSecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn inline_provider_refresh_secrets(
+        &self,
+        _: tonic::Request<proto::InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<proto::InlineProviderRefreshSecretsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox_config(
         &self,
         _: tonic::Request<proto::GetSandboxConfigRequest>,

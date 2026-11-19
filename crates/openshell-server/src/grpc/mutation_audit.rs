@@ -12,13 +12,14 @@ use openshell_core::proto::{
     AttachSandboxProviderResponse, BeginRootfsTarStagingResponse, ClearDraftChunksResponse,
     ConfigureProviderRefreshResponse, CreateWorkspaceResponse, DeleteProviderProfileResponse,
     DeleteProviderRefreshResponse, DeleteProviderResponse, DeleteSandboxResponse,
-    DeleteSandboxTemplateResponse, DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome,
-    DetachSandboxProviderResponse, EditDraftChunkResponse, ImportProviderProfilesResponse,
+    DeleteSandboxTemplateResponse, DeleteSecretResponse, DeleteServiceResponse,
+    DeleteWorkspaceResponse, DeletionOutcome, DetachSandboxProviderResponse,
+    EditDraftChunkResponse, ImportProviderProfilesResponse, InlineProviderRefreshSecretsResponse,
     ProviderCredentialRefreshStatus, ProviderProfile, ProviderResponse, RejectDraftChunkResponse,
     RemoveWorkspaceMemberResponse, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    SandboxTemplateResponse, ServiceEndpointResponse, UndoDraftChunkResponse, UpdateConfigRequest,
-    UpdateConfigResponse, UpdateProviderProfilesResponse, WorkspaceSelector, setting_value,
-    workspace_selector::Selection,
+    SandboxTemplateResponse, SecretResponse, ServiceEndpointResponse, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesResponse, WorkspaceSelector,
+    setting_value, workspace_selector::Selection,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_ocsf::ResourceDetails;
@@ -69,6 +70,7 @@ macro_rules! deletion {
 
 deletion!(
     DeleteSandboxTemplateResponse,
+    DeleteSecretResponse,
     DeleteServiceResponse,
     DeleteProviderResponse,
     DeleteProviderProfileResponse,
@@ -130,6 +132,27 @@ impl Audited for SandboxTemplateResponse {
             self.template
                 .as_ref()
                 .and_then(|template| template.metadata.as_ref()),
+        )
+    }
+}
+
+/// Records who read which secret. The named target comes from the request;
+/// the response carries the value and contributes nothing to the record.
+impl Audited for openshell_core::proto::RevealSecretResponse {}
+
+impl Audited for InlineProviderRefreshSecretsResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        refreshed_provider(self.status.as_ref())
+    }
+}
+
+impl Audited for SecretResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored(
+            "secret",
+            self.secret
+                .as_ref()
+                .and_then(|secret| secret.metadata.as_ref()),
         )
     }
 }

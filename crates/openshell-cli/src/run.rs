@@ -30,10 +30,14 @@ pub use crate::commands::provider::{
     provider_profile_describe, provider_profile_describe_text, provider_profile_export,
     provider_profile_export_text, provider_profile_import, provider_profile_lint,
     provider_profile_update, provider_refresh_config, provider_refresh_delete,
-    provider_refresh_status, provider_rotate, provider_update, sandbox_provider_attach,
-    sandbox_provider_detach, sandbox_provider_list,
+    provider_refresh_inline_secrets, provider_refresh_status, provider_rotate, provider_update,
+    sandbox_provider_attach, sandbox_provider_detach, sandbox_provider_list,
 };
 pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provider_status};
+pub use crate::commands::secret::{
+    SecretCreateInput, SecretUpdateInput, SecretValueSource, secret_create, secret_delete,
+    secret_get, secret_list, secret_update,
+};
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
