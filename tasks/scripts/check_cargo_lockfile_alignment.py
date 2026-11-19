@@ -40,6 +40,7 @@ ALIGNED_WORKSPACES = (
     "tests/suites/conformance",
     "tests/suites/drivers/podman",
     "tests/suites/features",
+    "tests/suites/workloads",
 )
 
 
