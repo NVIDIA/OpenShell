@@ -280,10 +280,12 @@ OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVID
 `<test>` is the crate name (`_` for `-`), then the name libtest shows. The
 program reads the variable under every interface, so `openshell-conformance
 run`, `cargo test` and nextest agree: the test is ignored, so each shows SKIP,
-and `list` marks it `[unsupported: <issue>]`. A run prints the entries to
-stderr, so a forgotten variable is visible. `run`'s summary lists each
-unsupported test with its issue, and its JUnit report marks it `skipped` with
-an `unsupported` property. `run` passes the variable on to its test processes.
+and `list` marks it `[unsupported: <issue>]`. `run` prints the entries to
+stderr, so a forgotten variable is visible. Under `cargo test` and nextest the
+program stays quiet, so whatever starts them should print the entries. `run`'s
+summary lists each unsupported test with its issue, and its JUnit report marks
+it `skipped` with an `unsupported` property. `run` passes the variable on to its
+test processes.
 
 A program applies only the entries for crates it links and ignores the rest, so
 one value can serve several programs. A misspelled crate name is therefore

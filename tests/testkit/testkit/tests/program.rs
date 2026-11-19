@@ -518,10 +518,8 @@ mod unix {
         let skipped = with(&["fixture::fails", "--exact", "--nocapture"]);
         assert!(skipped.status.success());
         assert!(stdout(&skipped).contains("1 ignored"));
-        assert!(stderr(&skipped).contains(&format!(
-            "lists program::fixture::fails as unsupported: {ISSUE}"
-        )));
-        // A listing is not a run: nothing is announced.
+        // Under libtest the caller lists the entries; the program stays quiet.
+        assert!(!stderr(&skipped).contains("unsupported"));
         assert!(!stderr(&ignored).contains("unsupported"));
 
         for forced in ["--ignored", "--include-ignored"] {
@@ -536,7 +534,7 @@ mod unix {
             assert!(!stderr(&run).contains("fixture failure"), "{forced}");
         }
 
-        // `run` skips it, announces it once, and passes the rest through to
+        // `run` is its own caller: it skips the test, announces it once, and passes the rest through to
         // its test processes.
         let dir = tempfile::tempdir().expect("temp dir");
         let (path, junit_arg) = junit(dir.path());

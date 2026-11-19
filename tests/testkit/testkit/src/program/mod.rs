@@ -289,10 +289,6 @@ fn ready(program: &str, timeout: Duration) -> ExitCode {
 /// processes.
 fn libtest(tests: &'static [Test], unsupported: Unsupported, args: Vec<OsString>) -> ExitCode {
     let mut args = libtest_mimic::Arguments::from_iter(args);
-    // `run` prints the entries once for all its test processes.
-    if !args.list && std::env::var_os(SUPERVISED_ENV).is_none() {
-        announce(&unsupported);
-    }
     // Tests share one gateway; run them one at a time unless asked otherwise.
     if args.test_threads.is_none() {
         args.test_threads = Some(1);
