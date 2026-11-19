@@ -322,8 +322,16 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
             assert!(captured[0].closed);
             assert_eq!(captured[0].fields["otel.status_code"], "OK");
             assert_eq!(
-                captured[0].fields["openshell.boundary.connect_attempts"],
-                if kind == "backend" { "3" } else { "1" }
+                captured[0]
+                    .fields
+                    .get("openshell.boundary.connect_attempts")
+                    .map(String::as_str),
+                match kind {
+                    "backend" => Some("3"),
+                    "dial" => Some("1"),
+                    _ => None,
+                },
+                "{kind}"
             );
 
             assert_eq!(client.discover_policy().await.unwrap(), (None, false));
@@ -336,6 +344,83 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
         server.abort();
         drop(client);
         drop(router);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn slow_discovery_exports_one_successful_connect_span() {
+    let _tracing_lock = tracing_test_lock().await;
+    for runtime_initiated in [false, true] {
+        let certificate = test_certificate();
+        let socket_path = PathBuf::from(format!("/tmp/ost-{}.sock", uuid::Uuid::new_v4()));
+        let mut descriptor =
+            tls_runtime_descriptor("127.0.0.1:1".parse().unwrap(), certificate.client_tls);
+        descriptor.transport = if runtime_initiated {
+            SandboxTransport::RuntimeInitiatedUnix {
+                socket_path: socket_path.clone(),
+            }
+        } else {
+            SandboxTransport::Unix {
+                socket_path: socket_path.clone(),
+            }
+        };
+        let mut client = BoundaryClient::new(descriptor.clone(), test_bearer(&"a".repeat(32)));
+        client.transport = BoundaryTransport::for_descriptor(&descriptor).unwrap();
+        let spans = ConnectionSpans::default();
+        let subscriber = tracing_subscriber::registry().with(spans.clone());
+
+        async {
+            let discovery = tracing::info_span!("supervisor.boundary.discover_policy");
+            let request = client.discover_policy().instrument(discovery.clone());
+            tokio::pin!(request);
+            for delay in [
+                Duration::ZERO,
+                CONNECT_RETRY_TIMEOUT + Duration::from_secs(1),
+                Duration::from_millis(25),
+                CONNECT_RETRY_TIMEOUT + Duration::from_secs(1),
+                Duration::from_millis(25),
+            ] {
+                tokio::time::advance(delay).await;
+                poll_fn(|context| {
+                    assert!(request.as_mut().poll(context).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            }
+
+            // Drive real socket readiness and TLS without advancing the startup deadline.
+            tokio::time::resume();
+            let server = tokio::spawn(async move {
+                let stream = if runtime_initiated {
+                    UnixStream::connect(&socket_path).await.unwrap()
+                } else {
+                    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+                    let (stream, _) = listener.accept().await.unwrap();
+                    std::fs::remove_file(&socket_path).unwrap();
+                    stream
+                };
+                let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                serve_test_grpc(Box::new(stream), "a".repeat(32)).await;
+            });
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut request)
+                .await
+                .expect("discovery completes after the runtime starts");
+            server.abort();
+            assert_eq!(result.unwrap(), (None, false));
+            tokio::time::pause();
+
+            let captured = spans.snapshot();
+            assert_eq!(captured.len(), 1, "{captured:?}");
+            assert_eq!(captured[0].parent, discovery.id());
+            assert!(captured[0].closed);
+            assert_eq!(captured[0].fields["otel.status_code"], "OK");
+        }
+        .with_subscriber(subscriber)
+        .await;
     }
 }
 
@@ -386,13 +471,10 @@ async fn connection_span_closes_on_error_and_cancellation() {
             assert!(span.closed);
             assert_eq!(span.parent, discovery.id());
             assert_eq!(span.fields, {
-                let mut expected = BTreeMap::from([
-                    (
-                        "openshell.boundary.transport",
-                        "runtime_initiated".to_string(),
-                    ),
-                    ("openshell.boundary.connect_attempts", "1".to_string()),
-                ]);
+                let mut expected = BTreeMap::from([(
+                    "openshell.boundary.transport",
+                    "runtime_initiated".to_string(),
+                )]);
                 if index == 1 {
                     expected.insert("otel.status_code", "ERROR".to_string());
                 }
