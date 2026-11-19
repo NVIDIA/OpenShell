@@ -72,7 +72,7 @@ pub mod transport_errors;
 pub mod upload;
 
 pub use config::{
-    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
+    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuditConfig, GatewayAuthConfig,
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,

@@ -31,8 +31,8 @@ use openshell_core::proto::{
 };
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_core::{
-    ExtensionBindingPolicy, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
+    ExtensionBindingPolicy, GatewayAuditConfig, GatewayAuthConfig, GatewayInterceptorConfig,
+    GatewayJwtConfig, GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::{Deserialize, Serialize};
@@ -224,6 +224,8 @@ pub struct GatewayFileSection {
     pub provider_profile_sources: Option<Vec<GatewayProviderProfileSourceConfig>>,
     #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
+    #[serde(default)]
+    pub audit: Option<GatewayAuditConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
     #[serde(default)]
@@ -2123,6 +2125,14 @@ service_name = "openshell-gateway-dev"
             Some("http://otel-collector.observability.svc:4317")
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn gateway_audit_capture_is_opt_in() {
+        let tmp = write_tmp("[openshell.gateway.audit]\ncapture_setting_values = true\n");
+        let audit = load(tmp.path()).unwrap().openshell.gateway.audit.unwrap();
+        assert!(audit.capture_setting_values);
+        assert!(!GatewayAuditConfig::default().capture_setting_values);
     }
 
     #[test]

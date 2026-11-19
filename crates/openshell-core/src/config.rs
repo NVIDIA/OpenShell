@@ -406,6 +406,9 @@ pub struct Config {
     /// sandbox identity is always carried by gateway-minted sandbox JWTs.
     pub mtls_auth: MtlsAuthConfig,
 
+    /// Optional details gateway mutation records capture.
+    pub audit: GatewayAuditConfig,
+
     /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
     /// loads the signing key from disk and accepts gateway-issued sandbox
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
@@ -711,6 +714,17 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+}
+
+/// `[openshell.gateway.audit]`: optional details gateway mutation records
+/// capture. Secrets are never captured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAuditConfig {
+    /// Record the values of gateway and sandbox settings that `UpdateConfig`
+    /// sets. Bytes values are never recorded.
+    #[serde(default)]
+    pub capture_setting_values: bool,
 }
 
 /// mTLS user authentication for gateway users.
@@ -1201,6 +1215,7 @@ impl Config {
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
+            audit: GatewayAuditConfig::default(),
             gateway_jwt: None,
             spiffe_broker: None,
             database_url: String::new(),

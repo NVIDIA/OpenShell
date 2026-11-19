@@ -683,7 +683,19 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            let name = request
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.metadata.as_ref())
+                .map_or("", |metadata| metadata.name.as_str());
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider", name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_provider_credentials(
@@ -754,7 +766,19 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            let name = request
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.metadata.as_ref())
+                .map_or("", |metadata| metadata.name.as_str());
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider", name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_provider_refresh_status(
@@ -768,14 +792,34 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ConfigureProviderRefreshRequest>,
     ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn rotate_provider_credential(
         &self,
         request: Request<RotateProviderCredentialRequest>,
     ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn delete_provider_refresh(
@@ -865,7 +909,19 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = mutation_audit::update_config_targets(
+            request.get_ref(),
+            self.state.config.audit.capture_setting_values,
+        );
+        let deleting_only = mutation_audit::deletes_only_a_setting(request.get_ref());
+        mutation_audit::audited(
+            targets,
+            mutation_audit::record_absent_delete(
+                deleting_only,
+                mutation_replay::run(&self.state, request),
+            ),
+        )
+        .await
     }
 
     async fn get_sandbox_policy_status(
@@ -939,42 +995,101 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveDraftChunkRequest>,
     ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn reject_draft_chunk(
         &self,
         request: Request<RejectDraftChunkRequest>,
     ) -> Result<Response<RejectDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn approve_all_draft_chunks(
         &self,
         request: Request<ApproveAllDraftChunksRequest>,
     ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
-        Box::pin(mutation_replay::run(&self.state, request)).await
+        let targets = {
+            let request = request.get_ref();
+            let chunks = request
+                .approvals
+                .iter()
+                .map(|approval| mutation_audit::requested("draft_chunk", &approval.chunk_id));
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                std::iter::once(mutation_audit::requested("sandbox", &request.sandbox))
+                    .chain(chunks),
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn edit_draft_chunk(
         &self,
         request: Request<EditDraftChunkRequest>,
     ) -> Result<Response<EditDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn undo_draft_chunk(
         &self,
         request: Request<UndoDraftChunkRequest>,
     ) -> Result<Response<UndoDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn clear_draft_chunks(
         &self,
         request: Request<ClearDraftChunksRequest>,
     ) -> Result<Response<ClearDraftChunksResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.sandbox)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_draft_history(
