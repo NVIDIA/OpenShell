@@ -1374,7 +1374,7 @@ impl fmt::Display for PolicyViolation {
 /// - UI clipboard access must use a recognized enum value
 /// - Filesystem paths must be absolute (start with `/`)
 /// - Filesystem paths must not contain `..` components
-/// - Read-write paths must not be overly broad (just `/`)
+/// - Read-write paths must not be overly broad (a filesystem root)
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
 /// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
@@ -1431,8 +1431,11 @@ pub fn validate_filesystem_paths(
     }
 
     for path_str in read_write {
-        // Repeated separators still designate the filesystem root.
-        if path_str.trim_end_matches('/').is_empty() {
+        // Oversized paths already have a violation; do not parse them again.
+        if path_str.len() > MAX_PATH_LENGTH {
+            continue;
+        }
+        if is_filesystem_root(path_str) {
             violations.push(PolicyViolation::OverlyBroadPath {
                 path: path_str.clone(),
             });
@@ -1442,6 +1445,153 @@ pub fn validate_filesystem_paths(
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+/// Return whether `path` designates a filesystem root, such as `/`, `C:\`, `\`,
+/// `\\?\C:\`, `\\?\GLOBALROOT\Device\HarddiskVolume4\` or `\\server\share`.
+/// The check is lexical rather than host-OS based
+/// because the sandbox platform, not the gateway, decides what a path means.
+/// Windows spellings are matched in any mix of separators, because the MXC
+/// driver converts `/` to `\` before it uses a path.
+fn is_filesystem_root(path: &str) -> bool {
+    // Win32 drops trailing dots and spaces from a component, so `C:\...` and
+    // `/ ` name a root. Verbatim (`\\?\`) and NT (`\??\`) paths keep every
+    // component as written.
+    fn only_root_components(rest: &str, literal: bool) -> bool {
+        rest.split('/').all(|c| {
+            let c = if literal {
+                c
+            } else {
+                c.trim_end_matches(['.', ' '])
+            };
+            // NTFS directory streams name the directory itself, including in
+            // verbatim paths: `C:\::$INDEX_ALLOCATION` still names `C:\`.
+            let c = c
+                .split_once(':')
+                .filter(|(_, stream)| {
+                    stream.eq_ignore_ascii_case(":$INDEX_ALLOCATION")
+                        || stream.eq_ignore_ascii_case("$I30:$INDEX_ALLOCATION")
+                })
+                .map_or(c, |(directory, _)| directory);
+            let c = if literal {
+                c
+            } else {
+                c.trim_end_matches(['.', ' '])
+            };
+            c.is_empty() || c == "."
+        })
+    }
+    // Skip up to `count` leading names (volume, server or share).
+    fn skip_names(mut rest: &str, count: usize) -> &str {
+        for _ in 0..count {
+            rest = rest.trim_start_matches('/');
+            rest = rest.split_once('/').map_or("", |(_, tail)| tail);
+        }
+        rest
+    }
+
+    // `rest` follows a `\\?\`, `\\.\` or `\??\` prefix, which all name the
+    // `\??` object directory: drive letters, `UNC`, `Global` (a link to
+    // `\GLOBAL??`) and `GLOBALROOT` (a link to the object namespace root).
+    fn is_namespace_root(mut rest: &str, literal: bool) -> bool {
+        // Namespace links can repeat. Consume them iteratively so stack usage
+        // does not depend on the number of components in an authored path.
+        loop {
+            let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            if name.eq_ignore_ascii_case("Global") {
+                rest = tail;
+                continue;
+            }
+            if !name.eq_ignore_ascii_case("GLOBALROOT") {
+                return if name.eq_ignore_ascii_case("UNC") {
+                    only_root_components(skip_names(tail, 2), literal)
+                } else {
+                    only_root_components(tail, literal)
+                };
+            }
+
+            // GLOBALROOT enters the object namespace. Drive-letter
+            // directories lead back to this loop; Device names a volume.
+            let object_path = tail.trim_start_matches('/');
+            let (dir, tail) = object_path.split_once('/').unwrap_or((object_path, ""));
+            if ["??", "GLOBAL??", "DosDevices"]
+                .iter()
+                .any(|name| dir.eq_ignore_ascii_case(name))
+            {
+                rest = tail;
+                continue;
+            }
+            // This well-known link names the Windows directory, not its
+            // containing volume. Preserve it and its subdirectories.
+            if dir.eq_ignore_ascii_case("SystemRoot") {
+                return false;
+            }
+            // Other object paths can be links to whole volumes.
+            return !dir.eq_ignore_ascii_case("Device") || is_device_root(tail, literal);
+        }
+    }
+    // `rest` follows `\Device\`, such as `HarddiskVolume4\`.
+    fn is_device_root(rest: &str, literal: bool) -> bool {
+        let (device, mut tail) = rest.split_once('/').unwrap_or((rest, ""));
+        // A disk is `Harddisk0\Partition2`; a network redirector is followed
+        // by optional `;`-prefixed connection names, a server and a share.
+        let names = if device
+            .get(..8)
+            .is_some_and(|name| name.eq_ignore_ascii_case("Harddisk"))
+            && device.len() > 8
+            && device[8..].bytes().all(|b| b.is_ascii_digit())
+        {
+            1
+        } else if ["Mup", "LanmanRedirector", "WebDavRedirector"]
+            .iter()
+            .any(|name| device.eq_ignore_ascii_case(name))
+        {
+            while let Some(after) = tail.strip_prefix(';') {
+                tail = after.split_once('/').map_or("", |(_, after)| after);
+            }
+            2
+        } else {
+            0
+        };
+        only_root_components(skip_names(tail, names), literal)
+    }
+
+    let normalized = path.replace('\\', "/");
+    let namespace = [("//?/", true), ("/??/", true), ("//./", false)]
+        .into_iter()
+        .find_map(|(prefix, literal)| normalized.strip_prefix(prefix).map(|tail| (tail, literal)));
+    if let Some((tail, literal)) = namespace {
+        if is_namespace_root(tail, literal) {
+            return true;
+        }
+        if !literal {
+            // Win32 also normalizes the namespace names themselves:
+            // `\\.\Global.\.\C:\` and `\\.\Global\\C:\` name `C:\`.
+            // Check this spelling in addition to the original so unknown
+            // object directories keep their conservative rejection.
+            let components = tail
+                .split('/')
+                .map(|name| name.trim_end_matches(['.', ' ']))
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            return is_namespace_root(&components, false);
+        }
+        return false;
+    }
+    // Two leading separators start a UNC path when either is a backslash; a
+    // leading `//` keeps its POSIX meaning.
+    if normalized.starts_with("//") && path.as_bytes()[..2].contains(&b'\\') {
+        return only_root_components(skip_names(&normalized[2..], 2), false);
+    }
+    match normalized.as_bytes() {
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => {
+            only_root_components(&normalized[2..], false)
+        }
+        // On Windows a leading `/` or `\` is the root of the current drive.
+        [b'/', ..] => only_root_components(&normalized, false),
+        _ => false,
     }
 }
 
@@ -3643,6 +3793,240 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. }))
         );
+    }
+
+    #[test]
+    fn validate_rejects_every_root_spelling_as_read_write_path() {
+        for root in [
+            "/",
+            "//",
+            "/.",
+            "C:/",
+            r"C:\",
+            "c:/",
+            "D:/",
+            "C:/.",
+            "C://",
+            r"\",
+            r"\\?\C:\",
+            r"\\?\C:",
+            r"\\.\C:\",
+            r"\\localhost\C$",
+            r"\\server\share\",
+            r"\\?\UNC\server\share",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("root read_write path must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root} should be overly broad, got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_root_detection_keeps_narrower_paths() {
+        for path in [
+            "/tmp",
+            "/work/demo",
+            "C:",
+            "C:/work/demo",
+            r"C:\work\demo",
+            r"\\?\C:\work",
+            r"\\localhost\C$\work",
+            r"\\?\UNC\server\share\work",
+            r"\\?\C:\...",
+            r"\??\C:\ ",
+            "//tmp/x",
+            "/tmp/...",
+        ] {
+            assert!(!is_filesystem_root(path), "{path} is not a filesystem root");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_systemroot_directory_aliases() {
+        for prefix in ["//?/", "//./", "/??/", "//?/Global/"] {
+            for directory in ["SystemRoot", "systemroot"] {
+                for suffix in ["", "/", "/Temp"] {
+                    let path = format!("{prefix}GLOBALROOT/{directory}{suffix}");
+                    assert!(
+                        validate_filesystem_paths(&[], std::slice::from_ref(&path)).is_ok(),
+                        "{path} names the Windows directory or a subdirectory"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_windows_root_aliases_as_read_write_path() {
+        for root in [
+            "//?/C:/",
+            r"/\?\C:\",
+            r"\??\C:\",
+            "//./C:/",
+            "C:/...",
+            "C:/ ",
+            "C:/. ",
+            r"\...",
+            "/...",
+            "/ ",
+            r"\\.\C:\...",
+            r"\\server\share\. ",
+            r"/\server\share",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("root alias read_write path must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root:?} should be overly broad, got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_normalized_namespace_roots() {
+        for root in [
+            r"\\.\Global\.\C:\",
+            r"\\.\.\C:\",
+            r"\\.\Global.\C:\",
+            r"\\.\Global\\C:\",
+            r"\\.\GLOBALROOT\??\.\C:\",
+            r"\\.\GLOBALROOT\??\\C:\",
+            "//./global././c:/",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("normalized namespace root must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root:?} should be overly broad, got {violations:?}"
+            );
+            assert!(!is_filesystem_root(&format!("{root}work")));
+        }
+
+        // Verbatim namespace components retain their literal meaning.
+        for path in [r"\\?\Global.\C:\", r"\\?\Global\.\C:\", r"\??\Global.\C:\"] {
+            assert!(!is_filesystem_root(path), "{path:?} is literal");
+        }
+        // Normalization must not weaken the conservative unknown-alias rule.
+        for path in [
+            r"\\.\GLOBALROOT\UnknownAlias\work",
+            r"\\.\GLOBALROOT\SystemRoot.\work",
+        ] {
+            assert!(is_filesystem_root(path), "{path:?} remains unsupported");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_directory_stream_roots() {
+        for root in [
+            "C:/",
+            r"C:\",
+            r"\\?\C:\",
+            r"\\.\C:\",
+            r"\??\C:\",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\",
+            r"\\.\Global\.\C:\",
+            r"\\?\UNC\server\share\",
+            r"\\server\share\",
+        ] {
+            for stream in [
+                "::$INDEX_ALLOCATION",
+                ":$I30:$INDEX_ALLOCATION",
+                "::$index_allocation",
+            ] {
+                let path = format!("{root}{stream}");
+                let violations = validate_filesystem_paths(&[], std::slice::from_ref(&path))
+                    .expect_err("directory stream of a root must be rejected");
+                assert!(
+                    violations
+                        .iter()
+                        .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                    "{path:?} should be overly broad, got {violations:?}"
+                );
+                let narrower = format!("{root}work{stream}");
+                assert!(!is_filesystem_root(&narrower), "{narrower:?} is narrower");
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_object_namespace_roots_as_read_write_path() {
+        for root in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume4\",
+            r"\??\GLOBALROOT\Device\HarddiskVolume4\",
+            "//?/globalroot/device/harddiskvolume4",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume4\. ",
+            r"\\?\GLOBALROOT\Device\Harddisk0\Partition2\",
+            r"\\?\GLOBALROOT\??\C:\",
+            r"\\?\GLOBALROOT\GLOBAL??\C:\",
+            r"\\?\GLOBALROOT\DosDevices\C:\",
+            r"\\?\Global\C:\",
+            r"\\?\GLOBALROOT\??\Global\C:\",
+            r"\\?\GLOBALROOT\Device\Mup\server\share\",
+            r"\\?\GLOBALROOT\Device\LanmanRedirector\;Z:0000000000012345\server\share",
+            r"\\?\GLOBALROOT\ArcName\multi(0)disk(0)rdisk(0)partition(3)\",
+            r"\\?\GLOBALROOT",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("object namespace root read_write path must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root:?} should be overly broad, got {violations:?}"
+            );
+        }
+        for path in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\work",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume4\work",
+            r"\??\GLOBALROOT\Device\HarddiskVolume4\work",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\...",
+            r"\\?\GLOBALROOT\Device\Harddisk0\Partition2\work",
+            r"\\?\GLOBALROOT\??\C:\work",
+            r"\\?\Global\C:\work",
+            r"\\?\GLOBALROOT\Device\Mup\server\share\work",
+        ] {
+            assert!(
+                !is_filesystem_root(path),
+                "{path:?} is narrower than a volume"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_read_only_filesystem_root() {
+        assert!(validate_filesystem_paths(&["/".to_string()], &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_namespace_paths_without_parsing() {
+        for segment in ["Global/", "GLOBALROOT/??/"] {
+            let path = format!("//?/{}C:/", segment.repeat(20_000));
+            let length = path.len();
+            let violations = validate_filesystem_paths(&[], &[path]).unwrap_err();
+            assert!(
+                matches!(violations.as_slice(), [PolicyViolation::FieldTooLong { length: actual, .. }] if *actual == length),
+                "oversized namespace path must return only its length violation"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_root_detection_handles_deep_namespace_links() {
+        for segment in ["Global/", "GLOBALROOT/??/", "GLOBALROOT/GLOBAL??/Global/"] {
+            let root = format!("//?/{}C:/", segment.repeat(20_000));
+            assert!(is_filesystem_root(&root));
+            assert!(!is_filesystem_root(&format!("{root}work")));
+        }
     }
 
     #[test]

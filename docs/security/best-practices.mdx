@@ -194,9 +194,22 @@ OpenShell validates policies before they take effect.
 |---|---|
 | Paths must be absolute (start with `/`). | Rejected with `INVALID_ARGUMENT`. |
 | Paths must not contain `..` traversal. | Rejected with `INVALID_ARGUMENT`. |
-| Read-write paths must not be overly broad (for example, `/` alone). | Rejected with `INVALID_ARGUMENT`. |
-| Each path must not exceed 4096 characters. | Rejected with `INVALID_ARGUMENT`. |
+| Read-write paths must not name a filesystem root, including Windows drive, share, and device-namespace roots. | Rejected with `INVALID_ARGUMENT`. |
+| Each path must not exceed 4096 bytes. | Rejected with `INVALID_ARGUMENT`. |
 | Combined `read_only` + `read_write` paths must not exceed 256. | Rejected with `INVALID_ARGUMENT`. |
+
+Windows root checks include normalized device-namespace paths such as
+`\\.\Global\.\C:\` and NTFS directory streams such as `C:\::$INDEX_ALLOCATION`.
+These spellings still name the drive root and cannot be used as read-write grants.
+
+The well-known Windows `GLOBALROOT/SystemRoot` alias names the Windows directory,
+so it and its subdirectories remain valid read-write paths. Other object-namespace
+aliases outside the recognized drive, volume, partition, and share forms are
+rejected conservatively: an alias can point to an entire volume, and the validator
+cannot resolve it on every gateway platform. If an existing policy uses one,
+replace it with the intended directory's absolute drive or share path, such as
+`C:/work/project`, before creating a sandbox or applying the policy. Keep the grant
+scoped to the specific directory the workload needs.
 
 ## Process Controls
 
