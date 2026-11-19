@@ -435,6 +435,9 @@ allow_unauthenticated_users = false
 enabled = false
 operator_enabled = false # Opt-in: trusted OU=operator grants gateway-wide administration.
 
+[openshell.gateway.audit]
+capture_setting_values = false # Opt-in: record setting values in mutation records.
+
 # OTLP export. Omit this table entirely to disable it.
 [openshell.gateway.otlp]
 endpoint     = "http://otel-collector.observability.svc:4317"
@@ -796,6 +799,21 @@ The gateway queues OCSF independently of `RUST_LOG`, excludes ordinary diagnosti
 Metrics include `openshell_ocsf_log_queued_total`, `openshell_ocsf_log_written_total`, `openshell_ocsf_log_queue_records`, `openshell_ocsf_log_queue_bytes`, `openshell_ocsf_log_dropped_total` (with a bounded `reason` label), and `openshell_ocsf_log_writer_errors_total`. Recovery reports discarded bytes through `openshell_ocsf_log_recovery_discarded_bytes_total`, not an invented lost-record count. Warnings report writer failures independently of this file.
 
 Allow enough retention and disk space for shipper outages. Graceful shutdown allows five seconds for draining; outstanding OS writes remain uncertain if they outlast that budget. Flush does not mean fsync. The file is a best-effort collection boundary, not durable acceptance, a replay protocol, or proof of a complete audit history. See [OCSF JSON export](/observability/ocsf-json-export) for the separate sandbox-local output.
+
+## Gateway Mutation Records
+
+`[openshell.gateway.audit]` adds optional details to [gateway mutation records](/observability/ocsf-json-export#gateway-mutation-records).
+
+```toml
+[openshell.gateway.audit]
+capture_setting_values = true
+```
+
+| Field | Default | Behavior |
+|---|---|---|
+| `capture_setting_values` | `false` | Record the value an `UpdateConfig` call sets for a registered setting. |
+
+Unknown fields are rejected. Restart the gateway after changing this configuration.
 
 ## OTLP Export
 
