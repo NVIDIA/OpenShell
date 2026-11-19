@@ -490,6 +490,7 @@ jobs:
     uses: ./.github/workflows/e2e-docker-test.yml
     with:
       prebuilt-conformance: true
+      unsupported: conformance::smoke::create_exec_delete=https://github.com/NVIDIA/OpenShell/issues/5754
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
 
