@@ -6,12 +6,11 @@
 //! Usage: `testkit-ready [TIMEOUT_SECS]` (default 60), with the gateway
 //! selected as for tests. Run it once per environment before the test
 //! binaries; exits non-zero with the last error if the gateway is not healthy
-//! in time, or if the CLI does not reach it.
+//! in time, or if the CLI does not reach it. A test program's `ready`
+//! subcommand does the same.
 
 use std::process::ExitCode;
 use std::time::Duration;
-
-use testkit::{Cli, Gateway};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const USAGE: &str = "usage: testkit-ready [TIMEOUT_SECS] (default 60)";
@@ -32,25 +31,9 @@ async fn main() -> ExitCode {
             }
         },
     };
-    let result = async {
-        let gateway = Gateway::from_env()?;
-        eprintln!("testkit-ready: {}", gateway.describe());
-        let health = gateway.wait_ready(Duration::from_secs(timeout)).await?;
-        Cli::from_env(&gateway).check_connected().await?;
-        testkit::Result::Ok(health)
-    }
-    .await;
-    match result {
-        Ok(health) => {
-            eprintln!(
-                "testkit-ready: gateway {} is healthy and the CLI reaches it",
-                health.version
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("testkit-ready: {error}");
-            ExitCode::FAILURE
-        }
+    if testkit::check_ready("testkit-ready", Duration::from_secs(timeout)).await {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

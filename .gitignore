@@ -146,6 +146,7 @@ tramp
 # =============================================================================
 
 # Local agent state and configuration
+/docs/superpowers/
 .codex/
 .pi/
 .claude/settings.local.json

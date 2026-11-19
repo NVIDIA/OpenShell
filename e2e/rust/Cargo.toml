@@ -37,8 +37,12 @@ e2e-kubernetes-ha = ["e2e-kubernetes"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
+# Trace export to the Jaeger fixture that `OPENSHELL_E2E_KUBE_JAEGER=1` deploys.
+e2e-kubernetes-tracing = ["e2e-kubernetes"]
 # One supervisor process shared by the gateway's sandboxes.
 e2e-kubernetes-shared-supervisor = ["e2e-kubernetes", "e2e-host-gateway"]
+# Gateway-owned sandbox identities through the SPIFFE Broker API.
+e2e-kubernetes-shared-supervisor-spiffe = ["e2e-kubernetes-shared-supervisor", "dep:openshell-core"]
 # A high-availability pool of shared supervisors.
 e2e-kubernetes-shared-supervisor-ha = ["e2e-kubernetes", "e2e-host-gateway"]
 # Scaling a one-member high-availability pool of shared supervisors to two
@@ -88,11 +92,6 @@ required-features = ["e2e-vm"]
 name = "vm_bind_mount"
 path = "tests/vm_bind_mount.rs"
 required-features = ["e2e-vm"]
-
-[[test]]
-name = "docker_preflight"
-path = "tests/docker_preflight.rs"
-required-features = ["e2e-docker"]
 
 [[test]]
 name = "docker_corporate_proxy"
@@ -145,11 +144,6 @@ path = "tests/podman_corporate_proxy.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "podman_oci_identity"
-path = "tests/podman_oci_identity.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
 name = "podman_resource_limits"
 path = "tests/podman_resource_limits.rs"
 required-features = ["e2e-podman"]
@@ -195,6 +189,11 @@ path = "tests/kubernetes_runtime_reconcile.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "kubernetes_tracing"
+path = "tests/kubernetes_tracing.rs"
+required-features = ["e2e-kubernetes-tracing"]
+
+[[test]]
 name = "credential_drivers"
 path = "tests/credential_drivers.rs"
 required-features = ["e2e-kubernetes-credential-drivers"]
@@ -202,11 +201,6 @@ required-features = ["e2e-kubernetes-credential-drivers"]
 [[test]]
 name = "websocket_conformance"
 path = "tests/websocket_conformance.rs"
-required-features = ["e2e-host-gateway"]
-
-[[test]]
-name = "credential_gating"
-path = "tests/credential_gating.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
@@ -235,14 +229,9 @@ path = "tests/forward_proxy_jsonrpc_l7.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
-name = "workspace_lifecycle"
-path = "tests/workspace_lifecycle.rs"
-required-features = ["e2e"]
-
-[[test]]
-name = "sandbox_templates"
-path = "tests/sandbox_templates.rs"
-required-features = ["e2e"]
+name = "supervisor_middleware_http_hooks"
+path = "tests/supervisor_middleware_http_hooks.rs"
+required-features = ["e2e-docker"]
 
 [[test]]
 name = "proxy_egress_pipeline"
@@ -270,6 +259,7 @@ path = "tests/otlp_relay.rs"
 required-features = ["e2e-local-container-driver"]
 
 [dependencies]
+openshell-core = { path = "../../crates/openshell-core", default-features = false, features = ["jwt"], optional = true }
 openshell-crypto = { path = "../../crates/openshell-crypto" }
 openshell-otel-test-support = { path = "../../crates/openshell-otel-test-support" }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace"] }
@@ -298,9 +288,9 @@ tonic-prost = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tower = "0.5"
 url = "2"
-nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
+flate2 = "1"
 openshell-ocsf-validate = { path = "../../crates/openshell-ocsf-validate" }
 serial_test = "3"
 
@@ -315,7 +305,3 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-[[test]]
-name = "live_internet_traffic_perf"
-path = "tests/live_internet_traffic_perf.rs"
-required-features = ["e2e-host-gateway"]

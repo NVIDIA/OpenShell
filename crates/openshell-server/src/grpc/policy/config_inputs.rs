@@ -59,7 +59,7 @@ pub async fn load_sandbox_config_inputs(
         state
             .provider_profile_sources
             .snapshot_catalog(store, workspace),
-        load_provider_environment_records(store, workspace, provider_names),
+        load_provider_environment_records(store, &state.refresh, workspace, provider_names),
         load_global_settings(store),
         async {
             store

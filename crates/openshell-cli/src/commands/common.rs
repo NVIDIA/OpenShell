@@ -142,22 +142,6 @@ pub fn format_timestamp(d: Duration) -> String {
     format!("[{secs:.1}s]")
 }
 
-/// Format a millisecond timestamp into a readable string.
-pub fn format_timestamp_ms(ms: i64) -> String {
-    if ms <= 0 {
-        return "-".to_string();
-    }
-    let secs = ms / 1000;
-    let mins = (secs / 60) % 60;
-    let hours = (secs / 3600) % 24;
-    let days = secs / 86400;
-    if days > 0 {
-        format!("{days}d {hours:02}:{mins:02}")
-    } else {
-        format!("{hours:02}:{mins:02}")
-    }
-}
-
 pub fn truncate_status_field(value: &str, max_chars: usize) -> String {
     if value.is_empty() {
         return "-".to_string();
@@ -573,13 +557,29 @@ pub fn print_sandbox_header(
 // Sandbox provisioning helpers
 // ---------------------------------------------------------------------------
 
-pub fn ready_false_condition_message(
+/// Summarize why a sandbox is not ready yet.
+///
+/// A failing `PodScheduled` condition (for example `Unschedulable` with the
+/// scheduler's "0/N nodes are available" message) is preferred because the
+/// `Ready` condition may be replaced by a less specific reason such as
+/// `ConfigurationPending` while the pod cannot be placed.
+pub fn provisioning_blocker_message(
     status: Option<&openshell_core::proto::SandboxStatus>,
 ) -> Option<String> {
-    let condition = status?.conditions.iter().find(|condition| {
-        condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")
-    })?;
+    let conditions = &status?.conditions;
+    let false_condition_message = |condition_type: &str| {
+        conditions
+            .iter()
+            .filter(|condition| {
+                condition.r#type == condition_type && condition.status.eq_ignore_ascii_case("false")
+            })
+            .find_map(condition_summary)
+    };
 
+    false_condition_message("PodScheduled").or_else(|| false_condition_message("Ready"))
+}
+
+fn condition_summary(condition: &openshell_core::proto::SandboxCondition) -> Option<String> {
     if condition.message.is_empty() {
         if condition.reason.is_empty() {
             None
@@ -1134,6 +1134,15 @@ mod tests {
         let err =
             parse_key_value_pairs(&["=value".to_string()], "--annotation").expect_err("empty key");
         assert!(err.to_string().contains("--annotation key cannot be empty"));
+    }
+
+    #[test]
+    fn format_optional_epoch_ms_shows_date_or_dash() {
+        assert_eq!(
+            format_optional_epoch_ms(1_794_000_000_000),
+            "2026-11-06 21:20:00"
+        );
+        assert_eq!(format_optional_epoch_ms(0), "-");
     }
 
     #[test]

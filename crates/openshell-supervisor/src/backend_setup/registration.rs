@@ -99,12 +99,14 @@ impl PreparedBackend for RegisteredLaunch {
     async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        attach_request_timeout: std::time::Duration,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
         OpenShellRuntimeBackend::discover_registered_policy(
             self.name.clone(),
             self.descriptor.clone(),
             self.payload.clone(),
             bearer,
+            attach_request_timeout,
         )
         .await
     }
@@ -119,14 +121,17 @@ impl PreparedBackend for RegisteredLaunch {
             ));
         }
         let payload = self.payload.clone();
-        let backend = Arc::new(OpenShellRuntimeBackend::registered(
-            self.name,
-            self.descriptor,
-            self.payload,
-            services.ca_file_paths,
-            services.provider_credentials,
-            services.sandbox_bearer,
-        )?);
+        let backend = Arc::new(
+            OpenShellRuntimeBackend::registered(
+                self.name,
+                self.descriptor,
+                self.payload,
+                services.ca_file_paths,
+                services.provider_credentials,
+                services.sandbox_bearer,
+            )?
+            .with_attach_request_timeout(services.attach_request_timeout),
+        );
         Ok(BuiltBackend {
             backend,
             payload,

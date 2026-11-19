@@ -7,10 +7,12 @@ use std::fmt;
 
 use openshell_sdk::SdkError;
 
-/// A test failure: a message with the context it happened in.
+/// A test failure: a message with the context it happened in, and the gRPC
+/// status code when the gateway refused a request.
 #[derive(Debug)]
 pub struct Error {
     message: String,
+    code: Option<tonic::Code>,
 }
 
 /// The result of a test or test step.
@@ -20,16 +22,22 @@ impl Error {
     pub fn msg(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            code: None,
         }
     }
 
-    pub fn from_display(error: impl fmt::Display) -> Self {
+    /// The gRPC status code, when the gateway refused a request.
+    pub fn grpc_code(&self) -> Option<tonic::Code> {
+        self.code
+    }
+
+    pub(crate) fn from_display(error: impl fmt::Display) -> Self {
         Self::msg(error.to_string())
     }
 
     /// An error with its sources, so a wrapper such as tonic's
     /// "transport error" still says what went wrong underneath.
-    pub fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+    pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut message = error.to_string();
         let mut source = error.source();
         while let Some(cause) = source {
@@ -45,7 +53,10 @@ impl Error {
 
     #[must_use]
     pub fn context(self, context: impl fmt::Display) -> Self {
-        Self::msg(format!("{context}: {}", self.message))
+        Self {
+            message: format!("{context}: {}", self.message),
+            code: self.code,
+        }
     }
 }
 
@@ -59,6 +70,37 @@ impl std::error::Error for Error {}
 
 impl From<SdkError> for Error {
     fn from(error: SdkError) -> Self {
+        Self {
+            code: error.grpc_status().map(tonic::Status::code),
+            ..Self::from_error(&error)
+        }
+    }
+}
+
+/// A gateway's refusal, keeping its status code for [`Error::grpc_code`].
+impl From<tonic::Status> for Error {
+    fn from(status: tonic::Status) -> Self {
+        Self {
+            code: Some(status.code()),
+            ..Self::from_error(&status)
+        }
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
+impl From<serde_yml::Error> for Error {
+    fn from(error: serde_yml::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
         Self::from_error(&error)
     }
 }

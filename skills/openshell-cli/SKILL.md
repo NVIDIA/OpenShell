@@ -150,6 +150,19 @@ when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
 
+Usable credential placement is enforced automatically when both gateway and
+supervisor support it. `credential_placement_mismatch` means a placeholder is
+outside its declared header, query parameter, or path-template slot. Match the
+profile. Explicit body/WebSocket rewrite policies retain their documented
+behavior for ordinary credentials. Without placement metadata, a supporting
+supervisor permits only `Authorization` and those explicit rewrite policies;
+malformed metadata is rejected. For custom headers, query parameters, or path
+slots, update the imported profile with explicit placement and upgrade the
+gateway before the supervisor. Older gateways cannot forward placement metadata;
+older supervisors retain their previous behavior. Updating example YAML does not
+update an imported profile. Check provider readiness after changing placement and
+launch a new process if retained references were revoked.
+
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port
 must match. For a tunnel to `api.example.com:8443`, send
@@ -231,6 +244,8 @@ openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 ```
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
+
+When many providers share one OAuth client secret, store it once as a workspace secret and reference it with `--material-secret client_secret=NAME`. Rotating it with `openshell secret update` reaches every referencing provider at its next refresh. A secret only reaches the token endpoints it was created with (`--allowed-endpoint`); one created without them is reveal-only and cannot be referenced. and `openshell secret delete` fails while a refresh references it; run `openshell provider refresh inline-secrets` to copy the value into the provider first. The gateway operator must set `enable_workspace_secrets`. See `openshell secret --help`.
 
 The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
@@ -570,16 +585,22 @@ complete the published
 [activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates)
 before enabling `enable_sandbox_updates`. Keep it false during a rolling
 upgrade and never enable it merely to bypass a failed compatibility check.
-After activation, image, command, and environment updates initially support only
-stopped Kubernetes sandboxes; other drivers return `UNIMPLEMENTED` for those
-fields. Metadata-only updates also support stopped sandboxes on other drivers. Stop and
+After activation, stopped Kubernetes sandboxes support image, command, and
+environment updates. Docker supports image-only updates for workspaces created
+with the driver's opt-in `persist_workspace` setting: both images must be cached,
+the target must declare a numeric `USER UID:GID` matching the recorded non-root
+identity, and neither image may declare volumes. Existing Docker writable-layer
+workspaces are not migrated; command and environment updates remain unsupported.
+Other drivers return `UNIMPLEMENTED` for configuration fields. Metadata-only
+updates also support stopped sandboxes on other drivers. Stop and
 wait for `Stopped`, read the sandbox's current resource version through
 `GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
 selected image, command, environment overrides, labels or annotations, and required nonzero `expected_resource_version`, then start after
 success. Rust SDK callers use `client.raw_sandbox_updates_fresh()`; generated
 clients use `SandboxUpdates`, not the unchanged `OpenShell` service. There is no
-curated SDK update method. The sandbox identity, Kubernetes
-custom resource, and persistent volume claim remain; the existing workspace is
+curated SDK update method. The sandbox identity and persistent workspace remain;
+Kubernetes retains its custom resource and PVC, while Docker replaces the stopped
+workload container and retains its owned `/sandbox` volume. The existing workspace is
 not reseeded and trusted runtime images do not change. Omitted update fields are
 unchanged; supplied lists and maps replace their user-owned values, including
 explicitly empty values. Template environment defaults still apply. System metadata
@@ -620,7 +641,7 @@ repair the complete policy or provider set through the gateway. The workload
 has not started on its first activation, so static fields can also be replaced
 during this initial repair. A previously activated sandbox retains static-field
 restrictions while restart admission is pending or rejected.
-Before the gateway's 300-second repair window expires, successful validation
+Before the gateway's configured repair window expires (300 seconds by default), successful validation
 completes startup in place. Effective stored configuration changes and their
 first failed load reset that window; repeated failures do not. After
 `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
@@ -656,6 +677,10 @@ Create sandbox with initial policy
         ▼                          │
   Verify reload succeeded ─────────┘
 ```
+
+Validate an authored policy offline with `openshell policy lint policy.yaml`
+before creating or updating a sandbox. Gateway-dependent provider, middleware
+registration, image and driver checks are deferred until application.
 
 ### Step 1: Create sandbox with initial policy
 
@@ -925,7 +950,12 @@ openshell sandbox exec work-session -- <client-command>
 The application owns the native base URL, model, request shape, and timeout.
 Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
 
-For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
+For an ordinary static provider update, wait for the update and launch a new
+client process to obtain the new reference. Readiness does not update an
+existing process's environment or guarantee that it uses the replacement value.
+See [Runtime Limitations](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#runtime-limitations)
+for retained revision and stable-placeholder behavior. Acknowledged detach
+revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 

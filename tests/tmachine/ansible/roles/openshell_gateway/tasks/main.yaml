@@ -58,6 +58,11 @@
     dest: /etc/openshell/gateway.toml
     mode: "0644"
 
+- name: Merge environment gateway settings
+  ansible.builtin.include_tasks: merge-settings.yaml
+  vars:
+    openshell_gateway_merge_target: /etc/openshell/gateway.toml
+
 - name: Install OpenShell gateway service
   become: true
   ansible.builtin.template:

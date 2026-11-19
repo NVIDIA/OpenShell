@@ -34,6 +34,9 @@
           src: "{{ openshell_sandbox_image }}"
         - name: supervisor
           src: "{{ openshell_supervisor_image }}"
+        # The testkit's python_image() sandbox workload.
+        - name: e2e-python
+          src: "{{ openshell_e2e_python_image }}"
 
     - name: Import OpenShell images into K3s
       ansible.builtin.command:
@@ -49,12 +52,48 @@
         - gateway
         - sandbox
         - supervisor
+        - e2e-python
 
     - name: Copy OpenShell Helm chart
       ansible.builtin.copy:
         src: "{{ openshell_helm_chart }}"
         dest: /var/lib/openshell/artifacts/helm-chart.tgz
         mode: "0600"
+
+    # Tests run in the guest, so host.openshell.internal must resolve to the
+    # node itself. A tmachine environment is one VM, so the cluster has one
+    # node; the check below fails if that stops being true, because then the
+    # address must be the one of the node the tests run on. QEMU user
+    # networking gives every boot the same guest address (10.0.2.15), so the
+    # value stays valid when the disk is reused.
+    # The node can also list an IPv6 address after it, so take the IPv4 one.
+    - name: Discover the K3s node address
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --request-timeout=10s
+          - get
+          - nodes
+          - --output=jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}
+      register: k3s_node_address
+      changed_when: false
+      until: >-
+        k3s_node_address.rc == 0
+        and k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | list | length > 0
+      retries: 30
+      delay: 2
+
+    - name: Check the K3s cluster has a single node
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, --request-timeout=10s, get, nodes, --output=name]
+      register: k3s_nodes
+      changed_when: false
+      failed_when: k3s_nodes.rc != 0 or k3s_nodes.stdout_lines | length != 1
+
+    - name: Select the K3s node IPv4 address
+      ansible.builtin.set_fact:
+        k3s_node_ipv4: "{{ k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | first }}"
 
     - name: Write OpenShell Helm values
       ansible.builtin.copy:
@@ -85,6 +124,7 @@
             auth:
               allowUnauthenticatedUsers: true
             disableTls: true
+            hostGatewayIP: "{{ k3s_node_ipv4 }}"
             telemetryEnabled: false
 
     - name: Write OpenShell Helm values overlay

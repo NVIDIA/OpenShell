@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod app_listener;
 pub mod auth;
+pub mod color;
 pub mod compute;
 pub mod config;
 pub mod container_paths;
@@ -64,7 +65,6 @@ pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
-pub mod spiffe;
 pub mod telemetry;
 pub mod time;
 pub mod token_grant_failure;
@@ -72,7 +72,7 @@ pub mod transport_errors;
 pub mod upload;
 
 pub use config::{
-    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
+    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuditConfig, GatewayAuthConfig,
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,

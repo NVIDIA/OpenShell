@@ -193,8 +193,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(
+                        openshell_cli::oidc_auth::oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             insecure,
                         ),
@@ -408,6 +409,15 @@ const WORKSPACE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell workspace delete staging
 ";
 
+const SECRET_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ openshell secret create acme-oauth-client --value-env CLIENT_SECRET \\
+      --allowed-endpoint https://login.example.com/oauth/token
+  $ openshell secret create signing-key --value-file ./signing-key.pem
+  $ openshell secret update acme-oauth-client --value-file ./client-secret
+  $ openshell secret list
+  $ openshell secret delete acme-oauth-client
+";
+
 const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   gw
 
@@ -504,6 +514,8 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `Sandbox` embeds `SandboxCommands`, which is intentionally large.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -598,6 +610,13 @@ enum Commands {
     Workspace {
         #[command(subcommand)]
         command: Option<WorkspaceCommands>,
+    },
+
+    /// Manage workspace secrets used as shared credential minting material.
+    #[command(after_help = SECRET_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Secret {
+        #[command(subcommand)]
+        command: Option<SecretCommands>,
     },
 
     // ===================================================================
@@ -1041,6 +1060,11 @@ enum ProviderRefreshCommands {
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
 
+        /// Secret refresh material supplied by a workspace secret
+        /// (`KEY=SECRET`); `KEY` is auto-marked secret.
+        #[arg(long = "material-secret", value_name = "KEY=SECRET")]
+        material_secrets: Vec<String>,
+
         /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
         #[arg(
             long = "credential-expires-at",
@@ -1065,6 +1089,21 @@ enum ProviderRefreshCommands {
     /// Delete refresh metadata for a provider credential.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+
+    /// Copy referenced workspace secrets into provider-owned refresh material.
+    ///
+    /// Keeps the current grant, including a rotated refresh token. Run it
+    /// before deleting a secret or rolling back workspace secrets.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    InlineSecrets {
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
@@ -1577,6 +1616,11 @@ enum SandboxCommands {
             default_value = "never"
         )]
         restart_policy: String,
+
+        /// Seconds to wait without provisioning progress before giving up
+        /// (default: 300, or `OPENSHELL_PROVISION_TIMEOUT`).
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<std::num::NonZeroU32>,
 
         /// Auto-create missing providers from local credentials.
         ///
@@ -2155,6 +2199,13 @@ enum DraftCommands {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommands {
+    /// Validate an authored policy file offline, without a gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE)]
+    Lint {
+        /// Path to the authored policy YAML file.
+        #[arg(value_hint = ValueHint::FilePath)]
+        policy: String,
+    },
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
@@ -2191,8 +2242,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
-        /// Options include allowed-ip=..., credential rewrite flags, and
-        /// allow-uninspected-credentials.
+        /// Options include allowed-ip=..., allow-encoded-slash, credential
+        /// rewrite flags, and allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -2511,6 +2562,10 @@ enum WorkspaceCommands {
         /// Labels to attach to the workspace (KEY=VALUE).
         #[arg(long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Fetch a workspace by name.
@@ -2519,6 +2574,10 @@ enum WorkspaceCommands {
         /// Workspace name.
         #[arg(add = ArgValueCompleter::new(completers::complete_workspace_names))]
         name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List workspaces.
@@ -2552,6 +2611,109 @@ enum WorkspaceCommands {
     /// Manage workspace members.
     #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Member(WorkspaceMemberCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum SecretCommands {
+    /// Create a workspace secret.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Secret name (DNS-1123 label).
+        name: String,
+
+        /// Read the value from this local environment variable.
+        #[arg(long = "value-env", value_name = "ENVVAR")]
+        value_env: Option<String>,
+
+        /// Read the value from this file, stored exactly as read, including any
+        /// trailing newline. Write it with `printf '%s'` to avoid one.
+        #[arg(long = "value-file", value_name = "PATH")]
+        value_file: Option<PathBuf>,
+
+        /// Token endpoint provider refresh may send the value to. Repeatable;
+        /// cannot be changed after creation. Omit for a reveal-only secret.
+        #[arg(long = "allowed-endpoint", value_name = "URL")]
+        allowed_endpoints: Vec<String>,
+
+        /// Human-readable description.
+        #[arg(long, default_value = "")]
+        description: String,
+
+        /// Labels to attach to the secret (KEY=VALUE).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Replace a workspace secret's value, description, or labels.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Secret name.
+        name: String,
+
+        /// Read the new value from this local environment variable.
+        #[arg(long = "value-env", value_name = "ENVVAR")]
+        value_env: Option<String>,
+
+        /// Read the new value from this file, stored exactly as read, including
+        /// any trailing newline. Write it with `printf '%s'` to avoid one.
+        #[arg(long = "value-file", value_name = "PATH")]
+        value_file: Option<PathBuf>,
+
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Replace all labels (KEY=VALUE). Repeatable.
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Option<Vec<String>>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show workspace secret metadata. The value is never shown.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Secret name.
+        name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List workspace secrets.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of secrets to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Filter by label selector (e.g. "team=platform").
+        #[arg(long)]
+        label_selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Delete workspace secrets. Fails while a provider refresh references one.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Secret name(s) to delete.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2775,7 +2937,12 @@ async fn run_async() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            // A gateway named on the command line must be registered.
+            let resolved = match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                Err(err) if cli.gateway.is_some() => return Err(err),
+                resolved => resolved,
+            };
+            if let Ok(ctx) = resolved {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
                 run::gateway_status(
@@ -3063,12 +3230,16 @@ async fn run_async() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
+            command: Some(PolicyCommands::Lint { policy }),
+        }) => run::sandbox_policy_lint(&policy)?,
+        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
+                PolicyCommands::Lint { .. } => unreachable!("offline lint is dispatched above"),
                 PolicyCommands::Set {
                     name,
                     policy,
@@ -3402,6 +3573,7 @@ async fn run_async() -> Result<()> {
                     no_tty,
                     detach,
                     restart_policy,
+                    timeout,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3497,6 +3669,7 @@ async fn run_async() -> Result<()> {
                             detach,
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
+                            provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
                         },
                         &cli.workspace,
                         &tls,
@@ -3858,11 +4031,15 @@ async fn run_async() -> Result<()> {
             apply_auth(&mut tls, &ctx.name)?;
 
             match command {
-                WorkspaceCommands::Create { name, labels } => {
-                    run::workspace_create(endpoint, &name, &labels, &tls).await?;
+                WorkspaceCommands::Create {
+                    name,
+                    labels,
+                    output,
+                } => {
+                    run::workspace_create(endpoint, &name, &labels, output.as_str(), &tls).await?;
                 }
-                WorkspaceCommands::Get { name } => {
-                    run::workspace_get(endpoint, &name, &tls).await?;
+                WorkspaceCommands::Get { name, output } => {
+                    run::workspace_get(endpoint, &name, output.as_str(), &tls).await?;
                 }
                 WorkspaceCommands::List {
                     page_size,
@@ -3983,6 +4160,7 @@ async fn run_async() -> Result<()> {
                         material,
                         secret_material_env,
                         secret_material_keys,
+                        material_secrets,
                         credential_expires_at,
                     } => {
                         run::provider_refresh_config(
@@ -3994,6 +4172,7 @@ async fn run_async() -> Result<()> {
                                 material: &material,
                                 secret_material_env: &secret_material_env,
                                 secret_material_keys: &secret_material_keys,
+                                material_secrets: &material_secrets,
                                 credential_expires_at_ms: credential_expires_at,
                             },
                             &cli.workspace,
@@ -4019,6 +4198,19 @@ async fn run_async() -> Result<()> {
                         credential_key,
                     } => {
                         run::provider_refresh_delete(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::InlineSecrets {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_inline_secrets(
                             endpoint,
                             &name,
                             &credential_key,
@@ -4218,6 +4410,98 @@ async fn run_async() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("settings")
                 .expect("settings subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Secret {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            match command {
+                SecretCommands::Create {
+                    name,
+                    value_env,
+                    value_file,
+                    allowed_endpoints,
+                    description,
+                    labels,
+                    output,
+                } => {
+                    run::secret_create(
+                        endpoint,
+                        run::SecretCreateInput {
+                            name: &name,
+                            description: &description,
+                            value: run::SecretValueSource {
+                                env: value_env.as_deref(),
+                                file: value_file.as_deref(),
+                            },
+                            allowed_endpoints: &allowed_endpoints,
+                            labels: &labels,
+                        },
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Update {
+                    name,
+                    value_env,
+                    value_file,
+                    description,
+                    labels,
+                    output,
+                } => {
+                    run::secret_update(
+                        endpoint,
+                        run::SecretUpdateInput {
+                            name: &name,
+                            value: run::SecretValueSource {
+                                env: value_env.as_deref(),
+                                file: value_file.as_deref(),
+                            },
+                            description: description.as_deref(),
+                            labels: labels.as_deref(),
+                        },
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Get { name, output } => {
+                    run::secret_get(endpoint, &name, output.as_str(), &cli.workspace, &tls).await?;
+                }
+                SecretCommands::List {
+                    page_size,
+                    page_token,
+                    label_selector,
+                    output,
+                } => {
+                    run::secret_list(
+                        endpoint,
+                        page_size,
+                        &page_token,
+                        label_selector.as_deref().unwrap_or(""),
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Delete { names } => {
+                    run::secret_delete(endpoint, &names, &cli.workspace, &tls).await?;
+                }
+            }
+        }
+        Some(Commands::Secret { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("secret")
+                .expect("secret subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -6356,6 +6640,20 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_timeout_parses() {
+        let cli =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "900"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { timeout, .. }),
+                ..
+            }) => assert_eq!(timeout, std::num::NonZeroU32::new(900)),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "0"]).is_err());
+    }
+
+    #[test]
     fn sandbox_create_restart_policy_rejects_unknown_value() {
         assert!(
             Cli::try_parse_from([
@@ -6753,6 +7051,35 @@ mod tests {
                 assert!(all_workspaces);
             }
             other => panic!("expected SandboxTemplateCommands::List, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_and_get_accept_output_format() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "create",
+            "--name",
+            "team-ml",
+            "--output",
+            "json",
+        ])
+        .expect("workspace create --output should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Create { output, .. }),
+            }) => assert_eq!(output.as_str(), "json"),
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "workspace", "get", "team-ml", "-o", "yaml"])
+            .expect("workspace get -o should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Get { output, .. }),
+            }) => assert_eq!(output.as_str(), "yaml"),
+            other => panic!("expected workspace get, got {other:?}"),
         }
     }
 

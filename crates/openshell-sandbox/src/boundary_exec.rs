@@ -6,15 +6,16 @@
 use crate::native_api::{BoundaryExec, BoundaryProcess, BoundaryTerminal, ExecSession};
 
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream as StdUnixStream;
+use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 
 use async_trait::async_trait;
 use nix::pty::{Winsize, openpty};
@@ -25,6 +26,8 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{
     BackendError, BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundarySignal, ExecSpec,
 };
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The sandbox executor. Every spawn reuses the same admitted policy and
 /// execution-environment controls while taking a fresh provider credential
@@ -258,6 +261,46 @@ impl LocalBoundaryExec {
             .spawn()
             .map_err(|error| BackendError::Process(error.to_string()))?;
         let pid = child.id();
+        // Adopt the pipes before any registration so a failed adoption cleans
+        // up the spawned child exactly like a failed spawn does.
+        let (stdin, stdout, stderr) = {
+            let adopted = (|| {
+                let stdin = child
+                    .stdin
+                    .take()
+                    .map(|file| -> Result<BoundaryInput, BackendError> {
+                        Ok(Box::new(ExecFd::new(file)?))
+                    })
+                    .transpose()?;
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|file| -> Result<BoundaryOutput, BackendError> {
+                        Ok(Box::new(ExecFd::new(file)?))
+                    })
+                    .transpose()?
+                    .ok_or_else(|| BackendError::Process("exec stdout pipe missing".to_string()))?;
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|file| -> Result<BoundaryOutput, BackendError> {
+                        Ok(Box::new(ExecFd::new(file)?))
+                    })
+                    .transpose()?;
+                Ok::<_, BackendError>((stdin, stdout, stderr))
+            })();
+            match adopted {
+                Ok(pipes) => pipes,
+                Err(error) => {
+                    let _ = killpg(
+                        Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX)),
+                        Signal::SIGKILL,
+                    );
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        };
         let process_terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let signal_lock = Arc::new(std::sync::Mutex::new(()));
         if let Err(error) =
@@ -275,22 +318,6 @@ impl LocalBoundaryExec {
         let managed_child = child_registry.register(pid);
         #[cfg(target_os = "linux")]
         drop(child_registry);
-        let stdin = child.stdin.take().map(|file| -> BoundaryInput {
-            let fd: OwnedFd = file.into();
-            Box::new(tokio::fs::File::from_std(std::fs::File::from(fd)))
-        });
-        let stdout = child
-            .stdout
-            .take()
-            .map(|file| -> BoundaryOutput {
-                let fd: OwnedFd = file.into();
-                Box::new(tokio::fs::File::from_std(std::fs::File::from(fd)))
-            })
-            .ok_or_else(|| BackendError::Process("exec stdout pipe missing".to_string()))?;
-        let stderr = child.stderr.take().map(|file| -> BoundaryOutput {
-            let fd: OwnedFd = file.into();
-            Box::new(tokio::fs::File::from_std(std::fs::File::from(fd)))
-        });
         let process = Arc::new(LocalExecProcess::new(
             child,
             pid,
@@ -326,12 +353,16 @@ impl LocalBoundaryExec {
         let master = std::fs::File::from(pty.master);
         let slave = std::fs::File::from(pty.slave);
         let slave_fd = slave.as_raw_fd();
+        // Adopted before the child spawns so a failed adoption leaves no
+        // process to clean up.
         let input = master
             .try_clone()
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+            .map_err(|error| BackendError::Process(error.to_string()))
+            .and_then(ExecFd::new)?;
         let output = master
             .try_clone()
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+            .map_err(|error| BackendError::Process(error.to_string()))
+            .and_then(ExecFd::new)?;
         let stdin = slave
             .try_clone()
             .map_err(|error| BackendError::Process(error.to_string()))?;
@@ -398,8 +429,8 @@ impl LocalBoundaryExec {
         Ok(SpawnedExec {
             session: Some(ExecSession {
                 process: process.clone(),
-                stdin: Some(Box::new(tokio::fs::File::from_std(input))),
-                stdout: Box::new(tokio::fs::File::from_std(output)),
+                stdin: Some(Box::new(input)),
+                stdout: Box::new(output),
                 stderr: None,
                 terminal: Some(terminal),
             }),
@@ -470,6 +501,86 @@ fn async_socket(socket: StdUnixStream) -> Result<tokio::net::UnixStream, Backend
     })?;
     tokio::net::UnixStream::from_std(socket)
         .map_err(|error| BackendError::Process(format!("adopt runtime helper pipe: {error}")))
+}
+
+/// A readiness-based adapter over an exec pipe end or PTY master.
+///
+/// `tokio::fs::File` parks one blocking-pool thread per idle read, and that
+/// pool is shared with the gRPC exchange, exec spawn/reap, and
+/// `AcceptNetwork`; enough idle execs exhaust it and block new control
+/// connections. This adapter registers the descriptor with the runtime's
+/// reactor instead and only reads or writes when the descriptor is ready.
+/// Close-on-drop remains the EOF mechanism, so the adapter exclusively owns
+/// its descriptor.
+struct ExecFd {
+    fd: AsyncFd<std::fs::File>,
+}
+
+impl ExecFd {
+    fn new(file: impl Into<OwnedFd>) -> Result<Self, BackendError> {
+        let file = std::fs::File::from(file.into());
+        crate::main_session::set_nonblocking(&file).map_err(|error| {
+            BackendError::Process(format!("set exec stream nonblocking: {error}"))
+        })?;
+        // SAFETY: `file` owns a valid, open descriptor, is moved into the
+        // AsyncFd, and solely controls its lifetime until drop.
+        #[allow(unsafe_code)]
+        let fd = unsafe { AsyncFd::register(file) }
+            .map_err(|error| BackendError::Process(format!("register exec stream: {error:?}")))?;
+        Ok(Self { fd })
+    }
+}
+
+impl AsyncRead for ExecFd {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = ready!(self.fd.poll_read_ready_mut(cx))?;
+            match guard.try_io(|inner| inner.get_ref().read(buf.initialize_unfilled())) {
+                Ok(Ok(read)) => {
+                    buf.advance(read);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(error)) => return Poll::Ready(Err(error)),
+                // The guard already cleared readiness; poll for the next
+                // edge-triggered notification.
+                Err(_would_block) => {}
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ExecFd {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.fd.poll_write_ready_mut(cx))?;
+            match guard.try_io(|inner| inner.get_ref().write(buf)) {
+                // Return the partial write count; write_all above this layer
+                // drives the remaining bytes through future polls.
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => {}
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // A raw pipe or PTY descriptor has no userspace buffer to flush.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // Drop closes the descriptor, which is the pipe EOF mechanism; a
+        // PTY master cannot be shut down selectively. Matches the
+        // `tokio::fs::File` semantics the consumers were written against.
+        Poll::Ready(Ok(()))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1176,6 +1287,266 @@ mod tests {
         assert_eq!(
             session.process.wait().await.unwrap(),
             BoundaryExitStatus::Exited(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_exec_reads_master_output() {
+        let session = executor()
+            .exec(ExecSpec {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "printf ready".to_string()],
+                shell: None,
+                runtime_helper: None,
+                env: vec![],
+                workdir: None,
+                pty: true,
+            })
+            .await
+            .expect("spawn pty exec");
+        let mut stdout = session.stdout;
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        output.extend_from_slice(&buffer[..read]);
+                        if output.windows(5).any(|window| window == b"ready") {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("read pty master output");
+        assert!(
+            output.windows(5).any(|window| window == b"ready"),
+            "pty master output was {output:?}"
+        );
+        assert_eq!(
+            session.process.wait().await.unwrap(),
+            BoundaryExitStatus::Exited(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn piped_exec_accepts_large_stdin_writes() {
+        let mut session = executor()
+            .exec(ExecSpec {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "cat > /dev/null".to_string()],
+                shell: None,
+                runtime_helper: None,
+                env: vec![],
+                workdir: None,
+                pty: false,
+            })
+            .await
+            .expect("spawn exec");
+        let mut stdin = session.stdin.take().expect("stdin");
+        // Far beyond the pipe buffer, so the write must survive partial
+        // writes and readiness-driven retries through the adapter.
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stdin.write_all(&payload),
+        )
+        .await
+        .expect("large stdin write completes")
+        .expect("write stdin");
+        drop(stdin);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), session.process.wait())
+                .await
+                .expect("exec exits after consuming the payload")
+                .expect("wait exec"),
+            BoundaryExitStatus::Exited(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_exec_accepts_large_master_writes() {
+        let mut session = executor()
+            .exec(ExecSpec {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "head -c 262144 > /dev/null".to_string()],
+                shell: None,
+                runtime_helper: None,
+                env: vec![],
+                workdir: None,
+                pty: true,
+            })
+            .await
+            .expect("spawn pty exec");
+        let mut stdin = session.stdin.take().expect("pty stdin");
+        // Short canonical-mode lines so the line discipline delivers input
+        // as it echoes it, and a concurrent reader drains the echo path so
+        // the discipline never fills and stalls the write side.
+        let mut line = vec![b'0'; 63];
+        line.push(b'\n');
+        let payload = line.repeat(4096);
+        let mut stdout = session.stdout;
+        let drained = tokio::spawn(async move {
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => received.extend_from_slice(&buffer[..read]),
+                }
+            }
+            received
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stdin.write_all(&payload),
+        )
+        .await
+        .expect("large pty master write completes")
+        .expect("write pty stdin");
+        drop(stdin);
+        // head -c exits only after consuming exactly the payload length, so a
+        // clean exit proves every byte crossed the shared master description.
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), session.process.wait())
+                .await
+                .expect("pty exec exits after consuming the payload")
+                .expect("wait pty exec"),
+            BoundaryExitStatus::Exited(0)
+        );
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), drained)
+            .await
+            .expect("echo drain finishes")
+            .expect("drain task");
+        // Echo is best-effort under backpressure: when the reader lags, the
+        // line discipline drops echo bytes rather than stalling input, and
+        // the queue still pending at slave close is discarded, so the echoed
+        // stream cannot be compared byte-for-byte with the payload. The
+        // drain exists to keep the echo path flowing; head's clean exit
+        // after exactly the payload length is the byte-accounting proof of
+        // the write path.
+        assert!(
+            received.contains(&b'0'),
+            "echo path returned {} bytes without payload data",
+            received.len()
+        );
+    }
+
+    /// A pipe end or PTY master that cannot be adopted must surface the
+    /// failure as a process error. An `O_PATH` descriptor rejects `F_SETFL`
+    /// with `EBADF`, the one deterministic way to fail the nonblocking step
+    /// of `ExecFd::new` on an otherwise valid descriptor.
+    #[test]
+    fn exec_fd_adoption_reports_a_nonblocking_failure() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let descriptor = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open("/dev/null")
+            .expect("open O_PATH descriptor");
+        match ExecFd::new(descriptor) {
+            Err(BackendError::Process(message)) => assert!(
+                message.contains("set exec stream nonblocking"),
+                "adoption error: {message}"
+            ),
+            Err(other) => panic!("adoption must fail as a process error: {other:?}"),
+            Ok(_) => panic!("adopting an O_PATH descriptor must fail"),
+        }
+    }
+
+    /// A descriptor the runtime reactor cannot register must surface the
+    /// registration half of adoption the same way: epoll refuses a regular
+    /// file with `EPERM` after the nonblocking switch succeeds.
+    #[tokio::test]
+    async fn exec_fd_adoption_reports_a_registration_failure() {
+        let file = tempfile::tempfile().expect("open regular file");
+        match ExecFd::new(file) {
+            Err(BackendError::Process(message)) => assert!(
+                message.contains("register exec stream"),
+                "adoption error: {message}"
+            ),
+            Err(other) => panic!("adoption must fail as a process error: {other:?}"),
+            Ok(_) => panic!("adopting a regular file must fail"),
+        }
+    }
+
+    /// A PTY adoption failure must surface before the child spawns, so there
+    /// is no process to clean up. Reserving exactly the descriptors openpty
+    /// needs makes the master clone fail with `EMFILE` at the adoption step,
+    /// before `Command::spawn` runs: the error returns, nothing executes the
+    /// workload command, and no process group is registered. The rlimit is
+    /// process-wide, so the scenario runs in an isolated copy of the test
+    /// binary, like the subreaper teardown test.
+    #[test]
+    fn pty_adoption_failure_leaves_no_spawned_process() {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+        const CHILD_MARKER: &str = "OPENSHELL_PTY_ADOPTION_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "boundary_exec::tests::pty_adoption_failure_leaves_no_spawned_process",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .expect("run isolated pty adoption test");
+            assert!(status.success(), "isolated pty adoption test failed");
+            return;
+        }
+
+        let executor = executor();
+        let runtime = executor.runtime.clone();
+        // Enter a runtime so an unexpectedly successful adoption fails the
+        // assertions below instead of panicking in `AsyncFd::register`.
+        let process_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _entered = process_runtime.enter();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let pid_file = scratch.path().join("pid");
+        let spec = ExecSpec {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("echo $$ > {}; sleep 300", pid_file.display()),
+            ],
+            shell: None,
+            runtime_helper: None,
+            env: vec![],
+            workdir: None,
+            pty: true,
+        };
+
+        // Reserve exactly the two descriptors openpty needs; the master
+        // clone that follows must then fail. The read_dir iterator's own
+        // descriptor closes when the count ends, leaving those two slots.
+        let open = std::fs::read_dir("/proc/self/fd")
+            .expect("count open descriptors")
+            .count();
+        let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("read descriptor limit");
+        let exhausted = u64::try_from(open + 1).expect("descriptor count fits");
+        setrlimit(Resource::RLIMIT_NOFILE, exhausted, hard).expect("reserve descriptor slots");
+        let result = executor.spawn_pty(&spec);
+        setrlimit(Resource::RLIMIT_NOFILE, soft, hard).expect("restore descriptor limit");
+
+        assert!(
+            matches!(result, Err(BackendError::Process(_))),
+            "a failed adoption must surface as a process error"
+        );
+        assert_eq!(runtime.registered_process_group_count(), 0);
+        runtime.ensure_active().expect("boundary remains active");
+        // The adoption runs before the child spawns: nothing may have
+        // executed the workload command.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !pid_file.exists(),
+            "no child may run when adoption fails before spawn"
         );
     }
 }

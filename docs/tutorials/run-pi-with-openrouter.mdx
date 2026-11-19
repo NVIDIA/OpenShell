@@ -11,8 +11,8 @@ inside an OpenShell sandbox. Pi works with many model providers out of the box,
 including [OpenRouter](https://openrouter.ai), which we use here.
 
 We'll build a Pi image, give the sandbox access to OpenRouter, and start Pi.
-The sandbox lets Pi reach OpenRouter but nothing else on the network, and Pi
-never sees your real API key.
+The sandbox lets Pi reach OpenRouter but nothing else on the network. OpenShell
+supplies Pi with an opaque placeholder for your API key.
 
 ## Prerequisites
 
@@ -76,8 +76,10 @@ use that image reference with `--from`.
 
 A sandbox has no network access until you grant it. To let Pi reach
 OpenRouter, we'll create a provider, which stores your API key and opens access
-to the service. Pi only ever sees a placeholder for the key. OpenShell swaps in
-the real key only when Pi calls OpenRouter.
+to the service. Pi receives an opaque placeholder in `OPENROUTER_API_KEY`.
+OpenShell substitutes the real key in requests authorized for OpenRouter. See
+[How Credential Injection Works](/how-it-works/providers/overview#how-credential-injection-works)
+for credential delivery and response-handling limits.
 
 A provider is built from a provider profile, which describes the service. Save
 this one as `provider-openrouter.yaml`:
@@ -117,8 +119,7 @@ Here's what the main sections do:
 
 - `credentials` declares the API key. Pi finds the placeholder in
   `OPENROUTER_API_KEY`.
-- `endpoints` allows only `openrouter.ai`, and OpenShell sends the key nowhere
-  else.
+- `endpoints` authorizes requests and credential injection for `openrouter.ai`.
 - `binaries` allows only `node` to use this access. Pi runs on Node.js, so
   that includes Pi.
 

@@ -65,9 +65,9 @@ publish the driver binary next to `openshell-gateway`.
 ## Provenance
 
 `package-vm-runtime.sh` writes `provenance.json` into each runtime tarball with
-the platform, libkrunfw commit, kernel version, and umoci version,
-GitHub SHA, and build time. The driver logs this metadata when it extracts and
-loads a runtime bundle.
+the platform, libkrunfw commit, kernel version, final kernel config SHA-256,
+umoci version, GitHub SHA, and build time. The driver logs this metadata when it
+extracts and loads a runtime bundle.
 
 The release workflow also publishes GitHub artifact attestations for each
 runtime tarball. Verify a downloaded runtime with:

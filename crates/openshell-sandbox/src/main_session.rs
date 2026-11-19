@@ -1029,7 +1029,7 @@ impl MainSession {
     }
 }
 
-fn set_nonblocking(file: &std::fs::File) -> Result<(), nix::errno::Errno> {
+pub(crate) fn set_nonblocking(file: &std::fs::File) -> Result<(), nix::errno::Errno> {
     let flags = fcntl(file.as_raw_fd(), FcntlArg::F_GETFL)?;
     let flags = OFlag::from_bits_truncate(flags);
     fcntl(

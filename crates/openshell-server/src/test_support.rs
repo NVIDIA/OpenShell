@@ -3,6 +3,30 @@
 
 //! Test fixtures for exercising gateway integration points.
 
+/// Test-only gRPC services whose unused methods return `UNIMPLEMENTED`.
+///
+/// These use the production message types and RPC paths. Implement only the
+/// methods the test exercises; the production server trait stays exhaustive.
+///
+/// ```compile_fail
+/// struct IncompleteGateway;
+/// #[tonic::async_trait]
+/// impl openshell_core::proto::open_shell_server::OpenShell for IncompleteGateway {}
+/// ```
+#[cfg(feature = "test-support")]
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    dead_code,
+    unused_imports,
+    unused_qualifications,
+    rust_2018_idioms
+)]
+pub mod grpc {
+    include!(concat!(env!("OUT_DIR"), "/test_grpc/openshell.v1.rs"));
+}
+
 use crate::ServerState;
 use crate::auth::identity::{Identity, IdentityProvider};
 use crate::auth::principal::{Principal, UserPrincipal};
@@ -282,6 +306,7 @@ impl FakeComputeDriver {
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(ComputeDriverServer::new(driver.clone()))
+                .add_service(openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver.clone()))
                 .add_service(openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver.clone()))
                 .serve_with_incoming(UnixIncoming { listener })
                 .await
@@ -590,5 +615,21 @@ impl ComputeDriver for FakeComputeDriver {
         _request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
         Ok(Response::new(DeleteWorkspaceResponse {}))
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for FakeComputeDriver {
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        self.record_traceparent(request.metadata());
+        Err(Status::unimplemented(
+            "supervisor application endpoint resolution is not supported",
+        ))
     }
 }

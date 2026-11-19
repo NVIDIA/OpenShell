@@ -63,7 +63,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
-use openshell_core::net::set_tcp_nodelay_best_effort;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -1016,10 +1015,18 @@ async fn connect_via_inner(
     target: ConnectTarget,
 ) -> std::io::Result<PrefixedStream> {
     let tcp = match endpoint.dial_ip {
-        Some(ip) => TcpStream::connect(SocketAddr::new(ip, endpoint.port)).await?,
-        None => TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?,
+        Some(ip) => {
+            openshell_core::net::connect_tcp_nodelay_best_effort(SocketAddr::new(ip, endpoint.port))
+                .await?
+        }
+        None => {
+            openshell_core::net::connect_tcp_nodelay_best_effort((
+                endpoint.host.as_str(),
+                endpoint.port,
+            ))
+            .await?
+        }
     };
-    set_tcp_nodelay_best_effort(&tcp);
     // For an `https://` proxy, wrap the connection in TLS (verifying the proxy
     // certificate against the configured roots) before the CONNECT handshake.
     let mut stream = match &endpoint.tls {
@@ -2062,7 +2069,9 @@ mod tests {
                             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                             .await
                             .unwrap();
-                        if let Ok(mut upstream) = TcpStream::connect(tls_addr).await {
+                        if let Ok(mut upstream) =
+                            openshell_core::net::connect_tcp_nodelay_best_effort(tls_addr).await
+                        {
                             let _ = copy_bidirectional(&mut client, &mut upstream).await;
                         }
                     });
@@ -2150,7 +2159,11 @@ mod tests {
     async fn prefixed_stream_replays_prefix_before_socket_bytes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let connect = tokio::spawn(async move {
+            openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+                .await
+                .unwrap()
+        });
         let (mut accepted, _) = listener.accept().await.unwrap();
         let dialed = connect.await.unwrap();
 

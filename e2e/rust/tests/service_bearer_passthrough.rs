@@ -204,6 +204,10 @@ where
     Ok((status, body))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the e2e workspace does not depend on openshell-core"
+)]
 async fn request_service(
     target: &ServiceTarget,
     authorization: &str,

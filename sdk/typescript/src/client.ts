@@ -486,7 +486,8 @@ export interface ForwardOptions extends SandboxWorkspaceOptions {
 
 // A process-lifetime local listener that tunnels each accepted connection into
 // the sandbox. Call `close()` on teardown; `closed` resolves once the listener
-// is fully torn down. An in-process forward cannot outlive the Node process.
+// is fully torn down. `close()` may wait up to 5s for best-effort revokes of
+// open connections' tokens. An in-process forward cannot outlive the Node process.
 export interface ForwardHandle {
   localHost: string;
   localPort: number;
@@ -723,6 +724,15 @@ function versionPin(value: string | undefined): bigint {
 }
 
 const FORWARD_CHUNK = 64 * 1024;
+
+// Bound for revoking a forward's SSH session token during cleanup.
+const SSH_CLEANUP_TIMEOUT_MS = 5_000;
+let sshCleanupTimeoutMs = SSH_CLEANUP_TIMEOUT_MS;
+
+// Test hook; not re-exported from index.ts. No argument restores the default.
+export function __setSshCleanupTimeoutMsForTests(ms?: number): void {
+  sshCleanupTimeoutMs = ms ?? SSH_CLEANUP_TIMEOUT_MS;
+}
 
 function workspaceName(options?: SandboxWorkspaceOptions | null): string {
   const workspace = options?.workspace ?? 'default';
@@ -1934,7 +1944,11 @@ export class SandboxClient {
       input.end();
       if (token !== undefined) {
         try {
-          await this.grpc.revokeSshSession({ token, allowMissing: true }, { signal });
+          // Not the connection signal: close() aborts it before this runs.
+          await this.grpc.revokeSshSession(
+            { token, allowMissing: true },
+            { signal: AbortSignal.timeout(sshCleanupTimeoutMs) },
+          );
         } catch {
           // Best-effort revoke; the token expires on its own regardless.
         }

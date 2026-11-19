@@ -57,7 +57,13 @@ loads the launch configuration from its arguments and environment and prepares
 push and the OCSF JSON settings with its logging layers, so renewal by either
 gateway client keeps both current. `run_sandbox_with_backend` sets the
 process-wide OCSF context, binds the readiness socket and port to instance
-readiness, and stops the instance on SIGTERM or SIGINT.
+readiness, and stops the instance on SIGTERM or SIGINT. Stopping gives the
+workload 5 seconds to exit after TERM, and the instance stops, including its
+exit report and trace flush, within 8 seconds. Telemetry exporters shut down
+after that and are not covered by this bound. A boundary connection lost while
+the process stops is not recovered; the workload's exit status is reported
+when the boundary returned it, otherwise the workload is reported as
+terminated.
 
 `sandbox_instance_host::SandboxInstanceHost` runs several sandbox instances in
 one process. Each instance gets its own Tokio runtime; every thread of that
@@ -73,8 +79,9 @@ is a single path component, then, under the registry lock, accepts the same
 launch fingerprint for an occupied key again, rejects a different one, and
 rejects any admission while the key is being removed. A new instance gets an
 empty private directory under the host root, and `sandbox_instance_launch`
-prepares its bindings and body there. A failed admission leaves no entry and
-no files.
+prepares its bindings and body there. A failed admission retains no entry;
+its directory is deleted on a best-effort basis, and the next admission of the
+key must delete any stale files before reusing it.
 
 Removing an instance stops its workload, shuts down only its runtime, which
 drops its runtime route, and revokes its gateway credentials; only then is its
@@ -257,10 +264,13 @@ control listener: it dials the gateway and receives its assignments from it.
   leaving, waits up to 40 seconds for the gateway to move its instances, and
   relinquishes what remains.
 
-Sandbox instances get no upstream proxy, extra CA bundle, or provider workload identity:
-the Kubernetes driver refuses the topology when an upstream proxy or provider
-SPIFFE identity is configured, so a workload never silently loses them. The
-host also initializes no OTLP trace or OCSF exporters, because one process
+Sandbox instances get no upstream proxy or extra CA bundle: the Kubernetes driver
+refuses the topology when an upstream proxy is configured, so a workload never
+silently loses it. The process's own SPIFFE identity never stands in for a
+sandbox. Shared sandbox instances obtain final provider access tokens through the gateway's
+`GetSandboxProviderAccessToken` RPC. They hold no SPIRE socket, SVID, or
+intermediate token. The gateway owns identity authorization, acquisition,
+exchange, and caching. The host also initializes no OTLP trace or OCSF exporters, because one process
 cannot export each instance's records with that instance's collector headers and
 identity. Its console logs and each instance's gateway log push remain, and the
 Kubernetes driver warns at startup when the gateway configures supervisor
@@ -303,3 +313,26 @@ URL selection. Dedicated and shared supervisors expose the app listener on their
 Pod IPs without app Services. Clients must select the member owning their
 sandbox. HA takeover may preserve the workload generation; existing ingress streams
 are not migrated. Runtime ownership fencing must reject stale connectors.
+
+### Installed-route evidence
+
+An enabled listener offers an installation view to the existing authenticated
+sandbox supervisor session. The gateway issues a single-use lease challenge
+every five seconds. The instance reports the complete installed allowlist only
+when its remaining serving freshness covers the challenge's fifteen-second
+lease. Expiry starts at gateway challenge issuance, so transport delay cannot
+extend publication past confirmed listener freshness. Empty reports withdraw
+installation evidence; suspended, expired, stopped, or not-yet-serving instances
+cannot report live routes.
+
+Reports contain declaration identities/revisions and configuration identity,
+not backend addresses. The gateway obtains endpoints from the compute driver
+and validates runtime identity, declarations, and session ownership before
+persisting ephemeral records. Shared Kubernetes pools resolve the acknowledged
+owner's Pod IP and app port. Durable pool ownership, credential epoch, membership,
+and acknowledged reports fence installation acceptance and discovery. Shared
+listeners additionally require a gateway-issued serving lease, capped at fifteen
+seconds from issuance, independently of configuration freshness. Expiry closes
+streams; later renewal cannot revive them. Takeover preserves the workload and
+public hostname while replacing the app endpoint. Clients reconnect after an
+interruption; sockets are not migrated.

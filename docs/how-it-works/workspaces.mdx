@@ -39,7 +39,8 @@ cannot perform platform-scoped or cross-workspace operations.
 When the gateway enables scope enforcement through `scopes_claim`, the token
 must also contain the scope required by the operation. Common scopes include
 `workspace:read`, `workspace:write`, `sandbox:read`, `sandbox:write`,
-`provider:read`, `provider:write`, `config:read`, and `config:write`.
+`provider:read`, `provider:write`, `config:read`, `config:write`,
+`secret:read`, and `secret:write`.
 `openshell:all` satisfies every scope requirement. For OIDC and scope
 configuration, refer to [Gateway Authentication](/how-it-works/gateways/authentication).
 
@@ -152,11 +153,13 @@ Filtering only returns workspaces you are authorized to view.
 openshell workspace list --label-selector env=dev,team=ml
 ```
 
-Inspect a workspace to see its labels, or use structured list output for
-automation.
+Inspect a workspace to see its labels. Pass `--output json` or `--output yaml`
+to `workspace create`, `workspace get`, or `workspace list` for structured
+output in automation.
 
 ```shell
 openshell workspace get team-research
+openshell workspace get team-research --output json
 openshell workspace list --label-selector env=dev --output json
 ```
 

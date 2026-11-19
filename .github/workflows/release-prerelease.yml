@@ -124,7 +124,6 @@ jobs:
       release-tag: ${{ needs.resolve.outputs.tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       semver: ${{ needs.build.outputs.semver }}
-      python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: true
     secrets:

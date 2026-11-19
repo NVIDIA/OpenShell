@@ -245,6 +245,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_sandbox_provider_access_token(
+        &self,
+        _request: tonic::Request<proto::GetSandboxProviderAccessTokenRequest>,
+    ) -> Result<Response<proto::GetSandboxProviderAccessTokenResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_notify_config_update(
         &self,
         _request: tonic::Request<proto::PeerNotifyConfigUpdateRequest>,
@@ -857,6 +864,55 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn create_secret(
+        &self,
+        _: tonic::Request<proto::CreateSecretRequest>,
+    ) -> Result<Response<proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_secret(
+        &self,
+        _: tonic::Request<proto::GetSecretRequest>,
+    ) -> Result<Response<proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_secrets(
+        &self,
+        _: tonic::Request<proto::ListSecretsRequest>,
+    ) -> Result<Response<proto::ListSecretsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn update_secret(
+        &self,
+        _: tonic::Request<proto::UpdateSecretRequest>,
+    ) -> Result<Response<proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_secret(
+        &self,
+        _: tonic::Request<proto::DeleteSecretRequest>,
+    ) -> Result<Response<proto::DeleteSecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn reveal_secret(
+        &self,
+        _: tonic::Request<proto::RevealSecretRequest>,
+    ) -> Result<Response<proto::RevealSecretResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn inline_provider_refresh_secrets(
+        &self,
+        _: tonic::Request<proto::InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<proto::InlineProviderRefreshSecretsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox_config(
         &self,
         _: tonic::Request<proto::GetSandboxConfigRequest>,
@@ -1195,6 +1251,35 @@ impl SandboxUpdates for TestOpenShell {
     }
 }
 
+#[tonic::async_trait]
+impl proto::service_discovery_server::ServiceDiscovery for TestOpenShell {
+    async fn get_service_route_snapshot(
+        &self,
+        request: tonic::Request<proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<proto::GetServiceRouteSnapshotResponse>, Status> {
+        if let Some(expected) = &self.state.require_bearer
+            && request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                != Some(expected.as_str())
+        {
+            return Err(Status::unauthenticated("invalid or missing bearer token"));
+        }
+        Ok(Response::new(proto::GetServiceRouteSnapshotResponse {
+            snapshot: Some(proto::ServiceRouteSnapshot::default()),
+        }))
+    }
+    type WatchServiceRoutesStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::WatchServiceRoutesResponse, Status>>;
+    async fn watch_service_routes(
+        &self,
+        _: tonic::Request<proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+}
+
 /// Spin up the mock gateway, return its endpoint URL.
 async fn start_mock(state: Arc<MockState>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1204,11 +1289,15 @@ async fn start_mock(state: Arc<MockState>) -> String {
     let updates = SandboxUpdatesServer::new(TestOpenShell {
         state: state.clone(),
     });
+    let discovery = proto::service_discovery_server::ServiceDiscoveryServer::new(TestOpenShell {
+        state: state.clone(),
+    });
     let svc = OpenShellServer::new(TestOpenShell { state });
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(svc)
             .add_service(updates)
+            .add_service(discovery)
             .serve_with_incoming(stream)
             .await;
     });
@@ -2455,6 +2544,58 @@ async fn raw_sandbox_updates_shares_transport_and_live_auth_slot() {
         .await
         .unwrap();
     assert_eq!(*state.last_update.lock().await, Some(request));
+}
+
+#[tokio::test]
+async fn raw_discovery_shares_transport_and_refreshes_the_live_auth_slot() {
+    let state = Arc::new(MockState {
+        require_bearer: Some("Bearer fresh-token".into()),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state).await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let mut config = ClientConfig::new(&endpoint);
+    config.auth = Some(AuthConfig::Oidc {
+        token: "stale-token".into(),
+        expires_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 5,
+        ),
+        refresh: Some(Arc::new(OneShotRefresher {
+            calls: calls.clone(),
+        })),
+    });
+    let client = OpenShellClient::connect(config).await.unwrap();
+    let mut discovery = client.raw_service_discovery();
+    let request = proto::GetServiceRouteSnapshotRequest {
+        workspace_scope: Some(proto::workspace_selector("team")),
+    };
+    assert_eq!(
+        discovery
+            .get_service_route_snapshot(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    client
+        .raw_service_discovery_fresh()
+        .await
+        .unwrap()
+        .get_service_route_snapshot(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    discovery.get_service_route_snapshot(request).await.unwrap();
+    client
+        .raw_grpc()
+        .health(proto::HealthRequest {})
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

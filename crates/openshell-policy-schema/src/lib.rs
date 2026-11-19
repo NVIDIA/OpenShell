@@ -285,7 +285,7 @@ pub struct NetworkEndpoint {
     /// Defaults to false (strict).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_encoded_slash: bool,
-    /// When true, client-to-server WebSocket text messages on this REST
+    /// When true, client-to-server WebSocket text messages on a `protocol: websocket`
     /// endpoint rewrite credential placeholders after an allowed 101 upgrade.
     /// Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

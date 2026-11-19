@@ -9,7 +9,7 @@ use blake3::Hasher;
 use crate::config::{Environment, Installer, Machine};
 
 use super::ansible_hash::hash_sources;
-use super::layer::{cached_layer, hash_file, hash_files, hash_inputs};
+use super::layer::{INSTALL_DISKS, cached_layer, hash_file, hash_files, hash_inputs};
 use super::setup::setup;
 
 const INSTALL_CACHE_VERSION: &[u8] = b"tmachine-install-blake3-v1";
@@ -26,6 +26,7 @@ pub async fn install(
 
     let hash = install_hash(&setup_disk, installer)?;
     cached_layer(
+        INSTALL_DISKS,
         &setup_disk,
         &hash,
         installer.use_galaxy,

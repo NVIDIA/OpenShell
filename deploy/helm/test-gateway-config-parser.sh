@@ -43,6 +43,24 @@ render "${work_dir}/default.yaml"
 extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
 
+# Disabling metrics must remove even a raw listener override. Re-enabling
+# with the same retained port must produce a loader-valid custom listener.
+render "${work_dir}/metrics-disabled.yaml" \
+  --set metrics.enabled=false \
+  --set service.metricsPort=19090 \
+  --set-string 'gatewayConfig.openshell\.gateway.metrics_bind_address=0.0.0.0:29090'
+extract_toml "${work_dir}/metrics-disabled.yaml" "${work_dir}/metrics-disabled.toml"
+preflight "${work_dir}/metrics-disabled.toml"
+if grep -Fq 'metrics_bind_address' "${work_dir}/metrics-disabled.toml"; then
+  echo "disabled metrics must not leave a runtime listener configured" >&2
+  exit 1
+fi
+render "${work_dir}/metrics-enabled.yaml" \
+  --set metrics.enabled=true --set service.metricsPort=19090
+extract_toml "${work_dir}/metrics-enabled.yaml" "${work_dir}/metrics-enabled.toml"
+preflight "${work_dir}/metrics-enabled.toml"
+grep -F 'metrics_bind_address = "0.0.0.0:19090"' "${work_dir}/metrics-enabled.toml" >/dev/null
+
 # Explicit app ingress must survive both template rendering and driver
 # preflight; child options cannot extend a sealed TOML inline table.
 render "${work_dir}/app-listener.yaml" \

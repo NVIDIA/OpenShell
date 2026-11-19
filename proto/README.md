@@ -72,6 +72,8 @@ identifies the service being exposed.
   wire identity and may therefore differ from declaration order.
 - Document authorization-sensitive selector variants and omission semantics on
   the containing request.
+- Give an RPC that changes gateway state a `*:write` scope and add it to the
+  audit catalog in `crates/openshell-server/src/auth/audit/catalog.rs`.
 
 ## Schema evolution
 
@@ -85,6 +87,18 @@ identifies the service being exposed.
 - Regenerate Rust, Python, Go, and TypeScript bindings after contract changes.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.
+
+## Compute-driver application endpoints
+
+`compute_driver.proto` is the internal gateway/driver contract. Ordinary
+`GetSandbox` observation does not resolve application routing endpoints.
+The optional `ComputeDriverAppEndpoints.ResolveSupervisorAppEndpoint` service
+returns the current trusted supervisor listener
+and its runtime/ownership binding for advertisement validation. Drivers without
+support return `UNIMPLEMENTED`; a successful response with no endpoint means no
+safe endpoint is currently available. Neither result authorizes publication.
+The gateway owns installation validation and the public discovery API.
+The baseline `ComputeDriver` service and generated server trait stay unchanged.
 
 ## Supervisor host protocol
 

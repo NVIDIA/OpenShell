@@ -8,7 +8,7 @@ instances:
     custom-domain: docs.nvidia.com/openshell
     multi-source: true
 
-title: NVIDIA OpenShell
+title: OpenShell
 
 global-theme: nvidia
 

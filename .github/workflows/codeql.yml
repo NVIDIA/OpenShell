@@ -40,8 +40,6 @@ jobs:
         include:
           - language: rust
             build-mode: none
-          - language: go
-            build-mode: manual
           - language: python
             build-mode: none
           - language: javascript-typescript
@@ -53,24 +51,12 @@ jobs:
           ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
 
-      - name: Set up Go
-        if: matrix.language == 'go'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: sdk/go/go.mod
-          cache-dependency-path: sdk/go/go.sum
-
       - name: Initialize CodeQL
         uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           config-file: ./.github/codeql/codeql-config.yml
-
-      - name: Build Go SDK
-        if: matrix.language == 'go'
-        working-directory: sdk/go
-        run: go build ./...
 
       - name: Analyze
         id: analyze

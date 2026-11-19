@@ -57,6 +57,16 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
+### Gateway metrics
+
+The chart enables its dedicated Prometheus endpoint by default. Set
+`metrics.enabled=false` to omit the listener and its container and Service
+ports without changing `service.metricsPort` (default `9090`). The port must
+remain between 1 and 65535 even when disabled. Legacy `metricsPort: 0` or
+`false` values fail rendering; migrate them to `metrics.enabled=false` and a
+valid port in the same upgrade. `metrics.tls.enabled=true` requires
+`metrics.enabled=true`. This setting does not disable OpenTelemetry export.
+
 ### Shared supervisor plumbing
 
 Set `gatewayConfig.openshell.drivers.kubernetes.supervisor_topology`
@@ -97,7 +107,52 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
   mise run e2e:kubernetes:shared-supervisor
 ```
 
+`mise run e2e:kubernetes:shared-supervisor-spiffe` installs pinned SPIRE charts
+(`ci/values-spire-broker-stack.yaml`) and the `openshell.gateway.spiffe_broker`
+overlay (`ci/values-supervisor-spiffe.yaml`). It exercises provider exchange and
+abrupt supervisor takeover over TLS, using Sandbox CR UID registrations and
+enforced Kubernetes authorization. Workload generation, Pod, process, and stable
+SPIFFE identity survive; the new owner acquires a fresh provider token and the
+broker rejects the old bearer. The fixture's 30-second workload X.509-SVIDs
+exercise acquisition after credential rotation. The gateway Pod must pass
+Restricted Pod Security admission. The task owns its SPIRE install and cluster.
+
+The task creates three nodes (`HELM_K3S_AGENT_COUNT=2` adds two k3d agents) and
+requires three SPIRE agents. Its cluster-scoped `server_spiffe_id_prefix` accepts
+the concrete node identities, and a node alias distributes Sandbox registrations
+to all eligible agents. The test selects each Broker backend in turn and forces
+a new generation's acquisition, then replaces one agent and checks acquisition
+without re-registering the sandbox. Exact-ID mode remains available for a fixed
+endpoint. The installed SPIRE version and operator must expose the experimental
+Broker API.
+
+For remote clusters, set `OPENSHELL_E2E_HOST_GATEWAY_IP` to a host reachable
+from Pods. Optional `OPENSHELL_E2E_SPIFFE_STS_PORT` and
+`OPENSHELL_E2E_SPIFFE_TARGET_PORT` fix the test's host listener ports so an
+operator can forward them through a reverse tunnel. Keep the tunnel available
+through the test and remove it afterward. Use an explicit kubeconfig and context
+to avoid repository environment defaults targeting a local cluster.
+`OPENSHELL_E2E_SPIFFE_DRIVER_CONFIG_JSON` can pass a driver override to test
+sandbox creation, such as a node selector for a Landlock-capable pool. Enable
+`allow_driver_config` in the test gateway when using this override. GKE COS
+nodes may lack Landlock; use compatible Ubuntu nodes for sandbox workloads.
+For remote abrupt-failover coverage, set
+`OPENSHELL_E2E_SUPERVISOR_PROCESS_CONTROL=1`. Before creating sandboxes, the test
+adds an unprivileged process-control sidecar and enables the supervisor Pod's
+shared process namespace. The sidecar sends SIGKILL to the supervisor as the
+same UID; it needs no host PID namespace, capabilities, or runtime socket.
+The default k3d/kind test continues to kill through the node container runtime.
+
 ### Shared supervisor high availability
+
+`mise run e2e:kubernetes:shared-supervisor-spiffe-node-local` validates direct
+node-local Broker TCP routing. The chart injects `OPENSHELL_NODE_IP` from
+`status.hostIP` for `spiffe_broker.node_local_port`; it creates no Broker Service.
+The task uses an external PostgreSQL fixture and a gateway Deployment, moves
+the gateway across the SPIRE nodes, restricts Broker egress to its current node,
+and forces fresh token acquisition on each node and after local agent replacement.
+The shared-supervisor failover, credential rotation, and identity fencing checks
+also run. Keep gateway/supervisor/sandbox images from the same branch.
 
 The shared supervisor is always a pool of `supervisor.replicas` members
 (default 1), or an HPA-managed pool when `supervisor.autoscaling.enabled=true`.
@@ -195,6 +250,17 @@ every member one at a time. The PID must survive each case, while an open
 replacement confirmed within the recovery timeout, so the runtime terminated
 the workload.
 
+For RFC 0017 app-listener validation, enable the listener and supply the app TLS
+Secret on the shared Deployment, plus a separate NetworkPolicy allowing the test
+client/proxy to reach its app port. Runtime-port access does not grant app access.
+Discovery returns the acknowledged owner's Pod IP and app port; no headless app
+Service is needed. Exercise HTTP/WebSocket reconnection through graceful downscale
+and abrupt loss, preserving workload generation/PID/in-memory state and the public
+hostname. Verify stale-owner rejection independently of the replacement's success.
+Shared serving leases expire within fifteen seconds of issuance and do not renew
+from configuration alone. Do not claim seamless socket migration or infer external
+ingress readiness from an advertisement.
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):
@@ -255,8 +321,9 @@ task running while using those endpoints.
 ### Viewing local traces
 
 The gateway exports OTLP/gRPC to
-`http://openshell-collector.observability.svc.cluster.local:4317` through the
-default Skaffold values. Forward OTLP/gRPC and the trace UI to the host:
+`http://openshell-collector.observability.svc.cluster.local:4317` through
+`ci/values-local-tracing.yaml`, which only `skaffold.yaml` layers. The Kubernetes
+E2E wrapper omits it, so E2E clusters export no traces. Forward OTLP/gRPC and the trace UI to the host:
 
 ```bash
 mise run helm:k3s:forward
@@ -267,9 +334,10 @@ Kubernetes compute-driver spans under their distinct service names, along with
 Agent Sandbox controller reconciliation spans linked through the Sandbox
 trace-context annotation. The same command exposes OTLP/gRPC on
 `http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
-`http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
-`gateway:vm` tasks detect the collector listener at startup and enable trace
-export, OCSF log export, and the agent trace relay only while it is reachable.
+`http://127.0.0.1:8090`. The local `gateway`, `gateway:docker`,
+`gateway:podman`, and `gateway:vm` tasks enable trace export, OCSF log export,
+and the agent trace relay only when `OPENSHELL_DEV_OTLP_ENDPOINT` is set, for
+example `OPENSHELL_DEV_OTLP_ENDPOINT=http://127.0.0.1:4317`.
 Spans an agent exports from inside a sandbox arrive through the supervisor's
 relay with `openshell.telemetry.source=agent` and share `openshell.sandbox.id`
 with that sandbox's supervisor spans.
@@ -424,8 +492,19 @@ Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
 Set `OPENSHELL_E2E_KUBE_TEST=kubernetes_image_update` to scope the Rust suite to
 combined image, command, environment, and metadata updates with retained sandbox,
 SSH, and PVC identities. The next start verifies the new argv and environment. This target is
-included in both existing Agent Sandbox API-version lanes; unlike the Python
-Docker suite, it exercises the driver that supports image updates.
+included in both existing Agent Sandbox API-version lanes. Docker separately
+supports image-only updates on stopped, opt-in persistent `/sandbox` workspaces;
+this Kubernetes lane does not qualify that path. Docker requires locally cached
+images, a matching numeric target `USER UID:GID`, and no image-declared volumes.
+Do not treat a skipped Docker lane as live image-replacement coverage.
+
+The separate `docker-updates` testkit suite qualifies the full Docker path
+through an owned mTLS gateway, including SSH exec, image replacement, restart,
+credential-publication repair and deletion. Follow
+`tests/suites/features/docker-updates/README.md`; the wrapper's
+`OPENSHELL_E2E_DOCKER_IMAGE_UPDATES=1` opts in only its fresh gateway and refuses
+an existing endpoint. On Docker Desktop without host networking, select the
+documented bridge override rather than changing engine settings.
 
 Image updates default to disabled outside test fixtures. The e2e wrapper opts
 in only for a fresh gateway fixture that it owns; set
@@ -527,7 +606,11 @@ development TLS certificate, and publishes its trust anchor as the
 `openshell-keycloak-ca` ConfigMap in the OpenShell namespace. The command prints a
 port-forward command for acquiring tokens from the CLI. Rerunning setup rotates the
 development certificate and trust anchor; redeploy the gateway afterward so it reloads
-the mounted CA bundle.
+the mounted CA bundle. The chart renders the mount path as
+`[openshell.gateway.oidc] ca_bundle`; the gateway adds that issuer CA to native roots
+for OIDC discovery and JWKS requests without changing trust for other HTTPS clients.
+The mounted bundle must be a regular file no larger than 1 MiB; the gateway rejects
+other file types and oversized bundles during startup.
 
 Then activate OIDC in the OpenShell Helm chart:
 1. Uncomment `#- ci/values-keycloak.yaml` in `skaffold.yaml`
@@ -631,6 +714,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/skaffold.yaml` | Skaffold config — images, Helm releases, values overlays |
 | `deploy/helm/openshell/values.yaml` | Default Helm values |
 | `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
+| `deploy/helm/openshell/ci/values-local-tracing.yaml` | OTLP export to the `helm:k3s:create` collector (Skaffold only) |
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |

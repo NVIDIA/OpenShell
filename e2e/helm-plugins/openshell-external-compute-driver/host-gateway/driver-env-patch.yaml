@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openshell
+spec:
+  template:
+    spec:
+      containers:
+        - name: kubernetes-compute-driver
+          env:
+            - name: OPENSHELL_HOST_GATEWAY_IP
+              value: replaced-by-kustomize

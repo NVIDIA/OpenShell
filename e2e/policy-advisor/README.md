@@ -66,10 +66,10 @@ candidate, run the `policy-advisor` suite of the `conformance` crate through the
 test runner:
 
 ```bash
-nix run .#openshell-test-runner -- \
+nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance \
-  --filter 'binary_id(=conformance::policy_advisor)'
+  --filter 'test(/^policy_advisor::/)'
 ```
 
 The GitHub write test above and the regressions below still exercise distinct

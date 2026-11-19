@@ -677,7 +677,7 @@ mod tests {
             let addr = listen_addr;
             client_handles.push(tokio::spawn(async move {
                 for _ in 0..cycles_per_client {
-                    let tcp = TcpStream::connect(addr)
+                    let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
                         .await
                         .expect("client connect failed");
                     let _tls = connector
@@ -747,7 +747,9 @@ mod tests {
                 .await
                 .expect("TLS accept failed");
         });
-        let tcp_1 = TcpStream::connect(addr1).await.expect("connect failed");
+        let tcp_1 = openshell_core::net::connect_tcp_nodelay_best_effort(addr1)
+            .await
+            .expect("connect failed");
         let tls_1 = connector
             .connect(server_name.clone(), tcp_1)
             .await
@@ -773,7 +775,9 @@ mod tests {
                 .await
                 .expect("TLS accept failed");
         });
-        let tcp_2 = TcpStream::connect(addr2).await.expect("connect failed");
+        let tcp_2 = openshell_core::net::connect_tcp_nodelay_best_effort(addr2)
+            .await
+            .expect("connect failed");
         let tls_2 = connector
             .connect(server_name.clone(), tcp_2)
             .await
@@ -872,7 +876,7 @@ mod tests {
                 acc.acceptor().accept(stream).await
             });
 
-            let tcp = TcpStream::connect(listen_addr)
+            let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
                 .await
                 .expect("connect failed");
             let handshake_result = tokio::time::timeout(
@@ -1004,7 +1008,7 @@ mod tests {
         let connector = tokio_rustls::TlsConnector::from(new_ca_client_config);
         let server_name =
             rustls::pki_types::ServerName::try_from("localhost").expect("invalid server name");
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         connector
@@ -1079,7 +1083,7 @@ mod tests {
         // server rejects the client cert (TLS 1.3 post-handshake auth),
         // so the authoritative check is the server-side accept result above.
         let connector = tokio_rustls::TlsConnector::from(old_ca_client_config);
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         let _ = connector.connect(server_name, tcp).await;
@@ -1296,7 +1300,7 @@ mod tests {
         });
 
         let connector = tokio_rustls::TlsConnector::from(client_config.clone());
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         let server_name = "external.example.com"
@@ -1332,7 +1336,7 @@ mod tests {
         });
 
         let connector = tokio_rustls::TlsConnector::from(client_config);
-        let tcp = TcpStream::connect(listen_addr)
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(listen_addr)
             .await
             .expect("connect failed");
         let server_name = "localhost".try_into().expect("invalid server name");

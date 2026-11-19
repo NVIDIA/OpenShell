@@ -315,9 +315,10 @@ async fn in_memory_sqlite_pins_the_pool_to_one_connection() {
     assert_eq!(store.max_connections(), 1);
 }
 
-/// The SSH identity lock keeps one data connection while it queries the
-/// pool, so a single-connection `PostgreSQL` pool is refused at startup. The
-/// check runs before any connection opens, so nothing listens on the URL.
+/// On `PostgreSQL`, an SSH identity or provider-refresh lock holder keeps one
+/// data connection for its lock and queries the pool on another, so a
+/// single-connection pool is refused at startup.
+/// The check runs before any connection opens, so nothing listens on the URL.
 #[tokio::test]
 async fn postgres_rejects_a_single_connection_data_pool_before_connecting() {
     for url in [
@@ -337,8 +338,8 @@ async fn postgres_rejects_a_single_connection_data_pool_before_connecting() {
     }
 }
 
-/// `SQLite` takes the SSH identity lock without a pool connection, so one
-/// connection is enough there, on disk and in memory.
+/// `SQLite` takes the SSH identity and provider-refresh locks without a pool
+/// connection, so one connection is enough there, on disk and in memory.
 #[tokio::test]
 async fn sqlite_accepts_a_single_connection_data_pool() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -880,6 +881,40 @@ async fn delete_many_is_bounded_idempotent_and_type_scoped() {
     assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), 0);
     assert_eq!(store.delete_many("sandbox", &[]).await.unwrap(), 0);
     assert!(store.get("provider", "other-type").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn existing_ids_spans_batches_and_is_type_scoped() {
+    let store = test_store().await;
+    let mut ids: Vec<String> = (0..=super::EXISTING_IDS_BATCH_SIZE)
+        .map(|idx| format!("missing-{idx}"))
+        .collect();
+    for id in ["sandbox-first", "sandbox-last"] {
+        store
+            .put("sandbox", id, id, "default", b"payload", None)
+            .await
+            .unwrap();
+    }
+    store
+        .put(
+            "provider",
+            "other-type",
+            "other-type",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+    ids.insert(0, "sandbox-first".to_string());
+    ids.extend(["other-type".to_string(), "sandbox-last".to_string()]);
+
+    let existing = store.existing_ids("sandbox", &ids).await.unwrap();
+    assert_eq!(
+        existing,
+        std::collections::HashSet::from(["sandbox-first".to_string(), "sandbox-last".to_string()])
+    );
+    assert!(store.existing_ids("sandbox", &[]).await.unwrap().is_empty());
 }
 
 #[tokio::test]

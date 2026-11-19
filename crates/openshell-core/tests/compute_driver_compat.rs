@@ -186,6 +186,16 @@ async fn roundtrip(serve_image_updates: bool) {
         .connect()
         .await
         .unwrap();
+    let mut apps = openshell_core::proto::compute::v1::compute_driver_app_endpoints_client::ComputeDriverAppEndpointsClient::new(channel.clone());
+    assert_eq!(
+        apps.resolve_supervisor_app_endpoint(
+            openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest::default()
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::Unimplemented,
+    );
     let mut baseline = ComputeDriverClient::new(channel.clone());
     assert_eq!(
         baseline

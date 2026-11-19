@@ -3818,8 +3818,8 @@ mod tests {
     /// agent is told its approved rule never landed.
     #[test]
     fn merged_policy_covers_the_rule_it_merged() {
-        // Every field `merge_endpoint` widens rather than replaces, set on the
-        // existing endpoint and absent from the proposal.
+        // REST-compatible fields that `merge_endpoint` widens rather than
+        // replaces, set on the existing endpoint and absent from the proposal.
         let existing_endpoint = NetworkEndpoint {
             protocol: "rest".to_string(),
             rules: vec![rest_rule("GET", "/health")],
@@ -3830,7 +3830,6 @@ mod tests {
             }],
             allowed_ips: vec!["10.0.0.1".to_string()],
             allow_encoded_slash: true,
-            websocket_credential_rewrite: true,
             request_body_credential_rewrite: true,
             advisor_proposed: true,
             ..endpoint("api.example.com", 443)

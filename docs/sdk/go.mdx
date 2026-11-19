@@ -10,14 +10,18 @@ position: 1
 
 Use the Go SDK to manage OpenShell resources from Go applications, operators,
 and controllers. Its typed subclients follow familiar Kubernetes client
-patterns. Use the SDK and gateway from the same OpenShell release when possible.
+patterns. The SDK is developed in
+[ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go), which also has
+the full [SDK documentation](https://ai-openshell.github.io/sdk-go/).
 
 ## Install the SDK
 
-The SDK requires Go 1.25.13 or later. Add it to your Go module:
+The SDK requires Go 1.26 or later. SDK releases follow OpenShell releases,
+so SDK `vX.Y.Z` works with a gateway from OpenShell `vX.Y.Z`. Add the version
+that matches your gateway to your Go module:
 
 ```shell
-go get github.com/NVIDIA/OpenShell/sdk/go@latest
+go get github.com/ai-openshell/sdk-go@vX.Y.Z
 ```
 
 ## Connect to a Gateway
@@ -34,7 +38,7 @@ import (
     "log"
     "time"
 
-    v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+    v1 "github.com/ai-openshell/sdk-go/openshell/v1"
 )
 
 func main() {
@@ -70,7 +74,7 @@ client, err := v1.NewClient(v1.Config{
 
 Omit `CAFile` to use system roots. For renewable OIDC service credentials, use
 `oidc.NewClientCredentialsAuth` from
-`github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc`.
+`github.com/ai-openshell/sdk-go/openshell/v1/oidc`.
 
 ## Discover the Active Gateway
 
@@ -95,7 +99,6 @@ sandbox, err := client.Sandboxes().Create(
             Image: "registry.example.com/team/python-agent:1.0",
         },
     },
-    nil,
 )
 if err != nil {
     log.Fatal(err)
@@ -126,8 +129,24 @@ The root client also exposes subclients for providers, services, files, SSH,
 TCP forwarding, policy, configuration, templates, and workspaces. List methods
 return lazy pagers so callers choose when to fetch the next page.
 
+## Migrate from `github.com/NVIDIA/OpenShell/sdk/go`
+
+The SDK used to live in this repository as `github.com/NVIDIA/OpenShell/sdk/go`.
+That module is deprecated and gets no further changes, including dependency and
+security updates. As of the move, packages and APIs are the same; only the
+module path is new. Rewrite the imports, then fetch the SDK version that
+matches your gateway:
+
+```shell
+grep -rlZ --include='*.go' --include=go.mod 'github.com/NVIDIA/OpenShell/sdk/go' . | xargs -0 perl -pi -e 's#github.com/NVIDIA/OpenShell/sdk/go#github.com/ai-openshell/sdk-go#g'
+go get github.com/ai-openshell/sdk-go@vX.Y.Z && go mod tidy
+```
+
+Existing builds keep working: the old module's tags stay published, and the
+latest one carries the deprecation notice that `go get` and pkg.go.dev show.
+
 ## Next Steps
 
 - Review [Gateway Authentication](/how-it-works/gateways/authentication) before connecting a service to a production gateway.
 - Review [API Errors](/sdk/api-errors) for the gateway error model.
-- Browse the [Go package reference](https://pkg.go.dev/github.com/NVIDIA/OpenShell/sdk/go/openshell/v1) for all exported types and methods.
+- Browse the [Go package reference](https://pkg.go.dev/github.com/ai-openshell/sdk-go/openshell/v1) for all exported types and methods.

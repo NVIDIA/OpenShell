@@ -104,9 +104,10 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $gateway := get $config "openshell.gateway" | default dict -}}
 {{- if not (hasKey $gateway "name") -}}{{- $_ := set $gateway "name" (get $legacyServer "name" | default (include "openshell.fullname" .)) -}}{{- end -}}
 {{/* The Service and probes own listener ports, so keep runtime listeners aligned. */}}
-{{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.service.port) -}}
-{{- if .Values.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
-{{- if .Values.service.metricsPort -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
+{{- $listenHost := include "openshell.listenHost" .Values.gateway.listenAddress -}}
+{{- $_ := set $gateway "bind_address" (printf "%s:%v" $listenHost .Values.service.port) -}}
+{{- if .Values.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "%s:%v" $listenHost .Values.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
+{{- if include "openshell.metricsEnabled" . -}}{{- $_ := set $gateway "metrics_bind_address" (printf "%s:%v" $listenHost .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
@@ -165,6 +166,7 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if and (get $legacyOidc "userRole") (not (hasKey $oidcConfig "user_role")) -}}{{- $_ := set $oidcConfig "user_role" (get $legacyOidc "userRole") -}}{{- end -}}
 {{- if and (get $legacyOidc "scopesClaim") (not (hasKey $oidcConfig "scopes_claim")) -}}{{- $_ := set $oidcConfig "scopes_claim" (get $legacyOidc "scopesClaim") -}}{{- end -}}
 {{- end -}}
+{{- if and (get $legacyOidc "caConfigMapName") (not (hasKey $oidcConfig "ca_bundle")) -}}{{- $_ := set $oidcConfig "ca_bundle" "/etc/openshell-tls/oidc-ca/ca.crt" -}}{{- end -}}
 {{- $_ := set $config "openshell.gateway.oidc" $oidcConfig -}}
 {{- end -}}
 {{- $legacyOtlp := get $legacyServer "otlp" | default dict -}}
@@ -333,8 +335,8 @@ boundary from the gateway listener so its client CA can stay independent. */}}
 {{- $metrics := .Values.metrics | default dict -}}
 {{- $metricsTls := get $metrics "tls" | default dict -}}
 {{- if get $metricsTls "enabled" -}}
-{{- if not .Values.service.metricsPort -}}
-{{- fail "metrics.tls.enabled requires service.metricsPort to be non-zero" -}}
+{{- if not (include "openshell.metricsEnabled" .) -}}
+{{- fail "metrics.tls.enabled requires metrics.enabled=true" -}}
 {{- end -}}
 {{- if and (get $metricsTls "requireClientCert") (not (get $metricsTls "clientCaSecretName")) -}}
 {{- fail "metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName" -}}

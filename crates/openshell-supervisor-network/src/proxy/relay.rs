@@ -244,6 +244,19 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    crate::l7::correlation::scope_connection(relay_http_stream_inner(client, upstream, context))
+        .await
+}
+
+async fn relay_http_stream_inner<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    context: RelayContext<'_>,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     match context.policy {
         PreparedHttpPolicy::Inspect { configs, evaluator } if configs.len() == 1 => {
             let generation_guard = evaluator.generation_guard().clone();
@@ -255,10 +268,7 @@ where
                     upstream,
                     context.request,
                 ) => result,
-                () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
-                    Ok(())
-                }
+                () = close_stale_http_relay(context.request, &generation_guard) => Ok(())
             }
         }
         PreparedHttpPolicy::Inspect { configs, evaluator } => {
@@ -271,10 +281,7 @@ where
                     upstream,
                     context.request,
                 ) => result,
-                () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
-                    Ok(())
-                }
+                () = close_stale_http_relay(context.request, &generation_guard) => Ok(())
             }
         }
         PreparedHttpPolicy::Passthrough { generation_guard } => {
@@ -286,13 +293,19 @@ where
                     &generation_guard,
                     Some(context.middleware_engine),
                 ) => result,
-                () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
-                    Ok(())
-                }
+                () = close_stale_http_relay(context.request, &generation_guard) => Ok(())
             }
         }
     }
+}
+
+async fn close_stale_http_relay(request: &L7EvalContext, guard: &PolicyGenerationGuard) {
+    guard.wait_until_stale().await;
+    crate::l7::correlation::record_current_failure(
+        crate::l7::correlation::HttpOutcome::PlatformError,
+        "policy_reloaded",
+    );
+    emit_stale_relay_close(request, guard);
 }
 
 // Exercise the production single/multiple-route dispatch from L7 fixtures.

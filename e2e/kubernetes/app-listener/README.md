@@ -174,3 +174,34 @@ subsequent discovery work.
 The local Rust listener tests use a real TLS client and backend RPC connector.
 They supplement this live cluster check; they do not establish HA pool recovery
 or real Kubernetes reachability.
+
+## Shared-supervisor HA and discovery
+
+Use the shared-supervisor HA overlay with the app-listener values and two gateway
+replicas sharing PostgreSQL. Use a dedicated test release for destructive pool
+checks. Give each proxy a discovery-only certificate with an explicit workspace
+or all-workspaces grant; mount no application private keys in proxies.
+
+Create HTTP/WebSocket fixtures on distinct supervisor owners. Record the workload
+Pod UID, runtime generation, PID, and an in-memory marker, along with each exact
+hostname, discovered owner endpoint, and installation version. Query both gateway
+replicas and verify both proxy replicas plus direct in-cluster TLS access.
+
+Exercise graceful 1 → 2 → 1 scaling and abrupt loss with the shared-supervisor
+HA harness's node-runtime SIGKILL procedure. A force-delete alone may still allow
+an orderly Leave and does not establish expiry-based recovery. Require unchanged
+workload identity/memory, stable public URLs, replacement endpoint/version, and
+successful HTTP/WebSocket reconnection. Keep another owner's WebSocket open to
+check sibling isolation. A stale installation must disappear even if a consumer
+retains it; shared listeners require an independent serving lease capped at
+fifteen seconds from issuance. Queued challenges cannot restart that deadline.
+Configuration renewal alone cannot extend serving authority.
+
+Also exercise gateway reconnection, discovery-reader revocation/regrant, route
+withdrawal, and discovery outage. Measure serving and discovery expiry separately;
+include membership failure detection and grant-file projection in the applicable
+bounds. These checks do not establish physical node or network-partition behavior
+when run on a single local k3d node. Existing sockets may break during takeover.
+
+Hashed multi-gateway hostnames still require the common hostname integration.
+Consumers use returned hostnames unchanged.

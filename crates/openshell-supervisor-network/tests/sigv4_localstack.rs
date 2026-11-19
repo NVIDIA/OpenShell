@@ -8,7 +8,6 @@
 use openshell_supervisor_network::sigv4::{apply_sigv4_headers_only, apply_sigv4_to_request};
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const LOCALSTACK: &str = "127.0.0.1:4566";
 const ACCESS_KEY: &str = "test";
@@ -28,7 +27,7 @@ fn s3_host() -> String {
 }
 
 async fn send_raw(raw: &[u8]) -> (u16, String) {
-    let mut stream = TcpStream::connect(LOCALSTACK)
+    let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(LOCALSTACK)
         .await
         .expect("connect to LocalStack");
     stream.write_all(raw).await.expect("write request");

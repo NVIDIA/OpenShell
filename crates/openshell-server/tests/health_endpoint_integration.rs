@@ -30,7 +30,7 @@ async fn start_health_server(
 }
 
 async fn http_get_json(addr: std::net::SocketAddr, path: &str) -> (StatusCode, Value) {
-    let stream = tokio::net::TcpStream::connect(addr)
+    let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
         .await
         .expect("connect test HTTP client");
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()

@@ -52,10 +52,6 @@ const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound on a routed sandbox instance's first connection. The instance is
-/// registered before its workload Pod is scheduled and its image pulled; the
-/// driver reaps a bootstrap that is still incomplete after the same interval.
-const ROUTED_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Bounds the liveness check that decides whether a stream failure lost the
 /// whole connection.
 const CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,11 +66,38 @@ const NETWORK_STREAM_WAIT_WARNING: Duration = Duration::from_secs(5);
 /// after a takeover retires its connection.
 const ADOPTED_ATTACHMENT_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn begin_recovery_window(
-    deadline: &mut Option<tokio::time::Instant>,
-    failure_time: tokio::time::Instant,
-) -> tokio::time::Instant {
-    *deadline.get_or_insert(failure_time + CONNECT_RETRY_TIMEOUT)
+/// Recovery budget for one outage of a long-lived wait stream.
+///
+/// A wait can outlive many connections. The budget opens at the first
+/// transport failure on a connection generation and covers only that outage:
+/// a failure on a newer generation means an earlier recovery replaced the
+/// connection, so it starts a fresh window instead of inheriting one that may
+/// have expired long ago. Repeated failures on the same generation (for
+/// example, a live connection whose streams keep failing) share one window.
+#[derive(Debug, Default)]
+struct WaitRecoveryWindow {
+    window: Option<(Option<u64>, tokio::time::Instant)>,
+}
+
+impl WaitRecoveryWindow {
+    /// Returns the deadline for recovering from a failure observed on
+    /// `generation` at `failure_time`.
+    fn deadline(
+        &mut self,
+        generation: Option<u64>,
+        failure_time: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        if self
+            .window
+            .is_some_and(|(window_generation, _)| window_generation != generation)
+        {
+            self.window = None;
+        }
+        let (_, deadline) = *self
+            .window
+            .get_or_insert((generation, failure_time + CONNECT_RETRY_TIMEOUT));
+        deadline
+    }
 }
 
 /// Internal raw transport establishment; shared code still authenticates
@@ -159,6 +182,7 @@ impl BoundaryTransport {
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
+        initial_connect_timeout: Duration,
     ) -> Result<BoundaryDuplexStream, BackendError> {
         let connector = match &self.0 {
             TransportSource::Dial => None,
@@ -176,7 +200,7 @@ impl BoundaryTransport {
                 let window = if registration.has_connected() {
                     CONNECT_RETRY_TIMEOUT
                 } else {
-                    ROUTED_FIRST_CONNECT_TIMEOUT
+                    initial_connect_timeout
                 };
                 return tokio::time::timeout(window, registration.accept(&descriptor.tls))
                     .await
@@ -327,6 +351,7 @@ pub struct OpenShellRuntimeBackend {
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    attach_request_timeout: Duration,
     delegated: Option<DelegatedRuntime>,
     resume: Option<ResumeLaunch>,
     takeover: Option<BoundaryTakeover>,
@@ -355,9 +380,11 @@ impl OpenShellRuntimeBackend {
         descriptor: SandboxRuntimeDescriptor,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
         transport: BoundaryTransport,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         let mut client = BoundaryClient::new(descriptor, bearer);
         client.transport = transport;
+        client.attach_request_timeout = attach_request_timeout;
         client.discover_policy().await
     }
 
@@ -371,6 +398,7 @@ impl OpenShellRuntimeBackend {
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
+            attach_request_timeout: ATTACH_REQUEST_TIMEOUT,
             delegated: None,
             resume: None,
             takeover: None,
@@ -411,6 +439,7 @@ impl OpenShellRuntimeBackend {
         descriptor: SandboxRuntimeDescriptor,
         driver_descriptor: Vec<u8>,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         Self::discover_registered_policy_with_resume(
             backend_name,
@@ -418,6 +447,7 @@ impl OpenShellRuntimeBackend {
             driver_descriptor,
             bearer,
             None,
+            attach_request_timeout,
         )
         .await
     }
@@ -429,13 +459,22 @@ impl OpenShellRuntimeBackend {
         driver_descriptor: Vec<u8>,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
         resume: Option<ResumeLaunch>,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         crate::delegated::validate_backend_name(&backend_name)?;
         validate_runtime_coordinates(&descriptor)?;
         let mut client =
             BoundaryClient::with_backend(descriptor, bearer, backend_name, driver_descriptor);
         client.resume = resume;
+        client.attach_request_timeout = attach_request_timeout;
         client.discover_policy().await
+    }
+
+    /// Set the initial attachment and image-policy discovery budget.
+    #[must_use]
+    pub fn with_attach_request_timeout(mut self, timeout: Duration) -> Self {
+        self.attach_request_timeout = timeout;
+        self
     }
 
     /// Use the transport selected for the descriptor this backend will attach.
@@ -505,6 +544,7 @@ impl OpenShellRuntimeBackend {
             descriptor.payload.clone(),
         );
         client.transport = self.transport.clone();
+        client.attach_request_timeout = self.attach_request_timeout;
         client.resume.clone_from(&self.resume);
         if let Some(takeover) = &self.takeover {
             client.supervisor_instance_id = takeover.supervisor_instance_id;
@@ -956,6 +996,12 @@ impl RunningBoundary {
             .call_idempotent(Request::TerminateBoundary)
             .await?;
         expect_response(response, "boundary_terminated")
+    }
+
+    /// Stop waiting for a lost boundary connection to recover. The owner is
+    /// stopping, and the boundary may be stopping with it.
+    pub fn begin_stop(&self) {
+        self.process.client.stopping.store(true, Ordering::Release);
     }
 
     /// Whether the negotiated backend advertised suspend/resume support.
@@ -1584,6 +1630,7 @@ struct BoundaryClient {
     backend_supports_suspend: AtomicBool,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    attach_request_timeout: Duration,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
     mediation: tokio::sync::Mutex<Option<Arc<ClientMediationSession>>>,
     mediation_open: tokio::sync::Mutex<()>,
@@ -1601,6 +1648,9 @@ struct BoundaryClient {
     recovery_timeout_secs: Option<u32>,
     /// True once a connection of this client was confirmed.
     confirmed: tokio::sync::watch::Sender<bool>,
+    /// Set when the owner stops the boundary; a lost connection is then
+    /// reported instead of recovered.
+    stopping: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -1787,6 +1837,7 @@ impl BoundaryClient {
             backend_supports_suspend: AtomicBool::new(false),
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
+            attach_request_timeout: ATTACH_REQUEST_TIMEOUT,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
             mediation_open: tokio::sync::Mutex::new(()),
@@ -1800,6 +1851,7 @@ impl BoundaryClient {
             requires_takeover: false,
             recovery_timeout_secs: None,
             confirmed: tokio::sync::watch::Sender::new(false),
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -1871,7 +1923,7 @@ impl BoundaryClient {
         let remember_attach = matches!(request, Request::Attach { .. });
         let remember_confirm = matches!(request, Request::Confirm);
         let timeout = if remember_attach || matches!(request, Request::DiscoverPolicy) {
-            ATTACH_REQUEST_TIMEOUT
+            self.attach_request_timeout
         } else {
             REQUEST_TIMEOUT
         };
@@ -1928,14 +1980,13 @@ impl BoundaryClient {
         request: Request,
     ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
         let envelope = Self::prepare_request(request)?;
-        let mut recovery_deadline = None;
+        let mut recovery = WaitRecoveryWindow::default();
         loop {
             let generation = self.connection_generation().await;
             match self.open_exchange_envelope(&envelope).await {
                 Ok(response) => return Ok(response),
                 Err(BackendError::Unavailable(message)) if is_transport_unavailable(&message) => {
-                    let deadline =
-                        begin_recovery_window(&mut recovery_deadline, tokio::time::Instant::now());
+                    let deadline = recovery.deadline(generation, tokio::time::Instant::now());
                     if tokio::time::Instant::now() >= deadline {
                         return Err(BackendError::Unavailable(message));
                     }
@@ -2208,6 +2259,11 @@ impl BoundaryClient {
             }
             cached.transport.abort();
         }
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(BackendError::Unavailable(
+                "boundary connection lost while stopping".to_string(),
+            ));
+        }
 
         *self.mediation.lock().await = None;
         let attach = self
@@ -2457,6 +2513,7 @@ impl BoundaryClient {
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
         let runtime_descriptor = self.runtime_descriptor.clone();
         let source = self.transport.clone();
+        let initial_connect_timeout = self.attach_request_timeout;
         let transport = Arc::new(TransportAbort::default());
         let connector_transport = transport.clone();
         let authority = match &runtime_descriptor.transport {
@@ -2490,7 +2547,7 @@ impl BoundaryClient {
                         return Err(AbortableTransport::aborted_error());
                     }
                     source
-                        .connect(&runtime_descriptor)
+                        .connect(&runtime_descriptor, initial_connect_timeout)
                         .await
                         .map(|inner| TokioIo::new(AbortableTransport { inner, abort }))
                         .map_err(|error| std::io::Error::other(error.to_string()))
@@ -2699,13 +2756,14 @@ async fn connect_boundary_using_connector(
                 authority,
                 addresses,
             } => {
-                let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addresses)
-                    .await
-                    .map_err(|error| {
-                        BackendError::Unavailable(format!(
-                            "connect to boundary TLS endpoint {authority}: {error}"
-                        ))
-                    })?;
+                let stream =
+                    openshell_core::net::connect_tcp_nodelay_best_effort(addresses.as_slice())
+                        .await
+                        .map_err(|error| {
+                            BackendError::Unavailable(format!(
+                                "connect to boundary TLS endpoint {authority}: {error}"
+                            ))
+                        })?;
                 enable_boundary_tcp_keepalive(&stream);
                 Box::new(stream)
             }
@@ -3044,6 +3102,7 @@ mod tests {
 
     use crate::isolation_protocol::exchange_frame;
     use rustls::pki_types::PrivateKeyDer;
+    use std::future::{Future as _, poll_fn};
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -3493,6 +3552,7 @@ mod tests {
                 tls_runtime_descriptor(address, client_tls),
                 test_bearer(&"a".repeat(32)),
                 BoundaryTransport::default(),
+                ATTACH_REQUEST_TIMEOUT,
             )
             .await;
             assert!(
@@ -3536,6 +3596,7 @@ mod tests {
                 tls_runtime_descriptor(address, client_tls),
                 test_bearer(&"a".repeat(32)),
                 BoundaryTransport::default(),
+                ATTACH_REQUEST_TIMEOUT,
             )
             .await;
             assert!(
@@ -3559,7 +3620,9 @@ mod tests {
     async fn boundary_tcp_connections_enable_keepalive() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let connected = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+        let connected = tokio::spawn(async move {
+            openshell_core::net::connect_tcp_nodelay_best_effort(address).await
+        });
         let (_server, _) = listener.accept().await.unwrap();
         let client = connected.await.unwrap().unwrap();
 
@@ -3694,6 +3757,10 @@ mod tests {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
                                 message: "a mediation session is already active".to_string(),
                             },
+                            Request::Wait { process_id } if hold_test_wait(&process_id) => {
+                                // Keep the wait in flight until its transport fails.
+                                std::future::pending().await
+                            }
                             Request::Wait { .. } => Response::Exited {
                                 status: ExitStatusWire::Exited(23),
                             },
@@ -3970,16 +4037,196 @@ mod tests {
         assert_eq!(requests.load(Ordering::Acquire), 5);
     }
 
+    #[tokio::test]
+    async fn wait_survives_a_second_transport_loss_after_recovery() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        let server_config = certificate.server_config.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(server_config.clone())
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                server_accepted.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(serve_test_grpc(Box::new(stream), "a".repeat(32)));
+            }
+        });
+        let client = Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(address, certificate.client_tls),
+            test_bearer(&"a".repeat(32)),
+        ));
+        let attach = Request::Attach {
+            supervisor_instance_id: client.supervisor_instance_id,
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
+        };
+        assert!(matches!(
+            client.call_idempotent(attach).await.unwrap(),
+            Response::Attached { .. }
+        ));
+        assert!(matches!(
+            client.call_idempotent(Request::Confirm).await.unwrap(),
+            Response::Confirmed { .. }
+        ));
+        let process = BoundaryProcess {
+            exec: false,
+            adopted: false,
+            client: client.clone(),
+            process_id: HELD_WAIT_PROCESS_ID.to_string(),
+        };
+        let waiting = tokio::spawn(async move { process.wait().await });
+        held_waits_reach(1).await;
+
+        // First outage: the wait reattaches on a replacement connection.
+        abort_current_transport(&client).await;
+        held_waits_reach(2).await;
+        assert_eq!(accepted.load(Ordering::Acquire), 2);
+        assert!(
+            !waiting.is_finished(),
+            "the first transport loss is recovered"
+        );
+
+        // The workload keeps running well past the first outage's recovery
+        // window. Step virtual time so real I/O, such as HTTP/2 keepalive
+        // pings, still completes on the live replacement connection.
+        for _ in 0..=CONNECT_RETRY_TIMEOUT.as_secs() {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::resume();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "the replacement connection stays live"
+        );
+
+        // Second outage on the replacement connection: the boundary is still
+        // reachable, so the wait must reattach again rather than report loss.
+        abort_current_transport(&client).await;
+        let status = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("wait finishes once the boundary answers")
+            .expect("wait task")
+            .expect("a second transport loss must be recovered, not reported as boundary loss");
+        assert_eq!(status, BoundaryExitStatus::Exited(23));
+        assert_eq!(accepted.load(Ordering::Acquire), 3);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_client_reports_a_lost_boundary_without_recovery() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_config = certificate.server_config.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            let service = TestGrpcBoundary {
+                wait_for_half_close: false,
+                expected_token: "a".repeat(32),
+                requests: Arc::default(),
+                mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                mediation_ready: false,
+                provider_environment_generation: 0,
+                confirmation: test_confirmation(),
+                attach_snapshots: Arc::default(),
+                received: Arc::default(),
+            };
+            tonic::transport::Server::builder()
+                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxProtocolServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                    Box::new(stream),
+                ))]))
+                .await
+                .unwrap();
+        });
+        let client = BoundaryClient::new(
+            tls_runtime_descriptor(address, certificate.client_tls),
+            test_bearer(&"a".repeat(32)),
+        );
+        let attach = Request::Attach {
+            supervisor_instance_id: client.supervisor_instance_id,
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
+        };
+        client.call_idempotent(attach).await.unwrap();
+        client.call_idempotent(Request::Confirm).await.unwrap();
+
+        // The boundary stops with its owner: no listener remains to reattach.
+        server.abort();
+        let _ = server.await;
+        client.stopping.store(true, Ordering::Release);
+        client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .expect("cached channel")
+            .transport
+            .abort();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_idempotent(Request::TerminateBoundary),
+        )
+        .await
+        .expect("a stopping client must not wait for the boundary to recover");
+        assert!(matches!(result, Err(BackendError::Unavailable(_))));
+    }
+
     #[test]
     fn wait_recovery_window_begins_at_transport_failure() {
         let wait_started = tokio::time::Instant::now();
         let failure_time = wait_started + CONNECT_RETRY_TIMEOUT + Duration::from_secs(5);
-        let mut deadline = None;
+        let mut recovery = WaitRecoveryWindow::default();
 
         assert_eq!(
-            begin_recovery_window(&mut deadline, failure_time),
+            recovery.deadline(Some(1), failure_time),
             failure_time + CONNECT_RETRY_TIMEOUT
         );
+    }
+
+    #[test]
+    fn wait_recovery_window_is_shared_by_failures_on_one_connection() {
+        let first_failure = tokio::time::Instant::now();
+        let mut recovery = WaitRecoveryWindow::default();
+        let deadline = recovery.deadline(Some(1), first_failure);
+
+        // A live connection whose streams keep failing must not retry forever.
+        assert_eq!(
+            recovery.deadline(Some(1), first_failure + Duration::from_secs(20)),
+            deadline
+        );
+        let late_failure = first_failure + CONNECT_RETRY_TIMEOUT + Duration::from_secs(1);
+        assert!(late_failure >= recovery.deadline(Some(1), late_failure));
+    }
+
+    #[test]
+    fn wait_recovery_window_resets_after_connection_is_replaced() {
+        // A wait loses its connection, recovers onto a new generation, and
+        // runs for far longer than the retry window before losing that
+        // replacement too. The second outage needs its own budget; inheriting
+        // the first window turned it into "boundary lost during wait" without
+        // any reattach attempt.
+        let first_failure = tokio::time::Instant::now();
+        let mut recovery = WaitRecoveryWindow::default();
+        recovery.deadline(Some(1), first_failure);
+
+        let second_failure = first_failure + Duration::from_mins(43);
+        let deadline = recovery.deadline(Some(2), second_failure);
+        assert_eq!(deadline, second_failure + CONNECT_RETRY_TIMEOUT);
+        assert!(second_failure < deadline);
     }
 
     #[tokio::test]
@@ -4160,6 +4407,125 @@ mod tests {
         server_config: Arc<rustls::ServerConfig>,
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn configured_initial_timeout_bounds_attach_and_discovery() {
+        for attach in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let descriptor = tls_runtime_descriptor(
+                listener.local_addr().unwrap(),
+                test_certificate().client_tls,
+            );
+            let mut client = BoundaryClient::new(descriptor, test_bearer(&"a".repeat(32)));
+            client.transport =
+                BoundaryTransport::connector(Arc::new(ReverseTestConnector(listener)));
+            client.attach_request_timeout = Duration::from_secs(2);
+            let request = if attach {
+                Request::Attach {
+                    supervisor_instance_id: client.supervisor_instance_id,
+                    policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+                    supervisor_takeover: None,
+                    supervisor_recovery_timeout_secs: None,
+                }
+            } else {
+                Request::DiscoverPolicy
+            };
+            let mut waiting = Box::pin(client.call_idempotent(request));
+            poll_fn(|context| {
+                assert!(waiting.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let result = poll_fn(|context| {
+                let Poll::Ready(result) = waiting.as_mut().poll(context) else {
+                    panic!("initial request must finish at its configured two-second deadline");
+                };
+                Poll::Ready(result)
+            })
+            .await;
+            assert!(matches!(result, Err(BackendError::Unavailable(message))
+                if message.contains("idempotent control request timed out")));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_routed_bootstrap_wait_preserves_reconnect_window() {
+        let certificate = test_certificate();
+        let mut descriptor =
+            tls_runtime_descriptor("127.0.0.1:1".parse().unwrap(), certificate.client_tls);
+        let router =
+            crate::runtime_routed::RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let route = crate::runtime_routed::new_route_handle();
+        descriptor.transport = SandboxTransport::RuntimeInitiatedRouted {
+            authority: "sandbox.test".to_string(),
+            route: route.clone(),
+        };
+        let registration = router.register(&route, &descriptor.tls).unwrap();
+        let transport = BoundaryTransport::routed(&descriptor, registration.clone()).unwrap();
+        let budget = Duration::from_mins(15);
+        let mut waiting = Box::pin(transport.connect(&descriptor, budget));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_mins(6)).await;
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "configured bootstrap survives the old five-minute ceiling"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // Real socket/TLS progress uses a normal clock; virtual time is only
+        // needed to cross the long bootstrap and recovery deadlines.
+        tokio::time::resume();
+        let address = router.local_addr();
+        let runtime = tokio::spawn(async move {
+            let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                .await
+                .unwrap();
+            stream
+                .write_all(&crate::runtime_routed::encode_route_preface(&route).unwrap())
+                .await
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                .accept(stream)
+                .await
+                .unwrap()
+        });
+        let stream = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(waiting);
+        assert!(registration.has_connected());
+        drop(stream);
+        drop(runtime.await.unwrap());
+
+        tokio::time::pause();
+        let mut reconnect = Box::pin(transport.connect(&descriptor, budget));
+        poll_fn(|context| {
+            assert!(reconnect.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        poll_fn(|context| {
+            assert!(reconnect.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // Resuming real I/O can leave the paused clock between Tokio's 1 ms timer ticks.
+        let result = tokio::time::timeout(Duration::from_millis(1), &mut reconnect)
+            .await
+            .expect("routed reconnect must finish within one timer tick after thirty seconds");
+        assert!(matches!(result, Err(BackendError::Unavailable(message))
+            if message.contains("timed out waiting for the sandbox runtime to connect")));
+    }
+
     fn test_certificate() -> TestCertificate {
         test_certificate_with_protocol_versions(&[&rustls::version::TLS13])
     }
@@ -4227,6 +4593,39 @@ mod tests {
             openshell_core::jwt::CredentialEpoch::new(1).expect("test epoch"),
         )
         .expect("test bearer slot")
+    }
+
+    /// Waits for this process are held open by `TestGrpcBoundary` for the
+    /// first `HELD_WAITS` arrivals, then answered with `Exited(23)`.
+    const HELD_WAIT_PROCESS_ID: &str = "test-generation:held-wait:0";
+    const HELD_WAITS: usize = 2;
+    static HELD_WAIT_ARRIVALS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn hold_test_wait(process_id: &str) -> bool {
+        process_id == HELD_WAIT_PROCESS_ID
+            && HELD_WAIT_ARRIVALS.fetch_add(1, Ordering::AcqRel) < HELD_WAITS
+    }
+
+    async fn held_waits_reach(count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while HELD_WAIT_ARRIVALS.load(Ordering::Acquire) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("held wait reaches the test boundary");
+    }
+
+    async fn abort_current_transport(client: &BoundaryClient) {
+        client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .expect("cached channel")
+            .transport
+            .abort();
     }
 
     async fn spawn_tls_boundary(
@@ -4585,7 +4984,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let connector = Arc::new(ReverseTestConnector(listener));
         let server = tokio::spawn(async move {
-            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                .await
+                .unwrap();
             let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
                 .accept(stream)
                 .await
@@ -4619,7 +5020,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let connector = ReverseTestConnector(listener);
         let server = tokio::spawn(async move {
-            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                .await
+                .unwrap();
             let _ = tokio_rustls::TlsAcceptor::from(server_certificate.server_config)
                 .accept(stream)
                 .await;
@@ -4645,7 +5048,7 @@ mod tests {
         let server_name =
             rustls::pki_types::ServerName::try_from(certificate.client_tls.server_name.clone())
                 .expect("server name");
-        let stream = tokio::net::TcpStream::connect(address)
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
             .await
             .expect("connect to TLS test server");
 

@@ -26,6 +26,16 @@ on:
         required: false
         type: string
         default: ""
+      test-inputs-artifact-name:
+        description: Prebuilt test archives, test workload images, and Helm chart; built here when empty
+        required: false
+        type: string
+        default: ""
+      external-drivers:
+        description: Include the external compute drivers (openshell-driver-<runtime> artifacts) built by this run, for the installers that run a driver as a service
+        required: false
+        type: boolean
+        default: false
     outputs:
       source_sha:
         description: Source revision of the candidate artifacts
@@ -66,6 +76,7 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-nix
+        if: inputs['test-inputs-artifact-name'] == ''
 
       - name: Download CLI artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -80,6 +91,16 @@ jobs:
         with:
           name: openshell-gateway-x86_64-unknown-linux-gnu
           path: artifacts/binaries/x86_64-unknown-linux-gnu
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
+
+      - name: Download external compute driver artifacts
+        if: inputs['external-drivers']
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: openshell-driver-*-x86_64-unknown-linux-gnu
+          merge-multiple: true
+          path: artifacts/external-drivers/x86_64-unknown-linux-gnu
           github-token: ${{ github.token }}
           run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
 
@@ -151,19 +172,31 @@ jobs:
           docker tag "ghcr.io/nvidia/openshell/supervisor:${IMAGE_TAG}" openshell/supervisor:tmachine
           docker save --output artifacts/images/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
 
+      - name: Download test inputs
+        if: inputs['test-inputs-artifact-name'] != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs['test-inputs-artifact-name'] }}
+          path: artifacts
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
+
       - name: Build test archives
+        if: inputs['test-inputs-artifact-name'] == ''
         run: |
           # Retry dependency preparation, then generate artifacts once.
           nix build --no-link .#build-artifacts-test-archives || nix build --no-link .#build-artifacts-test-archives
           nix run .#build-artifacts-test-archives
 
       - name: Build test workload images
+        if: inputs['test-inputs-artifact-name'] == ''
         run: |
           # Retry dependency preparation, then generate artifacts once.
           nix build --no-link .#build-artifacts-test-images || nix build --no-link .#build-artifacts-test-images
           nix run .#build-artifacts-test-images
 
       - name: Package Helm chart
+        if: inputs['test-inputs-artifact-name'] == ''
         run: |
           # Retry dependency preparation, then generate artifacts once.
           nix build --no-link .#build-artifacts-helm || nix build --no-link .#build-artifacts-helm

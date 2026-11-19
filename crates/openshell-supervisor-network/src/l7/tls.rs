@@ -620,7 +620,9 @@ mod tests {
         // policy-allowed, private-CA-signed destination. ---
         let addr = serve_one(acceptor.clone()).await;
         let client_without = build_upstream_client_config("").unwrap();
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let result = tls_connect_upstream(tcp, hostname, &client_without).await;
         assert!(
             result.is_err(),
@@ -633,7 +635,9 @@ mod tests {
         // fix. ---
         let addr = serve_one(acceptor).await;
         let client_with = build_upstream_client_config(&private_ca_pem).unwrap();
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tcp = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let result = tls_connect_upstream(tcp, hostname, &client_with).await;
         assert!(
             result.is_ok(),

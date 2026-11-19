@@ -31,6 +31,7 @@ Recognized gateway reasons include the following.
 | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` | Correct the fields listed in `BadRequest`. |
 | `RESOURCE_VERSION_CONFLICT` | `ABORTED` | Read the resource again and construct a new conditional write. `metadata.recovery` is `REFRESH_STATE`; `current_resource_version` is included when known. |
 | `PROFILE_SOURCE_UNAVAILABLE` | `UNAVAILABLE` | Retry a profile snapshot read after at least the supplied delay. |
+| `DATABASE_UNAVAILABLE` | `UNAVAILABLE` | The gateway could not get a database connection within 5 seconds. Retry after at least the supplied delay. |
 | `MUTATION_LOCK_TIMEOUT` | `UNAVAILABLE` | The request waited more than 10 seconds for a concurrent mutation to release a sandbox, workspace, or gateway-wide lock. Retry after at least the supplied delay. A request that carried a `request_id` leaves its admission unresolved, like any other error, so a retry with that ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe resource state and reconcile effects before you start a new request with a new ID. |
 | `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
 | `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
@@ -133,10 +134,11 @@ duplicates either replay its confirmed success or return
 `REQUEST_OUTCOME_UNCERTAIN`. Disconnecting or cancelling the client does not stop
 admitted work. An error, interrupted process, or failed success-record write
 leaves the admission unresolved. No gateway replica takes over that admission,
-even after restart or after 24 hours. Status codes alone do not prove that the
-attempt had no effects.
+even after restart or after the replay window. Status codes alone do not prove
+that the attempt had no effects.
 
-Successful results have a 24-hour replay window, measured from durable completion.
+Successful results have a replay window, measured from durable completion. It is
+24 hours unless the operator sets `mutation_replay_window_seconds`.
 A successful replay includes `openshell-replayed: true` response metadata and
 does not extend the window. After it expires, the same ID can admit a new
 execution. Do not retry an old operation after that window without reconciling
@@ -182,8 +184,10 @@ Replay rows contain fingerprints, resource references, and explicitly selected
 public diagnostic or scalar outcomes, not credential-bearing response snapshots.
 Completed receipts are limited to 64 KiB. A failure to capture a bounded receipt
 after execution leaves the admission unresolved. Each caller can
-hold at most 1,000 durable admissions. At capacity, the gateway removes expired
-successes; if no space remains, it rejects new admissions with
+hold at most 1,000 durable admissions across all replicas sharing a database,
+unless the operator sets `mutation_admission_limit_per_caller`. Successful
+admissions count until their replay window ends. At capacity, the gateway
+removes expired successes; if no space remains, it rejects new admissions with
 `RESOURCE_EXHAUSTED`. Existing records remain protected. Unresolved records
 require operator investigation; there is no automatic reset or takeover API.
 The gateway also limits detached admission workers to 64 per process and these

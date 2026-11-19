@@ -17,6 +17,10 @@ use tokio::time::{interval, timeout};
 /// # Errors
 ///
 /// Returns an error if the port does not accept a connection within `max_wait`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the e2e workspace does not depend on openshell-core"
+)]
 pub async fn wait_for_port(host: &str, port: u16, max_wait: Duration) -> Result<(), String> {
     let addr = format!("{host}:{port}");
 

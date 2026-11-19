@@ -9,7 +9,7 @@
 use std::io::Write as _;
 
 use keycloak_support::KeycloakContext;
-use testkit::{CliOutput, Context, Error, ResultExt as _};
+use testkit::{CliOutput, Context, ResultExt as _};
 
 const CREDENTIAL_KEY: &str = "KEYCLOAK_ACCESS_TOKEN";
 
@@ -172,11 +172,9 @@ binaries:
     let mut file = tempfile::Builder::new()
         .suffix(".yaml")
         .tempfile()
-        .map_err(|error| Error::from_error(&error))
         .context("create provider profile")?;
     file.write_all(profile.as_bytes())
         .and_then(|()| file.flush())
-        .map_err(|error| Error::from_error(&error))
         .context("write provider profile")?;
     Ok(file)
 }

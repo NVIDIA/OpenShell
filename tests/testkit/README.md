@@ -7,7 +7,7 @@ This is a separate Cargo workspace with its own lockfile:
 
 | Crate | Purpose |
 |---|---|
-| `testkit` | Finds and connects to the gateway, creates and cleans up sandboxes, runs the CLI. Also builds `testkit-ready`. |
+| `testkit` | Finds and connects to the gateway, creates and cleans up sandboxes, runs the CLI, and runs test programs. Also builds `testkit-ready`. |
 | `testkit-macros` | The `#[testkit::test]` attribute. |
 
 ## Writing a test
@@ -63,24 +63,105 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 
 `Context` currently provides:
 
-- `cx.sandbox(suffix)` to build and create a sandbox with a run-unique name.
-  The returned `Sandbox` can wait for ready or finished, stop, start, exec,
-  read its config and draft policy, set a setting, and delete.
+- `cx.sandbox(suffix)` to build a sandbox with a run-unique name
+  (`test-<run-id>-<suffix>`), then
+  `create()` it or `create_ready()` to also wait for Ready. Set its image
+  with `image(..)`, its policy with `policy(..)` and its providers with
+  `providers(..)`. A long-running sandbox is
+  `.command(["sleep", "infinity"])`; add `.image(testkit::python_image())`
+  when a test runs Python clients in it. The returned
+  `Sandbox` can wait for ready or finished, stop, start, exec or
+  `poll_exec` until the output matches, read its config and draft policy, set
+  a setting, read `sandbox get` JSON with `get_json()`, read its policy
+  revisions and active policy with `policy_revisions()` and
+  `active_policy()`, and delete. Its `expect_listed`, `expect_absent` and
+  `wait_absent` check list and get. `run_python(script, args)` runs a script
+  with `python3 -c` and fails unless it exits 0. Exec output has `success()`,
+  `failure()`, `expect_stdout()`, and `last_json()` for the last JSON object
+  or array line of stdout, such as a client script's result.
+- `cx.cli_sandbox(suffix)` for a sandbox only `openshell sandbox create`
+  can make, such as one with `policy_yaml(...)` or `--no-keep`. `create()`
+  detaches and returns the `Sandbox`, `create_ready()` also waits for Ready,
+  and `run()` returns the attached CLI output.
+- Sandbox names are limited to `testkit::MAX_SANDBOX_NAME_LEN` (19)
+  characters, so a sandbox suffix can have at most 5. `cx.sandbox`,
+  `cx.cli_sandbox` and `cx.track` panic on a longer name.
 - `cx.track(name)` to register a sandbox created some other way, such as
   through the CLI, for cleanup. Call it before the
   create, so a create that fails after the gateway accepted it is still cleaned
   up. `cx.adopt(name)` returns a `Sandbox` handle for one the CLI created.
-- `cx.expect_listed` and `cx.expect_absent` to check a sandbox in list and get.
 - `cx.expect_compute_driver(name)` to fail unless the gateway runs only that
   compute driver. Driver suites call it first.
 - `testkit::base_image()` for the image to create sandboxes from or build on:
   `OPENSHELL_TEST_BASE_IMAGE`, or OpenShell's default sandbox image.
+- `testkit::python_image()` for sandboxes that run `python3`, curl, git, or
+  openssl: `OPENSHELL_TEST_PYTHON_IMAGE`, or `openshell/e2e-python:dev`
+  (`e2e/python/Dockerfile.workload`). The tmachine installers load it into
+  every environment; `mise run e2e:workload:build` builds it locally. An
+  override image must run `python3` from one of `testkit::PYTHON_BINARIES`.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
-  `success()`, `failure()`, and `json()` on the output. `cx.cli_handle()`
-  returns that CLI for code that can't borrow `cx`, such as a cleanup hook.
+  the same `success()`, `failure()` and `expect_stdout()` as exec output,
+  plus `json()`, and `report_text()` for matching a wrapped error report.
+  `cx.cli_handle()` returns that CLI for code that can't borrow `cx`, such as
+  a cleanup hook. `cx.cli_find_listed(list, collection, name)` finds an entry
+  in a paginated `--output json` listing, following every page; a listing
+  without `collection` is an error.
+- `cx.cli_spawn([...])` to start the CLI and keep it running, for commands
+  that stream or read input, such as `sandbox connect`. The `CliChild` it
+  returns writes stdin, reads stdout and stderr line by line or all at once,
+  sends signals, and waits for the exit code. `cx.cli_spawn_with_stdin` takes
+  another stdin, such as a file or a pseudo-terminal.
+- `Cli::apply_env` to point another program at the same gateway, such as `ssh`
+  with the `ProxyCommand` from `sandbox ssh-config`. `Cli::gateway` says which
+  gateway that is.
 - `cx.on_cleanup(name, hook)` to remove something when the test ends.
+- `testkit::policy` for sandbox policies: `policy::base()` reads
+  `testkit/src/base-policy.yaml`, which allows no network access, and
+  `policy::allow(&mut policy, name, host, port, binaries)` adds an endpoint
+  (binaries apply to every endpoint under `name`) that `policy::Endpoint`
+  configures (`.rest(Access::Full)`, `.credential_binding(provider)`, ...).
+  Pass the result to `cx.sandbox(..).policy(policy)`, or `policy::to_yaml`
+  for the CLI. `policy::binaries_yaml(binaries)` writes a `binaries:` list
+  into policy YAML a test writes by hand.
+  `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
+- `cx.import_profile(profile)` to import a provider profile and return its
+  `id`, and `cx.create_provider(name, type, credentials)` to create a
+  provider, each with cleanup. `cx.install_provider(name, profile,
+  credentials)` does both.
+- `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
-- `poll_until` for waiting on other state.
+- In `tests/support`: `host-server` starts servers on the machine that runs
+  the tests, which sandboxes reach as `host_server_support::TEST_HOST`, and
+  `sandbox-clients` runs clients in a sandbox: `connect`, `http` and
+  `http_raw` return typed results, and `scripts` holds client scripts for
+  `run_python`.
+- `?` and `.context(..)` on I/O, JSON, YAML, SDK and gRPC results, which
+  convert into `testkit::Error`.
+- `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a
+  request the gateway refused, such as a sandbox create.
+- `poll_until` for waiting on other state, and `with_deadline(what, timeout,
+  future)` for a step that must finish sooner than its own timeout.
+
+## Writing a sandbox client
+
+A test that checks what a sandbox can reach runs its client inside the
+sandbox, because the sandbox policy applies only to processes there. A client
+script:
+
+- uses only Python's standard library, and runs with `sandbox.run_python(script,
+  args)` in a sandbox from `testkit::python_image()`;
+- takes its input as arguments;
+- prints its result as one JSON line, which the test reads with
+  `output.last_json()`. A refused connection or a failed read is a result,
+  not a crash: the script exits non-zero only on a bug;
+- leaves parsing and assertions to Rust.
+
+A script only one test uses can stay beside that test, as a `const` or an
+`include_str!`. Move it to `tests/support/sandbox-clients/scripts/`, with a
+constant in its `scripts` module, once a second test or suite needs it, so no
+suite reads another workspace's files. If its result has a fixed shape, add a
+typed probe there too, like `connect` and `http`. `sandbox-clients` holds
+network clients; put file-system or system-call probes in a sibling crate.
 
 ## Running against a gateway
 
@@ -122,6 +203,67 @@ In a tmachine VM, the test runner (`tests/runner/`) does the same: it sets
 `OPENSHELL_GATEWAY` to the gateway the installer registered and
 `OPENSHELL_BIN` to the installed CLI, then runs the suites with nextest. See
 [TESTING.md](../../TESTING.md).
+
+## Test programs
+
+`#[testkit::test]` also registers the test with testkit. A binary whose
+`main` calls `testkit::main()` runs every registered test it links, without
+cargo or nextest:
+
+```rust
+use conformance as _;
+
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+```
+
+The program must name each suite crate it runs, as `use conformance as _;` does
+above: Rust doesn't link a dependency that is never named, and its tests would
+be missing. A program that links no tests exits 2 with an error under every
+command. `openshell-conformance`, a binary in the conformance crate, is the
+program for the conformance suite; see
+[its README](../suites/conformance/README.md).
+
+| Command | What it does |
+|---|---|
+| `list [FILTER]...` | Prints each test's name and description. Ignored tests are included and marked. |
+| `ready [--timeout SECS]` | Waits for the gateway, like `testkit-ready` (default 60 seconds). Exits 2 if it is not ready in time. |
+| `run [FILTER]...` | Runs the tests one at a time, each in its own process. Unix only. |
+
+A filter selects tests whose name contains it. `run` also takes:
+
+- `--include-ignored`: runs ignored tests too, instead of reporting them as
+  skipped.
+- `--timeout SECS` (default 900): a test that runs longer gets SIGTERM, then
+  SIGKILL after `--grace SECS` (default 10).
+- `--junit PATH`: writes a JUnit report with one test suite per family.
+
+Each test runs in its own process group. When the test's process exits, `run`
+kills anything left in the group, such as CLI processes the test started.
+Interrupting `run` stops the current test the same way and runs no more
+tests; a second interrupt skips the grace period. If `run` itself is killed
+with SIGKILL, the current test's process group keeps running. In a container
+where `run` is PID 1, start it under an init, for example with
+`docker run --init`.
+
+`run` exits 0 when every test passed, 1 when a test failed, timed out, or
+crashed, and 2 when tests could not run: no tests matched, a test process
+could not start or run its test, or the run was interrupted.
+
+A test that is stopped does not clean up: sandboxes it created stay on the
+gateway. Run against a gateway you can throw away, or delete them by hand.
+
+Without a subcommand, the program takes libtest's arguments instead. A
+`[[test]]` target with `harness = false` therefore also runs under `cargo test`
+and nextest. In that mode tests run in one process, one at a time unless
+`--test-threads` says otherwise.
+
+A test's name is its module path without the crate name, then its function
+name, as in nextest. Its family, which groups tests in the JUnit report, is
+the first directory under the last `suites` directory in the crate's path:
+`conformance` for `tests/suites/conformance`, `features` for
+`tests/suites/features/<name>`.
 
 ## Checks
 

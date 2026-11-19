@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshell-e2e-jaeger
+  labels:
+    app.kubernetes.io/name: openshell-e2e-jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openshell-e2e-jaeger
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openshell-e2e-jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: mirror.gcr.io/jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: query
+              containerPort: 16686
+          readinessProbe:
+            httpGet:
+              path: /
+              port: query
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            timeoutSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshell-e2e-jaeger
+  labels:
+    app.kubernetes.io/name: openshell-e2e-jaeger
+spec:
+  selector:
+    app.kubernetes.io/name: openshell-e2e-jaeger
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: query
+      port: 16686
+      targetPort: query
