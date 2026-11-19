@@ -616,7 +616,9 @@ and `https://<workspace>--<sandbox>.<base-domain>/` for the unnamed endpoint.
 The base domain is the first wildcard DNS SAN in `server_sans`; gateways
 without SANs use the built-in `openshell.localhost`.
 
-`enable_gateway_service_routing` defaults to `true`. Set it to `false` to stop publishing
+The core runtime defaults `enable_gateway_service_routing` to `true`; Docker, Podman,
+and VM gateway behavior is unchanged. The Kubernetes Helm chart defaults it to
+`false`. Set it to `false` to stop publishing
 gateway service URLs and reject gateway-mediated application HTTP requests and
 WebSocket upgrades with `404`. Control-plane APIs, service declarations, direct
 supervisor listeners, and discovery remain available. The setting also accepts
@@ -629,6 +631,26 @@ gatewayConfig:
   openshell.gateway:
     enable_gateway_service_routing: false
 ```
+
+For Kubernetes service ingress directly through supervisors, set
+`[openshell.supervisor.app_listener].enabled = true` and configure the
+[supervisor application listener](#supervisor-application-listener). Pair it with
+an ingress solution, such as a TLS-passthrough proxy or a compatible Kubernetes
+ingress/Gateway API integration, that consumes discovery and routes each
+advertised hostname to the current owning supervisor's app-listener IP and port.
+Preserve the application hostname as Host and TLS SNI. Enabling the listener
+alone does not provision DNS or external ingress routes; the chart does not
+enable either the listener or the ingress integration automatically.
+
+If both routing modes are disabled, startup logs warn that sandbox service
+routing is disabled. Gateway-mediated forwarding does not require the app
+listener.
+
+When upgrading a Helm installation that uses gateway service URLs, explicitly
+set `enable_gateway_service_routing: true` in the canonical table above before the
+upgrade. Missing saved values receive the chart's `false` default; explicit
+`true` values remain enabled. This changes application forwarding only, not
+control-plane API access or the service-authentication default.
 
 With gateway routing disabled, `gateway_url` is empty and `gateway_service_urls`
 is empty. A configured application origin supplies the preferred URL; without
