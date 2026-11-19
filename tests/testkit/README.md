@@ -261,6 +261,13 @@ and nextest. In that mode tests run in one process, one at a time unless
 
 ### Unsupported tests
 
+The list is an environment variable, not a `--skip` flag, because `--skip`
+already means "leave out tests whose names match" to libtest and nextest, which
+would read an entry as a filter that matches nothing and run the test anyway.
+A flag also can't reach a program that nextest starts, since nextest writes
+the command line itself. An environment variable reaches every test process
+under every runner.
+
 An environment that cannot pass a test yet lists it in
 `OPENSHELL_TEST_UNSUPPORTED`, instead of putting `#[ignore]` on the test, which
 turns it off everywhere. The value is `<test>=<issue>` entries separated by
@@ -279,10 +286,12 @@ unsupported test with its issue, and its JUnit report marks it `skipped` with
 an `unsupported` property. `run` passes the variable on to its test processes.
 
 A program applies only the entries for crates it links and ignores the rest, so
-one value can serve several programs. For those entries, the program exits 2
-before it lists or runs anything if an entry names no test, names one twice,
-names an `#[ignore]`d test, has an issue that is not an `https://` URL, or has
-no `=`. A malformed entry exits 2 in every program. Forcing an unsupported test
+one value can serve several programs. A misspelled crate name is therefore
+ignored too. For the entries it applies, the program exits 2 before it lists or
+runs anything if an entry names no test, names one twice, names an
+`#[ignore]`d test, has an issue that is not an `https://` URL, or has no `=`. A
+malformed entry exits 2 in every program. Under nextest a bad entry fails the
+listing, so nextest exits 104 instead of 2. Forcing an unsupported test
 to run (`--include-ignored`, `--ignored`, nextest's `--run-ignored`, or
 `run --include-ignored`) fails it with `unsupported: <issue>; remove the entry
 from OPENSHELL_TEST_UNSUPPORTED to run it`.
