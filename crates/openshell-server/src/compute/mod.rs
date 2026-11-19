@@ -14144,7 +14144,7 @@ mod tests {
             }
             tokio::time::timeout(
                 Duration::from_secs(1),
-                observer.reconcile_snapshot_sandbox(polled, i64::MAX),
+                observer.reconcile_snapshot_sandbox(polled.clone(), i64::MAX),
             )
             .await
             .expect("reconciliation must not wait for the start")
@@ -14164,6 +14164,28 @@ mod tests {
 
             driver.release_start();
             start.await.unwrap().unwrap();
+
+            // Once the start settles, a genuine exit of the restarted
+            // workload still surfaces through the sweep.
+            observer
+                .reconcile_snapshot_sandbox(polled, i64::MAX)
+                .await
+                .unwrap();
+            let settled = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !provisioning_deadline::driver_operation_pending(&settled),
+                "other_replica={other_replica}"
+            );
+            assert_eq!(
+                settled.phase(),
+                SandboxPhase::Error as i32,
+                "other_replica={other_replica}"
+            );
         }
     }
 
