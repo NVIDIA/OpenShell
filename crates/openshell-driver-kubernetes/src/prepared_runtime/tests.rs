@@ -232,8 +232,18 @@ async fn preparation_recovers_public_identity_without_reading_secrets() {
         .await
         .unwrap();
     assert_eq!(first, recovered);
+    let state = state.lock().unwrap();
+    let keys = state.secret.as_ref().unwrap().data.as_ref().unwrap();
+    assert_eq!(keys.len(), 3);
+    for key in [
+        BOUNDARY_CONFIG_KEY,
+        BOUNDARY_CERTIFICATE_KEY,
+        BOUNDARY_PRIVATE_KEY,
+    ] {
+        assert!(keys.contains_key(key));
+    }
     assert_eq!(
-        state.lock().unwrap().events,
+        state.events,
         ["create", "other-bootstrap-writes", "prepare"]
     );
 }

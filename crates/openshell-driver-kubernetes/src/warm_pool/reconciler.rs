@@ -233,6 +233,19 @@ impl KubernetesComputeDriver {
         &self,
         pool: &WarmPoolConfig,
     ) -> Result<WarmPoolReport, KubernetesDriverError> {
+        let claims = self
+            .warm_supervision()?
+            .pool_claim_inventory(&pool.workspace, &pool.name, None)
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        self.reconcile_warm_pool_with_claims(pool, claims).await
+    }
+
+    async fn reconcile_warm_pool_with_claims(
+        &self,
+        pool: &WarmPoolConfig,
+        claims: openshell_supervisor_control::WarmClaimInventory,
+    ) -> Result<WarmPoolReport, KubernetesDriverError> {
         self.check_warm_runtime_support()?;
         pool.validate()
             .map_err(KubernetesDriverError::Precondition)?;
@@ -253,9 +266,14 @@ impl KubernetesComputeDriver {
                 "warm pool has a newer revision; this replica cannot change it",
             ));
         }
-        if snapshot.is_none()
-            && pool.target_size > 0
+        if pool.target_size > 0
             && self.config.workspace_mode == WorkspaceMode::Managed
+            && (snapshot.is_none()
+                || Api::<Namespace>::all(self.client.clone())
+                    .get_opt(&managed_namespace(&self.config.gateway_id, &pool.workspace))
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?
+                    .is_none())
         {
             self.ensure_namespace(&pool.workspace).await?;
         }
@@ -272,10 +290,10 @@ impl KubernetesComputeDriver {
             Err(error) => Err(invalid(&error.to_string())),
         };
         let mut inventory = self
-            .list_warm_runtime_inventory(&pool.workspace, Some(&pool.name))
+            .list_warm_runtime_inventory(&pool.workspace, Some(&pool.name), false)
             .await?;
         let recovering = self
-            .recover_pending_warm_claims(&pool.workspace, &pool.name, &mut inventory)
+            .recover_pending_warm_claims(&pool.workspace, &pool.name, &mut inventory, claims)
             .await?;
         let inventory: Vec<_> = inventory
             .into_iter()
@@ -536,9 +554,9 @@ impl KubernetesComputeDriver {
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
-        if self.check_warm_runtime_support().is_err() {
+        let Ok(supervision) = self.warm_supervision().cloned() else {
             return;
-        }
+        };
         let driver = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(INTERVAL);
@@ -554,10 +572,22 @@ impl KubernetesComputeDriver {
                             Ok(pools) => pools,
                             Err(error) => { warn!(%error, "warm template inventory unavailable"); continue; }
                         };
+                        if pools.is_empty() { continue; }
+                        let scopes = pools.iter().map(|p| (p.workspace.clone(), p.name.clone())).collect();
+                        let mut inventories = match supervision.pending_warm_claims(scopes, None).await {
+                            Ok(inventories) => inventories,
+                            Err(error) => { warn!(%error, "warm claim inventory unavailable"); continue; }
+                        };
                         let jobs = pools.into_iter().map(|pool| {
                             let driver = driver.clone();
+                            let claims = inventories.remove(&(pool.workspace.clone(), pool.name.clone()));
                             async move {
-                                if let Err(error) = driver.reconcile_warm_pool(&pool).await {
+                                let result = match claims {
+                                    Some(Ok(claims)) => driver.reconcile_warm_pool_with_claims(&pool, claims).await,
+                                    Some(Err(error)) => Err(KubernetesDriverError::Message(error)),
+                                    None => Err(invalid("missing warm claim inventory")),
+                                };
+                                if let Err(error) = result {
                                     warn!(workspace = %pool.workspace, pool = %pool.name, %error, "warm pool reconciliation deferred");
                                 }
                             }

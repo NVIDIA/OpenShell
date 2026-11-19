@@ -5,7 +5,8 @@ use super::*;
 use http_body_util::BodyExt;
 use openshell_supervisor_control::{
     ActivationRequest, InstancePlacement, PlacementFuture, PlacementRequest, PreparationRelease,
-    PreparationRequest, PreparationRevision, PreparedRuntime, proto::SandboxInstanceAssignment,
+    PreparationRequest, PreparationRevision, PreparedRuntime, WarmClaimInventory,
+    proto::SandboxInstanceAssignment,
 };
 use serde_json::{Value, json};
 use std::sync::Mutex;
@@ -93,11 +94,11 @@ impl InstancePlacement for Placement {
 
     fn pending_warm_claims(
         &self,
-        _: String,
-        _: String,
-    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
+        pools: Vec<(String, String)>,
+        _: Option<String>,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventories> {
         let state = self.0.lock().unwrap();
-        let inventory = openshell_supervisor_control::WarmClaimInventory {
+        let inventory = WarmClaimInventory {
             pending: state
                 .claims
                 .iter()
@@ -116,7 +117,12 @@ impl InstancePlacement for Placement {
                 .collect(),
             retired: state.retired.values().cloned().collect(),
         };
-        Box::pin(async move { Ok(inventory) })
+        Box::pin(async move {
+            Ok(pools
+                .into_iter()
+                .map(|scope| (scope, Ok(inventory.clone())))
+                .collect())
+        })
     }
 
     fn cancel_warm_claim(&self, workspace: String, route: String) -> PlacementFuture<bool> {
@@ -545,7 +551,8 @@ fn fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
                 .unwrap_or_default()
                 .replace("%3D", "=")
                 .replace("%2C", ",")
-                .replace("%2F", "/");
+                .replace("%2F", "/")
+                .replace("%21", "!");
             let bytes = request.into_body().collect().await.unwrap().to_bytes();
             let body = if bytes.is_empty() {
                 Value::Null
@@ -592,7 +599,9 @@ fn fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
                 }
                 http::Method::GET => {
                     if path == SANDBOXES
-                        && selector.split(',').any(|clause| clause == POOL_LABEL)
+                        && selector
+                            .split(',')
+                            .any(|clause| clause.split('=').next() == Some(POOL_LABEL))
                         && let Some(code) = state.fail_pool_inventory
                     {
                         return Ok::<_, std::convert::Infallible>(error(code));
@@ -612,6 +621,9 @@ fn fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
                                     |clause| match clause.split_once('=') {
                                         Some((key, expected)) => {
                                             value["metadata"]["labels"][key] == expected
+                                        }
+                                        None if clause.starts_with('!') => {
+                                            value["metadata"]["labels"].get(&clause[1..]).is_none()
                                         }
                                         None => value["metadata"]["labels"].get(clause).is_some(),
                                     },
@@ -784,11 +796,16 @@ struct ApiTestPlacement {
 impl InstancePlacement for ApiTestPlacement {
     fn pending_warm_claims(
         &self,
-        _: String,
-        _: String,
-    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
+        pools: Vec<(String, String)>,
+        _: Option<String>,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventories> {
         // This fixture exercises physical preparations only; it never claims.
-        Box::pin(async { Ok(openshell_supervisor_control::WarmClaimInventory::default()) })
+        Box::pin(async move {
+            Ok(pools
+                .into_iter()
+                .map(|scope| (scope, Ok(WarmClaimInventory::default())))
+                .collect())
+        })
     }
 
     fn runtime_assignment(
@@ -1529,6 +1546,45 @@ async fn ambiguous_claim_failure_never_selects_another_spare() {
 }
 
 #[tokio::test]
+async fn claim_ignores_invalid_records_outside_its_unclaimed_pool_and_skips_provisioning() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let (driver, request, prepared) = Box::pin(ready_pool(state.clone(), 1)).await;
+    {
+        let mut state = state.lock().unwrap();
+        let original = state.objects[&format!("{SANDBOXES}/{}", prepared[0].resource.name)].clone();
+        let mut unrelated = original.clone();
+        unrelated["metadata"]["labels"][POOL_LABEL] = json!("another-pool");
+        unrelated["metadata"]["annotations"][RECORD] = json!("invalid");
+        state
+            .objects
+            .insert(format!("{SANDBOXES}/unrelated"), unrelated);
+        let mut claimed = original;
+        claimed["metadata"]["labels"][LABEL_SANDBOX_ID] = json!("previous-sandbox");
+        claimed["metadata"]["annotations"][RECORD] = json!("invalid");
+        state
+            .objects
+            .insert(format!("{SANDBOXES}/already-claimed"), claimed);
+        state.events.clear();
+    }
+    let sandbox = claiming_sandbox(&request, "logical-create");
+    assert!(
+        driver
+            .try_claim_warm_runtime(&sandbox, "openshell")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| !event.starts_with("POST "))
+    );
+}
+
+#[tokio::test]
 async fn changed_control_policy_version_retires_the_spare_before_launch_selection_continues() {
     for ready in [1, 2] {
         let state = Arc::new(Mutex::new(State::default()));
@@ -1816,6 +1872,12 @@ async fn recovery_cancels_a_missing_pod_then_collects_the_reserved_cr() {
                 &request.workspace,
                 &request.pool_id,
                 &mut [prepared.resource.clone()],
+                driver
+                    .warm_supervision()
+                    .unwrap()
+                    .pool_claim_inventory(&request.workspace, &request.pool_id, None)
+                    .await
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -2064,7 +2126,19 @@ async fn creates_a_unique_gated_runtime_and_reserves_before_releasing() {
         .unwrap();
     let bootstrap = &state.objects[secret_path];
     assert_eq!(bootstrap["immutable"], true);
-    assert_eq!(bootstrap["data"].as_object().unwrap().len(), 4);
+    assert_eq!(
+        bootstrap["data"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            crate::sandbox_runtime::BOUNDARY_CONFIG_KEY,
+            crate::sandbox_runtime::BOUNDARY_CERTIFICATE_KEY,
+            crate::sandbox_runtime::BOUNDARY_PRIVATE_KEY,
+        ])
+    );
     assert_eq!(
         bootstrap["metadata"]["ownerReferences"][0]["uid"],
         "workload-pod-uid"

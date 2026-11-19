@@ -3087,21 +3087,29 @@ impl KubernetesComputeDriver {
         namespace: &str,
         names: &SandboxRuntimeNames,
     ) -> Result<(), KubernetesDriverError> {
-        let fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
-        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        for (mut policy, component) in [
-            (fence.workload_policy, "sandbox-workload-fence"),
-            (fence.supervisor_policy, "sandbox-supervisor-egress"),
-        ] {
-            let labels = policy.metadata.labels.get_or_insert_default();
-            labels.insert(
-                LABEL_MANAGED_BY.to_string(),
-                LABEL_MANAGED_BY_VALUE.to_string(),
-            );
-            labels.insert("openshell.ai/component".to_string(), component.to_string());
+        let policies = Api::namespaced(self.client.clone(), namespace);
+        for policy in self.sandbox_runtime_fences(namespace, names) {
             create_or_validate_sandbox_runtime_fence(&policies, &policy).await?;
         }
         Ok(())
+    }
+
+    fn sandbox_runtime_fences(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+    ) -> [NetworkPolicy; 2] {
+        let fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
+        [
+            (fence.workload_policy, "sandbox-workload-fence"),
+            (fence.supervisor_policy, "sandbox-supervisor-egress"),
+        ]
+        .map(|(mut policy, component)| {
+            let labels = policy.metadata.labels.get_or_insert_default();
+            labels.insert(LABEL_MANAGED_BY.into(), LABEL_MANAGED_BY_VALUE.into());
+            labels.insert("openshell.ai/component".into(), component.into());
+            policy
+        })
     }
 
     /// Create or validate the gateway-owned destination-trust generation for
@@ -5282,15 +5290,25 @@ impl KubernetesComputeDriver {
                 }
             }
             if sandbox_runtime_bootstrap_in_progress(&object) {
-                if generation_control_availability(
-                    &self.client,
-                    self.shared_supervisor.as_ref(),
-                    namespace,
-                    &sandbox_id,
-                    &object,
-                )
-                .await
-                    == SandboxRuntimeControlAvailability::Available
+                // A dedicated spare already passes the Pod readiness probe before delivery.
+                // Wait for the claimed generation's authenticated supervision session.
+                let started = match self.dedicated_bootstrap_started(&object, &sandbox_id).await {
+                    Ok(started) => started,
+                    Err(error) => {
+                        warn!(%sandbox_id, %error, "could not check warm supervisor session");
+                        continue;
+                    }
+                };
+                if started
+                    && generation_control_availability(
+                        &self.client,
+                        self.shared_supervisor.as_ref(),
+                        namespace,
+                        &sandbox_id,
+                        &object,
+                    )
+                    .await
+                        == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
                     self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)

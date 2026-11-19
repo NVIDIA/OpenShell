@@ -190,30 +190,65 @@ impl SupervisorPool {
     /// are cancelled with the same assignment/Sandbox CAS as activation.
     pub(super) async fn pending_warm_claims(
         &self,
-        workspace: &str,
-        pool_id: &str,
-    ) -> Result<WarmClaimInventory, String> {
-        if workspace.is_empty() {
-            return Err("pending claims require a workspace".into());
+        pools: Vec<(String, String)>,
+        route: Option<String>,
+    ) -> Result<openshell_supervisor_control::WarmClaimInventories, String> {
+        let mut grouped: BTreeMap<_, Vec<_>> =
+            pools.into_iter().map(|scope| (scope, Vec::new())).collect();
+        if grouped.is_empty() {
+            return Ok(BTreeMap::new());
         }
-        let mut inventory = WarmClaimInventory::default();
-        for record in self
-            .all_assignments()
-            .await
-            .map_err(|e| e.to_string())?
-            .values()
-        {
-            if record.payload.workspace != workspace
-                || record
-                    .payload
-                    .pool_id
-                    .as_deref()
-                    .is_some_and(|id| id != pool_id)
-                || record.payload.dedicated != self.dedicated
-                || !record.payload.prepared
+        let records = if let Some(route) = route {
+            self.assignment(&route)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect()
+        } else {
+            self.all_assignments()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_values()
+                .collect::<Vec<_>>()
+        };
+        for record in &records {
+            let payload = &record.payload;
+            if !payload.prepared
+                || payload.dedicated != self.dedicated
+                || !(payload.phase == RecordPhase::Retired
+                    || (payload.phase == RecordPhase::Published
+                        && !payload.claim_handle.is_empty()))
             {
                 continue;
             }
+            if let Some(id) = &payload.pool_id {
+                if let Some(group) = grouped.get_mut(&(payload.workspace.clone(), id.clone())) {
+                    group.push(record);
+                }
+            } else {
+                // Older assignments lack a pool id. Keep their workspace recovery coverage.
+                for ((workspace, _), group) in &mut grouped {
+                    if workspace == &payload.workspace {
+                        group.push(record);
+                    }
+                }
+            }
+        }
+        let mut inventories = BTreeMap::new();
+        for (scope, records) in grouped {
+            let result = self.resolve_pending_warm_claims(&scope.0, records).await;
+            inventories.insert(scope, result);
+        }
+        Ok(inventories)
+    }
+
+    async fn resolve_pending_warm_claims(
+        &self,
+        workspace: &str,
+        records: Vec<&AssignmentRecord>,
+    ) -> Result<WarmClaimInventory, String> {
+        let mut inventory = WarmClaimInventory::default();
+        for record in records {
             let retirement = PreparationRetirement {
                 workspace: workspace.into(),
                 route: record.payload.route.clone(),
@@ -228,11 +263,6 @@ impl SupervisorPool {
             };
             if record.payload.phase == RecordPhase::Retired {
                 inventory.retired.push(retirement);
-                continue;
-            }
-            if record.payload.phase != RecordPhase::Published
-                || record.payload.claim_handle.is_empty()
-            {
                 continue;
             }
             let bytes = self.load_material(&claim_material(&record.payload)).await?;
@@ -333,7 +363,8 @@ impl SupervisorPool {
             {
                 let mut sandbox =
                     Sandbox::decode(row.payload.as_slice()).map_err(|e| e.to_string())?;
-                if only_abandoned && claim_is_current(&sandbox, workspace, &intent)? {
+                let current_launch = claim_is_current(&sandbox, workspace, &intent)?;
+                if only_abandoned && current_launch {
                     return Ok(false);
                 }
                 if let Some(mut link) = read_claim_link(&sandbox)?
@@ -342,6 +373,21 @@ impl SupervisorPool {
                     && link.generation == intent.expected_generation
                     && link.auth_epoch == intent.expected_auth_epoch
                 {
+                    if link.decision == LaunchDecision::Warm
+                        && let Some(operation) = sandbox
+                            .status
+                            .as_mut()
+                            .and_then(|s| s.provisioning.as_mut())
+                        && operation.driver_operation_pending
+                        && !operation.driver_operation_id.is_empty()
+                        && record.payload.claim_operation_id.as_deref()
+                            == Some(&operation.driver_operation_id)
+                    {
+                        operation.driver_operation_pending = false;
+                        if current_launch {
+                            crate::compute::record_warm_create_failure(&mut sandbox);
+                        }
+                    }
                     link.decision = LaunchDecision::Cancelled;
                     write_claim_link(&mut sandbox, &link)?;
                 }
@@ -692,8 +738,11 @@ impl SupervisorPool {
                 records.push(record);
             }
         }
-        let owners = self.owners().await.map_err(|e| e.to_string())?;
-        let members = self.live_members().await.map_err(|e| e.to_string())?;
+        let (owners, members) = if self.dedicated {
+            Default::default()
+        } else {
+            tokio::try_join!(self.owners(), self.live_members()).map_err(|e| e.to_string())?
+        };
         let mut runtimes = Vec::new();
         for record in records.iter().filter(|record| {
             record.payload.prepared

@@ -341,13 +341,15 @@ impl KubernetesComputeDriver {
         &self,
         workspace: &str,
     ) -> Result<Vec<WarmRuntimeResource>, KubernetesDriverError> {
-        self.list_warm_runtime_inventory(workspace, None).await
+        self.list_warm_runtime_inventory(workspace, None, false)
+            .await
     }
 
     async fn list_warm_runtime_inventory(
         &self,
         workspace: &str,
         pool_id: Option<&str>,
+        unclaimed_only: bool,
     ) -> Result<Vec<WarmRuntimeResource>, KubernetesDriverError> {
         self.check_warm_runtime_support()?;
         let namespace = self.warm_runtime_namespace(workspace).await?;
@@ -357,10 +359,14 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Message)?;
         let pool_selector =
             pool_id.map_or_else(|| POOL_LABEL.to_string(), |id| format!("{POOL_LABEL}={id}"));
-        let selector = format!(
+        let mut selector = format!(
             "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_GATEWAY_ID}={},{}={workspace},{pool_selector}",
             self.config.gateway_id, LABEL_SANDBOX_WORKSPACE
         );
+        if unclaimed_only {
+            selector.push_str(",!");
+            selector.push_str(LABEL_SANDBOX_ID);
+        }
         let objects = api
             .api
             .list(&ListParams::default().labels(&selector))
@@ -415,7 +421,7 @@ impl KubernetesComputeDriver {
         if annotation_or_label(&object, LABEL_SANDBOX_ID).is_some()
             && !self
                 .warm_supervision()?
-                .pending_warm_claims(&record.workspace, &record.pool_id)
+                .pool_claim_inventory(&record.workspace, &record.pool_id, Some(record.route()))
                 .await
                 .map_err(KubernetesDriverError::Message)?
                 .retired

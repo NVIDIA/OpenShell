@@ -32,28 +32,13 @@ impl KubernetesComputeDriver {
             })
         } else {
             let staged = self.read_staged_bootstrap_material().await?;
-            let network_ca = self.network_trust_bundle.as_ref().map(|bundle| {
-                (
-                    network_additional_ca_config_map_name(&self.config.gateway_id, bundle.digest()),
-                    bundle.digest(),
-                )
-            });
-            let pod = self.render_sandbox_runtime_supervisor(
+            let pod = self.render_warm_supervisor(
                 &namespace,
                 &names,
                 physical_id,
-                "",
+                (uid, gid),
                 OwnerReference::default(),
-                uid,
-                gid,
-                &openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(None)
-                    .map_err(record_error)?,
-                "info",
                 staged.upstream_proxy_ca_bundle.is_some(),
-                true,
-                network_ca
-                    .as_ref()
-                    .map(|(name, digest)| (name.as_str(), *digest)),
             )?;
             serde_json::json!({
                 "dedicated": pod.spec,

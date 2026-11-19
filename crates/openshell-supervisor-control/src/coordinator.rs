@@ -221,6 +221,9 @@ pub struct WarmClaimInventory {
     pub retired: Vec<PreparationRetirement>,
 }
 
+/// Recovery results by (workspace, pool). An unreadable claim only stalls its pool.
+pub type WarmClaimInventories = BTreeMap<(String, String), Result<WarmClaimInventory, String>>;
+
 /// The gateway's durable records of a supervisor pool's instances.
 ///
 /// Installed by the gateway before instances launch, they make the pool's
@@ -251,10 +254,18 @@ pub trait InstancePlacement: Send + Sync + std::fmt::Debug {
 
     fn pending_warm_claims(
         &self,
-        _workspace: String,
-        _pool_id: String,
-    ) -> PlacementFuture<WarmClaimInventory> {
+        _pools: Vec<(String, String)>,
+        _route: Option<String>,
+    ) -> PlacementFuture<WarmClaimInventories> {
         Box::pin(async { Err("pending warm claim inventory is not supported".into()) })
+    }
+
+    fn dedicated_claim_started(
+        &self,
+        _sandbox_id: String,
+        _session: openshell_core::SandboxSessionId,
+    ) -> PlacementFuture<bool> {
+        Box::pin(async { Err("dedicated warm claim readiness is not supported".into()) })
     }
 
     /// Cancel an unactivated reservation. False means activation already won.
@@ -513,13 +524,38 @@ impl SharedSupervision {
 
     pub async fn pending_warm_claims(
         &self,
-        workspace: &str,
-        pool_id: &str,
-    ) -> Result<WarmClaimInventory, String> {
+        pools: Vec<(String, String)>,
+        route: Option<String>,
+    ) -> Result<WarmClaimInventories, String> {
         self.controller
             .placement()
             .ok_or("supervisor pool is not ready")?
-            .pending_warm_claims(workspace.into(), pool_id.into())
+            .pending_warm_claims(pools, route)
+            .await
+    }
+
+    pub async fn pool_claim_inventory(
+        &self,
+        workspace: &str,
+        pool: &str,
+        route: Option<String>,
+    ) -> Result<WarmClaimInventory, String> {
+        let scope = (workspace.to_owned(), pool.to_owned());
+        self.pending_warm_claims(vec![scope.clone()], route)
+            .await?
+            .remove(&scope)
+            .ok_or("missing warm claim inventory")?
+    }
+
+    pub async fn dedicated_claim_started(
+        &self,
+        sandbox_id: &str,
+        session: openshell_core::SandboxSessionId,
+    ) -> Result<bool, String> {
+        self.controller
+            .placement()
+            .ok_or("supervisor pool is not ready")?
+            .dedicated_claim_started(sandbox_id.into(), session)
             .await
     }
 

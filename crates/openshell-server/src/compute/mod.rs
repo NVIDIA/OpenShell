@@ -1856,18 +1856,7 @@ impl ComputeRuntime {
             Err(ProvisioningOperationError::Driver { status, settled }) => {
                 // A warm activation may have committed before the driver's response
                 // was lost. Settlement has already checked this operation and launch.
-                if !sandbox_compute_runtime_identity(&settled).is_empty()
-                    && settled
-                        .metadata
-                        .as_ref()
-                        .and_then(|meta| {
-                            crate::auth::sandbox_session::PersistedSandboxIdentity::read(
-                                &meta.annotations,
-                            )
-                            .ok()
-                        })
-                        .is_some_and(|identity| identity.prepared_runtime.is_some())
-                {
+                if committed_warm_binding(&settled).is_some() {
                     provisioning_operation::ensure_current_result(&settled, &settled)?;
                     return Ok(*settled);
                 }
@@ -1901,13 +1890,18 @@ impl ComputeRuntime {
             ));
         }
         let runtime_identity = response.into_inner().runtime_identity;
-        if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
+        if let Some(committed) = committed_warm_binding(&sandbox) {
+            if committed != runtime_identity {
+                return Err(Status::internal(
+                    "driver response differs from the committed warm runtime",
+                ));
+            }
+        } else if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
             let status = Status::internal("compute driver did not return a runtime identity");
             return Err(self
                 .compensate_failed_create(&sandbox, lifecycle_guard, Some(sandbox_guard), status)
                 .await);
-        }
-        if self.supports_sandbox_authentication() {
+        } else if self.supports_sandbox_authentication() {
             let persisted = self
                 .persist_runtime_binding(
                     &sandbox_id,
@@ -7671,6 +7665,18 @@ fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
         .map_or(0, |metadata| metadata.resource_version)
 }
 
+/// Warm activation settles CREATE and binds compute in the same transaction.
+fn committed_warm_binding(sandbox: &Sandbox) -> Option<&str> {
+    let annotations = &sandbox.metadata.as_ref()?.annotations;
+    crate::auth::sandbox_session::PersistedSandboxIdentity::read(annotations)
+        .ok()?
+        .prepared_runtime?;
+    annotations
+        .get(COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+        .map(String::as_str)
+        .filter(|identity| !identity.is_empty())
+}
+
 fn sandbox_compute_runtime_identity(sandbox: &Sandbox) -> String {
     sandbox
         .metadata
@@ -8193,6 +8199,20 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>) {
             reason: "DependenciesNotReady".to_string(),
             message: "Supervisor session disconnected".to_string(),
             transition_time: None,
+        },
+    );
+}
+
+pub fn record_warm_create_failure(sandbox: &mut Sandbox) {
+    sandbox.set_phase(SandboxPhase::Error as i32);
+    upsert_ready_condition(
+        &mut sandbox.status,
+        SandboxCondition {
+            r#type: "Ready".into(),
+            status: "False".into(),
+            reason: "WarmClaimCancelled".into(),
+            message: "The reserved warm runtime was lost before activation".into(),
+            ..Default::default()
         },
     );
 }

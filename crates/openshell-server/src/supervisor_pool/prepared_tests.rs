@@ -1237,6 +1237,38 @@ async fn dedicated_registration_is_pending_until_commit_and_recovers_the_same_la
             .unwrap(),
         canonical.launch_material
     );
+    let placement = PoolPlacement(pool.clone());
+    let session = prepared.registration.runtime_descriptor.session_id;
+    assert!(
+        !placement
+            .dedicated_claim_started("sandbox-a".into(), session)
+            .await
+            .unwrap()
+    );
+    let mut sandbox = pool
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    sandbox.status.as_mut().unwrap().configuration_admission =
+        Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: "connected-instance".into(),
+            ..Default::default()
+        });
+    pool.store.put_message(&sandbox).await.unwrap();
+    assert!(
+        placement
+            .dedicated_claim_started("sandbox-a".into(), session)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !placement
+            .dedicated_claim_started("sandbox-a".into(), openshell_core::SandboxSessionId::new())
+            .await
+            .unwrap()
+    );
     // A failed identity read must leave the committed launch available for retry.
     let saved = pool
         .store
@@ -1445,10 +1477,15 @@ async fn committed_intent_owns_the_preparation_before_infrastructure_binding() {
             .unwrap(),
         PreparationRelease::Changed
     );
-    let recovered = restarted
-        .pending_warm_claims("default", "test-pool")
+    let scope = (prepared.workspace.clone(), prepared.pool_id.clone());
+    let other_scope = (prepared.workspace.clone(), "other-pool".into());
+    let mut inventories = restarted
+        .pending_warm_claims(vec![scope.clone(), other_scope.clone()], None)
         .await
         .unwrap();
+    let other = inventories.remove(&other_scope).unwrap().unwrap();
+    assert!(other.pending.is_empty() && other.retired.is_empty());
+    let recovered = inventories.remove(&scope).unwrap().unwrap();
     assert_eq!(recovered.pending.len(), 1);
     assert!(recovered.retired.is_empty());
     assert_eq!(
@@ -1630,8 +1667,11 @@ async fn cancellation_fences_staged_activation_and_preserves_a_terminal_launch_d
             .is_err()
     );
     let inventory = other
-        .pending_warm_claims("default", "test-pool")
+        .pending_warm_claims(vec![("default".into(), "test-pool".into())], None)
         .await
+        .unwrap()
+        .remove(&("default".into(), "test-pool".into()))
+        .unwrap()
         .unwrap();
     assert!(inventory.pending.is_empty());
     assert_eq!(inventory.retired.len(), 1);
@@ -1643,6 +1683,68 @@ async fn cancellation_fences_staged_activation_and_preserves_a_terminal_launch_d
     );
     other.remove_stale_candidates().await;
     assert_eq!(fixture.candidates().await, 0);
+}
+
+#[tokio::test]
+async fn cancellation_after_restart_settles_only_the_reserved_create() {
+    for replace_operation in [false, true] {
+        let (fixture, pool, prepared) = setup().await;
+        let set_operation = |sandbox: &mut Sandbox, id: &str| {
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(openshell_core::proto::SandboxProvisioning {
+                    driver_operation_id: id.into(),
+                    driver_operation_pending: true,
+                    ..Default::default()
+                });
+        };
+        let mut sandbox = pool
+            .store
+            .get_message::<Sandbox>("sandbox-a")
+            .await
+            .unwrap()
+            .unwrap();
+        set_operation(&mut sandbox, "original");
+        pool.store.put_message(&sandbox).await.unwrap();
+        pool.record_warm_claim("default", claim_intent(&prepared, "sandbox-a"))
+            .await
+            .unwrap();
+        if replace_operation {
+            let mut sandbox = pool
+                .store
+                .get_message::<Sandbox>("sandbox-a")
+                .await
+                .unwrap()
+                .unwrap();
+            set_operation(&mut sandbox, "replacement");
+            pool.store.put_message(&sandbox).await.unwrap();
+        }
+        let restarted = fixture.replica("recovery");
+        assert!(
+            restarted
+                .cancel_warm_claim("default", &prepared.registration.route)
+                .await
+                .unwrap()
+        );
+        let sandbox = restarted
+            .store
+            .get_message::<Sandbox>("sandbox-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sandbox.phase() == SandboxPhase::Error as i32,
+            !replace_operation
+        );
+        assert_eq!(
+            sandbox
+                .status
+                .unwrap()
+                .provisioning
+                .unwrap()
+                .driver_operation_pending,
+            replace_operation
+        );
+    }
 }
 
 #[tokio::test]
@@ -1665,8 +1767,11 @@ async fn abandoned_claim_cleanup_preserves_a_newer_launch() {
             .cancel_abandoned_warm_claims(&restarted.all_assignments().await.unwrap())
             .await;
         let inventory = restarted
-            .pending_warm_claims("default", "test-pool")
+            .pending_warm_claims(vec![("default".into(), "test-pool".into())], None)
             .await
+            .unwrap()
+            .remove(&("default".into(), "test-pool".into()))
+            .unwrap()
             .unwrap();
         assert!(inventory.pending.is_empty());
         assert_eq!(inventory.retired.len(), 1);

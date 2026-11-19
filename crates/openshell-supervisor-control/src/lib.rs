@@ -49,7 +49,7 @@ pub use coordinator::{
     PlacementFuture, PlacementRequest, PreparationRelease, PreparationRequest,
     PreparationRetirement, PreparationRevision, PreparedRuntime, PreparedRuntimeOwner,
     RecoverableInstance, RecoveryBaseline, RecoveryOutcome, SharedSupervision, WarmClaimIntent,
-    WarmClaimInventory, WarmClaimLookup, WarmClaimReservation,
+    WarmClaimInventories, WarmClaimInventory, WarmClaimLookup, WarmClaimReservation,
 };
 pub use credential::deliver_credentials;
 /// Recovery deadlines, in seconds, a supervisor may offer a sandbox runtime.

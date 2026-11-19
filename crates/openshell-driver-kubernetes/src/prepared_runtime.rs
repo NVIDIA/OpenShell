@@ -32,7 +32,6 @@ use crate::sandbox_runtime::{
     BOUNDARY_PRIVATE_KEY_PATH,
 };
 
-const REGISTRATION_KEY: &str = "prepared-runtime.json";
 const WORKSPACE_ANNOTATION: &str = "openshell.ai/prepared-runtime-workspace";
 const MAX_BOOTSTRAP_BYTES: usize = 512 * 1024;
 
@@ -90,7 +89,7 @@ impl PreparedRuntimeBootstrap {
         let material = generate_sandbox_tls_material(self.session_id).map_err(backend_error)?;
         let provisioning = provision(tls_pin(&material)).map_err(backend_error)?;
         let request = self.request(&provisioning)?;
-        let candidate = self.secret(&provisioning, &request.registration, material)?;
+        let candidate = self.secret(&provisioning, material)?;
         Api::<Secret>::namespaced(client, &self.namespace)
             .create(&PostParams::default(), &candidate)
             .await
@@ -192,15 +191,24 @@ impl PreparedRuntimeBootstrap {
     fn secret(
         &self,
         provisioning: &KubernetesSandboxRuntimeBoundaryProvisioning,
-        registration: &PreparedRuntimeRegistration,
         material: SandboxTlsMaterial,
     ) -> Result<Secret, KubernetesDriverError> {
-        if registration.runtime_descriptor.tls != tls_pin(&material) {
+        if provisioning.runtime_descriptor.tls != tls_pin(&material) {
             return Err(invalid(
                 "provisioning did not preserve the generated TLS identity",
             ));
         }
-        let secret = Secret {
+        let config = provisioning
+            .boundary_config
+            .encode()
+            .map_err(backend_error)?;
+        if config.len() + material.certificate_chain_pem.len() + material.private_key_pem.len()
+            > MAX_BOOTSTRAP_BYTES
+        {
+            return Err(invalid("prepared bootstrap Secret exceeds its size limit"));
+        }
+        validate_server_key(&material)?;
+        Ok(Secret {
             metadata: ObjectMeta {
                 namespace: Some(self.namespace.clone()),
                 name: Some(self.secret_name.clone()),
@@ -214,22 +222,7 @@ impl PreparedRuntimeBootstrap {
             immutable: Some(true),
             type_: Some("Opaque".into()),
             data: Some(BTreeMap::from([
-                (
-                    BOUNDARY_CONFIG_KEY.into(),
-                    ByteString(
-                        provisioning
-                            .boundary_config
-                            .encode()
-                            .map_err(backend_error)?,
-                    ),
-                ),
-                (
-                    REGISTRATION_KEY.into(),
-                    ByteString(
-                        serde_json::to_vec(registration)
-                            .map_err(|_| invalid("cannot encode prepared registration"))?,
-                    ),
-                ),
+                (BOUNDARY_CONFIG_KEY.into(), ByteString(config)),
                 (
                     BOUNDARY_CERTIFICATE_KEY.into(),
                     ByteString(material.certificate_chain_pem.into_bytes()),
@@ -240,66 +233,18 @@ impl PreparedRuntimeBootstrap {
                 ),
             ])),
             ..Default::default()
-        };
-        self.read_registration(&secret)?;
-        Ok(secret)
-    }
-
-    fn read_registration(
-        &self,
-        secret: &Secret,
-    ) -> Result<PreparedRuntimeRegistration, KubernetesDriverError> {
-        if secret.metadata.namespace.as_ref() != Some(&self.namespace)
-            || secret.metadata.name.as_ref() != Some(&self.secret_name)
-            || secret.metadata.deletion_timestamp.is_some()
-            || secret.metadata.owner_references.as_deref() != Some(&[self.owner()])
-            || secret
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get(WORKSPACE_ANNOTATION))
-                != Some(&self.workspace)
-            || secret.immutable != Some(true)
-            || secret.type_.as_deref() != Some("Opaque")
-        {
-            return Err(invalid(
-                "prepared bootstrap Secret ownership or immutability changed",
-            ));
-        }
-        let data = secret
-            .data
-            .as_ref()
-            .ok_or_else(|| invalid("prepared bootstrap Secret is empty"))?;
-        if data.len() != 4 || data.values().map(|v| v.0.len()).sum::<usize>() > MAX_BOOTSTRAP_BYTES
-        {
-            return Err(invalid("invalid prepared bootstrap Secret size or keys"));
-        }
-        for key in [
-            BOUNDARY_CONFIG_KEY,
-            BOUNDARY_CERTIFICATE_KEY,
-            BOUNDARY_PRIVATE_KEY,
-        ] {
-            secret_value(secret, key)?;
-        }
-        let registration: PreparedRuntimeRegistration =
-            serde_json::from_slice(secret_value(secret, REGISTRATION_KEY)?)
-                .map_err(|_| invalid("invalid stored prepared runtime registration"))?;
-        registration
-            .validate()
-            .map_err(|_| invalid("invalid stored prepared runtime registration"))?;
-        validate_server_key(secret)?;
-        Ok(registration)
+        })
     }
 }
 
-fn validate_server_key(secret: &Secret) -> Result<(), KubernetesDriverError> {
+fn validate_server_key(material: &SandboxTlsMaterial) -> Result<(), KubernetesDriverError> {
     // PEM is a parsing type; all key loading and matching use the crypto facade's
     // TLS provider, just as they do when the runtime starts its listener.
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-    let certs = CertificateDer::pem_slice_iter(secret_value(secret, BOUNDARY_CERTIFICATE_KEY)?)
+    let certs = CertificateDer::pem_slice_iter(material.certificate_chain_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| invalid("invalid prepared TLS certificate"))?;
-    let key = PrivateKeyDer::from_pem_slice(secret_value(secret, BOUNDARY_PRIVATE_KEY)?)
+    let key = PrivateKeyDer::from_pem_slice(material.private_key_pem.as_bytes())
         .map_err(|_| invalid("invalid prepared TLS key"))?;
     openshell_crypto::tls::try_server_builder()
         .map_err(|_| invalid("cannot configure prepared runtime TLS"))?
@@ -307,16 +252,6 @@ fn validate_server_key(secret: &Secret) -> Result<(), KubernetesDriverError> {
         .with_single_cert(certs, key)
         .map_err(|_| invalid("prepared TLS certificate and key do not match"))?;
     Ok(())
-}
-
-fn secret_value<'a>(secret: &'a Secret, key: &str) -> Result<&'a [u8], KubernetesDriverError> {
-    secret
-        .data
-        .as_ref()
-        .and_then(|data| data.get(key))
-        .filter(|v| !v.0.is_empty())
-        .map(|v| v.0.as_slice())
-        .ok_or_else(|| invalid("prepared bootstrap Secret is incomplete"))
 }
 
 fn tls_pin(material: &SandboxTlsMaterial) -> SandboxTlsClientConfig {

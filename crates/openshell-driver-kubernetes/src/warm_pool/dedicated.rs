@@ -200,6 +200,104 @@ pub(super) struct WarmTarget {
 }
 
 impl KubernetesComputeDriver {
+    pub(super) fn render_warm_supervisor(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        physical_id: &str,
+        (uid, gid): (u32, u32),
+        owner: OwnerReference,
+        upstream_proxy_ca: bool,
+    ) -> Result<Pod, KubernetesDriverError> {
+        let network_ca = self.network_trust_bundle.as_ref().map(|bundle| {
+            (
+                network_additional_ca_config_map_name(&self.config.gateway_id, bundle.digest()),
+                bundle.digest(),
+            )
+        });
+        self.render_sandbox_runtime_supervisor(
+            namespace,
+            names,
+            physical_id,
+            "",
+            owner,
+            uid,
+            gid,
+            &openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(None)
+                .map_err(record_error)?,
+            "info",
+            upstream_proxy_ca,
+            true,
+            network_ca
+                .as_ref()
+                .map(|(name, digest)| (name.as_str(), *digest)),
+        )
+    }
+
+    pub(super) async fn verify_warm_supervisor(
+        &self,
+        api: &AgentSandboxApi,
+        record: &Record,
+        resource: &WarmRuntimeResource,
+        expected_uid: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let names = record.names();
+        let services = Api::<Service>::namespaced(self.client.clone(), &resource.namespace);
+        for mode in [
+            KubernetesControlConnection::SupervisorInitiated,
+            KubernetesControlConnection::RuntimeInitiated,
+        ] {
+            let service = services
+                .get(names.control_service(mode))
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            if !boundary_service_matches_mode(&service, &record.physical_id(), mode) {
+                return Err(KubernetesDriverError::StalePreparation);
+            }
+        }
+        let stored = Api::<Pod>::namespaced(self.client.clone(), &resource.namespace)
+            .get(&names.supervisor_pod)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        if stored.metadata.uid.as_deref() != Some(expected_uid) {
+            return Err(KubernetesDriverError::StalePreparation);
+        }
+        let owner = sandbox_runtime_sandbox_owner_reference(
+            &resource.name,
+            &resource.uid,
+            &api.resource.api_version,
+            false,
+        );
+        let staged = self.read_staged_bootstrap_material().await?;
+        let expected = self.render_warm_supervisor(
+            &resource.namespace,
+            &names,
+            &record.physical_id(),
+            (record.uid, record.gid),
+            owner,
+            staged.upstream_proxy_ca_bundle.is_some(),
+        )?;
+        validate_dedicated_pod(&stored, &expected)?;
+        if let Some(bundle) = self.network_trust_bundle.as_ref() {
+            let expected = network_additional_ca_config_map(
+                &resource.namespace,
+                &self.config.gateway_id,
+                bundle,
+            )?;
+            let name = expected
+                .metadata
+                .name
+                .as_deref()
+                .ok_or_else(|| invalid("missing trust ConfigMap name"))?;
+            let stored = Api::<ConfigMap>::namespaced(self.client.clone(), &resource.namespace)
+                .get(name)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            validate_network_additional_ca_config_map(&stored, &expected)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn authenticate_warm_supervisor(
         &self,
         credential: &str,

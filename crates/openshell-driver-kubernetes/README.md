@@ -192,8 +192,8 @@ The `prepared_runtime` module supplies bootstrap persistence for OpenShell-owned
 warm runtimes. `KubernetesSandboxRuntimeBoundarySpec::provision_prepared`
 builds an unassigned runtime with a shared-supervisor route and physical resource
 claims. `PreparedRuntimeBootstrap::prepare` creates a Pod-owned immutable Secret
-containing its boundary configuration, TLS certificate and private key, and public
-preparation descriptor. It then reserves capacity through `SharedSupervision`.
+containing its boundary configuration, TLS certificate, and private key. The gateway
+stores the public preparation descriptor when it reserves capacity through `SharedSupervision`.
 It supplies no logical Sandbox ID, gateway session token, or workload credentials.
 
 The controller must persist the physical session, generation and route first,
@@ -279,7 +279,8 @@ its startup probe succeeds only after TLS authenticates the runtime. Before clai
 readiness requires both the parked runtime and an accepted gateway registration.
 A disconnected registration closes the readiness listener until it reconnects.
 The driver checks Pod readiness, the original supervisor UID, successful startup,
-and absence of restarts. After claim, normal supervision owns readiness.
+and absence of restarts. Dedicated bootstrap completes after the gateway observes
+the claimed generation’s authenticated supervisor session.
 If the parked runtime disconnects before a claim, its dedicated supervisor exits.
 Terminated or restarted supervisors cannot make that spare eligible again; the
 pool retires and replaces it. The startup verdict therefore lasts only as long as

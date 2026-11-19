@@ -3229,13 +3229,48 @@ impl InstancePlacement for PoolPlacement {
 
     fn pending_warm_claims(
         &self,
-        workspace: String,
-        pool_id: String,
-    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
+        pools: Vec<(String, String)>,
+        route: Option<String>,
+    ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventories> {
         let pool = self.0.clone();
         Box::pin(detached(async move {
-            pool.pending_warm_claims(&workspace, &pool_id).await
+            pool.pending_warm_claims(pools, route).await
         }))
+    }
+
+    fn dedicated_claim_started(
+        &self,
+        sandbox_id: String,
+        session: openshell_core::SandboxSessionId,
+    ) -> PlacementFuture<bool> {
+        let pool = self.0.clone();
+        Box::pin(async move {
+            let Some(sandbox) = pool
+                .store
+                .get_message::<Sandbox>(&sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(false);
+            };
+            let annotations = &sandbox
+                .metadata
+                .as_ref()
+                .ok_or("missing sandbox metadata")?
+                .annotations;
+            let identity =
+                PersistedSandboxIdentity::read(annotations).map_err(|e| e.to_string())?;
+            Ok(identity
+                .prepared_runtime
+                .is_some_and(|binding| binding.session_id() == session)
+                && sandbox.status.is_some_and(|status| {
+                    // An admission report can precede main-process startup.
+                    !status.main_process_instance_id.is_empty()
+                        || status
+                            .configuration_admission
+                            .is_some_and(|report| !report.instance_id.is_empty())
+                }))
+        })
     }
 
     fn cancel_warm_claim(&self, workspace: String, route: String) -> PlacementFuture<bool> {

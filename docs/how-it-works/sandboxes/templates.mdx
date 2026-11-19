@@ -61,6 +61,10 @@ delete sandboxes already created from it. Templates without startup tuning do no
 create pools. Operators can disable pooling with
 [`openshell.drivers.kubernetes.warm_pool.enabled`](/how-it-works/gateways/configuration).
 
+If a gateway restarts during creation and the reserved runtime has disappeared,
+recovery marks the pending sandbox as failed. You can delete it and create a new
+sandbox from the same template.
+
 ### Identify Warm Pods
 
 A warm Kubernetes Sandbox resource and its workload Pod use the physical name

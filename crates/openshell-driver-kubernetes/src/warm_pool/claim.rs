@@ -3,6 +3,7 @@
 
 use super::*;
 use openshell_core::sandbox_generation::SandboxGenerationId;
+use openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor;
 
 pub(super) const CLAIM: &str = "openshell.ai/warm-claim";
 const CLAIM_COMPLETE: &str = "openshell.ai/warm-claim-complete";
@@ -131,14 +132,6 @@ impl KubernetesComputeDriver {
             .warm_runtime_trust()
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let Some(inventory) = optional_pool_discovery(
-            self.warm_runtime_inventory(&sandbox.workspace).await,
-            sandbox,
-            "inventory",
-        )?
-        else {
-            return Ok(None);
-        };
         for pool in &pools {
             let Some(Some(snapshot)) = optional_pool_discovery(
                 supervision
@@ -161,6 +154,15 @@ impl KubernetesComputeDriver {
             {
                 continue;
             }
+            let Some(inventory) = optional_pool_discovery(
+                self.list_warm_runtime_inventory(&sandbox.workspace, Some(&pool.name), true)
+                    .await,
+                sandbox,
+                "inventory",
+            )?
+            else {
+                continue;
+            };
             for resource in inventory.iter().filter(|resource| {
                 resource.pool_id == pool.name
                     && resource.released
@@ -203,17 +205,25 @@ impl KubernetesComputeDriver {
                     if !self.warm_shape_matches(sandbox, &record)? {
                         return Ok(None);
                     }
-                    let prepared = self.resume_warm_runtime(resource).await?;
-                    let object = api
-                        .api
-                        .get(&resource.name)
+                    let Some(assignment) = supervision
+                        .runtime_assignment(&record.workspace, &record.route())
                         .await
-                        .map_err(KubernetesDriverError::from_kube)?;
+                        .map_err(KubernetesDriverError::Message)?
+                    else {
+                        return Ok(None);
+                    };
+                    if !assignment.prepared {
+                        return Ok(None);
+                    }
+                    let prepared = PreparedRuntimeRegistration::from_assignment(&assignment)
+                        .map_err(|_| invalid("invalid prepared runtime assignment"))?;
+                    self.validate_released_candidate(&api, &object, &record, resource, &prepared)
+                        .await?;
                     // A failed reservation may have committed. Only a missing
                     // candidate before this point can skip claim recovery.
                     claim_attempted = true;
                     if self
-                        .claim_warm_object(sandbox, &api, &object, &record, prepared.registration)
+                        .claim_warm_object(sandbox, &api, &object, &record, prepared)
                         .await?
                     {
                         claim_runtime_identity(&object).map(Some)
@@ -244,7 +254,11 @@ impl KubernetesComputeDriver {
                             continue;
                         }
                         if supervision
-                            .pending_warm_claims(&resource.workspace, &resource.pool_id)
+                            .pool_claim_inventory(
+                                &resource.workspace,
+                                &resource.pool_id,
+                                Some(format!("rt-{}", resource.session_id)),
+                            )
                             .await
                             .map_err(KubernetesDriverError::Message)?
                             .retired
@@ -273,6 +287,94 @@ impl KubernetesComputeDriver {
             }
         }
         Ok(None)
+    }
+
+    async fn validate_released_candidate(
+        &self,
+        api: &AgentSandboxApi,
+        object: &DynamicObject,
+        record: &Record,
+        resource: &WarmRuntimeResource,
+        prepared: &PreparedRuntimeRegistration,
+    ) -> Result<(), KubernetesDriverError> {
+        let descriptor = &prepared.runtime_descriptor;
+        let claims = &descriptor.resource_claims;
+        if !same_resource(&resource_from_object(object, record)?, resource)
+            || prepared.route != record.route()
+            || descriptor.generation != record.physical_id()
+            || descriptor.session_id != record.session_id
+            || (
+                descriptor.workload_identity.uid,
+                descriptor.workload_identity.gid,
+            ) != (record.uid, record.gid)
+            || claims.get("kubernetes.sandbox_resource_uid") != Some(&resource.uid)
+            || resource.pod_uid.is_none()
+            || annotation(object, POD_UID) != resource.pod_uid.as_deref()
+            || claims.get("kubernetes.workload_pod_uid") != resource.pod_uid.as_ref()
+            || claims
+                .get("kubernetes.supervisor_pod_uid")
+                .map(String::as_str)
+                != annotation(object, ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID)
+        {
+            return Err(KubernetesDriverError::StalePreparation);
+        }
+        self.admit_warm_runtime(object).await?;
+        let pods = Api::<Pod>::namespaced(self.client.clone(), &resource.namespace);
+        let pod = pods
+            .get(&resource.name)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        validate_pod(&pod, object, record)?;
+        let (_, control) = self
+            .claim_policies(record, &resource.namespace, descriptor)
+            .await?;
+        if self.shared_supervisor.is_none() {
+            let uid = claims
+                .get("kubernetes.supervisor_pod_uid")
+                .ok_or(KubernetesDriverError::StalePreparation)?;
+            self.verify_warm_supervisor(api, record, resource, uid)
+                .await?;
+        } else {
+            let (_, target) = self.shared_supervisor_target().await?;
+            let expected = shared_control_policy(
+                &resource.namespace,
+                &record.names(),
+                &record.physical_id(),
+                &target.namespace,
+                target.selector,
+                target.address.port(),
+                OwnerReference::default(),
+            );
+            validate_sandbox_runtime_fence(&control, &expected)?;
+        }
+        Ok(())
+    }
+
+    async fn claim_policies(
+        &self,
+        record: &Record,
+        namespace: &str,
+        descriptor: &SandboxRuntimeDescriptor,
+    ) -> Result<(NetworkPolicy, NetworkPolicy), KubernetesDriverError> {
+        let names = record.names();
+        let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
+        let [expected_workload, expected_supervisor] =
+            self.sandbox_runtime_fences(namespace, &names);
+        let control_name = record.control_policy_name(self.shared_supervisor.is_none());
+        let (workload, supervisor, control) = Box::pin(async {
+            tokio::try_join!(
+                policies.get(&names.workload_policy),
+                policies.get(&names.supervisor_policy),
+                policies.get(&control_name)
+            )
+        })
+        .await
+        .map_err(KubernetesDriverError::from_kube)?;
+        validate_sandbox_runtime_fence(&workload, &expected_workload)?;
+        validate_sandbox_runtime_fence(&supervisor, &expected_supervisor)?;
+        verify_claim_policy(descriptor, &workload, "egress")?;
+        verify_claim_policy(descriptor, &control, "control")?;
+        Ok((workload, control))
     }
 
     async fn resume_warm_claim(
@@ -350,12 +452,8 @@ impl KubernetesComputeDriver {
         workspace: &str,
         pool_id: &str,
         resources: &mut [WarmRuntimeResource],
+        claims: openshell_supervisor_control::WarmClaimInventory,
     ) -> Result<bool, KubernetesDriverError> {
-        let claims = self
-            .warm_supervision()?
-            .pending_warm_claims(workspace, pool_id)
-            .await
-            .map_err(KubernetesDriverError::Message)?;
         let mut recovering = false;
         for pending in claims.pending {
             let session = pending.intent.registration.runtime_descriptor.session_id;
@@ -391,6 +489,26 @@ impl KubernetesComputeDriver {
             }
         }
         Ok(recovering)
+    }
+
+    pub(in crate::driver) async fn dedicated_bootstrap_started(
+        &self,
+        object: &DynamicObject,
+        sandbox_id: &str,
+    ) -> Result<bool, KubernetesDriverError> {
+        if annotation(object, CLAIM).is_none()
+            || supervisor_placement(object)? != SupervisorPlacement::Dedicated
+        {
+            return Ok(true);
+        }
+        let record = read_record(object, &self.config.gateway_id)?;
+        if sandbox_runtime_generation(object) != Some(&record.physical_id()) {
+            return Ok(true);
+        }
+        self.warm_supervision()?
+            .dedicated_claim_started(sandbox_id, record.session_id)
+            .await
+            .map_err(KubernetesDriverError::Message)
     }
 
     async fn validate_claim_retry(
@@ -461,7 +579,18 @@ impl KubernetesComputeDriver {
         if !resource.released {
             return Err(invalid("warm runtime is not released"));
         }
-        if self.warm_namespace_identity(&resource.namespace).await? != (record.uid, record.gid) {
+        let namespace = Api::<Namespace>::all(self.client.clone())
+            .get(&resource.namespace)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        if self.warm_pod_identity(&namespace) != (record.uid, record.gid)
+            || namespace.metadata.deletion_timestamp.is_some()
+            || prepared
+                .runtime_descriptor
+                .resource_claims
+                .get("kubernetes.namespace_uid")
+                != namespace.metadata.uid.as_ref()
+        {
             return Ok(false);
         }
         let mut auth = decode_launch_authentication(
@@ -555,10 +684,6 @@ impl KubernetesComputeDriver {
         {
             return Err(invalid("warm claim physical identity changed"));
         }
-        let prepared = PreparedRuntimeRegistration {
-            route: record.route(),
-            runtime_descriptor: intent.registration.runtime_descriptor.clone(),
-        };
         let mut claimed = object.clone();
         let annotations = claimed.metadata.annotations.get_or_insert_default();
         annotations.extend(sandbox_annotations(sandbox));
@@ -571,17 +696,13 @@ impl KubernetesComputeDriver {
             openshell_core::driver_utils::sandbox_log_level(sandbox, "info"),
         );
         let intent_name = record.route();
-        let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), &resource.namespace);
-        let fence = policies
-            .get(&record.names().workload_policy)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let control = policies
-            .get(&record.control_policy_name(self.shared_supervisor.is_none()))
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        verify_claim_policy(&prepared, &fence, "egress")?;
-        verify_claim_policy(&prepared, &control, "control")?;
+        let (fence, control) = self
+            .claim_policies(
+                record,
+                &resource.namespace,
+                &intent.registration.runtime_descriptor,
+            )
+            .await?;
         let annotations = claimed.metadata.annotations.get_or_insert_default();
         annotations.extend(BTreeMap::from([
             (CLAIM.into(), intent_name),
@@ -739,26 +860,12 @@ impl KubernetesComputeDriver {
         self.admit_stored_resources(object)
             .await
             .map_err(admission_error)?;
-        self.create_sandbox_runtime_fence(&resource.namespace, &record.names())
-            .await?;
-        let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), &resource.namespace);
-        let physical = PreparedRuntimeRegistration {
-            route: record.route(),
-            runtime_descriptor: intent.registration.runtime_descriptor.clone(),
-        };
-        for (name, kind) in [
-            (record.names().workload_policy, "egress"),
-            (
-                record.control_policy_name(self.shared_supervisor.is_none()),
-                "control",
-            ),
-        ] {
-            let policy = policies
-                .get(&name)
-                .await
-                .map_err(KubernetesDriverError::from_kube)?;
-            verify_claim_policy(&physical, &policy, kind)?;
-        }
+        self.claim_policies(
+            &record,
+            &resource.namespace,
+            &intent.registration.runtime_descriptor,
+        )
+        .await?;
         let namespace = Api::<Namespace>::all(self.client.clone())
             .get(&resource.namespace)
             .await
@@ -887,16 +994,16 @@ fn claim_runtime_identity(object: &DynamicObject) -> Result<String, KubernetesDr
 }
 
 fn verify_claim_policy(
-    prepared: &PreparedRuntimeRegistration,
+    descriptor: &SandboxRuntimeDescriptor,
     policy: &NetworkPolicy,
     kind: &str,
 ) -> Result<(), KubernetesDriverError> {
-    let claims = &prepared.runtime_descriptor.resource_claims;
+    let claims = &descriptor.resource_claims;
     if claims.get(&format!("kubernetes.{kind}_policy_uid")) != policy.metadata.uid.as_ref()
         || claims.get(&format!("kubernetes.{kind}_policy_resource_version"))
             != policy.metadata.resource_version.as_ref()
     {
-        return Err(invalid("warm runtime network fence changed before claim"));
+        return Err(KubernetesDriverError::StalePreparation);
     }
     Ok(())
 }
