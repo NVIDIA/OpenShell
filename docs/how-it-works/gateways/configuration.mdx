@@ -1918,6 +1918,11 @@ overlay_disk_mib = 4096
 # Values must fall within OpenShell's allowed non-root sandbox identity range.
 # sandbox_uid = 20001
 # sandbox_gid = 20001
+# Prepare this guest directory for the sandbox user in "managed" mode.
+# In "image" mode, use the image's OCI WORKDIR, or the managed /sandbox
+# when there is no custom WORKDIR. The workspace is fixed at sandbox creation.
+# workspace_mode = "managed"
+# workspace_root = "/sandbox"
 # Corporate forward proxy for sandbox egress. The keys, their semantics, and
 # the fail-closed contract are identical to the Podman driver above: only TLS
 # (CONNECT) egress is chained, plain-HTTP destination requests always dial

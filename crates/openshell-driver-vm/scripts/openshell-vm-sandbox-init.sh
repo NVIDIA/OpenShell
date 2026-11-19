@@ -48,6 +48,42 @@ root_path() {
     printf '%s%s\n' "${ROOT_PREFIX:-}" "$path"
 }
 
+load_sandbox_workspace() {
+    # Read driver-owned overlay metadata directly. The workload image cannot
+    # supply workspace configuration through the merged root filesystem.
+    local config=/overlay/config/openshell-workspace extra
+    WORKSPACE_MODE=managed
+    WORKSPACE_ROOT=/sandbox
+    [ -e "$config" ] || return 0
+
+    if ! {
+        IFS= read -r WORKSPACE_MODE &&
+            IFS= read -r WORKSPACE_ROOT &&
+            ! IFS= read -r extra &&
+            [ -z "$extra" ]
+    } < "$config"; then
+        ts "FATAL: invalid sandbox workspace configuration"
+        exit 1
+    fi
+    case "$WORKSPACE_MODE" in
+        managed|image) ;;
+        *)
+            ts "FATAL: invalid sandbox workspace mode"
+            exit 1
+            ;;
+    esac
+    case "$WORKSPACE_ROOT/" in
+        /|*//*|*/./*|*/../*|[!/]*)
+            ts "FATAL: invalid sandbox workspace path"
+            exit 1
+            ;;
+    esac
+    if [ "$WORKSPACE_MODE" = managed ] && [[ "$WORKSPACE_ROOT" == *:* ]]; then
+        ts "FATAL: managed workspace path contains a passwd field separator"
+        exit 1
+    fi
+}
+
 sandbox_owner() {
     sandbox_owner_from_passwd "$(root_path /etc/passwd)"
 }
@@ -377,7 +413,7 @@ setup_gpu() {
 reconcile_sandbox_account() {
     local sandbox_uid="${OPENSHELL_VM_SANDBOX_UID:-}"
     local sandbox_gid="${OPENSHELL_VM_SANDBOX_GID:-}"
-    local etc
+    local etc home=""
 
     [ -n "$sandbox_uid" ] && [ -n "$sandbox_gid" ] || return 0
     [[ "$sandbox_uid" =~ ^[0-9]+$ ]] && [[ "$sandbox_gid" =~ ^[0-9]+$ ]] || {
@@ -399,11 +435,19 @@ reconcile_sandbox_account() {
     else
         printf 'sandbox:x:%s:\n' "$sandbox_gid" >> "$etc/group"
     fi
+    if [ "$WORKSPACE_MODE" = managed ] && [ "$WORKSPACE_ROOT" != /sandbox ]; then
+        home="$WORKSPACE_ROOT"
+    fi
     if grep -q '^sandbox:' "$etc/passwd"; then
-        # Preserve image-owned account metadata (home, shell, and description)
-        # while restoring the UID/GID contract recorded for this overlay.
-        if ! awk -F: -v OFS=: -v uid="$sandbox_uid" -v gid="$sandbox_gid" \
-            '$1 == "sandbox" { $3 = uid; $4 = gid } { print }' \
+        # Update the account home only for an explicitly managed custom path.
+        if ! OPENSHELL_VM_ACCOUNT_HOME="$home" \
+            awk -F: -v OFS=: -v uid="$sandbox_uid" -v gid="$sandbox_gid" \
+            '$1 == "sandbox" {
+                $3 = uid
+                $4 = gid
+                home = ENVIRON["OPENSHELL_VM_ACCOUNT_HOME"]
+                if (home != "") $6 = home
+            } { print }' \
             "$etc/passwd" >"$etc/passwd.openshell"; then
             rm -f "$etc/passwd.openshell"
             ts "FATAL: failed to reconcile sandbox account"
@@ -411,7 +455,8 @@ reconcile_sandbox_account() {
         fi
         mv "$etc/passwd.openshell" "$etc/passwd"
     else
-        printf 'sandbox:x:%s:%s:OpenShell Sandbox:/sandbox:/bin/sh\n' "$sandbox_uid" "$sandbox_gid" >> "$etc/passwd"
+        printf 'sandbox:x:%s:%s:OpenShell Sandbox:%s:/bin/sh\n' \
+            "$sandbox_uid" "$sandbox_gid" "${home:-/sandbox}" >> "$etc/passwd"
     fi
     grep -q '^sandbox:' "$etc/gshadow" || printf 'sandbox:!::\n' >> "$etc/gshadow"
     grep -q '^sandbox:' "$etc/shadow" || printf 'sandbox:!:20123:0:99999:7:::\n' >> "$etc/shadow"
@@ -422,8 +467,24 @@ setup_sandbox_workdir() {
     local sandbox_dir
     local owner
     local current_owner
-    sandbox_dir="$(root_path /sandbox)"
+    if [ "$WORKSPACE_ROOT" != /sandbox ] && [ "$WORKSPACE_MODE" = image ]; then
+        # The boundary checks the image directory as the actual workload user.
+        return
+    fi
     owner="$(sandbox_owner)"
+    if [ "$WORKSPACE_ROOT" != /sandbox ]; then
+        sandbox_dir="$(
+            umask 022
+            prepare_guest_directory "$WORKSPACE_ROOT" "$owner" "$WORKSPACE_ROOT"
+        )" || exit 1
+        if ! chown "$owner" "$sandbox_dir" || ! chmod u+rwx "$sandbox_dir"; then
+            ts "FATAL: failed to prepare workspace ${WORKSPACE_ROOT} (${owner})"
+            exit 1
+        fi
+        return
+    fi
+
+    sandbox_dir="$(root_path /sandbox)"
     mkdir -p "$sandbox_dir"
     current_owner="$(stat -c '%u:%g' "$sandbox_dir" 2>/dev/null || true)"
     if [ "$owner" = "10001:10001" ]; then
@@ -561,11 +622,10 @@ run_openshell_init_dropins() {
     done < <(LC_ALL=C sort -u "$manifest")
 }
 
-# Create a virtiofs mount point under ROOT_PREFIX without following symlinks,
-# so an image cannot redirect a validated target onto another guest path.
-# Directories created under /sandbox are handed to the sandbox user.
-prepare_virtiofs_target() {
-    local target="$1" owner="$2"
+# Walk a guest directory path without following image symlinks. New
+# directories below the workspace belong to the sandbox account.
+prepare_guest_directory() {
+    local target="$1" owner="$2" workspace_root="$3"
     local path="${ROOT_PREFIX:-}" component
     local -a components
     IFS=/ read -r -a components <<<"${target#/}"
@@ -573,31 +633,31 @@ prepare_virtiofs_target() {
         [ -n "$component" ] || continue
         path="${path}/${component}"
         if [ -L "$path" ]; then
-            ts >&2 "FATAL: virtiofs mount target ${target} traverses symlink ${path#"${ROOT_PREFIX:-}"}"
+            ts >&2 "FATAL: guest path ${target} traverses symlink ${path#"${ROOT_PREFIX:-}"}"
             exit 1
         fi
         if [ ! -e "$path" ]; then
             if ! mkdir "$path"; then
-                ts >&2 "FATAL: failed to create virtiofs mount point ${target}"
+                ts >&2 "FATAL: failed to create guest directory ${target}"
                 exit 1
             fi
             case "${path#"${ROOT_PREFIX:-}"}" in
-                /sandbox/*)
+                "$workspace_root"/*)
                     if ! chown "$owner" "$path"; then
-                        ts >&2 "FATAL: failed to hand virtiofs mount point parent ${path#"${ROOT_PREFIX:-}"} to ${owner}"
+                        ts >&2 "FATAL: failed to assign guest directory ${path#"${ROOT_PREFIX:-}"} to ${owner}"
                         exit 1
                     fi
                     ;;
             esac
         elif [ ! -d "$path" ]; then
-            ts >&2 "FATAL: virtiofs mount target ${target} is not a directory"
+            ts >&2 "FATAL: guest path ${target} is not a directory"
             exit 1
         fi
     done
     printf '%s\n' "$path"
 }
 
-# Runs after every /sandbox ownership fixup and the root-run init drop-ins so
+# Runs after workspace ownership setup and the root-run init drop-ins so
 # nothing in init walks into host-backed shares.
 mount_virtiofs_shares() {
     local manifest
@@ -618,7 +678,7 @@ mount_virtiofs_shares() {
                 exit 1
                 ;;
         esac
-        guest_target="$(prepare_virtiofs_target "$target" "$owner")" || exit 1
+        guest_target="$(prepare_guest_directory "$target" "$owner" "$WORKSPACE_ROOT")" || exit 1
         # shellcheck disable=SC2086
         if mount -t virtiofs $mount_opts "$tag" "$guest_target"; then
             ts "  mounted virtiofs ${tag} -> ${target} (${mode})"
@@ -654,6 +714,7 @@ run_post_overlay_setup() {
     mount -t cgroup2 cgroup2 "$(root_path /sys/fs/cgroup)" 2>/dev/null &
     wait
 
+    load_sandbox_workspace
     reconcile_sandbox_account
     setup_sandbox_workdir
 
@@ -678,7 +739,7 @@ EOF
 # The boundary transport mediates network and DNS requests. Only loopback is
 # configured in the guest; no public resolver or guest NIC is needed.
 
-export HOME=/sandbox
+export HOME="$WORKSPACE_ROOT"
 export USER=sandbox
 
 # Fix /sandbox ownership. The host-side CLI extracts OCI layers as a non-root
@@ -688,7 +749,7 @@ export USER=sandbox
 # chown succeeds. On Linux non-root hosts with virtiofs, guest root maps to
 # the host user, so chown is denied — this is non-fatal because the
 # supervisor's own filesystem preparation handles the paths that matter.
-if [ -d /sandbox ]; then
+if [ "$WORKSPACE_ROOT" = /sandbox ] && [ -d /sandbox ]; then
     _sb_uid=$(id -u sandbox 2>/dev/null || true)
     _sb_gid=$(id -g sandbox 2>/dev/null || true)
     if [ -n "$_sb_uid" ] && [ -n "$_sb_gid" ]; then

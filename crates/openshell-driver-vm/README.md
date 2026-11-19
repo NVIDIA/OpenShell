@@ -173,6 +173,8 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `vcpus` | `2` | vCPUs per sandbox. |
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
+| `workspace_mode` | `"managed"` | `managed` prepares the configured guest directory for the sandbox user. `image` uses the image's OCI `WORKDIR`, falling back to the managed `/sandbox` for missing, empty, `/`, or `/sandbox` values. Rootfs tar archives have no OCI `WORKDIR`. |
+| `workspace_root` | `"/sandbox"` | Absolute path in the guest used by `managed` mode. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
 | `guest_tls_ca` | unset | Historical key name for the host supervisor's gateway CA certificate. Required when `grpc_endpoint` uses `https://`; never copied into the guest. |
 | `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) that host control chains policy-approved TLS CONNECT egress through. Host-loopback proxy URLs work because control runs on the gateway host. |
@@ -182,9 +184,11 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP CONNECT targets. |
 | `proxy_ca_bundle` | unset | Gateway-host PEM CA bundle trusted for the corporate proxy and TLS-intercepted server certificates. The driver validates it and stages it at a fixed non-secret guest path in the protected overlay. Requires `https_proxy`. |
 | `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
-| `enable_bind_mounts` | `false` | Allow per-sandbox `driver_config.vm.mounts` host directory shares (libkrun virtiofs only). The driver writes a `tag\ttarget\tmode` manifest to `/.openshell/mounts.manifest` in the overlay, and guest init mounts each share after `/sandbox` ownership fixups. Rejected while resource admission is enabled. |
+| `enable_bind_mounts` | `false` | Allow per-sandbox `driver_config.vm.mounts` host directory shares (libkrun virtiofs only). The driver writes a `tag\ttarget\tmode` manifest to `/.openshell/mounts.manifest` in the overlay, and guest init mounts each share after workspace setup. Rejected while resource admission is enabled. |
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and the driver passes them only to native host control. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
+
+In `managed` mode, OpenShell assigns ownership of a custom workspace directory to the sandbox user and preserves existing files and their ownership. In `image` mode, the directory must already exist without symlink components and be writable by the resolved sandbox user. Existing VM image preparation still normalizes the compatibility `/sandbox` tree. The driver records the selected workspace at creation and reuses it with the sandbox's writable overlay across restarts. It also retains the prepared workload image for a custom workspace or `image` mode.
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
@@ -242,7 +246,7 @@ At startup, the driver reclaims inactive attempts in this directory. It preserve
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`
 with the prepared image rootfs as lowerdir when present, otherwise the bootstrap
-rootfs is used directly. Writes to `/sandbox` and other mutable paths land in
+rootfs is used directly. Writes to the workspace and other mutable paths land in
 the overlay while cached image disks remain unchanged. The overlay disk must be
 large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
 during the first prepare.

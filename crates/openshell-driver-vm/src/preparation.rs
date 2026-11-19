@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tonic::Status;
 
 use super::{
-    OverlayPreparation, RuntimeImagePlan, SandboxOwnerIdentity, VmDriverConfig,
+    OverlayPreparation, RuntimeImagePlan, SandboxOwnerIdentity, VmDriverConfig, VmWorkspaceMode,
     WorkloadIdentityRequest,
 };
 
@@ -43,6 +43,7 @@ pub(super) struct Request {
     pub image_ref: String,
     pub rootfs_tar: Option<PathBuf>,
     pub bootstrap_only: bool,
+    pub prepared_workspace_mode: Option<VmWorkspaceMode>,
     pub overlay: Option<OverlayRequest>,
     pub lease_fd: i32,
     pub parent_pid: u32,
@@ -576,6 +577,7 @@ mod tests {
             image_ref: "test-image".to_string(),
             rootfs_tar: None,
             bootstrap_only: false,
+            prepared_workspace_mode: None,
             overlay: None,
             lease_fd: -1,
             parent_pid: 0,
