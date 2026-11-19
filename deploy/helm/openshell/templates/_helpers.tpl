@@ -511,7 +511,7 @@ it) means the default. Takes a dict of root, key, min, max, and default.
 
 {{/* Most sandboxes one supervisor runs (supervisor.pool.maxInstancesPerMember). */}}
 {{- define "openshell.supervisorMaxInstancesPerMember" -}}
-{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxInstancesPerMember" "min" 16 "max" 1024 "default" 128) -}}
+{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxInstancesPerMember" "min" 1 "max" 1024 "default" 128) -}}
 {{- end }}
 
 {{/* Most supervisors one gateway replica serves (supervisor.pool.maxMembersPerGateway). */}}

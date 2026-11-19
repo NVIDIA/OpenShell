@@ -748,18 +748,34 @@ tests:
           value: 512Mi
         template: templates/supervisor.yaml
         documentIndex: 0
-  - it: rejects a per-member cap below 16
+  - it: accepts a per-member cap of one sandbox
     template: templates/supervisor.yaml
     set:
       supervisor:
         pool:
-          maxInstancesPerMember: 15
+          maxInstancesPerMember: 1
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES
+            value: "1"
+        documentIndex: 0
+  - it: rejects a per-member cap of zero
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        pool:
+          maxInstancesPerMember: 0
       gatewayConfig:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.pool.maxInstancesPerMember must be an integer between 16 and 1024
+          errorMessage: supervisor.pool.maxInstancesPerMember must be an integer between 1 and 1024
   - it: rejects a per-member cap above 1024
     template: templates/supervisor.yaml
     set:
@@ -771,7 +787,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.pool.maxInstancesPerMember must be an integer between 16 and 1024
+          errorMessage: supervisor.pool.maxInstancesPerMember must be an integer between 1 and 1024
   - it: rejects members per gateway outside 1 to 64
     template: templates/supervisor.yaml
     set:

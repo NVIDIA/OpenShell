@@ -20,7 +20,7 @@ use crate::registration::MAX_LAUNCH_MATERIAL_BYTES;
 /// another cap.
 pub const DEFAULT_MAX_INSTANCES_PER_MEMBER: usize = 128;
 /// Per-member caps a gateway and a member may configure.
-pub const MAX_INSTANCES_PER_MEMBER_RANGE: RangeInclusive<usize> = 16..=1024;
+pub const MAX_INSTANCES_PER_MEMBER_RANGE: RangeInclusive<usize> = 1..=1024;
 /// Pool members one gateway replica is sized to serve unless configured.
 pub const DEFAULT_MAX_MEMBERS_PER_GATEWAY: usize = 32;
 /// Members per gateway replica a gateway may configure.
@@ -34,11 +34,18 @@ const ASSIGNMENT_FRAMING_BYTES: usize = 1024;
 const REPORTED_INSTANCE_BYTES: usize = 1024;
 /// Smallest bound on a host message.
 const MIN_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Smallest bound on a gateway message. A snapshot also lists every route in
+/// the pool, so a small per-member cap keeps room for that directory.
+const MIN_GATEWAY_MESSAGE_BYTES: usize =
+    16 * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES);
+/// Fewest instances a status report may describe, so a member with a small
+/// cap can still report instances it is removing or keeping.
+const MIN_REPORTED_INSTANCES: usize = 64;
 
 /// A pool limit outside its allowed range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PoolLimitsError {
-    #[error("max_instances_per_member must be between 16 and 1024")]
+    #[error("max_instances_per_member must be between 1 and 1024")]
     InstancesPerMember,
     #[error("max_members_per_gateway must be between 1 and 64")]
     MembersPerGateway,
@@ -107,14 +114,15 @@ impl PoolLimits {
     /// assignment plus instances still being removed.
     #[must_use]
     pub fn max_reported_instances(self) -> usize {
-        4 * self.max_instances_per_member
+        (4 * self.max_instances_per_member).max(MIN_REPORTED_INSTANCES)
     }
 
     /// Largest gateway message a member decodes: a full snapshot of its cap
     /// of assignments at their largest, plus framing.
     #[must_use]
     pub fn max_gateway_message_bytes(self) -> usize {
-        self.max_instances_per_member * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES)
+        (self.max_instances_per_member * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES))
+            .max(MIN_GATEWAY_MESSAGE_BYTES)
     }
 
     /// Largest member message: a status report of every instance it may
@@ -135,10 +143,10 @@ mod tests {
             PoolLimits::default(),
             PoolLimits::new(128, 32).expect("defaults are valid")
         );
-        for (instances, members) in [(16, 1), (1024, 64), (128, 32)] {
+        for (instances, members) in [(1, 1), (16, 1), (1024, 64), (128, 32)] {
             assert!(PoolLimits::new(instances, members).is_ok());
         }
-        for instances in [0, 15, 1025, 4096] {
+        for instances in [0, 1025, 4096] {
             assert_eq!(
                 PoolLimits::new(instances, 32),
                 Err(PoolLimitsError::InstancesPerMember)
@@ -180,5 +188,16 @@ mod tests {
         assert!(default.max_gateway_message_bytes() < largest.max_gateway_message_bytes());
         assert_eq!(small.max_host_message_bytes(), MIN_HOST_MESSAGE_BYTES);
         assert_eq!(largest.max_host_message_bytes(), 4 * 1024 * 1024);
+        // The smallest caps keep the bounds a cap of 16 gives.
+        let tiny = PoolLimits::new(1, 1).unwrap();
+        assert_eq!(
+            tiny.max_gateway_message_bytes(),
+            small.max_gateway_message_bytes()
+        );
+        assert_eq!(
+            tiny.max_reported_instances(),
+            small.max_reported_instances()
+        );
+        assert_eq!(tiny.max_host_message_bytes(), MIN_HOST_MESSAGE_BYTES);
     }
 }

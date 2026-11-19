@@ -1645,7 +1645,7 @@ mod tests {
 
     #[test]
     fn hosts_refuse_caps_outside_the_allowed_range() {
-        for max_instances in [0, 15, 1025] {
+        for max_instances in [0, 1025] {
             let root = tempfile::tempdir().unwrap();
             let started = SharedHost::start(SharedHostConfig {
                 gateway_endpoint: "https://gateway.invalid".to_string(),
