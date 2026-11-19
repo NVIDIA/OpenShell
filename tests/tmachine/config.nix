@@ -244,6 +244,23 @@ let
         };
       }
       {
+        # The deb-upgrade-source installer for the rpm packages.
+        name = "rpm-upgrade-source";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-rpm-upgrade-source.yaml" ];
+        inputs = {
+          openshell_rpm = "../../artifacts/upgrade/rpm/source/openshell.rpm";
+          openshell_gateway_rpm = "../../artifacts/upgrade/rpm/source/openshell-gateway.rpm";
+          openshell_supervisor_image = "../../artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../../artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar";
+          openshell_e2e_python_image = e2ePythonImage;
+          openshell_candidate_rpm = "../../artifacts/packages/rpm/openshell.rpm";
+          openshell_candidate_gateway_rpm = "../../artifacts/packages/rpm/openshell-gateway.rpm";
+          openshell_candidate_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_candidate_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
         name = "rpm";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-rpm.yaml" ];

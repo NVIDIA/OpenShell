@@ -197,8 +197,9 @@ The `OpenShell / E2E` required status is evaluated from the `Core E2E result` jo
 The continuity suites (`tests/suites/continuity`) check that state created before
 a disruption survives it. Each row of `e2e-suites.yml` names one disruption:
 `gateway-restart` restarts the gateway, and `upgrade` installs the candidate package
-over the latest published release. Each upgrade row downloads that release's
-package and runtime images itself, with the `prepare-upgrade-source` action and a tag
+over the latest published release: the Debian package on Ubuntu and Docker, and the
+RPM packages on Fedora and Podman. Each upgrade row downloads that release's
+packages and runtime images itself, with the `prepare-upgrade-source` action and a tag
 that `select` resolves once, so a failed download affects only that row. Callers run
 the row with `upgrade-source`. Release Dev and Pre-release run them.
 
