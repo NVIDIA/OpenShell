@@ -5176,7 +5176,6 @@ pub(super) async fn handle_report_sandbox_configuration(
             ],
             name: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
-            ..Default::default()
         });
         *config_request.extensions_mut() = request.extensions().clone();
         let config = handle_get_sandbox_config(state, config_request)
@@ -5198,7 +5197,6 @@ pub(super) async fn handle_report_sandbox_configuration(
             ],
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             name: sandbox_name,
-            ..Default::default()
         });
         *config_request.extensions_mut() = request.extensions().clone();
         admission.error = match handle_get_sandbox_config(state, config_request).await {

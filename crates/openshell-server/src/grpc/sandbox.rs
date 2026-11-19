@@ -4258,6 +4258,7 @@ mod tests {
         (state, driver)
     }
 
+    #[cfg(not(feature = "experimental"))]
     fn create_request_with_policy(
         name: &str,
         policy: openshell_core::proto::SandboxPolicy,
