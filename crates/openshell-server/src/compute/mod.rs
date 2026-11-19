@@ -6563,15 +6563,25 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.remove(sandbox_id);
     }
 
-    /// Whether a sweep observes a `Starting` sandbox with an active start.
+    /// Whether a sweep observes a sandbox with an active start.
     ///
     /// `StartSandbox` holds the gate for the whole driver call, during which
     /// the workload can still show its previous exit. The sweep skips the
     /// sandbox instead of waiting, and the next tick or watch event
     /// reports the settled state. Probe before and after polling without
     /// retaining the gate, so Deleted watches can still dispatch cleanup.
+    ///
+    /// The gate is local to this replica. A driver operation claimed by any
+    /// replica is recorded durably, so a pending claim also defers the sweep.
+    /// Deletion is exempt: `pending_driver_operation_blocks_cleanup` decides
+    /// whether a pending operation blocks its cleanup.
     fn sweep_start_in_progress(&self, record: &ObjectRecord) -> Result<bool, String> {
         let sandbox = decode_sandbox_record(record)?;
+        if sandbox.phase() != SandboxPhase::Deleting as i32
+            && provisioning_deadline::driver_operation_pending(&sandbox)
+        {
+            return Ok(true);
+        }
         Ok(sandbox.phase() == SandboxPhase::Starting as i32
             && self
                 .lifecycle_gates
@@ -14096,52 +14106,65 @@ mod tests {
     // waiting for a start, and a restarting workload still shows its previous
     // exit until the driver starts it. The sweep skips a sandbox whose start
     // holds the lifecycle gate; the settled state is reported afterwards.
+    // Another replica cannot see that gate, so it relies on the start's
+    // durable driver-operation claim.
     #[tokio::test]
     async fn reconcile_sweep_skips_a_sandbox_while_its_start_is_in_progress() {
-        let driver = ControlledDriver::new();
-        driver.block_start();
-        let sandbox = sandbox_record(
-            "sb-start-reconcile",
-            "sandbox-start-reconcile",
-            SandboxPhase::Stopped,
-        );
-        let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
-        polled.status = Some(make_driver_status(make_driver_condition(
-            "ContainerExited",
-            "Container exited with code 0",
-        )));
-        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
-        let runtime = test_runtime(driver.clone()).await;
-        runtime.store.put_message(&sandbox).await.unwrap();
-
-        let start_runtime = runtime.clone();
-        let sandbox_name = sandbox.object_name().to_string();
-        let start =
-            tokio::spawn(
-                async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+        for other_replica in [false, true] {
+            let driver = ControlledDriver::new();
+            driver.block_start();
+            let sandbox = sandbox_record(
+                "sb-start-reconcile",
+                "sandbox-start-reconcile",
+                SandboxPhase::Stopped,
             );
-        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
-            .await
-            .expect("start did not reach the driver");
+            let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            polled.status = Some(make_driver_status(make_driver_condition(
+                "ContainerExited",
+                "Container exited with code 0",
+            )));
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            runtime.reconcile_snapshot_sandbox(polled, i64::MAX),
-        )
-        .await
-        .expect("reconciliation must not wait for the start")
-        .unwrap();
-        let phase_during_start = runtime
-            .store
-            .get_message::<Sandbox>(sandbox.object_id())
-            .await
-            .unwrap()
-            .unwrap()
-            .phase();
-        assert_eq!(phase_during_start, SandboxPhase::Starting as i32);
+            let start_runtime = runtime.clone();
+            let sandbox_name = sandbox.object_name().to_string();
+            let start =
+                tokio::spawn(
+                    async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+                .await
+                .expect("start did not reach the driver");
 
-        driver.release_start();
-        start.await.unwrap().unwrap();
+            let mut observer = runtime.clone();
+            if other_replica {
+                // Replicas share the store but not lifecycle gates.
+                observer.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+            }
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                observer.reconcile_snapshot_sandbox(polled, i64::MAX),
+            )
+            .await
+            .expect("reconciliation must not wait for the start")
+            .unwrap();
+            let phase_during_start = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .phase();
+            assert_eq!(
+                phase_during_start,
+                SandboxPhase::Starting as i32,
+                "other_replica={other_replica}"
+            );
+
+            driver.release_start();
+            start.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
