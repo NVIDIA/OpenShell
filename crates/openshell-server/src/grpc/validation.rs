@@ -2166,21 +2166,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_policy_safety_rejects_windows_drive_root() {
+    fn validate_policy_safety_rejects_windows_roots() {
         use openshell_core::proto::FilesystemPolicy;
 
-        let policy = ProtoSandboxPolicy {
-            version: 1,
-            filesystem: Some(FilesystemPolicy {
-                include_workdir: false,
-                read_only: vec![],
-                read_write: vec!["C:/".into()],
-            }),
-            ..Default::default()
-        };
-        let err = validate_policy_safety(&policy).unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("broad"));
+        for root in ["C:/", "//./Global/./C:/", "C:/::$INDEX_ALLOCATION"] {
+            let policy = ProtoSandboxPolicy {
+                version: 1,
+                filesystem: Some(FilesystemPolicy {
+                    include_workdir: false,
+                    read_only: vec![],
+                    read_write: vec![root.into()],
+                }),
+                ..Default::default()
+            };
+            let err = validate_policy_safety(&policy).unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(err.message().contains("broad"), "{root}: {err}");
+        }
     }
 
     #[test]

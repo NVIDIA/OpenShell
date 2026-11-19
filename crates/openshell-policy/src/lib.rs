@@ -1465,6 +1465,20 @@ fn is_filesystem_root(path: &str) -> bool {
             } else {
                 c.trim_end_matches(['.', ' '])
             };
+            // NTFS directory streams name the directory itself, including in
+            // verbatim paths: `C:\::$INDEX_ALLOCATION` still names `C:\`.
+            let c = c
+                .split_once(':')
+                .filter(|(_, stream)| {
+                    stream.eq_ignore_ascii_case(":$INDEX_ALLOCATION")
+                        || stream.eq_ignore_ascii_case("$I30:$INDEX_ALLOCATION")
+                })
+                .map_or(c, |(directory, _)| directory);
+            let c = if literal {
+                c
+            } else {
+                c.trim_end_matches(['.', ' '])
+            };
             c.is_empty() || c == "."
         })
     }
@@ -1548,7 +1562,23 @@ fn is_filesystem_root(path: &str) -> bool {
         .into_iter()
         .find_map(|(prefix, literal)| normalized.strip_prefix(prefix).map(|tail| (tail, literal)));
     if let Some((tail, literal)) = namespace {
-        return is_namespace_root(tail, literal);
+        if is_namespace_root(tail, literal) {
+            return true;
+        }
+        if !literal {
+            // Win32 also normalizes the namespace names themselves:
+            // `\\.\Global.\.\C:\` and `\\.\Global\\C:\` name `C:\`.
+            // Check this spelling in addition to the original so unknown
+            // object directories keep their conservative rejection.
+            let components = tail
+                .split('/')
+                .map(|name| name.trim_end_matches(['.', ' ']))
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            return is_namespace_root(&components, false);
+        }
+        return false;
     }
     // Two leading separators start a UNC path when either is a backslash; a
     // leading `//` keeps its POSIX meaning.
@@ -3856,6 +3886,74 @@ network_policies:
                     .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
                 "{root:?} should be overly broad, got {violations:?}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_normalized_namespace_roots() {
+        for root in [
+            r"\\.\Global\.\C:\",
+            r"\\.\.\C:\",
+            r"\\.\Global.\C:\",
+            r"\\.\Global\\C:\",
+            r"\\.\GLOBALROOT\??\.\C:\",
+            r"\\.\GLOBALROOT\??\\C:\",
+            "//./global././c:/",
+        ] {
+            let violations = validate_filesystem_paths(&[], &[root.to_string()])
+                .expect_err("normalized namespace root must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                "{root:?} should be overly broad, got {violations:?}"
+            );
+            assert!(!is_filesystem_root(&format!("{root}work")));
+        }
+
+        // Verbatim namespace components retain their literal meaning.
+        for path in [r"\\?\Global.\C:\", r"\\?\Global\.\C:\", r"\??\Global.\C:\"] {
+            assert!(!is_filesystem_root(path), "{path:?} is literal");
+        }
+        // Normalization must not weaken the conservative unknown-alias rule.
+        for path in [
+            r"\\.\GLOBALROOT\UnknownAlias\work",
+            r"\\.\GLOBALROOT\SystemRoot.\work",
+        ] {
+            assert!(is_filesystem_root(path), "{path:?} remains unsupported");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_directory_stream_roots() {
+        for root in [
+            "C:/",
+            r"C:\",
+            r"\\?\C:\",
+            r"\\.\C:\",
+            r"\??\C:\",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume4\",
+            r"\\.\Global\.\C:\",
+            r"\\?\UNC\server\share\",
+            r"\\server\share\",
+        ] {
+            for stream in [
+                "::$INDEX_ALLOCATION",
+                ":$I30:$INDEX_ALLOCATION",
+                "::$index_allocation",
+            ] {
+                let path = format!("{root}{stream}");
+                let violations = validate_filesystem_paths(&[], std::slice::from_ref(&path))
+                    .expect_err("directory stream of a root must be rejected");
+                assert!(
+                    violations
+                        .iter()
+                        .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+                    "{path:?} should be overly broad, got {violations:?}"
+                );
+                let narrower = format!("{root}work{stream}");
+                assert!(!is_filesystem_root(&narrower), "{narrower:?} is narrower");
+            }
         }
     }
 

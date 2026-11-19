@@ -198,6 +198,10 @@ OpenShell validates policies before they take effect.
 | Each path must not exceed 4096 bytes. | Rejected with `INVALID_ARGUMENT`. |
 | Combined `read_only` + `read_write` paths must not exceed 256. | Rejected with `INVALID_ARGUMENT`. |
 
+Windows root checks include normalized device-namespace paths such as
+`\\.\Global\.\C:\` and NTFS directory streams such as `C:\::$INDEX_ALLOCATION`.
+These spellings still name the drive root and cannot be used as read-write grants.
+
 The well-known Windows `GLOBALROOT/SystemRoot` alias names the Windows directory,
 so it and its subdirectories remain valid read-write paths. Other object-namespace
 aliases outside the recognized drive, volume, partition, and share forms are
