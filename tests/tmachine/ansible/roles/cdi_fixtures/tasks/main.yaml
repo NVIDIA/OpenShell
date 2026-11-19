@@ -38,25 +38,11 @@
 # The tests select the scenario device per sandbox through driver config, which
 # the gateway rejects unless an administrator allows it. The installers add
 # this to the active driver's settings.
-- name: Create the test settings directory
-  become: true
-  ansible.builtin.file:
-    path: /etc/openshell-test
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-
-# The gateway must accept a per-sandbox CDI device, which it does only when the
-# driver allows caller driver config. Every installer merges this override into
-# the gateway's own configuration (see openshell_gateway/tasks/merge-settings.yaml).
 - name: Allow caller driver config for the CDI tests
-  become: true
-  ansible.builtin.copy:
-    dest: /etc/openshell-test/gateway-overrides.toml
-    content: |
+  ansible.builtin.include_role:
+    name: gateway_overrides
+  vars:
+    gateway_overrides_name: cdi
+    gateway_overrides_content: |
       [openshell.drivers.{{ environment_driver }}]
       allow_driver_config = true
-    owner: root
-    group: root
-    mode: "0644"

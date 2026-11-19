@@ -108,18 +108,11 @@
       ansible.builtin.fail:
         msg: The external driver socket did not appear
 
-- name: Create the environment settings directory
-  become: true
-  ansible.builtin.file:
-    path: /etc/openshell-test
-    state: directory
-    mode: "0755"
-
 - name: Point the gateway at the external driver
-  become: true
-  ansible.builtin.copy:
-    dest: /etc/openshell-test/gateway-overrides.toml
-    mode: "0644"
-    content: |
+  ansible.builtin.include_role:
+    name: gateway_overrides
+  vars:
+    gateway_overrides_name: external-driver
+    gateway_overrides_content: |
       [openshell.drivers.{{ openshell_external_driver_name }}]
       socket_path = "{{ openshell_external_driver_socket }}"
