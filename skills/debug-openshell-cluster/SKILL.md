@@ -1385,8 +1385,8 @@ shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
 gateway replica count times `maxMembersPerGateway`. A create that finds every
 member at its cap, or the pool at gateway replicas × members × instances
 (never above 131072), fails with `FAILED_PRECONDITION` "sandbox capacity
-reached: every supervisor runs its limit of N sandboxes" or "sandbox capacity
-reached: the cluster runs its limit of N sandboxes"; raise the cap or add
+reached"; the gateway log warns "every supervisor is at its sandbox limit" or
+"supervisor pool is at its sandbox limit" to say which. Raise the cap or add
 members. Supervisor container
 resources come from `supervisor.resources` (default requests 250m and 768Mi,
 memory limit 1.5Gi). The chart rolls one member
