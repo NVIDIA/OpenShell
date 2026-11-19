@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-policy-conformance"
+description = "Cross-backend policy conformance tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dev-dependencies]
+openshell-core = { path = "../../crates/openshell-core", default-features = false }
+openshell-policy = { path = "../../crates/openshell-policy", features = ["test-support"] }
+openshell-policy-cedar = { path = "../../crates/openshell-policy-cedar" }
+openshell-policy-cedar-runtime = { path = "../../crates/openshell-policy-cedar-runtime" }
+openshell-policy-runtime-interface = { path = "../../crates/openshell-policy-runtime-interface" }
+openshell-providers = { path = "../../crates/openshell-providers" }
+openshell-supervisor-network = { path = "../../crates/openshell-supervisor-network", features = ["test-support"] }
+miette = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

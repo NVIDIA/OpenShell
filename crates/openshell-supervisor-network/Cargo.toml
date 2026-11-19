@@ -62,23 +62,21 @@ uuid = { workspace = true }
 webpki-roots = { workspace = true, optional = true }
 
 [features]
+# Engine-neutral fixtures for the policy conformance suite.
+test-support = []
 default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
-# Enables shared Cedar validation and the Cedar parity tests. The runtime
-# backend is selected by `openshell-supervisor/experimental`.
+# Forwards shared policy validation features; supervisor composition selects
+# the runtime backend.
 experimental = ["openshell-policy/experimental"]
 
 [dev-dependencies]
-openshell-policy = { path = "../openshell-policy", features = ["test-support"] }
-openshell-policy-cedar = { path = "../openshell-policy-cedar" }
 openshell-policy-cedar-runtime = { path = "../openshell-policy-cedar-runtime" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-otel = { path = "../openshell-otel" }
-# Only the Cedar parity tests use it. It does not enable Cedar.
-openshell-providers = { path = "../openshell-providers" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = "0.3"

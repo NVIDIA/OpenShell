@@ -838,10 +838,10 @@ fn ported_route_selected_encoded_slash_scoping() {
         std::iter::once(("TOKEN".to_string(), "real-token".to_string())).collect(),
     );
     let placeholder = child_env.get("TOKEN").expect("placeholder env").clone();
-    let resolver_ctx = L7EvalContext {
-        secret_resolver: resolver.map(Arc::new),
-        ..ctx.clone()
-    };
+    let resolver_ctx = openshell_supervisor_network::conformance_support::with_secret_resolver(
+        ctx.clone(),
+        resolver.map(Arc::new),
+    );
     let cedar = encoded_slash_cedar();
     assert_settings_parity(&SettingsScenario {
         name: "relay.rs encoded slash scoping",

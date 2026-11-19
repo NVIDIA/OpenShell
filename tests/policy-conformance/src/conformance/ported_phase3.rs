@@ -309,7 +309,8 @@ network_policies:
         "could permit a client message without a GraphQL condition",
     );
     let engines = Engines::new(
-        OpaEngine::from_strings_unvalidated(REGO, YAML).expect("YAML data loads"),
+        openshell_supervisor_network::conformance_support::unvalidated_opa(REGO, YAML)
+            .expect("YAML data loads"),
         CedarOnlyEngine::from_policy_str(&cedar(&format!(
             r#"(context.method == "WEBSOCKET_TEXT"
                     && context.graphql_operation_type == "query" && {viewer})"#

@@ -1,0 +1,1749 @@
+{
+  "Address filter control plane": {
+    "0: proxy/destination.rs::address_filter_rejects_control_plane_port / exact-host": "exact"
+  },
+  "Address filter glob": {
+    "0: proxy/destination.rs::address_filter_retains_public_answer_from_mixed_set / exact-host": "not-exact"
+  },
+  "Address filter loopback": {
+    "0: proxy/destination.rs::address_filter_rejects_always_blocked_only_answer / exact-host": "exact"
+  },
+  "Address filter private": {
+    "0: proxy/destination.rs::address_filter_exact_host_allows_private_but_not_always_blocked / exact-host": "exact"
+  },
+  "Connections": {
+    "0: declared binary connects / connect": "allow",
+    "10: glob host is DNS eligible / dns-eligible": "eligible",
+    "11: undeclared host is not DNS eligible / dns-eligible": "ineligible",
+    "12: read-only preset allows GET / request": "allow",
+    "13: read-only preset denies POST / request": "deny",
+    "1: other binary is refused / connect": "deny",
+    "2: other port is refused / connect": "deny",
+    "3: glob host connects / connect": "allow",
+    "4: glob does not cross a label / connect": "deny",
+    "5: exact host is exactly declared / exact-host": "exact",
+    "6: glob host is not exactly declared / exact-host": "not-exact",
+    "7: inspected endpoint / inspection": "Rest/Enforce",
+    "8: uninspected endpoint / inspection": "none",
+    "9: exact host is DNS eligible / dns-eligible": "eligible"
+  },
+  "Credential guard does not shadow allowed_ips": {
+    "0: opa.rs::credential_guard_does_not_shadow_inspected_endpoint_config inspection / inspection": "Rest/Audit",
+    "1: opa.rs::credential_guard_does_not_shadow_inspected_endpoint_config tls / tls-mode": {
+      "cedar": "Auto",
+      "yaml": "Skip"
+    },
+    "2: opa.rs::credential_guard_does_not_shadow_inspected_endpoint_config allowed_ips inside / destination": "admitted",
+    "3: opa.rs::credential_guard_does_not_shadow_inspected_endpoint_config allowed_ips private outside / destination": "rejected",
+    "4: opa.rs::credential_guard_does_not_shadow_inspected_endpoint_config allowed_ips public outside / destination": "rejected"
+  },
+  "Declared endpoint hosts file": {
+    "0: proxy.rs::test_declared_endpoint_private_hosts_file_resolution_allowed / exact-host": "exact"
+  },
+  "Declared loopback 443": {
+    "0: proxy.rs::connect_handler_returns_ssrf_403_for_internal_address_not_503 / exact-host": "exact"
+  },
+  "Declared loopback 80": {
+    "0: proxy.rs::forward_handler_preserves_ssrf_response_and_denial_stage / exact-host": "exact",
+    "1: proxy/destination.rs::declared_endpoint_preserves_its_denial_classification / exact-host": "exact"
+  },
+  "Default mode glob": {
+    "0: proxy/destination.rs::default_mode_classifies_loopback_as_internal_address glob host / exact-host": "not-exact",
+    "1: proxy/destination.rs::default_mode_classifies_loopback_as_internal_address literal / exact-host": "deny"
+  },
+  "Destination mode precedence": {
+    "0: proxy/destination.rs::validation_mode_precedence_is_explicit_and_stable explicit private / destination": "admitted",
+    "1: proxy/destination.rs::validation_mode_precedence_is_explicit_and_stable explicit over exact / destination": "rejected",
+    "2: proxy/destination.rs::validation_mode_precedence_is_explicit_and_stable implicit literal / destination": "admitted",
+    "3: proxy/destination.rs::validation_mode_precedence_is_explicit_and_stable declared private / destination": "admitted",
+    "4: proxy/destination.rs::validation_mode_precedence_is_explicit_and_stable declared public / destination": "admitted",
+    "5: proxy/destination.rs::validation_mode_precedence_is_explicit_and_stable default private / destination": "rejected",
+    "6: proxy/destination.rs::validation_mode_precedence_is_explicit_and_stable default public / destination": "admitted"
+  },
+  "Exact deny binary through a symlink": {
+    "0: opa.rs::exact_deny_symlink_expands_but_glob_deny_does_not maximum / request": "deny",
+    "1: opa.rs::exact_deny_symlink_expands_but_glob_deny_does_not maximum connect / connect": "allow",
+    "2: opa.rs::exact_deny_symlink_expands_but_glob_deny_does_not maximum other binary / request": "deny"
+  },
+  "Explicit TCP endpoint identity": {
+    "0: opa.rs::egress_authorization_preserves_explicit_tcp_endpoint_identity configs / inspection": "none",
+    "1: opa.rs::egress_authorization_preserves_explicit_tcp_endpoint_identity matched / matched-endpoints": "database.example.com:5432/tcp",
+    "2: opa.rs::egress_authorization_preserves_explicit_tcp_endpoint_identity other binary / matched-endpoints": "deny"
+  },
+  "Forward middleware re-evaluation": {
+    "0: proxy.rs::forward_middleware_pipeline_denies_policy_invalid_transformation inspection / inspection": "JsonRpc/Enforce",
+    "1: proxy.rs::forward_middleware_pipeline_denies_policy_invalid_transformation original / request": "allow",
+    "2: proxy.rs::forward_middleware_pipeline_denies_policy_invalid_transformation redacted / request": "deny"
+  },
+  "Glob deny binary over a symlink's directory": {
+    "0: opa.rs::exact_deny_symlink_expands_but_glob_deny_does_not candidate / request": "allow",
+    "1: opa.rs::exact_deny_symlink_expands_but_glob_deny_does_not candidate link / request": "deny"
+  },
+  "GraphQL": {
+    "0: query / request": "allow",
+    "10: parse error / request": "deny",
+    "1: query type in uppercase / request": "allow",
+    "2: mutation with listed fields / request": "allow",
+    "3: mutation with an unlisted field / request": "deny",
+    "4: mutation with a denied field / request": "deny",
+    "5: mutation with no fields / request": "deny",
+    "6: subscription matching the name glob / request": "allow",
+    "7: subscription outside the name glob / request": "deny",
+    "8: batch with one disallowed operation / request": "deny",
+    "9: hash-only persisted query / request": "deny"
+  },
+  "GraphQL WebSocket generic text rule": {
+    "0: opa.rs::l7_websocket_graphql_not_bypassed_by_generic_text_rule / request": "deny",
+    "1: generic text rule/allowed operation / request": "allow"
+  },
+  "GraphQL WebSocket operation rules": {
+    "0: proxy.rs::forward_graphql_websocket_upgrade_blocks_unallowed_operation / websocket": "101/message-blocked",
+    "1: GraphQL WebSocket operation rules/allowed operation / websocket": "101/message-forwarded"
+  },
+  "GraphQL and REST routes": {
+    "0: relay.rs::route_selected_graphql_websocket_upgrade_is_denied_before_forwarding/enforce / relay": "403/blocked/marker",
+    "1: relay.rs::route_selected_graphql_query_without_upgrade_is_still_forwarded / relay": "204/forwarded",
+    "2: GraphQL and REST routes/denied query / relay": "403/blocked",
+    "3: GraphQL and REST routes/REST route / relay": "204/forwarded"
+  },
+  "GraphQL authority, REST translation scoped by resource.protocol": {
+    "0: GET GraphQL mutation / relay": "403/blocked",
+    "1: GET GraphQL query / relay": "204/forwarded"
+  },
+  "GraphQL authority, literal REST translation": {
+    "0: GET GraphQL mutation / relay": "403/blocked",
+    "1: GET GraphQL query / relay": "204/forwarded"
+  },
+  "GraphQL persisted queries default to deny": {
+    "0: registered hash, mode deny / request": "deny",
+    "1: registered hash, mode deny, reason / deny-reason": "deny: GraphQL persisted query is not registered"
+  },
+  "Host-less multi-port allowed_ips": {
+    "0: opa.rs::hostless_endpoint_multi_port port 80 / connect": "allow",
+    "1: opa.rs::hostless_endpoint_multi_port port 443 / connect": "allow",
+    "2: opa.rs::hostless_endpoint_multi_port unlisted port / connect": "deny",
+    "3: opa.rs::hostless_endpoint_multi_port in range / destination": "admitted",
+    "4: opa.rs::hostless_endpoint_multi_port out of range / destination": "rejected",
+    "5: opa.rs::hostless_endpoint_multi_port not exact / exact-host": "not-exact"
+  },
+  "JSON-RPC": {
+    "0: listed method / request": "allow",
+    "1: listed method sent with GET / request": "deny",
+    "2: unlisted method / request": "deny",
+    "3: other path / request": "deny",
+    "4: response frame / request": "deny"
+  },
+  "L7 deny rules": {
+    "0: opa.rs::l7_deny_rule_blocks_allowed_method_path / request": "deny",
+    "1: opa.rs::l7_deny_rule_allows_non_matching_requests / request": "allow",
+    "2: opa.rs::l7_deny_rule_allows_same_method_different_path / request": "allow",
+    "3: opa.rs::l7_deny_rule_blocks_wildcard_method / request": "deny",
+    "4: opa.rs::l7_deny_rule_blocks_put_protection / request": "deny",
+    "5: opa.rs::l7_deny_reason_populated_when_deny_rule_matches / request": "deny"
+  },
+  "L7 test data": {
+    "0: opa.rs::l7_endpoint_config_none_for_l4_only / inspection": "none",
+    "1: opa.rs::l7_head_allowed_where_get_is_allowed / request": "allow",
+    "2: opa.rs::l7_options_not_implicitly_allowed_by_get / request": "deny"
+  },
+  "MCP": {
+    "0: initialize / request": "allow",
+    "10: response frame / request": "allow",
+    "11: response frame sent with GET / request": "deny",
+    "1: allowed tool call sent with GET / request": "deny",
+    "2: tools/list / request": "allow",
+    "3: tool matching the glob / request": "allow",
+    "4: tool glob does not cross a dot / request": "deny",
+    "5: tool deny rule / request": "deny",
+    "6: tool outside the glob / request": "deny",
+    "7: unlisted core method / request": "deny",
+    "8: extension method / request": "deny",
+    "9: receive stream / request": "allow"
+  },
+  "MCP and REST routes": {
+    "0: relay.rs::route_selected_mcp_websocket_upgrade_is_denied_before_forwarding / relay": "403/blocked/marker",
+    "1: relay.rs::route_selected_rest_websocket_upgrade_still_relays_beside_mcp / websocket": "101/message-forwarded",
+    "2: relay.rs::route_selected_mcp_receive_stream_without_upgrade_is_still_forwarded / relay": "204/forwarded",
+    "3: MCP and REST routes/no endpoint path matches / relay": "403/blocked"
+  },
+  "MCP revision without settings": {
+    "0: 2026-07-28 request without mcp.versions settings / relay": {
+      "cedar": "403/blocked",
+      "yaml": "204/forwarded"
+    }
+  },
+  "MCP, JSON-RPC, and REST paths": {
+    "0: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/unmatched tool / request": "deny",
+    "10: MCP, JSON-RPC, and REST paths/allowed tool / request": "allow",
+    "11: MCP, JSON-RPC, and REST paths/allowed JSON-RPC method / request": "allow",
+    "12: MCP, JSON-RPC, and REST paths/allowed REST request / request": "allow",
+    "13: MCP, JSON-RPC, and REST paths/inspection / inspection": "JsonRpc/Enforce,Mcp/Enforce,Rest/Enforce",
+    "1: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/tools/call on /rest / request": "deny",
+    "2: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/tools/call on /rpc / request": "deny",
+    "3: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/tools/call on /other / request": "deny",
+    "4: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/no selected call / request": "deny",
+    "5: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/inspection error / request": "deny",
+    "6: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/unavailable method / request": "deny",
+    "7: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/JSON-RPC response frame / request": "deny",
+    "8: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/MCP response frame / request": "allow",
+    "9: opa.rs::l7_mcp_denial_reason_matches_request_path_and_protocol/MCP tools/list / request": "allow"
+  },
+  "Overlapping glob and host-less allowed_ips": {
+    "0: overlap public outside allowlist / destination": "rejected",
+    "1: overlap private inside allowlist / destination": {
+      "cedar": "rejected",
+      "yaml": "admitted"
+    },
+    "2: overlap host-less only / destination": "admitted"
+  },
+  "Overlapping policy outputs": {
+    "0: opa.rs::overlapping_policy_outputs_are_snapshotted_independently allow / connect": "allow",
+    "1: opa.rs::overlapping_policy_outputs_are_snapshotted_independently matched / matched-endpoints": "192.168.1.100:8567;192.168.1.100:8567",
+    "2: opa.rs::overlapping_policy_outputs_are_snapshotted_independently tls / tls-mode": {
+      "cedar": "Auto",
+      "yaml": "Skip"
+    },
+    "3: opa.rs::overlapping_policy_outputs_are_snapshotted_independently exact / exact-host": "exact",
+    "4: opa.rs::overlapping_policy_outputs_are_snapshotted_independently allowed_ips / destination": "admitted"
+  },
+  "POST-only endpoint": {
+    "0: opa.rs::l7_head_denied_when_only_post_allowed / request": "deny"
+  },
+  "Policy DNS allowed_ips filtering": {
+    "0: policy_dns/mod.rs::allowed_ips_filters_each_answer_without_rejecting_usable_addresses / dns-answers": "10.2.3.4",
+    "1: policy_dns/mod.rs::allowed_ips_filters_each_answer_without_rejecting_usable_addresses no usable answer / dns-answers": "dns refused: no trusted resolver address passed endpoint destination policy",
+    "2: policy_dns/mod.rs::allowed_ips_filters_each_answer_without_rejecting_usable_addresses transparent open / transparent-open": "RelayReady/10.2.3.4:5432/correlated",
+    "3: policy_dns/mod.rs::allowed_ips_filters_each_answer_without_rejecting_usable_addresses other binary / transparent-open": "Denied(PolicyDenied)",
+    "4: proxy/destination.rs::address_filter_enforces_allowed_ips / dns-answers": "10.2.3.4"
+  },
+  "Policy DNS base": {
+    "0: policy_dns/mod.rs::eligible_name_filters_answers_and_publishes_bounded_mapping dns / dns-eligible": "eligible",
+    "1: policy_dns/mod.rs::eligible_name_filters_answers_and_publishes_bounded_mapping exact / exact-host": "exact",
+    "2: policy_dns/mod.rs::stages_unknown_name_without_upstream_resolution / dns-eligible": "ineligible",
+    "3: policy_dns/mod.rs::unknown_name_correlates_without_authorizing_a_port / dns-eligible": "ineligible"
+  },
+  "Policy DNS gateway alias": {
+    "0: policy_dns/mod.rs::reserved_gateway_alias_pins_only_the_exact_trusted_address dns / dns-eligible": "eligible",
+    "1: policy_dns/mod.rs::reserved_gateway_alias_pins_only_the_exact_trusted_address exact / exact-host": "exact",
+    "2: policy_dns/mod.rs::reserved_gateway_alias_accepts_an_exact_private_backend_gateway dns / dns-eligible": "eligible",
+    "3: policy_dns/mod.rs::reserved_gateway_alias_accepts_an_exact_private_backend_gateway exact / exact-host": "exact",
+    "4: policy_dns/mod.rs::reserved_gateway_alias_rejects_wrong_address_family_without_resolver_fallback / dns-eligible": "eligible"
+  },
+  "Policy DNS snapshot TCP endpoints (reload)": {
+    "0: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint records / dns-records": "implicit.example:443;resolver.example:53,853/tcp;secondary.example:5353/tcp;web.example:443",
+    "1: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint resolver 53 / dns-eligible": "eligible",
+    "2: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint resolver 853 / dns-eligible": "eligible",
+    "3: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint web / dns-eligible": "eligible",
+    "4: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint implicit / dns-eligible": "eligible",
+    "5: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint secondary / dns-eligible": "eligible",
+    "6: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint undeclared port / dns-eligible": "ineligible",
+    "7: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint hostless excluded / dns-eligible": "ineligible",
+    "8: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint resolver matched / matched-endpoints": "resolver.example:53,853/tcp",
+    "9: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint web matched / matched-endpoints": "web.example:443"
+  },
+  "Policy DNS snapshot TCP endpoints (startup)": {
+    "0: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint records / dns-records": "implicit.example:443;resolver.example:53,853/tcp;secondary.example:5353/tcp;web.example:443",
+    "1: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint resolver 53 / dns-eligible": "eligible",
+    "2: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint resolver 853 / dns-eligible": "eligible",
+    "3: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint web / dns-eligible": "eligible",
+    "4: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint implicit / dns-eligible": "eligible",
+    "5: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint secondary / dns-eligible": "eligible",
+    "6: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint undeclared port / dns-eligible": "ineligible",
+    "7: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint hostless excluded / dns-eligible": "ineligible",
+    "8: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint resolver matched / matched-endpoints": "resolver.example:53,853/tcp",
+    "9: opa.rs::policy_dns_snapshot_includes_every_tcp_carried_endpoint web matched / matched-endpoints": "web.example:443"
+  },
+  "Policy DNS wildcard": {
+    "0: policy_dns/mod.rs::wildcard_is_eligible_but_uses_public_only_destination_rules dns / dns-eligible": "eligible",
+    "1: policy_dns/mod.rs::wildcard_is_eligible_but_uses_public_only_destination_rules exact / exact-host": "not-exact"
+  },
+  "Provider allowed_ips with a glob Cedar permit": {
+    "0: provider range inside, glob permit / destination": {
+      "cedar": "rejected",
+      "yaml": "admitted"
+    },
+    "1: provider range outside, glob permit / destination": "rejected"
+  },
+  "Provider allowed_ips with an exact Cedar permit": {
+    "0: provider range inside / destination": "admitted",
+    "1: provider range outside private / destination": "rejected",
+    "2: provider range outside public / destination": "rejected",
+    "3: provider range mixed answers / destination": "rejected"
+  },
+  "Proxy allowlist address checks": {
+    "0: proxy.rs::test_resolve_check_allowed_ips_blocks_loopback / destination": "rejected",
+    "10: proxy.rs::test_resolve_check_allowed_ips_allows_non_control_plane_ports / destination": "admitted",
+    "11: proxy.rs::test_resolve_check_allowed_ips_allows_non_control_plane_ports by name / destination": "admitted",
+    "12: proxy.rs::test_forward_private_ip_accepted_with_allowed_ips / destination": "admitted",
+    "13: proxy.rs::test_forward_private_ip_rejected_with_wrong_allowed_ips / destination": "rejected",
+    "14: proxy.rs::test_forward_private_ip_rejected_with_wrong_allowed_ips control / destination": "admitted",
+    "15: proxy.rs::test_resolve_from_hosts_file_contents_private_ip_requires_allowed_ips default / destination": "rejected",
+    "16: proxy.rs::test_resolve_from_hosts_file_contents_private_ip_requires_allowed_ips default public control / destination": "admitted",
+    "17: proxy.rs::test_resolve_from_hosts_file_contents_private_ip_requires_allowed_ips allowlisted / destination": "admitted",
+    "1: proxy.rs::test_resolve_check_allowed_ips_blocks_metadata / destination": "rejected",
+    "2: proxy.rs::test_resolve_check_allowed_ips_blocks_unspecified / destination": "rejected",
+    "3: proxy.rs::test_forward_loopback_always_blocked_even_with_allowed_ips / destination": "rejected",
+    "4: proxy.rs::test_forward_link_local_always_blocked_even_with_allowed_ips / destination": "rejected",
+    "5: proxy.rs::test_resolve_check_allowed_ips_rejects_outside_allowlist public / destination": "rejected",
+    "6: proxy.rs::test_resolve_check_allowed_ips_rejects_outside_allowlist one of two / destination": "rejected",
+    "7: proxy.rs::test_resolve_check_allowed_ips_blocks_control_plane_ports 6443 / destination": "rejected",
+    "8: proxy.rs::test_resolve_check_allowed_ips_blocks_control_plane_ports 2379 / destination": "rejected",
+    "9: proxy.rs::test_resolve_check_allowed_ips_blocks_control_plane_ports 10250 / destination": "rejected"
+  },
+  "REST": {
+    "0: GET under /repos / request": "allow",
+    "10: `**` inside a segment, same segment / request": "allow",
+    "11: `**` inside a segment, deeper path / request": "deny",
+    "1: POST to issues / request": "allow",
+    "2: POST to pulls / request": "deny",
+    "3: deny rule on hooks / request": "deny",
+    "4: other method / request": "deny",
+    "5: other path / request": "deny",
+    "6: lowercase method / request": "allow",
+    "7: HEAD under a GET rule / request": {
+      "cedar": "deny",
+      "yaml": "allow"
+    },
+    "8: empty trailing segment / request": "allow",
+    "9: no trailing segment / request": "deny"
+  },
+  "REST and GraphQL paths": {
+    "0: opa.rs::l7_endpoint_path_scopes_rest_and_graphql_on_same_host / request": "allow",
+    "1: opa.rs::l7_endpoint_path_scopes_rest_and_graphql_on_same_host / request": "allow",
+    "2: opa.rs::l7_endpoint_path_scopes_rest_and_graphql_on_same_host / request": "deny",
+    "3: REST and GraphQL paths/inspection / inspection": "Graphql/Enforce,Rest/Enforce",
+    "4: REST and GraphQL paths/no endpoint path matches / request": "deny"
+  },
+  "Rest/Audit": {
+    "0: relay/token_grant_ownership_tests.rs::audit_denial_does_not_authorize_a_grant / inspection": "Rest/Audit",
+    "1: relay/token_grant_ownership_tests.rs::audit_denial_does_not_authorize_a_grant / request": "deny",
+    "2: relay/token_grant_ownership_tests.rs::audit_denial_does_not_authorize_a_grant / owners": "none",
+    "3: denials admit no grant/allowed request / owners": "a"
+  },
+  "Rest/Enforce": {
+    "0: relay/token_grant_ownership_tests.rs::enforced_denial_mints_nothing_and_forwards_no_bytes / inspection": "Rest/Enforce",
+    "1: relay/token_grant_ownership_tests.rs::enforced_denial_mints_nothing_and_forwards_no_bytes / request": "deny",
+    "2: relay/token_grant_ownership_tests.rs::enforced_denial_mints_nothing_and_forwards_no_bytes / owners": "none",
+    "3: denials admit no grant/allowed request / owners": "a"
+  },
+  "SQL and L4 parity, protocol \"\"": {
+    "0: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"\" allow / connect": "allow",
+    "1: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"\" unlisted / connect": "deny",
+    "2: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"\" config / inspection": "none",
+    "3: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"\" matched / matched-endpoints": "sql-l4.parity.test:443",
+    "4: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"\" dns / dns-eligible": "eligible"
+  },
+  "SQL and L4 parity, protocol \"sql\"": {
+    "0: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"sql\" allow / connect": "allow",
+    "1: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"sql\" unlisted / connect": "deny"
+  },
+  "SQL and L4 parity, protocol \"tcp\"": {
+    "0: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"tcp\" allow / connect": "allow",
+    "1: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"tcp\" unlisted / connect": "deny",
+    "2: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"tcp\" config / inspection": "none",
+    "3: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"tcp\" matched / matched-endpoints": "sql-l4.parity.test:443/tcp",
+    "4: opa.rs::yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity \"tcp\" dns / dns-eligible": "eligible"
+  },
+  "Staged transparent open": {
+    "0: proxy.rs::staged_transparent_open_never_relays_an_observation_that_policy_allows connect / connect": "allow",
+    "1: proxy.rs::staged_transparent_open_never_relays_an_observation_that_policy_allows dns / dns-eligible": "eligible",
+    "2: proxy.rs::staged_transparent_open_proposes_a_denied_observation_hostname connect / connect": "deny",
+    "3: proxy.rs::staged_transparent_open_proposes_a_denied_observation_hostname dns / dns-eligible": "ineligible"
+  },
+  "Staged transparent open native TCP": {
+    "0: proxy.rs::staged_transparent_open_dials_only_pinned_policy_dns_addresses / transparent-open": "RelayReady/203.0.113.8:5432/correlated",
+    "1: proxy.rs::staged_transparent_open_dials_only_pinned_policy_dns_addresses plain L4 control / transparent-open": "RelayReady/203.0.113.8:80/correlated",
+    "2: proxy.rs::staged_transparent_open_dials_only_pinned_policy_dns_addresses other binary / transparent-open": "Denied(PolicyDenied)",
+    "3: proxy.rs::staged_transparent_open_dials_only_pinned_policy_dns_addresses undeclared port / transparent-open": "Denied(InvalidDestination)",
+    "4: proxy.rs::staged_transparent_open_dials_only_pinned_policy_dns_addresses undeclared name / transparent-open": "Denied(PolicyDenied)"
+  },
+  "Supplied identity": {
+    "0: proxy.rs::supplied_identity_pin_survives_policy_reload / connect": "allow"
+  },
+  "Supplied identity ancestor": {
+    "0: proxy.rs::supplied_identity_rejects_replaced_authorizing_ancestor / connect": "allow",
+    "1: proxy.rs::supplied_identity_rejects_replaced_authorizing_ancestor no ancestor / connect": "deny"
+  },
+  "Supplied identity endpoint metadata": {
+    "0: proxy.rs::supplied_identity_preserves_authorized_endpoint_metadata inspection / inspection": "Rest/Enforce",
+    "1: proxy.rs::supplied_identity_preserves_authorized_endpoint_metadata allowed_ips inside / destination": "admitted",
+    "2: proxy.rs::supplied_identity_preserves_authorized_endpoint_metadata allowed_ips outside / destination": "rejected"
+  },
+  "Supplied identity with L7 rules": {
+    "0: proxy.rs::supplied_identity_rejects_same_path_replacement / connect": "allow"
+  },
+  "Symlinked binary resolved at load": {
+    "0: opa.rs::from_proto_with_pid_expands_symlinks_in_container target / connect": "allow",
+    "1: opa.rs::from_proto_with_pid_expands_symlinks_in_container link / connect": "allow",
+    "2: opa.rs::from_proto_with_pid_expands_symlinks_in_container target as ancestor / connect": "allow",
+    "3: opa.rs::from_proto_with_pid_expands_symlinks_in_container other binary / connect": "deny"
+  },
+  "Symlinked binary resolved on reload (before pid)": {
+    "0: opa.rs::reload_from_proto_with_pid_resolves_symlinks target before / connect": "deny",
+    "1: opa.rs::reload_from_proto_with_pid_resolves_symlinks link before / connect": "allow"
+  },
+  "Symlinked binary resolved on reload (reload with pid)": {
+    "0: opa.rs::reload_from_proto_with_pid_resolves_symlinks target after / connect": "allow",
+    "1: opa.rs::reload_from_proto_with_pid_resolves_symlinks link after / connect": "allow"
+  },
+  "Transparent open L4 policy": {
+    "0: proxy.rs::staged_transparent_open_waits_for_l4_policy allowed / connect": "allow",
+    "1: proxy.rs::staged_transparent_open_waits_for_l4_policy metadata declared / connect": "allow",
+    "2: proxy.rs::staged_transparent_open_waits_for_l4_policy unlisted / connect": "deny"
+  },
+  "WebSocket text allow rule": {
+    "0: WebSocket text allow rule/message / websocket": "101/message-forwarded"
+  },
+  "WebSocket text deny rule": {
+    "0: proxy.rs::forward_websocket_upgrade_blocks_text_frame_by_policy / websocket": "101/message-blocked",
+    "1: proxy.rs::forward_websocket_upgrade_blocks_text_frame_by_policy / request": "deny",
+    "2: WebSocket text deny rule/upgrade / request": "allow"
+  },
+  "WebSocket without a message rule": {
+    "0: relay.rs::websocket_text_policy_requires_explicit_message_rule / request": "deny",
+    "1: relay.rs::websocket_text_policy_requires_explicit_message_rule / websocket": "101/message-blocked",
+    "2: WebSocket without a message rule/upgrade / request": "allow",
+    "3: WebSocket without a message rule/plain GET / relay": "403/blocked"
+  },
+  "YAML and proto protocol parity": {
+    "0: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/REST allowed / request": "allow",
+    "10: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/WebSocket inspection / inspection": "Websocket/Enforce",
+    "1: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/REST denied / request": "deny",
+    "2: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/GraphQL allowed / request": "allow",
+    "3: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/GraphQL denied / request": "deny",
+    "4: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/WebSocket allowed / request": "allow",
+    "5: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/WebSocket denied / request": "deny",
+    "6: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/JSON-RPC allowed / request": "allow",
+    "7: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/JSON-RPC denied / request": "deny",
+    "8: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/MCP allowed / request": "allow",
+    "9: opa.rs::yaml_and_proto_loads_have_protocol_config_and_authorization_parity/MCP denied / request": "deny"
+  },
+  "allow **": {
+    "0: allow **// / owners": "owner",
+    "10: allow **//a/b/git-upload-pack / owners": "owner",
+    "11: allow **//git-upload-pack / owners": "owner",
+    "12: allow **//a//b / owners": "owner",
+    "1: allow **//a / owners": "owner",
+    "2: allow **//a/ / owners": "owner",
+    "3: allow **//ab / owners": "owner",
+    "4: allow **//a/b / owners": "owner",
+    "5: allow **//a/b/c / owners": "owner",
+    "6: allow **//a/b/c/d / owners": "owner",
+    "7: allow **//x/a/b / owners": "owner",
+    "8: allow **//a.b / owners": "owner",
+    "9: allow **//a/git-upload-pack / owners": "owner"
+  },
+  "allow **/b": {
+    "0: allow **/b// / owners": "none",
+    "10: allow **/b//a/b/git-upload-pack / owners": "none",
+    "11: allow **/b//git-upload-pack / owners": "none",
+    "12: allow **/b//a//b / owners": "owner",
+    "1: allow **/b//a / owners": "none",
+    "2: allow **/b//a/ / owners": "none",
+    "3: allow **/b//ab / owners": "none",
+    "4: allow **/b//a/b / owners": "owner",
+    "5: allow **/b//a/b/c / owners": "none",
+    "6: allow **/b//a/b/c/d / owners": "none",
+    "7: allow **/b//x/a/b / owners": "owner",
+    "8: allow **/b//a.b / owners": "none",
+    "9: allow **/b//a/git-upload-pack / owners": "none"
+  },
+  "allow /**": {
+    "0: allow /**// / owners": "owner",
+    "10: allow /**//a/b/git-upload-pack / owners": "owner",
+    "11: allow /**//git-upload-pack / owners": "owner",
+    "12: allow /**//a//b / owners": "owner",
+    "1: allow /**//a / owners": "owner",
+    "2: allow /**//a/ / owners": "owner",
+    "3: allow /**//ab / owners": "owner",
+    "4: allow /**//a/b / owners": "owner",
+    "5: allow /**//a/b/c / owners": "owner",
+    "6: allow /**//a/b/c/d / owners": "owner",
+    "7: allow /**//x/a/b / owners": "owner",
+    "8: allow /**//a.b / owners": "owner",
+    "9: allow /**//a/git-upload-pack / owners": "owner"
+  },
+  "allow /**/git-upload-pack": {
+    "0: allow /**/git-upload-pack// / owners": "none",
+    "10: allow /**/git-upload-pack//a/b/git-upload-pack / owners": "owner",
+    "11: allow /**/git-upload-pack//git-upload-pack / owners": "owner",
+    "12: allow /**/git-upload-pack//a//b / owners": "none",
+    "1: allow /**/git-upload-pack//a / owners": "none",
+    "2: allow /**/git-upload-pack//a/ / owners": "none",
+    "3: allow /**/git-upload-pack//ab / owners": "none",
+    "4: allow /**/git-upload-pack//a/b / owners": "none",
+    "5: allow /**/git-upload-pack//a/b/c / owners": "none",
+    "6: allow /**/git-upload-pack//a/b/c/d / owners": "none",
+    "7: allow /**/git-upload-pack//x/a/b / owners": "none",
+    "8: allow /**/git-upload-pack//a.b / owners": "none",
+    "9: allow /**/git-upload-pack//a/git-upload-pack / owners": "owner"
+  },
+  "allow /*/b": {
+    "0: allow /*/b// / owners": "none",
+    "10: allow /*/b//a/b/git-upload-pack / owners": "none",
+    "11: allow /*/b//git-upload-pack / owners": "none",
+    "12: allow /*/b//a//b / owners": "none",
+    "1: allow /*/b//a / owners": "none",
+    "2: allow /*/b//a/ / owners": "none",
+    "3: allow /*/b//ab / owners": "none",
+    "4: allow /*/b//a/b / owners": "owner",
+    "5: allow /*/b//a/b/c / owners": "none",
+    "6: allow /*/b//a/b/c/d / owners": "none",
+    "7: allow /*/b//x/a/b / owners": "none",
+    "8: allow /*/b//a.b / owners": "none",
+    "9: allow /*/b//a/git-upload-pack / owners": "none"
+  },
+  "allow /a*": {
+    "0: allow /a*// / owners": "none",
+    "10: allow /a*//a/b/git-upload-pack / owners": "none",
+    "11: allow /a*//git-upload-pack / owners": "none",
+    "12: allow /a*//a//b / owners": "none",
+    "1: allow /a*//a / owners": "owner",
+    "2: allow /a*//a/ / owners": "none",
+    "3: allow /a*//ab / owners": "owner",
+    "4: allow /a*//a/b / owners": "none",
+    "5: allow /a*//a/b/c / owners": "none",
+    "6: allow /a*//a/b/c/d / owners": "none",
+    "7: allow /a*//x/a/b / owners": "none",
+    "8: allow /a*//a.b / owners": "owner",
+    "9: allow /a*//a/git-upload-pack / owners": "none"
+  },
+  "allow /a**": {
+    "0: allow /a**// / owners": "none",
+    "10: allow /a**//a/b/git-upload-pack / owners": "none",
+    "11: allow /a**//git-upload-pack / owners": "none",
+    "12: allow /a**//a//b / owners": "none",
+    "1: allow /a**//a / owners": "owner",
+    "2: allow /a**//a/ / owners": "none",
+    "3: allow /a**//ab / owners": "owner",
+    "4: allow /a**//a/b / owners": "none",
+    "5: allow /a**//a/b/c / owners": "none",
+    "6: allow /a**//a/b/c/d / owners": "none",
+    "7: allow /a**//x/a/b / owners": "none",
+    "8: allow /a**//a.b / owners": "owner",
+    "9: allow /a**//a/git-upload-pack / owners": "none"
+  },
+  "allow /a.*": {
+    "0: allow /a.*// / owners": "none",
+    "10: allow /a.*//a/b/git-upload-pack / owners": "none",
+    "11: allow /a.*//git-upload-pack / owners": "none",
+    "12: allow /a.*//a//b / owners": "none",
+    "1: allow /a.*//a / owners": "none",
+    "2: allow /a.*//a/ / owners": "none",
+    "3: allow /a.*//ab / owners": "none",
+    "4: allow /a.*//a/b / owners": "none",
+    "5: allow /a.*//a/b/c / owners": "none",
+    "6: allow /a.*//a/b/c/d / owners": "none",
+    "7: allow /a.*//x/a/b / owners": "none",
+    "8: allow /a.*//a.b / owners": "owner",
+    "9: allow /a.*//a/git-upload-pack / owners": "none"
+  },
+  "allow /a/*": {
+    "0: allow /a/*// / owners": "none",
+    "10: allow /a/*//a/b/git-upload-pack / owners": "none",
+    "11: allow /a/*//git-upload-pack / owners": "none",
+    "12: allow /a/*//a//b / owners": "none",
+    "1: allow /a/*//a / owners": "none",
+    "2: allow /a/*//a/ / owners": "owner",
+    "3: allow /a/*//ab / owners": "none",
+    "4: allow /a/*//a/b / owners": "owner",
+    "5: allow /a/*//a/b/c / owners": "none",
+    "6: allow /a/*//a/b/c/d / owners": "none",
+    "7: allow /a/*//x/a/b / owners": "none",
+    "8: allow /a/*//a.b / owners": "none",
+    "9: allow /a/*//a/git-upload-pack / owners": "owner"
+  },
+  "allow /a/**": {
+    "0: allow /a/**// / owners": "none",
+    "10: allow /a/**//a/b/git-upload-pack / owners": "owner",
+    "11: allow /a/**//git-upload-pack / owners": "none",
+    "12: allow /a/**//a//b / owners": "owner",
+    "1: allow /a/**//a / owners": "none",
+    "2: allow /a/**//a/ / owners": "owner",
+    "3: allow /a/**//ab / owners": "none",
+    "4: allow /a/**//a/b / owners": "owner",
+    "5: allow /a/**//a/b/c / owners": "owner",
+    "6: allow /a/**//a/b/c/d / owners": "owner",
+    "7: allow /a/**//x/a/b / owners": "none",
+    "8: allow /a/**//a.b / owners": "none",
+    "9: allow /a/**//a/git-upload-pack / owners": "owner"
+  },
+  "allow /a/**/b": {
+    "0: allow /a/**/b// / owners": "none",
+    "10: allow /a/**/b//a/b/git-upload-pack / owners": "none",
+    "11: allow /a/**/b//git-upload-pack / owners": "none",
+    "12: allow /a/**/b//a//b / owners": "owner",
+    "1: allow /a/**/b//a / owners": "none",
+    "2: allow /a/**/b//a/ / owners": "none",
+    "3: allow /a/**/b//ab / owners": "none",
+    "4: allow /a/**/b//a/b / owners": "owner",
+    "5: allow /a/**/b//a/b/c / owners": "none",
+    "6: allow /a/**/b//a/b/c/d / owners": "none",
+    "7: allow /a/**/b//x/a/b / owners": "none",
+    "8: allow /a/**/b//a.b / owners": "none",
+    "9: allow /a/**/b//a/git-upload-pack / owners": "none"
+  },
+  "allow /a/**/c/**": {
+    "0: allow /a/**/c/**// / owners": "none",
+    "10: allow /a/**/c/**//a/b/git-upload-pack / owners": "none",
+    "11: allow /a/**/c/**//git-upload-pack / owners": "none",
+    "12: allow /a/**/c/**//a//b / owners": "none",
+    "1: allow /a/**/c/**//a / owners": "none",
+    "2: allow /a/**/c/**//a/ / owners": "none",
+    "3: allow /a/**/c/**//ab / owners": "none",
+    "4: allow /a/**/c/**//a/b / owners": "none",
+    "5: allow /a/**/c/**//a/b/c / owners": "none",
+    "6: allow /a/**/c/**//a/b/c/d / owners": "owner",
+    "7: allow /a/**/c/**//x/a/b / owners": "none",
+    "8: allow /a/**/c/**//a.b / owners": "none",
+    "9: allow /a/**/c/**//a/git-upload-pack / owners": "none"
+  },
+  "allow /a/**b": {
+    "0: allow /a/**b// / owners": "none",
+    "10: allow /a/**b//a/b/git-upload-pack / owners": "none",
+    "11: allow /a/**b//git-upload-pack / owners": "none",
+    "12: allow /a/**b//a//b / owners": "none",
+    "1: allow /a/**b//a / owners": "none",
+    "2: allow /a/**b//a/ / owners": "none",
+    "3: allow /a/**b//ab / owners": "none",
+    "4: allow /a/**b//a/b / owners": "owner",
+    "5: allow /a/**b//a/b/c / owners": "none",
+    "6: allow /a/**b//a/b/c/d / owners": "none",
+    "7: allow /a/**b//x/a/b / owners": "none",
+    "8: allow /a/**b//a.b / owners": "none",
+    "9: allow /a/**b//a/git-upload-pack / owners": "none"
+  },
+  "allow /a/*/c": {
+    "0: allow /a/*/c// / owners": "none",
+    "10: allow /a/*/c//a/b/git-upload-pack / owners": "none",
+    "11: allow /a/*/c//git-upload-pack / owners": "none",
+    "12: allow /a/*/c//a//b / owners": "none",
+    "1: allow /a/*/c//a / owners": "none",
+    "2: allow /a/*/c//a/ / owners": "none",
+    "3: allow /a/*/c//ab / owners": "none",
+    "4: allow /a/*/c//a/b / owners": "none",
+    "5: allow /a/*/c//a/b/c / owners": "owner",
+    "6: allow /a/*/c//a/b/c/d / owners": "none",
+    "7: allow /a/*/c//x/a/b / owners": "none",
+    "8: allow /a/*/c//a.b / owners": "none",
+    "9: allow /a/*/c//a/git-upload-pack / owners": "none"
+  },
+  "allowed_ips modes": {
+    "0: opa.rs::allowed_ips_mode1_no_ips_returns_empty public / destination": "admitted",
+    "10: opa.rs::allowed_ips_mode3_hostless_allows_any_domain allow / connect": "allow",
+    "11: opa.rs::allowed_ips_mode3_hostless_allows_any_domain range / destination": "admitted",
+    "12: opa.rs::allowed_ips_mode3_returns_allowed_ips single address / destination": "admitted",
+    "13: opa.rs::allowed_ips_mode3_returns_allowed_ips next address / destination": "rejected",
+    "14: opa.rs::allowed_ips_mode3_returns_allowed_ips public / destination": "rejected",
+    "15: opa.rs::allowed_ips_mode3_wrong_port_denied wrong port / connect": "deny",
+    "16: opa.rs::allowed_ips_mode3_hostless_allows_any_domain not policy DNS eligible / dns-eligible": "ineligible",
+    "17: opa.rs::allowed_ips_mode3_hostless_allows_any_domain dns refused / dns-answers": "no mapping for port",
+    "18: opa.rs::exact_declared_endpoint_host_true_for_host_with_allowed_ips / exact-host": "exact",
+    "19: opa.rs::exact_declared_endpoint_host_false_for_hostless_allowed_ips / exact-host": "not-exact",
+    "1: opa.rs::allowed_ips_mode1_no_ips_returns_empty private / destination": "admitted",
+    "20: ALLOWED_IPS_TEST_DATA wildcard private / destination": "rejected",
+    "21: ALLOWED_IPS_TEST_DATA wildcard public / destination": "admitted",
+    "22: opa.rs::egress_authorization_returns_one_generation_consistent_snapshot allow / connect": "allow",
+    "23: opa.rs::egress_authorization_returns_one_generation_consistent_snapshot exact / exact-host": "exact",
+    "24: opa.rs::egress_authorization_returns_one_generation_consistent_snapshot matched / matched-endpoints": "my-service.corp.net:8080",
+    "2: opa.rs::allowed_ips_mode1_no_ips_returns_empty loopback / destination": "rejected",
+    "3: opa.rs::allowed_ips_mode2_host_plus_ips_allows allow / connect": "allow",
+    "4: opa.rs::allowed_ips_mode2_host_plus_ips_allows other binary / connect": "deny",
+    "5: opa.rs::allowed_ips_mode2_returns_allowed_ips inside / destination": "admitted",
+    "6: opa.rs::allowed_ips_mode2_returns_allowed_ips private outside / destination": "rejected",
+    "7: opa.rs::allowed_ips_mode2_returns_allowed_ips public outside / destination": "rejected",
+    "8: opa.rs::allowed_ips_mode2_returns_allowed_ips one address outside / destination": "rejected",
+    "9: opa.rs::allowed_ips_mode2_returns_allowed_ips dns answers / dns-answers": "10.0.5.7"
+  },
+  "allowed_ips proto round trip": {
+    "0: opa.rs::allowed_ips_proto_round_trip first range / destination": "admitted",
+    "1: opa.rs::allowed_ips_proto_round_trip second range / destination": "admitted",
+    "2: opa.rs::allowed_ips_proto_round_trip outside / destination": "rejected"
+  },
+  "audit denial and missing owner metadata": {
+    "0: opa.rs::l7_token_grant_owners_exclude_audit_denial_and_missing_metadata/audit denied / request": "deny",
+    "1: opa.rs::l7_token_grant_owners_exclude_audit_denial_and_missing_metadata/audit denial admits none / owners": "none",
+    "2: audit denial and missing owner metadata/audit allow admits its owner / owners": "owner-audit",
+    "3: audit denial and missing owner metadata/inspection / inspection": "Rest/Audit",
+    "4: opa.rs::l7_token_grant_owners_exclude_audit_denial_and_missing_metadata/missing forwarded / request": "allow",
+    "5: opa.rs::l7_token_grant_owners_exclude_audit_denial_and_missing_metadata/missing / owners": "none",
+    "6: opa.rs::l7_token_grant_owners_exclude_audit_denial_and_missing_metadata/empty forwarded / request": "allow",
+    "7: opa.rs::l7_token_grant_owners_exclude_audit_denial_and_missing_metadata/empty / owners": "none"
+  },
+  "audit endpoint beside an enforced path": {
+    "0: audit deny rule on the enforced path / relay": "403/blocked",
+    "1: audit allow rule on the enforced path / relay": "204/forwarded",
+    "2: allowed on the enforced path / relay": "204/forwarded",
+    "3: audited denial on the audit path / relay": "204/forwarded"
+  },
+  "audit endpoint beside an enforced path, rules split by enforcement": {
+    "0: audit deny rule on the enforced path / relay": "403/blocked",
+    "1: audit allow rule on the enforced path / relay": "204/forwarded",
+    "2: allowed on the enforced path / relay": "204/forwarded",
+    "3: audited denial on the audit path / relay": "204/forwarded"
+  },
+  "audited GraphQL and REST routes": {
+    "0: relay.rs::route_selected_graphql_websocket_upgrade_is_denied_before_forwarding/audit / relay": "403/blocked/marker",
+    "1: relay.rs::route_selected_audit_graphql_upgrade_with_denied_query_is_refused / relay": "403/blocked/marker",
+    "2: audited GraphQL and REST routes/denied query is forwarded / relay": "204/forwarded",
+    "3: audited GraphQL and REST routes/enforced REST route / relay": "403/blocked"
+  },
+  "audited JSON-RPC and REST routes": {
+    "0: relay.rs::route_selected_audit_jsonrpc_websocket_upgrade_is_denied_before_forwarding / relay": "403/blocked/marker",
+    "1: audited JSON-RPC and REST routes/inspection / inspection": "JsonRpc/Audit,Rest/Enforce"
+  },
+  "binary and query restrictions": {
+    "0: opa.rs::l7_token_grant_owners_preserve_binary_and_query_restrictions/argv / owners": "none",
+    "1: opa.rs::l7_token_grant_owners_preserve_binary_and_query_restrictions/ancestor / owners": "owner",
+    "2: opa.rs::l7_token_grant_owners_preserve_binary_and_query_restrictions/every query value / owners": "none",
+    "3: binary and query restrictions/calling binary matches the glob / owners": "owner"
+  },
+  "compatibility.rs identity": {
+    "0: compatibility.rs::identity_required_policy_accepts_real_binary_and_rejects_empty_exec_path/real binary / connect": "allow",
+    "1: compatibility.rs::identity_required_policy_accepts_real_binary_and_rejects_empty_exec_path/empty path / connect": "deny"
+  },
+  "deny **": {
+    "0: deny **// / owners": "none",
+    "10: deny **//a/b/git-upload-pack / owners": "none",
+    "11: deny **//git-upload-pack / owners": "none",
+    "12: deny **//a//b / owners": "none",
+    "1: deny **//a / owners": "none",
+    "2: deny **//a/ / owners": "none",
+    "3: deny **//ab / owners": "none",
+    "4: deny **//a/b / owners": "none",
+    "5: deny **//a/b/c / owners": "none",
+    "6: deny **//a/b/c/d / owners": "none",
+    "7: deny **//x/a/b / owners": "none",
+    "8: deny **//a.b / owners": "none",
+    "9: deny **//a/git-upload-pack / owners": "none"
+  },
+  "deny **/b": {
+    "0: deny **/b// / owners": "owner",
+    "10: deny **/b//a/b/git-upload-pack / owners": "owner",
+    "11: deny **/b//git-upload-pack / owners": "owner",
+    "12: deny **/b//a//b / owners": "none",
+    "1: deny **/b//a / owners": "owner",
+    "2: deny **/b//a/ / owners": "owner",
+    "3: deny **/b//ab / owners": "owner",
+    "4: deny **/b//a/b / owners": "none",
+    "5: deny **/b//a/b/c / owners": "owner",
+    "6: deny **/b//a/b/c/d / owners": "owner",
+    "7: deny **/b//x/a/b / owners": "none",
+    "8: deny **/b//a.b / owners": "owner",
+    "9: deny **/b//a/git-upload-pack / owners": "owner"
+  },
+  "deny /**": {
+    "0: deny /**// / owners": "none",
+    "10: deny /**//a/b/git-upload-pack / owners": "none",
+    "11: deny /**//git-upload-pack / owners": "none",
+    "12: deny /**//a//b / owners": "none",
+    "1: deny /**//a / owners": "none",
+    "2: deny /**//a/ / owners": "none",
+    "3: deny /**//ab / owners": "none",
+    "4: deny /**//a/b / owners": "none",
+    "5: deny /**//a/b/c / owners": "none",
+    "6: deny /**//a/b/c/d / owners": "none",
+    "7: deny /**//x/a/b / owners": "none",
+    "8: deny /**//a.b / owners": "none",
+    "9: deny /**//a/git-upload-pack / owners": "none"
+  },
+  "deny /**/git-upload-pack": {
+    "0: deny /**/git-upload-pack// / owners": "owner",
+    "10: deny /**/git-upload-pack//a/b/git-upload-pack / owners": "none",
+    "11: deny /**/git-upload-pack//git-upload-pack / owners": "none",
+    "12: deny /**/git-upload-pack//a//b / owners": "owner",
+    "1: deny /**/git-upload-pack//a / owners": "owner",
+    "2: deny /**/git-upload-pack//a/ / owners": "owner",
+    "3: deny /**/git-upload-pack//ab / owners": "owner",
+    "4: deny /**/git-upload-pack//a/b / owners": "owner",
+    "5: deny /**/git-upload-pack//a/b/c / owners": "owner",
+    "6: deny /**/git-upload-pack//a/b/c/d / owners": "owner",
+    "7: deny /**/git-upload-pack//x/a/b / owners": "owner",
+    "8: deny /**/git-upload-pack//a.b / owners": "owner",
+    "9: deny /**/git-upload-pack//a/git-upload-pack / owners": "none"
+  },
+  "deny /*/b": {
+    "0: deny /*/b// / owners": "owner",
+    "10: deny /*/b//a/b/git-upload-pack / owners": "owner",
+    "11: deny /*/b//git-upload-pack / owners": "owner",
+    "12: deny /*/b//a//b / owners": "owner",
+    "1: deny /*/b//a / owners": "owner",
+    "2: deny /*/b//a/ / owners": "owner",
+    "3: deny /*/b//ab / owners": "owner",
+    "4: deny /*/b//a/b / owners": "none",
+    "5: deny /*/b//a/b/c / owners": "owner",
+    "6: deny /*/b//a/b/c/d / owners": "owner",
+    "7: deny /*/b//x/a/b / owners": "owner",
+    "8: deny /*/b//a.b / owners": "owner",
+    "9: deny /*/b//a/git-upload-pack / owners": "owner"
+  },
+  "deny /a*": {
+    "0: deny /a*// / owners": "owner",
+    "10: deny /a*//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a*//git-upload-pack / owners": "owner",
+    "12: deny /a*//a//b / owners": "owner",
+    "1: deny /a*//a / owners": "none",
+    "2: deny /a*//a/ / owners": "owner",
+    "3: deny /a*//ab / owners": "none",
+    "4: deny /a*//a/b / owners": "owner",
+    "5: deny /a*//a/b/c / owners": "owner",
+    "6: deny /a*//a/b/c/d / owners": "owner",
+    "7: deny /a*//x/a/b / owners": "owner",
+    "8: deny /a*//a.b / owners": "none",
+    "9: deny /a*//a/git-upload-pack / owners": "owner"
+  },
+  "deny /a**": {
+    "0: deny /a**// / owners": "owner",
+    "10: deny /a**//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a**//git-upload-pack / owners": "owner",
+    "12: deny /a**//a//b / owners": "owner",
+    "1: deny /a**//a / owners": "none",
+    "2: deny /a**//a/ / owners": "owner",
+    "3: deny /a**//ab / owners": "none",
+    "4: deny /a**//a/b / owners": "owner",
+    "5: deny /a**//a/b/c / owners": "owner",
+    "6: deny /a**//a/b/c/d / owners": "owner",
+    "7: deny /a**//x/a/b / owners": "owner",
+    "8: deny /a**//a.b / owners": "none",
+    "9: deny /a**//a/git-upload-pack / owners": "owner"
+  },
+  "deny /a.*": {
+    "0: deny /a.*// / owners": "owner",
+    "10: deny /a.*//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a.*//git-upload-pack / owners": "owner",
+    "12: deny /a.*//a//b / owners": "owner",
+    "1: deny /a.*//a / owners": "owner",
+    "2: deny /a.*//a/ / owners": "owner",
+    "3: deny /a.*//ab / owners": "owner",
+    "4: deny /a.*//a/b / owners": "owner",
+    "5: deny /a.*//a/b/c / owners": "owner",
+    "6: deny /a.*//a/b/c/d / owners": "owner",
+    "7: deny /a.*//x/a/b / owners": "owner",
+    "8: deny /a.*//a.b / owners": "none",
+    "9: deny /a.*//a/git-upload-pack / owners": "owner"
+  },
+  "deny /a/*": {
+    "0: deny /a/*// / owners": "owner",
+    "10: deny /a/*//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a/*//git-upload-pack / owners": "owner",
+    "12: deny /a/*//a//b / owners": "owner",
+    "1: deny /a/*//a / owners": "owner",
+    "2: deny /a/*//a/ / owners": "none",
+    "3: deny /a/*//ab / owners": "owner",
+    "4: deny /a/*//a/b / owners": "none",
+    "5: deny /a/*//a/b/c / owners": "owner",
+    "6: deny /a/*//a/b/c/d / owners": "owner",
+    "7: deny /a/*//x/a/b / owners": "owner",
+    "8: deny /a/*//a.b / owners": "owner",
+    "9: deny /a/*//a/git-upload-pack / owners": "none"
+  },
+  "deny /a/**": {
+    "0: deny /a/**// / owners": "owner",
+    "10: deny /a/**//a/b/git-upload-pack / owners": "none",
+    "11: deny /a/**//git-upload-pack / owners": "owner",
+    "12: deny /a/**//a//b / owners": "none",
+    "1: deny /a/**//a / owners": "owner",
+    "2: deny /a/**//a/ / owners": "none",
+    "3: deny /a/**//ab / owners": "owner",
+    "4: deny /a/**//a/b / owners": "none",
+    "5: deny /a/**//a/b/c / owners": "none",
+    "6: deny /a/**//a/b/c/d / owners": "none",
+    "7: deny /a/**//x/a/b / owners": "owner",
+    "8: deny /a/**//a.b / owners": "owner",
+    "9: deny /a/**//a/git-upload-pack / owners": "none"
+  },
+  "deny /a/**/b": {
+    "0: deny /a/**/b// / owners": "owner",
+    "10: deny /a/**/b//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a/**/b//git-upload-pack / owners": "owner",
+    "12: deny /a/**/b//a//b / owners": "none",
+    "1: deny /a/**/b//a / owners": "owner",
+    "2: deny /a/**/b//a/ / owners": "owner",
+    "3: deny /a/**/b//ab / owners": "owner",
+    "4: deny /a/**/b//a/b / owners": "none",
+    "5: deny /a/**/b//a/b/c / owners": "owner",
+    "6: deny /a/**/b//a/b/c/d / owners": "owner",
+    "7: deny /a/**/b//x/a/b / owners": "owner",
+    "8: deny /a/**/b//a.b / owners": "owner",
+    "9: deny /a/**/b//a/git-upload-pack / owners": "owner"
+  },
+  "deny /a/**/c/**": {
+    "0: deny /a/**/c/**// / owners": "owner",
+    "10: deny /a/**/c/**//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a/**/c/**//git-upload-pack / owners": "owner",
+    "12: deny /a/**/c/**//a//b / owners": "owner",
+    "1: deny /a/**/c/**//a / owners": "owner",
+    "2: deny /a/**/c/**//a/ / owners": "owner",
+    "3: deny /a/**/c/**//ab / owners": "owner",
+    "4: deny /a/**/c/**//a/b / owners": "owner",
+    "5: deny /a/**/c/**//a/b/c / owners": "owner",
+    "6: deny /a/**/c/**//a/b/c/d / owners": "none",
+    "7: deny /a/**/c/**//x/a/b / owners": "owner",
+    "8: deny /a/**/c/**//a.b / owners": "owner",
+    "9: deny /a/**/c/**//a/git-upload-pack / owners": "owner"
+  },
+  "deny /a/**b": {
+    "0: deny /a/**b// / owners": "owner",
+    "10: deny /a/**b//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a/**b//git-upload-pack / owners": "owner",
+    "12: deny /a/**b//a//b / owners": "owner",
+    "1: deny /a/**b//a / owners": "owner",
+    "2: deny /a/**b//a/ / owners": "owner",
+    "3: deny /a/**b//ab / owners": "owner",
+    "4: deny /a/**b//a/b / owners": "none",
+    "5: deny /a/**b//a/b/c / owners": "owner",
+    "6: deny /a/**b//a/b/c/d / owners": "owner",
+    "7: deny /a/**b//x/a/b / owners": "owner",
+    "8: deny /a/**b//a.b / owners": "owner",
+    "9: deny /a/**b//a/git-upload-pack / owners": "owner"
+  },
+  "deny /a/*/c": {
+    "0: deny /a/*/c// / owners": "owner",
+    "10: deny /a/*/c//a/b/git-upload-pack / owners": "owner",
+    "11: deny /a/*/c//git-upload-pack / owners": "owner",
+    "12: deny /a/*/c//a//b / owners": "owner",
+    "1: deny /a/*/c//a / owners": "owner",
+    "2: deny /a/*/c//a/ / owners": "owner",
+    "3: deny /a/*/c//ab / owners": "owner",
+    "4: deny /a/*/c//a/b / owners": "owner",
+    "5: deny /a/*/c//a/b/c / owners": "none",
+    "6: deny /a/*/c//a/b/c/d / owners": "owner",
+    "7: deny /a/*/c//x/a/b / owners": "owner",
+    "8: deny /a/*/c//a.b / owners": "owner",
+    "9: deny /a/*/c//a/git-upload-pack / owners": "owner"
+  },
+  "deny rule on GET": {
+    "0: opa.rs::l7_head_blocked_by_deny_rule_targeting_get / request": "deny"
+  },
+  "dev policy": {
+    "0: opa.rs::network_action_with_dev_policy / claude / connect": "allow",
+    "1: opa.rs::network_action_with_dev_policy / git / connect": "allow",
+    "2: opa.rs::deny_reason_includes_symlink_hint / connect": "deny",
+    "3: opa.rs::deny_reason_collapses_endpoint_misses / connect": "deny"
+  },
+  "endpoint path **": {
+    "0: endpoint path **// / owners": "owner",
+    "10: endpoint path **//a/b/git-upload-pack / owners": "owner",
+    "11: endpoint path **//git-upload-pack / owners": "owner",
+    "12: endpoint path **//a//b / owners": "owner",
+    "1: endpoint path **//a / owners": "owner",
+    "2: endpoint path **//a/ / owners": "owner",
+    "3: endpoint path **//ab / owners": "owner",
+    "4: endpoint path **//a/b / owners": "owner",
+    "5: endpoint path **//a/b/c / owners": "owner",
+    "6: endpoint path **//a/b/c/d / owners": "owner",
+    "7: endpoint path **//x/a/b / owners": "owner",
+    "8: endpoint path **//a.b / owners": "owner",
+    "9: endpoint path **//a/git-upload-pack / owners": "owner"
+  },
+  "endpoint path /a": {
+    "0: endpoint path /a// / owners": "none",
+    "10: endpoint path /a//a/b/git-upload-pack / owners": "none",
+    "11: endpoint path /a//git-upload-pack / owners": "none",
+    "12: endpoint path /a//a//b / owners": "none",
+    "1: endpoint path /a//a / owners": "owner",
+    "2: endpoint path /a//a/ / owners": "none",
+    "3: endpoint path /a//ab / owners": "none",
+    "4: endpoint path /a//a/b / owners": "none",
+    "5: endpoint path /a//a/b/c / owners": "none",
+    "6: endpoint path /a//a/b/c/d / owners": "none",
+    "7: endpoint path /a//x/a/b / owners": "none",
+    "8: endpoint path /a//a.b / owners": "none",
+    "9: endpoint path /a//a/git-upload-pack / owners": "none"
+  },
+  "endpoint path /a*/b": {
+    "0: endpoint path /a*/b// / owners": "none",
+    "10: endpoint path /a*/b//a/b/git-upload-pack / owners": "none",
+    "11: endpoint path /a*/b//git-upload-pack / owners": "none",
+    "12: endpoint path /a*/b//a//b / owners": "owner",
+    "1: endpoint path /a*/b//a / owners": "none",
+    "2: endpoint path /a*/b//a/ / owners": "none",
+    "3: endpoint path /a*/b//ab / owners": "none",
+    "4: endpoint path /a*/b//a/b / owners": "owner",
+    "5: endpoint path /a*/b//a/b/c / owners": "none",
+    "6: endpoint path /a*/b//a/b/c/d / owners": "none",
+    "7: endpoint path /a*/b//x/a/b / owners": "none",
+    "8: endpoint path /a*/b//a.b / owners": "none",
+    "9: endpoint path /a*/b//a/git-upload-pack / owners": "none"
+  },
+  "endpoint path /a.b/**": {
+    "0: endpoint path /a.b/**// / owners": "none",
+    "10: endpoint path /a.b/**//a/b/git-upload-pack / owners": "none",
+    "11: endpoint path /a.b/**//git-upload-pack / owners": "none",
+    "12: endpoint path /a.b/**//a//b / owners": "none",
+    "1: endpoint path /a.b/**//a / owners": "none",
+    "2: endpoint path /a.b/**//a/ / owners": "none",
+    "3: endpoint path /a.b/**//ab / owners": "none",
+    "4: endpoint path /a.b/**//a/b / owners": "none",
+    "5: endpoint path /a.b/**//a/b/c / owners": "none",
+    "6: endpoint path /a.b/**//a/b/c/d / owners": "none",
+    "7: endpoint path /a.b/**//x/a/b / owners": "none",
+    "8: endpoint path /a.b/**//a.b / owners": "owner",
+    "9: endpoint path /a.b/**//a/git-upload-pack / owners": "none"
+  },
+  "endpoint path /a/*": {
+    "0: endpoint path /a/*// / owners": "none",
+    "10: endpoint path /a/*//a/b/git-upload-pack / owners": "owner",
+    "11: endpoint path /a/*//git-upload-pack / owners": "none",
+    "12: endpoint path /a/*//a//b / owners": "owner",
+    "1: endpoint path /a/*//a / owners": "none",
+    "2: endpoint path /a/*//a/ / owners": "owner",
+    "3: endpoint path /a/*//ab / owners": "none",
+    "4: endpoint path /a/*//a/b / owners": "owner",
+    "5: endpoint path /a/*//a/b/c / owners": "owner",
+    "6: endpoint path /a/*//a/b/c/d / owners": "owner",
+    "7: endpoint path /a/*//x/a/b / owners": "none",
+    "8: endpoint path /a/*//a.b / owners": "none",
+    "9: endpoint path /a/*//a/git-upload-pack / owners": "owner"
+  },
+  "endpoint path /a/**": {
+    "0: endpoint path /a/**// / owners": "none",
+    "10: endpoint path /a/**//a/b/git-upload-pack / owners": "owner",
+    "11: endpoint path /a/**//git-upload-pack / owners": "none",
+    "12: endpoint path /a/**//a//b / owners": "owner",
+    "1: endpoint path /a/**//a / owners": "owner",
+    "2: endpoint path /a/**//a/ / owners": "owner",
+    "3: endpoint path /a/**//ab / owners": "none",
+    "4: endpoint path /a/**//a/b / owners": "owner",
+    "5: endpoint path /a/**//a/b/c / owners": "owner",
+    "6: endpoint path /a/**//a/b/c/d / owners": "owner",
+    "7: endpoint path /a/**//x/a/b / owners": "none",
+    "8: endpoint path /a/**//a.b / owners": "none",
+    "9: endpoint path /a/**//a/git-upload-pack / owners": "owner"
+  },
+  "equal selector, other binary": {
+    "0: relay/token_grant_ownership_tests.rs::equal_selector_does_not_authorize_another_binarys_grant / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::equal_selector_does_not_authorize_another_binarys_grant / owners": "allowed",
+    "2: equal selector, other binary/owning binary / owners": "owner"
+  },
+  "exact declared host": {
+    "0: opa.rs::exact_declared_endpoint_host_true_for_l4_host_only / no L7 config / inspection": "none",
+    "1: opa.rs::exact_declared_endpoint_host_true_for_l4_host_only / exact-host": "exact",
+    "2: opa.rs::exact_declared_endpoint_host_false_for_wildcard_host / allowed / connect": "allow",
+    "3: opa.rs::exact_declared_endpoint_host_false_for_wildcard_host / exact-host": "not-exact"
+  },
+  "exact endpoint admission": {
+    "0: opa.rs::l7_token_grant_owners_require_exact_endpoint_admission/GET forwarded / request": "allow",
+    "1: opa.rs::l7_token_grant_owners_require_exact_endpoint_admission/GET owner / owners": "owner-broad",
+    "2: opa.rs::l7_token_grant_owners_require_exact_endpoint_admission/POST forwarded / request": "allow",
+    "3: opa.rs::l7_token_grant_owners_require_exact_endpoint_admission/POST owner / owners": "owner-narrow"
+  },
+  "forward inspection": {
+    "0: proxy/tests/token_grants.rs::forward_inspection_selects_only_the_owner_admitting_the_request / request": "allow",
+    "1: proxy/tests/token_grants.rs::forward_inspection_selects_only_the_owner_admitting_the_request / owners": "other-owner",
+    "2: proxy/tests/token_grants.rs::forward_inspection_selects_only_the_owner_admitting_the_request / request": "allow",
+    "3: proxy/tests/token_grants.rs::forward_inspection_selects_only_the_owner_admitting_the_request / owners": "test-owner",
+    "4: proxy/tests/token_grants.rs::forward_inspection_retains_installation_through_guarded_write / owners": "test-owner"
+  },
+  "global deny": {
+    "0: global deny/GET / owners": "owner",
+    "1: global deny/get / owners": "owner",
+    "2: global deny/HEAD / owners": "owner",
+    "3: global deny/POST / owners": "none",
+    "4: global deny/post / owners": "none",
+    "5: global deny/PUT / owners": "owner",
+    "6: global deny/OPTIONS / owners": "owner",
+    "7: global deny/DELETE / owners": "owner"
+  },
+  "graphql": {
+    "0: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added / request": "allow",
+    "0: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added/multiple routes / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added / owners": "native",
+    "1: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added/multiple routes / owners": "native",
+    "2: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes / request": "deny",
+    "2: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes/multiple routes / request": "deny",
+    "3: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes / owners": "none",
+    "3: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes/multiple routes / owners": "none",
+    "4: native protocol beside REST/unrelated route / owners": "unrelated",
+    "5: native protocol beside REST/inspection / inspection": "Graphql/Enforce,Rest/Enforce"
+  },
+  "graphql.rs field policy": {
+    "0: graphql.rs::absolute_form_chunked_graphql_post_is_allowed_by_field_policy / request": "allow"
+  },
+  "host.containers.internal": {
+    "0: policy_dns/mod.rs::reserved_gateway_alias_without_trusted_address_never_queries_resolver / dns-eligible": "eligible"
+  },
+  "host.docker.internal": {
+    "0: policy_dns/mod.rs::reserved_gateway_alias_without_trusted_address_never_queries_resolver / dns-eligible": "eligible"
+  },
+  "host.openshell.internal": {
+    "0: policy_dns/mod.rs::reserved_gateway_alias_without_trusted_address_never_queries_resolver / dns-eligible": "eligible"
+  },
+  "intra-label wildcard": {
+    "0: opa.rs::wildcard_host_intra_label_matches / connect": "allow",
+    "1: opa.rs::wildcard_host_intra_label_does_not_cross_dot / connect": "deny"
+  },
+  "json-rpc": {
+    "0: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added / request": "allow",
+    "0: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added/multiple routes / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added / owners": "native",
+    "1: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added/multiple routes / owners": "native",
+    "2: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes / request": "deny",
+    "2: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes/multiple routes / request": "deny",
+    "3: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes / owners": "none",
+    "3: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes/multiple routes / owners": "none",
+    "4: native protocol beside REST/unrelated route / owners": "unrelated",
+    "5: native protocol beside REST/inspection / inspection": "JsonRpc/Enforce,Rest/Enforce"
+  },
+  "mcp": {
+    "0: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added / request": "allow",
+    "0: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added/multiple routes / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added / owners": "native",
+    "1: relay/token_grant_ownership_tests.rs::native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added/multiple routes / owners": "native",
+    "2: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes / request": "deny",
+    "2: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes/multiple routes / request": "deny",
+    "3: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes / owners": "none",
+    "3: relay/token_grant_ownership_tests.rs::native_protocol_denials_do_not_resolve_grants_or_forward_bytes/multiple routes / owners": "none",
+    "4: native protocol beside REST/unrelated route / owners": "unrelated",
+    "4: relay/token_grant_ownership_tests.rs::missing_grant_owner_metadata_rejects_only_matching_requests / owners": "native",
+    "5: native protocol beside REST/inspection / inspection": "Mcp/Enforce,Rest/Enforce",
+    "6: relay/token_grant_ownership_tests.rs::missing_grant_owner_metadata_rejects_only_matching_requests/multiple routes / owners": "native"
+  },
+  "method *": {
+    "0: method */GET / owners": "owner",
+    "1: method */get / owners": "owner",
+    "2: method */HEAD / owners": "owner",
+    "3: method */POST / owners": "owner",
+    "4: method */post / owners": "owner",
+    "5: method */PUT / owners": "owner",
+    "6: method */OPTIONS / owners": "owner",
+    "7: method */DELETE / owners": "owner"
+  },
+  "method DELETE": {
+    "0: method DELETE/GET / owners": "none",
+    "1: method DELETE/get / owners": "none",
+    "2: method DELETE/HEAD / owners": "none",
+    "3: method DELETE/POST / owners": "none",
+    "4: method DELETE/post / owners": "none",
+    "5: method DELETE/PUT / owners": "none",
+    "6: method DELETE/OPTIONS / owners": "none",
+    "7: method DELETE/DELETE / owners": "owner"
+  },
+  "method GET": {
+    "0: method GET/GET / owners": "owner",
+    "1: method GET/get / owners": "owner",
+    "2: method GET/HEAD / owners": "owner",
+    "3: method GET/POST / owners": "none",
+    "4: method GET/post / owners": "none",
+    "5: method GET/PUT / owners": "none",
+    "6: method GET/OPTIONS / owners": "none",
+    "7: method GET/DELETE / owners": "none"
+  },
+  "method post": {
+    "0: method post/GET / owners": "none",
+    "1: method post/get / owners": "none",
+    "2: method post/HEAD / owners": "none",
+    "3: method post/POST / owners": "owner",
+    "4: method post/post / owners": "owner",
+    "5: method post/PUT / owners": "none",
+    "6: method post/OPTIONS / owners": "none",
+    "7: method post/DELETE / owners": "none"
+  },
+  "middle-label wildcard": {
+    "0: opa.rs::wildcard_host_middle_label_matches_one_region_label / connect": "allow",
+    "1: opa.rs::wildcard_host_middle_label_does_not_match_missing_bucket_label / connect": "deny",
+    "2: opa.rs::wildcard_host_middle_label_does_not_skip_dualstack_label / connect": "deny"
+  },
+  "multi-port L7 endpoint": {
+    "0: opa.rs::l7_multi_port_request_evaluation / 8080 / request": "allow",
+    "1: opa.rs::l7_multi_port_request_evaluation / 9090 / request": "allow"
+  },
+  "multi-port endpoint": {
+    "0: opa.rs::multi_port_endpoint_matches_first_port / connect": "allow",
+    "1: opa.rs::multi_port_endpoint_matches_second_port / connect": "allow",
+    "2: opa.rs::multi_port_endpoint_rejects_unlisted_port / connect": "deny",
+    "3: opa.rs::from_proto_multi_port_allows_matching / 443 / connect": "allow",
+    "4: opa.rs::from_proto_multi_port_allows_matching / 8443 / connect": "allow",
+    "5: opa.rs::from_proto_multi_port_allows_matching / 80 / connect": "deny"
+  },
+  "none": {
+    "0: relay/token_grant_ownership_tests.rs::jsonrpc_batch_requires_one_owner_to_admit_every_member / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::jsonrpc_batch_requires_one_owner_to_admit_every_member / request": "allow",
+    "2: relay/token_grant_ownership_tests.rs::jsonrpc_batch_requires_one_owner_to_admit_every_member / owners": "none",
+    "3: JSON-RPC batch/first member alone / owners": "first"
+  },
+  "opa.rs GraphQL persisted queries": {
+    "0: opa.rs::l7_graphql_registered_hash_only_query_allowed / request": "allow",
+    "1: opa.rs::l7_graphql_unregistered_hash_only_query_denied / request": "deny",
+    "2: opa.rs::l7_graphql_unregistered_hash_only_query_has_deny_reason / deny-reason": "deny: GraphQL persisted query is not registered"
+  },
+  "opa.rs L7_DENY_TEST_DATA deny_with_query": {
+    "0: opa.rs::l7_deny_rule_with_query_blocks_matching_params / request": "deny",
+    "1: opa.rs::l7_deny_rule_with_query_allows_non_matching_params / request": "allow",
+    "2: opa.rs::l7_deny_rule_with_query_blocks_when_any_value_matches / request": "deny",
+    "3: opa.rs::l7_deny_rule_without_matching_query_key_allows / request": "allow",
+    "4: deny_with_query/a dotted value does not match the literal / request": "allow",
+    "5: deny_with_query/the deny rule needs its path / request": "allow"
+  },
+  "opa.rs L7_TEST_DATA": {
+    "0: opa.rs::l7_get_allowed_by_rules / request": "allow",
+    "10: opa.rs::l7_readonly_preset_allows_head / request": "allow",
+    "11: opa.rs::l7_readonly_preset_allows_options / request": "allow",
+    "12: opa.rs::l7_readonly_preset_denies_post / request": "deny",
+    "13: opa.rs::l7_readonly_preset_denies_delete / request": "deny",
+    "14: opa.rs::l7_graphql_query_allowed_by_field_rule / request": "allow",
+    "15: opa.rs::l7_graphql_unlisted_field_denied / request": "deny",
+    "16: opa.rs::l7_graphql_batch_denied_if_any_operation_unallowed / request": "deny",
+    "17: opa.rs::l7_graphql_deny_rule_takes_precedence / request": "deny",
+    "18: opa.rs::l7_graphql_parse_error_denied / request": "deny",
+    "19: opa.rs::l7_graphql_readonly_access_allows_query_and_denies_mutation/query / request": "allow",
+    "1: opa.rs::l7_post_allowed_by_rules / request": "allow",
+    "20: opa.rs::l7_graphql_readonly_access_allows_query_and_denies_mutation/mutation / request": "deny",
+    "21: opa.rs::l7_no_request_on_l4_only_endpoint / request": "deny",
+    "22: opa.rs::l7_full_preset_allows_everything/GET / request": "allow",
+    "23: opa.rs::l7_full_preset_allows_everything/POST / request": "allow",
+    "24: opa.rs::l7_full_preset_allows_everything/PUT / request": "allow",
+    "25: opa.rs::l7_full_preset_allows_everything/DELETE / request": "allow",
+    "26: opa.rs::l7_full_preset_allows_everything/PATCH / request": "allow",
+    "27: opa.rs::l7_full_preset_allows_everything/OPTIONS / request": "allow",
+    "28: opa.rs::l7_full_preset_allows_everything/HEAD / request": "allow",
+    "2: opa.rs::l7_delete_denied_by_rules / request": "deny",
+    "3: opa.rs::l7_deny_reason_populated / request": "deny",
+    "4: opa.rs::l7_get_wrong_path_denied / request": "deny",
+    "5: opa.rs::l7_method_matching_case_insensitive / request": "allow",
+    "6: opa.rs::l7_path_glob_matching / request": "allow",
+    "7: opa.rs::l7_wrong_binary_denied_even_with_matching_rules / request": "deny",
+    "8: opa.rs::l7_endpoint_config_returned_for_l7_endpoint / inspection": "Rest/Enforce",
+    "9: opa.rs::l7_readonly_preset_allows_get / request": "allow"
+  },
+  "opa.rs L7_TEST_DATA explicit TCP": {
+    "0: opa.rs::explicit_tcp_authorizes_as_l4_without_endpoint_config allow / connect": "allow",
+    "1: opa.rs::explicit_tcp_authorizes_as_l4_without_endpoint_config config / inspection": "none",
+    "2: opa.rs::explicit_tcp_authorizes_as_l4_without_endpoint_config exact / exact-host": "exact",
+    "3: opa.rs::explicit_tcp_authorizes_as_l4_without_endpoint_config matched / matched-endpoints": "explicit-tcp.example.com:443/tcp",
+    "4: opa.rs::explicit_tcp_authorizes_as_l4_without_endpoint_config plain L4 control / matched-endpoints": "l4only.example.com:443"
+  },
+  "opa.rs L7_TEST_DATA graphql_ws": {
+    "0: opa.rs::l7_websocket_graphql_subscription_allowed_by_field_rule / request": "allow",
+    "1: opa.rs::l7_websocket_graphql_unlisted_field_denied / request": "deny",
+    "2: opa.rs::l7_websocket_graphql_deny_rule_takes_precedence / request": "deny",
+    "3: graphql_ws/upgrade / request": "allow",
+    "4: graphql_ws/inspection / inspection": "Websocket/Enforce",
+    "5: graphql_ws/relay forwards an allowed subscription / websocket": "101/message-forwarded",
+    "6: graphql_ws/relay blocks a denied mutation / websocket": "101/message-blocked",
+    "7: graphql_ws/relay forwards a control message / websocket": "101/message-forwarded",
+    "8: graphql_ws/relay blocks a message that is not GraphQL over WebSocket / websocket": "101/message-blocked"
+  },
+  "opa.rs L7_TEST_DATA query_api": {
+    "0: opa.rs::l7_query_glob_allows_matching_duplicate_values / request": "allow",
+    "10: query_api/repeated values over the combination cap / request": {
+      "cedar": "deny",
+      "yaml": "allow"
+    },
+    "1: opa.rs::l7_query_glob_denies_on_mismatched_duplicate_value / request": "deny",
+    "2: opa.rs::l7_query_any_allows_if_every_value_matches_any_pattern / request": "allow",
+    "3: opa.rs::l7_query_missing_required_key_denied / request": "deny",
+    "4: opa.rs::l7_rest_request_ignores_null_jsonrpc_metadata / request": "allow",
+    "5: query_api/a glob star stays within one dot-separated segment / request": "deny",
+    "6: query_api/any denies a value matching no pattern / request": "deny",
+    "7: query_api/relay decodes and forwards matching values / relay": "204/forwarded",
+    "8: query_api/relay blocks a mismatched repeated value / relay": "403/blocked",
+    "9: query_api/65 repeated values within the combination cap / request": "allow"
+  },
+  "opa.rs MCP strict tool names": {
+    "0: opa.rs::l7_endpoint_config_preserves_mcp_strict_tool_names_opt_out / configs": "Mcp/Enforce/tls=Auto/mcp=[2025-03-26,2025-11-25]/strict=false/slash=false/jsonrpc=65536/graphql=65536"
+  },
+  "opa.rs cmdline paths": {
+    "0: opa.rs::cmdline_path_does_not_grant_access / connect": "deny",
+    "1: control: declared binary connects / connect": "allow",
+    "2: opa.rs::cmdline_path_no_match_denied / connect": "deny"
+  },
+  "opa.rs default fixture": {
+    "0: opa.rs::allowed_binary_and_endpoint / connect": "allow",
+    "10: opa.rs::deep_ancestor_chain_matches / connect": "allow",
+    "11: opa.rs::empty_ancestors_falls_back_to_direct / connect": "allow",
+    "12: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/api.anthropic.com / dns-eligible": "eligible",
+    "13: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/statsig.anthropic.com / dns-eligible": "eligible",
+    "14: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/github.com / dns-eligible": "eligible",
+    "15: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/api.github.com / dns-eligible": "eligible",
+    "16: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/api.githubcopilot.com / dns-eligible": "eligible",
+    "17: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/api.individual.githubcopilot.com / dns-eligible": "eligible",
+    "18: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/api.business.githubcopilot.com / dns-eligible": "eligible",
+    "19: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/api.enterprise.githubcopilot.com / dns-eligible": "eligible",
+    "1: opa.rs::from_strings_and_from_files_produce_same_results / connect": "allow",
+    "20: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/copilot-proxy.githubusercontent.com / dns-eligible": "eligible",
+    "21: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/copilot-telemetry.githubusercontent.com / dns-eligible": "eligible",
+    "22: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/default.exp-tas.com / dns-eligible": "eligible",
+    "23: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/origin-tracker.githubusercontent.com / dns-eligible": "eligible",
+    "24: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/release-assets.githubusercontent.com / dns-eligible": "eligible",
+    "25: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/gitlab.com / dns-eligible": "eligible",
+    "26: opa.rs::policy_dns_snapshot_accepts_the_default_multi_policy_shape/undeclared / dns-eligible": "ineligible",
+    "2: opa.rs::wrong_binary_denied / connect": "deny",
+    "3: opa.rs::wrong_endpoint_denied / connect": "deny",
+    "4: opa.rs::unknown_binary_default_deny / connect": "deny",
+    "5: opa.rs::github_policy_allows_git / connect": "allow",
+    "6: opa.rs::case_insensitive_host_matching / connect": "allow",
+    "7: opa.rs::wrong_port_denied / connect": "deny",
+    "8: opa.rs::ancestor_binary_allowed / connect": "allow",
+    "9: opa.rs::no_ancestor_match_denied / connect": "deny"
+  },
+  "opa.rs empty_query (reload)": {
+    "0: opa.rs::yaml_empty_query_matcher_retains_deny_semantics_across_reload/empty / request": "deny",
+    "1: opa.rs::yaml_empty_query_matcher_retains_deny_semantics_across_reload/present / request": "allow"
+  },
+  "opa.rs empty_query (startup)": {
+    "0: opa.rs::yaml_empty_query_matcher_retains_deny_semantics_across_reload/empty / request": "deny",
+    "1: opa.rs::yaml_empty_query_matcher_retains_deny_semantics_across_reload/present / request": "allow"
+  },
+  "opa.rs github git transport": {
+    "0: opa.rs::l7_github_git_transport_allows_clone_blocks_push/info-refs / request": "allow",
+    "1: opa.rs::l7_github_git_transport_allows_clone_blocks_push/upload-pack / request": "allow",
+    "2: opa.rs::l7_github_git_transport_allows_clone_blocks_push/receive-pack / request": "deny"
+  },
+  "opa.rs glob /usr/bin/*": {
+    "0: opa.rs::glob_pattern_matches_binary / connect": "allow",
+    "1: opa.rs::glob_pattern_no_cross_segment / connect": "deny"
+  },
+  "opa.rs glob /usr/local/bin/*": {
+    "0: opa.rs::cmdline_glob_pattern_does_not_grant_access / connect": "deny"
+  },
+  "opa.rs jsonrpc_allow_all": {
+    "0: opa.rs::l7_jsonrpc_allow_all_still_allows_any_method/initialize / request": "allow",
+    "1: opa.rs::l7_jsonrpc_allow_all_still_allows_any_method/reports.archive / request": "allow"
+  },
+  "opa.rs jsonrpc_methods": {
+    "0: opa.rs::l7_jsonrpc_unlisted_method_is_denied / request": "deny"
+  },
+  "opa.rs jsonrpc_null": {
+    "0: opa.rs::l7_jsonrpc_null_metadata_non_matches_without_opa_error / request": "deny"
+  },
+  "opa.rs jsonrpc_params": {
+    "0: opa.rs::l7_jsonrpc_request_params_do_not_affect_method_policy/query / request": "allow",
+    "1: opa.rs::l7_jsonrpc_request_params_do_not_affect_method_policy/scope / request": "allow",
+    "2: opa.rs::l7_jsonrpc_request_params_do_not_affect_method_policy/blocked / request": "allow",
+    "3: opa.rs::l7_jsonrpc_request_params_do_not_affect_method_policy/blocked-args / request": "allow"
+  },
+  "opa.rs jsonrpc_post": {
+    "0: opa.rs::l7_method_rules_require_post/POST / request": "allow",
+    "1: opa.rs::l7_method_rules_require_post/PUT / request": "deny",
+    "2: opa.rs::l7_method_rules_require_post/GET / request": "deny"
+  },
+  "opa.rs jsonrpc_proto": {
+    "0: opa.rs::l7_method_from_proto_is_enforced/initialize / request": "allow",
+    "1: opa.rs::l7_method_from_proto_is_enforced/reports.list / request": "deny"
+  },
+  "opa.rs jsonrpc_response": {
+    "0: opa.rs::l7_jsonrpc_response_post_is_denied_for_matching_endpoint/response / request": "deny",
+    "1: opa.rs::l7_jsonrpc_response_post_is_denied_for_matching_endpoint/mixed / request": "deny",
+    "2: opa.rs::l7_jsonrpc_response_post_is_denied_for_matching_endpoint/other / request": "deny",
+    "3: control: listed call is allowed / request": "allow"
+  },
+  "opa.rs jsonrpc_stream": {
+    "0: opa.rs::l7_jsonrpc_receive_stream_get_is_denied_for_matching_endpoint/rpc / request": "deny",
+    "1: opa.rs::l7_jsonrpc_receive_stream_get_is_denied_for_matching_endpoint/other / request": "deny",
+    "2: opa.rs::l7_jsonrpc_receive_stream_get_is_denied_for_matching_endpoint/bodyless / request": "deny",
+    "3: opa.rs::l7_jsonrpc_receive_stream_get_is_denied_for_matching_endpoint/null-metadata / request": "deny",
+    "4: control: listed call is allowed / request": "allow"
+  },
+  "opa.rs matchers mcp (reload)": {
+    "0: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/mcp allow / request": "allow",
+    "1: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/mcp deny / request": "deny",
+    "2: matchers mcp/deny any second pattern / request": "deny",
+    "3: matchers mcp/a glob star stays within one dot-separated segment / request": "deny"
+  },
+  "opa.rs matchers mcp (startup)": {
+    "0: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/mcp allow / request": "allow",
+    "1: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/mcp deny / request": "deny",
+    "2: matchers mcp/deny any second pattern / request": "deny",
+    "3: matchers mcp/a glob star stays within one dot-separated segment / request": "deny"
+  },
+  "opa.rs matchers rest (reload)": {
+    "0: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/rest allow / request": "allow",
+    "1: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/rest deny / request": "deny"
+  },
+  "opa.rs matchers rest (startup)": {
+    "0: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/rest allow / request": "allow",
+    "1: opa.rs::yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload/rest deny / request": "deny"
+  },
+  "opa.rs mcp extensions": {
+    "0: opa.rs::l7_mcp_extension_requires_an_exact_method_literal/exact / request": "allow",
+    "1: opa.rs::l7_mcp_extension_requires_an_exact_method_literal/unavailable / request": "deny",
+    "2: opa.rs::l7_mcp_extension_requires_an_exact_method_literal/wildcard / request": "deny",
+    "3: opa.rs::l7_mcp_extension_requires_an_exact_method_literal/denied / request": "deny"
+  },
+  "opa.rs mcp_default": {
+    "0: opa.rs::l7_mcp_method_profile_allows_all_tools/tools-call / request": "allow",
+    "1: opa.rs::l7_mcp_method_profile_allows_all_tools/tools-list / request": "allow",
+    "2: opa.rs::l7_mcp_method_profile_allows_all_tools/extension / request": "deny"
+  },
+  "opa.rs mcp_null_params": {
+    "0: opa.rs::l7_mcp_null_params_non_matches_without_opa_error / request": "deny"
+  },
+  "opa.rs mcp_params": {
+    "0: opa.rs::l7_mcp_rules_filter_tools_call/read_status / request": "allow",
+    "1: opa.rs::l7_mcp_rules_filter_tools_call/read_status-other-args / request": "allow",
+    "2: opa.rs::l7_mcp_rules_filter_tools_call/submit_report / request": "allow",
+    "3: opa.rs::l7_mcp_rules_filter_tools_call/blocked_action / request": "deny",
+    "4: opa.rs::l7_mcp_rules_filter_tools_call/unmatched-tool / request": "deny",
+    "5: opa.rs::l7_mcp_rules_filter_tools_call/tools-list / request": "deny"
+  },
+  "opa.rs mcp_proto": {
+    "0: opa.rs::l7_mcp_tool_params_from_proto_are_enforced/read_status / request": "allow",
+    "1: opa.rs::l7_mcp_tool_params_from_proto_are_enforced/blocked_action / request": "deny"
+  },
+  "opa.rs mcp_response": {
+    "0: opa.rs::l7_mcp_response_post_is_allowed_for_matching_endpoint/mcp / request": "allow",
+    "1: opa.rs::l7_mcp_response_post_is_allowed_for_matching_endpoint/other / request": "deny"
+  },
+  "opa.rs mcp_stream": {
+    "0: opa.rs::l7_mcp_receive_stream_get_is_allowed_for_matching_endpoint/mcp / request": "allow",
+    "1: opa.rs::l7_mcp_receive_stream_get_is_allowed_for_matching_endpoint/other / request": "deny"
+  },
+  "opa.rs query_proto": {
+    "0: opa.rs::l7_query_rules_from_proto_are_enforced/allow / request": "allow",
+    "1: opa.rs::l7_query_rules_from_proto_are_enforced/deny / request": "deny"
+  },
+  "opa.rs relaxed identity proto": {
+    "0: opa.rs::relaxed_binary_identity_preserves_matched_policy_and_l7_for_proto/connect / connect": "allow",
+    "1: opa.rs::relaxed_binary_identity_preserves_matched_policy_and_l7_for_proto/request / request": "allow"
+  },
+  "opa.rs test_proto": {
+    "0: opa.rs::from_proto_allows_matching_request / connect": "allow",
+    "1: opa.rs::from_proto_denies_unmatched_request / connect": "deny"
+  },
+  "opa.rs wildcard host": {
+    "0: opa.rs::wildcard_host_percent_encoded_dot_no_match / connect": "deny"
+  },
+  "other endpoint": {
+    "0: opa.rs::unknown_endpoint_with_other_policy_returns_deny / connect": "deny",
+    "1: opa.rs::endpoint_in_policy_binary_not_allowed_with_other_policy_returns_deny / connect": "deny",
+    "2: control: declared binary connects / connect": "allow"
+  },
+  "overlapping GET and POST routes": {
+    "0: relay/token_grant_ownership_tests.rs::broader_get_allow_does_not_authorize_narrow_post_owner / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::broader_get_allow_does_not_authorize_narrow_post_owner / owners": "broad",
+    "2: relay/token_grant_ownership_tests.rs::overlapping_get_and_post_select_their_admitted_owner_on_one_connection / owners": "narrow",
+    "3: relay/token_grant_ownership_tests.rs::overlapping_get_and_post_select_their_admitted_owner_on_one_connection / request": "allow"
+  },
+  "overlapping L7 policies": {
+    "0: opa.rs::l7_overlapping_policies_allow_request_does_not_crash / request": "allow",
+    "1: opa.rs::l7_overlapping_policies_deny_request_does_not_crash / request": "deny"
+  },
+  "path-specific GraphQL route": {
+    "0: proxy.rs::l7_route_selection_prefers_path_specific_graphql_endpoint / inspection": "Graphql/Enforce,Rest/Enforce",
+    "1: proxy.rs::l7_route_selection_prefers_path_specific_graphql_endpoint / relay": "403/blocked",
+    "2: proxy.rs::l7_route_selection_prefers_path_specific_graphql_endpoint / relay": "204/forwarded"
+  },
+  "proto owner identity": {
+    "0: opa.rs::l7_token_grant_owners_preserve_proto_identity/forwarded / request": "allow",
+    "1: opa.rs::l7_token_grant_owners_preserve_proto_identity / owners": "gateway-stamped-owner"
+  },
+  "provider endpoints": {
+    "0: opa.rs::explicitly_allowed_endpoint_binary_returns_allow / connect": "allow",
+    "1: opa.rs::unknown_endpoint_returns_deny / connect": "deny",
+    "2: opa.rs::endpoint_in_policy_binary_not_allowed_returns_deny / connect": "deny"
+  },
+  "proxy.rs terminating endpoint": {
+    "0: proxy.rs::handler_test_policy_allows_glob_binary_and_reads_tls_mode/terminating / tls-mode": "Auto"
+  },
+  "proxy.rs tls: skip": {
+    "0: proxy.rs::connect_handler_tls_skip_route_is_not_refused/allowed / connect": "allow",
+    "1: proxy.rs::connect_handler_tls_skip_route_is_not_refused/tls mode / tls-mode": "Skip",
+    "2: proxy.rs::handler_test_policy_allows_glob_binary_and_reads_tls_mode/tls: skip / tls-mode": "Skip",
+    "3: proxy.rs::connect_handler_tls_skip_route_is_not_refused/no inspection / inspection": "none"
+  },
+  "query any": {
+    "0: query any/[] / owners": "none",
+    "1: query any/[(\"env\", [\"prod\"])] / owners": "none",
+    "2: query any/[(\"env\", [\"prod-a\"])] / owners": "owner",
+    "3: query any/[(\"env\", [\"prod-a\", \"prod-b\"])] / owners": "owner",
+    "4: query any/[(\"env\", [\"prod-a\", \"dev\"])] / owners": "none",
+    "5: query any/[(\"env\", [\"prod.a\"])] / owners": "none",
+    "6: query any/[(\"env\", [\"staging\"])] / owners": "owner",
+    "7: query any/[(\"env\", [\"prod-a\"]), (\"force\", [\"true\"])] / owners": "none",
+    "8: query any/[(\"env\", [\"prod-a\"]), (\"force\", [\"no\", \"true\"])] / owners": "none",
+    "9: query any/[(\"force\", [\"false\"])] / owners": "none"
+  },
+  "query audit endpoint": {
+    "0: allowed values / request": "allow",
+    "1: a mismatched value / request": "deny",
+    "2: the relay forwards the audit denial / relay": "204/forwarded"
+  },
+  "query glob": {
+    "0: query glob/[] / owners": "none",
+    "1: query glob/[(\"env\", [\"prod\"])] / owners": "none",
+    "2: query glob/[(\"env\", [\"prod-a\"])] / owners": "owner",
+    "3: query glob/[(\"env\", [\"prod-a\", \"prod-b\"])] / owners": "owner",
+    "4: query glob/[(\"env\", [\"prod-a\", \"dev\"])] / owners": "none",
+    "5: query glob/[(\"env\", [\"prod.a\"])] / owners": "none",
+    "6: query glob/[(\"env\", [\"staging\"])] / owners": "none",
+    "7: query glob/[(\"env\", [\"prod-a\"]), (\"force\", [\"true\"])] / owners": "none",
+    "8: query glob/[(\"env\", [\"prod-a\"]), (\"force\", [\"no\", \"true\"])] / owners": "none",
+    "9: query glob/[(\"force\", [\"false\"])] / owners": "none"
+  },
+  "relaxed binary identity": {
+    "0: opa.rs::relaxed_binary_identity_allows_declared_endpoint_without_binary_match / connect": "allow",
+    "1: opa.rs::relaxed_binary_identity_allows_declared_endpoint_without_binary_match / exact host / exact-host": "exact",
+    "2: opa.rs::relaxed_binary_identity_allows_declared_endpoint_without_binary_match / undeclared / connect": "deny"
+  },
+  "relay.rs JSON-RPC batch": {
+    "0: relay.rs::jsonrpc_batch_evaluates_each_call/allowed batch, call 1 / request": "allow",
+    "1: relay.rs::jsonrpc_batch_evaluates_each_call/allowed batch, call 2 / request": "allow",
+    "2: relay.rs::jsonrpc_batch_evaluates_each_call/batch with response / request": "deny",
+    "3: relay.rs::jsonrpc_batch_evaluates_each_call/response only / request": "deny",
+    "4: relay.rs::jsonrpc_batch_evaluates_each_call/denied batch, call 1 / request": "allow",
+    "5: relay.rs::jsonrpc_batch_evaluates_each_call/denied batch, call 2 / request": "allow",
+    "6: relay.rs::jsonrpc_batch_evaluates_each_call/denied batch, call 3 / request": "deny"
+  },
+  "relay.rs JSON-RPC params": {
+    "0: relay.rs::jsonrpc_request_params_do_not_affect_method_policy/object params / request": "allow",
+    "1: relay.rs::jsonrpc_request_params_do_not_affect_method_policy/array params / request": "allow"
+  },
+  "relay.rs JSON-RPC relay": {
+    "0: relay.rs::jsonrpc_relay_forwards_allowed_method / request": "allow",
+    "1: relay.rs::jsonrpc_relay_denies_method_not_in_allow_list / request": "deny"
+  },
+  "relay.rs MCP 2025-03-26 batches audit": {
+    "0: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/allowed/route_selected=false / relay": "204/forwarded/no-marker",
+    "1: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/deny last/route_selected=false / relay": "204/forwarded/no-marker",
+    "2: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/deny first/route_selected=false / relay": "204/forwarded/no-marker",
+    "3: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/malformed last/route_selected=false / relay": "400/blocked/marker",
+    "4: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/allowed/route_selected=true / relay": "204/forwarded/no-marker",
+    "5: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/deny last/route_selected=true / relay": "204/forwarded/no-marker",
+    "6: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/deny first/route_selected=true / relay": "204/forwarded/no-marker",
+    "7: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/audit/malformed last/route_selected=true / relay": "400/blocked/marker"
+  },
+  "relay.rs MCP 2025-03-26 batches enforce": {
+    "0: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/allowed/route_selected=false / relay": "204/forwarded/no-marker",
+    "1: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/deny last/route_selected=false / relay": "403/blocked/no-marker",
+    "2: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/deny first/route_selected=false / relay": "403/blocked/no-marker",
+    "3: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/malformed last/route_selected=false / relay": "400/blocked/marker",
+    "4: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/allowed/route_selected=true / relay": "204/forwarded/no-marker",
+    "5: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/deny last/route_selected=true / relay": "403/blocked/no-marker",
+    "6: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/deny first/route_selected=true / relay": "403/blocked/no-marker",
+    "7: relay.rs::mcp_march_batches_authorize_every_member_before_forwarding/enforce/malformed last/route_selected=true / relay": "400/blocked/marker"
+  },
+  "relay.rs MCP legacy receive stream": {
+    "0: relay.rs::mcp_legacy_receive_stream_get_does_not_admit_tool_bodies_or_delete/empty GET / request": "allow",
+    "1: relay.rs::mcp_legacy_receive_stream_get_does_not_admit_tool_bodies_or_delete/GET with denied tool / request": "deny",
+    "2: relay.rs::mcp_legacy_receive_stream_get_does_not_admit_tool_bodies_or_delete/GET with allowed tool / request": "deny",
+    "3: relay.rs::mcp_legacy_receive_stream_get_does_not_admit_tool_bodies_or_delete/empty DELETE / request": "deny"
+  },
+  "relay.rs MCP response frame": {
+    "0: relay.rs::mcp_relay_forwards_jsonrpc_response_frame / request": "allow"
+  },
+  "relay.rs MCP rewrites 2025-06-18 of [\"2025-06-18\"] audit": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/audit/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/audit/delete_resource/route_selected=false / relay": "204/forwarded",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/audit/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/audit/delete_resource/route_selected=true / relay": "204/forwarded"
+  },
+  "relay.rs MCP rewrites 2025-06-18 of [\"2025-06-18\"] enforce": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/enforce/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/enforce/delete_resource/route_selected=false / relay": "403/blocked",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/enforce/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-06-18 of [\"2025-06-18\"]/enforce/delete_resource/route_selected=true / relay": "403/blocked"
+  },
+  "relay.rs MCP rewrites 2025-11-25 of [\"2025-11-25\", \"2026-07-28\"] audit": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/audit/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/audit/delete_resource/route_selected=false / relay": "204/forwarded",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/audit/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/audit/delete_resource/route_selected=true / relay": "204/forwarded"
+  },
+  "relay.rs MCP rewrites 2025-11-25 of [\"2025-11-25\", \"2026-07-28\"] enforce": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/enforce/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/enforce/delete_resource/route_selected=false / relay": "403/blocked",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/enforce/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\", \"2026-07-28\"]/enforce/delete_resource/route_selected=true / relay": "403/blocked"
+  },
+  "relay.rs MCP rewrites 2025-11-25 of [\"2025-11-25\"] audit": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/audit/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/audit/delete_resource/route_selected=false / relay": "204/forwarded",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/audit/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/audit/delete_resource/route_selected=true / relay": "204/forwarded"
+  },
+  "relay.rs MCP rewrites 2025-11-25 of [\"2025-11-25\"] enforce": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/enforce/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/enforce/delete_resource/route_selected=false / relay": "403/blocked",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/enforce/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2025-11-25 of [\"2025-11-25\"]/enforce/delete_resource/route_selected=true / relay": "403/blocked"
+  },
+  "relay.rs MCP rewrites 2026-07-28 of [\"2025-11-25\", \"2026-07-28\"] audit": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/audit/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/audit/delete_resource/route_selected=false / relay": "204/forwarded",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/audit/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/audit/delete_resource/route_selected=true / relay": "204/forwarded"
+  },
+  "relay.rs MCP rewrites 2026-07-28 of [\"2025-11-25\", \"2026-07-28\"] enforce": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/enforce/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/enforce/delete_resource/route_selected=false / relay": "403/blocked",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/enforce/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2025-11-25\", \"2026-07-28\"]/enforce/delete_resource/route_selected=true / relay": "403/blocked"
+  },
+  "relay.rs MCP rewrites 2026-07-28 of [\"2026-07-28\"] audit": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/audit/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/audit/delete_resource/route_selected=false / relay": "204/forwarded",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/audit/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/audit/delete_resource/route_selected=true / relay": "204/forwarded"
+  },
+  "relay.rs MCP rewrites 2026-07-28 of [\"2026-07-28\"] enforce": {
+    "0: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/enforce/read_status/route_selected=false / relay": "204/forwarded",
+    "1: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/enforce/delete_resource/route_selected=false / relay": "403/blocked",
+    "2: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/enforce/read_status/route_selected=true / relay": "204/forwarded",
+    "3: relay.rs::mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata/2026-07-28 of [\"2026-07-28\"]/enforce/delete_resource/route_selected=true / relay": "403/blocked"
+  },
+  "relay.rs MCP sessionless": {
+    "0: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/server/discover/route_selected=false / relay": "200/forwarded/marker",
+    "10: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/vendor/inspect/route_selected=true / relay": "200/forwarded/marker",
+    "11: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/subscriptions/listen/route_selected=true / relay": "200/forwarded/marker",
+    "12: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/tools/list as server/discover/route_selected=true / relay": "400/blocked",
+    "13: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/tools/call as tools/call/route_selected=true / relay": "400/blocked",
+    "14: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/tools/call as tools/call/route_selected=true / relay": "403/blocked",
+    "15: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/vendor/unlisted as vendor/unlisted/route_selected=true / relay": "403/blocked",
+    "1: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/tools/call/route_selected=false / relay": "200/forwarded/marker",
+    "2: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/vendor/inspect/route_selected=false / relay": "200/forwarded/marker",
+    "3: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/subscriptions/listen/route_selected=false / relay": "200/forwarded/marker",
+    "4: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/tools/list as server/discover/route_selected=false / relay": "400/blocked",
+    "5: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/tools/call as tools/call/route_selected=false / relay": "400/blocked",
+    "6: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/tools/call as tools/call/route_selected=false / relay": "403/blocked",
+    "7: relay.rs::mcp_sessionless_relays_apply_metadata_and_method_policy/vendor/unlisted as vendor/unlisted/route_selected=false / relay": "403/blocked",
+    "8: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/server/discover/route_selected=true / relay": "200/forwarded/marker",
+    "9: relay.rs::mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse/tools/call/route_selected=true / relay": "200/forwarded/marker"
+  },
+  "relay.rs MCP tool deny": {
+    "0: relay.rs::mcp_tool_deny_rule_blocks_tools_call/read_status / request": "allow",
+    "1: relay.rs::mcp_tool_deny_rule_blocks_tools_call/delete_resource / request": "deny"
+  },
+  "relay.rs encoded slash scoping": {
+    "0: relay.rs::route_selected_encoded_slash_optin_does_not_leak_to_other_endpoints / relay": "403/blocked/marker",
+    "1: relay.rs::route_selected_encoded_slash_check_survives_credential_redaction / relay": "403/blocked/marker",
+    "2: relay.rs::route_selected_encoded_slash_still_allowed_on_opted_in_endpoint / relay": "204/forwarded/no-marker",
+    "3: control: unencoded admin path / relay": "204/forwarded/no-marker"
+  },
+  "relay.rs endpoint path deny /p/**": {
+    "0: relay.rs::endpoint_path_deny_covers_subtree_root / request": "deny",
+    "1: relay.rs::endpoint_path_deny_preserves_matching_and_nonmatching_controls/POST /p/child / request": "deny",
+    "2: relay.rs::endpoint_path_deny_preserves_matching_and_nonmatching_controls/GET /p / request": "allow",
+    "3: relay.rs::endpoint_path_deny_preserves_matching_and_nonmatching_controls/POST /public / request": "allow",
+    "4: relay.rs::endpoint_path_deny_preserves_matching_and_nonmatching_controls/POST /prefix / request": "allow"
+  },
+  "relay.rs endpoint path deny /v1/*": {
+    "0: relay.rs::endpoint_path_deny_covers_multisegment_star / request": "deny",
+    "1: control: GET under the selector / request": "allow",
+    "2: control: POST outside the selector / request": "allow",
+    "3: relay.rs::endpoint_path_deny_preserves_matching_and_nonmatching_controls/POST /v1/a / request": "deny"
+  },
+  "relay.rs pipeline graphql": {
+    "0: relay.rs::chunked_http_pipeline_authorizes_each_request/graphql echo / request": "allow",
+    "1: relay.rs::chunked_http_pipeline_authorizes_each_request/graphql blocked / request": "deny"
+  },
+  "relay.rs pipeline json-rpc": {
+    "0: relay.rs::chunked_http_pipeline_authorizes_each_request/json-rpc echo / request": "allow",
+    "1: relay.rs::chunked_http_pipeline_authorizes_each_request/json-rpc blocked / request": "deny"
+  },
+  "relay.rs pipeline mcp": {
+    "0: relay.rs::chunked_http_pipeline_authorizes_each_request/mcp echo / request": "allow",
+    "1: relay.rs::chunked_http_pipeline_authorizes_each_request/mcp blocked / request": "deny"
+  },
+  "relay.rs pipeline rest": {
+    "0: relay.rs::chunked_http_pipeline_authorizes_each_request/rest allowed / request": "allow",
+    "1: relay.rs::chunked_http_pipeline_authorizes_each_request/rest blocked / request": "deny"
+  },
+  "relay.rs rest_api audit": {
+    "0: relay.rs::audit_endpoint_forwards_policy_denied_request_through_healthy_chain/decision / request": "deny",
+    "1: relay.rs::audit_endpoint_forwards_policy_denied_request_through_healthy_chain/enforcement / inspection": "Rest/Audit"
+  },
+  "relay.rs rest_api enforce": {
+    "0: relay.rs::l7_denial_precedes_credential_endpoint_resolution / request": "deny"
+  },
+  "relay.rs route selection": {
+    "0: relay.rs::route_selected_unmatched_path_emits_denied_policy_activity / request": "deny"
+  },
+  "relay.rs single-endpoint GraphQL": {
+    "0: relay.rs::single_endpoint_graphql_post_still_inspects_body/viewer / request": "allow",
+    "1: relay.rs::single_endpoint_graphql_post_still_inspects_body/admin / request": "deny"
+  },
+  "relay.rs transformed GraphQL": {
+    "0: relay.rs::transformed_graphql_body_is_reevaluated_and_denied/original / request": "allow",
+    "1: relay.rs::transformed_graphql_body_is_reevaluated_and_denied/rewritten / request": "deny"
+  },
+  "relay.rs transformed JSON-RPC audit": {
+    "0: relay.rs::transformed_jsonrpc_body_policy_deny_forwards_under_audit/rewritten / request": "deny",
+    "1: relay.rs::transformed_jsonrpc_body_policy_deny_forwards_under_audit/enforcement / inspection": "JsonRpc/Audit"
+  },
+  "relay.rs transformed JSON-RPC enforce": {
+    "0: relay.rs::transformed_jsonrpc_body_is_reevaluated_and_denied/original / request": "allow",
+    "1: relay.rs::transformed_jsonrpc_body_is_reevaluated_and_denied/rewritten / request": "deny"
+  },
+  "route-selected grants": {
+    "0: relay/token_grant_ownership_tests.rs::grant_selection_uses_canonical_path_and_ignores_query_selector_text / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::grant_selection_uses_canonical_path_and_ignores_query_selector_text / owners": "a",
+    "2: relay/token_grant_ownership_tests.rs::route_selected_grants_follow_a_b_a_on_one_connection / owners": "a",
+    "3: relay/token_grant_ownership_tests.rs::route_selected_grants_follow_a_b_a_on_one_connection / owners": "b",
+    "4: relay/token_grant_ownership_tests.rs::route_selected_grants_follow_a_b_a_on_one_connection / owners": "a"
+  },
+  "shared": {
+    "0: relay/token_grant_ownership_tests.rs::jsonrpc_batch_requires_one_owner_to_admit_every_member / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::jsonrpc_batch_requires_one_owner_to_admit_every_member / request": "allow",
+    "2: relay/token_grant_ownership_tests.rs::jsonrpc_batch_requires_one_owner_to_admit_every_member / owners": "shared",
+    "3: JSON-RPC batch/first member alone / owners": "first,shared"
+  },
+  "single port": {
+    "0: opa.rs::single_port_backwards_compat / 443 / connect": "allow",
+    "1: opa.rs::single_port_backwards_compat / 80 / connect": "deny"
+  },
+  "symlink-expanded binaries": {
+    "0: opa.rs::symlink_expanded_binary_allows_resolved_path / connect": "allow",
+    "1: opa.rs::symlink_expanded_binary_still_allows_original_path / connect": "allow",
+    "2: opa.rs::symlink_expanded_binary_does_not_weaken_security / connect": "deny",
+    "3: opa.rs::symlink_expansion_works_with_ancestors / connect": "allow"
+  },
+  "test_proto": {
+    "0: opa.rs::from_proto_explicitly_allowed_returns_allow / connect": "allow",
+    "1: opa.rs::from_proto_unknown_endpoint_returns_deny / connect": "deny"
+  },
+  "transformed JSON-RPC body": {
+    "0: relay/token_grant_ownership_tests.rs::transformed_jsonrpc_body_selects_final_operation_owner / request": "allow",
+    "1: relay/token_grant_ownership_tests.rs::transformed_jsonrpc_body_selects_final_operation_owner / owners": "original",
+    "2: relay/token_grant_ownership_tests.rs::transformed_jsonrpc_body_selects_final_operation_owner / request": "allow",
+    "3: relay/token_grant_ownership_tests.rs::transformed_jsonrpc_body_selects_final_operation_owner / owners": "transformed"
+  },
+  "uninspected forward request": {
+    "0: proxy.rs::forward_proxy_injects_token_grant_before_rewriting_request / connect": "allow",
+    "1: proxy.rs::forward_proxy_injects_token_grant_before_rewriting_request / inspection": "none",
+    "2: proxy.rs::forward_proxy_injects_token_exchange_before_rewriting_request / connect": "allow",
+    "3: proxy.rs::forward_proxy_injects_token_exchange_before_rewriting_request / inspection": "none",
+    "4: proxy.rs::forward_proxy_token_grant_failure_returns_error_before_rewrite / connect": "allow",
+    "5: proxy.rs::forward_proxy_token_grant_failure_returns_error_before_rewrite / inspection": "none",
+    "6: proxy.rs::forward_proxy_token_exchange_failure_returns_error_before_rewrite / connect": "allow",
+    "7: proxy.rs::forward_proxy_token_exchange_failure_returns_error_before_rewrite / inspection": "none"
+  },
+  "union allow and global deny": {
+    "0: opa.rs::l7_token_grant_owners_preserve_union_allow_and_global_deny/allowed / request": "allow",
+    "1: opa.rs::l7_token_grant_owners_preserve_union_allow_and_global_deny/union / owners": "owner-a,owner-z",
+    "2: opa.rs::l7_token_grant_owners_preserve_union_allow_and_global_deny/denied / request": "deny",
+    "3: opa.rs::l7_token_grant_owners_preserve_union_allow_and_global_deny/deny admits none / owners": "none"
+  },
+  "uppercase wildcard host": {
+    "0: opa.rs::wildcard_host_case_insensitive / connect": "allow"
+  },
+  "websocket.rs GRAPHQL_WS_POLICY": {
+    "0: websocket.rs::graphql_websocket_policy_allows_subscription_operation / websocket": "101/message-forwarded",
+    "1: websocket.rs::graphql_websocket_policy_denies_unlisted_operation_field / websocket": "101/message-blocked",
+    "2: websocket.rs::graphql_policy_denial_reports_policy_denial_to_middleware / websocket": "101/message-blocked"
+  },
+  "wildcard host": {
+    "0: opa.rs::wildcard_host_matches_subdomain / connect": "allow",
+    "1: opa.rs::wildcard_host_rejects_deep_subdomain / connect": "deny",
+    "2: opa.rs::wildcard_host_rejects_exact_domain / connect": "deny",
+    "3: opa.rs::wildcard_host_plus_port / connect": "deny"
+  },
+  "wildcard host endpoint config": {
+    "0: opa.rs::wildcard_host_l7_endpoint_config_returned / inspection": "Rest/Enforce",
+    "1: opa.rs::wildcard_host_l7_endpoint_config_returned / other subdomain / inspection": "Rest/Enforce",
+    "2: opa.rs::wildcard_host_l7_endpoint_config_returned / other subdomain GET / request": "allow",
+    "3: opa.rs::wildcard_host_l7_endpoint_config_returned / other subdomain DELETE / request": "deny",
+    "4: opa.rs::wildcard_host_l7_endpoint_config_returned / exact path POST / request": "allow",
+    "5: opa.rs::wildcard_host_l7_endpoint_config_returned / other subdomain POST / request": "deny",
+    "6: opa.rs::wildcard_host_l7_endpoint_config_returned / non-matching host / inspection": "deny"
+  },
+  "wildcard host with L7 rules": {
+    "0: opa.rs::wildcard_host_l7_rules_apply / GET / request": "allow",
+    "1: opa.rs::wildcard_host_l7_rules_apply / DELETE / request": "deny",
+    "2: second wildcard host relays GET / relay": "204/forwarded",
+    "3: second wildcard host blocks DELETE / relay": "403/blocked"
+  },
+  "wildcard host, multiple ports": {
+    "0: opa.rs::wildcard_host_multi_port / connect": "allow"
+  }
+}

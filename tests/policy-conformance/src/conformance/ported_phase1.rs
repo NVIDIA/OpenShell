@@ -140,7 +140,10 @@ fn canonical(method: &str, raw_target: &str) -> L7RequestInfo {
     .expect("canonical target");
     let query_params = query
         .as_deref()
-        .map(|query| crate::l7::rest::parse_query_params(query).expect("query parses"))
+        .map(|query| {
+            openshell_supervisor_network::conformance_support::parse_query_params(query)
+                .expect("query parses")
+        })
         .unwrap_or_default();
     L7RequestInfo {
         query_params,

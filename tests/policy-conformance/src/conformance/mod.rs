@@ -1,34 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decision parity between YAML policies evaluated by Rego and equivalent
-//! Cedar policies.
+//! Policy conformance across YAML/Rego and Cedar backends.
 //!
-//! Each scenario pairs a YAML policy with a Cedar policy written to mean the
-//! same thing, and runs every [`Probe`] through both engines using the calls
-//! the proxy makes. A case marked [`Expect::Same`] fails if the outcomes
-//! differ. A case marked [`Expect::Diverges`] records a known difference and
-//! fails if the engines start to agree, so the list stays accurate.
-//!
-//! `scenarios` holds hand-written scenarios. The `ported_*` modules port the
-//! existing YAML decision tests that Cedar can express; each case names the
-//! YAML test it ports.
-//!
-//! The harness measures one thing: can a Cedar policy be written to mean what
-//! the YAML meant? It does not measure a mechanical translation. The Cedar
-//! side of each scenario deliberately absorbs YAML quirks such as HEAD
-//! standing in for GET, the stream permits MCP endpoints imply, and audit
-//! annotations, so a `same` case says the meaning is expressible, not that the
-//! two texts correspond line for line. A YAML binary glob, which also matches
-//! every process ancestor, is written as `context.binary_globs.contains`,
-//! since Cedar has no way to apply `like` across the `context.ancestors` set.
-//!
-//! An evaluation error on either side fails a case even when the decision it
-//! collapses to (a denial) matches, unless the case opts in with
-//! [`Case::allowing_error`]. Each report ends with its counts and the
-//! cumulative `parity tally` for the process; with `--nocapture`, the last
-//! tally printed gives the totals (cases, same, known differences) for the
-//! whole run.
+//! Scenarios provide equivalent authored documents and exercise the same
+//! production networking paths. Each backend must meet the fixed expectations
+//! in `expected.json`; agreement alone cannot make a changed decision pass.
+//! Known backend differences and expected evaluation failures remain explicit
+//! at their scenario definitions. The ported modules identify their source tests.
 
 mod ported_opa_a;
 mod ported_opa_b;
@@ -51,8 +30,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use crate::cedar_only::CedarOnlyEngine;
 use crate::l7::L7RequestInfo;
@@ -62,7 +40,8 @@ use crate::l7::relay::L7EvalContext;
 use crate::opa::OpaEngine;
 use crate::policy_types::{EgressAuthorization, NetworkAction, NetworkInput};
 
-const REGO: &str = include_str!("../../data/sandbox-policy.rego");
+const REGO: &str =
+    include_str!("../../../../crates/openshell-supervisor-network/data/sandbox-policy.rego");
 const BINARY: &str = "/usr/bin/curl";
 
 /// Whether both engines are expected to agree on a case.
@@ -177,6 +156,29 @@ enum Probe {
     /// Outcome: `deny`, `passthrough`, `<status>/blocked` when the upgrade
     /// is refused, or `101/message-forwarded` or `101/message-blocked`.
     WebSocket(Box<WebSocketExchange>),
+}
+
+impl Probe {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Request { .. } => "request",
+            Self::Connect(_) => "connect",
+            Self::ExactHost(_) => "exact-host",
+            Self::Inspection(_) => "inspection",
+            Self::DnsEligible { .. } => "dns-eligible",
+            Self::MatchedEndpoints(_) => "matched-endpoints",
+            Self::DnsRecords => "dns-records",
+            Self::TransparentOpen { .. } => "transparent-open",
+            Self::DnsAnswers { .. } => "dns-answers",
+            Self::Destination { .. } => "destination",
+            Self::Owners { .. } => "owners",
+            Self::Configs(_) => "configs",
+            Self::TlsMode(_) => "tls-mode",
+            Self::DenyReason { .. } => "deny-reason",
+            Self::Relay(_) => "relay",
+            Self::WebSocket(_) => "websocket",
+        }
+    }
 }
 
 /// One WebSocket session for [`Probe::WebSocket`].
@@ -311,12 +313,7 @@ fn diverges_probe(name: impl Into<Cow<'static, str>>, probe: Probe, reason: &'st
 
 /// An L7 evaluation context for `binary` connecting to `host:port`.
 fn l7_ctx(host: &str, port: u16, binary: &str) -> L7EvalContext {
-    L7EvalContext {
-        host: host.to_string(),
-        port,
-        binary_path: binary.to_string(),
-        ..Default::default()
-    }
+    openshell_supervisor_network::conformance_support::l7_context(host, port, binary)
 }
 
 /// A request probe with an explicit context.
@@ -665,7 +662,9 @@ impl Engines {
             }
             Probe::Destination { input, addresses } => {
                 let outcome = |engine: crate::policy_engine::PolicyEngine| {
-                    crate::proxy::connect_destination_outcome_for_test(&engine, input, addresses)
+                    openshell_supervisor_network::conformance_support::connect_destination_outcome(
+                        &engine, input, addresses,
+                    )
                 };
                 (
                     outcome(Arc::clone(&self.opa).into()),
@@ -679,7 +678,9 @@ impl Engines {
                     .unwrap_or_else(|| l7_ctx(host, 443, BINARY));
                 let owners = |tunnel: miette::Result<crate::policy_engine::TunnelPolicyEngine>| {
                     tunnel.and_then(|tunnel| {
-                        crate::l7::relay::admitted_token_grant_owners(&tunnel, &ctx, request)
+                        openshell_supervisor_network::conformance_support::admitted_token_grant_owners(
+                            &tunnel, &ctx, request,
+                        )
                     })
                 };
                 let yaml = owners(
@@ -854,11 +855,10 @@ impl PreparedRelay {
         Ok(Self {
             configs,
             engine,
-            ctx: L7EvalContext {
-                policy_name: matched_policy.clone().unwrap_or_default(),
-                request_default_port: Some(ctx.port),
-                ..ctx.clone()
-            },
+            ctx: openshell_supervisor_network::conformance_support::relay_context(
+                ctx.clone(),
+                matched_policy.clone().unwrap_or_default(),
+            ),
         })
     }
 
@@ -1280,185 +1280,23 @@ fn matched_endpoints_outcome(
 /// cases that do not name their answers.
 const TRANSPARENT_UPSTREAM: std::net::Ipv4Addr = std::net::Ipv4Addr::new(203, 0, 113, 8);
 
-/// A trusted resolver that answers every name with the same addresses.
-struct FixedResolver(Vec<IpAddr>);
-
-impl crate::policy_dns::TrustedResolver for FixedResolver {
-    async fn resolve(
-        &self,
-        _name: &crate::policy_dns::NormalizedName,
-        _family: crate::policy_dns::AddressFamily,
-    ) -> Result<crate::policy_dns::TrustedAnswer, crate::policy_dns::TrustedResolveError> {
-        Ok(crate::policy_dns::TrustedAnswer {
-            addresses: self.0.clone(),
-            ttl: std::time::Duration::from_secs(30),
-        })
-    }
-}
-
-/// Resolves `name` through `engine`'s policy DNS, with the trusted resolver
-/// answering `answers`, and returns the store holding the mapping.
-async fn policy_dns_answer(
-    engine: &crate::policy_engine::PolicyEngine,
-    name: &str,
-    answers: &[IpAddr],
-) -> Result<
-    (
-        crate::policy_dns::SyntheticAnswer,
-        Arc<crate::policy_dns::ResolvedEndpointStore>,
-    ),
-    String,
-> {
-    use crate::policy_dns::{
-        AddressFamily, PolicyDnsService, ResolvedEndpointStore, StoreConfig, SyntheticPools,
-    };
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    // Like the production pools, skip the reserved sandbox-local address.
-    let pools = SyntheticPools::new(
-        Ipv4Addr::new(198, 18, 0, 2)..=Ipv4Addr::new(198, 18, 0, 9),
-        Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 1)..=Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 8),
-    )
-    .expect("test pools are valid");
-    let store = Arc::new(ResolvedEndpointStore::new(
-        StoreConfig::new(pools, 16).expect("test store config is valid"),
-    ));
-    let dns = PolicyDnsService::new(
-        engine.clone(),
-        FixedResolver(answers.to_vec()),
-        Arc::clone(&store),
-        None,
-    );
-    dns.answer_query(name, AddressFamily::Ipv4, std::time::Instant::now())
-        .await
-        .map(|answer| (answer, store))
-        .map_err(|error| format!("dns refused: {error}"))
-}
-
-/// Returns the addresses policy DNS pins for `name` on `port`; see
-/// [`Probe::DnsAnswers`].
-async fn dns_answers_outcome(
-    engine: crate::policy_engine::PolicyEngine,
-    name: &str,
-    port: u16,
-    answers: &[IpAddr],
-) -> String {
-    let (answer, store) = match policy_dns_answer(&engine, name, answers).await {
-        Ok(resolved) => resolved,
-        Err(refusal) => return refusal,
-    };
-    let Ok(mapping) = store.lookup(
-        answer.address,
-        port,
-        answer.policy_generation,
-        std::time::Instant::now(),
-    ) else {
-        return "no mapping for port".to_string();
-    };
-    let mut pinned: Vec<String> = mapping
-        .pinned_addresses()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    pinned.sort();
-    pinned.join(",")
-}
-
-/// Resolves `name` through `engine`'s policy DNS and stages a transparent
-/// open to the answer; see [`Probe::TransparentOpen`].
-async fn transparent_open_outcome(
-    engine: crate::policy_engine::PolicyEngine,
-    name: &str,
-    port: u16,
-    binary: &str,
-    answers: &[IpAddr],
-) -> String {
-    let (answer, store) = match policy_dns_answer(&engine, name, answers).await {
-        Ok(resolved) => resolved,
-        Err(refusal) => return refusal,
-    };
-    let destination = std::net::SocketAddr::new(answer.address, port);
-    let outcome =
-        crate::proxy::stage_transparent_open_for_test(&engine, &store, destination, binary).await;
-    if outcome.dial_addresses.is_empty() {
-        return format!("{:?}", outcome.decision);
-    }
-    let addresses: Vec<String> = outcome
-        .dial_addresses
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    format!(
-        "{:?}/{}/{}",
-        outcome.decision,
-        addresses.join(","),
-        if outcome.correlated {
-            "correlated"
-        } else {
-            "uncorrelated"
-        }
-    )
-}
+use openshell_supervisor_network::conformance_support::{
+    dns_answers_outcome, transparent_open_outcome,
+};
 
 /// The marker an outcome carries when the engine reported an evaluation
 /// error instead of deciding; see [`Engines::outcomes`].
 const ERROR_MARKER: &str = " (error";
 
-/// Running counts of every report row printed so far in this test process.
-///
-/// Scenario tests run in parallel, so each report prints the cumulative
-/// tally; the last tally printed holds the totals for the whole run.
-static TALLY: Tally = Tally::new();
-
-struct Tally {
-    cases: AtomicUsize,
-    same: AtomicUsize,
-    known_differences: AtomicUsize,
-}
-
-impl Tally {
-    const fn new() -> Self {
-        Self {
-            cases: AtomicUsize::new(0),
-            same: AtomicUsize::new(0),
-            known_differences: AtomicUsize::new(0),
-        }
-    }
-
-    /// Adds one report's rows and returns its counts with the cumulative line.
-    ///
-    /// Every row is one case; a row ending in `same` agreed, and a row with
-    /// a `known difference:` result diverged as expected. The rest failed.
-    fn record(&self, report: &str) -> String {
-        let rows: Vec<&str> = report
-            .lines()
-            .filter(|line| line.starts_with("| "))
-            .collect();
-        let cases = rows.len();
-        let same = rows.iter().filter(|row| row.ends_with("| same |")).count();
-        let known_differences = rows
-            .iter()
-            .filter(|row| row.contains("| known difference:"))
-            .count();
-        let total_cases = self.cases.fetch_add(cases, Ordering::Relaxed) + cases;
-        let total_same = self.same.fetch_add(same, Ordering::Relaxed) + same;
-        let total_known = self
-            .known_differences
-            .fetch_add(known_differences, Ordering::Relaxed)
-            + known_differences;
-        format!(
-            "this report: {cases} cases, {same} same, {known_differences} known differences\n\
-             parity tally: {total_cases} cases, {total_same} same, {total_known} known \
-             differences (cumulative across the reports printed so far in this process)"
-        )
-    }
-}
+static EXPECTED: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("expected.json")).expect("valid conformance expectations")
+});
 
 /// Runs a scenario's cases and returns its report rows and any failures.
 fn run(name: &str, host: &str, engines: &Engines, cases: &[Case]) -> (String, Vec<String>) {
     let mut report = String::new();
     let mut failures = Vec::new();
-    for case in cases {
+    for (index, case) in cases.iter().enumerate() {
         let (yaml, cedar) = engines.outcomes(host, &case.probe);
         // The outcome collapses an evaluation error into the decision the
         // proxy makes on it (a denial), with the error noted after a marker.
@@ -1469,6 +1307,16 @@ fn run(name: &str, host: &str, engines: &Engines, cases: &[Case]) -> (String, Ve
                 .unwrap_or_default()
                 .to_string()
         };
+        let key = format!("{index}: {} / {}", case.name, case.probe.kind());
+        let expected = &EXPECTED[name][key.as_str()];
+        for (backend, actual) in [("yaml", decision(&yaml)), ("cedar", decision(&cedar))] {
+            let wanted = expected.as_str().or_else(|| expected[backend].as_str());
+            if wanted != Some(actual.as_str()) {
+                failures.push(format!(
+                    "{name} / {key}: {backend} expected {wanted:?}, got {actual:?}"
+                ));
+            }
+        }
         // Compare decisions, but an error on either side is a failure in its
         // own right unless the case expects one: an erroring Cedar policy
         // must not pass as agreeing with YAML on the deny cases.
@@ -1575,12 +1423,7 @@ fn assert_provider_parity(scenario: &ProviderScenario<'_>) {
     report_parity(run(scenario.name, scenario.host, &engines, &scenario.cases));
 }
 
-/// Prints a report with its counts and the cumulative tally, then fails on
-/// any failure.
+/// Include both backend outcomes when a conformance assertion fails.
 fn report_parity((report, failures): (String, Vec<String>)) {
-    let tally = TALLY.record(&report);
-    println!(
-        "| Scenario | Case | YAML | Cedar | Result |\n|---|---|---|---|---|\n{report}\n{tally}\n"
-    );
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(failures.is_empty(), "{report}\n{}", failures.join("\n"));
 }

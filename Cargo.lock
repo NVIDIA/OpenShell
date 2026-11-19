@@ -5281,6 +5281,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-policy-conformance"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "noyalib",
+ "openshell-core",
+ "openshell-policy",
+ "openshell-policy-cedar",
+ "openshell-policy-cedar-runtime",
+ "openshell-policy-runtime-interface",
+ "openshell-providers",
+ "openshell-supervisor-network",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-policy-runtime-interface"
 version = "0.0.0"
 dependencies = [
@@ -5690,11 +5708,9 @@ dependencies = [
  "openshell-ocsf",
  "openshell-otel",
  "openshell-policy",
- "openshell-policy-cedar",
  "openshell-policy-cedar-runtime",
  "openshell-policy-runtime-interface",
  "openshell-policy-schema",
- "openshell-providers",
  "openshell-sandbox-backend",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",

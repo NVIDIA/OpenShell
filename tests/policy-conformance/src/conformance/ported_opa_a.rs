@@ -134,7 +134,8 @@ when {{
 // testdata/sandbox-policy.yaml (`test_engine()`)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_FIXTURE_YAML: &str = include_str!("../../testdata/sandbox-policy.yaml");
+const DEFAULT_FIXTURE_YAML: &str =
+    include_str!("../../../../crates/openshell-supervisor-network/testdata/sandbox-policy.yaml");
 
 /// The distinct `host:443` endpoints of the default fixture (15 endpoints,
 /// `github.com` declared twice).

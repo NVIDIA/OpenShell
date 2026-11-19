@@ -103,13 +103,23 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
         let config = route(&engine, host, path);
         let selected = crate::l7::parse_l7_config(&config).expect("MCP config");
         assert_eq!(selected.endpoint_id, endpoint_id(expected), "{host}{path}");
-        let observer = crate::l7::EndpointObserver::begin(Some(&sender), &selected)
-            .expect("observation starts");
-        observer.observe(EndpointResult::HttpResponseReceived);
+        assert!(
+            openshell_supervisor_network::conformance_support::observe_endpoint(
+                &sender,
+                &selected,
+                EndpointResult::HttpResponseReceived
+            )
+        );
     }
     let rest = route(&engine, "api.example.com", "/rest/item");
     let rest = crate::l7::parse_l7_config(&rest).expect("REST config");
-    assert!(crate::l7::EndpointObserver::begin(Some(&sender), &rest).is_none());
+    assert!(
+        !openshell_supervisor_network::conformance_support::observe_endpoint(
+            &sender,
+            &rest,
+            EndpointResult::HttpResponseReceived
+        )
+    );
     while let Ok(command) = receiver.try_recv() {
         tracker.apply(command);
     }
@@ -139,7 +149,10 @@ fn decoded_query_params_reach_the_cedar_backend() {
     let engine = crate::policy_engine::PolicyEngine::from(backend);
     let tunnel = engine.tunnel_engine(engine.current_generation()).unwrap();
     let (target, query_params) =
-        crate::l7::rest::parse_target_query("/download?t%61g=foo%2Da&tag=foo-x+y").unwrap();
+        openshell_supervisor_network::conformance_support::parse_target_query(
+            "/download?t%61g=foo%2Da&tag=foo-x+y",
+        )
+        .unwrap();
     let ctx = openshell_policy_runtime_interface::L7PolicyContext {
         host: "api.example.com".into(),
         port: 443,

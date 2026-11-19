@@ -47,7 +47,7 @@ const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 
 /// Context for L7 request policy evaluation.
 #[derive(Clone)]
-#[cfg_attr(test, derive(Default))]
+#[cfg_attr(any(test, feature = "test-support"), derive(Default))]
 pub struct L7EvalContext {
     /// Host from the CONNECT request.
     pub host: String,

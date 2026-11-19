@@ -14,7 +14,7 @@ use openshell_sandbox_backend::test_support as rpc_test;
 
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", test, feature = "test-support"))]
 use crate::policy_dns::PolicyEndpointId;
 use crate::policy_dns::{MappingLookup, MappingLookupError, ResolvedEndpointStore};
 use crate::policy_engine::PolicyEngine;
@@ -36,7 +36,7 @@ use openshell_core::net::{
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use openshell_isolation_interface::contract::ExecutableIdentity as ContractExecutableIdentity;
 use openshell_isolation_interface::contract::{
     BinaryIdentity as ContractBinaryIdentity, BoundaryDuplexStream, MediationTiming,
@@ -845,7 +845,7 @@ async fn preauthorize_transparent_open(
 }
 
 /// What a staged transparent open to a policy DNS destination did.
-#[cfg(all(test, feature = "experimental"))]
+#[cfg(feature = "test-support")]
 pub(crate) struct StagedOpenOutcome {
     /// The decision sent back to the boundary.
     pub(crate) decision: TcpOpenDecision,
@@ -858,7 +858,7 @@ pub(crate) struct StagedOpenOutcome {
 
 /// Stages a transparent open from `binary` to `destination` through
 /// `engine`, as the boundary does, for tests that compare policy engines.
-#[cfg(all(test, feature = "experimental"))]
+#[cfg(feature = "test-support")]
 pub(crate) async fn stage_transparent_open_for_test(
     engine: &PolicyEngine,
     store: &Arc<ResolvedEndpointStore>,
@@ -936,7 +936,7 @@ pub(crate) async fn stage_transparent_open_for_test(
 /// all-or-nothing with that mode's own check, without resolving anything.
 /// Returns `"deny"` for a policy denial, `"rejected"` when a destination
 /// check rejects the addresses, and `"admitted"` otherwise.
-#[cfg(all(test, feature = "experimental"))]
+#[cfg(feature = "test-support")]
 pub(crate) fn connect_destination_outcome_for_test(
     engine: &PolicyEngine,
     input: &crate::policy_types::NetworkInput,
@@ -1283,7 +1283,7 @@ impl Drop for TransparentTcpHandle {
 ///
 /// `None` means the decision and the mapping name no common endpoint, so the
 /// transparent TCP listener refuses the connection.
-#[cfg(any(target_os = "linux", all(test, feature = "experimental")))]
+#[cfg(any(target_os = "linux", feature = "test-support"))]
 pub(crate) fn correlated_endpoint(
     matched_endpoints: &[crate::policy_types::MatchedEndpoint],
     mapping: &MappingLookup,
