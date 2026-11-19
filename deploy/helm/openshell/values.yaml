@@ -302,6 +302,11 @@ agentSandbox:
     # -- Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting.
     enabled: true
 
+storageClass:
+  preflight:
+    # -- On a fresh StatefulSet install with no server.dataStorageClass, check for a default StorageClass. The Helm identity must be allowed to list StorageClasses.
+    enabled: false
+
 # Pod restart behavior and health probe tuning.
 podLifecycle:
   # -- Maximum time, in seconds, Kubernetes waits for the gateway to exit before

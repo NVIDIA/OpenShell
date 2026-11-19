@@ -98,6 +98,13 @@ kubectl create namespace openshell
 
 ## Install the chart
 
+Check the cluster's default with `kubectl get storageclass`. If there is no
+default and you use dynamic provisioning, set `server.dataStorageClass` for the
+gateway StatefulSet and `server.workspaceStorageClass` for sandbox workspaces.
+Use `storageClass.preflight.enabled=true` on a fresh StatefulSet install to
+check for a default when the gateway class is unset. The Helm identity needs
+cluster-scoped `list storageclasses` permission for this check.
+
 Install from the OCI registry on GHCR. Replace `<version>` with the chart version you want to install.
 
 ```shell

@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: StorageClass preflight
+templates:
+  - templates/storage-class-preflight.yaml
+set:
+  agentSandbox.preflight.enabled: false
+  storageClass.preflight.enabled: true
+kubernetesProvider:
+  scheme:
+    storage.k8s.io/v1/StorageClass:
+      gvr:
+        group: storage.k8s.io
+        version: v1
+        resource: storageclasses
+      namespaced: false
+  objects:
+    - apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: fast-ssd
+
+tests:
+  - it: names the gateway storage setting on a fresh install without a default class
+    asserts:
+      - failedTemplate:
+          errorPattern: "The cluster has no default StorageClass. Set server.dataStorageClass for the gateway openshell-data PVC"
+
+  - it: skips the check for a gateway Deployment
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: postgres
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: accepts an explicit gateway class
+    set:
+      server.dataStorageClass: fast-ssd
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: skips the check on an upgrade without a default class
+    release:
+      install: false
+      upgrade: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: accepts a default class
+    kubernetesProvider:
+      objects:
+        - apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: default-ssd
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+    asserts:
+      - hasDocuments:
+          count: 0
