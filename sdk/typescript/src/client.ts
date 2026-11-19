@@ -27,6 +27,7 @@ import type {
   PlatformEvent as WirePlatformEvent,
 } from './gen/openshell_pb.js';
 import {
+  type CreateSandboxRequestSchema,
   type ExecSandboxInputSchema,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
@@ -833,6 +834,12 @@ export function __setWatchLogsBackoffSleepForTests(
   watchLogsBackoffSleep = fn ?? defaultWatchLogsBackoffSleep;
 }
 
+const CREATE_RETRY_MS = 60_000;
+
+function isLockTimeout(err: SdkError): boolean {
+  return err.connectCode === Code.Unavailable && err.errorInfo?.reason === 'MUTATION_LOCK_TIMEOUT';
+}
+
 // Only Unavailable (connection drop, gateway restart) is retryable. Every
 // other status — including OUT_OF_RANGE — is terminal so the caller sees it
 // instead of the loop silently restarting from an empty cursor and hiding a gap.
@@ -1221,6 +1228,21 @@ export class SandboxClient {
     return new SandboxClient(buildTransport(options));
   }
 
+  // CreateSandbox, retried for up to 60s on MUTATION_LOCK_TIMEOUT.
+  private async createSandbox(request: MessageInitShape<typeof CreateSandboxRequestSchema>) {
+    const deadline = Date.now() + CREATE_RETRY_MS;
+    for (;;) {
+      try {
+        return await this.grpc.createSandbox(request);
+      } catch (e) {
+        const err = fromConnect(e);
+        const wait = (err.retryDelayMs ?? 1000) * (1 + Math.random() / 2);
+        if (!isLockTimeout(err) || Date.now() + wait > deadline) throw err;
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+    }
+  }
+
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
       // Curated fields build the base spec; rawSpec then shallow-overrides at
@@ -1239,7 +1261,7 @@ export class SandboxClient {
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 
-      const resp = await this.grpc.createSandbox({
+      const resp = await this.createSandbox({
         workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
         labels: spec.labels ?? {},
@@ -1260,7 +1282,7 @@ export class SandboxClient {
   async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
     if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
     try {
-      const resp = await this.grpc.createSandbox({
+      const resp = await this.createSandbox({
         workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
         labels: spec.labels ?? {},

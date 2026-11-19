@@ -26,6 +26,7 @@ import {
   STATUS_NAMES,
   type WatchEvent,
 } from './client.js';
+import { ErrorInfoSchema, RetryInfoSchema } from './gen/google/rpc/error_details_pb.js';
 import {
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
@@ -700,6 +701,30 @@ describe('watchLogs', () => {
 });
 
 describe('create', () => {
+  it.each([
+    ['MUTATION_LOCK_TIMEOUT', 3],
+    ['OTHER', 1],
+  ])('retries %s up to %i attempts', async (reason, attempts) => {
+    let calls = 0;
+    const sandbox = client({
+      createSandbox: () => {
+        calls += 1;
+        if (calls < 3) {
+          throw new ConnectError('busy', Code.Unavailable, undefined, [
+            { desc: ErrorInfoSchema, value: { reason } },
+            { desc: RetryInfoSchema, value: { retryDelay: { nanos: 1_000_000 } } },
+          ]);
+        }
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    const result = sandbox.create({ image: 'img' });
+    if (attempts === 1) await expect(result).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    else await expect(result).resolves.toMatchObject({ name: 'sb' });
+    expect(calls).toBe(attempts);
+  });
+
   it('sends create-time service exposures', async () => {
     let created: {
       serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
