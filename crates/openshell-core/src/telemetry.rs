@@ -4,7 +4,7 @@
 //! Best-effort anonymous telemetry emission helpers.
 
 #[cfg(feature = "telemetry")]
-use chrono::{SecondsFormat, Utc};
+use jiff::Timestamp;
 #[cfg(feature = "telemetry")]
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -356,7 +356,7 @@ fn telemetry_endpoint_from(endpoint: Option<&str>) -> Option<String> {
 
 #[cfg(feature = "telemetry")]
 fn timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    format!("{:.3}", Timestamp::now())
 }
 
 #[cfg(feature = "telemetry")]
@@ -614,6 +614,15 @@ where
 #[cfg(all(test, feature = "telemetry"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_uses_utc_milliseconds() {
+        let value = timestamp();
+        value.parse::<Timestamp>().unwrap();
+        assert_eq!(value.len(), 24);
+        assert_eq!(value.as_bytes()[19], b'.');
+        assert!(value.ends_with('Z'));
+    }
 
     #[test]
     fn telemetry_enabled_defaults_true() {

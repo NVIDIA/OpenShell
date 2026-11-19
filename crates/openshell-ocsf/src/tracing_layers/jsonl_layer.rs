@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
@@ -112,8 +112,8 @@ where
                 return;
             };
             let line = if self.console_format {
-                let ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-                format!("{ts} OCSF-JSON {line}")
+                let ts = Timestamp::now();
+                format!("{ts:.3} OCSF-JSON {line}")
             } else {
                 line
             };

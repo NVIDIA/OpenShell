@@ -4,9 +4,9 @@
 //! Shared helpers, types, and parsing utilities used across CLI command groups.
 
 use crate::color::Colorize;
-use chrono::DateTime;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use jiff::Timestamp;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -1049,13 +1049,16 @@ pub fn parse_credential_expiry_value(value: &str, key: Option<&str>) -> Result<i
         return Ok(value_ms);
     }
 
-    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
+    let parsed = value.parse::<Timestamp>().map_err(|_| {
         credential_expiry_value_error(
             key,
-            "must be a Unix epoch millisecond timestamp or RFC3339 timestamp",
+            "must be a Unix epoch millisecond timestamp, RFC3339 timestamp, or ISO 8601 timestamp with a UTC offset",
         )
     })?;
-    let value_ms = parsed.timestamp_millis();
+    // Preserve flooring before the epoch and rolling RFC3339 leap seconds forward.
+    let value_ms = parsed.as_second() * 1_000
+        + i64::from(parsed.subsec_nanosecond()).div_euclid(1_000_000)
+        + i64::from(value.get(16..19) == Some(":60")) * 1_000;
     if value_ms < 0 {
         return Err(credential_expiry_value_error(
             key,

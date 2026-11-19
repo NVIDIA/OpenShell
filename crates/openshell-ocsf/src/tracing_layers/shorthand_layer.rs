@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::sync::Mutex;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
@@ -53,14 +53,14 @@ where
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
 
-        let ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+        let ts = Timestamp::now();
 
         if meta.target() == OCSF_TARGET {
             // This is an OCSF event — clone from thread-local (non-consuming)
             if let Some(ocsf_event) = clone_current_event() {
                 let line = ocsf_event.format_shorthand();
                 if let Ok(mut w) = self.writer.lock() {
-                    let _ = write_record(&mut *w, format!("{ts} OCSF {line}"));
+                    let _ = write_record(&mut *w, format!("{ts:.3} OCSF {line}"));
                 }
             }
         } else if self.include_non_ocsf {
@@ -71,7 +71,7 @@ where
             let mut message = String::new();
             event.record(&mut MessageVisitor(&mut message));
             if let Ok(mut w) = self.writer.lock() {
-                let _ = write_record(&mut *w, format!("{ts} {level} {target}: {message}"));
+                let _ = write_record(&mut *w, format!("{ts:.3} {level} {target}: {message}"));
             }
         }
     }
@@ -152,11 +152,10 @@ mod tests {
 
         let output = buffer.lock().unwrap();
         let line = String::from_utf8_lossy(&output);
-        // Should start with a timestamp like 2026-04-01T...
-        assert!(
-            line.contains('T') && line.contains('Z'),
-            "Expected timestamp in output, got: {line}"
-        );
+        let timestamp = line.split_once(' ').unwrap().0;
+        timestamp.parse::<Timestamp>().unwrap();
+        assert_eq!(timestamp.len(), 24);
+        assert!(timestamp.ends_with('Z'));
         assert!(
             line.contains("test message"),
             "Expected message, got: {line}"

@@ -16,11 +16,11 @@ use crate::objects::{Endpoint, Url, User};
 /// instead of panicking.
 #[must_use]
 pub fn format_ts(time_ms: i64) -> String {
-    use chrono::{MappedLocalTime, TimeZone, Utc};
-    match Utc.timestamp_millis_opt(time_ms) {
-        MappedLocalTime::Single(dt) => dt.format("%H:%M:%S%.3f").to_string(),
-        _ => "??:??:??.???".to_string(),
-    }
+    use jiff::Timestamp;
+    Timestamp::from_millisecond(time_ms).map_or_else(
+        |_| "??:??:??.???".to_string(),
+        |ts| ts.strftime("%H:%M:%S%.3f").to_string(),
+    )
 }
 
 /// Map a severity ID byte to its single-character shorthand.
@@ -693,8 +693,13 @@ mod tests {
 
     #[test]
     fn test_format_ts() {
-        let ts = format_ts(1_742_047_200_000);
-        assert_eq!(ts, "14:00:00.000");
+        for (time_ms, expected) in [
+            (1_742_047_200_000, "14:00:00.000"),
+            (1_742_047_200_123, "14:00:00.123"),
+            (-1, "23:59:59.999"),
+        ] {
+            assert_eq!(format_ts(time_ms), expected, "{time_ms}");
+        }
     }
 
     #[test]
