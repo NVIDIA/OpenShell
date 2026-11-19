@@ -13,7 +13,7 @@ This page describes gateway authentication for CLI clients and sandbox service r
 ## Sandbox service requests
 
 Gateway application authentication is opt-in. Set
-`service_auth_enabled = true` in `[openshell.gateway]` to enable it. The default
+`enable_gateway_service_auth = true` in `[openshell.gateway]` to enable it. The default
 is `false`, which preserves existing service routing and its header, cookie,
 and path handling. The supervisor app-listener setting does not enable
 this authentication gate.

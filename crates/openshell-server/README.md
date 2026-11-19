@@ -403,10 +403,10 @@ equality tokens, not resumable cursors or an ordering across gateway replicas.
 
 Gateway service authentication defaults to disabled, independently of the app
 listener. Disabled mode preserves application routing, reserved-looking paths,
-and the pre-existing header/cookie policy. CLI `--service-auth-enabled` and
-`OPENSHELL_SERVICE_AUTH_ENABLED` override the TOML setting.
+and the pre-existing header/cookie policy. CLI `--enable-gateway-service-auth` and
+`OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH` override the TOML setting.
 
-With `[openshell.gateway].service_auth_enabled = true`, gateway-mediated
+With `[openshell.gateway].enable_gateway_service_auth = true`, gateway-mediated
 application HTTP requests and WebSocket upgrades authenticate
 through the gateway chain or verified TLS client identity before endpoint lookup,
 independently of app-listener enablement. User access requires TCP-forwarding

@@ -326,8 +326,8 @@ struct RunArgs {
     server_sans: Vec<String>,
 
     /// Authenticate sandbox application requests using configured gateway auth.
-    #[arg(long, env = "OPENSHELL_SERVICE_AUTH_ENABLED", default_value_t = false, action = ArgAction::Set)]
-    service_auth_enabled: bool,
+    #[arg(long, env = "OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH", default_value_t = false, action = ArgAction::Set)]
+    enable_gateway_service_auth: bool,
 
     /// Hostname format for exposed sandbox services: `readable` (default)
     /// keeps `<workspace>--<sandbox>[--<service>]` hostnames; `hashed` mints
@@ -678,7 +678,7 @@ fn prepare_server_config_with_drivers(
         .with_server_sans(args.server_sans.clone())
         .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
         .with_service_routing(args.enable_gateway_service_routing)
-        .with_service_auth(args.service_auth_enabled)
+        .with_service_auth(args.enable_gateway_service_auth)
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
     config
@@ -1698,10 +1698,10 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.enable_gateway_service_routing = enabled;
     }
-    if let Some(enabled) = file.service_auth_enabled
-        && arg_defaulted(matches, "service_auth_enabled")
+    if let Some(enabled) = file.enable_gateway_service_auth
+        && arg_defaulted(matches, "enable_gateway_service_auth")
     {
-        args.service_auth_enabled = enabled;
+        args.enable_gateway_service_auth = enabled;
     }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
@@ -4300,34 +4300,40 @@ enabled = false
     #[test]
     fn service_auth_is_opt_in_with_explicit_cli_environment_and_file_precedence() {
         Environment::new()
-            .remove("OPENSHELL_SERVICE_AUTH_ENABLED")
+            .remove("OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH")
             .run(|| {
                 let file = toml::from_str::<ConfigFile>(
-                    "[openshell.gateway]\nservice_auth_enabled = true\n",
+                    "[openshell.gateway]\nenable_gateway_service_auth = true\n",
                 )
                 .unwrap();
                 let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
-                assert!(!args.service_auth_enabled);
+                assert!(!args.enable_gateway_service_auth);
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-                assert!(args.service_auth_enabled);
-                let (mut args, matches) =
-                    parse_with_args(&["openshell-gateway", "--service-auth-enabled", "false"]);
+                assert!(args.enable_gateway_service_auth);
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-auth",
+                    "false",
+                ]);
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-                assert!(!args.service_auth_enabled);
+                assert!(!args.enable_gateway_service_auth);
             });
         Environment::new()
-            .set("OPENSHELL_SERVICE_AUTH_ENABLED", "false")
+            .set("OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH", "false")
             .run(|| {
                 let file = toml::from_str::<ConfigFile>(
-                    "[openshell.gateway]\nservice_auth_enabled = true\n",
+                    "[openshell.gateway]\nenable_gateway_service_auth = true\n",
                 )
                 .unwrap();
                 let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-                assert!(!args.service_auth_enabled);
-                let (args, _) =
-                    parse_with_args(&["openshell-gateway", "--service-auth-enabled", "true"]);
-                assert!(args.service_auth_enabled);
+                assert!(!args.enable_gateway_service_auth);
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-auth",
+                    "true",
+                ]);
+                assert!(args.enable_gateway_service_auth);
             });
     }
 

@@ -30,33 +30,34 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_gateway_service_routing\s*=\s*false$'
-  - it: leaves gateway application auth disabled by default
+  - it: leaves gateway application auth disabled by the runtime default when omitted
     template: templates/gateway-config.yaml
     asserts:
-      - matchRegex:
+      - notMatchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^service_auth_enabled\s*=\s*false$'
+          pattern: 'enable_gateway_service_auth\s*='
 
   - it: enables application auth without enabling the app listener
     template: templates/gateway-config.yaml
     set:
-      server.serviceAuthEnabled: true
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?m)^service_auth_enabled\s*=\s*true$'
-
-  - it: honors canonical auth false over legacy true
-    template: templates/gateway-config.yaml
-    set:
-      server.serviceAuthEnabled: true
       gatewayConfig:
         openshell.gateway:
-          service_auth_enabled: false
+          enable_gateway_service_auth: true
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^service_auth_enabled\s*=\s*false$'
+          pattern: '(?m)^enable_gateway_service_auth\s*=\s*true$'
+
+  - it: disables application auth through canonical configuration
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          enable_gateway_service_auth: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_gateway_service_auth\s*=\s*false$'
 
   - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
     template: templates/gateway-config.yaml

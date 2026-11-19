@@ -957,7 +957,7 @@ fn build_upstream_request(
     target_port: u16,
     preserve_upgrade_headers: bool,
     authorization_mode: ServiceAuthorizationMode,
-    service_auth_enabled: bool,
+    enable_gateway_service_auth: bool,
 ) -> Result<Request<Body>, ServiceRouteError> {
     let (parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
@@ -976,12 +976,12 @@ fn build_upstream_request(
     for (name, value) in &parts.headers {
         if (is_hop_by_hop_header(name)
             && !(preserve_upgrade_headers && is_websocket_hop_by_hop_header(name)))
-            || is_gateway_auth_header(name, authorization_mode, service_auth_enabled)
+            || is_gateway_auth_header(name, authorization_mode, enable_gateway_service_auth)
         {
             continue;
         }
         if name == header::COOKIE {
-            if let Some(cookie) = sanitize_cookie_header(value, service_auth_enabled) {
+            if let Some(cookie) = sanitize_cookie_header(value, enable_gateway_service_auth) {
                 headers.append(name, cookie);
             }
             continue;
@@ -1120,7 +1120,7 @@ fn is_bearer_token68(value: &str) -> bool {
 fn is_gateway_auth_header(
     name: &header::HeaderName,
     authorization_mode: ServiceAuthorizationMode,
-    service_auth_enabled: bool,
+    enable_gateway_service_auth: bool,
 ) -> bool {
     match name.as_str() {
         "authorization" => authorization_mode != ServiceAuthorizationMode::BearerPassthrough,
@@ -1129,7 +1129,7 @@ fn is_gateway_auth_header(
         | "x-openshell-principal"
         | "x-openshell-user"
         | "x-openshell-roles"
-        | "cf-access-authenticated-user-email" => service_auth_enabled,
+        | "cf-access-authenticated-user-email" => enable_gateway_service_auth,
         "cf-access-jwt-assertion"
         | "x-forwarded-client-cert"
         | "x-ssl-client-cert"
@@ -1138,14 +1138,17 @@ fn is_gateway_auth_header(
     }
 }
 
-fn sanitize_cookie_header(value: &HeaderValue, service_auth_enabled: bool) -> Option<HeaderValue> {
+fn sanitize_cookie_header(
+    value: &HeaderValue,
+    enable_gateway_service_auth: bool,
+) -> Option<HeaderValue> {
     let value = value.to_str().ok()?;
     let cookies = value
         .split(';')
         .filter_map(|cookie| {
             let cookie = cookie.trim();
             let (name, _) = cookie.split_once('=')?;
-            (!is_gateway_auth_cookie(name.trim(), service_auth_enabled)).then_some(cookie)
+            (!is_gateway_auth_cookie(name.trim(), enable_gateway_service_auth)).then_some(cookie)
         })
         .collect::<Vec<_>>();
 
@@ -1156,10 +1159,11 @@ fn sanitize_cookie_header(value: &HeaderValue, service_auth_enabled: bool) -> Op
     HeaderValue::from_str(&cookies.join("; ")).ok()
 }
 
-fn is_gateway_auth_cookie(name: &str, service_auth_enabled: bool) -> bool {
+fn is_gateway_auth_cookie(name: &str, enable_gateway_service_auth: bool) -> bool {
     name.eq_ignore_ascii_case("CF_Authorization")
         || name.eq_ignore_ascii_case("cf-authorization")
-        || (service_auth_enabled && name.to_ascii_lowercase().starts_with("__host-openshell-"))
+        || (enable_gateway_service_auth
+            && name.to_ascii_lowercase().starts_with("__host-openshell-"))
 }
 
 pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {

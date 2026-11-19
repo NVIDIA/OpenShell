@@ -196,7 +196,7 @@ pub struct GatewayFileSection {
     pub enable_gateway_service_routing: Option<bool>,
     /// Opt in to gateway authentication for sandbox application requests.
     #[serde(default)]
-    pub service_auth_enabled: Option<bool>,
+    pub enable_gateway_service_auth: Option<bool>,
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[serde(default)]
