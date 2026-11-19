@@ -676,7 +676,7 @@ Three values set how many sandboxes the cluster can run:
 
 | Value | Default | Range | Meaning |
 |---|---|---|---|
-| `supervisor.pool.maxInstancesPerMember` | `128` | `16` to `1024` | Sandboxes one supervisor runs. |
+| `supervisor.pool.maxInstancesPerMember` | `128` | `1` to `1024` | Sandboxes one supervisor runs. |
 | `supervisor.pool.maxMembersPerGateway` | `32` | `1` to `64` | Supervisors one gateway replica serves. |
 | `replicaCount` | `1` | | Gateway replicas. |
 
@@ -687,6 +687,18 @@ create when every supervisor is full. Rendering fails when
 `supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds
 `replicaCount` × `maxMembersPerGateway`; with gateway autoscaling, the chart
 uses `autoscaling.minReplicas`.
+
+To run more supervisors, raise `replicaCount` or `maxMembersPerGateway`. More
+than one gateway replica needs an external PostgreSQL database and a
+Deployment workload; refer to
+[Size PostgreSQL Connections](#size-postgresql-connections). For example,
+three gateways serve up to 96 supervisors at the default 32 each:
+
+```shell
+helm install openshell <chart> -n openshell \
+  --set replicaCount=3 --set workload.kind=deployment \
+  --set server.externalDbSecret=<secret> --set supervisor.replicas=80
+```
 
 Supervisor memory grows with the sandboxes it runs. Size
 `supervisor.resources` for `maxInstancesPerMember`; the defaults request

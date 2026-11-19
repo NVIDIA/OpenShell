@@ -132,7 +132,7 @@ refused() {
     fail "the chart accepted ${reason}"
   fi
 }
-refused "maxInstancesPerMember=15" --set supervisor.pool.maxInstancesPerMember=15
+refused "maxInstancesPerMember=0" --set supervisor.pool.maxInstancesPerMember=0
 refused "maxInstancesPerMember=1025" --set supervisor.pool.maxInstancesPerMember=1025
 refused "maxMembersPerGateway=0" --set supervisor.pool.maxMembersPerGateway=0
 refused "maxMembersPerGateway=65" --set supervisor.pool.maxMembersPerGateway=65

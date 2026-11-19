@@ -1377,7 +1377,7 @@ shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
 `supervisor.replicas` members (default 2). The chart renders
 `[openshell.gateway.supervisor_pool]` `recovery_timeout_secs`,
 `max_instances_per_member` (Helm `supervisor.pool.maxInstancesPerMember`,
-16 to 1024, default 128, also passed to each member as
+1 to 1024, default 128, also passed to each member as
 `OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`), and `max_members_per_gateway`
 (`supervisor.pool.maxMembersPerGateway`, 1 to 64, default 32); the driver's
 `shared_supervisor` table carries no pool settings. Rendering fails when

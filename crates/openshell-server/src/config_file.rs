@@ -273,7 +273,7 @@ pub struct SupervisorPoolConfig {
     /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_timeout_secs: Option<u32>,
-    /// Most sandbox instances the gateway places on one pool member, from 16
+    /// Most sandbox instances the gateway places on one pool member, from 1
     /// to 1024; unset places
     /// [`openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER`].
     /// Each member must run with the same cap.
@@ -1673,7 +1673,7 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
             openshell_supervisor_control::PoolLimitsError::InstancesPerMember => {
                 ConfigFileError::InvalidValue {
                     field: "openshell.gateway.supervisor_pool.max_instances_per_member",
-                    message: "must be between 16 and 1024",
+                    message: "must be between 1 and 1024",
                 }
             }
             openshell_supervisor_control::PoolLimitsError::MembersPerGateway => {
@@ -3606,13 +3606,13 @@ database_lock_max_connections = 0
             openshell_supervisor_control::MAX_POOL_INSTANCES_CEILING
         );
         for lower_bound in [
-            "max_instances_per_member = 16\n",
+            "max_instances_per_member = 1\n",
             "max_members_per_gateway = 1\n",
         ] {
             assert!(pool(lower_bound).is_ok(), "{lower_bound}");
         }
 
-        for out_of_range in ["0", "15", "1025", "4096"] {
+        for out_of_range in ["0", "1025", "4096"] {
             assert!(matches!(
                 pool(&format!("max_instances_per_member = {out_of_range}\n")),
                 Err(ConfigFileError::InvalidValue {
