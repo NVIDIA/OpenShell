@@ -5,7 +5,8 @@ $source = (Get-Location).Path
 $env:CARGO_TARGET_DIR = Join-Path $source 'target'
 $env:CARGO_INCREMENTAL = '0'
 $env:OPENSHELL_WINDOWS_BUILD_JOBS = '4'
-$env:OPENSHELL_IMAGE_TAG = '0.1.8'
+$env:OPENSHELL_WINDOWS_STATIC_RUNTIME = '1'
+$env:OPENSHELL_IMAGE_TAG = '0.1.9'
 $env:MISE_TRUSTED_CONFIG_PATHS = $source
 $env:CARGO_HOME = Join-Path $env:USERPROFILE '.cargo'
 $pairs = @(
@@ -27,7 +28,9 @@ foreach ($pair in $pairs) {
         }
     }
 }
-$env:CARGO_ENCODED_RUSTFLAGS = ($maps | ForEach-Object { "--remap-path-prefix=$($_.Prefix)=$($_.Replacement)" }) -join [char]31
+# Environment flags override target rustflags, including windows-static.toml.
+$rustFlags = @('-C', 'target-feature=+crt-static') + @($maps | ForEach-Object { "--remap-path-prefix=$($_.Prefix)=$($_.Replacement)" })
+$env:CARGO_ENCODED_RUSTFLAGS = $rustFlags -join [char]31
 $env:AWS_LC_SYS_CFLAGS = if ($Architecture -eq 'arm64') {
     ($maps | ForEach-Object { "/clang:-ffile-prefix-map=$($_.Prefix)=$($_.Replacement)" }) -join ' '
 } else {
@@ -36,7 +39,7 @@ $env:AWS_LC_SYS_CFLAGS = if ($Architecture -eq 'arm64') {
 # Match the existing release version-stamping convention without inventing a tag.
 $cargo = Get-Content -Raw Cargo.toml
 if ($cargo -notmatch '(?m)^version = "0\.0\.0"\r?$') { throw 'Unexpected workspace version' }
-[IO.File]::WriteAllText((Join-Path $source 'Cargo.toml'), ($cargo -replace '(?m)^version = "0\.0\.0"\r?$', 'version = "0.1.8"'))
+[IO.File]::WriteAllText((Join-Path $source 'Cargo.toml'), ($cargo -replace '(?m)^version = "0\.0\.0"\r?$', 'version = "0.1.9"'))
 # Git-derived development versions must not override the stamped package version.
 $env:GIT_DIR = Join-Path $env:RUNNER_TEMP 'absent-release-git'
 & mise run --skip-tools "windows:build:$Architecture"
@@ -57,18 +60,21 @@ function Assert-Sanitized([string]$Path) {
         }
     }
 }
-foreach ($name in @('openshell.exe','openshell-gateway.exe','openshell-supervisor.exe','openshell-windows-sandbox.exe','libz3.dll')) {
+. (Join-Path $source 'tasks/scripts/windows-runtime.ps1')
+if (Test-Path (Join-Path $env:CARGO_TARGET_DIR "$target/release/libz3.dll")) { throw 'Static release unexpectedly contains libz3.dll' }
+foreach ($name in @('openshell.exe','openshell-gateway.exe','openshell-supervisor.exe','openshell-windows-sandbox.exe')) {
     $path = Join-Path $env:CARGO_TARGET_DIR "$target/release/$name"
+    Assert-StaticWindowsRuntime $path $target
     Assert-Sanitized $path
     Copy-Item $path $out
     if ($name.EndsWith('.exe')) {
         $version = & $path --version
-        if ($LASTEXITCODE -ne 0 -or "$version" -notmatch '0\.1\.8') { throw "Executable version/launch failed: $name" }
+        if ($LASTEXITCODE -ne 0 -or "$version" -notmatch '0\.1\.9') { throw "Executable version/launch failed: $name" }
     }
     $signature = Get-AuthenticodeSignature $path
-    $files += @{ file=$name; sha256=(Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant(); signature=$signature.Status.ToString() }
+    $files += @{ file=$name; sha256=(Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant(); signature=$signature.Status.ToString(); dependencies=@((Get-WindowsImageDependencies $path).Dependencies); staticRuntimeAudit='passed' }
 }
-@{architecture=$Architecture; source=$env:SOURCE_SHA; rust=(& rustc --version); runner=$env:RUNNER_ARCH; version='0.1.8'; launchChecks='passed'; files=$files} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $out 'build-record.json')
+@{architecture=$Architecture; source=$env:SOURCE_SHA; rust=(& rustc --version); runner=$env:RUNNER_ARCH; version='0.1.9'; launchChecks='passed'; runtime='static-crt-and-z3'; z3Pin=(Get-Content -Raw (Join-Path $source 'tasks/windows-z3.json') | ConvertFrom-Json); files=$files} | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $out 'build-record.json')
 $validation = Join-Path $env:GITHUB_WORKSPACE "validation-$Architecture"
 New-Item -ItemType Directory -Force $validation | Out-Null
 $fixture = Join-Path $env:CARGO_TARGET_DIR "$target/release/examples/mxc-forwarding-agent.exe"

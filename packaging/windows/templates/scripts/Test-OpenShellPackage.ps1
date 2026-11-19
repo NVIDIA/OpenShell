@@ -14,7 +14,9 @@ foreach ($file in $manifest.files) {
     if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $file.sha256) { throw "Package hash mismatch: $($file.path)" }
 }
 $machine = if ($manifest.architecture -eq 'arm64') { 0xAA64 } else { 0x8664 }
-foreach ($name in @('openshell.exe','openshell-gateway.exe','openshell-supervisor.exe','openshell-windows-sandbox.exe','libz3.dll')) {
+if ($manifest.build.runtime -ne 'static-crt-and-z3' -or $manifest.build.staticRuntimeAudit -ne 'passed') { throw 'Missing static runtime build record' }
+if (Test-Path -LiteralPath (Join-Path $root 'bin\libz3.dll')) { throw 'Unexpected Z3 DLL in the static package' }
+foreach ($name in @('openshell.exe','openshell-gateway.exe','openshell-supervisor.exe','openshell-windows-sandbox.exe')) {
     $path = Join-Path $root "bin\$name"
     if (-not $seen.ContainsKey([IO.Path]::GetFullPath($path))) { throw "Executable is not in manifest: $name" }
     $bytes = [IO.File]::ReadAllBytes($path)
@@ -28,7 +30,7 @@ foreach ($name in @('openshell.exe','openshell-gateway.exe','openshell-superviso
 }
 foreach ($name in @('openshell.exe','openshell-gateway.exe','openshell-supervisor.exe','openshell-windows-sandbox.exe')) {
     & (Join-Path $root "bin\$name") --version
-    if ($LASTEXITCODE -ne 0) { throw "Executable launch failed: $name; check the matching Visual C++ runtime and libz3.dll." }
+    if ($LASTEXITCODE -ne 0) { throw "Executable launch failed: $name; check the package architecture and supported Windows version." }
 }
 Write-Output "Package hashes, signatures, and $($manifest.architecture) executable launches checked. Source: $($manifest.source.commit)"
 Write-Output 'Verify the ZIP GitHub attestation separately before trusting this manifest.'

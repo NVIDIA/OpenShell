@@ -14,7 +14,13 @@ separate fixture only during validation. Do not rebuild product binaries locally
 Keep local reports separate from the ZIPs and identify tested bytes by SHA256.
 Do not upload raw local logs, machine identities, generated keys, or runtime state.
 
-Authenticode signing changes binary hashes. After signing all EXEs and DLLs,
+The four executables embed the CRT and the gateway embeds Z3. The build audits
+normal and delayed PE imports and excludes standalone Z3 DLLs. Preserve the Z3
+license and pinned dependency record. Path-remapping rustflags must also include
+`-C target-feature=+crt-static` because environment flags override Cargo config.
+
+Authenticode signing changes binary hashes. After signing all EXEs, PowerShell
+scripts, and SDK JavaScript files,
 update manifests and checksums, retest, and attest the new final archives before
 publishing. Candidate checks do not qualify the final signed bytes or the known
 Windows isolation limitations. Native x64 runtime qualification remains pending.
@@ -25,7 +31,8 @@ SBOM before attesting the candidate archives. The SBOM covers the broader source
 tree; it is not an exact linked-library inventory or compliance approval.
 
 `windows-signing-handoff.yml` retrieves a pinned successful candidate run,
-verifies the ZIP attestations, and binds sanitized external validation results
-to the unchanged archive and executable hashes. It assembles ten PE signing
-inputs and uploads a consolidated handoff artifact. The handoff does not perform
-external runtime tests, establish signing clearance, or sign executable files.
+verifies its ZIP attestations, checks the supplied external signing and validation
+records, and attests the final signed archive checksums. Its custom predicate
+states that Authenticode signing, final package assembly, and runtime validation
+occurred externally. The workflow uploads the final verification bundle; it does
+not perform those external operations or upload release assets.

@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 env:
-  SOURCE_SHA: e39791be4f47ed6fb6357885ef42ca1339320679
-  SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: 0.1.8
+  SOURCE_SHA: 7e4e113e3249238b61db71947c4b79b2d7a247e3
+  SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: 0.1.9
 
 jobs:
   native:
@@ -29,6 +29,7 @@ jobs:
     timeout-minutes: 180
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+      OPENSHELL_WINDOWS_STATIC_RUNTIME: '1'
     defaults:
       run:
         shell: pwsh
@@ -63,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: source -> target
-          shared-key: windows-security-${{ matrix.arch }}
+          shared-key: windows-security-static-${{ matrix.arch }}
           cache-on-failure: true
           cache-bin: false
       - name: Build and smoke-test candidate binaries
@@ -105,9 +106,9 @@ jobs:
           mise run --skip-tools sdk:ts:ci
           mise run --skip-tools test:python
           mkdir sdk-artifacts
-          cp target/wheels/openshell-0.1.8-py3-none-any.whl sdk-artifacts/
+          cp target/wheels/openshell-0.1.9-py3-none-any.whl sdk-artifacts/
           cd sdk/typescript
-          npm version 0.1.8 --no-git-tag-version --ignore-scripts
+          npm version 0.1.9 --no-git-tag-version --ignore-scripts
           npm pack --ignore-scripts --pack-destination ../../sdk-artifacts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -161,7 +162,7 @@ jobs:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: OpenShell-Windows-0.1.8-signing-candidates
+          name: OpenShell-Windows-0.1.9-signing-candidates
           path: dist/
           if-no-files-found: error
           retention-days: 30

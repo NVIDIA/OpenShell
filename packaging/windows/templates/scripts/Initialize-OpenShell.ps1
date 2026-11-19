@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param([switch]$AllowUnsigned,
     [Parameter(Mandatory)][string]$WxcExecPath,
-    [string]$StateDirectory = (Join-Path $env:LOCALAPPDATA 'OpenShell\Windows-0.1.8'),
+    [string]$StateDirectory = (Join-Path $env:LOCALAPPDATA 'OpenShell\Windows-0.1.9'),
     [ValidateRange(1024,65535)][int]$Port = 17670
 )
 $ErrorActionPreference = 'Stop'

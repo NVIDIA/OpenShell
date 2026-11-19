@@ -3,7 +3,7 @@ import { mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-const state = process.argv[2] ?? join(process.env.LOCALAPPDATA, 'OpenShell', 'Windows-0.1.8');
+const state = process.argv[2] ?? join(process.env.LOCALAPPDATA, 'OpenShell', 'Windows-0.1.9');
 const settings = JSON.parse(await readFile(join(state, 'settings.json'), 'utf8'));
 const workspace = join(state, 'workspace');
 await mkdir(workspace, { recursive: true });

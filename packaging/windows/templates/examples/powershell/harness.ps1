@@ -1,6 +1,6 @@
 #Requires -Version 7.3
 [CmdletBinding()]
-param([string]$StateDirectory = (Join-Path $env:LOCALAPPDATA 'OpenShell\Windows-0.1.8'))
+param([string]$StateDirectory = (Join-Path $env:LOCALAPPDATA 'OpenShell\Windows-0.1.9'))
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandArgumentPassing = 'Standard'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent

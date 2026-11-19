@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$AllowUnsigned, [string]$StateDirectory = (Join-Path $env:LOCALAPPDATA 'OpenShell\Windows-0.1.8'))
+param([switch]$AllowUnsigned, [string]$StateDirectory = (Join-Path $env:LOCALAPPDATA 'OpenShell\Windows-0.1.9'))
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $state = (Resolve-Path -LiteralPath $StateDirectory).Path
