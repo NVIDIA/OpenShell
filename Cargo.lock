@@ -5057,6 +5057,8 @@ dependencies = [
  "openshell-core",
  "openshell-crypto",
  "openshell-isolation-interface",
+ "openshell-otel",
+ "openshell-otel-test-support",
  "prost",
  "prost-types",
  "rcgen",

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use openshell_otel_test_support::{OtlpTestServer, tracing_test_lock};
 use std::collections::BTreeMap;
 use std::future::Future;
 #[cfg(unix)]
@@ -115,7 +116,80 @@ impl BoundaryTransportConnector for RetryingConnector {
 }
 
 #[tokio::test]
+async fn connection_span_exports_one_attempt_count_after_retries() {
+    let _tracing_lock = tracing_test_lock().await;
+    let collector = OtlpTestServer::start().await;
+    let provider = openshell_otel::build_provider(&openshell_otel::OtlpExportConfig {
+        endpoint: collector.endpoint(),
+        service_name: openshell_otel::ServiceName::Fixed("openshell-supervisor"),
+        service_version: None,
+        resource_attributes: vec![],
+    })
+    .unwrap();
+    let subscriber = tracing_subscriber::registry()
+        .with(openshell_otel::layer(&provider, "openshell-supervisor"));
+
+    let certificate = test_certificate();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let descriptor = tls_runtime_descriptor(address, certificate.client_tls);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let transport = BoundaryTransport::connector(Arc::new(RetryingConnector {
+        inner: ReverseTestConnector(listener),
+        attempts: attempts.clone(),
+        accepted: Arc::new(tokio::sync::Notify::new()),
+    }));
+    let runtime = async {
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(certificate.server_config)
+            .accept(stream)
+            .await
+            .unwrap()
+    };
+    let (connection, _runtime_stream) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            transport
+                .connect(&descriptor, ATTACH_REQUEST_TIMEOUT)
+                .with_subscriber(subscriber),
+            runtime,
+        )
+    })
+    .await
+    .expect("boundary authenticates after two failed attempts");
+    assert!(connection.is_ok());
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    tokio::task::spawn_blocking(move || {
+        provider.force_flush().unwrap();
+        provider.shutdown().unwrap();
+    })
+    .await
+    .unwrap();
+    collector.wait_for_export().await;
+    let received = collector.shutdown().await;
+    let span = received
+        .spans
+        .iter()
+        .find(|span| span.name == "supervisor.boundary.connect")
+        .expect("collector receives the boundary connect span");
+    let attempt_attributes: Vec<_> = span
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.key == "openshell.boundary.connect_attempts")
+        .map(|attribute| &attribute.value)
+        .collect();
+    assert_eq!(
+        attempt_attributes.len(),
+        1,
+        "expected one attempt count in OTLP, got {attempt_attributes:?}"
+    );
+}
+
+#[tokio::test]
 async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
+    let _tracing_lock = tracing_test_lock().await;
     for kind in [
         "dial",
         "backend",
@@ -236,13 +310,7 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
                 assert!(!captured[0].closed, "TLS authentication is still pending");
                 assert_eq!(
                     captured[0].fields,
-                    BTreeMap::from([
-                        ("openshell.boundary.transport", kind.to_string()),
-                        (
-                            "openshell.boundary.connect_attempts",
-                            if kind == "backend" { "3" } else { "1" }.to_string()
-                        )
-                    ])
+                    BTreeMap::from([("openshell.boundary.transport", kind.to_string())])
                 );
             }
             if kind == "backend" {
@@ -250,8 +318,13 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
             }
             authenticate_tx.send(()).unwrap();
             assert_eq!(request.await.unwrap(), (None, false));
-            assert!(spans.snapshot()[0].closed);
-            assert_eq!(spans.snapshot()[0].fields["otel.status_code"], "OK");
+            let captured = spans.snapshot();
+            assert!(captured[0].closed);
+            assert_eq!(captured[0].fields["otel.status_code"], "OK");
+            assert_eq!(
+                captured[0].fields["openshell.boundary.connect_attempts"],
+                if kind == "backend" { "3" } else { "1" }
+            );
 
             assert_eq!(client.discover_policy().await.unwrap(), (None, false));
             assert_eq!(spans.snapshot().len(), 1, "cached {kind} connection");
@@ -269,6 +342,7 @@ async fn connection_span_covers_authenticated_wait_and_cached_reuse() {
 #[cfg(unix)]
 #[tokio::test]
 async fn connection_span_closes_on_error_and_cancellation() {
+    let _tracing_lock = tracing_test_lock().await;
     let certificate = test_certificate();
     let mut descriptor =
         tls_runtime_descriptor("127.0.0.1:1".parse().unwrap(), certificate.client_tls);

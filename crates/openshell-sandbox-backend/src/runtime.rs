@@ -132,6 +132,19 @@ enum TransportSource {
     Routed(Arc<crate::runtime_routed::RouteRegistration>),
 }
 
+struct BoundaryConnectAttempts {
+    span: tracing::Span,
+    count: u64,
+}
+
+impl Drop for BoundaryConnectAttempts {
+    fn drop(&mut self) {
+        // Export one value even when the connection future is cancelled.
+        self.span
+            .record("openshell.boundary.connect_attempts", self.count);
+    }
+}
+
 impl BoundaryTransport {
     /// Select the transport the descriptor requires. A runtime-initiated
     /// descriptor binds its control listener, so call this inside the
@@ -187,13 +200,17 @@ impl BoundaryTransport {
             TransportSource::Connector(_) => "backend",
             TransportSource::RuntimeInitiated(_) => "runtime_initiated",
             TransportSource::Routed(_) => "routed",
-        }, openshell.boundary.connect_attempts = 1_u64, otel.status_code = tracing::field::Empty)
+        }, openshell.boundary.connect_attempts = tracing::field::Empty, otel.status_code = tracing::field::Empty)
     )]
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
         initial_connect_timeout: Duration,
     ) -> Result<BoundaryDuplexStream, BackendError> {
+        let mut attempts = BoundaryConnectAttempts {
+            span: tracing::Span::current(),
+            count: 1,
+        };
         let result = async {
             let connector = match &self.0 {
                 TransportSource::Dial => None,
@@ -226,19 +243,19 @@ impl BoundaryTransport {
                 }
             };
             let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
-            let mut attempts = 0_u64;
             loop {
-                attempts += 1;
-                tracing::Span::current().record("openshell.boundary.connect_attempts", attempts);
                 match connect_boundary_using_connector(descriptor, connector).await {
                     Ok(stream) => return Ok(stream),
                     Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
-                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        attempts.count += 1;
+                    }
                 }
             }
         }
         .await;
-        tracing::Span::current().record(
+        attempts.span.record(
             "otel.status_code",
             if result.is_ok() { "OK" } else { "ERROR" },
         );
