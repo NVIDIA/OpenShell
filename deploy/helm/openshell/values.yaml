@@ -91,9 +91,9 @@ supervisor:
     maxInstancesPerMember: 128
     # -- Most supervisors one gateway replica serves, rendered as
     # [openshell.gateway.supervisor_pool] max_members_per_gateway. Must be a
-    # positive integer. The pool runs at most gateway replicas *
-    # maxMembersPerGateway * maxInstancesPerMember sandboxes, never more than
-    # 131072.
+    # positive integer. The pool runs at most gateway replicas times
+    # maxMembersPerGateway times maxInstancesPerMember sandboxes, never more
+    # than 131072.
     maxMembersPerGateway: 32
   # -- Resources of each shared supervisor container. Memory grows with the
   # sandboxes a supervisor runs; raise it with pool.maxInstancesPerMember.
