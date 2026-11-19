@@ -29,11 +29,18 @@ depends = [
   "test:merge-gateway-toml",
   "test:accepted-work",
   "test:label-issue",
+  "test:agent-adapters",
 ]
 
 ["test:merge-gateway-toml"]
 description = "Test the tmachine gateway TOML merge script"
 run = "uv run --no-project --with pytest pytest tests/tmachine/ansible/roles/openshell_gateway/files/merge_gateway_toml_test.py"
+
+["test:agent-adapters"]
+description = "Test local agent harness adapter generation"
+run = "uv run --no-project --with pytest pytest tasks/scripts/agent_adapters_test.py"
+run_windows = "echo Skipping test:agent-adapters: adapter generation uses Unix symlinks."
+hide = true
 
 ["test:cargo-lockfile-alignment"]
 description = "Test the Cargo lockfile alignment check"
