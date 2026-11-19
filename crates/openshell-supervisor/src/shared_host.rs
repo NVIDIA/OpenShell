@@ -42,7 +42,8 @@ use openshell_extension_core::BearerTokenSlot;
 use openshell_sandbox_backend::BoundaryTakeover;
 use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
 use openshell_supervisor_control::{
-    SandboxInstancePhaseReport, SandboxInstanceRegistration, SandboxInstanceStatusReport,
+    PoolLimits, SandboxInstancePhaseReport, SandboxInstanceRegistration,
+    SandboxInstanceStatusReport,
 };
 use tokio::sync::watch;
 use tokio_stream::StreamExt as _;
@@ -77,15 +78,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Host-to-gateway messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
-/// Most sandbox instances one snapshot may assign to a host; the gateway
-/// enforces the same bound before it assigns.
-pub const MAX_ASSIGNED_INSTANCES: usize = openshell_supervisor_control::MAX_ASSIGNED_INSTANCES;
-/// Largest gateway message the host decodes: a full snapshot of
-/// `MAX_ASSIGNED_INSTANCES` assignments at their largest, plus framing.
-const MAX_GATEWAY_MESSAGE_BYTES: usize =
-    MAX_ASSIGNED_INSTANCES * (openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES + 1024);
-/// Largest host message: a status report is a few hundred bytes per instance.
-const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// How a host notices a silent gateway and paces its reconnects: it must
 /// reach a responsive gateway replica well before its membership record
@@ -179,6 +171,9 @@ pub struct SharedHostConfig {
     pub attach_request_timeout: Duration,
     /// This process's identity as a member of the supervisor pool.
     pub pool: PoolIdentity,
+    /// Most sandbox instances this member runs. The gateway enforces the
+    /// same cap before it assigns.
+    pub max_instances: usize,
 }
 
 /// The sandbox instance registry and the routed runtime listener its
@@ -198,6 +193,8 @@ pub struct SharedHost {
     desired_routes: Mutex<Option<std::collections::BTreeSet<String>>>,
     /// This process's identity as a member of the supervisor pool.
     pool: PoolIdentity,
+    /// This member's cap, which also sizes its stream's message bounds.
+    limits: PoolLimits,
     /// Routes of the latest snapshot listed for stopping. Every other route
     /// it omits is relinquished.
     stop_routes: Mutex<std::collections::BTreeSet<String>>,
@@ -295,6 +292,11 @@ impl From<SandboxInstanceHostError> for ControlError {
 impl SharedHost {
     /// Bind the routed runtime listener and prepare the instance root.
     pub fn start(config: SharedHostConfig) -> Result<Arc<Self>> {
+        let limits = PoolLimits::new(
+            config.max_instances,
+            openshell_supervisor_control::DEFAULT_MAX_MEMBERS_PER_GATEWAY,
+        )
+        .map_err(|error| miette::miette!("{error}"))?;
         let app_listener = crate::app_listener::Config::from_env()?
             .map(crate::app_listener::Config::bind)
             .transpose()?
@@ -312,6 +314,7 @@ impl SharedHost {
             rejected: Mutex::new(BTreeMap::new()),
             desired_routes: Mutex::new(None),
             pool: config.pool,
+            limits,
             stop_routes: Mutex::new(std::collections::BTreeSet::new()),
             deferred: Mutex::new(None),
             deferred_reports: Mutex::new(BTreeMap::new()),
@@ -328,6 +331,12 @@ impl SharedHost {
     #[must_use]
     pub fn pool(&self) -> &PoolIdentity {
         &self.pool
+    }
+
+    /// Most sandbox instances this member runs.
+    #[must_use]
+    pub fn max_instances(&self) -> usize {
+        self.limits.max_instances_per_member()
     }
 
     /// Whether this pool member announced that it is leaving.
@@ -491,8 +500,8 @@ impl SharedHost {
     /// every hosted instance it omits. Assignments that cannot be admitted are
     /// reported as failed instances; they never affect a running instance.
     ///
-    /// A snapshot that would run more than [`MAX_ASSIGNED_INSTANCES`]
-    /// instances still applies its stops, directory, and kept routes, and
+    /// A snapshot that would run more than this member's cap of instances
+    /// still applies its stops, directory, and kept routes, and
     /// keeps every hosted instance it assigns; only the new instances beyond
     /// capacity are left unstarted, as kept routes are, until a later
     /// snapshot fits.
@@ -552,7 +561,7 @@ impl SharedHost {
             .into_iter()
             .map(|status| status.route)
             .collect::<std::collections::BTreeSet<_>>();
-        let (admitted, unstarted) = within_capacity(snapshot, &hosted);
+        let (admitted, unstarted) = within_capacity(snapshot, &hosted, self.max_instances());
         if !unstarted.is_empty() {
             tracing::warn!(
                 assigned = snapshot.instances.len(),
@@ -957,9 +966,21 @@ pub struct GatewayLink {
     /// connection attempt, so the gateway's renewals take effect at the next
     /// reconnect without a restart.
     pub token_file: PathBuf,
+    /// Sizes the stream's message bounds; [`attach_to_gateway`] sets it from
+    /// the host's cap.
+    limits: PoolLimits,
 }
 
 impl GatewayLink {
+    #[must_use]
+    pub fn new(endpoint: String, token_file: PathBuf) -> Self {
+        Self {
+            endpoint,
+            token_file,
+            limits: PoolLimits::default(),
+        }
+    }
+
     /// Read the current supervisor token. A missing, empty, malformed, or
     /// already expired token is an error; the gateway keeps the file fresh,
     /// so the caller retries later.
@@ -1065,8 +1086,8 @@ impl GatewayConnector for GatewayLink {
                 .map_err(|_| "connecting to the gateway timed out".to_string())?
                 .map_err(|error| format!("could not connect to the gateway: {error}"))?;
             let mut client = SupervisorHostClient::with_interceptor(channel, token.interceptor())
-                .max_decoding_message_size(MAX_GATEWAY_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_HOST_MESSAGE_BYTES);
+                .max_decoding_message_size(self.limits.max_gateway_message_bytes())
+                .max_encoding_message_size(self.limits.max_host_message_bytes());
             let attach = client.attach(tokio_stream::wrappers::ReceiverStream::new(outbound));
             let response = tokio::time::timeout_at(deadline, attach)
                 .await
@@ -1087,9 +1108,10 @@ impl GatewayConnector for GatewayLink {
 /// disconnects.
 pub async fn attach_to_gateway(
     host: Arc<SharedHost>,
-    link: GatewayLink,
+    mut link: GatewayLink,
     shutdown: impl Future<Output = ()>,
 ) {
+    link.limits = host.limits;
     attach_with(host, Arc::new(link), shutdown).await;
 }
 
@@ -1365,11 +1387,11 @@ impl Drop for ReconcilerHandle {
 
 /// The assignments of `snapshot` a host admits, and the routes it leaves
 /// unstarted. Hosted instances the snapshot assigns or keeps stay; new ones
-/// are admitted in route order while fewer than [`MAX_ASSIGNED_INSTANCES`]
-/// would run.
+/// are admitted in route order while fewer than `max_instances` would run.
 fn within_capacity<'a>(
     snapshot: &'a AssignmentSnapshot,
     hosted: &std::collections::BTreeSet<String>,
+    max_instances: usize,
 ) -> (Vec<&'a SandboxInstanceAssignment>, Vec<&'a str>) {
     let assigned = snapshot
         .instances
@@ -1380,7 +1402,7 @@ fn within_capacity<'a>(
         .iter()
         .filter(|route| assigned.contains(route.as_str()) || snapshot.keep_routes.contains(*route))
         .count();
-    let mut room = MAX_ASSIGNED_INSTANCES.saturating_sub(staying);
+    let mut room = max_instances.saturating_sub(staying);
     let mut fresh = snapshot
         .instances
         .iter()
@@ -1618,6 +1640,63 @@ mod tests {
     use openshell_core::jwt::CredentialEpoch;
     use openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId;
 
+    /// The smallest per-member cap a member accepts.
+    const TEST_MAX_INSTANCES: usize = 16;
+
+    #[test]
+    fn hosts_refuse_caps_outside_the_allowed_range() {
+        for max_instances in [0, 15, 1025] {
+            let root = tempfile::tempdir().unwrap();
+            let started = SharedHost::start(SharedHostConfig {
+                gateway_endpoint: "https://gateway.invalid".to_string(),
+                instance_root: root.path().join("instances"),
+                runtime_listen: "127.0.0.1:0".parse().unwrap(),
+                removal_grace: Duration::from_secs(1),
+                attach_request_timeout: Duration::from_secs(1),
+                pool: PoolIdentity {
+                    member_id: "member-1".to_string(),
+                    runtime_address: "127.0.0.1:5500".parse().unwrap(),
+                },
+                max_instances,
+            });
+            assert!(started.is_err(), "{max_instances}");
+        }
+    }
+
+    #[test]
+    fn capacity_admits_new_instances_only_up_to_the_configured_cap() {
+        let assignment = |route: &str| SandboxInstanceAssignment {
+            sandbox_id: route.to_string(),
+            route: route.to_string(),
+            generation: "generation".to_string(),
+            launch_material: b"{}".to_vec(),
+            takeover: None,
+        };
+        let snapshot = AssignmentSnapshot {
+            instances: (0..40)
+                .map(|index| assignment(&format!("rt-{index:02}")))
+                .collect(),
+            keep_routes: vec!["rt-kept".to_string()],
+            ..AssignmentSnapshot::default()
+        };
+        let hosted = ["rt-00", "rt-kept", "rt-gone"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for cap in [16, 32] {
+            let (admitted, unstarted) = within_capacity(&snapshot, &hosted, cap);
+            // The hosted and kept instances count; the one being released
+            // does not.
+            assert_eq!(admitted.len(), cap - 1, "{cap}");
+            assert_eq!(admitted.len() + unstarted.len(), 40, "{cap}");
+            assert!(
+                admitted
+                    .iter()
+                    .any(|assignment| assignment.route == "rt-00")
+            );
+        }
+    }
+
     /// A hosted instance whose stop path reports on `stopped`.
     fn admit_supervising(host: &SharedHost, route: &str, stopped: tokio::sync::mpsc::Sender<()>) {
         let bindings = crate::SandboxInstanceBindings {
@@ -1674,6 +1753,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            max_instances: TEST_MAX_INSTANCES,
         })
         .unwrap();
         for (revision, (offered, kept)) in [
@@ -1711,6 +1791,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            max_instances: TEST_MAX_INSTANCES,
         })
         .unwrap();
         let routes = [
@@ -1833,6 +1914,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            max_instances: TEST_MAX_INSTANCES,
         })
         .unwrap();
         let (released, stopped) = ("rt-released-0123456789", "rt-stopped-0123456789");
@@ -1930,6 +2012,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            max_instances: TEST_MAX_INSTANCES,
         })
         .unwrap();
         let (hosted_route, stopped_route) = ("rt-hosted-0123456789", "rt-stopped-0123456789");
@@ -1962,7 +2045,7 @@ mod tests {
         };
         let mut instances = vec![assignment(hosted_route.to_string())];
         instances.extend(
-            (0..MAX_ASSIGNED_INSTANCES)
+            (0..TEST_MAX_INSTANCES)
                 .map(|index| assignment(format!("rt-new-{index:04}-0123456789"))),
         );
         let elsewhere = "rt-elsewhere-0123456789";
@@ -2003,8 +2086,8 @@ mod tests {
         // Only up to capacity was attempted: the hosted instance and all but
         // the last new one in route order; the last stays unstarted.
         let rejected = host.rejected.lock().unwrap().clone();
-        assert_eq!(rejected.len(), MAX_ASSIGNED_INSTANCES);
-        let last = format!("rt-new-{:04}-0123456789", MAX_ASSIGNED_INSTANCES - 1);
+        assert_eq!(rejected.len(), TEST_MAX_INSTANCES);
+        let last = format!("rt-new-{:04}-0123456789", TEST_MAX_INSTANCES - 1);
         assert!(!rejected.contains_key(&last));
         assert!(rejected.contains_key("rt-new-0000-0123456789"));
         assert!(host.list().iter().all(|status| status.route != last));
@@ -2153,6 +2236,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            max_instances: TEST_MAX_INSTANCES,
         })
         .unwrap();
         let (opened, streams) = tokio::sync::mpsc::unbounded_channel();
@@ -2590,6 +2674,7 @@ mod tests {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            max_instances: TEST_MAX_INSTANCES,
         })
         .unwrap();
         let reconciler = Reconciler::start(host.clone());

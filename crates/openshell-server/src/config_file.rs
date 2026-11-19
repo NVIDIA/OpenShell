@@ -273,6 +273,50 @@ pub struct SupervisorPoolConfig {
     /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_timeout_secs: Option<u32>,
+    /// Most sandbox instances the gateway places on one pool member, from 16
+    /// to 1024; unset places
+    /// [`openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER`].
+    /// Each member must run with the same cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances_per_member: Option<u32>,
+    /// Pool members one gateway replica is sized to serve, from 1 to 64;
+    /// unset sizes for
+    /// [`openshell_supervisor_control::DEFAULT_MAX_MEMBERS_PER_GATEWAY`]. The
+    /// pool runs at most live replicas × this × `max_instances_per_member`
+    /// instances, never past
+    /// [`openshell_supervisor_control::MAX_POOL_INSTANCES_CEILING`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_members_per_gateway: Option<u32>,
+}
+
+impl SupervisorPoolConfig {
+    /// The configured pool limits, defaults filled in.
+    ///
+    /// # Errors
+    ///
+    /// A limit is outside its range.
+    pub fn limits(
+        &self,
+    ) -> Result<
+        openshell_supervisor_control::PoolLimits,
+        openshell_supervisor_control::PoolLimitsError,
+    > {
+        let configured = |value: Option<u32>, default: usize| {
+            value.map_or(default, |value| {
+                usize::try_from(value).unwrap_or(usize::MAX)
+            })
+        };
+        openshell_supervisor_control::PoolLimits::new(
+            configured(
+                self.max_instances_per_member,
+                openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER,
+            ),
+            configured(
+                self.max_members_per_gateway,
+                openshell_supervisor_control::DEFAULT_MAX_MEMBERS_PER_GATEWAY,
+            ),
+        )
+    }
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.
@@ -1617,6 +1661,27 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         return Err(ConfigFileError::InvalidValue {
             field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
             message: "must be between 30 and 300 seconds",
+        });
+    }
+    if let Some(Err(error)) = file
+        .openshell
+        .gateway
+        .supervisor_pool
+        .map(|pool| pool.limits())
+    {
+        return Err(match error {
+            openshell_supervisor_control::PoolLimitsError::InstancesPerMember => {
+                ConfigFileError::InvalidValue {
+                    field: "openshell.gateway.supervisor_pool.max_instances_per_member",
+                    message: "must be between 16 and 1024",
+                }
+            }
+            openshell_supervisor_control::PoolLimitsError::MembersPerGateway => {
+                ConfigFileError::InvalidValue {
+                    field: "openshell.gateway.supervisor_pool.max_members_per_gateway",
+                    message: "must be between 1 and 64",
+                }
+            }
         });
     }
     if let Some((name, _)) = file
@@ -3514,6 +3579,61 @@ database_lock_max_connections = 0
                 "{unknown}"
             );
         }
+    }
+
+    #[test]
+    fn parses_and_bounds_the_supervisor_pool_limits() {
+        let pool = |table: &str| {
+            let tmp = write_tmp(&format!("[openshell.gateway.supervisor_pool]\n{table}"));
+            load(tmp.path()).map(|file| file.openshell.gateway.supervisor_pool)
+        };
+        let defaults = pool("").unwrap().unwrap().limits().unwrap();
+        assert_eq!(
+            defaults,
+            openshell_supervisor_control::PoolLimits::default()
+        );
+        assert_eq!(defaults.max_instances_per_member(), 128);
+        assert_eq!(defaults.max_members_per_gateway(), 32);
+
+        let configured = pool("max_instances_per_member = 1024\nmax_members_per_gateway = 64\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(configured.max_instances_per_member, Some(1024));
+        assert_eq!(configured.max_members_per_gateway, Some(64));
+        let limits = configured.limits().unwrap();
+        assert_eq!(
+            limits.max_pool_instances(25),
+            openshell_supervisor_control::MAX_POOL_INSTANCES_CEILING
+        );
+        for lower_bound in [
+            "max_instances_per_member = 16\n",
+            "max_members_per_gateway = 1\n",
+        ] {
+            assert!(pool(lower_bound).is_ok(), "{lower_bound}");
+        }
+
+        for out_of_range in ["0", "15", "1025", "4096"] {
+            assert!(matches!(
+                pool(&format!("max_instances_per_member = {out_of_range}\n")),
+                Err(ConfigFileError::InvalidValue {
+                    field: "openshell.gateway.supervisor_pool.max_instances_per_member",
+                    ..
+                })
+            ));
+        }
+        for out_of_range in ["0", "65", "128"] {
+            assert!(matches!(
+                pool(&format!("max_members_per_gateway = {out_of_range}\n")),
+                Err(ConfigFileError::InvalidValue {
+                    field: "openshell.gateway.supervisor_pool.max_members_per_gateway",
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            pool("max_instances_per_member = -1\n"),
+            Err(ConfigFileError::Parse { .. })
+        ));
     }
 
     #[test]
