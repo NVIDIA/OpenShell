@@ -161,6 +161,10 @@ pub(in crate::grpc) enum Outcome {
         changed: bool,
         #[serde(default)]
         service_urls: HashMap<String, String>,
+        #[serde(default)]
+        application_service_urls: HashMap<String, String>,
+        #[serde(default)]
+        gateway_service_urls: Option<HashMap<String, String>>,
     },
     SandboxDeletion {
         id: String,
@@ -183,6 +187,10 @@ pub(in crate::grpc) enum Outcome {
         reference: Reference,
         sandbox_id: String,
         url: String,
+        #[serde(default)]
+        application_url: String,
+        #[serde(default)]
+        gateway_url: Option<String>,
     },
     Profiles {
         references: Vec<Reference>,
@@ -343,7 +351,7 @@ async fn profile_scope(
 }
 
 macro_rules! mutation {
-    ($req:ty, $resp:ty, $method:literal, $handler:path, $auth:expr, $capture:expr, $restore:expr $(, $replay_method:literal)?) => {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $auth:expr, $capture:expr, $restore:expr $(, replay_method = $replay_method:literal)?) => {
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;
@@ -398,7 +406,7 @@ macro_rules! scoped_mutation {
 }
 
 macro_rules! sandbox_scoped_mutation {
-    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr $(, $replay_method:literal)?) => {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr $(, replay_method = $replay_method:literal)?) => {
         mutation!(
             $req,
             $resp,
@@ -415,20 +423,54 @@ macro_rules! sandbox_scoped_mutation {
             },
             $capture,
             $restore
-            $(, $replay_method)?
+            $(, replay_method = $replay_method)?
         );
     };
 }
 
-fn sandbox_receipt(
-    sandbox: Option<&Sandbox>,
-    changed: bool,
-    service_urls: HashMap<String, String>,
-) -> Result<Outcome, Status> {
+fn sandbox_receipt(response: &SandboxResponse, changed: bool) -> Result<Outcome, Status> {
     Ok(Outcome::Sandbox {
-        id: sandbox.ok_or_else(uncertain)?.object_id().into(),
+        id: response
+            .sandbox
+            .as_ref()
+            .ok_or_else(uncertain)?
+            .object_id()
+            .into(),
         changed,
+        service_urls: response.service_urls.clone(),
+        application_service_urls: response.application_service_urls.clone(),
+        gateway_service_urls: Some(response.gateway_service_urls.clone()),
+    })
+}
+
+async fn restore_sandbox_response(
+    store: &Store,
+    outcome: Outcome,
+) -> Result<SandboxResponse, Status> {
+    let Outcome::Sandbox {
+        id,
         service_urls,
+        application_service_urls,
+        gateway_service_urls,
+        ..
+    } = outcome
+    else {
+        return Err(replay_unavailable());
+    };
+    // Receipts written before application URLs were introduced contain only
+    // gateway URLs. New receipts always record both explicit access paths.
+    let gateway_service_urls = gateway_service_urls.unwrap_or_else(|| {
+        service_urls
+            .iter()
+            .filter(|(_, url)| !url.is_empty())
+            .map(|(name, url)| (name.clone(), url.clone()))
+            .collect()
+    });
+    Ok(SandboxResponse {
+        sandbox: Some(live(store, &id).await?),
+        service_urls,
+        application_service_urls,
+        gateway_service_urls,
     })
 }
 
@@ -440,21 +482,9 @@ macro_rules! sandbox_mutation {
             $method,
             $handler,
             User,
-            |response: &Response<SandboxResponse>| sandbox_receipt(
-                response.get_ref().sandbox.as_ref(),
-                false,
-                HashMap::new(),
-            ),
-            async |store: &Store, outcome: Outcome| {
-                let Outcome::Sandbox { id, .. } = outcome else {
-                    return Err(replay_unavailable());
-                };
-                Ok(SandboxResponse {
-                    sandbox: Some(live(store, &id).await?),
-                    service_urls: HashMap::new(),
-                })
-            }
-            $(, $replay_method)?
+            |response: &Response<SandboxResponse>| sandbox_receipt(response.get_ref(), false),
+            restore_sandbox_response
+            $(, replay_method = $replay_method)?
         );
     };
 }
@@ -464,23 +494,8 @@ scoped_mutation!(
     "CreateSandbox",
     sandbox::handle_create_sandbox,
     User,
-    |response: &Response<SandboxResponse>| sandbox_receipt(
-        response.get_ref().sandbox.as_ref(),
-        false,
-        response.get_ref().service_urls.clone(),
-    ),
-    async |store: &Store, outcome: Outcome| {
-        let Outcome::Sandbox {
-            id, service_urls, ..
-        } = outcome
-        else {
-            return Err(replay_unavailable());
-        };
-        Ok(SandboxResponse {
-            sandbox: Some(live(store, &id).await?),
-            service_urls,
-        })
-    }
+    |response: &Response<SandboxResponse>| sandbox_receipt(response.get_ref(), false),
+    restore_sandbox_response
 );
 sandbox_mutation!(
     openshell_core::proto::UpdateSandboxRequest,
@@ -589,6 +604,8 @@ sandbox_scoped_mutation!(
             reference: Reference::new(endpoint),
             sandbox_id: endpoint.sandbox_id.clone(),
             url: value.url.clone(),
+            application_url: value.application_url.clone(),
+            gateway_url: Some(value.gateway_url.clone()),
         })
     },
     async |store: &Store, outcome: Outcome| {
@@ -596,12 +613,16 @@ sandbox_scoped_mutation!(
             reference,
             sandbox_id,
             url,
+            application_url,
+            gateway_url,
         } = outcome
         else {
             return Err(replay_unavailable());
         };
         let _: Sandbox = live(store, &sandbox_id).await?;
         Ok(ServiceEndpointResponse {
+            application_url,
+            gateway_url: gateway_url.unwrap_or_else(|| url.clone()),
             endpoint: Some(reference.restore(store).await?),
             url,
         })

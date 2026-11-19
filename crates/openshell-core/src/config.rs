@@ -515,6 +515,8 @@ pub struct Config {
 /// Part of the programmatically-built [`Config`]; never deserialized directly.
 #[derive(Debug, Clone)]
 pub struct ServiceRoutingConfig {
+    /// Publish gateway URLs and forward application requests through the gateway.
+    pub enabled: bool,
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
     pub base_domains: Vec<String>,
@@ -1475,6 +1477,13 @@ impl Config {
             .then_some(self.name.as_str())
     }
 
+    /// Enable gateway-mediated application routing independently of app listeners.
+    #[must_use]
+    pub const fn with_service_routing(mut self, enabled: bool) -> Self {
+        self.service_routing.enabled = enabled;
+        self
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1494,6 +1503,7 @@ impl Config {
 impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
             service_hostname_format: ServiceHostnameFormat::default(),
