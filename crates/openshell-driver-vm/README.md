@@ -274,6 +274,60 @@ file. Replacement is written and synced under a temporary name, then atomically
 renamed into place. `OPENSHELL_VM_SUPERVISOR_BIN` remains an explicit
 development override.
 
+## External launcher cleanup
+
+For a launcher that implements this contract, start the VM driver with
+`--launcher-bin /path/to/launcher --launcher-managed-cleanup`. Library callers
+can set `VmDriverConfig::launcher_bin` and
+`VmDriverConfig::launcher_managed_cleanup`. This applies to workload VMs.
+When the gateway spawns the driver, use `OPENSHELL_VM_LAUNCHER_BIN` and
+`OPENSHELL_VM_LAUNCHER_MANAGED_CLEANUP=true` in the gateway process environment.
+Built-in launchers and image preparation use their existing teardown paths.
+The custom executable also receives the existing image-preparation commands.
+Handle or forward them to the built-in launcher. Those commands do not get the
+workload run environment. GPU passthrough requires the built-in cleanup path.
+
+The driver passes `OPENSHELL_VM_LAUNCH_RUN_ID` and
+`OPENSHELL_VM_LAUNCH_STATE_DIR` to the host launcher. The directory is private
+and unique to the run. Keep the launcher's ownership and cleanup records there.
+Use the run ID to associate each record with the exact VM and the resources it
+owns. A Linux launcher can use a pidfd to track the live process across UID
+changes. For recovery, retain a durable way to identify or fence that instance.
+A saved PID alone can refer to a different process after restart.
+
+After the guest shutdown attempt, the driver creates an empty `stop-requested`
+file in the run directory. It also sends `SIGTERM` if it has the launcher
+process handle. The live launcher must observe the file while it manages the
+VM, including when the driver has lost that handle. On either request, stop
+the exact VMM and confirm it has exited. Keep any disk or identity lease until
+the old VM can no longer use the resource. Record progress by writing one of
+the following lines to a temporary file, then renaming it to `status`.
+
+| Status | What the launcher has confirmed |
+| --- | --- |
+| `compute-stopped` | The VMM has exited and resource release is still pending. |
+| `cleanup-failed` | The VMM has exited and resource release needs a retry. |
+| `complete` | The VMM has exited and the launcher has released its resources. |
+
+A Stop or Delete first gives the supervisor time to flush the guest filesystem.
+The driver then allows up to five seconds for launcher cleanup. A shorter caller
+deadline can end the request sooner. A cleanup timeout returns the last
+confirmed stage and the run ID. The driver
+leaves the launcher running so it can finish cleanup. Retry Stop or Delete for
+the same sandbox. On retry or driver restart, the driver can call the same
+launcher with `--internal-cleanup-vm` and the original run environment. The
+launcher must serialize cleanup for that run, including with any live launcher
+already doing the work. If another process holds the lock, return promptly
+and let that process observe `stop-requested`. Use the same lock when starting
+compute, and check for `stop-requested` or a completed run before allocating
+anything. An in-place launcher upgrade must be able to finish cleanup from
+records written by the previous version. Keep the records and leases until
+cleanup succeeds. After recording `complete`, that run can no longer start
+compute or use its former resources. Start waits for confirmation before
+starting a replacement VM. After a restart, the driver finishes the old run
+before allowing a new Start. A pending Delete retains its state and is retried
+after restart.
+
 ## Logs and debugging
 
 Raise log verbosity for both processes:

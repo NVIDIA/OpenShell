@@ -253,6 +253,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_MAX_BYTES")]
     rootfs_tar_max_bytes: Option<u64>,
 
+    /// Operator-selected VM launcher executable.
+    #[arg(long, env = "OPENSHELL_VM_LAUNCHER_BIN")]
+    launcher_bin: Option<PathBuf>,
+
+    /// Require the external launcher to confirm compute exit and host cleanup.
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_LAUNCHER_MANAGED_CLEANUP",
+        requires = "launcher_bin"
+    )]
+    launcher_managed_cleanup: bool,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -333,7 +345,8 @@ async fn main() -> Result<()> {
         supervisor_otlp,
         supervisor_gateway_name: args.gateway_name.clone(),
         state_dir: args.state_dir.clone(),
-        launcher_bin: None,
+        launcher_bin: args.launcher_bin.clone(),
+        launcher_managed_cleanup: args.launcher_managed_cleanup,
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
         log_level: args.log_level.clone(),

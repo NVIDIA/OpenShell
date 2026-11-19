@@ -3,6 +3,11 @@
 
 #![allow(unsafe_code)]
 
+#[path = "launcher_cleanup.rs"]
+mod launcher_cleanup;
+#[cfg(test)]
+#[path = "launcher_cleanup_tests.rs"]
+mod launcher_cleanup_tests;
 #[path = "preparation.rs"]
 mod preparation;
 
@@ -249,6 +254,7 @@ const SANDBOX_OWNER_STATE_V1: &str = "sandbox-owner-v1";
 const SANDBOX_OWNER_STATE_V2: &str = "sandbox-owner-v2";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
 const SANDBOX_STOPPED_FILE: &str = "stopped";
+const SANDBOX_DELETE_PENDING_FILE: &str = "launcher-delete-pending";
 /// Durable tombstone preventing driver restart from relaunching a sandbox
 /// whose canonical main process already terminated.
 const MAIN_PROCESS_EXITED_FILE: &str = "main-process-exited";
@@ -356,6 +362,9 @@ pub struct VmDriverConfig {
     pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
+    /// The configured launcher confirms compute exit and resource cleanup per run.
+    #[serde(default)]
+    pub launcher_managed_cleanup: bool,
     pub default_image: String,
     pub bootstrap_image: String,
     pub log_level: String,
@@ -429,6 +438,7 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("supervisor_gateway_name", &self.supervisor_gateway_name)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
+            .field("launcher_managed_cleanup", &self.launcher_managed_cleanup)
             .field("default_image", &self.default_image)
             .field("bootstrap_image", &self.bootstrap_image)
             .field("log_level", &self.log_level)
@@ -502,6 +512,7 @@ impl Default for VmDriverConfig {
                 openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             state_dir: PathBuf::from("target/openshell-vm-driver"),
             launcher_bin: None,
+            launcher_managed_cleanup: false,
             default_image: String::new(),
             bootstrap_image: String::new(),
             log_level: "info".to_string(),
@@ -1054,6 +1065,22 @@ struct VmProcess {
     supervisor: Child,
     supervisor_liveness: Option<fs::File>,
     deleting: bool,
+    launcher_stop_requested: bool,
+}
+
+impl VmProcess {
+    fn request_launcher_stop(&mut self) -> std::io::Result<()> {
+        if !self.launcher_stop_requested {
+            signal_vm_process(&self.child)?;
+            self.launcher_stop_requested = true;
+        }
+        Ok(())
+    }
+}
+
+enum LauncherRecovery {
+    Stop(String),
+    Delete(Option<String>),
 }
 
 struct SandboxRecord {
@@ -1165,6 +1192,23 @@ impl VmDriver {
         lifecycle_extensions: LifecycleExtensionRegistry,
     ) -> Result<Self, String> {
         config.resource_admission.validate()?;
+        if config.launcher_managed_cleanup {
+            if config.gpu_enabled {
+                return Err("launcher-managed cleanup does not support GPU passthrough".to_owned());
+            }
+            let path = config
+                .launcher_bin
+                .as_deref()
+                .filter(|path| path.is_absolute())
+                .ok_or("launcher-managed cleanup requires an absolute launcher_bin path")?;
+            if !path.is_file() {
+                return Err(format!("VM launcher is not a file: {}", path.display()));
+            }
+            config.launcher_bin = Some(
+                fs::canonicalize(path)
+                    .map_err(|error| format!("resolve VM launcher {}: {error}", path.display()))?,
+            );
+        }
         lifecycle_extensions
             .validate()
             .map_err(|err| err.message().to_string())?;
@@ -1644,6 +1688,7 @@ impl VmDriver {
         );
 
         let snapshot = sandbox_snapshot(sandbox, provisioning_condition(), false);
+        self.require_launcher_idle(&state_dir).await?;
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox.id) {
@@ -1772,7 +1817,9 @@ impl VmDriver {
         {
             tracing::Span::current().record("otel.status_code", "ERROR");
             if err.code() == tonic::Code::Cancelled {
-                if overlay_preparation == OverlayPreparation::Fresh {
+                if overlay_preparation == OverlayPreparation::Fresh
+                    && matches!(launcher_cleanup::Run::load(&state_dir).await, Ok(None))
+                {
                     let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 }
                 remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox_id);
@@ -1805,6 +1852,7 @@ impl VmDriver {
         overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
+        self.require_launcher_idle(&state_dir).await?;
         // Launch credentials are independent of the image. Validate them before
         // resolving registry references, preparing disks, or publishing progress.
         let launch_authentication = decode_launch_authentication(
@@ -2139,6 +2187,9 @@ impl VmDriver {
         .map_err(|error| Status::internal(format!("persist VM boundary generation: {error}")))?;
         let runtime_descriptor = provisioning.runtime_descriptor;
         let mut command = Command::new(&self.launcher_bin);
+        command
+            .env_remove(launcher_cleanup::RUN_ID_ENV)
+            .env_remove(launcher_cleanup::RUN_STATE_DIR_ENV);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
@@ -2216,7 +2267,31 @@ impl VmDriver {
             console_output = %console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let mut child = match command.spawn() {
+        let managed_launch = self.config.launcher_managed_cleanup;
+        let launch_operation = if managed_launch {
+            // Journal writes and fsyncs do not hold the shared registry.
+            // Teardown of this sandbox takes the same operation lock.
+            let operation = launcher_cleanup::lock(&state_dir)?;
+            self.ensure_provisioning_active(&sandbox.id).await?;
+            Some(operation)
+        } else {
+            None
+        };
+        if managed_launch {
+            let run = launcher_cleanup::Run::begin(&state_dir, &self.launcher_bin).await?;
+            if run.launcher() != self.launcher_bin {
+                return Err(Status::failed_precondition(
+                    "configured VM launcher changed while registering the run",
+                ));
+            }
+            run.configure(&mut command);
+            // The launcher owns its VMM and can continue cleanup across a
+            // canceled request. The journal fences the next launch.
+            command.kill_on_drop(false);
+        }
+        let spawned = command.spawn();
+        drop(launch_operation);
+        let mut child = match spawned {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -2256,15 +2331,19 @@ impl VmDriver {
         {
             Ok(supervisor) => supervisor,
             Err(error) => {
-                let _ = terminate_vm_process(&mut child).await;
-                self.lifecycle_extensions
-                    .after_launch_failed(
-                        &sandbox,
-                        &state_dir,
-                        LaunchAbortReason::LauncherSpawnFailed,
-                    )
-                    .await;
-                self.release_gpu(&sandbox.id);
+                if managed_launch {
+                    let _ = signal_vm_process(&child);
+                } else {
+                    let _ = terminate_vm_process(&mut child).await;
+                    self.lifecycle_extensions
+                        .after_launch_failed(
+                            &sandbox,
+                            &state_dir,
+                            LaunchAbortReason::LauncherSpawnFailed,
+                        )
+                        .await;
+                    self.release_gpu(&sandbox.id);
+                }
                 return Err(error);
             }
         };
@@ -2273,6 +2352,7 @@ impl VmDriver {
             supervisor,
             supervisor_liveness,
             deleting: false,
+            launcher_stop_requested: false,
         }));
 
         let mut process_to_stop = None;
@@ -2307,11 +2387,17 @@ impl VmDriver {
             {
                 let mut process = process.lock().await;
                 process.deleting = true;
-                terminate_sandbox_processes(&mut process)
-                    .await
-                    .map_err(|err| Status::internal(format!("failed to stop sandbox: {err}")))?;
+                if !managed_launch {
+                    terminate_sandbox_processes(&mut process)
+                        .await
+                        .map_err(|err| {
+                            Status::internal(format!("failed to stop sandbox: {err}"))
+                        })?;
+                }
             }
-            self.release_gpu(&sandbox.id);
+            if !managed_launch {
+                self.release_gpu(&sandbox.id);
+            }
             return Err(Status::cancelled("sandbox provisioning cancelled"));
         }
 
@@ -2333,7 +2419,9 @@ impl VmDriver {
             let driver = self.clone();
             let sandbox_id = sandbox.id.clone();
             async move {
-                driver.monitor_sandbox(sandbox_id).await;
+                driver
+                    .monitor_sandbox(sandbox_id, process, managed_launch)
+                    .await;
             }
         });
 
@@ -2358,7 +2446,22 @@ impl VmDriver {
                 .state_dir
                 .clone()
         };
+        let operation = self.lock_launcher_operation(&state_dir).await?;
+        self.stop_sandbox_record(&record_id, &state_dir, operation.is_some())
+            .await
+    }
 
+    async fn stop_sandbox_record(
+        &self,
+        record_id: &str,
+        state_dir: &Path,
+        managed: bool,
+    ) -> Result<(), Status> {
+        if managed && launcher_delete_pending(state_dir).await? {
+            return Err(Status::failed_precondition(
+                "VM Delete is pending; retry Delete",
+            ));
+        }
         // Persist intent before detaching process handles or releasing host
         // allocations. If this write fails, the live record remains intact.
         tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
@@ -2368,12 +2471,22 @@ impl VmDriver {
         let (process, provisioning_task, has_gpu, snapshot) = {
             let mut registry = self.registry.lock().await;
             let record = registry
-                .get_mut(&record_id)
+                .get_mut(record_id)
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            // Managed launches remain fenced and retryable if teardown
+            // returns early. Keep their process and resource ownership.
+            if managed {
+                record.deleting = true;
+            }
+            let (process, has_gpu) = if managed {
+                (record.process.clone(), record.gpu_bdf.is_some())
+            } else {
+                (record.process.take(), record.gpu_bdf.take().is_some())
+            };
             (
-                record.process.take(),
+                process,
                 record.provisioning_task.take(),
-                record.gpu_bdf.take().is_some(),
+                has_gpu,
                 record.snapshot.clone(),
             )
         };
@@ -2384,15 +2497,11 @@ impl VmDriver {
             // registered attempt. Aborting alone does not stop its subprocess.
             let _ = task.await;
         }
-        self.cleanup_image_preparation(&record_id).await?;
-        if let Some(process) = process {
-            let mut process = process.lock().await;
-            process.deleting = true;
-            terminate_sandbox_processes(&mut process)
-                .await
-                .map_err(|err| Status::internal(format!("failed to stop sandbox: {err}")))?;
-        }
-        remove_runtime_generation_material(&state_dir)
+        self.cleanup_image_preparation(record_id).await?;
+        let run = self
+            .stop_owned_launch(record_id, state_dir, process.as_ref())
+            .await?;
+        remove_runtime_generation_material(state_dir)
             .await
             .map_err(|error| {
                 Status::internal(format!(
@@ -2400,22 +2509,163 @@ impl VmDriver {
                 ))
             })?;
         self.lifecycle_extensions
-            .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Stopped)
+            .after_launch_failed(&snapshot, state_dir, LaunchAbortReason::Stopped)
             .await;
-        if has_gpu {
-            self.release_gpu(&record_id);
+        if let Some(run) = run {
+            run.retire().await?;
+        }
+        if has_gpu || managed {
+            self.release_gpu(record_id);
+        }
+        if managed && let Some(record) = self.registry.lock().await.get_mut(record_id) {
+            record.process = None;
+            record.gpu_bdf = None;
+            record.deleting = false;
         }
 
         if let Some(snapshot) = self
-            .set_snapshot_condition(&record_id, stopped_condition(), false)
+            .set_snapshot_condition(record_id, stopped_condition(), false)
             .await
         {
             self.publish_snapshot(snapshot);
         }
         self.publish_platform_event(
-            record_id,
+            record_id.to_owned(),
             platform_event("vm", "Normal", "Stopped", "VM sandbox stopped".to_string()),
         );
+        Ok(())
+    }
+
+    async fn lock_launcher_operation(&self, state_dir: &Path) -> Result<Option<fs::File>, Status> {
+        if self.config.launcher_managed_cleanup
+            || launcher_cleanup::Run::load(state_dir).await?.is_some()
+            || launcher_delete_pending(state_dir).await?
+        {
+            launcher_cleanup::lock(state_dir).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn require_launcher_idle(&self, state_dir: &Path) -> Result<(), Status> {
+        if launcher_delete_pending(state_dir).await? {
+            return Err(Status::failed_precondition(
+                "VM Delete is pending; retry Delete",
+            ));
+        }
+        if let Some(run) = launcher_cleanup::Run::load(state_dir).await? {
+            return Err(Status::failed_precondition(format!(
+                "VM launcher run {} still owns host state; retry Stop or Delete",
+                run.id()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn stop_owned_launch(
+        &self,
+        record_id: &str,
+        state_dir: &Path,
+        process: Option<&Arc<Mutex<VmProcess>>>,
+    ) -> Result<Option<launcher_cleanup::Run>, Status> {
+        let run = launcher_cleanup::Run::load(state_dir).await?;
+        let Some(run) = run else {
+            if let Some(process) = process {
+                let mut process = process.lock().await;
+                process.deleting = true;
+                terminate_sandbox_processes(&mut process)
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!("failed to stop sandbox: {error}"))
+                    })?;
+            }
+            return Ok(None);
+        };
+        let result = self.confirm_launcher_cleanup(&run, process).await;
+        if let Err(error) = &result {
+            if let Some(snapshot) = self
+                .set_snapshot_condition(
+                    record_id,
+                    error_condition("LauncherCleanupIncomplete", error.message()),
+                    false,
+                )
+                .await
+            {
+                self.publish_snapshot(snapshot);
+            }
+            self.publish_platform_event(
+                record_id.to_owned(),
+                platform_event(
+                    "vm",
+                    "Warning",
+                    "LauncherCleanupIncomplete",
+                    error.message().to_owned(),
+                ),
+            );
+        }
+        result.map(|()| Some(run))
+    }
+
+    async fn confirm_launcher_cleanup(
+        &self,
+        run: &launcher_cleanup::Run,
+        process: Option<&Arc<Mutex<VmProcess>>>,
+    ) -> Result<(), Status> {
+        let mut process = if let Some(process) = process {
+            Some(process.lock().await)
+        } else {
+            None
+        };
+        let supervisor_error = if let Some(process) = process.as_mut() {
+            process.deleting = true;
+            // Preserve the normal supervisor-first guest filesystem flush.
+            // Reserve a separate bounded window for the launcher after that.
+            let result = tokio::time::timeout(
+                SUPERVISOR_SHUTDOWN_GRACE + Duration::from_secs(1),
+                stop_host_supervisor(process, SUPERVISOR_SHUTDOWN_GRACE),
+            )
+            .await;
+            process.supervisor_liveness.take();
+            match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("shutdown deadline elapsed".to_owned()),
+            }
+        } else {
+            None
+        };
+
+        let deadline = tokio::time::Instant::now() + PROCESS_TERMINATION_GRACE;
+        tokio::time::timeout_at(deadline, run.request_stop())
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "VM launcher run {}: stop request persistence timed out; retry Stop or Delete",
+                    run.id()
+                ))
+            })??;
+        if let Some(process) = process.as_mut()
+            && process.request_launcher_stop().is_ok()
+            && tokio::time::timeout_at(deadline, process.child.wait())
+                .await
+                .is_err()
+        {
+            // A live owner can finish slow host cleanup after the RPC returns.
+            // Its report, not the launcher process lifetime, is authoritative.
+            run.require_complete().await?;
+        } else {
+            run.recover(
+                &self.launcher_bin,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?;
+        }
+        if let Some(error) = supervisor_error {
+            return Err(Status::unavailable(format!(
+                "VM launcher run {}: compute stopped and launcher resources released, but host supervisor shutdown needs a retry: {error}",
+                run.id()
+            )));
+        }
         Ok(())
     }
 
@@ -2433,23 +2683,32 @@ impl VmDriver {
             generation_id.to_string(),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let (record_id, state_dir, already_running) = {
+        let (record_id, state_dir) = {
             let registry = self.registry.lock().await;
             let id = resolve_record_id(&registry, sandbox_id, sandbox_name)?
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
             let record = registry
                 .get(&id)
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (id, record.state_dir.clone())
+        };
+        let operation = self.lock_launcher_operation(&state_dir).await?;
+        let already_running = {
+            let registry = self.registry.lock().await;
+            let record = registry
+                .get(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            if operation.is_some() && record.deleting {
+                return Err(Status::failed_precondition(
+                    "VM teardown is incomplete; retry Stop or Delete before Start",
+                ));
+            }
             if record.preparation.is_some() && record.provisioning_task.is_none() {
                 return Err(Status::failed_precondition(
                     "image preparation cleanup is still in progress",
                 ));
             }
-            (
-                id,
-                record.state_dir.clone(),
-                record.process.is_some() || record.provisioning_task.is_some(),
-            )
+            record.process.is_some() || record.provisioning_task.is_some()
         };
         if already_running {
             let active_generation =
@@ -2485,9 +2744,11 @@ impl VmDriver {
             // during startup recovery represents a new gateway session, so
             // restart the VM before installing it rather than leaving the old
             // supervisor connected with invalid credentials.
-            self.stop_sandbox(&record_id, sandbox_name).await?;
+            self.stop_sandbox_record(&record_id, &state_dir, operation.is_some())
+                .await?;
         }
 
+        self.require_launcher_idle(&state_dir).await?;
         remove_runtime_generation_material(&state_dir)
             .await
             .map_err(|error| {
@@ -2548,6 +2809,16 @@ impl VmDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<DeleteSandboxResponse, Status> {
+        self.delete_sandbox_record(sandbox_id, sandbox_name, None)
+            .await
+    }
+
+    async fn delete_sandbox_record(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        recovery: Option<&Option<String>>,
+    ) -> Result<DeleteSandboxResponse, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
@@ -2562,14 +2833,71 @@ impl VmDriver {
             return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
         };
 
-        let (state_dir, process, gpu_bdf, provisioning_task, sandbox_snapshot) = {
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            let Some(record) = registry.get(&record_id) else {
+                return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
+            };
+            record.state_dir.clone()
+        };
+        // Fresh provisioning can remove its state before any launcher owns it.
+        // Delete can still clear that failed record without recreating the path.
+        let (operation, missing_state_lock) = match self.lock_launcher_operation(&state_dir).await {
+            Ok(operation) => (operation, None),
+            Err(_)
+                if self.config.launcher_managed_cleanup
+                    && matches!(
+                        tokio::fs::symlink_metadata(&state_dir).await,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                // Serialize absent-state Deletes so a stale request cannot
+                // race a replacement after the failed record is removed.
+                let lock = launcher_cleanup::lock(&sandboxes_root_dir(&self.config.state_dir))?;
+                (None, Some(lock))
+            }
+            Err(error) => return span_status.finish(Err(error)),
+        };
+        if let Some(expected_run) = recovery {
+            // A foreground retry may already have finished this Delete. Only
+            // resume the persisted intent and never act on a replacement run.
+            if !launcher_delete_pending(&state_dir).await?
+                || launcher_cleanup::Run::load(&state_dir)
+                    .await?
+                    .is_some_and(|run| expected_run.as_deref() != Some(run.id()))
+            {
+                return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
+            }
+        }
+        if operation.is_some() {
+            // Recovery must never relaunch compute after a committed delete
+            // intent, even if it completes cleanup before the caller retries.
+            write_private_file(&state_dir.join(SANDBOX_DELETE_PENDING_FILE), Vec::new())
+                .await
+                .map_err(|error| Status::internal(format!("persist VM delete intent: {error}")))?;
+        }
+        let (process, gpu_bdf, provisioning_task, sandbox_snapshot) = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(&record_id) else {
                 return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
             };
+            // Create can register a sandbox before its state directory exists.
+            if missing_state_lock.is_some()
+                && (record.process.is_some()
+                    || record.preparation.is_some()
+                    || !record.snapshot.status.as_ref().is_some_and(|status| {
+                        status
+                            .conditions
+                            .iter()
+                            .any(|condition| condition.reason == "ProvisioningFailed")
+                    }))
+            {
+                return span_status.finish(Err(Status::unavailable(
+                    "VM sandbox state directory is missing; retry Delete",
+                )));
+            }
             record.deleting = true;
             (
-                record.state_dir.clone(),
                 record.process.clone(),
                 record.gpu_bdf.clone(),
                 record.provisioning_task.take(),
@@ -2577,9 +2905,11 @@ impl VmDriver {
             )
         };
 
-        if let Some(snapshot) = self
-            .set_snapshot_condition(&record_id, deleting_condition(), true)
-            .await
+        // Preserve ProvisioningFailed for a retry if this request is cancelled.
+        if missing_state_lock.is_none()
+            && let Some(snapshot) = self
+                .set_snapshot_condition(&record_id, deleting_condition(), true)
+                .await
         {
             self.publish_snapshot(snapshot);
         }
@@ -2592,19 +2922,18 @@ impl VmDriver {
         }
         self.cleanup_image_preparation(&record_id).await?;
 
-        if let Some(process) = process {
-            let mut process = process.lock().await;
-            process.deleting = true;
-            terminate_sandbox_processes(&mut process)
-                .await
-                .map_err(|err| Status::internal(format!("failed to stop sandbox: {err}")))?;
-        }
+        let run = self
+            .stop_owned_launch(&record_id, &state_dir, process.as_ref())
+            .await?;
 
         self.lifecycle_extensions
             .after_delete(&sandbox_snapshot, &state_dir)
             .await;
 
-        if gpu_bdf.is_some() {
+        if let Some(run) = run {
+            run.retire().await?;
+        }
+        if gpu_bdf.is_some() || operation.is_some() {
             self.release_gpu(&record_id);
         }
 
@@ -2731,7 +3060,30 @@ impl VmDriver {
                 continue;
             }
 
-            let inactive_condition = if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+            let delete_intent = launcher_delete_pending(&state_dir).await;
+            let resume_delete = matches!(delete_intent, Ok(true));
+            let recovered_launch = match delete_intent {
+                Ok(_) => launcher_cleanup::Run::load(&state_dir).await,
+                Err(error) => Err(error),
+            };
+            let resume_stop = matches!(recovered_launch, Ok(Some(_)));
+            let inactive_condition = if let Err(error) = &recovered_launch {
+                warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM launcher cleanup needs a retry");
+                Some(error_condition(
+                    "LauncherCleanupIncomplete",
+                    error.message(),
+                ))
+            } else if resume_delete {
+                Some(deleting_condition())
+            } else if let Ok(Some(run)) = &recovered_launch {
+                Some(error_condition(
+                    "LauncherCleanupIncomplete",
+                    &format!(
+                        "recovering VM launcher run {} after driver restart",
+                        run.id()
+                    ),
+                ))
+            } else if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok()
             {
@@ -2761,7 +3113,7 @@ impl VmDriver {
                         None
                     }
                 };
-                let mut snapshot = sandbox_snapshot(&sandbox, condition, false);
+                let mut snapshot = sandbox_snapshot(&sandbox, condition, resume_delete);
                 snapshot
                     .status
                     .get_or_insert_with(SandboxStatus::default)
@@ -2774,10 +3126,21 @@ impl VmDriver {
                     provisioning_task: None,
                     preparation: None,
                     gpu_bdf: None,
-                    deleting: false,
+                    deleting: resume_delete || resume_stop,
                 });
                 drop(registry);
                 self.publish_snapshot(snapshot);
+                if let Ok(run) = recovered_launch {
+                    let run_id = run.as_ref().map(|run| run.id().to_owned());
+                    let recovery = if resume_delete {
+                        Some(LauncherRecovery::Delete(run_id))
+                    } else {
+                        run_id.map(LauncherRecovery::Stop)
+                    };
+                    if let Some(recovery) = recovery {
+                        self.resume_launcher_teardown(sandbox.id.clone(), recovery);
+                    }
+                }
                 info!(
                     sandbox_id = %sandbox.id,
                     "vm driver: restored inactive sandbox without launching compute"
@@ -2788,6 +3151,55 @@ impl VmDriver {
             self.restore_persisted_sandbox(sandbox, state_dir, false, &tracing::Span::current())
                 .await;
         }
+    }
+
+    fn resume_launcher_teardown(&self, sandbox_id: String, recovery: LauncherRecovery) {
+        // Bind the driver socket without waiting on slow old launchers.
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                let result = match &recovery {
+                    LauncherRecovery::Delete(run) => driver
+                        .delete_sandbox_record(&sandbox_id, "", Some(run))
+                        .await
+                        .map(|_| ()),
+                    LauncherRecovery::Stop(run_id) => {
+                        driver.resume_launcher_stop(&sandbox_id, run_id).await
+                    }
+                };
+                match result {
+                    Ok(()) => break,
+                    Err(error) if error.code() == tonic::Code::NotFound => break,
+                    Err(error) => warn!(
+                        %sandbox_id,
+                        reason = %error.message(),
+                        "retrying VM launcher cleanup"
+                    ),
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        });
+    }
+
+    async fn resume_launcher_stop(&self, sandbox_id: &str, run_id: &str) -> Result<(), Status> {
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            let Some(record) = registry.get(sandbox_id) else {
+                return Ok(());
+            };
+            record.state_dir.clone()
+        };
+        let _operation = launcher_cleanup::lock(&state_dir)?;
+        if launcher_delete_pending(&state_dir).await?
+            || launcher_cleanup::Run::load(&state_dir)
+                .await?
+                .is_none_or(|run| run.id() != run_id)
+        {
+            return Ok(());
+        }
+        self.stop_sandbox_record(sandbox_id, &state_dir, true).await
     }
 
     /// Restore a persisted sandbox and report whether the driver accepted it.
@@ -3230,7 +3642,10 @@ impl VmDriver {
         message: &str,
         remove_state: bool,
     ) {
-        self.release_gpu(sandbox_id);
+        let launcher_pending = !matches!(launcher_cleanup::Run::load(state_dir).await, Ok(None));
+        if !launcher_pending {
+            self.release_gpu(sandbox_id);
+        }
         let (snapshot, may_remove_state) = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(sandbox_id) else {
@@ -3239,8 +3654,10 @@ impl VmDriver {
             if record.deleting {
                 return;
             }
-            record.process = None;
-            record.gpu_bdf = None;
+            if !launcher_pending {
+                record.process = None;
+                record.gpu_bdf = None;
+            }
             record.snapshot.status = Some(status_with_condition(
                 &record.snapshot,
                 error_condition(reason, message),
@@ -3251,7 +3668,7 @@ impl VmDriver {
             // stopped, even when provisioning itself has already failed.
             (
                 Some(record.snapshot.clone()),
-                remove_state && record.preparation.is_none(),
+                remove_state && record.preparation.is_none() && !launcher_pending,
             )
         };
 
@@ -4630,6 +5047,9 @@ impl VmDriver {
     ) -> Result<(), Status> {
         let console_output = run_dir.join(IMAGE_PREP_CONSOLE_LOG);
         let mut command = Command::new(&self.launcher_bin);
+        command
+            .env_remove(launcher_cleanup::RUN_ID_ENV)
+            .env_remove(launcher_cleanup::RUN_STATE_DIR_ENV);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
         // Worker stdout carries framed progress and completion messages.
@@ -4995,17 +5415,24 @@ impl VmDriver {
     /// handles the sad paths: the child process failing to start, exiting
     /// abnormally, or becoming unpollable. Those still surface as driver
     /// `Error` conditions so the gateway can reason about a dead VM.
-    async fn monitor_sandbox(&self, sandbox_id: String) {
+    async fn monitor_sandbox(
+        &self,
+        sandbox_id: String,
+        process: Arc<Mutex<VmProcess>>,
+        managed_launch: bool,
+    ) {
         loop {
-            let process = {
+            let state_dir = {
                 let registry = self.registry.lock().await;
-                let Some(record) = registry.get(&sandbox_id) else {
+                let Some(record) = registry.get(&sandbox_id).filter(|record| {
+                    record
+                        .process
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &process))
+                }) else {
                     return;
                 };
-                let Some(process) = record.process.as_ref() else {
-                    return;
-                };
-                process.clone()
+                record.state_dir.clone()
             };
 
             let poll_result = {
@@ -5050,29 +5477,55 @@ impl VmDriver {
             };
 
             if let Some((component, status)) = exit_status {
-                let state_dir = {
-                    let registry = self.registry.lock().await;
-                    registry
-                        .get(&sandbox_id)
-                        .map(|record| record.state_dir.clone())
-                };
-                if let Some(ref state_dir) = state_dir {
-                    let marker = state_dir.join(MAIN_PROCESS_EXITED_FILE);
-                    if !tokio::fs::try_exists(&marker).await.unwrap_or(false)
-                        && let Err(error) =
-                            write_private_file(&marker, b"terminal\n".to_vec()).await
-                    {
-                        warn!(
-                            sandbox_id = %sandbox_id,
-                            %error,
-                            "vm driver: failed to persist canonical-process exit tombstone"
-                        );
+                let _operation = if managed_launch {
+                    let guard = match launcher_cleanup::lock(&state_dir) {
+                        Ok(guard) => guard,
+                        Err(error) if error.code() == tonic::Code::Unavailable => {
+                            // A Start attempt may release the lock without
+                            // changing this run. Recheck ownership afterward.
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(%sandbox_id, reason = %error.message(), "cannot monitor stopped VM launcher");
+                            return;
+                        }
+                    };
+                    let owns_record =
+                        self.registry
+                            .lock()
+                            .await
+                            .get(&sandbox_id)
+                            .is_some_and(|record| {
+                                !record.deleting
+                                    && record
+                                        .process
+                                        .as_ref()
+                                        .is_some_and(|current| Arc::ptr_eq(current, &process))
+                            });
+                    if !owns_record {
+                        return;
                     }
+                    Some(guard)
+                } else {
+                    None
+                };
+                let marker = state_dir.join(MAIN_PROCESS_EXITED_FILE);
+                if !tokio::fs::try_exists(&marker).await.unwrap_or(false)
+                    && let Err(error) = write_private_file(&marker, b"terminal\n".to_vec()).await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "vm driver: failed to persist canonical-process exit tombstone"
+                    );
                 }
                 {
                     let mut process = process.lock().await;
                     if component == "VM" {
                         let _ = terminate_vm_process(&mut process.supervisor).await;
+                    } else if managed_launch {
+                        let _ = process.request_launcher_stop();
                     } else {
                         let _ = terminate_vm_process(&mut process.child).await;
                     }
@@ -5082,7 +5535,6 @@ impl VmDriver {
                     |code| format!("{component} process exited with status {code}"),
                 );
                 if component == "host supervisor"
-                    && let Some(state_dir) = state_dir.as_deref()
                     && let Some(stderr) = read_vm_console_tail(
                         &state_dir.join("supervisor.err.log"),
                         VM_CONSOLE_DIAGNOSTIC_BYTES,
@@ -5105,6 +5557,14 @@ impl VmDriver {
                     sandbox_id.clone(),
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
+                if managed_launch {
+                    // Launch or supervisor exit is not confirmation that the
+                    // external owner has released the run's host resources.
+                    if let Some(record) = self.registry.lock().await.get_mut(&sandbox_id) {
+                        record.deleting = true;
+                    }
+                    return;
+                }
                 let (has_gpu, cleanup_ctx) = {
                     let registry = self.registry.lock().await;
                     registry.get(&sandbox_id).map_or((false, None), |record| {
@@ -6768,6 +7228,14 @@ fn sandboxes_root_dir(root: &Path) -> PathBuf {
     root.join("sandboxes")
 }
 
+async fn launcher_delete_pending(state_dir: &Path) -> Result<bool, Status> {
+    match tokio::fs::try_exists(state_dir.join(SANDBOX_DELETE_PENDING_FILE)).await {
+        Ok(exists) => Ok(exists),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        Err(error) => Err(Status::internal(format!("read VM delete intent: {error}"))),
+    }
+}
+
 async fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
     tokio::fs::create_dir_all(path).await?;
     restrict_owner_only_dir(path).await
@@ -8005,6 +8473,17 @@ async fn terminate_vm_process_within(
     child: &mut Child,
     grace: Duration,
 ) -> Result<ExitStatus, std::io::Error> {
+    signal_vm_process(child)?;
+
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        status
+    } else {
+        child.kill().await?;
+        child.wait().await
+    }
+}
+
+fn signal_vm_process(child: &Child) -> Result<(), std::io::Error> {
     if let Some(pid) = child.id()
         && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
@@ -8013,13 +8492,7 @@ async fn terminate_vm_process_within(
             "send SIGTERM to vm process {pid}: {err}"
         )));
     }
-
-    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
-        status
-    } else {
-        child.kill().await?;
-        child.wait().await
-    }
+    Ok(())
 }
 
 /// Stop the host supervisor first, then the VM it was supervising.
@@ -8034,8 +8507,26 @@ async fn terminate_sandbox_processes_within(
     process: &mut VmProcess,
     supervisor_grace: Duration,
 ) -> Result<(), std::io::Error> {
+    let supervisor_error = stop_host_supervisor(process, supervisor_grace).await.err();
+    process.supervisor_liveness.take();
+    let vm_error = terminate_vm_process(&mut process.child).await.err();
+
+    match (supervisor_error, vm_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(std::io::Error::other(format!("stop supervisor: {error}"))),
+        (None, Some(error)) => Err(std::io::Error::other(format!("stop vm: {error}"))),
+        (Some(supervisor), Some(vm)) => Err(std::io::Error::other(format!(
+            "stop supervisor: {supervisor}; stop vm: {vm}"
+        ))),
+    }
+}
+
+async fn stop_host_supervisor(
+    process: &mut VmProcess,
+    grace: Duration,
+) -> Result<(), std::io::Error> {
     let supervisor_pid = process.supervisor.id();
-    let supervisor_error = terminate_vm_process_within(&mut process.supervisor, supervisor_grace)
+    terminate_vm_process_within(&mut process.supervisor, grace)
         .await
         .inspect(|status| {
             // An orderly shutdown returns the workload's exit code, which can
@@ -8048,18 +8539,7 @@ async fn terminate_sandbox_processes_within(
                 );
             }
         })
-        .err();
-    process.supervisor_liveness.take();
-    let vm_error = terminate_vm_process(&mut process.child).await.err();
-
-    match (supervisor_error, vm_error) {
-        (None, None) => Ok(()),
-        (Some(error), None) => Err(std::io::Error::other(format!("stop supervisor: {error}"))),
-        (None, Some(error)) => Err(std::io::Error::other(format!("stop vm: {error}"))),
-        (Some(supervisor), Some(vm)) => Err(std::io::Error::other(format!(
-            "stop supervisor: {supervisor}; stop vm: {vm}"
-        ))),
-    }
+        .map(|_| ())
 }
 
 fn absolute_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
@@ -9349,7 +9829,13 @@ mod tests {
             let mut events = driver.events.subscribe();
             insert_test_record(&driver, "sb-exit", temp.path().to_path_buf(), child).await;
 
-            driver.monitor_sandbox("sb-exit".to_string()).await;
+            let process = driver.registry.lock().await["sb-exit"]
+                .process
+                .clone()
+                .unwrap();
+            driver
+                .monitor_sandbox("sb-exit".to_string(), process, false)
+                .await;
 
             let condition = driver.registry.lock().await["sb-exit"]
                 .snapshot
@@ -12476,6 +12962,7 @@ mod tests {
                 supervisor: spawn_exited_child(),
                 supervisor_liveness: None,
                 deleting: false,
+                launcher_stop_requested: false,
             })));
         }
 
@@ -12974,7 +13461,7 @@ mod tests {
         ))
     }
 
-    fn spawn_exited_child() -> Child {
+    pub(super) fn spawn_exited_child() -> Child {
         Command::new("sh")
             .arg("-c")
             .arg("exit 0")
@@ -13049,6 +13536,7 @@ while :; do sleep 0.05; done"#,
             supervisor,
             supervisor_liveness: Some(fs::File::from(write_end)),
             deleting: false,
+            launcher_stop_requested: false,
         };
         terminate_sandbox_processes(&mut process).await.unwrap();
 
@@ -13130,6 +13618,7 @@ while :; do sleep 0.05; done"#,
             supervisor,
             supervisor_liveness: Some(fs::File::from(write_end)),
             deleting: false,
+            launcher_stop_requested: false,
         };
         let grace = Duration::from_millis(300);
         let started = tokio::time::Instant::now();
@@ -13165,7 +13654,7 @@ while :; do sleep 0.05; done"#,
         fs::remove_dir_all(&dir).ok();
     }
 
-    async fn insert_test_record(
+    pub(super) async fn insert_test_record(
         driver: &VmDriver,
         sandbox_id: &str,
         state_dir: PathBuf,
@@ -13181,6 +13670,7 @@ while :; do sleep 0.05; done"#,
             supervisor: spawn_exited_child(),
             supervisor_liveness: None,
             deleting: false,
+            launcher_stop_requested: false,
         }));
 
         let mut registry = driver.registry.lock().await;
@@ -13546,7 +14036,7 @@ while :; do sleep 0.05; done"#,
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
+    pub(super) fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         let (socket_root, socket_root_fd) = test_socket_root();
         VmDriver {

@@ -2073,6 +2073,15 @@ externally managed `vm` socket owned by another user, the driver cannot read the
 gateway's staging directory and rootfs tar sources fail with a
 `FAILED_PRECONDITION` error; use a registry image reference instead.
 
+To use an external workload launcher that implements the
+[VM launcher cleanup contract](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md#external-launcher-cleanup),
+set `OPENSHELL_VM_LAUNCHER_BIN` to its absolute executable path and
+`OPENSHELL_VM_LAUNCHER_MANAGED_CLEANUP=true` in the gateway process environment.
+If Stop or Delete reports incomplete cleanup, retry the operation for the same
+sandbox and use the reported stage and run ID when inspecting launcher
+diagnostics. The driver blocks replacement launches until the launcher
+confirms resource release. GPU passthrough requires the built-in cleanup path.
+
 ### Extension Driver
 
 Extension drivers run outside the gateway and expose the
