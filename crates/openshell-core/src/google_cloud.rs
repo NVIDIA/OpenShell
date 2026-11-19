@@ -21,14 +21,6 @@ pub fn is_metadata_destination(destination: std::net::SocketAddr) -> bool {
     destination == std::net::SocketAddr::from(([127, 0, 0, 1], 8174))
 }
 
-// ── Metadata environment keys ───────────────────────────────────────────────
-
-/// Env vars that carry the GCP project ID inside sandboxes.
-pub const PROJECT_ID_ENV_VARS: &[&str] = &["GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT"];
-
-/// Env vars that carry the GCP service account email inside sandboxes.
-pub const SERVICE_ACCOUNT_EMAIL_ENV_VARS: &[&str] = &["GCP_SERVICE_ACCOUNT_EMAIL"];
-
 // ── Token search order ──────────────────────────────────────────────────────
 
 /// GCP token env vars searched in priority order by the metadata emulator.

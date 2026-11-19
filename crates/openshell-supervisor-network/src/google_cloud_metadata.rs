@@ -32,9 +32,8 @@ const PATH_SCOPES: &str = "/computeMetadata/v1/instance/service-accounts/default
 const PATH_ALIASES: &str = "/computeMetadata/v1/instance/service-accounts/default/aliases";
 const PATH_PROJECT_ID: &str = "/computeMetadata/v1/project/project-id";
 
-const ENV_GCP_PROJECT_ID: &str = openshell_core::google_cloud::PROJECT_ID_ENV_VARS[0];
-const ENV_GCP_SERVICE_ACCOUNT_EMAIL: &str =
-    openshell_core::google_cloud::SERVICE_ACCOUNT_EMAIL_ENV_VARS[0];
+const ENV_GCP_PROJECT_ID: &str = "GCP_PROJECT_ID";
+const ENV_GCP_SERVICE_ACCOUNT_EMAIL: &str = "GCP_SERVICE_ACCOUNT_EMAIL";
 
 const METADATA_FLAVOR_HEADER: &str = "metadata-flavor";
 const METADATA_FLAVOR_VALUE: &str = "Google";

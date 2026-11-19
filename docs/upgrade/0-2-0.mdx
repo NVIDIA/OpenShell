@@ -14,6 +14,24 @@ your role before upgrading from OpenShell 0.1.x to 0.2.0.
 
 If you run OpenShell for a team, start here.
 
+### Upgrade gateways before supervisors
+
+Use this order when your sandboxes use Google Cloud metadata discovery.
+
+1. Export and edit existing profiles as described in
+   [Migrate Google Cloud and Vertex AI profiles](#migrate-google-cloud-and-vertex-ai-profiles).
+2. Upgrade the gateway to 0.2.0 and apply the updated profiles.
+3. Upgrade supervisors to 0.2.0. The updated metadata settings work with 0.1.x
+   supervisors during the rollout.
+
+A 0.1.x gateway sends `GCE_METADATA_HOST=gcp.metadata.openshell.internal`.
+Older supervisors rewrite it to `127.0.0.1:8174` and add `GCE_METADATA_IP` and
+`METADATA_SERVER_DETECTION`. Supervisors in 0.2.0 use profile-declared settings
+without this rewrite or these additions. Upgrading supervisors first breaks
+clients that dial the metadata host directly and SDK detection in Python
+`google-auth` and Node.js `gcp-metadata`, even while requests through the proxy
+can continue to work.
+
 ### Migrate Google Cloud and Vertex AI profiles
 
 In OpenShell 0.1.x, the gateway recognized the Google profile IDs and added SDK

@@ -161,19 +161,28 @@ Requests to the host's cloud metadata service remain blocked; the emulator does 
 
 ### Injected Environment Variables
 
-The provider automatically injects these into the sandbox. Non-secret
-vars are resolved to real values at process spawn time; token vars stay
-as placeholders for proxy-time resolution.
+The `google-cloud` example profile declares these environment variables.
+Non-secret values come from `environment.config` or `environment.fixed` and
+resolve at process spawn time. Declare token destinations in credential
+`env_vars`; token values remain placeholders for proxy-time resolution.
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `GCE_METADATA_HOST` | `127.0.0.1:8174` | GCP SDK metadata discovery (supervisor emulator) |
 | `GCE_METADATA_IP` | `127.0.0.1:8174` | Python google-auth ping detection |
 | `METADATA_SERVER_DETECTION` | `assume-present` | Node.js gcp-metadata skip detection |
-| `GCP_PROJECT_ID` | from `project_id` config | GCP SDK project |
+| `GCP_PROJECT_ID` | from `project_id` config | Metadata project-ID endpoint and GCP SDK project |
 | `GOOGLE_CLOUD_PROJECT` | from `project_id` config | Alternative project var |
 | `CLOUD_ML_REGION` | from `region` config | GCP region |
 | `GCP_LOCATION` | from `region` config | Alternative region var |
+| `GCP_SERVICE_ACCOUNT_EMAIL` | from `service_account_email` config | Optional metadata service-account email |
+| `GCP_SA_ACCESS_TOKEN` | Credential placeholder | Preferred metadata access token |
+| `GCP_ADC_ACCESS_TOKEN` | Credential placeholder | Metadata access token when no usable service-account token is available |
+
+Custom profiles must use these exact names for the metadata project-ID, email,
+and token endpoints. A project or email key unavailable as a non-secret value
+makes its endpoint return HTTP `404`. Mapping the project only to
+`GOOGLE_CLOUD_PROJECT` does not supply the metadata project-ID endpoint.
 
 For each non-secret variable, a sandbox create-time value overrides its template
 value, which overrides the provider default. The metadata project-ID endpoint
