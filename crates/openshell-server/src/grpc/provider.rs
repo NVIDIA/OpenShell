@@ -5781,9 +5781,21 @@ pub(super) async fn handle_inline_provider_refresh_secrets(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), &workspace)
+        .await?;
+    let credential_key = resolve_github_app_refresh_key(
+        &state.refresh,
+        &catalog,
+        &provider,
+        credential_key,
+        RefreshCredentialLookup::Resolve,
+    )
+    .await?;
     let mut refresh: StoredProviderCredentialRefreshState = state
         .refresh
-        .get(&workspace, provider.object_id(), credential_key)
+        .get(&workspace, provider.object_id(), &credential_key)
         .await?
         .as_ref()
         .map(Into::into)
@@ -9107,6 +9119,7 @@ mod tests {
         use wiremock::{Mock, ResponseTemplate};
 
         let (mut state, server, _, mut configure) = github_app_refresh_fixture().await;
+        configure.credential_key = "GH_TOKEN".into();
         Arc::get_mut(&mut state)
             .unwrap()
             .config
@@ -9159,13 +9172,29 @@ mod tests {
             &state,
             authed_request(RotateProviderCredentialRequest {
                 provider: "github-app-test".into(),
-                credential_key: "GITHUB_TOKEN".into(),
+                credential_key: "GH_TOKEN".into(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
+        let inlined = handle_inline_provider_refresh_secrets(
+            &state,
+            authed_request(InlineProviderRefreshSecretsRequest {
+                provider: "github-app-test".into(),
+                credential_key: "api_token".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+        assert_eq!(inlined.credential_key, "GH_TOKEN");
+        assert!(inlined.material_secrets.is_empty());
     }
 
     #[tokio::test]
