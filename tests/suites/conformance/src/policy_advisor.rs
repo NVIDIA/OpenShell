@@ -224,9 +224,7 @@ async fn create(
     suffix: &str,
     policy: Option<proto::SandboxPolicy>,
 ) -> testkit::Result<Sandbox> {
-    let mut builder = cx
-        .sandbox(suffix)
-        .command(["sh", "-c", "exec sleep infinity"]);
+    let mut builder = cx.sandbox(suffix).command(["sleep", "infinity"]);
     if let Some(policy) = policy {
         builder = builder.policy(policy);
     }
