@@ -65,7 +65,6 @@ pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
-pub mod spiffe;
 pub mod telemetry;
 pub mod time;
 pub mod token_grant_failure;
@@ -74,10 +73,11 @@ pub mod upload;
 
 pub use config::{
     AppArmorProfile, Config, EdgeAuthConfig, EdgeAuthProvider, ExtensionBindingPolicy,
-    GatewayAuthConfig, GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
-    GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
-    GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig,
-    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    GatewayAuditConfig, GatewayAuthConfig, GatewayInterceptorBindingOverride,
+    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
+    ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode,
+    TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};
