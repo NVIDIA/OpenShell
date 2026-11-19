@@ -280,7 +280,9 @@ def main():
                     {
                         "gatewayConfig": {
                             "openshell.supervisor.app_listener": {"enabled": False},
-                            "openshell.gateway": {"enable_gateway_service_routing": True},
+                            "openshell.gateway": {
+                                "enable_gateway_service_routing": True
+                            },
                         }
                     }
                 )
