@@ -372,8 +372,8 @@ nix run .#openshell-test-runner -- run \
 ```
 
 The `upgrade` disruption installs the candidate over a released package. Use the
-`deb-upgrade-source` installer, or `rpm-upgrade-source` on `fedora-podman-rootless`,
-which installs the latest release as the baseline.
+`deb-upgrade-source` installer, or `rpm-upgrade-source` on `fedora-podman-rootless` or
+`fedora-podman-rootful`, which installs the latest release as the baseline.
 The candidate is this checkout's `nix run .#build-artifacts` output, which CI also
 builds. CI downloads the baseline; locally, put the release's Debian package at
 `artifacts/upgrade/deb/source/openshell.deb` and its sandbox and supervisor images,

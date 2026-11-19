@@ -28,17 +28,27 @@
         - /var/lib/openshell-qualification/candidate
         - /var/lib/openshell-qualification/disruptions
 
-    - name: Copy candidate packages, runtime images and upgrade disruption
+    - name: Copy candidate packages and runtime images
       become: true
       ansible.builtin.copy:
         src: "{{ item.src }}"
-        dest: "{{ item.dest }}"
+        dest: "/var/lib/openshell-qualification/candidate/{{ item.name }}"
         owner: root
         group: root
-        mode: "{{ item.mode | default('0644') }}"
+        mode: "0644"
       loop:
-        - { dest: /var/lib/openshell-qualification/candidate/openshell.rpm, src: "{{ openshell_candidate_rpm }}" }
-        - { dest: /var/lib/openshell-qualification/candidate/openshell-gateway.rpm, src: "{{ openshell_candidate_gateway_rpm }}" }
-        - { dest: /var/lib/openshell-qualification/candidate/sandbox.tar, src: "{{ openshell_candidate_sandbox_image }}" }
-        - { dest: /var/lib/openshell-qualification/candidate/supervisor.tar, src: "{{ openshell_candidate_supervisor_image }}" }
-        - { dest: /var/lib/openshell-qualification/disruptions/upgrade, src: "{{ playbook_dir }}/upgrade/rpm.sh", mode: "0755" }
+        - { name: openshell.rpm, src: "{{ openshell_candidate_rpm }}" }
+        - { name: openshell-gateway.rpm, src: "{{ openshell_candidate_gateway_rpm }}" }
+        - { name: sandbox.tar, src: "{{ openshell_candidate_sandbox_image }}" }
+        - { name: supervisor.tar, src: "{{ openshell_candidate_supervisor_image }}" }
+
+    # Rendered for the user that runs the gateway, which the packaged-gateway
+    # role detected: the login user under rootless Podman, root under rootful.
+    - name: Stage the upgrade disruption
+      become: true
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/upgrade/rpm.sh.j2"
+        dest: /var/lib/openshell-qualification/disruptions/upgrade
+        owner: root
+        group: root
+        mode: "0755"
