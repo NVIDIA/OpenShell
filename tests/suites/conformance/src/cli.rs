@@ -8,7 +8,6 @@
 //! check that the CLI commands for create, get, list, exec, stop, start, and
 //! delete work against the same gateway.
 
-use serde_json::Value;
 use testkit::Context;
 
 /// Delay before an attached main prints and exits, so the CLI attaches while
@@ -64,7 +63,7 @@ async fn cli_create_exec_list_delete(cx: &mut Context) -> testkit::Result {
 async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .cli_sandbox("cl")
-        .command(["sh", "-c", "exec sleep infinity"])
+        .command(["sleep", "infinity"])
         .create_ready()
         .await?;
     let name = sandbox.name().to_string();
@@ -112,8 +111,9 @@ async fn cli_attached_create_streams_main_and_reports_exit(cx: &mut Context) -> 
             "sandbox {completed} is not listed after its main exited; sandboxes are kept by default"
         );
         // The phase can trail the CLI's exit by a status update.
-        cx.adopt(&completed).await?.wait_finished().await?;
-        let got = get_json(cx, &completed).await?;
+        let sandbox = cx.adopt(&completed).await?;
+        sandbox.wait_finished().await?;
+        let got = sandbox.get_json().await?;
         testkit::ensure!(
             got["phase"] == "Completed",
             "sandbox {completed} is in phase {}; expected Completed",
@@ -136,8 +136,9 @@ async fn cli_attached_create_streams_main_and_reports_exit(cx: &mut Context) -> 
             output.stderr.trim()
         );
         expect_streamed(&output, "failed-main")?;
-        cx.adopt(&failed).await?.wait_finished().await?;
-        let got = get_json(cx, &failed).await?;
+        let sandbox = cx.adopt(&failed).await?;
+        sandbox.wait_finished().await?;
+        let got = sandbox.get_json().await?;
         testkit::ensure!(
             got["phase"] == "Error" && got["exit_code"] == 7,
             "sandbox {failed} is in phase {} with exit code {}; expected Error with 7",
@@ -196,13 +197,6 @@ fn expect_streamed(output: &testkit::CliOutput, marker: &str) -> testkit::Result
         output.stderr.trim()
     );
     Ok(())
-}
-
-async fn get_json(cx: &Context, name: &str) -> testkit::Result<Value> {
-    cx.cli(["sandbox", "get", name, "--output", "json"])
-        .await?
-        .success()?
-        .json()
 }
 
 /// Wait until `sandbox list` no longer shows the sandbox.

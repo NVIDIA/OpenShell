@@ -48,6 +48,7 @@ mod refresh_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+mod spiffe_broker;
 mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
@@ -74,11 +75,13 @@ use hyper_util::{
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
+use openshell_core::token_grant_failure::TokenGrantFailure;
 use openshell_core::{Config, Error, NetworkSupervisorTrustBundle, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
+use openshell_spiffe::SandboxIdentityProvider;
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -430,6 +433,7 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+    pub(crate) provider_token_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 
     /// Immutable public reflection index and its per-query rate limiter.
     pub(crate) reflection_service: reflection::GatewayReflectionServer,
@@ -445,6 +449,11 @@ pub struct ServerState {
     /// Gateway-local provider profile sources. User-imported profiles are read
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
+
+    /// Source of sandbox JWT-SVIDs for brokered provider tokens, built once
+    /// from the SPIRE broker settings. `None` when disabled.
+    pub(crate) sandbox_identity:
+        Option<Arc<dyn SandboxIdentityProvider<Error = TokenGrantFailure>>>,
 
     /// OIDC admin role name for workspace-level authorization.
     /// Empty when OIDC is not configured — `authorize_workspace()` treats
@@ -595,6 +604,12 @@ fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool
 
 impl ServerState {
     /// Create new server state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `config` holds credential-driver or SPIRE broker
+    /// settings that startup validation would reject. Gateway startup uses
+    /// [`Self::new_with_credentials`], which reports those as errors.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -621,10 +636,18 @@ impl ServerState {
             oidc_cache,
             credentials,
         )
+        .expect("server config should be validated before ServerState::new")
     }
 
     /// Create new server state with an already-initialized credential runtime.
-    #[must_use]
+    ///
+    /// Parses the SPIRE broker settings into the state that serves every
+    /// provider access-token request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the SPIRE broker settings are
+    /// invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_credentials(
         config: Config,
@@ -636,7 +659,9 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
         credentials: credentials::CredentialRuntime,
-    ) -> Self {
+    ) -> Result<Self> {
+        let sandbox_identity =
+            spiffe_broker::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
         let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());
@@ -646,6 +671,7 @@ impl ServerState {
         compute.configure_service_route_index(Arc::clone(&service_route_index));
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let provider_token_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let reflection_service = reflection::build_gateway_reflection_service(&config)
             .expect("compiled public gateway descriptors must be valid");
         let admin_role = config
@@ -655,7 +681,7 @@ impl ServerState {
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         let refresh = provider_refresh::runtime(&store, Some(&credentials), Some(&compute));
-        Self {
+        Ok(Self {
             config,
             store,
             compute,
@@ -690,12 +716,14 @@ impl ServerState {
             peer_authenticator: None,
             logons: auth::audit::Logons::default(),
             grpc_rate_limiter,
+            provider_token_rate_limiter,
             reflection_service,
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
+            sandbox_identity,
             admin_role,
-        }
+        })
     }
 }
 
@@ -988,7 +1016,7 @@ pub(crate) async fn run_server(
         supervisor_sessions,
         oidc_cache,
         credentials,
-    );
+    )?;
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;

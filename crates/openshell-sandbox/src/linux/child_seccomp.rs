@@ -3,10 +3,13 @@
 
 //! Prepared seccomp self-protection for same-UID workload children.
 //!
-//! The program is built before `fork` and installed by the workload launcher
-//! after the child has inherited the network user-notification filter. It does
-//! not allocate while installing and deliberately leaves mediated networking
-//! syscalls alone so the older `USER_NOTIF` action can still win.
+//! The program is built before `fork` and installed in the child after it has
+//! inherited a user-notification filter. It does not allocate while
+//! installing. The brokered program (`prepare`) deliberately leaves mediated
+//! networking syscalls alone so the older `USER_NOTIF` action can still win,
+//! and does the same for scheduling and limit calls except those that name the
+//! trusted leader. The program for a child without a broker
+//! (`prepare_without_broker`) limits those calls to the caller itself.
 
 #![allow(unsafe_code)]
 
@@ -128,7 +131,40 @@ pub fn mark_inherited_descriptors_close_on_exec() -> io::Result<()> {
 /// `rt_sigqueueinfo`, and `SIGCONT` sent with `tgkill` or
 /// `rt_tgsigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
 /// static TGID comparison alone cannot protect future sandbox worker threads.
+/// The same comparison covers the trusted leader as the target of `prlimit64`,
+/// the `sched_set*` calls, and `setpriority`, which are otherwise mediated by
+/// the broker so the workload can still reconfigure its own thread group.
+///
+/// The child must inherit [`install_workload_listener`]: this program alone
+/// lets those calls reach any other same-UID task. A child without that
+/// listener takes [`prepare_without_broker`] instead.
+///
+/// [`install_workload_listener`]: crate::linux::seccomp_notify::install_workload_listener
 pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
+    build(sandbox_tgid, Mediation::Brokered)
+}
+
+/// Build the self-protection program for a child no broker mediates.
+///
+/// Nothing can check a named scheduling, priority, or resource-limit target
+/// for such a child, so the program decides those calls alone: `prlimit64` and
+/// the `sched_set*` calls are limited to `pid == 0`, the caller itself, and
+/// `setpriority` is denied.
+pub fn prepare_without_broker(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
+    build(sandbox_tgid, Mediation::Unbrokered)
+}
+
+/// Whether a broker behind the inherited workload listener decides the calls
+/// this program cannot narrow alone.
+#[derive(Clone, Copy)]
+enum Mediation {
+    /// The child inherits the workload listener.
+    Brokered,
+    /// No broker: this program decides alone.
+    Unbrokered,
+}
+
+fn build(sandbox_tgid: u32, mediation: Mediation) -> io::Result<ChildHardeningProgram> {
     if sandbox_tgid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -187,7 +223,6 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         libc::SYS_setgroups,
         libc::SYS_sethostname,
         libc::SYS_setdomainname,
-        libc::SYS_setpriority,
         libc::SYS_ioprio_set,
     ] {
         append_unconditional_deny(&mut instructions, syscall)?;
@@ -210,6 +245,31 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     ] {
         append_argument_equal_deny(&mut instructions, syscall, argument, sandbox_tgid)?;
     }
+    // The broker-mediated scheduling, priority, and resource-limit calls are
+    // still denied against the trusted leader as defense in depth. Their PID
+    // position comes from the shared table, so `setpriority(which, who, nice)`
+    // correctly compares argument 1 rather than the `PRIO_*` selector. Without
+    // a broker only `pid == 0` passes, and a call that also needs a selector
+    // to name the caller is denied outright.
+    for mediated in crate::linux::process_sched::MEDIATED_PROCESS_SCHED_SYSCALLS {
+        let argument = u32::from(mediated.pid_argument);
+        match mediation {
+            Mediation::Brokered => {
+                append_argument_equal_deny(
+                    &mut instructions,
+                    mediated.number,
+                    argument,
+                    sandbox_tgid,
+                )?;
+            }
+            Mediation::Unbrokered if mediated.has_selector() => {
+                append_unconditional_deny(&mut instructions, mediated.number)?;
+            }
+            Mediation::Unbrokered => {
+                append_argument_nonzero_deny(&mut instructions, mediated.number, argument)?;
+            }
+        }
+    }
     for syscall in [libc::SYS_kill, libc::SYS_rt_sigqueueinfo] {
         // PID zero targets the caller's process group. Deny it even though
         // OpenShell normally gives each workload a dedicated process group:
@@ -221,16 +281,6 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     // to include the trusted sandbox workers in a broad signal operation.
     append_argument_masked_deny(&mut instructions, libc::SYS_kill, 0, 1 << 31)?;
     append_argument_masked_deny(&mut instructions, libc::SYS_rt_sigqueueinfo, 0, 1 << 31)?;
-
-    for syscall in [
-        libc::SYS_prlimit64,
-        libc::SYS_sched_setaffinity,
-        libc::SYS_sched_setattr,
-        libc::SYS_sched_setparam,
-        libc::SYS_sched_setscheduler,
-    ] {
-        append_argument_nonzero_deny(&mut instructions, syscall, 0)?;
-    }
 
     // The ordinary workload filter is installed after this program and owns
     // the final ban on further seccomp installation. Blocking it here would
@@ -505,6 +555,20 @@ mod tests {
             {
                 unsafe { libc::_exit(11) };
             }
+            // `setpriority` carries its PID in argument 1, so the trusted
+            // leader deny is pinned separately from the argument-0 calls.
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_setpriority,
+                    libc::c_long::from(libc::PRIO_PROCESS),
+                    libc::c_long::from(sandbox_tgid),
+                    0,
+                )
+            } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(12) };
+            }
             if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETOWN, sandbox_tgid) } != -1
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
             {
@@ -521,6 +585,140 @@ mod tests {
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
             {
                 unsafe { libc::_exit(9) };
+            }
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status = 0;
+        // SAFETY: `child` names our live direct child and status is writable.
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn filter_allows_own_group_scheduling_and_limit_calls() {
+        // SAFETY: the child uses only raw syscalls after fork and exits with
+        // `_exit`, so it does not run copied Rust cleanup state.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+        if child == 0 {
+            let sandbox_tgid = unsafe { libc::getppid() };
+            let Ok(mut filter) = prepare(u32::try_from(sandbox_tgid).unwrap_or(0)) else {
+                unsafe { libc::_exit(1) };
+            };
+            if filter.install().is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            // SAFETY: every call names this child's own thread group or
+            // re-applies its current settings, so the kernel performs it.
+            unsafe {
+                let mut mask: libc::cpu_set_t = std::mem::zeroed();
+                let size = size_of::<libc::cpu_set_t>();
+                if libc::sched_getaffinity(0, size, &raw mut mask) != 0
+                    || libc::sched_setaffinity(libc::getpid(), size, &raw const mask) != 0
+                {
+                    libc::_exit(3);
+                }
+                // `getpriority` returns -1 both for a valid nice value and on
+                // error, so a failed read must not be fed back into
+                // `setpriority` where it would look like a filter regression.
+                *libc::__errno_location() = 0;
+                let nice = libc::getpriority(libc::PRIO_PROCESS, 0);
+                if nice == -1 && *libc::__errno_location() != 0 {
+                    libc::_exit(7);
+                }
+                if libc::setpriority(libc::PRIO_PROCESS, libc::getpid().cast_unsigned(), nice) != 0
+                {
+                    libc::_exit(4);
+                }
+                let mut limits = [0_u64; 2];
+                if libc::syscall(
+                    libc::SYS_prlimit64,
+                    libc::getpid(),
+                    libc::c_long::from(libc::RLIMIT_CORE),
+                    std::ptr::null::<u64>(),
+                    limits.as_mut_ptr(),
+                ) != 0
+                {
+                    libc::_exit(5);
+                }
+                let mut param: libc::sched_param = std::mem::zeroed();
+                if libc::sched_getparam(0, &raw mut param) != 0
+                    || libc::sched_setparam(libc::getpid(), &raw const param) != 0
+                {
+                    libc::_exit(6);
+                }
+            }
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status = 0;
+        // SAFETY: `child` names our live direct child and status is writable.
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// Without a broker the program alone narrows the target: only `pid == 0`
+    /// passes, even for the child's own PID, and `setpriority` is denied.
+    #[test]
+    fn filter_without_broker_limits_scheduling_and_limit_calls_to_pid_zero() {
+        // SAFETY: the child uses only raw syscalls after fork and exits with
+        // `_exit`, so it does not run copied Rust cleanup state.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+        if child == 0 {
+            let sandbox_tgid = unsafe { libc::getppid() };
+            let Ok(mut filter) = prepare_without_broker(u32::try_from(sandbox_tgid).unwrap_or(0))
+            else {
+                unsafe { libc::_exit(1) };
+            };
+            if filter.install().is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            // SAFETY: the mask and limit buffers are live for each call, which
+            // re-applies or reads this child's own settings.
+            unsafe {
+                let mut mask: libc::cpu_set_t = std::mem::zeroed();
+                let size = size_of::<libc::cpu_set_t>();
+                if libc::sched_getaffinity(0, size, &raw mut mask) != 0
+                    || libc::sched_setaffinity(0, size, &raw const mask) != 0
+                {
+                    libc::_exit(3);
+                }
+                if libc::sched_setaffinity(libc::getpid(), size, &raw const mask) != -1
+                    || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+                {
+                    libc::_exit(4);
+                }
+                let mut limits = [0_u64; 2];
+                if libc::syscall(
+                    libc::SYS_prlimit64,
+                    0,
+                    libc::c_long::from(libc::RLIMIT_CORE),
+                    std::ptr::null::<u64>(),
+                    limits.as_mut_ptr(),
+                ) != 0
+                {
+                    libc::_exit(5);
+                }
+                if libc::syscall(
+                    libc::SYS_prlimit64,
+                    libc::getpid(),
+                    libc::c_long::from(libc::RLIMIT_CORE),
+                    std::ptr::null::<u64>(),
+                    limits.as_mut_ptr(),
+                ) != -1
+                    || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+                {
+                    libc::_exit(6);
+                }
+                if libc::syscall(libc::SYS_setpriority, 0, 0, 0) != -1
+                    || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+                {
+                    libc::_exit(7);
+                }
             }
             unsafe { libc::_exit(0) };
         }

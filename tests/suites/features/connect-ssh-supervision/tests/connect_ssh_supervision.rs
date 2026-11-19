@@ -62,7 +62,7 @@ mod linux {
 
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
-    use testkit::{Context, ResultExt as _, Sandbox};
+    use testkit::{Context, ResultExt as _};
 
     use super::ATTACH_TIMEOUT;
 
@@ -75,7 +75,11 @@ mod linux {
     const ECHO_MAIN: &str = r#"trap 'kill "$writer" 2>/dev/null || true' EXIT; (n=1; while true; do printf 'transport_pid=%s sequence=%04d\n' "$$" "$n"; n=$((n + 1)); sleep 0.2; done) & writer=$!; while IFS= read -r line; do printf 'transport_pid=%s input=%s\n' "$$" "$line"; done"#;
 
     pub(super) async fn connect_recovers_its_ssh_transport(cx: &mut Context) -> testkit::Result {
-        let sandbox = ready_sandbox(cx, "tr", &["sh", "-lc", ECHO_MAIN]).await?;
+        let sandbox = cx
+            .sandbox("tr")
+            .command(["sh", "-lc", ECHO_MAIN])
+            .create_ready()
+            .await?;
         let mut connect = cx.cli_spawn(["sandbox", "connect", sandbox.name()])?;
         let first = connect.stdout_line(ATTACH_TIMEOUT).await?;
         testkit::ensure!(
@@ -120,7 +124,11 @@ mod linux {
     pub(super) async fn connect_forwards_pid_targeted_termination_and_reaps_ssh(
         cx: &mut Context,
     ) -> testkit::Result {
-        let sandbox = ready_sandbox(cx, "term", &["sh", "-lc", "exec sleep infinity"]).await?;
+        let sandbox = cx
+            .sandbox("term")
+            .command(["sh", "-lc", "exec sleep infinity"])
+            .create_ready()
+            .await?;
         let pty = nix::pty::openpty(None, None)
             .map_err(std::io::Error::from)
             .context("open a pseudo-terminal")?;
@@ -156,17 +164,6 @@ mod linux {
             },
         )
         .await
-    }
-
-    async fn ready_sandbox(
-        cx: &Context,
-        suffix: &str,
-        command: &[&str],
-    ) -> testkit::Result<Sandbox> {
-        cx.sandbox(suffix)
-            .command(command.iter().copied())
-            .create_ready()
-            .await
     }
 
     fn send(pid: u32, signal: Signal) -> testkit::Result {
