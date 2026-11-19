@@ -268,6 +268,51 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
 
+## Sandbox identity broker
+
+`openshell.gateway.spiffe_broker` enables gateway-owned SPIFFE Broker API
+acquisition over mTLS for the Kubernetes shared supervisor. The gateway obtains
+its own X.509-SVID through the CSI Workload API socket. `GetSandboxProviderAccessToken` accepts an
+endpoint-bound configured credential key; sandbox identity comes from the
+verified, currently authorized session JWT. The key must equal one of the
+gateway's configured keys, including its endpoint owner, once the supervisor's
+revision and installation are removed. Provider attachment and profile
+configuration determine the endpoint, audience, and scopes. The gateway performs
+RFC 7523 or both RFC 8693 exchanges and returns only the final access token.
+Its bounded cache is isolated by sandbox generation, credential epoch, provider
+revision, the matched configured key and grant, and the subject token, which is
+resolved before every lookup so its revocation or rotation also applies to
+cached tokens. Concurrent misses for one cache key wait for a single
+acquisition, then use its cached token. A token is served until the usual skew
+before the earliest of its `expires_in`, its JWT `exp`, and the session, SVID,
+and subject expiries, and no longer than the default cache lifetime; a
+configured cache TTL can only shorten that. The response reports the remaining
+lifetime. The session is authorized again around each SPIRE and
+token-service call. A cache hit and a fresh token then pass the same final
+check: the grant configuration still matches and the session is still
+authorized. A fresh token is cached only after that check. Startup validates
+the Broker API settings, and gateway state construction builds the
+[`openshell-spire`](../openshell-spire/README.md) adapter once and returns a
+configuration error when they are invalid. The broker depends only on
+[`openshell-spiffe`](../openshell-spiffe/README.md)'s `SandboxIdentityProvider`
+with `TokenGrantFailure` as its error, which returns a JWT-SVID
+verified for the requested gateway, sandbox, and audience; each cache miss
+fetches a new SVID and the agent's current JWT bundle. SPIRE attests the referenced Sandbox resource UID and enforces the gateway's
+`impersonate-via-spire` authorization for that object.
+
+`openshell_core::token_grant_failure` defines the time limits: SPIRE and
+Workload API calls, token-service requests, the gateway's deadline for one
+request (including waiting for a concurrent acquisition), and the longer
+supervisor deadline that covers connecting to the gateway.
+
+Deployments must enable the SPIFFE Broker endpoint, authorize the gateway
+SPIFFE ID and Kubernetes object-reference type, and set the Kubernetes workload
+attestor's `access_policy` to `enforced`. The gateway's persisted driver runtime
+identity supplies the Sandbox CR UID. SPIRE resolves that reference and matches
+its attested selectors against registrations distributed to each selected agent.
+The adapter fetches current gateway X.509 credentials and bundles on every
+acquisition, allowing rotation without restarting the gateway.
+
 ## Application route installation records
 
 Supervisor installation reports arrive only through the authenticated sandbox

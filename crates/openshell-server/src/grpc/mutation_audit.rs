@@ -8,17 +8,23 @@ use std::future::Future;
 
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
-    AddWorkspaceMemberResponse, AttachSandboxProviderResponse, BeginRootfsTarStagingResponse,
-    CreateWorkspaceResponse, DeleteProviderProfileResponse, DeleteProviderRefreshResponse,
-    DeleteProviderResponse, DeleteSandboxResponse, DeleteSandboxTemplateResponse,
-    DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome, DetachSandboxProviderResponse,
-    ImportProviderProfilesResponse, ProviderProfile, RemoveWorkspaceMemberResponse, Sandbox,
-    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse,
-    UpdateProviderProfilesResponse, WorkspaceSelector, workspace_selector::Selection,
+    AddWorkspaceMemberResponse, ApproveAllDraftChunksResponse, ApproveDraftChunkResponse,
+    AttachSandboxProviderResponse, BeginRootfsTarStagingResponse, ClearDraftChunksResponse,
+    ConfigureProviderRefreshResponse, CreateWorkspaceResponse, DeleteProviderProfileResponse,
+    DeleteProviderRefreshResponse, DeleteProviderResponse, DeleteSandboxResponse,
+    DeleteSandboxTemplateResponse, DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome,
+    DetachSandboxProviderResponse, EditDraftChunkResponse, ImportProviderProfilesResponse,
+    ProviderCredentialRefreshStatus, ProviderProfile, ProviderResponse, RejectDraftChunkResponse,
+    RemoveWorkspaceMemberResponse, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
+    SandboxTemplateResponse, ServiceEndpointResponse, UndoDraftChunkResponse, UpdateConfigRequest,
+    UpdateConfigResponse, UpdateProviderProfilesResponse, WorkspaceSelector, setting_value,
+    workspace_selector::Selection,
 };
+use openshell_core::settings::{self, SettingValueKind};
 use openshell_ocsf::ResourceDetails;
 use tonic::{Code, Response, Status};
 
+use super::policy::POLICY_SETTING_KEY;
 pub(super) use crate::auth::audit::requested;
 use crate::auth::audit::{self, Outcome};
 
@@ -212,6 +218,165 @@ impl Audited for AddWorkspaceMemberResponse {
 
 impl Audited for BeginRootfsTarStagingResponse {}
 
+impl Audited for ProviderResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored(
+            "provider",
+            self.provider
+                .as_ref()
+                .and_then(|provider| provider.metadata.as_ref()),
+        )
+    }
+}
+
+fn refreshed_provider(status: Option<&ProviderCredentialRefreshStatus>) -> Vec<Produced<'_>> {
+    status
+        .map(|status| Produced {
+            type_label: "provider",
+            name: &status.provider,
+            uid: &status.provider_id,
+        })
+        .into_iter()
+        .collect()
+}
+
+impl Audited for ConfigureProviderRefreshResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        refreshed_provider(self.status.as_ref())
+    }
+}
+
+impl Audited for RotateProviderCredentialResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        refreshed_provider(self.status.as_ref())
+    }
+}
+
+/// The policy a call left in place, identified by its hash.
+fn stored_policy(hash: &str) -> Vec<Produced<'_>> {
+    (!hash.is_empty())
+        .then_some(Produced {
+            type_label: "policy",
+            name: "",
+            uid: hash,
+        })
+        .into_iter()
+        .collect()
+}
+
+impl Audited for UpdateConfigResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+}
+
+impl Audited for ApproveDraftChunkResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+}
+
+impl Audited for UndoDraftChunkResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+}
+
+impl Audited for ApproveAllDraftChunksResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored_policy(&self.policy_hash)
+    }
+
+    fn outcome(&self) -> Option<Outcome> {
+        (self.chunks_approved == 0).then_some(Outcome::Detail("no_op:unchanged"))
+    }
+}
+
+impl Audited for ClearDraftChunksResponse {
+    fn outcome(&self) -> Option<Outcome> {
+        (self.chunks_cleared == 0).then_some(Outcome::Detail("no_op:already_absent"))
+    }
+}
+
+impl Audited for RejectDraftChunkResponse {}
+impl Audited for EditDraftChunkResponse {}
+
+/// The resources an `UpdateConfig` call changes, with the setting value it
+/// sets when `capture_values` is on.
+pub(super) fn update_config_targets(
+    request: &UpdateConfigRequest,
+    capture_values: bool,
+) -> Vec<ResourceDetails> {
+    let scope = if request.global {
+        "global"
+    } else {
+        request.sandbox.as_str()
+    };
+    let key = request.setting_key.trim();
+    let mut targets = Vec::new();
+    if !request.global {
+        targets.push(requested("sandbox", &request.sandbox));
+    }
+    if key == POLICY_SETTING_KEY {
+        targets.push(requested("policy", scope));
+    } else if !key.is_empty() {
+        let mut setting = requested("setting", key);
+        if capture_values
+            && !request.delete_setting
+            && let Some(value) = request
+                .setting_value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+            && let Some(value) = captured_value(key, value)
+        {
+            setting = setting.with_data(serde_json::json!({ "value": value }));
+        }
+        targets.push(setting);
+    }
+    if request.policy.is_some() || !request.merge_operations.is_empty() {
+        targets.push(requested("policy", scope));
+    }
+    scoped(request.workspace_scope.as_ref(), targets)
+}
+
+/// The value of a registered setting when it has the registered kind and is
+/// allowed. Bytes and unregistered keys are never recorded.
+fn captured_value(key: &str, value: &setting_value::Value) -> Option<serde_json::Value> {
+    let setting = settings::setting_for_key(key)?;
+    match (setting.kind, value) {
+        (SettingValueKind::String, setting_value::Value::StringValue(value))
+            if setting.validate_string_value(value).is_ok() =>
+        {
+            Some(value.as_str().into())
+        }
+        (SettingValueKind::Bool, setting_value::Value::BoolValue(value)) => Some((*value).into()),
+        (SettingValueKind::Int, setting_value::Value::IntValue(value)) => Some((*value).into()),
+        _ => None,
+    }
+}
+
+/// Whether an `UpdateConfig` call only deletes a setting.
+pub(super) fn deletes_only_a_setting(request: &UpdateConfigRequest) -> bool {
+    request.delete_setting && request.annotations.is_empty()
+}
+
+/// Run an `UpdateConfig` call, recording a delete that removed no setting
+/// and changed nothing else as a no-op.
+pub(super) async fn record_absent_delete(
+    deleting_only: bool,
+    call: impl Future<Output = Result<Response<UpdateConfigResponse>, Status>>,
+) -> Result<Response<UpdateConfigResponse>, Status> {
+    let response = call.await;
+    if deleting_only
+        && response
+            .as_ref()
+            .is_ok_and(|response| !response.get_ref().deleted)
+    {
+        audit::record_outcome(Outcome::Detail("no_op:already_absent"));
+    }
+    response
+}
+
 /// Run `call`, recording the requested `targets` that have a name before it
 /// starts, then what it produced and how it ended. The call is boxed because
 /// handler futures are large.
@@ -257,6 +422,7 @@ fn complete(targets: &mut Vec<ResourceDetails>, produced: Vec<Produced<'_>>) {
                 uid: None,
                 name: None,
                 type_label: Some(produced.type_label.to_string()),
+                data: None,
             });
             targets.last_mut().expect("target just added")
         };
@@ -284,7 +450,7 @@ pub(super) fn scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::audit::test_support::{audited_mutation, cancelled_mutation};
+    use crate::auth::audit::test_support::{assert_redacted, audited_mutation, cancelled_mutation};
     use crate::auth::principal::Principal;
     use crate::grpc::OpenShellService;
     use crate::grpc::test_support::{authed_request, test_server_state};
@@ -304,7 +470,16 @@ mod tests {
         StartSandboxRequest, StopSandboxRequest, SuspendSandboxRequest,
         UpdateProviderProfilesRequest, UpdateSandboxRequest, WorkspaceRole, workspace_selector,
     };
+    use openshell_core::proto::{
+        ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
+        ConfigureProviderRefreshRequest, CreateProviderRequest, DraftChunkApproval,
+        EditDraftChunkRequest, NetworkPolicyRule, Provider, RejectDraftChunkRequest,
+        RotateProviderCredentialRequest, SandboxPolicy, SettingValue, UndoDraftChunkRequest,
+        UpdateConfigRequest, UpdateProviderRequest, setting_value,
+    };
     use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn principal() -> Principal {
         authed_request(())
@@ -1066,7 +1241,8 @@ mod tests {
         .await;
 
         assert_eq!(event["resources"].as_array().unwrap().len(), 16, "{event}");
-        assert_eq!(event["resources"][15]["name"], "profile-15", "{event}");
+        assert_eq!(event["resources"][14]["name"], "profile-14", "{event}");
+        assert_eq!(event["resources"][15]["name"], "profile-39", "{event}");
         assert_eq!(
             event["message"], "mutation succeeded; 24 more resources not listed",
             "{event}"
@@ -1154,5 +1330,509 @@ mod tests {
         .await;
         assert_eq!(event["status_detail"], "no_op:already_absent", "{event}");
         assert_eq!(event["resources"], json!([sandbox_with_uid, provider]));
+    }
+
+    const CANARY: &str = "audit-canary-6c1f9e2d";
+
+    fn named(event: &Value) -> Vec<String> {
+        event["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|resource| {
+                format!(
+                    "{}:{}",
+                    resource["type"].as_str().unwrap(),
+                    resource["name"].as_str().unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn provider_records_name_the_provider_but_never_its_secrets() {
+        let service = OpenShellService::new(test_server_state().await);
+        let scope = || Some(workspace_selector("default"));
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                name: "audit-openai".into(),
+                ..Default::default()
+            }),
+            r#type: "openai".into(),
+            credentials: HashMap::from([("OPENAI_API_KEY".into(), CANARY.into())]),
+            ..Default::default()
+        };
+
+        let (result, event) = record(
+            "CreateProvider",
+            service.create_provider(authed_request(CreateProviderRequest {
+                workspace_scope: scope(),
+                provider: Some(provider),
+                ..Default::default()
+            })),
+        )
+        .await;
+        let created = result.unwrap().into_inner().provider.unwrap();
+        assert_eq!(
+            event["resources"],
+            json!([
+                default_workspace(),
+                stored_json("provider", created.metadata.as_ref().unwrap())
+            ])
+        );
+        assert_redacted(&event, CANARY);
+
+        let mut update = created.clone();
+        update.credential_handles.clear();
+        update.credentials = HashMap::from([("OPENAI_API_KEY".into(), format!("{CANARY}-2"))]);
+        let (_, event) = record(
+            "UpdateProvider",
+            service.update_provider(authed_request(UpdateProviderRequest {
+                workspace_scope: scope(),
+                provider: Some(update),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(
+            named(&event),
+            ["workspace:default", "provider:audit-openai"]
+        );
+        assert_redacted(&event, CANARY);
+
+        let (_, event) = record(
+            "ConfigureProviderRefresh",
+            service.configure_provider_refresh(authed_request(ConfigureProviderRefreshRequest {
+                workspace_scope: scope(),
+                provider: "audit-openai".into(),
+                credential_key: "OPENAI_API_KEY".into(),
+                material: HashMap::from([("client_secret".into(), CANARY.into())]),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(
+            named(&event),
+            [
+                "workspace:default",
+                "provider:audit-openai",
+                "provider_credential:OPENAI_API_KEY"
+            ]
+        );
+        assert_redacted(&event, CANARY);
+
+        let (_, event) = record(
+            "RotateProviderCredential",
+            service.rotate_provider_credential(authed_request(RotateProviderCredentialRequest {
+                workspace_scope: scope(),
+                provider: "audit-openai".into(),
+                credential_key: "OPENAI_API_KEY".into(),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(
+            named(&event),
+            [
+                "workspace:default",
+                "provider:audit-openai",
+                "provider_credential:OPENAI_API_KEY"
+            ]
+        );
+    }
+
+    #[test]
+    fn update_config_targets_name_setting_sandbox_and_policy() {
+        let setting = |key: &str, value| UpdateConfigRequest {
+            global: true,
+            setting_key: key.into(),
+            setting_value: Some(SettingValue { value: Some(value) }),
+            ..Default::default()
+        };
+        let text = |value: &str| setting_value::Value::StringValue(value.into());
+        let targets = |request: &UpdateConfigRequest, capture| {
+            serde_json::to_value(update_config_targets(request, capture)).unwrap()
+        };
+
+        assert_eq!(
+            targets(&setting("ocsf_schema_version", text("1.8.0")), false),
+            json!([{"type": "setting", "name": "ocsf_schema_version"}])
+        );
+        assert_eq!(
+            targets(&setting("ocsf_schema_version", text("1.8.0")), true),
+            json!([{"type": "setting", "name": "ocsf_schema_version", "data": {"value": "1.8.0"}}])
+        );
+        assert_eq!(
+            targets(
+                &setting(" ocsf_json_enabled ", setting_value::Value::BoolValue(true)),
+                true
+            ),
+            json!([{"type": "setting", "name": "ocsf_json_enabled", "data": {"value": true}}])
+        );
+        for rejected in [
+            setting("OPENAI_API_KEY", text(CANARY)),
+            setting("ocsf_json_enabled", text(CANARY)),
+            setting("proposal_approval_mode", text(CANARY)),
+            setting(
+                "ocsf_schema_version",
+                setting_value::Value::BytesValue(CANARY.into()),
+            ),
+        ] {
+            assert!(
+                targets(&rejected, true)[0].get("data").is_none(),
+                "{rejected:?}"
+            );
+        }
+        let mut delete = setting("ocsf_schema_version", text("1.8.0"));
+        delete.delete_setting = true;
+        assert_eq!(
+            targets(&delete, true),
+            json!([{"type": "setting", "name": "ocsf_schema_version"}])
+        );
+
+        let sandbox_policy = UpdateConfigRequest {
+            workspace_scope: Some(workspace_selector("default")),
+            sandbox: "agent-01".into(),
+            policy: Some(SandboxPolicy::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            targets(&sandbox_policy, false),
+            json!([
+                default_workspace(),
+                {"type": "sandbox", "name": "agent-01"},
+                {"type": "policy", "name": "agent-01"},
+            ])
+        );
+        let global_policy = UpdateConfigRequest {
+            global: true,
+            policy: Some(SandboxPolicy::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            targets(&global_policy, false),
+            json!([{"type": "policy", "name": "global"}])
+        );
+        let global_policy_delete = UpdateConfigRequest {
+            global: true,
+            setting_key: "policy".into(),
+            delete_setting: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            targets(&global_policy_delete, true),
+            json!([{"type": "policy", "name": "global"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_records_setting_values_when_configured_to_capture_them() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("unshared test state")
+            .config
+            .audit
+            .capture_setting_values = true;
+        let service = OpenShellService::new(state);
+
+        let (result, event) = record(
+            "UpdateConfig",
+            service.update_config(authed_request(UpdateConfigRequest {
+                global: true,
+                setting_key: "ocsf_json_enabled".into(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                ..Default::default()
+            })),
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(
+            event["resources"],
+            json!([{"type": "setting", "name": "ocsf_json_enabled", "data": {"value": true}}]),
+            "{event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_setting_values_are_bounded() {
+        let request = UpdateConfigRequest {
+            global: true,
+            setting_key: "ocsf_schema_version".into(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::StringValue("v".repeat(300))),
+            }),
+            ..Default::default()
+        };
+        let (_, event) = record(
+            "UpdateConfig",
+            audited(update_config_targets(&request, true), async {
+                Ok(Response::new(UpdateConfigResponse::default()))
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            event["resources"][0]["data"]["value"],
+            format!("{}...", "v".repeat(128)),
+            "{event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_setting_values_are_bounded() {
+        let request = UpdateConfigRequest {
+            global: true,
+            setting_key: "ocsf_schema_version".into(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::StringValue("v".repeat(300))),
+            }),
+            ..Default::default()
+        };
+        let (result, event) = record(
+            "UpdateConfig",
+            audited(update_config_targets(&request, true), async {
+                Err::<Response<UpdateConfigResponse>, _>(audit::deny(
+                    &principal(),
+                    audit::AuthzDenial::MissingRole,
+                    "admin role required",
+                ))
+            }),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
+        assert_eq!(event["status_detail"], "missing_role", "{event}");
+        assert_eq!(
+            event["resources"][0]["data"]["value"],
+            format!("{}...", "v".repeat(128)),
+            "{event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_setting_while_annotating_is_not_a_no_op() {
+        let request = UpdateConfigRequest {
+            sandbox: "agent-01".into(),
+            setting_key: "ocsf_json_enabled".into(),
+            delete_setting: true,
+            annotations: HashMap::from([("ticket".into(), "OPS-1".into())]),
+            ..Default::default()
+        };
+        let (_, event) = record(
+            "UpdateConfig",
+            record_absent_delete(deletes_only_a_setting(&request), async {
+                Ok(Response::new(UpdateConfigResponse::default()))
+            }),
+        )
+        .await;
+
+        assert!(event.get("status_detail").is_none(), "{event}");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_absent_global_setting_records_a_no_op() {
+        let service = OpenShellService::new(test_server_state().await);
+
+        let (result, event) = record(
+            "UpdateConfig",
+            service.update_config(authed_request(UpdateConfigRequest {
+                global: true,
+                setting_key: "ocsf_json_enabled".into(),
+                delete_setting: true,
+                ..Default::default()
+            })),
+        )
+        .await;
+
+        assert!(!result.unwrap().into_inner().deleted);
+        assert_eq!(event["status_detail"], "no_op:already_absent", "{event}");
+        assert_eq!(
+            event["resources"],
+            json!([{"type": "setting", "name": "ocsf_json_enabled"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_chunk_records_name_chunks_but_never_tokens_or_rules() {
+        let service = OpenShellService::new(test_server_state().await);
+        let scope = || Some(workspace_selector("default"));
+        let chunk_targets = [
+            "workspace:default",
+            "sandbox:missing-sbx",
+            "draft_chunk:chunk-1",
+        ];
+
+        let (_, event) = record(
+            "ApproveDraftChunk",
+            service.approve_draft_chunk(authed_request(ApproveDraftChunkRequest {
+                workspace_scope: scope(),
+                sandbox: "missing-sbx".into(),
+                chunk_id: "chunk-1".into(),
+                review_token: CANARY.into(),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(named(&event), chunk_targets);
+        assert_redacted(&event, CANARY);
+
+        let (_, event) = record(
+            "RejectDraftChunk",
+            service.reject_draft_chunk(authed_request(RejectDraftChunkRequest {
+                workspace_scope: scope(),
+                sandbox: "missing-sbx".into(),
+                chunk_id: "chunk-1".into(),
+                reason: CANARY.into(),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(named(&event), chunk_targets);
+        assert_redacted(&event, CANARY);
+
+        let (_, event) = record(
+            "EditDraftChunk",
+            service.edit_draft_chunk(authed_request(EditDraftChunkRequest {
+                workspace_scope: scope(),
+                sandbox: "missing-sbx".into(),
+                chunk_id: "chunk-1".into(),
+                proposed_rule: Some(NetworkPolicyRule {
+                    name: CANARY.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(named(&event), chunk_targets);
+        assert_redacted(&event, CANARY);
+
+        let (_, event) = record(
+            "UndoDraftChunk",
+            service.undo_draft_chunk(authed_request(UndoDraftChunkRequest {
+                workspace_scope: scope(),
+                sandbox: "missing-sbx".into(),
+                chunk_id: "chunk-1".into(),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(named(&event), chunk_targets);
+
+        let (_, event) = record(
+            "ApproveAllDraftChunks",
+            service.approve_all_draft_chunks(authed_request(ApproveAllDraftChunksRequest {
+                workspace_scope: scope(),
+                sandbox: "missing-sbx".into(),
+                approvals: vec![DraftChunkApproval {
+                    chunk_id: "chunk-1".into(),
+                    review_token: CANARY.into(),
+                }],
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(named(&event), chunk_targets);
+        assert_redacted(&event, CANARY);
+
+        let (_, event) = record(
+            "ClearDraftChunks",
+            service.clear_draft_chunks(authed_request(ClearDraftChunksRequest {
+                workspace_scope: scope(),
+                sandbox: "missing-sbx".into(),
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert_eq!(named(&event), ["workspace:default", "sandbox:missing-sbx"]);
+    }
+
+    #[tokio::test]
+    async fn draft_chunk_responses_name_the_policy_or_record_a_no_op() {
+        let (_, event) = record(
+            "ApproveDraftChunk",
+            audited(Vec::new(), async {
+                Ok(Response::new(ApproveDraftChunkResponse {
+                    policy_version: 4,
+                    policy_hash: "sha256:abc".into(),
+                }))
+            }),
+        )
+        .await;
+        assert_eq!(
+            event["resources"],
+            json!([{"type": "policy", "uid": "sha256:abc"}])
+        );
+
+        let (_, event) = record(
+            "ApproveAllDraftChunks",
+            audited(Vec::new(), async {
+                Ok(Response::new(ApproveAllDraftChunksResponse::default()))
+            }),
+        )
+        .await;
+        assert_eq!(event["status_detail"], "no_op:unchanged", "{event}");
+
+        let (_, event) = record(
+            "ClearDraftChunks",
+            audited(Vec::new(), async {
+                Ok(Response::new(ClearDraftChunksResponse::default()))
+            }),
+        )
+        .await;
+        assert_eq!(event["status_detail"], "no_op:already_absent", "{event}");
+    }
+
+    #[tokio::test]
+    async fn bulk_approvals_keep_the_resulting_policy() {
+        let targets = scoped(
+            Some(&workspace_selector("default")),
+            std::iter::once(requested("sandbox", "agent-01"))
+                .chain((0..20).map(|n| requested("draft_chunk", &format!("chunk-{n}")))),
+        );
+        let (_, event) = record(
+            "ApproveAllDraftChunks",
+            audited(targets, async {
+                Ok(Response::new(ApproveAllDraftChunksResponse {
+                    policy_hash: "sha256:abc".into(),
+                    chunks_approved: 20,
+                    ..Default::default()
+                }))
+            }),
+        )
+        .await;
+
+        assert_eq!(event["resources"].as_array().unwrap().len(), 16, "{event}");
+        assert_eq!(
+            event["resources"][15],
+            json!({"type": "policy", "uid": "sha256:abc"})
+        );
+        assert_eq!(
+            event["message"], "mutation succeeded; 7 more resources not listed",
+            "{event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_status_errors_are_never_recorded() {
+        let (_, event) = record(
+            "ConfigureProviderRefresh",
+            audited(Vec::new(), async {
+                Ok(Response::new(ConfigureProviderRefreshResponse {
+                    status: Some(ProviderCredentialRefreshStatus {
+                        provider: "audit-openai".into(),
+                        last_error: CANARY.into(),
+                        ..Default::default()
+                    }),
+                }))
+            }),
+        )
+        .await;
+
+        assert_eq!(named(&event), ["provider:audit-openai"]);
+        assert_redacted(&event, CANARY);
     }
 }

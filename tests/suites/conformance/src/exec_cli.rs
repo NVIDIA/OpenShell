@@ -21,7 +21,11 @@ const STDIN_LIMIT: usize = 4 * 1024 * 1024;
 #[testkit::test]
 async fn cli_exec_large_output_is_complete(cx: &mut Context) -> testkit::Result {
     const BYTES: usize = 8 * 1024 * 1024;
-    let sandbox = ready_sandbox(cx, "lo").await?;
+    let sandbox = cx
+        .sandbox("lo")
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
 
     for stream in ["stdout", "stderr"] {
         let script = match stream {
@@ -88,7 +92,11 @@ async fn cli_exec_large_output_is_complete(cx: &mut Context) -> testkit::Result 
 /// read fails the exec.
 #[testkit::test]
 async fn cli_exec_piped_stdin_crosses_grpc_message_limit(cx: &mut Context) -> testkit::Result {
-    let sandbox = ready_sandbox(cx, "si").await?;
+    let sandbox = cx
+        .sandbox("si")
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
     let wc = exec_args(&sandbox, &["wc", "-c"]);
 
     for size in [5, 1024 * 1024, STDIN_LIMIT] {
@@ -163,13 +171,6 @@ async fn cli_exec_piped_stdin_crosses_grpc_message_limit(cx: &mut Context) -> te
         );
     }
     Ok(())
-}
-
-async fn ready_sandbox(cx: &Context, suffix: &str) -> testkit::Result<Sandbox> {
-    cx.sandbox(suffix)
-        .command(["sleep", "infinity"])
-        .create_ready()
-        .await
 }
 
 /// `sandbox exec` of `command` without a TTY or login shell.
