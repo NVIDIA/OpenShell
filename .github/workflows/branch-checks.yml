@@ -679,7 +679,15 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- sdk/typescript)
+          # The package is a stub that re-exports @ai-openshell/sdk. Its files stay
+          # editable so the stub and its moved notice can be maintained.
+          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- sdk/typescript \
+            ':(exclude)sdk/typescript/package.json' \
+            ':(exclude)sdk/typescript/README.md' \
+            ':(exclude)sdk/typescript/index.js' \
+            ':(exclude)sdk/typescript/index.d.ts' \
+            ':(exclude)sdk/typescript/raw.js' \
+            ':(exclude)sdk/typescript/raw.d.ts')
           if [ -z "$changed" ]; then
             echo "No added or changed TypeScript SDK files."
             exit 0
