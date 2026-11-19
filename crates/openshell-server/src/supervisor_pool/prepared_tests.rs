@@ -3,6 +3,7 @@
 
 use super::tests::Fixture;
 use super::*;
+use crate::persistence::ObjectType;
 use openshell_core::jwt::CredentialEpoch;
 use openshell_supervisor_control::{PreparedRuntimeRegistration, SandboxInstanceRegistration};
 
@@ -55,6 +56,7 @@ fn activation(prepared: &PreparationRequest, sandbox: &str) -> ActivationRequest
     })).unwrap();
     registration.validate().unwrap();
     ActivationRequest {
+        runtime_identity: "runtime-identity".into(),
         assignment: registration.to_assignment().unwrap(),
         expected_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
             "generation-1",
@@ -115,8 +117,11 @@ async fn setup() -> (Fixture, Arc<SupervisorPool>, PreparationRequest) {
     (fixture, pool, prepared)
 }
 
-async fn inventory(pool: &SupervisorPool) -> PreparedRuntime {
-    let mut runtimes = pool.prepared_runtimes("default").await.unwrap();
+async fn inventory(pool: &SupervisorPool, prepared: &PreparationRequest) -> PreparedRuntime {
+    let mut runtimes = pool
+        .prepared_runtimes("default", vec![prepared.registration.route.clone()])
+        .await
+        .unwrap();
     assert_eq!(runtimes.len(), 1);
     runtimes.pop().unwrap()
 }
@@ -124,7 +129,7 @@ async fn inventory(pool: &SupervisorPool) -> PreparedRuntime {
 #[tokio::test]
 async fn preparation_inventory_is_scoped_durable_and_excludes_unadmitted_and_claimed_runtimes() {
     let (fixture, pool, prepared) = setup().await;
-    let before = inventory(&pool).await;
+    let before = inventory(&pool, &prepared).await;
     let mut other = preparation(&fixture, "rt-other-workspace-0123456789").await;
     other.workspace = "another-workspace".into();
     authorize_preparation(&fixture, &other).await;
@@ -140,7 +145,7 @@ async fn preparation_inventory_is_scoped_durable_and_excludes_unadmitted_and_cla
 
     // A replica needs no locally published state to recover the inventory.
     let recovered = fixture.replica("gateway-restarted");
-    let after = inventory(&recovered).await;
+    let after = inventory(&recovered, &prepared).await;
     assert_eq!(before.revision, after.revision);
     assert_eq!(after.registration, prepared.registration);
     assert_eq!(after.auth_epoch, prepared.auth_epoch);
@@ -153,15 +158,23 @@ async fn preparation_inventory_is_scoped_durable_and_excludes_unadmitted_and_cla
             available: true,
         })
     );
-    assert!(recovered.prepared_runtimes("").await.is_err());
     assert!(
         recovered
-            .prepared_runtimes("missing")
+            .prepared_runtimes("", vec![prepared.registration.route.clone()])
+            .await
+            .is_err()
+    );
+    assert!(
+        recovered
+            .prepared_runtimes("missing", vec![prepared.registration.route.clone()])
             .await
             .unwrap()
             .is_empty()
     );
-    let scoped = recovered.prepared_runtimes(&other.workspace).await.unwrap();
+    let scoped = recovered
+        .prepared_runtimes(&other.workspace, vec![other.registration.route.clone()])
+        .await
+        .unwrap();
     assert_eq!(scoped.len(), 1);
     assert_eq!(scoped[0].registration, other.registration);
     recovered
@@ -170,7 +183,7 @@ async fn preparation_inventory_is_scoped_durable_and_excludes_unadmitted_and_cla
         .unwrap();
     assert!(
         recovered
-            .prepared_runtimes("default")
+            .prepared_runtimes("default", vec![prepared.registration.route.clone()])
             .await
             .unwrap()
             .is_empty()
@@ -179,22 +192,24 @@ async fn preparation_inventory_is_scoped_durable_and_excludes_unadmitted_and_cla
 
 #[tokio::test]
 async fn preparation_inventory_reports_the_original_process_availability() {
-    let (fixture, pool, _prepared) = setup().await;
+    let (fixture, pool, prepared) = setup().await;
     fixture.member("m1", "p1", true).await;
-    assert!(!inventory(&pool).await.owner.unwrap().available);
+    assert!(!inventory(&pool, &prepared).await.owner.unwrap().available);
     fixture.remove_member("m1").await;
-    assert!(!inventory(&pool).await.owner.unwrap().available);
+    assert!(!inventory(&pool, &prepared).await.owner.unwrap().available);
     fixture.member("m1", "replacement", false).await;
-    let owner = inventory(&pool).await.owner.unwrap();
+    let owner = inventory(&pool, &prepared).await.owner.unwrap();
     assert_eq!(owner.process_id, "p1");
     assert!(!owner.available);
     fixture.member("m1", "p1", false).await;
-    assert!(inventory(&pool).await.owner.unwrap().available);
+    assert!(inventory(&pool, &prepared).await.owner.unwrap().available);
 }
 
 #[tokio::test]
 async fn unreadable_preparation_material_fails_inventory_without_affecting_other_workspaces() {
-    let (_fixture, pool, prepared) = setup().await;
+    let (fixture, pool, prepared) = setup().await;
+    let healthy = preparation(&fixture, "rt-healthy-0123456789").await;
+    pool.prepare_runtime(healthy.clone()).await.unwrap();
     let record = pool
         .assignment(&prepared.registration.route)
         .await
@@ -202,12 +217,25 @@ async fn unreadable_preparation_material_fails_inventory_without_affecting_other
         .unwrap();
     let handle = CredentialHandle::decode(record.payload.material_handle.as_slice()).unwrap();
     pool.delete_material(&record.payload, handle).await.unwrap();
-    assert!(pool.prepared_runtimes("default").await.is_err());
+    let scoped = pool
+        .prepared_runtimes("default", vec![healthy.registration.route.clone()])
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].registration, healthy.registration);
     assert!(
-        pool.prepared_runtimes("another-workspace")
+        pool.prepared_runtimes("default", vec![prepared.registration.route.clone()])
             .await
-            .unwrap()
-            .is_empty()
+            .is_err()
+    );
+    assert!(
+        pool.prepared_runtimes(
+            "another-workspace",
+            vec![prepared.registration.route.clone()]
+        )
+        .await
+        .unwrap()
+        .is_empty()
     );
     assert!(
         pool.assignment(&prepared.registration.route)
@@ -226,7 +254,7 @@ async fn preparation_release_is_idempotent_and_reclaims_capacity() {
         .controller()
         .install_placement(Arc::new(PoolPlacement(other.clone())));
     let observed = supervision
-        .prepared_runtimes("default")
+        .prepared_runtimes("default", vec![prepared.registration.route.clone()])
         .await
         .unwrap()
         .pop()
@@ -247,7 +275,12 @@ async fn preparation_release_is_idempotent_and_reclaims_capacity() {
     );
     assert!(other.controller.pool_withdrawals().is_empty());
     assert!(supervision.controller().pool_withdrawals().is_empty());
-    assert!(pool.prepared_runtimes("default").await.unwrap().is_empty());
+    assert!(
+        pool.prepared_runtimes("default", vec![prepared.registration.route.clone()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     pool.reconcile_once().await.unwrap();
     assert!(fixture.owner(&prepared.registration.route).await.is_none());
     assert!(pool.capacity("m1").await.unwrap().payload.routes.is_empty());
@@ -256,8 +289,8 @@ async fn preparation_release_is_idempotent_and_reclaims_capacity() {
 
 #[tokio::test]
 async fn malformed_preparation_is_neither_an_empty_inventory_nor_an_absent_route() {
-    let (_fixture, pool, _prepared) = setup().await;
-    let observed = inventory(&pool).await;
+    let (_fixture, pool, prepared) = setup().await;
+    let observed = inventory(&pool, &prepared).await;
     let revision = observed.revision;
     pool.store
         .put_if(
@@ -271,7 +304,11 @@ async fn malformed_preparation_is_neither_an_empty_inventory_nor_an_absent_route
         )
         .await
         .unwrap();
-    assert!(pool.prepared_runtimes("default").await.is_err());
+    assert!(
+        pool.prepared_runtimes("default", vec![prepared.registration.route.clone()])
+            .await
+            .is_err()
+    );
     assert!(
         pool.runtime_assignment("default", &revision.route)
             .await
@@ -285,7 +322,7 @@ async fn malformed_preparation_is_neither_an_empty_inventory_nor_an_absent_route
 #[tokio::test]
 async fn preparation_release_rejects_wrong_workspace_and_prevents_route_reuse() {
     let (fixture, pool, prepared) = setup().await;
-    let observed = inventory(&pool).await;
+    let observed = inventory(&pool, &prepared).await;
     let mut wrong_workspace = observed.revision.clone();
     wrong_workspace.workspace = "another-workspace".into();
     assert_eq!(
@@ -309,14 +346,19 @@ async fn preparation_release_rejects_wrong_workspace_and_prevents_route_reuse() 
         PreparationRelease::Released
     );
     pool.reconcile_once().await.unwrap();
-    assert!(pool.prepared_runtimes("default").await.unwrap().is_empty());
+    assert!(
+        pool.prepared_runtimes("default", vec![prepared.registration.route.clone()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(fixture.owner(&prepared.registration.route).await.is_none());
 }
 
 #[tokio::test]
 async fn conditional_release_preserves_a_winning_claim_and_its_credentials() {
     let (fixture, pool, prepared) = setup().await;
-    let observed = inventory(&pool).await;
+    let observed = inventory(&pool, &prepared).await;
     let published = pool
         .activate_runtime(activation(&prepared, "sandbox-a"))
         .await
@@ -356,7 +398,7 @@ async fn conditional_release_preserves_a_winning_claim_and_its_credentials() {
 #[tokio::test]
 async fn conditional_release_fences_an_inflight_claim() {
     let (fixture, pool, prepared) = setup().await;
-    let observed = inventory(&pool).await;
+    let observed = inventory(&pool, &prepared).await;
     let original_identity = fixture.identity("sandbox-a").await;
     let (task, resume) = pause_claim(&pool, activation(&prepared, "sandbox-a")).await;
     let cleaner = fixture.replica("gateway-cleaner");
@@ -892,7 +934,7 @@ async fn retirement_before_preparation_survives_restart_and_blocks_late_preparat
     recovered.reconcile_once().await.unwrap();
     assert!(
         recovered
-            .prepared_runtimes("default")
+            .prepared_runtimes("default", vec![prepared.registration.route.clone()])
             .await
             .unwrap()
             .is_empty()
@@ -1087,7 +1129,7 @@ async fn dedicated_claim_uses_the_common_transaction_without_shared_capacity() {
     assert!(pool.owners().await.unwrap().is_empty());
     assert!(pool.capacities().await.unwrap().is_empty());
     assert_eq!(
-        inventory(&pool).await.owner.unwrap().process_id,
+        inventory(&pool, &prepared).await.owner.unwrap().process_id,
         "supervisor-pod"
     );
     let request = activation(&prepared, "sandbox-a");
@@ -1127,7 +1169,7 @@ async fn dedicated_claim_uses_the_common_transaction_without_shared_capacity() {
 #[tokio::test]
 async fn dedicated_retirement_fences_late_preparation_and_claim() {
     let (_fixture, pool, prepared) = dedicated_setup().await;
-    let revision = inventory(&pool).await.revision;
+    let revision = inventory(&pool, &prepared).await.revision;
     assert_eq!(
         pool.release_preparation(revision).await.unwrap(),
         PreparationRelease::Released
@@ -1151,7 +1193,10 @@ async fn dedicated_stop_racing_activation_keeps_the_sandbox_unclaimed() {
             .await
             .is_err()
     );
-    assert_eq!(inventory(&pool).await.registration, prepared.registration);
+    assert_eq!(
+        inventory(&pool, &prepared).await.registration,
+        prepared.registration
+    );
 }
 
 fn registration_identity(
@@ -1192,6 +1237,32 @@ async fn dedicated_registration_is_pending_until_commit_and_recovers_the_same_la
             .unwrap(),
         canonical.launch_material
     );
+    // A failed identity read must leave the committed launch available for retry.
+    let saved = pool
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    pool.store
+        .put(
+            Sandbox::object_type(),
+            "sandbox-a",
+            "sandbox-a",
+            "default",
+            &[0xff],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pool.dedicated_registration(&identity)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+    pool.store.put_message(&saved).await.unwrap();
     let mut recovered = fixture.replica("different-gateway");
     Arc::get_mut(&mut recovered).unwrap().dedicated = true;
     assert_eq!(
@@ -1244,7 +1315,7 @@ async fn dedicated_registration_rejects_retirement_and_credential_epoch_changes(
     assert!(pool.dedicated_registration(&identity).await.is_err());
     let (_, pool, prepared) = dedicated_setup().await;
     let identity = registration_identity(&prepared);
-    pool.release_preparation(inventory(&pool).await.revision)
+    pool.release_preparation(inventory(&pool, &prepared).await.revision)
         .await
         .unwrap();
     assert!(pool.dedicated_registration(&identity).await.is_err());
@@ -1304,7 +1375,7 @@ async fn dedicated_registration_watcher_observes_remote_activation_and_local_ret
         claimed.launch_material
     );
 
-    let remaining = inventory(&pool).await;
+    let remaining = inventory(&pool, &other).await;
     assert_eq!(remaining.registration.route, other.registration.route);
     pool.release_preparation(remaining.revision).await.unwrap();
     unaffected.changed().await.unwrap();
@@ -1341,12 +1412,25 @@ fn claim_lookup(
 #[tokio::test]
 async fn committed_intent_owns_the_preparation_before_infrastructure_binding() {
     let (fixture, pool, prepared) = setup().await;
+    let mut sandbox = pool
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    sandbox.status.as_mut().unwrap().provisioning =
+        Some(openshell_core::proto::SandboxProvisioning {
+            driver_operation_pending: true,
+            driver_operation_id: "original-create".into(),
+            ..Default::default()
+        });
+    pool.store.put_message(&sandbox).await.unwrap();
     let intent = claim_intent(&prepared, "sandbox-a");
     pool.record_warm_claim("default", intent.clone())
         .await
         .unwrap();
     let restarted = fixture.replica("gateway-restarted");
-    let observed = inventory(&restarted).await;
+    let observed = inventory(&restarted, &prepared).await;
     assert_eq!(
         restarted
             .release_preparation(observed.revision)
@@ -1361,7 +1445,10 @@ async fn committed_intent_owns_the_preparation_before_infrastructure_binding() {
             .unwrap(),
         PreparationRelease::Changed
     );
-    let recovered = restarted.pending_warm_claims("default").await.unwrap();
+    let recovered = restarted
+        .pending_warm_claims("default", "test-pool")
+        .await
+        .unwrap();
     assert_eq!(recovered.pending.len(), 1);
     assert!(recovered.retired.is_empty());
     assert_eq!(
@@ -1375,10 +1462,64 @@ async fn committed_intent_owns_the_preparation_before_infrastructure_binding() {
             .unwrap()
             .is_some()
     );
+    let mut pending = restarted
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let original = pending.clone();
+    pending
+        .status
+        .as_mut()
+        .unwrap()
+        .provisioning
+        .as_mut()
+        .unwrap()
+        .driver_operation_id = "another-create".into();
+    restarted.store.put_message(&pending).await.unwrap();
+    assert!(
+        restarted
+            .activate_runtime(activation(&prepared, "sandbox-a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .store
+            .get_message::<Sandbox>("sandbox-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .unwrap()
+            .provisioning
+            .unwrap()
+            .driver_operation_pending
+    );
+    restarted.store.put_message(&original).await.unwrap();
     restarted
         .activate_runtime(activation(&prepared, "sandbox-a"))
         .await
         .unwrap();
+    let settled = restarted
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let op = settled.status.unwrap().provisioning.unwrap();
+    assert!(!op.driver_operation_pending);
+    assert_eq!(op.driver_operation_id, "original-create");
+    let annotations = settled.metadata.unwrap().annotations;
+    assert_eq!(
+        annotations[crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+        "runtime-identity"
+    );
+    assert_eq!(
+        annotations[crate::compute::COMPUTE_DRIVER_ANNOTATION],
+        "kubernetes"
+    );
     assert!(
         !restarted
             .cancel_warm_claim("default", &prepared.registration.route)
@@ -1488,7 +1629,10 @@ async fn cancellation_fences_staged_activation_and_preserves_a_terminal_launch_d
             .await
             .is_err()
     );
-    let inventory = other.pending_warm_claims("default").await.unwrap();
+    let inventory = other
+        .pending_warm_claims("default", "test-pool")
+        .await
+        .unwrap();
     assert!(inventory.pending.is_empty());
     assert_eq!(inventory.retired.len(), 1);
     assert!(
@@ -1520,7 +1664,10 @@ async fn abandoned_claim_cleanup_preserves_a_newer_launch() {
         restarted
             .cancel_abandoned_warm_claims(&restarted.all_assignments().await.unwrap())
             .await;
-        let inventory = restarted.pending_warm_claims("default").await.unwrap();
+        let inventory = restarted
+            .pending_warm_claims("default", "test-pool")
+            .await
+            .unwrap();
         assert!(inventory.pending.is_empty());
         assert_eq!(inventory.retired.len(), 1);
         if restart {

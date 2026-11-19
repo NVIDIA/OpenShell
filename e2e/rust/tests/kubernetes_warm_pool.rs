@@ -180,7 +180,7 @@ async fn claims_existing_pod_refills_pool_and_restarts_with_fresh_identity() {
             .iter()
             .find(|pod| pod["metadata"]["uid"] == uid)
             .unwrap();
-        assert_eq!(supervisor["status"]["containerStatuses"][0]["ready"], false);
+        assert_eq!(supervisor["status"]["containerStatuses"][0]["ready"], true);
         let logs = kubectl(&[
             "-n",
             workspace_namespace,

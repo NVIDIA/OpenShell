@@ -1701,6 +1701,8 @@ expiry limits. It replaces unclaimed spares only when their effective workload,
 supervisor, bootstrap, or trust configuration changes. Unused defaults and
 unrelated driver settings do not affect compatibility. For example, changing the
 default workload image does not invalidate a template with an explicit image.
+On OpenShift, increase the revision when a namespace annotation changes the
+UID or GID used by its warm workloads.
 Image references are compared without querying registries. Changing the contents
 behind an unchanged tag does not trigger replacement.
 
@@ -1732,7 +1734,8 @@ a running Pod or released scheduling gate is insufficient. Runtimes that fail
 to connect within the preparation timeout, lose their supervisor, exceed their
 maximum age, or lack a healthy observation for 60 seconds are retired and replaced.
 Shared supervisors report current parked connections; dedicated supervisors use
-Kubernetes startup-probe success and the original supervisor Pod's running state.
+the original Pod's startup and readiness probes. Before claim, readiness requires
+both the parked runtime and an accepted gateway registration.
 Gateway replicas share durable creation intents, so a restart or lost API
 response reuses the pending identity.
 

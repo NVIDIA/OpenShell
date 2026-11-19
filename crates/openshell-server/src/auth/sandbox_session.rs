@@ -405,11 +405,20 @@ pub async fn authorize_persisted(
     store: &Store,
     principal: &AuthenticatedSandboxSession,
 ) -> Result<PersistedSandboxIdentity, AuthRejection> {
-    let (_, identity) = load_identity(store, principal).await?;
+    authorize_persisted_sandbox(store, principal)
+        .await
+        .map(|(_, identity)| identity)
+}
+
+pub async fn authorize_persisted_sandbox(
+    store: &Store,
+    principal: &AuthenticatedSandboxSession,
+) -> Result<(Sandbox, PersistedSandboxIdentity), AuthRejection> {
+    let (sandbox, identity) = load_identity(store, principal).await?;
     if principal.token_id != identity.gateway_token_id {
         return Err(stale_identity());
     }
-    Ok(identity)
+    Ok((sandbox, identity))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -883,10 +883,15 @@ impl KubernetesComputeConfig {
     pub fn resolve_sandbox_gid(
         &self,
         resolved_uid: u32,
-        _namespace_annotations: Option<&BTreeMap<String, String>>,
+        namespace_annotations: Option<&BTreeMap<String, String>>,
     ) -> u32 {
         self.sandbox_gid
             .or(self.sandbox_uid)
+            .or_else(|| {
+                namespace_annotations?
+                    .get(ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
+                    .and_then(|range| Self::from_open_shift_supplemental_groups(range))
+            })
             .unwrap_or(resolved_uid)
     }
 

@@ -94,6 +94,7 @@ impl InstancePlacement for Placement {
     fn pending_warm_claims(
         &self,
         _: String,
+        _: String,
     ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
         let state = self.0.lock().unwrap();
         let inventory = openshell_supervisor_control::WarmClaimInventory {
@@ -426,7 +427,11 @@ impl InstancePlacement for Placement {
     fn place_launch(&self, _: PlacementRequest) -> PlacementFuture {
         panic!("unexpected active launch")
     }
-    fn prepared_runtimes(&self, _: String) -> PlacementFuture<Vec<PreparedRuntime>> {
+    fn prepared_runtimes(
+        &self,
+        _: String,
+        _: Vec<String>,
+    ) -> PlacementFuture<Vec<PreparedRuntime>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     fn release_preparation(&self, _: PreparationRevision) -> PlacementFuture<PreparationRelease> {
@@ -780,6 +785,7 @@ impl InstancePlacement for ApiTestPlacement {
     fn pending_warm_claims(
         &self,
         _: String,
+        _: String,
     ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
         // This fixture exercises physical preparations only; it never claims.
         Box::pin(async { Ok(openshell_supervisor_control::WarmClaimInventory::default()) })
@@ -857,7 +863,11 @@ impl InstancePlacement for ApiTestPlacement {
     fn place_launch(&self, _: PlacementRequest) -> PlacementFuture {
         panic!("unexpected launch")
     }
-    fn prepared_runtimes(&self, _: String) -> PlacementFuture<Vec<PreparedRuntime>> {
+    fn prepared_runtimes(
+        &self,
+        _: String,
+        _: Vec<String>,
+    ) -> PlacementFuture<Vec<PreparedRuntime>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     fn release_preparation(&self, _: PreparationRevision) -> PlacementFuture<PreparationRelease> {
@@ -2482,6 +2492,18 @@ fn dedicated_fixture(state: Arc<Mutex<State>>) -> KubernetesComputeDriver {
 }
 
 #[test]
+fn dedicated_validation_allows_inherited_but_checks_explicit_image_pull_secrets() {
+    let mut rendered =
+        json!({"spec": {"containers": [{"name": "supervisor"}], "imagePullSecrets": []}});
+    let expected: Pod = serde_json::from_value(rendered.clone()).unwrap();
+    rendered["spec"]["imagePullSecrets"] = json!([{"name": "inherited"}]);
+    let admitted = serde_json::from_value(rendered.clone()).unwrap();
+    validate_dedicated_pod(&admitted, &expected).unwrap();
+    rendered["spec"]["imagePullSecrets"] = json!([{"name": "configured"}]);
+    assert!(validate_dedicated_pod(&admitted, &serde_json::from_value(rendered).unwrap()).is_err());
+}
+
+#[test]
 fn dedicated_validation_accepts_a_previous_reconcilers_literal_trace_context() {
     let expected: Pod = serde_json::from_value(json!({"spec": {"containers": [{
         "name": "supervisor", "env": [{"name": openshell_core::sandbox_env::OTLP_ENDPOINT, "value": "http://traces:4317"}]
@@ -2695,6 +2717,18 @@ async fn dedicated_readiness_excludes_terminated_and_restarted_supervisors() {
             }]
         });
     }
+    assert!(
+        !driver
+            .warm_connection_ready(&prepared.resource)
+            .await
+            .unwrap()
+    );
+    state
+        .lock()
+        .unwrap()
+        .objects
+        .get_mut(&supervisor_path)
+        .unwrap()["status"]["containerStatuses"][0]["ready"] = json!(true);
     assert!(
         driver
             .warm_connection_ready(&prepared.resource)

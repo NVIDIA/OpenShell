@@ -18,10 +18,9 @@ impl KubernetesComputeDriver {
         }
         let physical_id = "00000000-0000-4000-8000-000000000001";
         let names = SandboxRuntimeNames::for_generation(physical_id, physical_id);
-        let uid = self.config.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID);
-        let gid = self.config.sandbox_gid.unwrap_or(uid);
-        let workload = self.warm_runtime_shape(Some(&pool.spec), physical_id, &names, uid, gid)?;
         let namespace = self.warm_runtime_namespace(&pool.workspace).await?;
+        let (uid, gid) = self.warm_namespace_identity(&namespace).await?;
+        let workload = self.warm_runtime_shape(Some(&pool.spec), physical_id, &names, uid, gid)?;
         let supervisor = if let Some(shared) = &self.shared_supervisor {
             let config = shared.config();
             serde_json::json!({

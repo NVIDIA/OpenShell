@@ -284,6 +284,12 @@ struct AssignmentPayload {
     /// activation and collected atomically with retirement.
     #[serde(default)]
     claim_handle: Vec<u8>,
+    /// Older assignments lack the pool ID and recover through workspace inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_id: Option<String>,
+    /// Gateway CREATE owning this reservation, captured in the claim CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1732,6 +1738,8 @@ impl SupervisorPool {
             },
             activation_candidate: false,
             claim_handle: Vec::new(),
+            pool_id: preparation.map(|(_, _, pool_id)| pool_id.to_string()),
+            claim_operation_id: None,
         };
         let id = assignment_object_id(&payload.route, &payload.writer);
         let encode = |payload: &AssignmentPayload| {
@@ -3222,10 +3230,11 @@ impl InstancePlacement for PoolPlacement {
     fn pending_warm_claims(
         &self,
         workspace: String,
+        pool_id: String,
     ) -> PlacementFuture<openshell_supervisor_control::WarmClaimInventory> {
         let pool = self.0.clone();
         Box::pin(detached(async move {
-            pool.pending_warm_claims(&workspace).await
+            pool.pending_warm_claims(&workspace, &pool_id).await
         }))
     }
 
@@ -3318,9 +3327,13 @@ impl InstancePlacement for PoolPlacement {
         Box::pin(detached(async move { pool.prepare_runtime(request).await }))
     }
 
-    fn prepared_runtimes(&self, workspace: String) -> PlacementFuture<Vec<PreparedRuntime>> {
+    fn prepared_runtimes(
+        &self,
+        workspace: String,
+        routes: Vec<String>,
+    ) -> PlacementFuture<Vec<PreparedRuntime>> {
         let pool = self.0.clone();
-        Box::pin(async move { pool.prepared_runtimes(&workspace).await })
+        Box::pin(async move { pool.prepared_runtimes(&workspace, routes).await })
     }
 
     fn release_preparation(
@@ -3605,6 +3618,8 @@ mod tests {
                 prepared_session: None,
                 activation_candidate: false,
                 claim_handle: Vec::new(),
+                pool_id: None,
+                claim_operation_id: None,
             };
             self.store
                 .put_if(

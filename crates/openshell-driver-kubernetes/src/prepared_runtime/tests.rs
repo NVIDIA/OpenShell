@@ -134,7 +134,11 @@ impl InstancePlacement for Placement {
     fn place_launch(&self, _: PlacementRequest) -> PlacementFuture {
         panic!("active launch")
     }
-    fn prepared_runtimes(&self, _: String) -> PlacementFuture<Vec<PreparedRuntime>> {
+    fn prepared_runtimes(
+        &self,
+        _: String,
+        _: Vec<String>,
+    ) -> PlacementFuture<Vec<PreparedRuntime>> {
         panic!("inventory")
     }
     fn retire_preparation(

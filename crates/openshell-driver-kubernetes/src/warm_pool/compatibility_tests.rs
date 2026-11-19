@@ -42,6 +42,43 @@ async fn compatibility_uses_effective_workload_and_ignores_inventory_policy() {
 }
 
 #[tokio::test]
+async fn namespace_scc_changes_invalidate_spares_before_claim() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut driver = fixture(state.clone());
+    driver.config.sandbox_uid = None;
+    driver.config.sandbox_gid = None;
+    let pool = pool_config();
+    let request = request();
+    let before = driver
+        .warm_pool_fingerprint(&pool, &request.trust)
+        .await
+        .unwrap();
+    let spare = driver.prepare_warm_runtime(&request).await.unwrap();
+    state
+        .lock()
+        .unwrap()
+        .objects
+        .get_mut("/api/v1/namespaces/openshell")
+        .unwrap()["metadata"]["annotations"] = json!({"openshift.io/sa.scc.uid-range": "1000000000/10000", "openshift.io/sa.scc.supplemental-groups": "1000010000/10000"});
+    assert_ne!(
+        before,
+        driver
+            .warm_pool_fingerprint(&pool, &request.trust)
+            .await
+            .unwrap()
+    );
+    let (api, object, record) = claim_object(&driver, &spare.resource).await;
+    let sandbox = claiming_sandbox(&request, "logical-scc");
+    assert!(
+        !driver
+            .claim_warm_object(&sandbox, &api, &object, &record, spare.registration)
+            .await
+            .unwrap()
+    );
+    assert!(state.lock().unwrap().activated.is_empty());
+}
+
+#[tokio::test]
 async fn compatibility_changes_with_runtime_shape_and_trust() {
     let driver = fixture(Arc::new(Mutex::new(State::default())));
     let pool = pool_config();

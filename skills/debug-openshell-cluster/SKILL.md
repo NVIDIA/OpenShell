@@ -1423,8 +1423,9 @@ activation and cleans up the reserved runtime; it does not start a second runtim
 for the same launch. Dedicated warm pairs have a separate
 supervisor Pod: its startup probe records TLS authentication on port 5502 (5503 when the
 boundary uses 5502), while
-normal readiness on port 5501 remains false until claim. Check the original Pod UID,
-container running/startup state and restart count, gateway TLS trust, and the
+readiness on port 5501 requires an accepted gateway registration while the runtime
+is parked. Check the original Pod UID, container readiness, startup state and
+restart count, gateway TLS trust, and the
 pending `RegisterSupervisor` stream when a dedicated claim stalls. Claims arrive
 over that stream; they do not require a new Secret projection. Before assignment,
 the supervisor Pod logs `Waiting for warm supervisor claim` and

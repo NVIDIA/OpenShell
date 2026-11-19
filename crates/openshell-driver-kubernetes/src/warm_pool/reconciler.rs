@@ -253,6 +253,12 @@ impl KubernetesComputeDriver {
                 "warm pool has a newer revision; this replica cannot change it",
             ));
         }
+        if snapshot.is_none()
+            && pool.target_size > 0
+            && self.config.workspace_mode == WorkspaceMode::Managed
+        {
+            self.ensure_namespace(&pool.workspace).await?;
+        }
         let trust = supervision
             .warm_runtime_trust()
             .await
@@ -265,7 +271,9 @@ impl KubernetesComputeDriver {
             Ok(trust) => self.warm_pool_fingerprint(pool, trust).await,
             Err(error) => Err(invalid(&error.to_string())),
         };
-        let mut inventory = self.warm_runtime_inventory(&pool.workspace).await?;
+        let mut inventory = self
+            .list_warm_runtime_inventory(&pool.workspace, Some(&pool.name))
+            .await?;
         let recovering = self
             .recover_pending_warm_claims(&pool.workspace, &pool.name, &mut inventory)
             .await?;
@@ -273,8 +281,21 @@ impl KubernetesComputeDriver {
             .into_iter()
             .filter(|resource| resource.pool_id == pool.name)
             .collect();
+        let sessions: BTreeSet<_> =
+            inventory
+                .iter()
+                .filter(|resource| !resource.claimed)
+                .map(|resource| resource.session_id)
+                .chain(snapshot.iter().flat_map(|snapshot| {
+                    snapshot.state.entries.iter().map(|entry| entry.session_id)
+                }))
+                .collect();
+        let routes = sessions
+            .into_iter()
+            .map(|session| format!("rt-{session}"))
+            .collect();
         let preparations = supervision
-            .prepared_runtimes(&pool.workspace)
+            .prepared_runtimes(&pool.workspace, routes)
             .await
             .map_err(KubernetesDriverError::Message)?;
         let mut ready = BTreeSet::new();

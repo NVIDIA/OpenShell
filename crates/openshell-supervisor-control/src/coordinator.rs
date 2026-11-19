@@ -163,6 +163,7 @@ pub enum PreparationRelease {
 /// The expected identity fences concurrent restart, stop, and takeover.
 #[derive(Clone)]
 pub struct ActivationRequest {
+    pub runtime_identity: String,
     pub assignment: crate::proto::SandboxInstanceAssignment,
     pub expected_generation: openshell_core::sandbox_generation::SandboxGenerationId,
     pub expected_auth_epoch: openshell_core::jwt::CredentialEpoch,
@@ -248,7 +249,11 @@ pub trait InstancePlacement: Send + Sync + std::fmt::Debug {
         Box::pin(async { Err("cold launch arbitration is not supported".into()) })
     }
 
-    fn pending_warm_claims(&self, _workspace: String) -> PlacementFuture<WarmClaimInventory> {
+    fn pending_warm_claims(
+        &self,
+        _workspace: String,
+        _pool_id: String,
+    ) -> PlacementFuture<WarmClaimInventory> {
         Box::pin(async { Err("pending warm claim inventory is not supported".into()) })
     }
 
@@ -322,8 +327,12 @@ pub trait InstancePlacement: Send + Sync + std::fmt::Debug {
     /// Reserve a live member and one capacity slot before releasing a warm runtime.
     fn prepare_runtime(&self, request: PreparationRequest) -> PlacementFuture;
 
-    /// List admitted, unclaimed runtimes in exactly one workspace.
-    fn prepared_runtimes(&self, workspace: String) -> PlacementFuture<Vec<PreparedRuntime>>;
+    /// Read admitted preparations for the requested pool routes in this workspace.
+    fn prepared_runtimes(
+        &self,
+        workspace: String,
+        routes: Vec<String>,
+    ) -> PlacementFuture<Vec<PreparedRuntime>>;
 
     /// Remove only the observed preparation, never a concurrent claim.
     fn release_preparation(
@@ -502,11 +511,15 @@ impl SharedSupervision {
             .await
     }
 
-    pub async fn pending_warm_claims(&self, workspace: &str) -> Result<WarmClaimInventory, String> {
+    pub async fn pending_warm_claims(
+        &self,
+        workspace: &str,
+        pool_id: &str,
+    ) -> Result<WarmClaimInventory, String> {
         self.controller
             .placement()
             .ok_or("supervisor pool is not ready")?
-            .pending_warm_claims(workspace.into())
+            .pending_warm_claims(workspace.into(), pool_id.into())
             .await
     }
 
@@ -547,10 +560,12 @@ impl SharedSupervision {
         &self,
         workspace: &str,
         route: &str,
+        runtime_identity: String,
     ) -> Result<SandboxInstanceRegistration, String> {
         let intent = self.warm_claim(workspace, route).await?;
         self.activate(
             &intent.registration,
+            runtime_identity,
             intent.expected_generation,
             intent.expected_auth_epoch,
         )
@@ -610,13 +625,17 @@ impl SharedSupervision {
         placement.prepare_runtime(request).await
     }
 
-    /// Recover a workspace's admitted warm runtimes independently of assigned
+    /// Recover a pool's admitted warm runtimes independently of assigned
     /// Sandbox recovery. Failed reads return an error, never an empty inventory.
-    pub async fn prepared_runtimes(&self, workspace: &str) -> Result<Vec<PreparedRuntime>, String> {
+    pub async fn prepared_runtimes(
+        &self,
+        workspace: &str,
+        routes: Vec<String>,
+    ) -> Result<Vec<PreparedRuntime>, String> {
         self.controller
             .placement()
             .ok_or("the supervisor pool is not ready to list prepared runtimes")?
-            .prepared_runtimes(workspace.to_string())
+            .prepared_runtimes(workspace.to_string(), routes)
             .await
     }
 
@@ -662,6 +681,7 @@ impl SharedSupervision {
     pub async fn activate(
         &self,
         registration: &SandboxInstanceRegistration,
+        runtime_identity: String,
         expected_generation: openshell_core::sandbox_generation::SandboxGenerationId,
         expected_auth_epoch: openshell_core::jwt::CredentialEpoch,
     ) -> Result<SandboxInstanceRegistration, String> {
@@ -673,6 +693,7 @@ impl SharedSupervision {
             .ok_or("the supervisor pool is not ready to activate runtimes")?;
         let assignment = placement
             .activate_runtime(ActivationRequest {
+                runtime_identity,
                 assignment: assignment.clone(),
                 expected_generation,
                 expected_auth_epoch,
@@ -946,7 +967,11 @@ mod tests {
             Box::pin(async { Err("preparation not installed in this fixture".into()) })
         }
 
-        fn prepared_runtimes(&self, _workspace: String) -> PlacementFuture<Vec<PreparedRuntime>> {
+        fn prepared_runtimes(
+            &self,
+            _workspace: String,
+            _: Vec<String>,
+        ) -> PlacementFuture<Vec<PreparedRuntime>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -997,7 +1022,12 @@ mod tests {
     #[tokio::test]
     async fn preparation_inventory_and_release_require_installed_placement() {
         let supervision = SharedSupervision::new();
-        assert!(supervision.prepared_runtimes("default").await.is_err());
+        assert!(
+            supervision
+                .prepared_runtimes("default", vec![])
+                .await
+                .is_err()
+        );
         assert!(
             supervision
                 .release_preparation(PreparationRevision {
@@ -1015,6 +1045,7 @@ mod tests {
     #[test]
     fn activation_debug_omits_launch_credentials() {
         let request = ActivationRequest {
+            runtime_identity: "runtime".into(),
             assignment: SandboxInstanceAssignment {
                 route: "rt-1234567890".into(),
                 launch_material: b"private-credential-material".to_vec(),

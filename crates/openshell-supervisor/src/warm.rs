@@ -82,16 +82,22 @@ pub async fn wait_for_claim(
     let token_path =
         std::env::var(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE).into_diagnostic()?;
     tracing::info!(route = %prepared.route, "Waiting for warm supervisor claim");
+    let (accepted, registration) = tokio::sync::watch::channel(false);
     park_until_claim(
         args,
         prepared,
-        register(&endpoint, Path::new(&token_path)),
+        register(&endpoint, Path::new(&token_path), accepted),
+        registration,
         listen,
     )
     .await
 }
 
-async fn register(endpoint: &str, token_path: &Path) -> Result<Vec<u8>> {
+async fn register(
+    endpoint: &str,
+    token_path: &Path,
+    accepted: tokio::sync::watch::Sender<bool>,
+) -> Result<Vec<u8>> {
     use openshell_core::proto::supervisor_host::v1::{
         RegisterSupervisorRequest, supervisor_host_client::SupervisorHostClient,
     };
@@ -121,6 +127,7 @@ async fn register(endpoint: &str, token_path: &Path) -> Result<Vec<u8>> {
                 .register_supervisor(request)
                 .await?
                 .into_inner();
+            accepted.send_replace(true);
             // No deadline or retry while an unclaimed registration is pending.
             stream
                 .message()
@@ -129,6 +136,7 @@ async fn register(endpoint: &str, token_path: &Path) -> Result<Vec<u8>> {
                 .ok_or_else(|| tonic::Status::unavailable("registration stream closed"))
         }
         .await;
+        accepted.send_replace(false);
         match attempt {
             Ok(material) => return Ok(material),
             Err(status)
@@ -163,6 +171,7 @@ async fn park_until_claim(
     args: &mut crate::Args,
     prepared: PreparedRuntimeRegistration,
     claim: impl Future<Output = Result<Vec<u8>>>,
+    mut registration: tokio::sync::watch::Receiver<bool>,
     listen: std::net::SocketAddr,
 ) -> Result<(Box<dyn BackendSetup>, SandboxInstanceRegistration)> {
     tokio::pin!(claim);
@@ -171,8 +180,9 @@ async fn park_until_claim(
         .register(&prepared.route, &prepared.runtime_descriptor.tls)
         .map_err(|e| miette::miette!(e.to_string()))?;
     let mut health = None;
+    let mut ready = None;
     let mut connected = false;
-    loop {
+    let bytes = loop {
         // The startup probe records that a pinned TLS connection is parked, not
         // merely that this process has bound its listening socket.
         if route.has_parked_connection() {
@@ -195,32 +205,52 @@ async fn park_until_claim(
                 "prepared runtime disconnected before its claim"
             ));
         }
+        if connected && *registration.borrow_and_update() {
+            if ready.is_none()
+                && let Some(port) = args.health_port
+            {
+                ready = Some(
+                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+                        .await
+                        .into_diagnostic()?,
+                );
+            }
+        } else {
+            ready = None;
+        }
         tokio::select! {
-            bytes = &mut claim => {
-            let bytes = bytes?;
-            if bytes.len() > MAX_LAUNCH_MATERIAL_BYTES { return Err(miette::miette!("warm launch material exceeds its size limit")); }
-            let registration: SandboxInstanceRegistration = serde_json::from_slice(&bytes)
-                .map_err(|_| miette::miette!("invalid warm launch material"))?;
-            prepared
-                .validate_activation(&registration)
-                .map_err(|_| miette::miette!("warm claim does not match the prepared runtime"))?;
-            // Close warm readiness before normal dedicated startup begins. Its
-            // health listener opens only once supervision is ready.
-            drop(health);
-            args.sandbox_id = Some(registration.sandbox_id.clone());
-            args.sandbox = Some(registration.sandbox_name.clone());
-            args.workdir.clone_from(&registration.workdir);
-            let setup = RoutedBackendSetup::new(router, prepared.route).with_prepared_route(route);
-            return Ok((Box::new(setup), registration));
-        }
+            _ = registration.changed() => {}
+            () = accept_probe(&ready) => {}
+            bytes = &mut claim => break bytes?,
             () = tokio::time::sleep(Duration::from_millis(100)) => {}
-            () = async {
-                match &health {
-                    Some(listener) => { let _ = listener.accept().await; }
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
+            () = accept_probe(&health) => {}
         }
+    };
+    drop(health);
+    drop(ready);
+    if bytes.len() > MAX_LAUNCH_MATERIAL_BYTES {
+        return Err(miette::miette!(
+            "warm launch material exceeds its size limit"
+        ));
+    }
+    let registration: SandboxInstanceRegistration = serde_json::from_slice(&bytes)
+        .map_err(|_| miette::miette!("invalid warm launch material"))?;
+    prepared
+        .validate_activation(&registration)
+        .map_err(|_| miette::miette!("warm claim does not match the prepared runtime"))?;
+    args.sandbox_id = Some(registration.sandbox_id.clone());
+    args.sandbox = Some(registration.sandbox_name.clone());
+    args.workdir.clone_from(&registration.workdir);
+    let setup = RoutedBackendSetup::new(router, prepared.route).with_prepared_route(route);
+    Ok((Box::new(setup), registration))
+}
+
+async fn accept_probe(listener: &Option<tokio::net::TcpListener>) {
+    match listener {
+        Some(listener) => {
+            let _ = listener.accept().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -255,6 +285,10 @@ mod tests {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let health = socket.local_addr().unwrap();
         drop(socket);
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let readiness = socket.local_addr().unwrap();
+        drop(socket);
+        let (accepted, registration) = tokio::sync::watch::channel(false);
         let prepared: PreparedRuntimeRegistration = serde_json::from_value(serde_json::json!({
             "route": "rt-dedicated-0123456789",
             "runtime_descriptor": {
@@ -288,6 +322,8 @@ mod tests {
             &address.to_string(),
             "--warm-health-port",
             &health.port().to_string(),
+            "--health-port",
+            &readiness.port().to_string(),
         ]);
         let peer = async {
             let socket = loop {
@@ -329,6 +365,28 @@ mod tests {
             })
             .await
             .unwrap();
+            assert!(
+                openshell_core::net::connect_tcp_nodelay_best_effort(readiness)
+                    .await
+                    .is_err()
+            );
+            for available in [true, false, true] {
+                accepted.send_replace(available);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if openshell_core::net::connect_tcp_nodelay_best_effort(readiness)
+                            .await
+                            .is_ok()
+                            == available
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
             if disconnect {
                 drop(stream);
                 // Retain the sender so the pending registration cannot end the
@@ -344,6 +402,7 @@ mod tests {
                     &mut args,
                     prepared.clone(),
                     async { Ok(claim_rx.await.unwrap()) },
+                    registration,
                     address
                 ),
                 peer

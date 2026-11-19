@@ -244,7 +244,7 @@ impl KubernetesComputeDriver {
                             continue;
                         }
                         if supervision
-                            .pending_warm_claims(&resource.workspace)
+                            .pending_warm_claims(&resource.workspace, &resource.pool_id)
                             .await
                             .map_err(KubernetesDriverError::Message)?
                             .retired
@@ -353,7 +353,7 @@ impl KubernetesComputeDriver {
     ) -> Result<bool, KubernetesDriverError> {
         let claims = self
             .warm_supervision()?
-            .pending_warm_claims(workspace)
+            .pending_warm_claims(workspace, pool_id)
             .await
             .map_err(KubernetesDriverError::Message)?;
         let mut recovering = false;
@@ -460,6 +460,9 @@ impl KubernetesComputeDriver {
         let resource = resource_from_object(object, record)?;
         if !resource.released {
             return Err(invalid("warm runtime is not released"));
+        }
+        if self.warm_namespace_identity(&resource.namespace).await? != (record.uid, record.gid) {
+            return Ok(false);
         }
         let mut auth = decode_launch_authentication(
             &sandbox
@@ -769,6 +772,15 @@ impl KubernetesComputeDriver {
         {
             return Err(invalid("warm claim namespace was replaced"));
         }
+        if self.warm_pod_identity(&namespace) != (record.uid, record.gid)
+            && self
+                .warm_supervision()?
+                .cancel_warm_claim(&record.workspace, &record.route())
+                .await
+                .map_err(KubernetesDriverError::Message)?
+        {
+            return Err(invalid("warm claim namespace workload identity changed"));
+        }
         self.verify_sandbox_runtime_control_path(object, &logical_id, &resource.namespace, true)
             .await?;
         let supervision = self.warm_supervision()?;
@@ -777,7 +789,11 @@ impl KubernetesComputeDriver {
                 .await?;
         }
         supervision
-            .activate_warm_claim(&record.workspace, &record.route())
+            .activate_warm_claim(
+                &record.workspace,
+                &record.route(),
+                claim_runtime_identity(object)?,
+            )
             .await
             .map_err(KubernetesDriverError::Message)?;
         complete_claim(&api.api, object).await

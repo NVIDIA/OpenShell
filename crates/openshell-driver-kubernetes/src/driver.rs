@@ -2115,19 +2115,7 @@ impl KubernetesComputeDriver {
                     "Resolved namespace annotations for sandbox identity"
                 );
                 let uid = self.config.resolve_sandbox_uid(Some(&anns));
-                let baseline_gid = self.config.resolve_sandbox_gid(uid, None);
-                let gid = self.config.sandbox_gid.map_or_else(
-                    || {
-                        anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
-                            .and_then(|sup_range| {
-                                KubernetesComputeConfig::from_open_shift_supplemental_groups(
-                                    sup_range,
-                                )
-                            })
-                            .unwrap_or(baseline_gid)
-                    },
-                    |_| baseline_gid,
-                );
+                let gid = self.config.resolve_sandbox_gid(uid, Some(&anns));
                 tracing::info!(uid, gid, "Resolved sandbox identity");
                 (uid, gid, anns)
             }

@@ -1854,6 +1854,23 @@ impl ComputeRuntime {
                 | ProvisioningOperationError::Unsettled(status),
             ) => return Err(status),
             Err(ProvisioningOperationError::Driver { status, settled }) => {
+                // A warm activation may have committed before the driver's response
+                // was lost. Settlement has already checked this operation and launch.
+                if !sandbox_compute_runtime_identity(&settled).is_empty()
+                    && settled
+                        .metadata
+                        .as_ref()
+                        .and_then(|meta| {
+                            crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                                &meta.annotations,
+                            )
+                            .ok()
+                        })
+                        .is_some_and(|identity| identity.prepared_runtime.is_some())
+                {
+                    provisioning_operation::ensure_current_result(&settled, &settled)?;
+                    return Ok(*settled);
+                }
                 let status = match status.code() {
                     Code::AlreadyExists => Status::already_exists("sandbox already exists"),
                     Code::FailedPrecondition => {

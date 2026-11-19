@@ -132,8 +132,8 @@ parked connections on its existing heartbeat cadence. The router reads idle TLS
 streams to detect closure and preserves at most 64 KiB of early HTTP/2 bytes for
 activation. The observation cannot guarantee that a peer stays connected.
 
-`SharedSupervision::prepared_runtimes` recovers admitted preparations for one
-workspace, including their physical resource claims, bootstrap epoch, and
+`SharedSupervision::prepared_runtimes` looks up the requested pool routes in
+their workspace, including their physical resource claims, bootstrap epoch, and
 original supervisor process. Owner availability is a reconciliation hint;
 activation checks it again. Read or material-loading failures return an error,
 not an empty inventory. The listing can race claims and other pool changes.
@@ -192,6 +192,8 @@ The Kubernetes driver's OpenShell-owned pool persists per-Pod TLS bootstrap
 material before calling `prepare`, then releases its scheduling gate. Creation
 selects a compatible connected spare, persists its intent through
 `reserve_warm_claim`, binds the CR with a CAS, and calls `activate_warm_claim`.
+Activation records the compute runtime identity and settles the owning CREATE
+in the same transaction that publishes the assignment.
 Recovery uses gateway persistence to complete interrupted claims without reading
 workspace Secrets, including intents whose CR binding never happened. Reservation
 and retirement compete on the gateway assignment version. Retirement must commit
@@ -206,7 +208,7 @@ CR bindings that arrive after cancellation. Activation publication uses durable
 pool reconciliation so a delayed response cannot locally revive a stopped route.
 Dedicated pools use the same journal and activation contracts with a
 separate coordinator: no shared membership or capacity rows are created. The driver
-binds the dedicated Pod UID, observes startup-probe success, and delivers the
+binds the dedicated Pod UID, checks startup and registration readiness, and delivers the
 committed registration through the dedicated supervisor’s pending
 `RegisterSupervisor` stream. Initial gateway TLS trust is mounted before warming;
 claim credentials and the proxy CA arrive in the response. The supervisor adopts

@@ -191,6 +191,7 @@ impl SupervisorPool {
     pub(super) async fn pending_warm_claims(
         &self,
         workspace: &str,
+        pool_id: &str,
     ) -> Result<WarmClaimInventory, String> {
         if workspace.is_empty() {
             return Err("pending claims require a workspace".into());
@@ -203,6 +204,11 @@ impl SupervisorPool {
             .values()
         {
             if record.payload.workspace != workspace
+                || record
+                    .payload
+                    .pool_id
+                    .as_deref()
+                    .is_some_and(|id| id != pool_id)
                 || record.payload.dedicated != self.dedicated
                 || !record.payload.prepared
             {
@@ -523,6 +529,12 @@ impl SupervisorPool {
             }
         }
         let mut payload = record.payload.clone();
+        payload.claim_operation_id = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.provisioning.as_ref())
+            .filter(|op| op.driver_operation_pending)
+            .map(|op| op.driver_operation_id.clone());
         payload
             .claim_handle
             .clone_from(&staged_payload.material_handle);
@@ -629,17 +641,23 @@ impl SupervisorPool {
         }
         let registration =
             SandboxInstanceRegistration::from_assignment(&assignment).map_err(|_| refused())?;
-        let sandbox = self
-            .store
-            .get_message::<Sandbox>(&payload.sandbox_id)
-            .await
-            .map_err(|_| tonic::Status::unavailable("cannot read sandbox claim"))?
-            .ok_or_else(refused)?;
-        let identity = sandbox
-            .metadata
-            .as_ref()
-            .and_then(|meta| PersistedSandboxIdentity::read(&meta.annotations).ok())
-            .ok_or_else(refused)?;
+        let authenticated = self
+            .authority
+            .verify_gateway_token(registration.auth.gateway_token.expose_secret())
+            .map_err(|_| refused())?;
+        if authenticated.sandbox_id.as_str() != payload.sandbox_id {
+            return Err(refused());
+        }
+        let (sandbox, identity) =
+            crate::auth::sandbox_session::authorize_persisted_sandbox(&self.store, &authenticated)
+                .await
+                .map_err(|rejection| {
+                    if rejection.status.code() == tonic::Code::Unavailable {
+                        tonic::Status::unavailable("cannot read sandbox identity")
+                    } else {
+                        refused()
+                    }
+                })?;
         if sandbox.object_workspace() != payload.workspace
             || !matches!(
                 SandboxPhase::try_from(sandbox.phase()),
@@ -654,36 +672,26 @@ impl SupervisorPool {
         {
             return Err(refused());
         }
-        let authenticated = self
-            .authority
-            .verify_gateway_token(registration.auth.gateway_token.expose_secret())
-            .map_err(|_| refused())?;
-        crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated)
-            .await
-            .map_err(|_| refused())?;
         Ok((stamp, Some(material)))
     }
 
     pub(super) async fn prepared_runtimes(
         &self,
         workspace: &str,
+        routes: Vec<String>,
     ) -> Result<Vec<PreparedRuntime>, String> {
         if workspace.is_empty() {
             return Err("a prepared runtime inventory requires a workspace".into());
         }
-        // This inventory authorizes infrastructure cleanup. Do not silently
-        // omit a malformed row as the best-effort pool view does.
-        let records = self
-            .list_all(ASSIGNMENT_OBJECT_TYPE)
-            .await
-            .map_err(|e| e.to_string())?
-            .iter()
-            .map(|row| {
-                decode_assignment(row).ok_or_else(|| {
-                    "invalid supervisor pool assignment in preparation inventory".to_string()
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if routes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::with_capacity(routes.len());
+        for route in routes {
+            if let Some(record) = self.assignment(&route).await.map_err(|e| e.to_string())? {
+                records.push(record);
+            }
+        }
         let owners = self.owners().await.map_err(|e| e.to_string())?;
         let members = self.live_members().await.map_err(|e| e.to_string())?;
         let mut runtimes = Vec::new();
@@ -888,6 +896,8 @@ impl SupervisorPool {
                         .and_then(|session| session.parse().ok()),
                     activation_candidate: false,
                     claim_handle: Vec::new(),
+                    pool_id: None,
+                    claim_operation_id: None,
                 };
                 match self
                     .store
@@ -1063,12 +1073,42 @@ impl SupervisorPool {
                 "the claim does not match the prepared workspace, generation, and epoch".into(),
             );
         }
-        if let Some(link) = read_claim_link(&sandbox)?
+        let claim_link = read_claim_link(&sandbox)?;
+        if let Some(link) = &claim_link
             && link.generation == request.expected_generation
             && link.auth_epoch == request.expected_auth_epoch
             && (link.decision != LaunchDecision::Warm || link.route != assignment.route)
         {
             return Err("activation lost the sandbox launch decision".into());
+        }
+        if request.runtime_identity.is_empty() {
+            return Err("warm activation requires a compute runtime identity".into());
+        }
+        if let Some(operation) = sandbox
+            .status
+            .as_mut()
+            .and_then(|status| status.provisioning.as_mut())
+        {
+            let owns_launch = claim_link.as_ref().is_some_and(|link| {
+                link.generation == request.expected_generation
+                    && link.auth_epoch == request.expected_auth_epoch
+                    && link.route == assignment.route
+                    && link.decision == LaunchDecision::Warm
+            });
+            if !owns_launch
+                || !operation.driver_operation_pending
+                || record
+                    .payload
+                    .claim_operation_id
+                    .as_ref()
+                    .is_some_and(|id| id != &operation.driver_operation_id)
+            {
+                return Err("warm claim driver operation changed".into());
+            }
+            // The activation CAS is the durable CREATE result, including when
+            // another replica completes this reservation after the caller exits.
+            operation.driver_operation_pending = false;
+            operation.cleanup_completed_time = None;
         }
         let mut binding = PreparedRuntimeIdentity::new(
             prepared.runtime_descriptor.session_id,
@@ -1095,12 +1135,19 @@ impl SupervisorPool {
             .mint_persisted_launch(&assignment.sandbox_id, &identity)
             .map_err(|_| "could not mint prepared runtime credentials")?;
         replace_session_tokens(&mut registration.auth, authentication.supervisor);
-        identity.write(
-            &mut sandbox
-                .metadata
-                .as_mut()
-                .ok_or("sandbox metadata is missing")?
-                .annotations,
+        let annotations = &mut sandbox
+            .metadata
+            .as_mut()
+            .ok_or("sandbox metadata is missing")?
+            .annotations;
+        identity.write(annotations);
+        annotations.insert(
+            crate::compute::COMPUTE_DRIVER_ANNOTATION.into(),
+            "kubernetes".into(),
+        );
+        annotations.insert(
+            crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+            request.runtime_identity.clone(),
         );
         let assignment = registration.to_assignment().map_err(|e| e.to_string())?;
         let assignment = &assignment;

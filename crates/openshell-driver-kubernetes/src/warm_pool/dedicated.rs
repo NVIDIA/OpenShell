@@ -172,6 +172,16 @@ pub(in crate::driver) fn validate_dedicated_pod(
         .as_object_mut()
         .expect("Pod spec")
         .remove("schedulingGates");
+    if expected_spec["spec"]["imagePullSecrets"]
+        .as_array()
+        .is_some_and(Vec::is_empty)
+    {
+        // Kubernetes fills an empty pull-secret list from the Pod's ServiceAccount.
+        expected_spec["spec"]
+            .as_object_mut()
+            .expect("Pod spec")
+            .remove("imagePullSecrets");
+    }
     if stored.metadata.deletion_timestamp.is_some()
         || stored.metadata.owner_references != expected.metadata.owner_references
         || !requested_shape_matches(&expected_spec["spec"], &actual["spec"])
@@ -540,6 +550,7 @@ impl KubernetesComputeDriver {
                                     containers.iter().any(|container| {
                                         container.name == "supervisor"
                                             && container.started == Some(true)
+                                            && container.ready
                                             && container.restart_count == 0
                                             && container
                                                 .state

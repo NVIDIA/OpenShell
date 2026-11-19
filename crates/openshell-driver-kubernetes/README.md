@@ -275,9 +275,11 @@ journal reads stop the pass. Template deletion and the disable switch both drain
 
 Shared readiness comes from the current supervisor owner's `PREPARED` report with an
 authenticated parked connection. Dedicated spares have a separate supervisor Pod:
-its startup probe succeeds only after TLS authenticates the runtime. Normal Pod
-readiness stays false until the claim has started supervision. The driver checks
-the original supervisor Pod UID, successful startup, and absence of restarts.
+its startup probe succeeds only after TLS authenticates the runtime. Before claim, Pod
+readiness requires both the parked runtime and an accepted gateway registration.
+A disconnected registration closes the readiness listener until it reconnects.
+The driver checks Pod readiness, the original supervisor UID, successful startup,
+and absence of restarts. After claim, normal supervision owns readiness.
 If the parked runtime disconnects before a claim, its dedicated supervisor exits.
 Terminated or restarted supervisors cannot make that spare eligible again; the
 pool retires and replaces it. The startup verdict therefore lasts only as long as

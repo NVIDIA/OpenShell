@@ -304,6 +304,11 @@ impl ComputeRuntime {
                 "provisioning attempt changed before driver settlement",
             ));
         }
+        if !provisioning_deadline::driver_operation_pending(&current) {
+            self.sandbox_index.update_from_sandbox(&current);
+            self.sandbox_watch_bus.notify(starting.object_id());
+            return Ok(current);
+        }
         let updated = self
             .store
             .update_message_cas::<Sandbox, _>(

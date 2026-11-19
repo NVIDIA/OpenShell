@@ -239,7 +239,7 @@ impl KubernetesComputeDriver {
             .admit_requested_resources(&sandbox)
             .await
             .map_err(admission_error)?;
-        let (uid, gid, _) = self.resolve_sandbox_identity_in_namespace(&namespace).await;
+        let (uid, gid) = self.warm_namespace_identity(&namespace).await?;
         let physical_id = request.session_id.to_string();
         let names = SandboxRuntimeNames::for_generation(&physical_id, &physical_id);
         let (data, child_env) =
@@ -341,14 +341,24 @@ impl KubernetesComputeDriver {
         &self,
         workspace: &str,
     ) -> Result<Vec<WarmRuntimeResource>, KubernetesDriverError> {
+        self.list_warm_runtime_inventory(workspace, None).await
+    }
+
+    async fn list_warm_runtime_inventory(
+        &self,
+        workspace: &str,
+        pool_id: Option<&str>,
+    ) -> Result<Vec<WarmRuntimeResource>, KubernetesDriverError> {
         self.check_warm_runtime_support()?;
         let namespace = self.warm_runtime_namespace(workspace).await?;
         let api = self
             .supported_agent_sandbox_api(self.client.clone(), &namespace)
             .await
             .map_err(KubernetesDriverError::Message)?;
+        let pool_selector =
+            pool_id.map_or_else(|| POOL_LABEL.to_string(), |id| format!("{POOL_LABEL}={id}"));
         let selector = format!(
-            "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_GATEWAY_ID}={},{}={workspace},{POOL_LABEL}",
+            "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_GATEWAY_ID}={},{}={workspace},{pool_selector}",
             self.config.gateway_id, LABEL_SANDBOX_WORKSPACE
         );
         let objects = api
@@ -405,7 +415,7 @@ impl KubernetesComputeDriver {
         if annotation_or_label(&object, LABEL_SANDBOX_ID).is_some()
             && !self
                 .warm_supervision()?
-                .pending_warm_claims(&record.workspace)
+                .pending_warm_claims(&record.workspace, &record.pool_id)
                 .await
                 .map_err(KubernetesDriverError::Message)?
                 .retired
@@ -495,6 +505,26 @@ impl KubernetesComputeDriver {
             ));
         }
         Ok(())
+    }
+
+    async fn warm_namespace_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<(u32, u32), KubernetesDriverError> {
+        if let Some(uid) = self.config.sandbox_uid {
+            return Ok((uid, self.config.resolve_sandbox_gid(uid, None)));
+        }
+        let ns = Api::<Namespace>::all(self.client.clone())
+            .get(namespace)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        Ok(self.warm_pod_identity(&ns))
+    }
+
+    fn warm_pod_identity(&self, ns: &Namespace) -> (u32, u32) {
+        let annotations = ns.metadata.annotations.as_ref();
+        let uid = self.config.resolve_sandbox_uid(annotations);
+        (uid, self.config.resolve_sandbox_gid(uid, annotations))
     }
 
     async fn warm_runtime_namespace(
