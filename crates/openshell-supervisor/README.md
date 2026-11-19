@@ -294,9 +294,16 @@ With the listener enabled, both polling and push maintenance cap their sleep at
 five seconds, even if the configured polling interval is longer. Failed polls
 do not renew routes. Ending the configuration loop suspends routes.
 
+Rejected route installations emit an OCSF configuration-change failure with
+the reason, configuration revision, and sandbox/workspace identity when available.
+Identical rejections are logged once per configuration instance/revision and
+reason until installation succeeds. Normal shutdown does not emit a rejection.
+
 `OPENSHELL_APP_LISTENER_ENABLED=true` explicitly enables the process listener.
-`OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_SERVICE_DOMAIN`,
-`OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. Hosted
+`OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_BASE_URL`,
+`OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. The domain
+is derived from the HTTPS base URL; its public port does not change the listen
+address. Hosted
 instances receive the process router explicitly and never read another
 instance's configuration from process environment. TLS configuration uses
 `openshell-crypto`; certificates are read at process startup. Restart the
@@ -336,3 +343,9 @@ seconds from issuance, independently of configuration freshness. Expiry closes
 streams; later renewal cannot revive them. Takeover preserves the workload and
 public hostname while replacing the app endpoint. Clients reconnect after an
 interruption; sockets are not migrated.
+
+The gateway supplies a canonical `application_hostname` with each installed
+service route. The listener dispatches exact hashed or readable SNI names to
+the correct sandbox instance, validates HTTP Host against SNI, and fences old
+streams when a hostname changes. Readable aliases remain accepted during
+migration; an older gateway omitting the field retains readable routing.

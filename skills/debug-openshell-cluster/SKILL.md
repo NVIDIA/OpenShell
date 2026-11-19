@@ -1750,7 +1750,8 @@ manual schema-v2 migration in the Gateway Configuration reference.
 ## Supervisor application ingress
 
 When `[openshell.supervisor.app_listener]` is explicitly enabled, check its
-`port` and `domain` separately from the gateway API and supervisor runtime ports.
+`port` and `base_url` separately from the gateway API and supervisor runtime ports.
+Derive the domain from the HTTPS `base_url`; do not configure a `domain` key.
 The Kubernetes TLS Secret is configured with `tls_secret_name` under
 `[openshell.drivers.kubernetes.sandbox_runtime.app_listener]`. Disabled listeners
 create no app TLS mount or app port. TLS material is mounted only in supervisors
@@ -1764,16 +1765,28 @@ NetworkPolicy forwarding; also test from a permitted in-cluster client. Operator
 provide ingress network rules. Running supervisors retain their startup listener
 configuration until restarted.
 
+Gateway, compute-driver, and supervisor images must match. After upgrading from
+the `domain` configuration, replace existing dedicated sandbox Pods with the
+matching supervisor image; a gateway rollout alone does not update them. Old
+supervisors cannot acknowledge the new hostname declarations, so their services
+drop out of discovery. New supervisors require `OPENSHELL_APP_BASE_URL` from the
+driver; `OPENSHELL_APP_SERVICE_DOMAIN` is not a compatibility input. Plan for
+service interruption when replacing dedicated Pods.
+
 Service changes arrive through polling or push configuration. Only admitted
 service declarations are installed. Polling and accepted live push sessions
 renew a 30-second lease; rejected configuration or expired freshness closes
 routes. When the listener is enabled, polling delays are capped at five seconds
 even if the configured interval is longer; failed polls do not renew the lease.
 App traffic uses application/edge authentication independently of gateway
-user authentication. The discovery API publishes accepted listener installations; public URLs
-printed by the CLI continue to use the gateway path.
+user authentication. The discovery API publishes accepted listener installations. CLI URLs use the
+configured application origin when `base_url` is set, otherwise the gateway path.
 
-When enabled application routes are not published, check the authenticated
+When enabled application routes are not published, inspect supervisor OCSF events
+whose message starts with `App listener service routes rejected` for the reason
+and configuration revision. Identical rejections are suppressed until the
+configuration instance/revision or reason changes, or installation succeeds.
+Then check the authenticated
 supervisor session and installed configuration before checking ingress. The
 gateway requests installation evidence every five seconds with a fifteen-second
 lease measured from challenge issuance. Instances report only when their serving
@@ -1809,6 +1822,25 @@ admits 16 unary requests (four per principal, eight per workspace), and 32 watch
 record/route/byte limits; `UNAVAILABLE` means storage or collection timeout.
 Watches recheck bearer credentials and membership every second. Allow one refresh
 interval for withdrawals; route lease expiry remains independently enforced.
+
+For incorrect public service URLs, inspect
+`[openshell.gateway].enable_gateway_service_routing` first. When false, gateway URL fields
+are empty and gateway application requests return `404`; direct listener and
+discovery behavior is independent. Then inspect
+`[openshell.supervisor.app_listener].base_url`. It is the external HTTPS base origin
+whose hostname supplies the service domain; its port is independent of the listener port.
+Service responses identify the application and gateway paths separately. A
+configured application URL must retain its public port even when the CLI uses a
+gateway port-forward. Inspect discovery and ingress acceptance separately:
+URL publication alone proves neither installation nor public reachability.
+
+Application URLs and discovery follow the gateway's `service_hostname_format`.
+In hashed mode, check the returned hostname against the supervisor's accepted
+`application_hostname` route, and preserve that exact SNI/Host through ingress.
+Do not reconstruct it from sandbox names. Distinct gateway installations sharing
+an app domain need distinct gateway names; replicas of one installation share
+its name. Changing the mode or installation name requires fresh route
+installation before discovery can advertise the replacement.
 
 ## Azure PostgreSQL workload identity
 

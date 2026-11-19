@@ -12,15 +12,21 @@ use openshell_core::proto::{
     AttachSandboxProviderResponse, BeginRootfsTarStagingResponse, ClearDraftChunksResponse,
     ConfigureProviderRefreshResponse, CreateWorkspaceResponse, DeleteProviderProfileResponse,
     DeleteProviderRefreshResponse, DeleteProviderResponse, DeleteSandboxResponse,
-    DeleteSandboxTemplateResponse, DeleteServiceResponse, DeleteWorkspaceResponse, DeletionOutcome,
-    DetachSandboxProviderResponse, EditDraftChunkResponse, ImportProviderProfilesResponse,
+    DeleteSandboxTemplateResponse, DeleteSecretResponse, DeleteServiceResponse,
+    DeleteWorkspaceResponse, DeletionOutcome, DetachSandboxProviderResponse,
+    EditDraftChunkResponse, ImportProviderProfilesResponse, InlineProviderRefreshSecretsResponse,
     ProviderCredentialRefreshStatus, ProviderProfile, ProviderResponse, RejectDraftChunkResponse,
     RemoveWorkspaceMemberResponse, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    SandboxTemplateResponse, ServiceEndpointResponse, UndoDraftChunkResponse, UpdateConfigRequest,
-    UpdateConfigResponse, UpdateProviderProfilesResponse, WorkspaceSelector, setting_value,
-    workspace_selector::Selection,
+    SandboxTemplateResponse, SecretResponse, ServiceEndpointResponse, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesResponse, WorkspaceSelector,
+    setting_value, workspace_selector::Selection,
+};
+use openshell_core::proto::{
+    CreateSshSessionResponse, ExecSandboxRequest, RevokeSshSessionResponse, SshSession,
+    TcpForwardInit, relay_open,
 };
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_core::{GatewayAuditConfig, ObjectName, ObjectWorkspace};
 use openshell_ocsf::ResourceDetails;
 use tonic::{Code, Response, Status};
 
@@ -69,12 +75,14 @@ macro_rules! deletion {
 
 deletion!(
     DeleteSandboxTemplateResponse,
+    DeleteSecretResponse,
     DeleteServiceResponse,
     DeleteProviderResponse,
     DeleteProviderProfileResponse,
     DeleteProviderRefreshResponse,
     DeleteWorkspaceResponse,
     RemoveWorkspaceMemberResponse,
+    RevokeSshSessionResponse,
 );
 
 impl Audited for DeleteSandboxResponse {
@@ -130,6 +138,27 @@ impl Audited for SandboxTemplateResponse {
             self.template
                 .as_ref()
                 .and_then(|template| template.metadata.as_ref()),
+        )
+    }
+}
+
+/// Records who read which secret. The named target comes from the request;
+/// the response carries the value and contributes nothing to the record.
+impl Audited for openshell_core::proto::RevealSecretResponse {}
+
+impl Audited for InlineProviderRefreshSecretsResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        refreshed_provider(self.status.as_ref())
+    }
+}
+
+impl Audited for SecretResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        stored(
+            "secret",
+            self.secret
+                .as_ref()
+                .and_then(|secret| secret.metadata.as_ref()),
         )
     }
 }
@@ -298,6 +327,16 @@ impl Audited for ClearDraftChunksResponse {
     }
 }
 
+impl Audited for CreateSshSessionResponse {
+    fn produced(&self) -> Vec<Produced<'_>> {
+        vec![Produced {
+            type_label: "sandbox",
+            name: "",
+            uid: &self.sandbox_id,
+        }]
+    }
+}
+
 impl Audited for RejectDraftChunkResponse {}
 impl Audited for EditDraftChunkResponse {}
 
@@ -380,16 +419,17 @@ pub(super) async fn record_absent_delete(
 /// Run `call`, recording the requested `targets` that have a name before it
 /// starts, then what it produced and how it ended. The call is boxed because
 /// handler futures are large.
+///
+/// Hooks record targets here when the unary request names them. Handlers
+/// record the rest: what exists only once admitted, such as a relay channel
+/// or a stored session, and the targets of client-streaming requests.
 pub(super) fn audited<T: Audited>(
-    mut targets: Vec<ResourceDetails>,
+    targets: Vec<ResourceDetails>,
     call: impl Future<Output = Result<Response<T>, Status>>,
 ) -> impl Future<Output = Result<Response<T>, Status>> {
     let call = Box::pin(call);
     async move {
-        targets.retain(|target| target.name.as_deref().is_some_and(|name| !name.is_empty()));
-        for target in targets {
-            audit::record_target(target);
-        }
+        record_requested(targets);
         let response = call.await;
         if let Ok(response) = &response {
             let response = response.get_ref();
@@ -401,6 +441,118 @@ pub(super) fn audited<T: Audited>(
         }
         response
     }
+}
+
+/// Record each requested target that has a non-empty name.
+fn record_requested(targets: impl IntoIterator<Item = ResourceDetails>) {
+    for target in targets {
+        if target.name.as_deref().is_some_and(|name| !name.is_empty()) {
+            audit::record_target(target);
+        }
+    }
+}
+
+/// Command arguments an exec record holds at most.
+const MAX_EXEC_ARGS: usize = 32;
+
+/// Record the workspace and sandbox an exec requested, before it starts.
+pub(super) fn record_exec_targets(request: &ExecSandboxRequest) {
+    record_requested(scoped(
+        request.workspace_scope.as_ref(),
+        [requested("sandbox", &request.sandbox)],
+    ));
+}
+
+/// Record the relay an exec opened, with its command when `config` captures it.
+pub(super) fn record_exec_relay(
+    config: &GatewayAuditConfig,
+    sandbox: &Sandbox,
+    channel_id: &str,
+    request: &ExecSandboxRequest,
+) {
+    let data = exec_command(config.capture_exec_command, request);
+    record_relay("exec", sandbox, channel_id, data);
+}
+
+/// Resource data holding an exec's first `MAX_EXEC_ARGS` command arguments
+/// and how many it left out, when `capture` is set.
+fn exec_command(capture: bool, request: &ExecSandboxRequest) -> Option<serde_json::Value> {
+    capture.then(|| {
+        let command: Vec<&String> = request.command.iter().take(MAX_EXEC_ARGS).collect();
+        let omitted = request.command.len() - command.len();
+        if omitted == 0 {
+            serde_json::json!({ "command": command })
+        } else {
+            serde_json::json!({ "command": command, "omitted": omitted })
+        }
+    })
+}
+
+/// Record the workspace and sandbox a forward requested, before it starts.
+/// `TcpForwardInit` names its workspace directly.
+pub(super) fn record_forward_targets(init: &TcpForwardInit) {
+    record_requested([
+        requested("workspace", &init.workspace),
+        requested("sandbox", &init.sandbox),
+    ]);
+}
+
+/// Record the relay a forward opened to `target`. A TCP forward's data holds
+/// its host and port.
+pub(super) fn record_forward_relay(
+    sandbox: &Sandbox,
+    channel_id: &str,
+    target: &relay_open::Target,
+) {
+    let data = match target {
+        relay_open::Target::Tcp(target) => {
+            Some(serde_json::json!({ "host": target.host, "port": target.port }))
+        }
+        relay_open::Target::Ssh(_) => None,
+    };
+    record_relay("forward", sandbox, channel_id, data);
+}
+
+/// Record the relay opened to `sandbox` as a `type_label` resource whose
+/// `uid` is its channel ID.
+fn record_relay(
+    type_label: &str,
+    sandbox: &Sandbox,
+    channel_id: &str,
+    data: Option<serde_json::Value>,
+) {
+    let produced = stored_sandbox(Some(sandbox));
+    audit::amend_targets(|targets| {
+        complete(targets, produced);
+        targets.push(ResourceDetails {
+            uid: Some(channel_id.to_string()),
+            name: None,
+            type_label: Some(type_label.to_string()),
+            data,
+        });
+    });
+}
+
+/// Record an SSH session by its name, never by its ID, which is its token.
+pub(super) fn record_ssh_session(name: &str) {
+    record_requested([requested("ssh_session", name)]);
+}
+
+/// Record the session a revoke found: its workspace, sandbox, and name.
+pub(super) fn record_revoked_ssh_session(session: &SshSession) {
+    record_requested([requested("workspace", session.object_workspace())]);
+    audit::record_target(ResourceDetails {
+        uid: Some(session.sandbox_id.clone()),
+        name: None,
+        type_label: Some("sandbox".to_string()),
+        data: None,
+    });
+    record_ssh_session(session.object_name());
+}
+
+/// Record a revoke of a session that was already revoked as a no-op.
+pub(super) fn record_repeated_revoke() {
+    audit::record_outcome(Outcome::Detail("no_op:already_absent"));
 }
 
 /// Fill in the first unfilled requested target of each produced
@@ -476,6 +628,11 @@ mod tests {
         EditDraftChunkRequest, NetworkPolicyRule, Provider, RejectDraftChunkRequest,
         RotateProviderCredentialRequest, SandboxPolicy, SettingValue, UndoDraftChunkRequest,
         UpdateConfigRequest, UpdateProviderRequest, setting_value,
+    };
+    use openshell_core::proto::{
+        CreateSshSessionRequest, ExecSandboxInput, ExecSandboxRequest, RevokeSshSessionRequest,
+        SshRelayTarget, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, tcp_forward_frame,
+        tcp_forward_init,
     };
     use serde_json::{Value, json};
     use std::collections::HashMap;
@@ -1834,5 +1991,351 @@ mod tests {
 
         assert_eq!(named(&event), ["provider:audit-openai"]);
         assert_redacted(&event, CANARY);
+    }
+
+    /// Decodes the frames `client_stream` sends.
+    struct Decode<T>(std::marker::PhantomData<T>);
+
+    impl<T: prost::Message + Default + Send + 'static> tonic::codec::Decoder for Decode<T> {
+        type Item = T;
+        type Error = Status;
+
+        fn decode(&mut self, buf: &mut tonic::codec::DecodeBuf<'_>) -> Result<Option<T>, Status> {
+            T::decode(buf)
+                .map(Some)
+                .map_err(|error| Status::internal(error.to_string()))
+        }
+    }
+
+    /// A client stream that sends `frames` and ends.
+    fn client_stream<T: prost::Message + Default + Send + 'static>(
+        frames: &[T],
+    ) -> tonic::Streaming<T> {
+        let mut body = Vec::new();
+        for frame in frames {
+            let frame = frame.encode_to_vec();
+            body.push(0);
+            body.extend(u32::try_from(frame.len()).unwrap().to_be_bytes());
+            body.extend(frame);
+        }
+        tonic::Streaming::new_request(
+            Decode(std::marker::PhantomData),
+            http_body_util::Full::new(bytes::Bytes::from(body)),
+            None,
+            None,
+        )
+    }
+
+    /// A ready sandbox named `agent-01` whose supervisor session hands each
+    /// relay it is asked to open to the returned receiver.
+    async fn ready_sandbox(
+        state: &Arc<crate::ServerState>,
+    ) -> tokio::sync::mpsc::Receiver<openshell_core::proto::GatewayMessage> {
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-agent-01".into(),
+                name: "agent-01".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(openshell_core::proto::SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        state.supervisor_sessions.register(
+            "sb-agent-01".into(),
+            "session-1".into(),
+            tx,
+            tokio::sync::oneshot::channel().0,
+        );
+        rx
+    }
+
+    /// The channel of the next relay the supervisor was asked to open.
+    fn relay_channel(
+        supervisor: &mut tokio::sync::mpsc::Receiver<openshell_core::proto::GatewayMessage>,
+    ) -> String {
+        use openshell_core::proto::gateway_message::Payload;
+        loop {
+            if let Some(Payload::RelayOpen(open)) = supervisor.try_recv().unwrap().payload {
+                return open.channel_id;
+            }
+        }
+    }
+
+    fn exec_request() -> ExecSandboxRequest {
+        ExecSandboxRequest {
+            workspace_scope: Some(workspace_selector("default")),
+            sandbox: "agent-01".into(),
+            command: vec!["echo".into(), format!("{CANARY}-command")],
+            environment: HashMap::from([("API_TOKEN".into(), format!("{CANARY}-env"))]),
+            stdin: format!("{CANARY}-stdin").into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    /// An interactive exec that starts and then sends input.
+    fn interactive_exec() -> tonic::Streaming<ExecSandboxInput> {
+        use openshell_core::proto::exec_sandbox_input::Payload;
+        client_stream(&[
+            ExecSandboxInput {
+                payload: Some(Payload::Start(exec_request())),
+            },
+            ExecSandboxInput {
+                payload: Some(Payload::Stdin(format!("{CANARY}-input").into_bytes())),
+            },
+        ])
+    }
+
+    fn agent_sandbox() -> Value {
+        json!({"type": "sandbox", "name": "agent-01", "uid": "sb-agent-01"})
+    }
+
+    #[tokio::test]
+    async fn execs_name_the_sandbox_and_relay_but_not_their_command_env_or_stdin_by_default() {
+        let state = test_server_state().await;
+        let mut supervisor = ready_sandbox(&state).await;
+        let service = OpenShellService::new(state);
+
+        let (result, event) = record(
+            "ExecSandbox",
+            service.exec_sandbox(authed_request(exec_request())),
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(
+            event["resources"],
+            json!([
+                default_workspace(),
+                agent_sandbox(),
+                {"type": "exec", "uid": relay_channel(&mut supervisor)},
+            ]),
+            "{event}"
+        );
+        assert_redacted(&event, CANARY);
+
+        let (result, event) = record(
+            "ExecSandboxInteractive",
+            service.exec_sandbox_interactive(authed_request(interactive_exec())),
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(
+            event["resources"],
+            json!([
+                default_workspace(),
+                agent_sandbox(),
+                {"type": "exec", "uid": relay_channel(&mut supervisor)},
+            ]),
+            "{event}"
+        );
+        assert_redacted(&event, CANARY);
+    }
+
+    #[tokio::test]
+    async fn execs_record_their_command_when_the_gateway_captures_it() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("unshared test state")
+            .config
+            .audit
+            .capture_exec_command = true;
+        let mut supervisor = ready_sandbox(&state).await;
+        let service = OpenShellService::new(state);
+
+        let (result, event) = record(
+            "ExecSandbox",
+            service.exec_sandbox(authed_request(exec_request())),
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(
+            event["resources"][2],
+            json!({
+                "type": "exec",
+                "uid": relay_channel(&mut supervisor),
+                "data": {"command": ["echo", format!("{CANARY}-command")]},
+            }),
+            "{event}"
+        );
+        for secret in [format!("{CANARY}-env"), format!("{CANARY}-stdin")] {
+            assert_redacted(&event, &secret);
+        }
+    }
+
+    #[test]
+    fn captured_commands_count_the_arguments_left_out() {
+        let request = ExecSandboxRequest {
+            command: (0..40).map(|n| n.to_string()).collect(),
+            ..Default::default()
+        };
+
+        let data = exec_command(true, &request).unwrap();
+
+        assert_eq!(data["command"].as_array().unwrap().len(), 32);
+        assert_eq!(data["command"][31], "31");
+        assert_eq!(data["omitted"], 8);
+    }
+
+    #[tokio::test]
+    async fn rejected_exec_names_the_requested_sandbox() {
+        let service = OpenShellService::new(test_server_state().await);
+
+        let (_, event) = record(
+            "ExecSandboxInteractive",
+            service.exec_sandbox_interactive(authed_request(interactive_exec())),
+        )
+        .await;
+
+        assert_eq!(event["status_detail"], "rejected:not_found", "{event}");
+        assert_eq!(named(&event), ["workspace:default", "sandbox:agent-01"]);
+        assert_redacted(&event, CANARY);
+    }
+
+    #[tokio::test]
+    async fn ssh_session_and_forward_records_name_the_session_but_never_its_token() {
+        let state = test_server_state().await;
+        let mut supervisor = ready_sandbox(&state).await;
+        let service = OpenShellService::new(state);
+
+        let (result, created) = record(
+            "CreateSshSession",
+            service.create_ssh_session(authed_request(CreateSshSessionRequest {
+                workspace_scope: Some(workspace_selector("default")),
+                sandbox: "agent-01".into(),
+            })),
+        )
+        .await;
+        let token = result.unwrap().into_inner().token;
+        let session = created["resources"][2]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ssh_session = json!({"type": "ssh_session", "name": session});
+        assert_eq!(
+            created["resources"],
+            json!([default_workspace(), agent_sandbox(), ssh_session]),
+            "{created}"
+        );
+        assert_redacted(&created, &token);
+
+        let forward = client_stream(&[
+            TcpForwardFrame {
+                payload: Some(tcp_forward_frame::Payload::Init(TcpForwardInit {
+                    sandbox: "agent-01".into(),
+                    workspace: "default".into(),
+                    target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
+                    authorization_token: token.clone(),
+                    ..Default::default()
+                })),
+            },
+            TcpForwardFrame {
+                payload: Some(tcp_forward_frame::Payload::Data(CANARY.into())),
+            },
+        ]);
+        let (result, forwarded) =
+            record("ForwardTcp", service.forward_tcp(authed_request(forward))).await;
+        result.unwrap();
+        assert_eq!(
+            forwarded["resources"],
+            json!([
+                default_workspace(),
+                agent_sandbox(),
+                ssh_session,
+                {"type": "forward", "uid": relay_channel(&mut supervisor)},
+            ]),
+            "{forwarded}"
+        );
+        assert_redacted(&forwarded, &token);
+        assert_redacted(&forwarded, CANARY);
+
+        let revoke = || {
+            service.revoke_ssh_session(authed_request(RevokeSshSessionRequest {
+                token: token.clone(),
+                allow_missing: false,
+            }))
+        };
+        let (_, revoked) = record("RevokeSshSession", revoke()).await;
+        assert_eq!(
+            revoked["resources"],
+            json!([
+                default_workspace(),
+                {"type": "sandbox", "uid": "sb-agent-01"},
+                ssh_session,
+            ]),
+            "{revoked}"
+        );
+        assert!(revoked.get("status_detail").is_none(), "{revoked}");
+        assert_redacted(&revoked, &token);
+
+        let (_, repeated) = record("RevokeSshSession", revoke()).await;
+        assert_eq!(
+            repeated["status_detail"], "no_op:already_absent",
+            "{repeated}"
+        );
+        assert_eq!(repeated["resources"], revoked["resources"]);
+    }
+
+    #[tokio::test]
+    async fn revoking_an_unknown_ssh_session_names_nothing() {
+        let service = OpenShellService::new(test_server_state().await);
+        let revoke = |allow_missing| {
+            service.revoke_ssh_session(authed_request(RevokeSshSessionRequest {
+                token: CANARY.into(),
+                allow_missing,
+            }))
+        };
+
+        let (_, absent) = record("RevokeSshSession", revoke(true)).await;
+        let (_, rejected) = record("RevokeSshSession", revoke(false)).await;
+
+        assert_eq!(absent["status_detail"], "no_op:already_absent", "{absent}");
+        assert_eq!(
+            rejected["status_detail"], "rejected:not_found",
+            "{rejected}"
+        );
+        for event in [absent, rejected] {
+            assert!(event.get("resources").is_none(), "{event}");
+            assert_redacted(&event, CANARY);
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_forwards_record_their_target() {
+        let state = test_server_state().await;
+        let mut supervisor = ready_sandbox(&state).await;
+        let service = OpenShellService::new(state);
+        let init = TcpForwardFrame {
+            payload: Some(tcp_forward_frame::Payload::Init(TcpForwardInit {
+                sandbox: "agent-01".into(),
+                workspace: "default".into(),
+                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                })),
+                ..Default::default()
+            })),
+        };
+
+        let (result, event) = record(
+            "ForwardTcp",
+            service.forward_tcp(authed_request(client_stream(&[init]))),
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(
+            event["resources"][2],
+            json!({
+                "type": "forward",
+                "uid": relay_channel(&mut supervisor),
+                "data": {"host": "127.0.0.1", "port": 8080},
+            }),
+            "{event}"
+        );
     }
 }

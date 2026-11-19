@@ -211,36 +211,28 @@ impl SdkError {
         self.error_details()?.retry_info()?.retry_delay
     }
 
-    /// The gateway timed out waiting for a mutation lock
-    /// (`ErrorInfo.reason = MUTATION_LOCK_TIMEOUT`). No state changed, so the
-    /// request may be repeated after [`Self::retry_delay`].
-    pub fn is_lock_contention(&self) -> bool {
-        self.grpc_status()
-            .is_some_and(openshell_core::create_retry::is_lock_contention)
-    }
-
-    /// Whether retrying the same operation may succeed.
-    ///
-    /// True for a transient [`SdkError::Auth`] failure or a lock-contention
-    /// timeout; every other error is non-retryable and the caller should
-    /// surface it rather than loop. Consumers use this to distinguish a
-    /// retryable refresh blip from a dead session that needs re-authentication.
-    pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Auth {
-                retryable: true,
-                ..
-            }
-        ) || self.is_lock_contention()
-    }
-
     /// Stable string code for cross-language binding consumers.
     ///
     /// Returns one of: `invalid_config`, `tls`, `connect`, `auth`, `io`,
     /// `not_found`, `already_exists`, `rpc`. Phase 3 (napi binding) will
     /// surface this as the JS error's `code` field for discriminated-union
     /// ergonomics.
+    /// Whether retrying the same operation may succeed.
+    ///
+    /// Only a transient [`SdkError::Auth`] failure reports `true`; every other
+    /// error is non-retryable and the caller should surface it rather than
+    /// loop. Consumers use this to distinguish a retryable refresh blip from a
+    /// dead session that needs re-authentication.
+    pub const fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Auth {
+                retryable: true,
+                ..
+            }
+        )
+    }
+
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidConfig { .. } => "invalid_config",
@@ -311,24 +303,6 @@ mod tests {
         assert_eq!(error.grpc_status().unwrap().details(), &[255]);
         assert!(error.error_details().is_none());
         assert!(error.retry_delay().is_none());
-    }
-
-    #[test]
-    fn only_lock_contention_rpc_errors_are_retryable() {
-        let busy = SdkError::from_status(rpc_error::unavailable(
-            rpc_error::MUTATION_LOCK_TIMEOUT,
-            "busy",
-            std::time::Duration::from_secs(1),
-        ));
-        assert!(busy.is_lock_contention() && busy.retryable());
-        assert_eq!(busy.retry_delay(), Some(std::time::Duration::from_secs(1)));
-        for status in [
-            tonic::Status::unavailable("down"),
-            rpc_error::unavailable("DATABASE_UNAVAILABLE", "db", std::time::Duration::ZERO),
-            tonic::Status::internal("boom"),
-        ] {
-            assert!(!SdkError::from_status(status).retryable());
-        }
     }
 
     #[test]

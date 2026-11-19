@@ -48,7 +48,6 @@ pub use auth::EdgeAuthInterceptor;
 pub use client::{OpenShellClient, WorkspaceScopedClient};
 pub use config::{AuthConfig, ClientConfig, ClientIdentity};
 pub use error::SdkError;
-pub use openshell_core::create_retry::RetryPolicy;
 pub use pagination::{Page, Pager};
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{

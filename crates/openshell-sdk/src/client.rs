@@ -22,7 +22,6 @@ use crate::types::{
 };
 use crate::{WatchEvent, WatchOptions, transport};
 use futures::{Stream, StreamExt};
-use openshell_core::create_retry::{RetryPolicy, retry_create};
 use openshell_core::proto;
 use openshell_core::replica_routing::{owner_replica, retry_unrouted, routed_to, with_owner_hint};
 use std::collections::HashMap;
@@ -48,7 +47,6 @@ pub struct OpenShellClient {
     /// here so rotation reaches in-flight requests. `None` for non-OIDC auth.
     bearer_slot: Option<BearerSlot>,
     owners: OwnerCache,
-    create_retry: RetryPolicy,
 }
 
 impl OpenShellClient {
@@ -67,7 +65,6 @@ impl OpenShellClient {
             token_source,
             bearer_slot,
             owners: OwnerCache::default(),
-            create_retry: RetryPolicy::default(),
         })
     }
 
@@ -84,17 +81,7 @@ impl OpenShellClient {
             token_source: None,
             bearer_slot,
             owners: OwnerCache::default(),
-            create_retry: RetryPolicy::default(),
         }
-    }
-
-    /// Retry budget for sandbox creation while the gateway reports a mutation
-    /// lock timeout. Defaults to [`RetryPolicy::lock_contention`]; pass
-    /// [`RetryPolicy::none`] to fail on the first error.
-    #[must_use]
-    pub fn with_create_retry(mut self, policy: RetryPolicy) -> Self {
-        self.create_retry = policy;
-        self
     }
 
     /// Underlying tonic [`Channel`].
@@ -201,7 +188,12 @@ impl OpenShellClient {
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
         let request = create_sandbox_request(spec);
-        let response = self.create_with_retry(&request).await?;
+        let response = self
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
         sandbox_from_create_response(response)
     }
 
@@ -211,7 +203,12 @@ impl OpenShellClient {
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
         let request = create_sandbox_from_template_request(spec);
-        let response = self.create_with_retry(&request).await?;
+        let response = self
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
         sandbox_from_create_response(response)
     }
 
@@ -852,26 +849,6 @@ impl OpenShellClient {
         )
     }
 
-    /// `CreateSandbox` under the unary auth policy, retrying per the client's
-    /// create retry policy.
-    async fn create_with_retry(
-        &self,
-        request: &proto::CreateSandboxRequest,
-    ) -> Result<proto::SandboxResponse> {
-        retry_create(
-            self.create_retry,
-            || {
-                self.unary(|mut grpc| {
-                    let request = request.clone();
-                    async move { grpc.create_sandbox(request).await }
-                })
-            },
-            SdkError::grpc_status,
-            |wait, attempt| tracing::debug!(?wait, attempt, "retrying sandbox create"),
-        )
-        .await
-    }
-
     /// Run a unary RPC with OIDC-aware auth: refresh proactively before the
     /// call (if the token is near expiry) and, on an `Unauthenticated`
     /// response, force a refresh and retry exactly once. No-op auth behaves
@@ -1057,7 +1034,13 @@ impl WorkspaceScopedClient {
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
         let mut request = create_sandbox_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
-        let response = self.client.create_with_retry(&request).await?;
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
         sandbox_from_create_response(response)
     }
 
@@ -1068,7 +1051,13 @@ impl WorkspaceScopedClient {
     ) -> Result<SandboxRef> {
         let mut request = create_sandbox_from_template_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
-        let response = self.client.create_with_retry(&request).await?;
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
         sandbox_from_create_response(response)
     }
 
@@ -1599,6 +1588,8 @@ fn sandbox_from_response(sandbox: Option<proto::Sandbox>) -> Result<SandboxRef> 
 fn sandbox_from_create_response(response: proto::SandboxResponse) -> Result<SandboxRef> {
     let mut sandbox = sandbox_from_response(response.sandbox)?;
     sandbox.service_urls = response.service_urls;
+    sandbox.application_service_urls = response.application_service_urls;
+    sandbox.gateway_service_urls = response.gateway_service_urls;
     Ok(sandbox)
 }
 
@@ -1730,7 +1721,6 @@ mod tests {
             token_source: Some(source),
             bearer_slot,
             owners: OwnerCache::default(),
-            create_retry: RetryPolicy::default(),
         }
     }
 

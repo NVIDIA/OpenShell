@@ -24,6 +24,10 @@ pub enum SecretOwnerKind<'a> {
     SupervisorInstance {
         sandbox_id: &'a str,
     },
+    /// A workspace secret shared as minting material by many providers.
+    WorkspaceSecret {
+        id: &'a str,
+    },
 }
 
 pub struct LegacyScope<'a> {
@@ -54,6 +58,13 @@ impl<'a> SecretOwner<'a> {
         }
     }
 
+    pub fn workspace_secret(workspace: &'a str, id: &'a str) -> Self {
+        Self {
+            workspace,
+            kind: SecretOwnerKind::WorkspaceSecret { id },
+        }
+    }
+
     pub(crate) fn legacy_scope(self) -> LegacyScope<'a> {
         let (provider, id) = match self.kind {
             SecretOwnerKind::Provider { id, name } => (Cow::Borrowed(name), id),
@@ -62,6 +73,9 @@ impl<'a> SecretOwner<'a> {
                 Cow::Owned(format!("sandbox-instance-{sandbox_id}")),
                 sandbox_id,
             ),
+            SecretOwnerKind::WorkspaceSecret { id } => {
+                (Cow::Owned(format!("workspace-secret-{id}")), id)
+            }
         };
         LegacyScope {
             provider,
@@ -92,6 +106,11 @@ mod tests {
                 SecretOwner::supervisor_instance("workspace-a", "sandbox-id"),
                 "sandbox-instance-sandbox-id",
                 "sandbox-id",
+            ),
+            (
+                SecretOwner::workspace_secret("workspace-a", "secret-id"),
+                "workspace-secret-secret-id",
+                "secret-id",
             ),
         ] {
             let scope = owner.legacy_scope();

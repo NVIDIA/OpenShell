@@ -4514,7 +4514,6 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
- "rand 0.9.4",
  "rcgen",
  "reqwest 0.12.28",
  "rustix 1.1.6",

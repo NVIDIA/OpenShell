@@ -1175,9 +1175,9 @@ mod tests {
         assert!(!config.app_listener.common.enabled);
         assert!(config.validate().is_ok());
         config.app_listener.common = openshell_core::app_listener::AppListenerConfig {
+            base_url: Some("https://services.example.com".into()),
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
         };
         assert!(config.validate().is_ok());
         config.app_listener.common.port = config.boundary_port;

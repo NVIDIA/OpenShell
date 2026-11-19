@@ -196,7 +196,7 @@ def main():
                     "openshell.supervisor.app_listener": {
                         "enabled": True,
                         "port": 9443,
-                        "domain": "services.example.com",
+                        "base_url": "https://services.example.com",
                     },
                     "openshell.drivers.kubernetes.sandbox_runtime.app_listener": {
                         "tls_secret_name": "openshell-app-tls",

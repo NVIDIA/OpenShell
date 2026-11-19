@@ -324,6 +324,63 @@ Force a gateway-managed refresh for one credential:
 openshell provider refresh rotate my-graph --credential-key MS_GRAPH_ACCESS_TOKEN
 ```
 
+### Shared Secret Material
+
+Use a workspace secret when many providers share one secret, such as the
+client secret of a confidential OAuth client that every user's provider
+refreshes through. The gateway reads the secret's current value at each mint,
+so updating the secret reaches every provider that references it without
+reauthorizing users. OpenShell never injects workspace secrets into sandboxes,
+and `openshell secret get` and `openshell secret list` never show their values.
+A secret created without `--allowed-endpoint` is reveal-only: no refresh can
+reference it, and only an operator can read it through the `RevealSecret` RPC.
+
+Create the secret with the token endpoints it may be sent to:
+
+```shell
+openshell secret create acme-oauth-client \
+  --value-env CLIENT_SECRET \
+  --allowed-endpoint https://login.example.com/oauth/token
+```
+
+Reference it from refresh configuration with `--material-secret KEY=SECRET`:
+
+```shell
+openshell provider refresh configure alice-mcp \
+  --credential-key MCP_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material client_id="$CLIENT_ID" \
+  --secret-material-env refresh_token=REFRESH_TOKEN \
+  --material-secret client_secret=acme-oauth-client
+```
+
+Rotate the shared value with `openshell secret update acme-oauth-client
+--value-file ./client-secret`. The file is stored exactly as read, including
+any trailing newline, so write it with `printf '%s'`. Each provider uses the
+new value at its next refresh; `openshell provider refresh rotate` applies it
+immediately.
+
+These rules apply:
+
+- Only secret material can come from a workspace secret, and never a
+  `refresh_token`, which each provider rotates on its own.
+- The token endpoint the refresh calls must be one of the secret's allowed
+  endpoints, and the gateway does not follow redirects for these requests.
+  Allowed endpoints cannot change; create a new secret for a new endpoint.
+- Workspace secrets work with the OAuth2 and Google service account
+  strategies, not `aws_sts_assume_role`.
+- `openshell secret delete` fails while a refresh references the secret. Run
+  `openshell provider refresh inline-secrets` to copy the current value into
+  the provider's own refresh material first. It keeps the current grant,
+  including a rotated refresh token.
+- If credential storage fails during deletion, `openshell secret list` shows
+  the secret as `deleting` until the gateway finishes the cleanup. Rerun
+  `openshell secret delete` to retry it.
+
+`provider refresh status` reports which secrets a credential references. The
+gateway operator must enable workspace secrets with `enable_workspace_secrets`;
+refer to [Gateway Configuration](/how-it-works/gateways/configuration#workspace-secrets).
+
 ### AWS STS
 
 The gateway calls `sts:AssumeRole` and writes three short-lived credentials

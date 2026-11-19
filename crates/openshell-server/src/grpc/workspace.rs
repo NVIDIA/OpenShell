@@ -403,6 +403,10 @@ pub(super) async fn handle_delete_workspace(
             StoredProviderCredentialRefreshState::object_type(),
             "credential refresh state",
         ),
+        (
+            crate::storage_proto::StoredWorkspaceSecret::object_type(),
+            "secret",
+        ),
     ] {
         let records = state
             .store
@@ -988,6 +992,54 @@ mod tests {
         assert!(
             err.message().contains("ssh session"),
             "error should name ssh session as blocker: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_blocked_by_workspace_secret() {
+        let state = test_server_state().await;
+
+        handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "secretive".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let secret = crate::storage_proto::StoredWorkspaceSecret {
+            metadata: Some(ObjectMeta {
+                id: "secret-1".to_string(),
+                name: "acme".to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+                workspace: "secretive".to_string(),
+                deletion_time: None,
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&secret).await.unwrap();
+
+        let err = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
+                allow_missing: false,
+                name: "secretive".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("secret"),
+            "error should name secret as blocker: {}",
             err.message()
         );
     }

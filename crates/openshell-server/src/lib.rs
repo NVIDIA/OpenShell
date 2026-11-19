@@ -3187,11 +3187,22 @@ mod tests {
 
     async fn start_plaintext_gateway_listener()
     -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        start_plaintext_gateway_listener_with_service_routing(true).await
+    }
+
+    async fn start_plaintext_gateway_listener_with_service_routing(
+        enabled: bool,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind test listener");
         let listen_addr = listener.local_addr().expect("failed to read local addr");
-        let state = test_state(listen_addr, false).await;
+        let mut state = test_state(listen_addr, false).await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .service_routing
+            .enabled = enabled;
         let service = MultiplexService::new(state);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(serve_gateway_listener(
@@ -3205,6 +3216,21 @@ mod tests {
             shutdown_rx,
         ));
         (listen_addr, shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn gateway_routing_opt_out_keeps_control_plane_available() {
+        let (addr, shutdown, handle) =
+            start_plaintext_gateway_listener_with_service_routing(false).await;
+        let mut client = OpenShellClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        client.health(HealthRequest {}).await.unwrap();
+        let response = send_plain_http(addr, format!(
+            "GET /app HTTP/1.1\r\nHost: default--demo--web.openshell.localhost:{}\r\nConnection: close\r\n\r\n", addr.port()
+        )).await;
+        assert!(response.starts_with("HTTP/1.1 404"));
+        stop_listener(shutdown, handle).await;
     }
 
     #[tokio::test]

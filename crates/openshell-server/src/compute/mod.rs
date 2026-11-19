@@ -1725,14 +1725,20 @@ impl ComputeRuntime {
                 labels_json.as_deref(),
                 WriteCondition::MustCreate,
             )
-            .await;
-        let result = match result {
-            Ok(result) => result,
-            Err(crate::persistence::PersistenceError::UniqueViolation { .. }) => {
-                return Err(self.sandbox_exists_status(&sandbox).await);
-            }
-            Err(e) => return Err(Status::internal(format!("persist sandbox failed: {e}"))),
-        };
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    crate::persistence::PersistenceError::UniqueViolation { .. }
+                ) {
+                    Status::already_exists(format!(
+                        "sandbox '{}' already exists",
+                        sandbox.object_name()
+                    ))
+                } else {
+                    Status::internal(format!("persist sandbox failed: {e}"))
+                }
+            })?;
         if let Some(metadata) = sandbox.metadata.as_mut() {
             metadata.resource_version = result.resource_version;
         }
@@ -1896,27 +1902,6 @@ impl ComputeRuntime {
         Ok(sandbox)
     }
 
-    /// `AlreadyExists` for a name taken by `sandbox`. When the holder is still
-    /// being deleted the conflict is transient, so clients may wait it out.
-    async fn sandbox_exists_status(&self, sandbox: &Sandbox) -> Status {
-        let message = format!("sandbox '{}' already exists", sandbox.object_name());
-        let deleting = matches!(
-            self.store
-                .get_message_by_name::<Sandbox>(sandbox.object_workspace(), sandbox.object_name())
-                .await,
-            Ok(Some(existing)) if existing.phase() == SandboxPhase::Deleting as i32
-        );
-        if deleting {
-            openshell_core::rpc_error::already_exists_transient(
-                openshell_core::rpc_error::SANDBOX_DELETING,
-                message,
-                Duration::from_secs(1),
-            )
-        } else {
-            Status::already_exists(message)
-        }
-    }
-
     async fn compensate_failed_create(
         &self,
         created: &Sandbox,
@@ -1950,8 +1935,8 @@ impl ComputeRuntime {
         )
         .await
         .unwrap_or_else(|_| {
-            openshell_core::rpc_error::with_message(
-                &fallback,
+            Status::new(
+                fallback.code(),
                 format!(
                     "{}; failed-create cleanup worker failed",
                     fallback.message()
@@ -1975,8 +1960,8 @@ impl ComputeRuntime {
         {
             Ok(BeginDelete::Started(transition)) => *transition,
             Ok(BeginDelete::AlreadyDeleting) => {
-                return openshell_core::rpc_error::with_message(
-                    &original,
+                return Status::new(
+                    original.code(),
                     format!(
                         "{}; cleanup after failed create was already claimed",
                         original.message()
@@ -1995,8 +1980,8 @@ impl ComputeRuntime {
                 // A failed store read or CAS cannot establish cleanup
                 // ownership. Keep the record for authoritative cleanup; an
                 // unclaimed DELETE could destroy a newer same-ID runtime.
-                return openshell_core::rpc_error::with_message(
-                    &original,
+                return Status::new(
+                    original.code(),
                     format!(
                         "{}; cleanup after failed create could not claim the sandbox record: {}",
                         original.message(),
@@ -2023,8 +2008,8 @@ impl ComputeRuntime {
                         .await
                     {
                         Ok(_) => original,
-                        Err(error) => openshell_core::rpc_error::with_message(
-                            &original,
+                        Err(error) => Status::new(
+                            original.code(),
                             format!(
                                 "{}; cleanup after failed create remains pending: {}",
                                 original.message(),
@@ -2038,8 +2023,8 @@ impl ComputeRuntime {
                 {
                     original
                 } else {
-                    openshell_core::rpc_error::with_message(
-                        &original,
+                    Status::new(
+                        original.code(),
                         format!(
                             "{}; cleanup after failed create remains pending",
                             original.message()
@@ -2051,8 +2036,8 @@ impl ComputeRuntime {
                 // This sandbox never finished creation. Unlike a user-requested
                 // delete, it must not recover back to its previous live phase.
                 // Keep Deleting and credential ownership for reconciliation.
-                openshell_core::rpc_error::with_message(
-                    &original,
+                Status::new(
+                    original.code(),
                     format!(
                         "{}; cleanup after failed create remains pending: {}",
                         original.message(),
@@ -19513,37 +19498,6 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].object_id(), "sb-labeled");
-    }
-
-    #[tokio::test]
-    async fn duplicate_create_is_transient_only_while_the_holder_is_deleting() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let holder = sandbox_record("sb-holder", "taken", SandboxPhase::Provisioning);
-        runtime.store.put_message(&holder).await.unwrap();
-        let rival = || sandbox_record("sb-rival", "taken", SandboxPhase::Provisioning);
-
-        let error = runtime
-            .create_sandbox(rival(), None, false)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::AlreadyExists);
-        assert!(!openshell_core::rpc_error::has_reason(
-            &error,
-            openshell_core::rpc_error::SANDBOX_DELETING
-        ));
-
-        let mut deleting = holder;
-        deleting.set_phase(SandboxPhase::Deleting as i32);
-        runtime.store.put_message(&deleting).await.unwrap();
-        let error = runtime
-            .create_sandbox(rival(), None, false)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::AlreadyExists);
-        assert!(openshell_core::rpc_error::has_reason(
-            &error,
-            openshell_core::rpc_error::SANDBOX_DELETING
-        ));
     }
 
     #[tokio::test]

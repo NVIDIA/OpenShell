@@ -11,7 +11,6 @@ import json
 import math
 import os
 import pathlib
-import random
 import sys
 import tempfile
 import threading
@@ -145,18 +144,6 @@ def _retry_unrouted(error: grpc.RpcError) -> bool:
         details == ""
         or "no healthy upstream" in details
         or "connection failure" in details
-    )
-
-
-_CREATE_RETRY_SECONDS = 60.0
-
-
-def _is_lock_timeout(error: grpc.RpcError) -> bool:
-    status = from_grpc_error(error)
-    return (
-        status.code() == grpc.StatusCode.UNAVAILABLE
-        and status.error_info is not None
-        and status.error_info.reason == "MUTATION_LOCK_TIMEOUT"
     )
 
 
@@ -935,23 +922,6 @@ class SandboxClient:
     def health(self) -> openshell_pb2.HealthResponse:
         return self._stub.Health(openshell_pb2.HealthRequest(), timeout=self._timeout)
 
-    def _create_sandbox(
-        self, request: openshell_pb2.CreateSandboxRequest
-    ) -> openshell_pb2.SandboxResponse:
-        """CreateSandbox, retried for up to 60s on MUTATION_LOCK_TIMEOUT."""
-        deadline = time.monotonic() + _CREATE_RETRY_SECONDS
-        while True:
-            try:
-                return self._stub.CreateSandbox(request, timeout=self._timeout)
-            except grpc.RpcError as error:
-                if not _is_lock_timeout(error):
-                    raise
-                delay = from_grpc_error(error).retry_delay or 1.0
-                wait = delay * random.uniform(1.0, 1.5)
-                if time.monotonic() + wait > deadline:
-                    raise
-                time.sleep(wait)
-
     def create(
         self,
         *,
@@ -962,14 +932,15 @@ class SandboxClient:
         service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
-        response = self._create_sandbox(
+        response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
                 service_exposures=_service_exposure_messages(service_exposures),
-            )
+            ),
+            timeout=self._timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
@@ -989,7 +960,7 @@ class SandboxClient:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
         request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
-        response = self._create_sandbox(
+        response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 spec=request_spec,
@@ -997,7 +968,8 @@ class SandboxClient:
                 labels=dict(labels) if labels else {},
                 workload_template=workload_template,
                 service_exposures=_service_exposure_messages(service_exposures),
-            )
+            ),
+            timeout=self._timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":

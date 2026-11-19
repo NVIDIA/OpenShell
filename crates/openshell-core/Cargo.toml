@@ -19,7 +19,6 @@ openshell-spiffe = { path = "../openshell-spiffe" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-rand = { workspace = true }
 tonic = { workspace = true, features = ["channel"] }
 tonic-prost = { workspace = true }
 tonic-types = { workspace = true }
@@ -73,7 +72,6 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
 h2 = "0.4"
 rcgen = { workspace = true }
 tempfile = "3"

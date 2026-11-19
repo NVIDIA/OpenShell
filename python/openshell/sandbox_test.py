@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, Never, cast
 import grpc
 import pytest
 from google.protobuf.struct_pb2 import Struct
-from google.rpc import error_details_pb2, status_pb2
 
 import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2, openshell_pb2_grpc
@@ -2351,56 +2350,6 @@ def test_create_forwards_name_and_labels() -> None:
     assert stub.create_request.name == "job-1"
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
     assert dict(ref.labels) == {"aiq": "deep-research"}
-
-
-class _LockTimeout(grpc.RpcError):
-    def __init__(self, reason: str = "MUTATION_LOCK_TIMEOUT") -> None:
-        super().__init__("busy")
-        status = status_pb2.Status(
-            code=grpc.StatusCode.UNAVAILABLE.value[0], message="busy"
-        )
-        retry = error_details_pb2.RetryInfo()
-        retry.retry_delay.nanos = 1_000_000
-        for detail in (error_details_pb2.ErrorInfo(reason=reason), retry):
-            status.details.add().Pack(detail)
-        self._trailing = (("grpc-status-details-bin", status.SerializeToString()),)
-
-    def code(self) -> grpc.StatusCode:
-        return grpc.StatusCode.UNAVAILABLE
-
-    def details(self) -> str:
-        return "busy"
-
-    def trailing_metadata(self) -> Any:
-        return self._trailing
-
-
-@pytest.mark.parametrize(
-    ("reason", "attempts"), [("MUTATION_LOCK_TIMEOUT", 3), ("OTHER", 1)]
-)
-def test_create_retries_only_mutation_lock_timeout(reason: str, attempts: int) -> None:
-    calls: list[int] = []
-
-    class _Flaky(_FakeSandboxStub):
-        def CreateSandbox(
-            self,
-            request: openshell_pb2.CreateSandboxRequest,
-            timeout: float | None = None,
-        ) -> Any:
-            calls.append(1)
-            if len(calls) < 3:
-                raise _LockTimeout(reason)
-            return super().CreateSandbox(request, timeout)
-
-    stub = _Flaky()
-    client = _client_with_fake_stub(stub)
-
-    if attempts == 1:
-        with pytest.raises(grpc.RpcError):
-            client.create(workspace="default")
-    else:
-        assert client.create(workspace="default").id == "sandbox-1"
-    assert len(calls) == attempts
 
 
 def test_create_forwards_service_exposures() -> None:

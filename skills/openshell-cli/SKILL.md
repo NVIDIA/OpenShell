@@ -245,6 +245,8 @@ openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+When many providers share one OAuth client secret, store it once as a workspace secret and reference it with `--material-secret client_secret=NAME`. Rotating it with `openshell secret update` reaches every referencing provider at its next refresh. A secret only reaches the token endpoints it was created with (`--allowed-endpoint`); one created without them is reveal-only and cannot be referenced. and `openshell secret delete` fails while a refresh references it; run `openshell provider refresh inline-secrets` to copy the value into the provider first. The gateway operator must set `enable_workspace_secrets`. See `openshell secret --help`.
+
 The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
 Vault alongside injectable provider credentials; refresh state contains only
@@ -322,7 +324,6 @@ Key flags:
 - `--env-from KEY[=ENVVAR]`: Read a sandbox environment value from the CLI process environment without putting its value in arguments; use `--provider` to keep credentials hidden from the workload
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
-- `--create-retry-timeout SECONDS` / `--no-create-retry`: Set how long create retries while the gateway is busy (default 60), or turn retry off
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
