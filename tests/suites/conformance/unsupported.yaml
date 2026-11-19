@@ -17,8 +17,4 @@
 # the bug. A test can appear more than once with different issues, but not twice
 # for one environment. tasks/scripts/conformance-unsupported.sh --check
 # validates this file; see tests/suites/conformance/README.md.
-- test: conformance::smoke::create_exec_delete
-  issue: https://github.com/NVIDIA/OpenShell/issues/5754
-  environments:
-    - ubuntu-docker-rootful/deb
-    - docker
+[]
