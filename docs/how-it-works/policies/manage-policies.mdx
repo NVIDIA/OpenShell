@@ -191,7 +191,7 @@ running sandbox. The startup sections do not:
 | Network rules | The sandbox loads the new rules. Connections opened under the previous rules close. | Apply the change, then retry the request. |
 | Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
 | External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
-| Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
+| Added filesystem paths | The sandbox rejects the entire revision, including network changes. With the default `fail_closed` failure mode, it blocks network traffic until a valid revision loads. | Recreate the sandbox. |
 | Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
 
 When new network rules take effect, OpenShell closes connections that were
