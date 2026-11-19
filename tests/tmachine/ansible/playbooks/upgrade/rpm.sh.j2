@@ -4,9 +4,10 @@
 
 # Upgrades the installed RPM packages to the candidates in
 # /var/lib/openshell-qualification/candidate, and runs the gateway on the
-# candidate's runtime images. The rpm-upgrade-source installer stages this as
-# /var/lib/openshell-qualification/disruptions/upgrade; the runner runs it as
-# the login user, who runs the gateway's user service under rootless Podman.
+# candidate's runtime images. The rpm-upgrade-source installer renders this
+# for the gateway's user, which differs between rootless Podman (the login
+# user) and rootful Podman (root), and stages it as
+# /var/lib/openshell-qualification/disruptions/upgrade for the runner.
 #
 # The gateway package restarts the user service after an upgrade
 # (%systemd_user_postun_with_restart), so this selects the candidate's images
@@ -17,8 +18,18 @@ set -euo pipefail
 
 stage=/var/lib/openshell-qualification/candidate
 unit=openshell-gateway.service
-uid=$(id -u)
-export XDG_RUNTIME_DIR="/run/user/${uid}"
+gateway_user={{ openshell_gateway_user }}
+gateway_home={{ openshell_gateway_home }}
+gateway_uid={{ openshell_gateway_uid }}
+
+# Run a command as the user that runs the gateway, with its user manager.
+as_gateway_user() {
+  sudo -n -u "${gateway_user}" env \
+    HOME="${gateway_home}" \
+    XDG_RUNTIME_DIR="/run/user/${gateway_uid}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${gateway_uid}/bus" \
+    "$@"
+}
 
 # The epoch, version, release and architecture of each package, one per line.
 versions_of() {
@@ -30,16 +41,15 @@ diagnostics() {
   echo "=== upgrade failed; diagnostics ===" >&2
   versions_of openshell openshell-gateway >&2
   openshell --version >&2
-  systemctl --user status "${unit}" --no-pager >&2
-  journalctl --user -u "${unit}" --no-pager -n 100 >&2
-  podman images >&2
+  as_gateway_user systemctl --user status "${unit}" --no-pager >&2
+  as_gateway_user journalctl --user -u "${unit}" --no-pager -n 100 >&2
+  as_gateway_user podman images >&2
 }
 trap diagnostics EXIT
 
-# The gateway has to be the login user's service: this upgrade loads images
-# into that user's Podman storage.
-if ! systemctl --user cat "${unit}" > /dev/null 2>&1; then
-  echo "${unit} is not a user service of $(id -un): this upgrade supports rootless Podman only" >&2
+load_state=$(as_gateway_user systemctl --user show --property=LoadState --value "${unit}" || true)
+if [ "${load_state}" != loaded ]; then
+  echo "${unit} is not a loaded user service of ${gateway_user} (LoadState=${load_state:-unknown})" >&2
   exit 1
 fi
 
@@ -50,23 +60,26 @@ if [ "${before}" = "${candidate}" ]; then
   exit 1
 fi
 
-podman load --input "${stage}/sandbox.tar"
-podman load --input "${stage}/supervisor.tar"
+# The images go into the gateway user's Podman storage: root's for rootful.
+as_gateway_user podman load --input "${stage}/sandbox.tar"
+as_gateway_user podman load --input "${stage}/supervisor.tar"
 
 # Select the candidate's runtime images, which carry the tmachine tag, so the
-# gateway the package restarts uses them.
-mkdir -p "${HOME}/.config/openshell"
-(
+# gateway the package restarts uses them. ${HOME} is the gateway user's, so it
+# expands in the inner shell.
+# shellcheck disable=SC2016
+as_gateway_user sh -c '
   umask 077
-  cat > "${HOME}/.config/openshell/gateway.env" <<ENV
+  mkdir -p "${HOME}/.config/openshell"
+  cat > "${HOME}/.config/openshell/gateway.env"
+' <<ENV
 OPENSHELL_COMPUTE_DRIVER=podman
 OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
 OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
 ENV
-)
 
 invocation_of() {
-  systemctl --user show --property=InvocationID --value "${unit}"
+  as_gateway_user systemctl --user show --property=InvocationID --value "${unit}"
 }
 invocation=$(invocation_of)
 
@@ -90,8 +103,8 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 if [ "${restarted}" = false ]; then
-  systemctl --user daemon-reload
-  systemctl --user restart "${unit}"
+  as_gateway_user systemctl --user daemon-reload
+  as_gateway_user systemctl --user restart "${unit}"
 fi
 echo "upgraded openshell $(tr '\n' ' ' <<< "${before}")-> $(tr '\n' ' ' <<< "${after}")(restarted by $([ "${restarted}" = true ] && echo the package || echo this step))"
 trap - EXIT
