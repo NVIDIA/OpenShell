@@ -488,28 +488,83 @@ default.
 {{- end }}
 
 {{/*
+One supervisor.pool limit as a whole number in [min, max]. A missing value
+(for example after `helm upgrade --reuse-values` from a release that predates
+it) means the default. Takes a dict of root, key, min, max, and default.
+*/}}
+{{- define "openshell.supervisorPoolLimit" -}}
+{{- $pool := get (.root.Values.supervisor | default dict) "pool" | default dict -}}
+{{- if not (kindIs "map" $pool) -}}
+{{- fail "supervisor.pool must be a map" -}}
+{{- end -}}
+{{- $value := get $pool .key -}}
+{{- if or (not (hasKey $pool .key)) (kindIs "invalid" $value) -}}
+{{- .default -}}
+{{- else -}}
+{{- $limit := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $limit "") (lt (int64 $limit) (int64 .min)) (gt (int64 $limit) (int64 .max)) -}}
+{{- fail (printf "supervisor.pool.%s must be an integer between %d and %d" .key (int .min) (int .max)) -}}
+{{- end -}}
+{{- $limit -}}
+{{- end -}}
+{{- end }}
+
+{{/* Most sandboxes one supervisor runs (supervisor.pool.maxInstancesPerMember). */}}
+{{- define "openshell.supervisorMaxInstancesPerMember" -}}
+{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxInstancesPerMember" "min" 16 "max" 1024 "default" 128) -}}
+{{- end }}
+
+{{/* Most supervisors one gateway replica serves (supervisor.pool.maxMembersPerGateway). */}}
+{{- define "openshell.supervisorMaxMembersPerGateway" -}}
+{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxMembersPerGateway" "min" 1 "max" 64 "default" 32) -}}
+{{- end }}
+
+{{/*
+Refuse more supervisors than the fewest gateway replicas can serve:
+supervisor.replicas, or supervisor.autoscaling.maxReplicas, must not exceed
+the gateway replica count * supervisor.pool.maxMembersPerGateway.
+*/}}
+{{- define "openshell.validateSupervisorMembers" -}}
+{{- $members := int64 (include "openshell.supervisorMaxMembersPerGateway" .) -}}
+{{- $gateways := int64 (include "openshell.minReplicas" .) -}}
+{{- $served := mul $gateways $members -}}
+{{- $source := "supervisor.replicas" -}}
+{{- $supervisors := 0 -}}
+{{- if eq (include "openshell.supervisorAutoscalingEnabled" .) "true" -}}
+{{- $source = "supervisor.autoscaling.maxReplicas" -}}
+{{- $supervisors = int64 (get .Values.supervisor.autoscaling "maxReplicas") -}}
+{{- else -}}
+{{- $supervisors = int64 (include "openshell.supervisorReplicas" .) -}}
+{{- end -}}
+{{- if gt $supervisors $served -}}
+{{- fail (printf "%s (%d) exceeds %s (%d) * supervisor.pool.maxMembersPerGateway (%d) = %d; add gateway replicas or raise maxMembersPerGateway" $source $supervisors (include "openshell.minReplicasSource" .) $gateways $members $served) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 The gateway's [openshell.gateway.supervisor_pool] tuning table as YAML, or
 nothing. The shared supervisor always runs as a high-availability pool that
-the gateway coordinates; the chart owns the table only to set the recovery
-deadline (supervisor.recoveryTimeoutSeconds; none leaves the gateway default).
-It never depends on supervisor.replicas, so scaling never changes the gateway
-configuration. Renders nothing without the gateway topology. Validates the
-supervisor values whenever the topology is selected, and refuses a
-hand-written table in either TOML form.
+the gateway coordinates; the chart owns the table to set the recovery
+deadline (supervisor.recoveryTimeoutSeconds; none leaves the gateway default)
+and the pool limits (supervisor.pool). It never depends on
+supervisor.replicas, so scaling never changes the gateway configuration.
+Renders nothing without the gateway topology. Validates the supervisor values
+whenever the topology is selected, and refuses a hand-written table in either
+TOML form.
 */}}
 {{- define "openshell.supervisorPoolConfig" -}}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- if or (hasKey $gatewayConfig "openshell.gateway.supervisor_pool") (hasKey (get $gatewayConfig "openshell.gateway" | default dict) "supervisor_pool") -}}
-{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds" -}}
+{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas, supervisor.pool, and supervisor.recoveryTimeoutSeconds" -}}
 {{- end -}}
 {{- if include "openshell.supervisorEnabled" . -}}
-{{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" -}}
-{{- $_ := include "openshell.supervisorReplicas" . -}}
-{{- end -}}
+{{- include "openshell.validateSupervisorMembers" . -}}
+{{- $table := dict "max_instances_per_member" (int64 (include "openshell.supervisorMaxInstancesPerMember" .)) "max_members_per_gateway" (int64 (include "openshell.supervisorMaxMembersPerGateway" .)) -}}
 {{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
 {{- if $recoveryTimeout -}}
-{{- toYaml (dict "recovery_timeout_secs" (int64 $recoveryTimeout)) -}}
+{{- $_ := set $table "recovery_timeout_secs" (int64 $recoveryTimeout) -}}
 {{- end -}}
+{{- toYaml $table -}}
 {{- end -}}
 {{- end }}
 
