@@ -84,7 +84,8 @@ impl Unsupported {
         self.0.get(&test.qualified_name()).map(String::as_str)
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 

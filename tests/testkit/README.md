@@ -255,23 +255,22 @@ A test that is stopped does not clean up: sandboxes it created stay on the
 gateway. Run against a gateway you can throw away, or delete them by hand.
 
 Without a subcommand, the program takes libtest's arguments instead. A
-`[[test]]` target with `harness = false` therefore also runs under `cargo test`
+test target with `harness = false` therefore also runs under `cargo test`
 and nextest. In that mode tests run in one process, one at a time unless
 `--test-threads` says otherwise.
 
-### Unsupported tests
+A test's name is its module path without the crate name, then its function
+name, as in nextest. Its family, which groups tests in the JUnit report, is
+the first directory under the last `suites` directory in the crate's path:
+`conformance` for `tests/suites/conformance`, `features` for
+`tests/suites/features/<name>`.
 
-The list is an environment variable, not a `--skip` flag, because `--skip`
-already means "leave out tests whose names match" to libtest and nextest, which
-would read an entry as a filter that matches nothing and run the test anyway.
-A flag also can't reach a program that nextest starts, since nextest writes
-the command line itself. An environment variable reaches every test process
-under every runner.
+### Unsupported tests
 
 An environment that cannot pass a test yet lists it in
 `OPENSHELL_TEST_UNSUPPORTED`, instead of putting `#[ignore]` on the test, which
 turns it off everywhere. The value is `<test>=<issue>` entries separated by
-commas and/or whitespace:
+commas and/or whitespace, so an issue URL can't contain either:
 
 ```shell
 OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVIDIA/OpenShell/issues/1234"
@@ -287,6 +286,10 @@ summary lists each unsupported test with its issue, and its JUnit report marks
 it `skipped` with an `unsupported` property. `run` passes the variable on to its
 test processes.
 
+The list is a variable and not a `--skip` flag because libtest and nextest
+already read `--skip` as a name filter, which would silently run the test, and
+a flag can't reach the programs nextest starts.
+
 A program applies only the entries for crates it links and ignores the rest, so
 one value can serve several programs. A misspelled crate name is therefore
 ignored too. For the entries it applies, the program exits 2 before it lists or
@@ -297,12 +300,6 @@ listing, so nextest exits 104 instead of 2. Forcing an unsupported test
 to run (`--include-ignored`, `--ignored`, nextest's `--run-ignored`, or
 `run --include-ignored`) fails it with `unsupported: <issue>; remove the entry
 from OPENSHELL_TEST_UNSUPPORTED to run it`.
-
-A test's name is its module path without the crate name, then its function
-name, as in nextest. Its family, which groups tests in the JUnit report, is
-the first directory under the last `suites` directory in the crate's path:
-`conformance` for `tests/suites/conformance`, `features` for
-`tests/suites/features/<name>`.
 
 ## Checks
 

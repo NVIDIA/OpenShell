@@ -26,7 +26,7 @@
 //! `--test-threads` says otherwise.
 //!
 //! `OPENSHELL_TEST_UNSUPPORTED` lists tests an environment does not support
-//! yet (see [`Unsupported`]). They are reported as ignored under every
+//! yet (see `unsupported.rs`). They are reported as ignored under every
 //! interface, and a forced run of one fails.
 
 #[cfg(unix)]
@@ -39,7 +39,7 @@ mod process;
 mod supervisor;
 mod unsupported;
 
-pub use unsupported::Unsupported;
+pub(crate) use unsupported::Unsupported;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
