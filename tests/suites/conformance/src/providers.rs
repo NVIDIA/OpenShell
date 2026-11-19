@@ -28,7 +28,7 @@ async fn provider_file_open_update_and_detach(cx: &mut Context) -> testkit::Resu
 
     let sandbox = cx
         .sandbox("pf")
-        .spec(|spec| spec.providers = vec![provider.clone()])
+        .providers([&provider])
         .command(["sleep", "infinity"])
         .create_ready()
         .await?;
