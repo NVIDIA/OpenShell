@@ -135,7 +135,6 @@ refused() {
 refused "maxInstancesPerMember=0" --set supervisor.pool.maxInstancesPerMember=0
 refused "maxInstancesPerMember=1025" --set supervisor.pool.maxInstancesPerMember=1025
 refused "maxMembersPerGateway=0" --set supervisor.pool.maxMembersPerGateway=0
-refused "maxMembersPerGateway=65" --set supervisor.pool.maxMembersPerGateway=65
 refused "3 supervisors for 1 gateway * 2 members" \
   --set supervisor.replicas=3 --set supervisor.pool.maxMembersPerGateway=2
 refused "an HPA maximum of 5 for 1 gateway * 4 members" \

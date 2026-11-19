@@ -677,13 +677,15 @@ Three values set how many sandboxes the cluster can run:
 | Value | Default | Range | Meaning |
 |---|---|---|---|
 | `supervisor.pool.maxInstancesPerMember` | `128` | `1` to `1024` | Sandboxes one supervisor runs. |
-| `supervisor.pool.maxMembersPerGateway` | `32` | `1` to `64` | Supervisors one gateway replica serves. |
+| `supervisor.pool.maxMembersPerGateway` | `32` | `1` or more | Supervisors one gateway replica serves. |
 | `replicaCount` | `1` | | Gateway replicas. |
 
 The pool runs at most `replicaCount` × `maxMembersPerGateway` ×
 `maxInstancesPerMember` sandboxes, and never more than 131,072. The gateway
-places each new sandbox on the supervisor running the fewest, and refuses the
-create when every supervisor is full. Rendering fails when
+places each new sandbox on the supervisor running the fewest. When every
+supervisor is full, `openshell sandbox create` fails at once with
+`sandbox capacity reached: every supervisor runs its limit of N sandboxes`.
+Rendering fails when
 `supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds
 `replicaCount` × `maxMembersPerGateway`; with gateway autoscaling, the chart
 uses `autoscaling.minReplicas`.

@@ -90,8 +90,8 @@ supervisor:
     # refuses a sandbox when every supervisor is full.
     maxInstancesPerMember: 128
     # -- Most supervisors one gateway replica serves, rendered as
-    # [openshell.gateway.supervisor_pool] max_members_per_gateway. Must be an
-    # integer from 1 to 64. The pool runs at most gateway replicas *
+    # [openshell.gateway.supervisor_pool] max_members_per_gateway. Must be a
+    # positive integer. The pool runs at most gateway replicas *
     # maxMembersPerGateway * maxInstancesPerMember sandboxes, never more than
     # 131072.
     maxMembersPerGateway: 32
