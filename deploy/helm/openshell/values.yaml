@@ -95,14 +95,16 @@ supervisor:
     # maxMembersPerGateway times maxInstancesPerMember sandboxes, never more
     # than 131072.
     maxMembersPerGateway: 32
-  # -- Resources of each shared supervisor container. Memory grows with the
-  # sandboxes a supervisor runs; raise it with pool.maxInstancesPerMember.
-  resources:
-    requests:
-      cpu: 250m
-      memory: 768Mi
-    limits:
-      memory: 1.5Gi
+  # -- Resources of each shared supervisor container, unset by default.
+  # Memory grows with the sandboxes a supervisor runs; for the default of 128
+  # sandboxes, request 250m CPU and 768Mi memory with a 1.5Gi memory limit.
+  # Refer to Size Sandbox Capacity in the High Availability guide.
+  resources: {}
+  #   requests:
+  #     cpu: 250m
+  #     memory: 768Mi
+  #   limits:
+  #     memory: 1.5Gi
   autoscaling:
     # -- Enable memory-based autoscaling of the shared supervisor Deployment.
     # Requires supervisor_topology = "gateway" and the Kubernetes resource

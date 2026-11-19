@@ -1388,8 +1388,9 @@ member at its cap, or the pool at gateway replicas × members × instances
 reached"; the gateway log warns "every supervisor is at its sandbox limit" or
 "supervisor pool is at its sandbox limit" to say which. Raise the cap or add
 members. Supervisor container
-resources come from `supervisor.resources` (default requests 250m and 768Mi,
-memory limit 1.5Gi). The chart rolls one member
+resources come from `supervisor.resources` (unset by default; the chart
+recommends requests 250m and 768Mi with a 1.5Gi memory limit for 128
+sandboxes per supervisor). The chart rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control
 supervisor scheduling; top-level `affinity` applies only to the gateway), gives
 each member a 60-second grace period to leave,

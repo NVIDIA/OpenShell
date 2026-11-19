@@ -109,9 +109,8 @@ render defaults
 yq ea -e 'select(.kind == "HorizontalPodAutoscaler") | .metadata.name' "${work_dir}/defaults.yaml" >/dev/null 2>&1 \
   && fail "the default pool renders an HPA"
 yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor")
-  | .spec.template.spec.containers[0].resources
-  | (.requests.cpu == "250m" and .requests.memory == "768Mi" and .limits.memory == "1.5Gi")' \
-  "${work_dir}/defaults.yaml" >/dev/null || fail "the supervisor does not render the default resources"
+  | .spec.template.spec.containers[0] | has("resources") | not' \
+  "${work_dir}/defaults.yaml" >/dev/null || fail "the supervisor renders resources by default"
 
 # The pool limits reach the gateway table and every supervisor alike.
 render limits --set supervisor.pool.maxInstancesPerMember=16 --set supervisor.pool.maxMembersPerGateway=4
