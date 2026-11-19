@@ -12,6 +12,7 @@
 //! handle `SIGTERM` yet, so sandboxes named `test-<run id>-*` can be left
 //! behind.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -68,12 +69,14 @@ impl Outcome {
         }
     }
 
-    fn message(&self) -> Option<&str> {
+    fn message(&self) -> Option<Cow<'_, str>> {
         match self {
             Self::Passed | Self::Skipped => None,
-            Self::Unsupported(issue) => Some(issue),
-            Self::Failed(message) | Self::TimedOut(message) | Self::Error(message) => Some(message),
-            Self::Interrupted => Some("interrupted"),
+            Self::Unsupported(issue) => Some(format!("unsupported: {issue}").into()),
+            Self::Failed(message) | Self::TimedOut(message) | Self::Error(message) => {
+                Some(message.into())
+            }
+            Self::Interrupted => Some("interrupted".into()),
         }
     }
 }
@@ -250,11 +253,7 @@ fn summarize(program: &str, runs: &[TestRun<'_>], not_run: usize, elapsed: Durat
     eprintln!("{summary}");
     for run in runs {
         if let Some(message) = run.outcome.message() {
-            let detail = match &run.outcome {
-                Outcome::Unsupported(issue) => format!("unsupported: {issue}"),
-                _ => message.to_string(),
-            };
-            eprintln!("    {} {}: {detail}", run.outcome.label(), run.test.name());
+            eprintln!("    {} {}: {message}", run.outcome.label(), run.test.name());
         }
     }
     if not_run > 0 {

@@ -85,8 +85,6 @@ jobs:
           # `tmachine` for the k3s and binaries installers. A row without a
           # package runs every package in the workspace; each driver suite is a
           # workspace of its own.
-          # Tests an environment can't pass yet are listed in
-          # tests/suites/conformance/unsupported.yaml, not here.
           rows='[
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb-external-docker-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true},

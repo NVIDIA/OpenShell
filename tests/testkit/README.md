@@ -279,27 +279,17 @@ OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVID
 `<test>` is the crate name (`_` for `-`), then the name libtest shows. The
 program reads the variable under every interface, so `openshell-conformance
 run`, `cargo test` and nextest agree: the test is ignored, so each shows SKIP,
-and `list` marks it `[unsupported: <issue>]`. `run` prints the entries to
-stderr, so a forgotten variable is visible. Under `cargo test` and nextest the
-program stays quiet, so whatever starts them should print the entries. `run`'s
-summary lists each unsupported test with its issue, and its JUnit report marks
-it `skipped` with an `unsupported` property. `run` passes the variable on to its
-test processes.
+and `list` marks it `[unsupported: <issue>]`. `run` prints the entries to stderr
+and lists them in its summary and JUnit report; under `cargo test` and nextest
+the program stays quiet, so whatever starts them should print the entries.
 
-The list is a variable and not a `--skip` flag because libtest and nextest
-already read `--skip` as a name filter, which would silently run the test, and
-a flag can't reach the programs nextest starts.
-
-A program applies only the entries for crates it links and ignores the rest, so
-one value can serve several programs. A misspelled crate name is therefore
-ignored too. For the entries it applies, the program exits 2 before it lists or
-runs anything if an entry names no test, names one twice, names an
-`#[ignore]`d test, has an issue that is not an `https://` URL, or has no `=`. A
-malformed entry exits 2 in every program. Under nextest a bad entry fails the
-listing, so nextest exits 104 instead of 2. Forcing an unsupported test
-to run (`--include-ignored`, `--ignored`, nextest's `--run-ignored`, or
-`run --include-ignored`) fails it with `unsupported: <issue>; remove the entry
-from OPENSHELL_TEST_UNSUPPORTED to run it`.
+A program applies only the entries for crates it links, so one value can serve
+several programs, and a misspelled crate name is ignored. A bad entry for a
+crate it links exits 2 before anything is listed or run (nextest exits 104,
+because its listing fails). Forcing an unsupported test to run
+(`--include-ignored`, `--ignored`, nextest's `--run-ignored`) fails it with
+`unsupported: <issue>; remove the entry from OPENSHELL_TEST_UNSUPPORTED to run
+it`.
 
 ## Checks
 

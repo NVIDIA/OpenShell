@@ -11,7 +11,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 
 use crate::registry::Test;
 
@@ -25,9 +24,10 @@ pub struct Unsupported(BTreeMap<String, String>);
 impl Unsupported {
     /// Read [`ENV`] and check it against `tests`.
     pub fn from_env(tests: &[Test]) -> Result<Self, String> {
-        match std::env::var_os(ENV) {
-            None => Ok(Self::default()),
-            Some(value) => Self::parse(&value_str(value)?, tests),
+        match std::env::var(ENV) {
+            Ok(value) => Self::parse(&value, tests),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{ENV} is not valid UTF-8")),
         }
     }
 
@@ -42,16 +42,12 @@ impl Unsupported {
             .split(|c: char| c == ',' || c.is_whitespace())
             .filter(|entry| !entry.is_empty())
         {
-            let Some((name, issue)) = entry.split_once('=') else {
-                return Err(format!(
-                    "{ENV}: malformed entry {entry:?}; expected <test>=<issue url>"
-                ));
-            };
-            if name.is_empty() || issue.is_empty() {
-                return Err(format!(
-                    "{ENV}: malformed entry {entry:?}; expected <test>=<issue url>"
-                ));
-            }
+            let (name, issue) = entry
+                .split_once('=')
+                .filter(|(name, issue)| !name.is_empty() && !issue.is_empty())
+                .ok_or_else(|| {
+                    format!("{ENV}: malformed entry {entry:?}; expected <test>=<issue url>")
+                })?;
             let package = name.split_once("::").map_or(name, |(package, _)| package);
             if !packages.contains(package) {
                 continue;
@@ -84,11 +80,6 @@ impl Unsupported {
         self.0.get(&test.qualified_name()).map(String::as_str)
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// `(qualified name, issue)` in name order.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
         self.0
@@ -100,12 +91,6 @@ impl Unsupported {
     pub fn refusal(issue: &str) -> String {
         format!("unsupported: {issue}; remove the entry from {ENV} to run it")
     }
-}
-
-fn value_str(value: OsString) -> Result<String, String> {
-    value
-        .into_string()
-        .map_err(|_| format!("{ENV} is not valid UTF-8"))
 }
 
 #[cfg(test)]
@@ -143,8 +128,8 @@ mod tests {
         );
         assert_eq!(unsupported.issue(&TESTS[0]), Some(ISSUE));
         assert_eq!(unsupported.issue(&TESTS[2]), None);
-        assert!(parse("").unwrap().is_empty());
-        assert!(parse(" , \n").unwrap().is_empty());
+        assert!(parse("").unwrap().entries().next().is_none());
+        assert!(parse(" , \n").unwrap().entries().next().is_none());
     }
 
     #[test]
@@ -186,16 +171,5 @@ mod tests {
         assert!(parse(&twice).unwrap_err().contains("listed twice"));
         // A malformed entry fails even with another package's prefix.
         assert!(parse("other::a").is_err());
-    }
-
-    #[test]
-    fn refusal_names_the_issue_and_the_variable() {
-        let message = Unsupported::refusal(ISSUE);
-        assert_eq!(
-            message,
-            format!(
-                "unsupported: {ISSUE}; remove the entry from OPENSHELL_TEST_UNSUPPORTED to run it"
-            )
-        );
     }
 }

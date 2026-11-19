@@ -80,15 +80,10 @@ bug, keep the test and mark it unsupported there:
    (`docker`, `podman`, `kubernetes` or `vm`).
 3. Delete the entry in the PR that fixes the bug.
 
-CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`, which
-the program reads (see the
-[testkit README](../../testkit/README.md#unsupported-tests)). The tmachine job
-sets it for its row and the runner passes it into the guest; host lanes set it
-in `e2e/support/conformance.sh`. Branch Checks validates the file and that every
-test it names exists, using `tasks/scripts/conformance-unsupported.sh`. Locally,
-set `OPENSHELL_TEST_UNSUPPORTED` to `conformance::<test>=<issue url>` entries,
-or run `tasks/scripts/conformance-unsupported.sh <environment>` to print the
-value for an environment.
+CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`; the
+[testkit README](../../testkit/README.md#unsupported-tests) describes what the
+program does with it. Branch Checks validates the file with
+`tasks/scripts/conformance-unsupported.sh --check`.
 
 ## Adding a test
 
