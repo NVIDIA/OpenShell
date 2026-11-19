@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     ServerState,
-    persistence::{ObjectRecord, WriteCondition},
+    persistence::{AtomicWrite, ObjectRecord, PersistenceError, WriteCondition},
 };
 use axum::{
     body::{Body, to_bytes},
@@ -165,10 +165,25 @@ fn origin(value: &str) -> Result<url::Url, Status> {
         || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
+        || url.port() == Some(0)
     {
         return Err(Status::invalid_argument("HTTPS origin required"));
     }
     Ok(url)
+}
+
+fn trusted_login_origin(state: &ServerState, value: &str) -> Result<url::Url, Status> {
+    let candidate = origin(value)?;
+    if !state
+        .config
+        .service_routing
+        .auth_login_origins
+        .iter()
+        .any(|allowed| origin(allowed).is_ok_and(|allowed| allowed.origin() == candidate.origin()))
+    {
+        return Err(Status::permission_denied("untrusted browser login origin"));
+    }
+    Ok(candidate)
 }
 fn request_origin(req: &Request<Body>) -> Result<url::Url, Status> {
     origin(&format!(
@@ -329,19 +344,7 @@ async fn cleanup(state: &ServerState, workspace: &str) -> Result<(), Status> {
             || value.expires <= now()
             || !value.redeemed && value.pending_until <= now()
         {
-            state
-                .credentials
-                .delete_application_token(
-                    workspace,
-                    &value.credential_id,
-                    credential_handle(&value)?,
-                )
-                .await?;
-            state
-                .store
-                .delete(SESSION, &record.id)
-                .await
-                .map_err(|_| internal())?;
+            retire_session(state, &record, value).await?;
         }
     }
     for record in state
@@ -359,6 +362,49 @@ async fn cleanup(state: &ServerState, workspace: &str) -> Result<(), Status> {
         }
     }
     Ok(())
+}
+
+async fn retire_session(
+    state: &ServerState,
+    record: &ObjectRecord,
+    mut value: Session,
+) -> Result<(), Status> {
+    // Claim the exact record before touching the credential shared with a
+    // possible replacement. Leave a retryable tombstone if secret deletion fails.
+    value.revoked = true;
+    let claim = match state
+        .store
+        .put_if(
+            SESSION,
+            &record.id,
+            &record.name,
+            &record.workspace,
+            &serde_json::to_vec(&value).map_err(|_| internal())?,
+            None,
+            WriteCondition::MatchResourceVersion(record.resource_version),
+        )
+        .await
+    {
+        Ok(claim) => claim,
+        Err(PersistenceError::Conflict { .. }) => return Ok(()),
+        Err(_) => return Err(internal()),
+    };
+    state
+        .credentials
+        .delete_application_token(
+            &record.workspace,
+            &value.credential_id,
+            credential_handle(&value)?,
+        )
+        .await?;
+    match state
+        .store
+        .delete_if(SESSION, &record.id, claim.resource_version)
+        .await
+    {
+        Ok(_) | Err(PersistenceError::Conflict { .. }) => Ok(()),
+        Err(_) => Err(internal()),
+    }
 }
 
 async fn service_origin(state: &ServerState, value: &str) -> Result<(url::Url, String), Status> {
@@ -395,6 +441,7 @@ fn redirect(url: &url::Url) -> Result<Response, Status> {
 pub async fn control(state: &ServerState, mut req: Request<Body>) -> Result<Response, Status> {
     secure(&req)?;
     let control_origin = request_origin(&req)?;
+    trusted_login_origin(state, control_origin.as_str())?;
     if req.method() == Method::GET {
         let params = parameters(&req)?;
         let (mut target, _) = service_origin(
@@ -507,7 +554,8 @@ pub async fn handle(
     let path = req.uri().path().to_string();
     if path == format!("{PREFIX}/start") && req.method() == Method::GET {
         let params = parameters(req)?;
-        let mut login = origin(params.get("login_origin").map_or("", String::as_str))?;
+        let mut login =
+            trusted_login_origin(state, params.get("login_origin").map_or("", String::as_str))?;
         if crate::service_routing::resolve_service_host(state, login.host_str().unwrap_or_default())
             .await
             .is_some()
@@ -570,39 +618,27 @@ pub async fn handle(
         let payload = serde_json::to_vec(&value).map_err(|_| internal())?;
         state
             .store
-            .put_if(
-                SESSION,
-                &key,
-                &key,
-                workspace,
-                &payload,
-                None,
-                WriteCondition::MatchResourceVersion(record.resource_version),
-            )
+            .write_atomically(&[
+                AtomicWrite::Delete {
+                    object_type: SESSION.into(),
+                    id: key,
+                    expected_version: record.resource_version,
+                },
+                AtomicWrite::Create {
+                    object_type: SESSION.into(),
+                    id: session_key.clone(),
+                    name: session_key,
+                    workspace: workspace.into(),
+                    payload,
+                },
+            ])
             .await
-            .map_err(|_| Status::unauthenticated("login code already consumed"))?;
-        if state
-            .store
-            .create_if_workspace_count_below(
-                SESSION,
-                &session_key,
-                &session_key,
-                workspace,
-                &payload,
-                None,
-                1024,
-            )
-            .await
-            .map_err(|_| internal())?
-            .is_none()
-        {
-            return Err(Status::resource_exhausted("browser session limit reached"));
-        }
-        state
-            .store
-            .delete(SESSION, &key)
-            .await
-            .map_err(|_| internal())?;
+            .map_err(|error| match error {
+                PersistenceError::Conflict { .. } => {
+                    Status::unauthenticated("login code already consumed")
+                }
+                _ => internal(),
+            })?;
         let response = with_cookie(
             browser_complete()?,
             COOKIE,
@@ -814,6 +850,7 @@ pub mod tests {
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.config.auth.allow_unauthenticated_users = false;
         inner.config.service_routing.auth_enabled = true;
+        inner.config.service_routing.auth_login_origins = vec![GATEWAY.into()];
         inner.config.service_routing.base_domains = vec!["services.example.com".into()];
         inner.config.oidc = Some(serde_json::from_value(serde_json::json!({"issuer":server.uri(),"audience":"openshell-cli","scopes_claim":"scope"})).unwrap());
         inner.admin_role = "openshell-admin".into();
@@ -884,6 +921,194 @@ pub mod tests {
     }
     pub async fn browser_login(state: &Arc<ServerState>, token: &str) -> String {
         browser_login_for(state, token, APP).await
+    }
+
+    #[tokio::test]
+    async fn browser_login_uses_only_exact_trusted_control_origins() {
+        let (_issuer, state, _token) = fixture().await;
+        for candidate in [
+            "https://untrusted.example",
+            "https://gateway.example.com.untrusted.example",
+            "https://gateway.example.com:8443",
+        ] {
+            let mut start = url::Url::parse(&format!("{APP}{PREFIX}/start")).unwrap();
+            start
+                .query_pairs_mut()
+                .append_pair("login_origin", candidate);
+            let response = send(&state, request(Method::GET, start.as_str())).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+
+            // A direct request with a forged control Host cannot create a
+            // different trusted origin, even outside a browser's Origin rules.
+            let mut control = url::Url::parse(&format!("{candidate}{CONTROL}")).unwrap();
+            control.query_pairs_mut().append_pair("service_origin", APP);
+            assert_eq!(
+                send(&state, request(Method::GET, control.as_str()))
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        for candidate in [GATEWAY, "https://GATEWAY.EXAMPLE.COM:443"] {
+            let mut start = url::Url::parse(&format!("{APP}{PREFIX}/start")).unwrap();
+            start
+                .query_pairs_mut()
+                .append_pair("login_origin", candidate);
+            let response = send(&state, request(Method::GET, start.as_str())).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert!(location(&response).starts_with(GATEWAY));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_login_origins_disable_browser_login_but_preserve_bearer_access() {
+        let (_issuer, mut state, token) = fixture().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .service_routing
+            .auth_login_origins
+            .clear();
+        let response = send(
+            &state,
+            request(
+                Method::GET,
+                &format!("{APP}{PREFIX}/start?login_origin={GATEWAY}"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        let mut app = request(Method::GET, APP);
+        app.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        authorize_request(&state, &mut app, "default")
+            .await
+            .unwrap();
+        assert!(!app.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[tokio::test]
+    async fn session_promotion_preserves_capacity_and_fences_replay_and_cleanup() {
+        let (_issuer, state, token) = fixture().await;
+        let active = Session {
+            host: APP.into(),
+            expires: now() + 600,
+            pending_until: 0,
+            login_state: String::new(),
+            handle: String::new(),
+            credential_id: String::new(),
+            cookie_key: String::new(),
+            redeemed: true,
+            revoked: false,
+        };
+        let payload = serde_json::to_vec(&active).unwrap();
+        let writes = (0..1023)
+            .map(|n| {
+                let id = format!("active-{n}");
+                AtomicWrite::Create {
+                    object_type: SESSION.into(),
+                    name: id.clone(),
+                    id,
+                    workspace: "default".into(),
+                    payload: payload.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        state.store.write_atomically(&writes).await.unwrap();
+
+        let start = send(
+            &state,
+            request(
+                Method::GET,
+                &format!("{APP}{PREFIX}/start?login_origin={GATEWAY}"),
+            ),
+        )
+        .await;
+        let nonce_cookie = response_cookie(&start, LOGIN_COOKIE);
+        let login_url = url::Url::parse(&location(&start)).unwrap();
+        let login_state = login_url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let mut login = request(Method::POST, &format!("{GATEWAY}{CONTROL}"));
+        login
+            .headers_mut()
+            .insert(header::ORIGIN, GATEWAY.parse().unwrap());
+        login.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        *login.body_mut() = Body::from(
+            serde_json::to_vec(&serde_json::json!({"service_origin":APP,"state":login_state}))
+                .unwrap(),
+        );
+        let response = send(&state, login).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let redeem_url = json["redirect"].as_str().unwrap();
+        let code = url::Url::parse(redeem_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        let pending = state
+            .store
+            .get(SESSION, &digest(&code).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let redeem = || {
+            let mut req = request(Method::GET, redeem_url);
+            req.headers_mut()
+                .insert(header::COOKIE, nonce_cookie.parse().unwrap());
+            req
+        };
+        let (left, right) = tokio::join!(send(&state, redeem()), send(&state, redeem()));
+        let successful = if left.status() == StatusCode::OK {
+            assert_eq!(right.status(), StatusCode::UNAUTHORIZED);
+            left
+        } else {
+            assert_eq!(left.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(right.status(), StatusCode::OK);
+            right
+        };
+        assert_eq!(
+            state
+                .store
+                .list(SESSION, "default", 1025, 0)
+                .await
+                .unwrap()
+                .len(),
+            1024
+        );
+        assert_eq!(
+            send(&state, redeem()).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Cleanup may already have selected a pending record when redemption
+        // replaces it. Its stale claim must not delete the active credential.
+        retire_session(&state, &pending, session(&pending).unwrap())
+            .await
+            .unwrap();
+        let mut app = request(Method::GET, APP);
+        app.headers_mut().insert(
+            header::COOKIE,
+            response_cookie(&successful, COOKIE).parse().unwrap(),
+        );
+        authorize_request(&state, &mut app, "default")
+            .await
+            .unwrap();
     }
 
     async fn browser_login_for(state: &Arc<ServerState>, token: &str, app_origin: &str) -> String {
@@ -1048,7 +1273,7 @@ pub mod tests {
                 .await
                 .unwrap_err()
                 .code(),
-            tonic::Code::InvalidArgument
+            tonic::Code::PermissionDenied
         );
         let cookie = browser_login_for(&state, &token, &app_origin).await;
         let mut application = request(Method::GET, &format!("{app_origin}/"));

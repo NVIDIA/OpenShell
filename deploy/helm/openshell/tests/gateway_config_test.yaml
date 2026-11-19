@@ -59,6 +59,18 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_gateway_service_auth\s*=\s*false$'
 
+  - it: renders exact trusted browser login origins
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          service_auth_login_origins:
+            - https://gateway.example.com:8443
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_auth_login_origins\s*=\s*\["https://gateway\.example\.com:8443"\]'
+
   - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
     template: templates/gateway-config.yaml
     asserts:

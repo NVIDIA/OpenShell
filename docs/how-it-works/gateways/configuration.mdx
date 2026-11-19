@@ -2418,6 +2418,13 @@ access controls. See
 for browser sessions, application credential passthrough, and revocation.
 Direct app-listener authentication belongs to the ingress provider.
 
+Browser login additionally requires `service_auth_login_origins` in
+`[openshell.gateway]`, for example `["https://gateway.example.com:8443"]`.
+Only exact HTTPS control-plane origins are allowed; wildcards, credentials,
+paths, queries, and fragments are invalid. The default empty list disables
+browser login while preserving bearer and mTLS application access. Helm uses
+`gatewayConfig."openshell.gateway".service_auth_login_origins`.
+
 When service authentication is enabled, TLS gateways advertise HTTPS for gateway service access, including
 on loopback, so clients can present an mTLS identity. The separate plaintext
 loopback service listener cannot accept a client-certificate identity or browser

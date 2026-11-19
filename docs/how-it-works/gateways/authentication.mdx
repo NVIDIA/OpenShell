@@ -57,6 +57,20 @@ application connection. Role, scope, membership, and origin denials return 403.
 
 ### Browser sessions
 
+Configure the exact trusted control-plane origins before enabling browser login:
+
+```toml
+[openshell.gateway]
+enable_gateway_service_auth = true
+service_auth_login_origins = ["https://gateway.example.com"]
+```
+
+The list defaults to empty, disabling browser login. Bearer and mTLS application
+access do not require it. Include each public gateway origin and its port when
+nonstandard; wildcards, credentials, paths, queries, and fragments are rejected.
+Keep this list consistent across gateway replicas. Application origins do not
+belong in this list.
+
 Open the control-plane gateway's sign-in page with the gateway-mediated service
 origin as `service_origin`, for example:
 
