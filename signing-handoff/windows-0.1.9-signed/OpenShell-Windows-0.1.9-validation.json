@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/NVIDIA/OpenShell",
+    "branch": "windows",
+    "commit": "7e4e113e3249238b61db71947c4b79b2d7a247e3",
+    "versionStamp": "0.1.9"
+  },
+  "intendedRelease": {
+    "repository": "NVIDIA/OpenShell",
+    "tag": "v0.1.9",
+    "matchesReleaseTagSource": false
+  },
+  "buildRun": "https://github.com/NVIDIA/OpenShell/actions/runs/44465275559",
+  "buildAutomationCommit": "4d7c622fa4886567687eca7cc3f42271b0d6edf1",
+  "nativeRunnerTests": {
+    "arm64": {
+      "passed": 6767,
+      "failed": 0,
+      "skipped": 43
+    },
+    "x64": {
+      "passed": 6767,
+      "failed": 0,
+      "skipped": 43
+    }
+  },
+  "sdkRunnerTests": {
+    "pythonPassed": 229,
+    "typescriptPassed": 196
+  },
+  "architectures": {
+    "arm64": {
+      "file": "OpenShell-Windows-0.1.9-arm64.zip",
+      "sha256": "253413c616685ca1633a9f9d279ae4514c493a1a996c057e88feb53d9dba8131",
+      "size": 55622751,
+      "authenticode": {
+        "result": "valid-timestamped",
+        "verifiedFiles": 22,
+        "publisher": "NVIDIA Corporation"
+      },
+      "runtimeLinkage": {
+        "crt": "static",
+        "z3": "static",
+        "z3DllIncluded": false,
+        "signedPeImportAudit": "passed"
+      },
+      "manifestIntegrity": "passed",
+      "executableLaunches": "passed",
+      "launchEnvironment": "native-arm64",
+      "nativeMxcRuntime": {
+        "passed": 9,
+        "failed": 0,
+        "skipped": 0
+      },
+      "gatewayKillAndRestart": "passed",
+      "injectedCaHttps": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      },
+      "signedPayloadHashesUnchangedAfterTests": true
+    },
+    "x64": {
+      "file": "OpenShell-Windows-0.1.9-x64.zip",
+      "sha256": "f95c30cfc957d1d3150269c6e681c5cadec4a717408956e7ff3a9d265056ffc4",
+      "size": 59504488,
+      "authenticode": {
+        "result": "valid-timestamped",
+        "verifiedFiles": 22,
+        "publisher": "NVIDIA Corporation"
+      },
+      "runtimeLinkage": {
+        "crt": "static",
+        "z3": "static",
+        "z3DllIncluded": false,
+        "signedPeImportAudit": "passed"
+      },
+      "manifestIntegrity": "passed",
+      "executableLaunches": "passed",
+      "launchEnvironment": "x64-emulation-on-arm64",
+      "nativeMxcRuntime": "unqualified-not-tested",
+      "gatewayKillAndRestart": "not-tested",
+      "injectedCaHttps": "not-tested",
+      "signedPayloadHashesUnchangedAfterTests": true
+    }
+  },
+  "arm64PackageExamples": {
+    "gatewayStartAndInfo": "passed",
+    "initialization": "passed",
+    "typescriptHarness": "passed",
+    "powershellHarness": "passed",
+    "pythonHealth": "blocked-native-dependency-installation"
+  },
+  "signingVerification": {
+    "signatureVerification": "Windows Authenticode and signtool /pa /all /v",
+    "uniqueSignedPayloads": 26,
+    "payloadIdentityPreserved": true,
+    "signedFilesPerPackage": {
+      "arm64": 22,
+      "x64": 22
+    },
+    "unsignedSourceExampleTypesCoveredByArchiveAttestation": [
+      ".py",
+      ".mjs"
+    ]
+  },
+  "privacyScan": "passed",
+  "limitations": [
+    "Native x64 MXC remains unqualified; x64 signed-package launches were tested under emulation.",
+    "Passing MXC scenarios does not establish exclusive network mediation or live revocation.",
+    "Windows cfg-gated tests and unsupported-package exclusions are outside the Nextest skipped count.",
+    "The source SBOM covers the broader source tree and is not an exact linked-binary inventory.",
+    "Native ARM64 Python health example remains unqualified because its binary dependencies could not be installed."
+  ]
+}
