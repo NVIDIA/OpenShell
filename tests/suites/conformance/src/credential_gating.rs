@@ -326,9 +326,6 @@ async fn profile_websocket_endpoint_rewrites_text_frames(cx: &mut Context) -> te
 /// or its variable name.
 #[testkit::test]
 async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit::Result {
-    if crate::skip_reading_sandbox_logs("profile_endpoints_bind_static_credentials") {
-        return Ok(());
-    }
     const SECRET_A: &str = "e2e-bound-secret";
     const SECRET_B: &str = "e2e-provider-b-secret";
     let authorized = |request: &Request| {

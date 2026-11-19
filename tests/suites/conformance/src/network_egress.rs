@@ -218,9 +218,6 @@ async fn middleware_redacts_request_bodies(cx: &mut Context) -> testkit::Result 
 /// byte reaches upstream, and the sandbox logs why.
 #[testkit::test]
 async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -> testkit::Result {
-    if crate::skip_reading_sandbox_logs("fail_closed_middleware_blocks_uninspectable_traffic") {
-        return Ok(());
-    }
     let server = TcpServer::echo().await?;
     let policy = middleware_policy(server.port, "fail_closed", "")?;
     let sandbox = cx

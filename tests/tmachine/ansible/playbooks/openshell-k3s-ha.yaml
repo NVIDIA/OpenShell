@@ -104,12 +104,3 @@
           become: false
       vars:
         openshell_client_gateway_endpoint: "https://openshell.openshell.svc.cluster.local:{{ k3s_gateway_address.stdout.split(':')[1] }}"
-
-    # Sandbox logs are read from one replica only (#5462); tests that read
-    # them skip themselves here until #5752.
-    - name: Publish gateway test variables
-      ansible.builtin.include_tasks: test-env.yaml
-      vars:
-        test_env_name: gateway
-        test_env_vars:
-          OPENSHELL_TEST_GATEWAY_REPLICAS: "3"
