@@ -6563,30 +6563,24 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.remove(sandbox_id);
     }
 
-    /// Whether a sweep observes a sandbox with an active start.
+    /// Whether a sweep observes a `Starting` sandbox with an active start.
     ///
     /// `StartSandbox` holds the gate for the whole driver call, during which
     /// the workload can still show its previous exit. The sweep skips the
     /// sandbox instead of waiting, and the next tick or watch event
-    /// reports the settled state. Probe before and after polling without
-    /// retaining the gate, so Deleted watches can still dispatch cleanup.
+    /// reports the settled state. The gate is probed, never retained, so
+    /// Deleted watches can still dispatch cleanup.
     ///
-    /// The gate is local to this replica. A driver operation claimed by any
-    /// replica is recorded durably, so a pending claim also defers the sweep.
-    /// Deletion is exempt: `pending_driver_operation_blocks_cleanup` decides
-    /// whether a pending operation blocks its cleanup.
+    /// The gate is local to this replica. A start owned by another replica is
+    /// visible through its durable driver-operation claim.
     fn sweep_start_in_progress(&self, record: &ObjectRecord) -> Result<bool, String> {
         let sandbox = decode_sandbox_record(record)?;
-        if sandbox.phase() != SandboxPhase::Deleting as i32
-            && provisioning_deadline::driver_operation_pending(&sandbox)
-        {
-            return Ok(true);
-        }
         Ok(sandbox.phase() == SandboxPhase::Starting as i32
-            && self
-                .lifecycle_gates
-                .try_lock_for(sandbox.object_id())
-                .is_none())
+            && (provisioning_deadline::driver_operation_pending(&sandbox)
+                || self
+                    .lifecycle_gates
+                    .try_lock_for(sandbox.object_id())
+                    .is_none()))
     }
 
     async fn reconcile_snapshot_sandbox(
@@ -6606,9 +6600,6 @@ impl ComputeRuntime {
             };
 
             if existing.updated_at_ms > sweep_started_at_ms {
-                return Ok(());
-            }
-            if self.sweep_start_in_progress(&existing)? {
                 return Ok(());
             }
             existing.resource_version
@@ -6675,9 +6666,6 @@ impl ComputeRuntime {
             if age_ms < grace_ms {
                 return Ok(());
             }
-            if self.sweep_start_in_progress(&current_record)? {
-                return Ok(());
-            }
 
             (
                 sandbox.object_id().to_string(),
@@ -6700,7 +6688,6 @@ impl ComputeRuntime {
         };
         if current_record.resource_version != expected_resource_version
             || current_record.updated_at_ms > sweep_started_at_ms
-            || self.sweep_start_in_progress(&current_record)?
         {
             return Ok(());
         }
@@ -14189,6 +14176,42 @@ mod tests {
         }
     }
 
+    // A start writes `Starting` before it records its driver-operation claim.
+    // In between, only the local lifecycle gate defers this replica's sweep.
+    #[tokio::test]
+    async fn reconcile_sweep_skips_a_starting_sandbox_whose_gate_is_held_before_its_claim() {
+        let driver = ControlledDriver::new();
+        let sandbox = sandbox_record(
+            "sb-start-gate",
+            "sandbox-start-gate",
+            SandboxPhase::Starting,
+        );
+        let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        polled.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "Container exited with code 0",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+        runtime
+            .reconcile_snapshot_sandbox(polled, i64::MAX)
+            .await
+            .unwrap();
+        drop(gate);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!provisioning_deadline::driver_operation_pending(&stored));
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
     #[tokio::test]
     async fn live_container_exit_during_start_still_transitions_to_error() {
         for reason in [
@@ -16009,86 +16032,94 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_reconciliation_lookup_does_not_delay_watch_events() {
-        for (observation, deleted_id) in [
-            ("snapshot", "sb-b"),
-            ("snapshot", "sb-a"),
-            ("prune", "sb-a"),
+        let driver = ControlledDriver::new();
+        driver.block_get();
+        let snapshot = ready_driver_sandbox("sb-a", "sandbox-a");
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(snapshot.clone())));
+        let runtime = test_runtime(driver.clone()).await;
+        for sandbox in [
+            sandbox_record("sb-a", "sandbox-a", SandboxPhase::Provisioning),
+            sandbox_record("sb-b", "sandbox-b", SandboxPhase::Ready),
         ] {
-            let driver = ControlledDriver::new();
-            driver.block_get();
-            let snapshot = ready_driver_sandbox("sb-a", "sandbox-a");
-            driver.set_get_outcome(if deleted_id == "sb-b" {
-                ControlledGetOutcome::Sandbox(Box::new(snapshot.clone()))
-            } else if observation == "snapshot" {
-                ControlledGetOutcome::Missing
-            } else {
-                ControlledGetOutcome::Error("lookup failed after the Deleted watch")
-            });
-            let runtime = test_runtime(driver.clone()).await;
-            for sandbox in [
-                sandbox_record("sb-a", "sandbox-a", SandboxPhase::Starting),
-                sandbox_record("sb-b", "sandbox-b", SandboxPhase::Ready),
-            ] {
-                runtime.store.put_message(&sandbox).await.unwrap();
-            }
+            runtime.store.put_message(&sandbox).await.unwrap();
+        }
 
-            let (shutdown_tx, watch_handle) = start_watch_loop(&runtime, &driver).await;
-            let mut deleted_rx = runtime.sandbox_watch_bus.subscribe(deleted_id);
-            let reconcile_runtime = runtime.clone();
-            let reconcile = tokio::spawn(async move {
-                if observation == "prune" {
-                    let record = reconcile_runtime
-                        .store
-                        .get(Sandbox::object_type(), "sb-a")
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    return reconcile_runtime
-                        .prune_missing_sandbox(record, i64::MAX, 0)
-                        .await;
-                }
-                reconcile_runtime
-                    .reconcile_snapshot_sandbox(snapshot, i64::MAX)
-                    .await
-            });
-            tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
+        let (shutdown_tx, watch_handle) = start_watch_loop(&runtime, &driver).await;
+        let mut sandbox_b_rx = runtime.sandbox_watch_bus.subscribe("sb-b");
+        let reconcile_runtime = runtime.clone();
+        let reconcile = tokio::spawn(async move {
+            reconcile_runtime
+                .reconcile_snapshot_sandbox(snapshot, i64::MAX)
                 .await
-                .expect("reconciliation did not reach the driver lookup");
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
+            .await
+            .expect("reconciliation did not reach the driver lookup");
 
-            driver.send_event(deleted_watch_event(deleted_id));
-            tokio::time::timeout(Duration::from_secs(1), deleted_rx.recv())
-                .await
-                .expect("watch event was blocked by reconciliation lookup")
-                .expect("sandbox watch bus closed before notification");
-            assert!(
-                runtime
-                    .store
-                    .get_message::<Sandbox>(deleted_id)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            let cleanup =
-                tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
-                    .await;
-            driver.release_get();
-            let reconciled = tokio::time::timeout(Duration::from_secs(1), reconcile)
+        driver.send_event(deleted_watch_event("sb-b"));
+        tokio::time::timeout(Duration::from_secs(1), sandbox_b_rx.recv())
+            .await
+            .expect("watch event was blocked by reconciliation lookup")
+            .expect("sandbox B watch bus closed before notification");
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-b")
                 .await
                 .unwrap()
-                .unwrap();
-            if observation == "prune" {
-                assert!(
-                    reconciled
-                        .unwrap_err()
-                        .contains("lookup failed after the Deleted watch")
-                );
-            } else {
-                reconciled.unwrap();
-            }
-            cleanup.expect("the sweep must not suppress deletion-watch driver cleanup");
-            assert_eq!(driver.delete_calls(), 1);
-            stop_watch_loop(shutdown_tx, watch_handle).await;
-        }
+                .is_none()
+        );
+
+        driver.release_get();
+        tokio::time::timeout(Duration::from_secs(1), reconcile)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        stop_watch_loop(shutdown_tx, watch_handle).await;
+    }
+
+    // The sweep's start probe must not hold the lifecycle gate across the
+    // driver poll, or a Deleted watch for a `Starting` sandbox could not
+    // dispatch driver cleanup.
+    #[tokio::test]
+    async fn deleted_watch_during_sweep_poll_of_starting_sandbox_dispatches_cleanup() {
+        let driver = ControlledDriver::new();
+        driver.block_get();
+        driver.set_get_outcome(ControlledGetOutcome::Missing);
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-a", "sandbox-a", SandboxPhase::Starting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let (shutdown_tx, watch_handle) = start_watch_loop(&runtime, &driver).await;
+        let mut deleted_rx = runtime.sandbox_watch_bus.subscribe("sb-a");
+        let reconcile_runtime = runtime.clone();
+        let snapshot = ready_driver_sandbox("sb-a", "sandbox-a");
+        let reconcile = tokio::spawn(async move {
+            reconcile_runtime
+                .reconcile_snapshot_sandbox(snapshot, i64::MAX)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
+            .await
+            .expect("reconciliation did not reach the driver lookup");
+
+        driver.send_event(deleted_watch_event("sb-a"));
+        tokio::time::timeout(Duration::from_secs(1), deleted_rx.recv())
+            .await
+            .expect("watch event was blocked by reconciliation lookup")
+            .expect("sandbox watch bus closed before notification");
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("the sweep must not suppress deletion-watch driver cleanup");
+        driver.release_get();
+        tokio::time::timeout(Duration::from_secs(1), reconcile)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.delete_calls(), 1);
+        stop_watch_loop(shutdown_tx, watch_handle).await;
     }
 
     #[tokio::test]
