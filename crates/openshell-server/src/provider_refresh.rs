@@ -471,7 +471,7 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -486,6 +486,9 @@ mod tests {
             ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
             ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
             ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+            ProviderCredentialRefreshStrategy::OciInstancePrincipal,
+            ProviderCredentialRefreshStrategy::OciResourcePrincipal,
+            ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity,
         ] {
             assert_eq!(
                 can_mint(strategy as i32),
@@ -3120,4 +3123,622 @@ KfNSI8uuA8PLqmUY30I9KFWzN6VDLu00eKa90F4w3CeWRRQWXW1+007tTz3V1mNw
 20A24Fi3HGQmXc7NyuLDODTJsWBICuOemCnRkvcxIlxb+ec7jp+XRmzDwKkzSnVN
 pM2zFU8SeVkvHKlEuoHaP0s=
 -----END PRIVATE KEY-----";
+
+    // -----------------------------------------------------------------------
+    // OCI principal strategies
+    // -----------------------------------------------------------------------
+
+    /// Unsigned JWT with the given `exp`, shaped like an OCI security token.
+    fn oci_test_jwt(exp_seconds: i64) -> String {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(bytes);
+        format!(
+            "{}.{}.c2lnbmF0dXJl",
+            encode(br#"{"alg":"RS256","typ":"JWT"}"#),
+            encode(
+                format!(r#"{{"sub":"ocid1.instance.oc1..test","exp":{exp_seconds}}}"#).as_bytes()
+            )
+        )
+    }
+
+    fn oci_refresh_state(
+        prov: &Provider,
+        strategy: ProviderCredentialRefreshStrategy,
+        material: HashMap<String, String>,
+    ) -> StoredProviderCredentialRefreshState {
+        new_refresh_state(
+            prov,
+            "default",
+            "OCI_KEY_ID",
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::from([(
+                    "private_key".to_string(),
+                    "OCI_PRIVATE_KEY".to_string(),
+                )]),
+                strategy,
+                material,
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Self-signed RSA certificate standing in for the instance identity
+    /// certificate the metadata service publishes.
+    fn oci_instance_identity() -> (String, String, String) {
+        let session = openshell_core::oci_signature::SessionKeyPair::generate().unwrap();
+        let key_pair = rcgen::KeyPair::from_pem(&session.private_key_pem).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["instance.test".to_string()]).unwrap();
+        let certificate = params.self_signed(&key_pair).unwrap();
+        let fingerprint =
+            openshell_credential_issuer::refresh::minter::oci_certificate_sha1_fingerprint(
+                &certificate.pem(),
+            )
+            .unwrap();
+        (certificate.pem(), session.private_key_pem, fingerprint)
+    }
+
+    async fn resolved_oci_credentials(
+        store: &crate::persistence::Store,
+        credentials: &CredentialRuntime,
+        provider_name: &str,
+    ) -> (String, String) {
+        let stored = store
+            .get_message_by_name::<Provider>("default", provider_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
+        (
+            resolved
+                .values
+                .get("OCI_KEY_ID")
+                .cloned()
+                .expect("OCI_KEY_ID"),
+            resolved
+                .values
+                .get("OCI_PRIVATE_KEY")
+                .cloned()
+                .expect("OCI_PRIVATE_KEY"),
+        )
+    }
+
+    fn decode_private_key_credential(credential: &str) -> String {
+        use base64::Engine as _;
+        let pem = base64::prelude::BASE64_STANDARD
+            .decode(credential)
+            .expect("OCI_PRIVATE_KEY is single-line base64");
+        String::from_utf8(pem).expect("decoded key is PEM text")
+    }
+
+    #[test]
+    fn oci_certificate_fingerprint_is_colon_separated_uppercase_sha1() {
+        let (_, _, fingerprint) = oci_instance_identity();
+        assert_eq!(
+            fingerprint.len(),
+            59,
+            "20 bytes as hex pairs joined by colons"
+        );
+        assert!(fingerprint.split(':').all(|pair| {
+            pair.len() == 2
+                && pair
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+        }));
+        assert!(
+            openshell_credential_issuer::refresh::minter::oci_certificate_sha1_fingerprint(
+                "not a certificate"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_instance_principal_federates_instance_identity_into_session_token() {
+        let mock_server = MockServer::start().await;
+        let (cert_pem, key_pem, fingerprint) = oci_instance_identity();
+        let tenancy = "ocid1.tenancy.oc1..testtenancy";
+        Mock::given(method("GET"))
+            .and(path("/opc/v2/instance/"))
+            .and(header("authorization", "Bearer Oracle"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ocid1.instance.oc1.test..instance",
+                "tenantId": tenancy,
+                "canonicalRegionName": "us-testregion-1"
+            })))
+            .mount(&mock_server)
+            .await;
+        for (leaf, body) in [
+            ("cert.pem", cert_pem.clone()),
+            ("key.pem", key_pem.clone()),
+            ("intermediate.pem", cert_pem.clone()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/opc/v2/identity/{leaf}")))
+                .and(header("authorization", "Bearer Oracle"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&mock_server)
+                .await;
+        }
+        let exp_seconds = current_time_ms() / 1000 + 1200;
+        let token = oci_test_jwt(exp_seconds);
+        Mock::given(method("POST"))
+            .and(path("/v1/x509"))
+            .and(header("content-type", "application/json"))
+            .and(header_exists("date"))
+            .and(header_exists("x-content-sha256"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "token": token })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let prov = provider("oci-instance", "oci-instance-principal");
+        store.put_message(&prov).await.unwrap();
+        let state = oci_refresh_state(
+            &prov,
+            ProviderCredentialRefreshStrategy::OciInstancePrincipal,
+            HashMap::from([
+                ("purpose".to_string(), "DEFAULT".to_string()),
+                (
+                    "metadata_base_url".to_string(),
+                    format!("{}/opc/v2", mock_server.uri()),
+                ),
+                (
+                    "federation_endpoint_url".to_string(),
+                    format!("{}/v1/x509", mock_server.uri()),
+                ),
+            ]),
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "oci-instance",
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert_eq!(
+            refreshed.expires_at_ms,
+            exp_seconds * 1000,
+            "token exp inside the lifetime cap wins"
+        );
+
+        let (key_id, private_key) =
+            resolved_oci_credentials(&store, &credentials, "oci-instance").await;
+        assert_eq!(key_id, format!("ST${token}"));
+        let session_pem = decode_private_key_credential(&private_key);
+        assert!(session_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+        assert_ne!(
+            session_pem, key_pem,
+            "the session key is ephemeral, not the instance key"
+        );
+        openshell_core::oci_signature::OciSigningKey::from_credentials(&key_id, &private_key)
+            .expect("minted pair loads in the proxy signer");
+
+        let federation = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.url.path() == "/v1/x509")
+            .expect("federation request");
+        let authorization = federation
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(authorization.starts_with("Signature "), "{authorization}");
+        assert!(
+            authorization.contains(&format!("keyId=\"{tenancy}/fed-x509/{fingerprint}\"")),
+            "{authorization}"
+        );
+        assert!(
+            authorization.contains(
+                "headers=\"date (request-target) content-length content-type x-content-sha256\""
+            ),
+            "federation signatures omit host: {authorization}"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&federation.body).unwrap();
+        assert_eq!(
+            payload["certificate"],
+            openshell_core::oci_signature::sanitize_pem(&cert_pem)
+        );
+        assert_eq!(
+            payload["intermediateCertificates"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(payload["purpose"], "DEFAULT");
+        let public_key = payload["publicKey"].as_str().unwrap();
+        assert!(!public_key.is_empty() && !public_key.contains("-----"));
+    }
+
+    #[tokio::test]
+    async fn oci_instance_principal_federation_denial_is_a_configuration_failure() {
+        let mock_server = MockServer::start().await;
+        let (cert_pem, key_pem, _) = oci_instance_identity();
+        Mock::given(method("GET"))
+            .and(path("/opc/v2/instance/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tenantId": "ocid1.tenancy.oc1..testtenancy",
+                "canonicalRegionName": "us-testregion-1"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opc/v2/identity/cert.pem"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(cert_pem))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opc/v2/identity/key.pem"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(key_pem))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opc/v2/identity/intermediate.pem"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/x509"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(
+                r#"{"code":"NotAuthenticated","message":"The required information to complete authentication was not provided."}"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let prov = provider("oci-instance-denied", "oci-instance-principal");
+        store.put_message(&prov).await.unwrap();
+        let state = oci_refresh_state(
+            &prov,
+            ProviderCredentialRefreshStrategy::OciInstancePrincipal,
+            HashMap::from([
+                (
+                    "metadata_base_url".to_string(),
+                    format!("{}/opc/v2", mock_server.uri()),
+                ),
+                (
+                    "federation_endpoint_url".to_string(),
+                    format!("{}/v1/x509", mock_server.uri()),
+                ),
+            ]),
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "oci-instance-denied",
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("dynamic group"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn oci_oke_workload_identity_exchanges_service_account_token_at_proxymux() {
+        use base64::Engine as _;
+        let mock_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "service-account-jwt\n").unwrap();
+        // The token outlives the configured maximum, so the cap applies.
+        let token = oci_test_jwt(current_time_ms() / 1000 + 7200);
+        let envelope = base64::prelude::BASE64_STANDARD
+            .encode(serde_json::json!({ "token": token }).to_string());
+        Mock::given(method("POST"))
+            .and(path("/resourcePrincipalSessionTokens"))
+            .and(header("authorization", "Bearer service-account-jwt"))
+            .and(header("content-type", "application/json"))
+            .and(header_exists("opc-request-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(envelope))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let prov = provider("oci-oke", "oci-oke-workload-identity");
+        store.put_message(&prov).await.unwrap();
+        let state = oci_refresh_state(
+            &prov,
+            ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity,
+            HashMap::from([
+                (
+                    "service_account_token_file".to_string(),
+                    token_path.to_string_lossy().to_string(),
+                ),
+                (
+                    "proxymux_endpoint_url".to_string(),
+                    format!("{}/resourcePrincipalSessionTokens", mock_server.uri()),
+                ),
+            ]),
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        let before_ms = current_time_ms();
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "oci-oke",
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert!(
+            refreshed.expires_at_ms >= before_ms + 3_600_000
+                && refreshed.expires_at_ms <= current_time_ms() + 3_600_000,
+            "expiry capped at max_lifetime, got {}",
+            refreshed.expires_at_ms
+        );
+
+        let (key_id, private_key) = resolved_oci_credentials(&store, &credentials, "oci-oke").await;
+        assert_eq!(key_id, format!("ST${token}"));
+        openshell_core::oci_signature::OciSigningKey::from_credentials(&key_id, &private_key)
+            .expect("minted pair loads in the proxy signer");
+
+        let request = mock_server.received_requests().await.unwrap().remove(0);
+        let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let pod_key = payload["podKey"].as_str().expect("podKey");
+        assert!(
+            !pod_key.is_empty() && !pod_key.contains("-----"),
+            "{pod_key}"
+        );
+        // The podKey is the session key's SubjectPublicKeyInfo (the sanitized
+        // `PUBLIC KEY` PEM); the RSAPublicKey the signer exposes sits inside it.
+        let spki = base64::prelude::BASE64_STANDARD.decode(pod_key).unwrap();
+        let session_pem = decode_private_key_credential(&private_key);
+        let session =
+            openshell_core::oci_signature::OciSigningKey::from_credentials("x", &session_pem)
+                .unwrap();
+        assert!(
+            spki.ends_with(&session.public_key_der()),
+            "podKey must wrap the minted session key's public key"
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_oke_workload_identity_forbidden_names_the_enhanced_cluster_requirement() {
+        let mock_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "service-account-jwt").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/resourcePrincipalSessionTokens"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let prov = provider("oci-oke-basic", "oci-oke-workload-identity");
+        store.put_message(&prov).await.unwrap();
+        let state = oci_refresh_state(
+            &prov,
+            ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity,
+            HashMap::from([
+                (
+                    "service_account_token_file".to_string(),
+                    token_path.to_string_lossy().to_string(),
+                ),
+                (
+                    "proxymux_endpoint_url".to_string(),
+                    format!("{}/resourcePrincipalSessionTokens", mock_server.uri()),
+                ),
+            ]),
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "oci-oke-basic",
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("enhanced cluster"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_oke_workload_identity_requires_a_readable_service_account_token() {
+        let store = test_store().await;
+        let prov = provider("oci-oke-no-token", "oci-oke-workload-identity");
+        store.put_message(&prov).await.unwrap();
+        let state = oci_refresh_state(
+            &prov,
+            ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity,
+            HashMap::from([(
+                "service_account_token_file".to_string(),
+                "/nonexistent/openshell-test/token".to_string(),
+            )]),
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "oci-oke-no-token",
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("service-account token"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_resource_principal_republishes_platform_token_and_key_files() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let session = openshell_core::oci_signature::SessionKeyPair::generate().unwrap();
+        let exp_seconds = current_time_ms() / 1000 + 600;
+        let token = oci_test_jwt(exp_seconds);
+        let rpst_path = dir.path().join("rpst");
+        let key_path = dir.path().join("private.pem");
+        std::fs::write(&rpst_path, format!("{token}\n")).unwrap();
+        std::fs::write(&key_path, &session.private_key_pem).unwrap();
+
+        let store = test_store().await;
+        let prov = provider("oci-resource", "oci-resource-principal");
+        store.put_message(&prov).await.unwrap();
+        let state = oci_refresh_state(
+            &prov,
+            ProviderCredentialRefreshStrategy::OciResourcePrincipal,
+            HashMap::from([
+                (
+                    "rpst_file".to_string(),
+                    rpst_path.to_string_lossy().to_string(),
+                ),
+                (
+                    "private_key_file".to_string(),
+                    key_path.to_string_lossy().to_string(),
+                ),
+            ]),
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "oci-resource",
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert_eq!(refreshed.expires_at_ms, exp_seconds * 1000);
+
+        let (key_id, private_key) =
+            resolved_oci_credentials(&store, &credentials, "oci-resource").await;
+        assert_eq!(key_id, format!("ST${token}"));
+        assert_eq!(
+            private_key,
+            base64::prelude::BASE64_STANDARD.encode(session.private_key_pem.trim()),
+            "the platform key is republished in the single-line form the proxy accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_resource_principal_rejects_passphrase_protected_keys_and_missing_token() {
+        let store = test_store().await;
+        for (name, material, expected) in [
+            (
+                "oci-resource-passphrase",
+                HashMap::from([
+                    ("rpst".to_string(), oci_test_jwt(4_102_444_800)),
+                    ("private_key".to_string(), "unused".to_string()),
+                    ("private_key_passphrase".to_string(), "secret".to_string()),
+                ]),
+                "passphrase",
+            ),
+            (
+                "oci-resource-no-token",
+                HashMap::from([("private_key".to_string(), "unused".to_string())]),
+                "rpst_file",
+            ),
+        ] {
+            let prov = provider(name, "oci-resource-principal");
+            store.put_message(&prov).await.unwrap();
+            let state = oci_refresh_state(
+                &prov,
+                ProviderCredentialRefreshStrategy::OciResourcePrincipal,
+                material,
+            );
+            put_refresh_state(&store, &state).await.unwrap();
+            let err = refresh_provider_credential(
+                &store,
+                "default",
+                &test_credentials(),
+                None,
+                name,
+                "OCI_KEY_ID",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{name}");
+            assert!(
+                err.message().contains(expected),
+                "{name}: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oci_principal_mint_requires_the_private_key_output_to_be_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = openshell_core::oci_signature::SessionKeyPair::generate().unwrap();
+        let key_path = dir.path().join("private.pem");
+        std::fs::write(&key_path, &session.private_key_pem).unwrap();
+
+        let store = test_store().await;
+        let prov = provider("oci-resource-unpinned", "oci-resource-principal");
+        store.put_message(&prov).await.unwrap();
+        let mut state = oci_refresh_state(
+            &prov,
+            ProviderCredentialRefreshStrategy::OciResourcePrincipal,
+            HashMap::from([
+                ("rpst".to_string(), oci_test_jwt(4_102_444_800)),
+                (
+                    "private_key_file".to_string(),
+                    key_path.to_string_lossy().to_string(),
+                ),
+            ]),
+        );
+        state.additional_output_keys.clear();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "oci-resource-unpinned",
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("private_key"), "{}", err.message());
+    }
 }
