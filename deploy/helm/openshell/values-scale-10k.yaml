@@ -26,6 +26,12 @@ supervisor:
   pool:
     maxInstancesPerMember: 128
     maxMembersPerGateway: 40
+  resources:
+    requests:
+      cpu: 250m
+      memory: 768Mi
+    limits:
+      memory: 1.5Gi
   autoscaling:
     enabled: true
     minReplicas: 10

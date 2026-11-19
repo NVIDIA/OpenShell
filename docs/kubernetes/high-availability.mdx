@@ -702,9 +702,10 @@ helm install openshell <chart> -n openshell \
   --set server.externalDbSecret=<secret> --set supervisor.replicas=80
 ```
 
-Supervisor memory grows with the sandboxes it runs. Size
-`supervisor.resources` for `maxInstancesPerMember`; the defaults request
-`250m` CPU and `768Mi` memory, with a `1.5Gi` memory limit.
+Supervisor memory grows with the sandboxes it runs. The chart sets no
+`supervisor.resources` by default. For 128 sandboxes per supervisor, request
+`250m` CPU and `768Mi` memory, with a `1.5Gi` memory limit, and scale memory
+with `maxInstancesPerMember`.
 
 The chart ships `values-scale-10k.yaml` as a starting point for about 10,000
 sandboxes: 2 gateway replicas with up to 40 supervisors each, and a supervisor
