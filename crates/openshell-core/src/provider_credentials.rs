@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::{CredentialPlacement, PathTemplate, SecretResolver};
+use crate::secrets::{CREDENTIAL_PATH_SLOT, CredentialPlacement, SecretResolver};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -1173,8 +1173,19 @@ fn compile_credential_placement(
         {
             CredentialPlacement::QueryParam(metadata.query_param.trim().to_string())
         }
-        "path" if PathTemplate::parse(&metadata.path_template).is_some() => {
-            CredentialPlacement::PathTemplate(metadata.path_template.clone())
+        "path" | "path_subtree"
+            if metadata.path_template.starts_with('/')
+                && metadata.path_template.matches(CREDENTIAL_PATH_SLOT).count() == 1
+                && !metadata
+                    .path_template
+                    .chars()
+                    .any(|c| c.is_control() || "?#".contains(c)) =>
+        {
+            if style == "path_subtree" {
+                CredentialPlacement::PathSubtree(metadata.path_template.clone())
+            } else {
+                CredentialPlacement::PathTemplate(metadata.path_template.clone())
+            }
         }
         _ => {
             return Err(binding_error(
@@ -1601,7 +1612,7 @@ mod tests {
 
     #[test]
     fn static_metadata_selects_one_location_and_preserves_other_providers() {
-        for style in ["bearer", "header", "basic", "query", "path"] {
+        for style in ["bearer", "header", "basic", "query", "path", "path_subtree"] {
             let env = HashMap::from([
                 ("API_KEY".into(), "synthetic".into()),
                 ("OTHER_KEY".into(), "other-secret".into()),
@@ -1632,7 +1643,7 @@ mod tests {
             }
             .into();
             declaration.query_param = "api_key".into();
-            declaration.path_template = "/v1/{credential}/events".into();
+            declaration.path_template = "/v1/{credential}/**".into();
             assert_eq!(
                 state
                     .install_bound_environment(8, env, HashMap::new(), metadata, bindings, vec![])
@@ -1665,16 +1676,52 @@ mod tests {
                 &format!("/v1/chat?api_key={reference}"),
                 &resolver,
             );
-            let path = crate::secrets::rewrite_target_for_eval(
-                &format!("/v1/{reference}/events"),
-                &resolver,
-            );
+            let path =
+                crate::secrets::rewrite_target_for_eval(&format!("/v1/{reference}/**"), &resolver);
             assert_eq!(
                 header.is_ok(),
                 matches!(style, "bearer" | "header" | "basic")
             );
             assert_eq!(query.is_ok(), style == "query");
-            assert_eq!(path.is_ok(), style == "path");
+            assert_eq!(path.is_ok(), matches!(style, "path" | "path_subtree"));
+            let descendant = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/{reference}/**/events"),
+                &resolver,
+            );
+            assert_eq!(descendant.is_ok(), style == "path_subtree");
+            // Even when subtree matching is selected, stars in the base are literal.
+            assert!(
+                crate::secrets::rewrite_target_for_eval(
+                    &format!("/v1/{reference}/events"),
+                    &resolver,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn path_styles_require_one_slot_in_an_absolute_path() {
+        for style in ["path", "path_subtree"] {
+            for invalid in [
+                "",
+                "/bot/**",
+                "/{credential}/{credential}",
+                "bot{credential}",
+                "/{credential}?query",
+                "/{credential}#fragment",
+                "/{credential}/\n",
+            ] {
+                let metadata = crate::proto::ProviderProfileCredential {
+                    auth_style: style.into(),
+                    path_template: invalid.into(),
+                    ..Default::default()
+                };
+                assert!(
+                    compile_credential_placement(&metadata).is_err(),
+                    "{style}: {invalid:?}"
+                );
+            }
         }
     }
 
@@ -1692,8 +1739,8 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let mut metadata = placement_metadata("path");
-        metadata.values_mut().next().unwrap().path_template = "/bot{credential}/**".into();
+        let mut metadata = placement_metadata("path_subtree");
+        metadata.values_mut().next().unwrap().path_template = "/bot{credential}".into();
         assert_eq!(
             state
                 .install_bound_environment(8, env, HashMap::new(), metadata, bindings, vec![])

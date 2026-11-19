@@ -15007,8 +15007,8 @@ network_policies:
                 format!("{STATIC_CREDENTIAL_METADATA_PREFIX}BOT_TOKEN"),
                 ProviderProfileCredential {
                     env_vars: vec!["BOT_TOKEN".into()],
-                    auth_style: "path".into(),
-                    path_template: "/bot{credential}/**".into(),
+                    auth_style: "path_subtree".into(),
+                    path_template: "/bot{credential}".into(),
                     ..Default::default()
                 },
             )]),

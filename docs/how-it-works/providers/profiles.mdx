@@ -420,13 +420,13 @@ credentials:
     # placeholder to survive value-only provider revisions.
     stable_placeholder: false
 
-    # Accepted values: basic, bearer, header, query, path.
+    # Accepted values: basic, bearer, header, query, path, path_subtree.
     # These fields restrict where a static placeholder can resolve.
     auth_style: bearer
     header_name: authorization
     # For auth_style: query, set query_param: api_key instead.
-    # For auth_style: path, set path_template: /v1/{credential}/resources instead,
-    # or /v1/{credential}/** to match every path below the credential's segment.
+    # For auth_style: path, set path_template to the exact credential-bearing path.
+    # For auth_style: path_subtree, set it to the base path, e.g. /bot{credential}.
 
     refresh:
       # Accepted values:
@@ -532,7 +532,18 @@ import for compatibility.
 
 `category` supplies the `CATEGORY` column in `openshell profile list`. Use one of the values in the category enum.
 
-`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). A template matches only that path. End it with `/**` to also match every path below the slot's segment, so one credential works for every method of an API that keeps its token in a path prefix. For example, `/bot{credential}/**` matches `/bot<placeholder>/sendMessage` and `/bot<placeholder>/getUpdates`, but not `/other/bot<placeholder>/sendMessage` or a request that repeats the placeholder. Only a terminal `/**` is a wildcard; a `*` anywhere else is an ordinary character. Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
+`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, `path`, or `path_subtree`.
+
+Both path styles require exactly one `{credential}` slot in `path_template`. With `auth_style: path`, the entire path must match, including any literal stars. To authorize the base path and its descendants, select `path_subtree` and give the base path directly.
+
+```yaml
+auth_style: path_subtree
+path_template: /bot{credential}
+```
+
+This lets one credential serve both `/bot<placeholder>/getUpdates` and `/bot<placeholder>/sendMessage` at the bound endpoint. The placeholder must occur once, in the declared slot. Subtree matching rejects dot segments, encoded separators, and paths that still contain a percent sign after decoding.
+
+Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
 
 Credential names must not contain control characters such as tabs or newlines. Dynamic token-grant endpoint and audience-override selectors have the same restriction.
 
@@ -609,7 +620,7 @@ The refresh attaches to the primary credential (`access_key_id`). Each reference
 
 ### Dynamic Token Grants
 
-`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credentials, caches each returned access token separately, and injects them before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credentials, caches each returned access token separately, and injects them before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header.
 
 Declare multiple credentials with different destination headers when one request needs independently issued tokens. Each credential keeps its own token endpoint, audience, scopes, and cache lifetime. For example, this profile sends a service bearer token and a separate workload token on the same inspected request:
 

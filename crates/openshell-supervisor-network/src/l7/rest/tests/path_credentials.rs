@@ -30,7 +30,7 @@ async fn subtree_path_credential_sends_while_the_same_client_long_polls() {
         let (child_env, resolver) = placed_test_resolver(
             HashMap::from([("TELEGRAM_TOKEN".into(), "123456:synthetic".into())]),
             "api.telegram.org",
-            &[("TELEGRAM_TOKEN", "path", "/bot{credential}/**")],
+            &[("TELEGRAM_TOKEN", "path_subtree", "/bot{credential}")],
         );
         let resolver = Arc::new(resolver.unwrap());
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

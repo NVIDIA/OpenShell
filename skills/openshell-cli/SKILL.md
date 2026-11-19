@@ -162,10 +162,10 @@ gateway before the supervisor. Older gateways cannot forward placement metadata;
 older supervisors retain their previous behavior. Updating example YAML does not
 update an imported profile. Check provider readiness after changing placement and
 launch a new process if retained references were revoked. For path-based APIs
-that use one token across multiple methods, a terminal `/**` in `path_template`
-permits the fixed path and its descendants, such as `/bot{credential}/**`.
-Templates without that suffix still match exactly, and endpoint bindings remain
-independently enforced.
+that use one token across multiple methods, select `auth_style: path_subtree`
+and set `path_template` to the base path, such as `/bot{credential}`. This
+authorizes the base and its descendants at the bound endpoint. With
+`auth_style: path`, the template matches exactly, including literal stars.
 
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port

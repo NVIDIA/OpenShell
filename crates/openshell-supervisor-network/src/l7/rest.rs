@@ -11053,7 +11053,7 @@ mod tests {
                 match *style {
                     "header" => credential.header_name = (*selector).into(),
                     "query" => credential.query_param = (*selector).into(),
-                    "path" => credential.path_template = (*selector).into(),
+                    "path" | "path_subtree" => credential.path_template = (*selector).into(),
                     _ => panic!("fixture needs an explicit placement"),
                 }
                 (
@@ -12041,7 +12041,7 @@ mod tests {
             .into_iter()
             .collect(),
             "api.telegram.org",
-            &[("TELEGRAM_TOKEN", "path", "/bot{credential}/**")],
+            &[("TELEGRAM_TOKEN", "path_subtree", "/bot{credential}")],
         );
         let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
 
@@ -12079,7 +12079,7 @@ mod tests {
             .into_iter()
             .collect(),
             "api.telegram.org",
-            &[("TELEGRAM_TOKEN", "path", "/bot{credential}/**")],
+            &[("TELEGRAM_TOKEN", "path_subtree", "/bot{credential}")],
         );
         let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
 
