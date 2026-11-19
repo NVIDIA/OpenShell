@@ -32,4 +32,12 @@ if [[ ! -s "${work}/program" ]]; then
     echo "error: openshell-conformance lists no tests" >&2
     exit 1
 fi
+# Every test in unsupported.yaml must exist, so a rename or typo fails here.
+"${root}/tasks/scripts/conformance-unsupported.sh" --check
+"${root}/tasks/scripts/conformance-unsupported.sh" --tests > "${work}/unsupported"
+if missing="$(comm -13 "${work}/program" "${work}/unsupported")" && [[ -n "${missing}" ]]; then
+    echo "error: unsupported.yaml names tests the program does not list:" >&2
+    echo "${missing}" >&2
+    exit 1
+fi
 echo "openshell-conformance lists the same $(wc -l < "${work}/program" | tr -d ' ') tests as nextest"

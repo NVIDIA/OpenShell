@@ -74,20 +74,21 @@ When a test can't pass in one environment yet, for example because of a driver
 bug, keep the test and mark it unsupported there:
 
 1. File an issue for the bug.
-2. Add an entry that names the test and the issue, where the environment runs:
-   - tmachine rows: an `unsupported` list on the row in
-     `.github/workflows/e2e-suites.yml`, such as
-     `"unsupported":[{"test":"conformance::lifecycle::<name>","issue":"https://github.com/NVIDIA/OpenShell/issues/<n>"}]`.
-     The runner passes it to the program in the guest.
-   - Host lanes (`e2e-docker-test.yml`, `e2e-podman-test.yml`,
-     `e2e-kubernetes-test.yml`, `e2e-vm-test.yml`): the `unsupported` input
-     from the caller, as comma-separated `<test>=<issue url>` entries.
+2. Add an entry to [`unsupported.yaml`](unsupported.yaml): the test, the issue,
+   and the environments it fails in, each a tmachine row
+   (`<environment>/<installer>`, such as `ubuntu-k3s/k3s-ha`) or a host lane
+   (`docker`, `podman`, `kubernetes` or `vm`).
 3. Delete the entry in the PR that fixes the bug.
 
-The program skips the test in every way of running it; see the
-[testkit README](../../testkit/README.md#unsupported-tests). Locally, set
-`OPENSHELL_TEST_UNSUPPORTED` to the same `conformance::<test>=<issue url>`
-entries.
+CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`, which
+the program reads (see the
+[testkit README](../../testkit/README.md#unsupported-tests)). The tmachine job
+sets it for its row and the runner passes it into the guest; host lanes set it
+in `e2e/support/conformance.sh`. Branch Checks validates the file and that every
+test it names exists, using `tasks/scripts/conformance-unsupported.sh`. Locally,
+set `OPENSHELL_TEST_UNSUPPORTED` to `conformance::<test>=<issue url>` entries,
+or run `tasks/scripts/conformance-unsupported.sh <environment>` to print the
+value for an environment.
 
 ## Adding a test
 

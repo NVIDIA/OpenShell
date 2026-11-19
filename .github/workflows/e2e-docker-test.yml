@@ -25,11 +25,6 @@ on:
         required: false
         type: boolean
         default: false
-      unsupported:
-        description: "Conformance tests this lane can't pass yet, as comma-separated <test>=<issue url> entries (OPENSHELL_TEST_UNSUPPORTED)"
-        required: false
-        type: string
-        default: ""
       suite-matrix:
         required: false
         type: string
@@ -108,6 +103,5 @@ jobs:
 
       - name: Run tests
         env:
-          OPENSHELL_TEST_UNSUPPORTED: ${{ inputs.unsupported }}
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
         run: ${{ matrix.cmd }}
