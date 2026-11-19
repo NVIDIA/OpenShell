@@ -598,6 +598,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        mutation_audit::record_exec_targets(request.get_ref());
         mutation_replay::run(&self.state, request).await
     }
 
@@ -626,7 +627,18 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
-        sandbox::handle_create_ssh_session(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.sandbox)],
+            )
+        };
+        mutation_audit::audited(
+            targets,
+            sandbox::handle_create_ssh_session(&self.state, request),
+        )
+        .await
     }
 
     async fn expose_service(
@@ -681,7 +693,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
-        sandbox::handle_revoke_ssh_session(&self.state, request).await
+        mutation_audit::audited(
+            Vec::new(),
+            sandbox::handle_revoke_ssh_session(&self.state, request),
+        )
+        .await
     }
 
     // --- Providers ---

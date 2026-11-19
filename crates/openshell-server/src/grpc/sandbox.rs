@@ -2762,6 +2762,7 @@ pub(super) async fn handle_exec_sandbox(
     )
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    super::mutation_audit::record_exec_relay(&state.config.audit, &sandbox, &channel_id, &req);
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -2868,6 +2869,7 @@ pub(super) async fn handle_forward_tcp(
         ));
     };
 
+    super::mutation_audit::record_forward_targets(&init);
     let target = validate_tcp_forward_init(&init)?;
 
     let sandbox = resolve_and_authorize_sandbox_name(
@@ -2891,12 +2893,13 @@ pub(super) async fn handle_forward_tcp(
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
         sandbox.object_id(),
-        target,
+        target.clone(),
         init.service_id.clone(),
         std::time::Duration::from_secs(15),
     )
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    super::mutation_audit::record_forward_relay(&sandbox, &channel_id, &target);
 
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
     let sandbox_id = sandbox.object_id().to_string();
@@ -3010,9 +3013,10 @@ async fn acquire_forward_connection_guard(
         });
     }
 
-    validate_ssh_forward_token(state, token, &sandbox_id)
+    let session = validate_ssh_forward_token(state, token, &sandbox_id)
         .await
         .map_err(|rejection| crate::auth::audit::reject_credential(Some(principal), rejection))?;
+    super::mutation_audit::record_ssh_session(session.object_name());
     crate::auth::audit::emit_ssh_session_logon(&state.logons, principal, token);
     acquire_ssh_connection_slots(state, budget, token, &sandbox_id)?;
 
@@ -3029,7 +3033,7 @@ async fn validate_ssh_forward_token(
     state: &Arc<ServerState>,
     token: &str,
     sandbox_id: &str,
-) -> Result<(), AuthRejection> {
+) -> Result<SshSession, AuthRejection> {
     let reject =
         |reason, status| AuthRejection::new(AuthMechanism::SshSessionToken, reason, status);
     let session = state
@@ -3079,7 +3083,7 @@ async fn validate_ssh_forward_token(
         }
     }
 
-    Ok(())
+    Ok(session)
 }
 
 const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
@@ -3308,6 +3312,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .map_err(|e| Status::internal(format!("failed to read first message: {e}")))?;
 
     let req = validate_interactive_exec_start(first_msg)?;
+    super::mutation_audit::record_exec_targets(&req);
 
     let mut request = Request::from_parts(
         metadata,
@@ -3373,6 +3378,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
     )
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    super::mutation_audit::record_exec_relay(&state.config.audit, &sandbox, &channel_id, req);
 
     let command_str = build_remote_exec_command(req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -3517,6 +3523,7 @@ pub(super) async fn handle_create_ssh_session(
         )
         .await
         .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
+    super::mutation_audit::record_ssh_session(session.object_name());
 
     let (gateway_host, gateway_port) = resolve_gateway(&state.config);
     let scheme = if state.config.tls.is_some() {
@@ -3559,6 +3566,7 @@ pub(super) async fn handle_revoke_ssh_session(
             outcome: super::deletion_outcome(false, req.allow_missing, "ssh session")?,
         }));
     };
+    super::mutation_audit::record_revoked_ssh_session(&session);
     authorize_sandbox_workspace(
         &state.store,
         &state.admin_role,
@@ -3576,6 +3584,7 @@ pub(super) async fn handle_revoke_ssh_session(
     })?;
 
     if session.revoked {
+        super::mutation_audit::record_repeated_revoke();
         return Ok(Response::new(RevokeSshSessionResponse {
             outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
         }));
