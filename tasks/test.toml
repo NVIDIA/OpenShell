@@ -124,8 +124,8 @@ run = [
 hide = true
 
 [e2e]
-description = "Run all end-to-end tests (Rust + Python + MCP)"
-depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
+description = "Run all end-to-end tests (Rust + MCP)"
+depends = ["e2e:rust", "e2e:mcp"]
 
 ["e2e:test"]
 description = "Build the current checkout and run a named host or Nix test-guest E2E suite"
@@ -201,6 +201,10 @@ run = "OPENSHELL_TEST_CONTAINER_ENGINE=docker e2e/with-docker-gateway.sh cargo t
 description = "Run the shared OCI image feature suite against a Podman-backed gateway"
 run = "OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh cargo test --locked --manifest-path tests/suites/features/Cargo.toml -p oci-image -- --test-threads 1 --nocapture"
 
+["e2e:gateway-mtls"]
+description = "Run the gateway mTLS feature suite against a Docker-backed gateway"
+run = "e2e/with-docker-gateway.sh cargo test --locked --manifest-path tests/suites/features/Cargo.toml -p gateway-mtls -- --test-threads 1 --nocapture"
+
 ["e2e:testkit"]
 description = "Run the testkit suites in tests/suites/conformance against a Docker-backed gateway"
 depends = ["e2e:workload:build"]
@@ -246,15 +250,6 @@ run = "bash e2e/mcp-conformance.sh"
 description = "Alias for e2e:mcp"
 depends = ["e2e:mcp"]
 
-["e2e:python"]
-description = "Run Python e2e tests against a Docker-backed gateway (E2E_PARALLEL=N or 'auto'; default 5)"
-depends = ["python:proto"]
-env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
-run = [
-  "CONTAINER_ENGINE=docker bash tasks/scripts/e2e-build-workload.sh",
-  "OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=openshell/e2e-python:dev OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=never e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py *_test.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python",
-]
-
 ["e2e:podman"]
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
@@ -264,23 +259,15 @@ description = "Run the Podman Rust e2e targets enabled in required branch CI"
 run = "OPENSHELL_E2E_PODMAN_TEST_SET=ci e2e/rust/e2e-podman.sh"
 
 ["e2e:oidc-pkce"]
-description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Podman gateway"
+description = "Run Linux browser PKCE, RBAC, and workspace authorization e2e tests against Keycloak and a Podman gateway"
 run = [
-  "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce",
+  "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce --test oidc_authz",
 ]
 
 ["e2e:oidc-pkce:docker"]
-description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Docker gateway"
+description = "Run Linux browser PKCE, RBAC, and workspace authorization e2e tests against Keycloak and a Docker gateway"
 run = [
-  "CONTAINER_RUNTIME=docker e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce",
-]
-
-["e2e:oidc-python:docker"]
-description = "Run Python OIDC and workspace authorization e2e tests against Keycloak and a Docker gateway"
-depends = ["python:proto"]
-env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
-run = [
-  "CONTAINER_RUNTIME=docker e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-docker-gateway.sh uv run pytest -m 'not gpu' e2e/python/oidc",
+  "CONTAINER_RUNTIME=docker e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce --test oidc_authz",
 ]
 
 ["e2e:podman:gpu"]

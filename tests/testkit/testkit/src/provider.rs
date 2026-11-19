@@ -42,6 +42,19 @@ impl Context {
         provider_type: &str,
         credentials: &[(&str, &str)],
     ) -> Result {
+        self.create_provider_with_config(name, provider_type, credentials, &[])
+            .await
+    }
+
+    /// [`Context::create_provider`] with `config`, as pairs of key and value
+    /// for the provider's non-secret configuration.
+    pub async fn create_provider_with_config(
+        &self,
+        name: &str,
+        provider_type: &str,
+        credentials: &[(&str, &str)],
+        config: &[(&str, &str)],
+    ) -> Result {
         // Deleting a missing provider succeeds, so register the delete before
         // the create.
         self.on_cleanup_delete("provider", name);
@@ -55,6 +68,10 @@ impl Context {
         ];
         for (key, _) in credentials {
             args.extend(["--credential", key]);
+        }
+        let config: Vec<String> = config.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        for pair in &config {
+            args.extend(["--config", pair]);
         }
         self.cli_with_env(credentials, args)
             .await?

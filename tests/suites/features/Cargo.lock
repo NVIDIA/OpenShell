@@ -1120,6 +1120,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-mtls"
+version = "0.0.0"
+dependencies = [
+ "openshell-crypto",
+ "openshell-testkit",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

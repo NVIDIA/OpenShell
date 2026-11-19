@@ -50,7 +50,8 @@ e2e-kubernetes-shared-supervisor-ha = ["e2e-kubernetes", "e2e-host-gateway"]
 e2e-kubernetes-shared-supervisor-scaling = ["e2e-kubernetes", "e2e-host-gateway"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
-e2e-oidc-pkce = []
+# The OIDC tests call the gateway through the SDK's generated client.
+e2e-oidc-pkce = ["dep:openshell-sdk"]
 e2e-vm = ["e2e", "e2e-host-gateway"]
 
 [[test]]
@@ -71,6 +72,11 @@ required-features = ["e2e-docker"]
 [[test]]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
+required-features = ["e2e-oidc-pkce"]
+
+[[test]]
+name = "oidc_authz"
+path = "tests/oidc_authz.rs"
 required-features = ["e2e-oidc-pkce"]
 
 [[test]]
@@ -262,6 +268,7 @@ required-features = ["e2e-local-container-driver"]
 openshell-core = { path = "../../crates/openshell-core", default-features = false, features = ["jwt"], optional = true }
 openshell-crypto = { path = "../../crates/openshell-crypto" }
 openshell-otel-test-support = { path = "../../crates/openshell-otel-test-support" }
+openshell-sdk = { path = "../../crates/openshell-sdk", optional = true }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace"] }
 base64 = "0.22"
 bollard = "0.20"

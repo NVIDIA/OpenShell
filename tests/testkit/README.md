@@ -96,7 +96,7 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   `OPENSHELL_TEST_BASE_IMAGE`, or OpenShell's default sandbox image.
 - `testkit::python_image()` for sandboxes that run `python3`, curl, git, or
   openssl: `OPENSHELL_TEST_PYTHON_IMAGE`, or `openshell/e2e-python:dev`
-  (`e2e/python/Dockerfile.workload`). The tmachine installers load it into
+  (`e2e/workload/Dockerfile`). The tmachine installers load it into
   every environment; `mise run e2e:workload:build` builds it locally. An
   override image must run `python3` from one of `testkit::PYTHON_BINARIES`.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with

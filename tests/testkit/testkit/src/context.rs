@@ -757,6 +757,25 @@ impl Sandbox {
             .into_inner())
     }
 
+    /// The sandbox's stored spec, as the gateway persisted it.
+    pub async fn spec(&self) -> Result<Option<proto::SandboxSpec>> {
+        let request = proto::GetSandboxRequest {
+            name: self.name.clone(),
+            workspace_scope: self.handles.grpc.scope(),
+        };
+        Ok(self
+            .handles
+            .grpc
+            .client()
+            .await?
+            .get_sandbox(request)
+            .await
+            .context(format!("get sandbox {}", self.name))?
+            .into_inner()
+            .sandbox
+            .and_then(|sandbox| sandbox.spec))
+    }
+
     /// The sandbox's current state.
     pub async fn get(&self) -> Result<SandboxRef> {
         self.handles

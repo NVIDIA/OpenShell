@@ -297,10 +297,10 @@ rec {
 
       docker build \
         --platform linux/${dockerArch} \
-        --file e2e/python/Dockerfile.workload \
+        --file e2e/workload/Dockerfile \
         --build-arg "PYTHON_VERSION=$(cat .python-version)" \
         --tag openshell/e2e-python:dev \
-        e2e/python
+        e2e/workload
 
       mkdir -p artifacts/images
       docker save \
