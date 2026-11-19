@@ -134,6 +134,8 @@ navigation:
 - section: "Upgrade Guides"
   slug: upgrade
   contents:
+  - page: "0.2.0"
+    path: upgrade/0-2-0.mdx
   - page: "0.1.0"
     path: upgrade/0-1-0.mdx
 - folder: resources
