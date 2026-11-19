@@ -19,7 +19,7 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 ### TypeScript SDK freeze
 
-The `TypeScript SDK Freeze` job rejects additions and modifications under `sdk/typescript/` on PR mirror pushes. It permits deletions for removal and skips merge groups, matching the Python freeze check. A failure blocks the required `OpenShell / Branch Checks` status and directs SDK PRs to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no TypeScript bindings here.
+The `TypeScript SDK Freeze` job rejects additions and modifications under `sdk/typescript/` on PR mirror pushes, except the files of the `@nvidia/openshell-sdk` re-export stub. It permits deletions for removal and skips merge groups, matching the Python freeze check. A failure blocks the required `OpenShell / Branch Checks` status and directs SDK PRs to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no TypeScript bindings here.
 
 The freeze replaces the `TypeScript SDK` build and publish dry-run job. Core's aggregate checks no longer run SDK tasks, and `proto:lint` uses the core-owned Buf tool. Core retains release publication until the separate publishing cutover.
 

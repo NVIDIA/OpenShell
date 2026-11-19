@@ -64,7 +64,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK (frozen) | Moved to ai-openshell/sdk-python; kept until removal |
-| `sdk/typescript/` | TypeScript SDK (frozen) | Development moved to ai-openshell/sdk-typescript; kept until removal |
+| `sdk/typescript/` | TypeScript SDK stub (deprecated) | `@nvidia/openshell-sdk` re-exports `@ai-openshell/sdk` from ai-openshell/sdk-typescript |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
 | `tests/suites/` | E2E suites | One directory per test family, such as `conformance` |
@@ -210,9 +210,9 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 ## TypeScript SDK (`sdk/typescript/`)
 
 - Open TypeScript SDK changes in [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript).
-- `sdk/typescript/` is frozen at core `v0.1.9`. Branch Checks rejects additions and modifications, including dependency updates. Deletions remain allowed for removal.
+- `sdk/typescript/` holds only the deprecated `@nvidia/openshell-sdk` stub, which depends on `@ai-openshell/sdk` and re-exports it. Branch Checks rejects other additions and modifications there. Deletions remain allowed for removal.
 - Core proto changes need no TypeScript bindings here. The standalone SDK generates bindings from its pinned core release.
-- Core retains the SDK files and release publisher until the separate publishing cutover.
+- Core releases publish the stub to GitHub Packages with a dependency on the same `@ai-openshell/sdk` minor line, so release `@ai-openshell/sdk` first.
 
 ## Python
 

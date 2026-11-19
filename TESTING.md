@@ -118,12 +118,6 @@ Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
 skipping them.
 
-`mise run --skip-tools sdk:ts:ci` selects the x64 Biome executable on Windows
-(including ARM64 hosts running it under emulation), resolves the protobuf
-plugin through its Windows `.cmd` launcher, and installs the matching locked
-ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
-resolution; it must not upgrade unrelated test dependencies.
-
 Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
 Use a checkout with LF text files when running Unix-shell fixture checks.

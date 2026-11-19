@@ -67,9 +67,6 @@ SIDECAR_LICENSE_FILES: set[str] = {
     "scripts/keycloak-realm.json",
     "sdk/conformance/oauth-client-credentials.json",
     "sdk/conformance/oidc-token-bundle.json",
-    "sdk/typescript/biome.json",
-    "sdk/typescript/tsconfig.build.json",
-    "sdk/typescript/tsconfig.json",
 }
 
 # Directories to skip entirely (relative to repo root).
@@ -83,7 +80,6 @@ EXCLUDE_DIRS: set[str] = {
     ".git",
     ".cache",
     "python/openshell/_proto",
-    "sdk/typescript/src/gen",
 }
 
 # Individual filenames to skip.

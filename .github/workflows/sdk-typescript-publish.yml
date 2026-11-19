@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       source-ref:
-        description: Commit to build the package from
+        description: Commit to publish the package from
         required: true
         type: string
       npm-version:
@@ -57,10 +57,6 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
 
-      - name: Install TypeScript dependencies
-        working-directory: ./sdk/typescript
-        run: npm ci
-
       - name: Configure npm auth for GitHub Packages
         working-directory: ./sdk/typescript
         run: |
@@ -94,7 +90,17 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # The package is a stub that re-exports @ai-openshell/sdk from npmjs.org.
+          # Depend on the same minor line, and refuse to publish a stub that
+          # npm cannot install yet.
+          IFS=. read -r major minor _ <<<"${OPENSHELL_NPM_VERSION}"
+          sdk_range="^${major}.${minor}.0"
+          if [[ -z "$(npm view "@ai-openshell/sdk@${sdk_range}" version --registry=https://registry.npmjs.org/)" ]]; then
+            echo "::error title=@ai-openshell/sdk missing::No @ai-openshell/sdk version matches ${sdk_range} on npmjs.org. Release ai-openshell/sdk-typescript first, then rerun this workflow with workflow_dispatch."
+            exit 1
+          fi
           npm pkg set version="${OPENSHELL_NPM_VERSION}"
+          npm pkg set "dependencies.@ai-openshell/sdk=${sdk_range}"
           package="$(npm pkg get name | tr -d '"')@${OPENSHELL_NPM_VERSION}"
           if npm view "${package}" version >/dev/null 2>&1; then
             echo "${package} is already published."
