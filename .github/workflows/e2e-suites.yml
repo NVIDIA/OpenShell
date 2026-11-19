@@ -114,14 +114,16 @@ jobs:
             {"environment":"fedora-podman-rootless-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"}
+            {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"continuity","disruption":"gateway-restart","gateway":"openshell","runner":"ubuntu-24.04"}
           ]'
           # `suite` names the row's tests in the job and artifact names.
           matrix=$(jq -c --arg family "${FAMILY}" --arg external "${EXTERNAL_DRIVERS}" '{include: map(
               select($family == "" or .family == $family or (.family | startswith($family + "/")))
               | select((.external_driver // false) == false or $external == "true")
               | .package //= ""
-              | .suite = (if .package == "" then .family else "\(.family)/\(.package)" end)
+              | .disruption //= ""
+              | .suite = ([.family, .package, .disruption] | map(select(. != "")) | join("/"))
               | .artifact = ([.suite, .environment, .installer] | join("-") | gsub("/"; "-"))
               | .bundle = "openshell-e2e-bundle-\(.family | gsub("/"; "-"))-x86_64-unknown-linux-musl"
             )}' <<< "$rows")
@@ -218,6 +220,7 @@ jobs:
           FAMILY: ${{ matrix.family }}
           PACKAGE: ${{ matrix.package }}
           GATEWAY: ${{ matrix.gateway }}
+          DISRUPTION: ${{ matrix.disruption }}
         run: |
           # The tests this environment can't pass yet; the runner passes the
           # variable on to the guest.
@@ -243,6 +246,10 @@ jobs:
             if [ -n "${PACKAGE}" ]; then
               selection+=(--package "${PACKAGE}")
             fi
+          fi
+          # A continuity row seeds state, applies the disruption, and verifies.
+          if [ -n "${DISRUPTION}" ]; then
+            selection+=(--disruption "${DISRUPTION}")
           fi
           nix run .#openshell-test-runner -- run \
             --environment "${ENVIRONMENT}" \

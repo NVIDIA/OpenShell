@@ -95,6 +95,26 @@
     port: 17670
     timeout: 60
 
+# The runner's continuity disruptions run the executables staged here. How to
+# restart the gateway depends on who runs it, which this role knows.
+- name: Create disruptions directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/openshell-qualification/disruptions
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Stage the gateway-restart disruption
+  become: true
+  ansible.builtin.template:
+    src: gateway-restart.sh.j2
+    dest: /var/lib/openshell-qualification/disruptions/gateway-restart
+    owner: root
+    group: root
+    mode: "0755"
+
 # The rootful Podman gateway uses root's image store and packaged user service.
 # Copy only client credentials so the test runner can register that gateway
 # without granting access to root's home or copying server signing keys.
