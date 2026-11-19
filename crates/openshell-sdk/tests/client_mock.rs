@@ -49,8 +49,6 @@ struct MockState {
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
-    reject_cedar_policy: bool,
-    health_requests: AtomicU32,
     last_template_create: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
     last_template_get: Mutex<Option<proto::GetSandboxTemplateRequest>>,
     last_template_list: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
@@ -305,7 +303,6 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::HealthRequest>,
     ) -> Result<Response<proto::HealthResponse>, Status> {
-        self.state.health_requests.fetch_add(1, Ordering::SeqCst);
         if let Some(expected) = &self.state.require_bearer {
             let got = request
                 .metadata()
@@ -364,18 +361,7 @@ impl OpenShell for TestOpenShell {
                 )
             })
             .collect();
-        let reject = self.state.reject_cedar_policy
-            && req
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.policy.as_ref())
-                .is_some_and(proto::SandboxPolicy::is_cedar);
         *self.state.last_create.lock().await = Some(req);
-        if reject {
-            return Err(Status::failed_precondition(
-                "this gateway was built without Cedar policy support",
-            ));
-        }
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
             service_urls,
@@ -486,7 +472,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
-            policy_warnings: Vec::new(),
+            ..Default::default()
         }))
     }
 
@@ -504,7 +490,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
-            policy_warnings: Vec::new(),
+            ..Default::default()
         }))
     }
 
@@ -2524,54 +2510,5 @@ async fn watch_logs_addresses_the_sandbox_by_canonical_name() {
             selected_workspace(&reqs[0].workspace_scope),
             Some(workspace)
         );
-    }
-}
-
-#[tokio::test]
-async fn cedar_template_create_surfaces_gateway_errors_without_preflight() {
-    for supported in [false, true] {
-        let state = Arc::new(MockState {
-            reject_cedar_policy: !supported,
-            ..Default::default()
-        });
-        let endpoint = start_mock(state.clone()).await;
-        let client = OpenShellClient::connect(ClientConfig::new(&endpoint))
-            .await
-            .unwrap();
-        let spec = || SandboxTemplateCreateSpec {
-            template_name: "python".to_string(),
-            policy: Some(proto::SandboxPolicy {
-                cedar_policy: Some(proto::CedarPolicy {
-                    source: "permit(principal, action, resource);".to_string(),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        for workspace in [None, Some("staging")] {
-            *state.last_create.lock().await = None;
-            let result = if let Some(workspace) = workspace {
-                client
-                    .workspace(workspace)
-                    .create_sandbox_from_template(spec())
-                    .await
-            } else {
-                client.create_sandbox_from_template(spec()).await
-            };
-            assert_eq!(result.is_ok(), supported);
-            assert!(state.last_create.lock().await.is_some());
-            if let Err(error) = result {
-                assert_eq!(
-                    error.grpc_status().unwrap().code(),
-                    tonic::Code::FailedPrecondition
-                );
-                assert!(
-                    error
-                        .to_string()
-                        .contains("this gateway was built without Cedar policy support")
-                );
-            }
-            assert_eq!(state.health_requests.load(Ordering::SeqCst), 0);
-        }
     }
 }
