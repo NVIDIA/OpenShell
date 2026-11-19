@@ -42,6 +42,7 @@ libc = "0.2"
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tonic-reflection = { workspace = true }
+tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
@@ -125,7 +126,7 @@ default = ["telemetry"]
 telemetry = ["openshell-core/telemetry"]
 vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
-test-support = ["openshell-credential-issuer/test-support"]
+test-support = ["dep:tonic-prost", "openshell-credential-issuer/test-support"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
