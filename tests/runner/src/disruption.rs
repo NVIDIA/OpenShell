@@ -35,10 +35,16 @@ impl Disruption {
     }
 }
 
-const ALL: &[Disruption] = &[Disruption {
-    name: "gateway-restart",
-    description: "restart the gateway service",
-}];
+const ALL: &[Disruption] = &[
+    Disruption {
+        name: "gateway-restart",
+        description: "restart the gateway service",
+    },
+    Disruption {
+        name: "upgrade",
+        description: "upgrade to the candidate the installer staged (see deb-upgrade-source)",
+    },
+];
 
 /// The disruption called `name`.
 pub fn find(name: &str) -> Result<&'static Disruption> {
