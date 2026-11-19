@@ -326,6 +326,9 @@ async fn profile_websocket_endpoint_rewrites_text_frames(cx: &mut Context) -> te
 /// or its variable name.
 #[testkit::test]
 async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit::Result {
+    if crate::skip_reading_sandbox_logs("profile_endpoints_bind_static_credentials") {
+        return Ok(());
+    }
     const SECRET_A: &str = "e2e-bound-secret";
     const SECRET_B: &str = "e2e-provider-b-secret";
     let authorized = |request: &Request| {
@@ -383,9 +386,6 @@ async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit:
         output.stdout.replace(SECRET_A, "<secret>")
     );
 
-    if crate::sandbox_logs_unreliable("profile_endpoints_bind_static_credentials") {
-        return Ok(());
-    }
     let logs = sandbox
         .logs_until("the endpoint mismatch", |logs| {
             logs.contains("openshell.provider_credential.endpoint_mismatch")

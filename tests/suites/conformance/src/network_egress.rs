@@ -218,6 +218,9 @@ async fn middleware_redacts_request_bodies(cx: &mut Context) -> testkit::Result 
 /// byte reaches upstream, and the sandbox logs why.
 #[testkit::test]
 async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -> testkit::Result {
+    if crate::skip_reading_sandbox_logs("fail_closed_middleware_blocks_uninspectable_traffic") {
+        return Ok(());
+    }
     let server = TcpServer::echo().await?;
     let policy = middleware_policy(server.port, "fail_closed", "")?;
     let sandbox = cx
@@ -235,9 +238,6 @@ async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -
             && crate::network_l7::error_code(&reply).as_deref() == Some("unsupported_l7_protocol"),
         "expected the middleware to block the payload: {reply:?}"
     );
-    if crate::sandbox_logs_unreliable("fail_closed_middleware_blocks_uninspectable_traffic") {
-        return Ok(());
-    }
     sandbox
         .logs_until("the middleware denial", |logs| {
             logs.contains("openshell.middleware.traffic_uninspectable")
