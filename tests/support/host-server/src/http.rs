@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -18,6 +19,9 @@ pub struct Request {
     /// The request line and headers.
     pub head: String,
     pub body: String,
+    /// The server's address on the connection the request arrived on: the
+    /// address of the test host the client reached it by.
+    pub local_addr: Option<SocketAddr>,
 }
 
 impl Request {
@@ -260,8 +264,9 @@ async fn respond(mut stream: TcpStream, handler: Arc<Handler>, requests: Arc<Mut
 pub(crate) async fn read_request(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<Request> {
     let mut chunk = [0_u8; 4096];
     loop {
-        if let Some((request, length)) = parse_request(buffer) {
+        if let Some((mut request, length)) = parse_request(buffer) {
             buffer.drain(..length);
+            request.local_addr = stream.local_addr().ok();
             return Some(request);
         }
         match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
@@ -289,7 +294,14 @@ fn parse_request(bytes: &[u8]) -> Option<(Request, usize)> {
         (rest.get(..length)?.to_vec(), length)
     };
     let body = String::from_utf8_lossy(&body).into_owned();
-    Some((Request { head, body }, end + 4 + length))
+    Some((
+        Request {
+            head,
+            body,
+            local_addr: None,
+        },
+        end + 4 + length,
+    ))
 }
 
 /// A complete chunked body at the start of `bytes`, decoded, and its encoded
