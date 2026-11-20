@@ -21,6 +21,19 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Configure shared sccache on GKE runners
+      if: ${{ runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+      shell: nix develop -c bash -euo pipefail {0}
+      run: |
+        mise install --locked github:mozilla/sccache
+        sccache_bin=$(mise which sccache)
+        dirname "$sccache_bin" >> "$GITHUB_PATH"
+        {
+          echo "RUSTC_WRAPPER=$sccache_bin"
+          echo "SCCACHE_MEMCACHED_ENDPOINT=tcp://memcached.sccache:11211"
+          echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+        } >> "$GITHUB_ENV"
+
     - name: Hash Nix development shell
       id: dev-shell
       shell: bash

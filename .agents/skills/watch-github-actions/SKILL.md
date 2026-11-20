@@ -131,6 +131,16 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 `Release Dev` finishes its active run and replaces pending runs when new commits arrive. Other callers retain E2E cancellation. Inspect job annotations for cancellation reasons.
 
+## GKE runner trial
+
+Branch Checks Linux amd64 jobs from ai-openshell/openshell branches run on the
+`openshell-ci-amd64` ARC scale set during the GKE trial. Fork, ARM, and macOS jobs
+keep their hosted runners. Confirm the runner name in the job details before
+attributing a result to GKE. For a job-container or PostgreSQL startup failure,
+check the runner pod's Docker sidecar first. Rust jobs report shared memcached
+sccache statistics; distinguish backend connectivity errors from compiler/test
+failures. See `CI.md` for the trial scope and cache setup.
+
 ## View Job Logs
 
 For Branch Checks `Reviewer Roster` failures, the log lists non-collaborators in

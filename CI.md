@@ -6,7 +6,20 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 ## Overview
 
-PR CI runs on standard GitHub-hosted runners. `Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`. Workflow runs from outside contributors wait for a maintainer to approve them in the Actions tab.
+`Branch Checks` uses the `openshell-ci-amd64` GKE ARC scale set for Linux amd64
+jobs from branches in `ai-openshell/openshell`, manual runs, and merge groups.
+Fork PRs use GitHub-hosted runners; ARM and macOS jobs keep their existing
+runner labels. This is a branch trial and does not change main until merged.
+`Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`.
+Workflow runs from outside contributors wait for a maintainer to approve them
+in the Actions tab.
+
+The GKE scale set maintains five idle runners and permits twenty total. Each
+runner has an isolated Docker daemon for job containers and Docker-backed tests.
+Rust jobs use the shared memcached sccache backend and report cache statistics;
+the existing GitHub Rust target/registry cache remains enabled. Inspect the job's
+runner name to confirm whether it ran on GKE. ARM, macOS, and fork jobs do not
+use the cluster-local cache endpoint.
 
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 

@@ -22,7 +22,7 @@ concurrency:
 jobs:
   reviewer-roster:
     name: Reviewer Roster
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,7 +59,7 @@ jobs:
       ${{ !cancelled() && github.event_name == 'pull_request'
           && needs.compatibility-review.outputs.has_findings == 'true'
           && needs.compatibility-review.outputs.report_artifact != '' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     permissions:
@@ -98,7 +98,7 @@ jobs:
 
   protobuf-compatibility:
     name: Protobuf Compatibility
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -116,7 +116,7 @@ jobs:
 
   monitoring-changes:
     name: Detect monitoring mixin changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       changed: ${{ steps.changes.outputs.changed }}
@@ -153,7 +153,7 @@ jobs:
     name: Monitoring Mixin
     needs: monitoring-changes
     if: needs.monitoring-changes.outputs.changed == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     container:
       image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
@@ -174,7 +174,7 @@ jobs:
 
   mise-lockfile:
     name: mise Lockfile
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     container:
       image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
@@ -197,7 +197,7 @@ jobs:
 
   license-headers:
     name: License Headers
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     container:
       image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
@@ -215,7 +215,7 @@ jobs:
 
   cargo-deny:
     name: Cargo Deny
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     defaults:
       run:
@@ -243,7 +243,7 @@ jobs:
 
   rust-format:
     name: Rust format
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -272,7 +272,7 @@ jobs:
 
   cargo-lockfiles:
     name: Cargo lockfiles
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -294,7 +294,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -332,13 +332,17 @@ jobs:
           cargo clippy --locked --manifest-path tests/suites/features/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings
 
+      - name: Shared sccache statistics
+        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        run: sccache --show-stats
+
   rust-test:
     name: Rust test (${{ matrix.system }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -421,11 +425,15 @@ jobs:
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/support/Cargo.toml
           tasks/scripts/check-conformance-program.sh
 
+      - name: Shared sccache statistics
+        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        run: sccache --show-stats
+
   rust-postgres-test:
     name: Rust PostgreSQL tests
     # Bare runner: the test script starts a disposable PostgreSQL container
     # with the host's Docker.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -449,13 +457,17 @@ jobs:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: tasks/scripts/run-postgres-tests.sh --locked --profile ci
 
+      - name: Shared sccache statistics
+        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        run: sccache --show-stats
+
   rust-build-modes:
     name: Rust build modes (${{ matrix.system }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -507,9 +519,13 @@ jobs:
             exit 1
           fi
 
+      - name: Shared sccache statistics
+        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        run: sccache --show-stats
+
   rust-feature-alias:
     name: Rust feature alias
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -530,9 +546,13 @@ jobs:
           tasks/scripts/verify-defaults-without-telemetry.sh
           git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
 
+      - name: Shared sccache statistics
+        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        run: sccache --show-stats
+
   rust-gateway-core-features:
     name: Rust gateway core features
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -555,9 +575,13 @@ jobs:
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
 
+      - name: Shared sccache statistics
+        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        run: sccache --show-stats
+
   rust-gateway-extended-features:
     name: Rust gateway extended features
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -579,12 +603,18 @@ jobs:
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
+      - name: Shared sccache statistics
+        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        run: sccache --show-stats
+
   python:
     name: Python (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        runner:
+          - ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
+          - ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     container:
@@ -635,7 +665,7 @@ jobs:
     # Merge queue runs skip this job; the PR already passed it.
     name: Python SDK Freeze
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -662,7 +692,7 @@ jobs:
 
   markdown:
     name: Markdown
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     container:
       image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
@@ -681,7 +711,7 @@ jobs:
   typescript-sdk-freeze:
     name: TypeScript SDK Freeze
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -714,7 +744,7 @@ jobs:
 
   install-script:
     name: install.sh
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
