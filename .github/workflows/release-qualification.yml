@@ -131,7 +131,7 @@ jobs:
     with:
       image-tag: ${{ inputs.source-sha }}
       checkout-ref: ${{ inputs.source-sha }}
-      runner: linux-arm64-cpu8
+      runner: ubuntu-24.04-arm
 
   vm-e2e:
     permissions:
@@ -144,7 +144,7 @@ jobs:
 
   protobuf-compatibility:
     name: Protobuf Compatibility
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

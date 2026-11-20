@@ -106,13 +106,13 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
             package: prover-binary-linux-amd64
           - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
+            runner: ubuntu-24.04-arm
             package: prover-binary-linux-arm64
           - triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
+            runner: macos-15
             package: prover-binary-macos
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

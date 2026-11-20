@@ -103,7 +103,7 @@ runs:
           -o "$RUNNER_TEMP/calico.yaml"
         sed 's@192.168.0.0/16@10.244.0.0/16@g' "$RUNNER_TEMP/calico.yaml" > "$RUNNER_TEMP/calico-kind.yaml"
         # The kind node's containerd pulls Docker Hub anonymously and is rate
-        # limited. The host daemon pulls through the runner's registry mirror.
+        # limited. GitHub-hosted runners' Docker daemon is not.
         for component in cni node kube-controllers; do
           image="docker.io/calico/$component:$CALICO_VERSION"
           archive="$RUNNER_TEMP/calico-$component-linux-amd64.tar"

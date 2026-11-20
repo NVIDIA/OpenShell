@@ -3,9 +3,6 @@
 
 self-hosted-runner:
   labels:
-    - linux-amd64-cpu8
-    - linux-arm64-cpu8
-    - nv
     - ubuntu-26.04
     - windows-arm64
 
