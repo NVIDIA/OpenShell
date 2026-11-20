@@ -3,7 +3,7 @@
 
 //! Lifecycle tests for a compute driver whose workspace is persistent.
 //!
-//! Adapted from the `sandbox-lifecycle` suite in NVIDIA/OpenShell#4629 by Evan
+//! Adapted from the `sandbox-lifecycle` suite in ai-openshell/openshell#4629 by Evan
 //! Lezar. Docker, Podman, Kubernetes, and MicroVM keep `/sandbox` across stop
 //! and start, and so must every conformant driver. The Microsoft MXC driver
 //! cannot start a stopped sandbox yet, so it is not conformant until it can.

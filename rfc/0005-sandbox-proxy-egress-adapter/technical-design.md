@@ -560,7 +560,7 @@ These adapters may call gateway APIs or local credential helpers, but they
 should not bypass policy and credential invariants that apply to external
 egress.
 
-Issue [#1633](https://github.com/NVIDIA/OpenShell/issues/1633) is a prospective
+Issue [#1633](https://github.com/ai-openshell/openshell/issues/1633) is a prospective
 consumer of these boundaries, not a feature defined by this RFC. A
 policy-declared host-local endpoint should use an explicit local-routing adapter
 or destination mode; it must not become a general loopback exemption in the

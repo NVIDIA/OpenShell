@@ -35,7 +35,7 @@ async fn registered_needs_a_gateway(cx: &mut testkit::Context) -> testkit::Resul
 
 /// Ignored until later.
 #[testkit::test]
-#[ignore = "https://github.com/NVIDIA/OpenShell/issues/1"]
+#[ignore = "https://github.com/ai-openshell/openshell/issues/1"]
 async fn registered_ignored(_cx: &mut testkit::Context) -> testkit::Result {
     Ok(())
 }
@@ -137,7 +137,7 @@ mod unix {
         },
     ];
 
-    pub static CHECKS: [Test; 12] = [
+    pub static CHECKS: [Test; 14] = [
         check("nextest_interface", || {
             Box::pin(async { nextest_interface() })
         }),
@@ -169,6 +169,12 @@ mod unix {
         check("registered_tests_run_through_testkit", || {
             Box::pin(async { registered_tests_run_through_testkit() })
         }),
+        check("unsupported_tests_are_ignored_by_every_interface", || {
+            Box::pin(async { unsupported_tests_are_ignored_by_every_interface() })
+        }),
+        check("bad_unsupported_entries_stop_the_program", || {
+            Box::pin(async { bad_unsupported_entries_stop_the_program() })
+        }),
         check("ready_fails_without_a_gateway", || {
             Box::pin(async { ready_fails_without_a_gateway() })
         }),
@@ -180,6 +186,7 @@ mod unix {
             .args(args)
             .env("TESTKIT_FIXTURE", fixture)
             .env_remove("TESTKIT_SUPERVISED")
+            .env_remove("OPENSHELL_TEST_UNSUPPORTED")
             .stdin(Stdio::null());
         command
     }
@@ -258,7 +265,7 @@ mod unix {
         assert_eq!(
             lines[0],
             "registered_ignored          Ignored until later. \
-             [ignored: https://github.com/NVIDIA/OpenShell/issues/1]"
+             [ignored: https://github.com/ai-openshell/openshell/issues/1]"
         );
         assert_eq!(lines[1], "registered_needs_a_gateway  Needs a gateway.");
 
@@ -475,6 +482,125 @@ mod unix {
         let run = output(command);
         assert_eq!(run.status.code(), Some(0));
         assert_gone(read_pid(&pid_file));
+    }
+
+    const UNSUPPORTED: &str = "OPENSHELL_TEST_UNSUPPORTED";
+    const ISSUE: &str = "https://github.com/ai-openshell/openshell/issues/7";
+
+    fn unsupported_entry(test: &str) -> String {
+        format!("program::fixture::{test}={ISSUE}")
+    }
+
+    /// An unsupported test shows as ignored under libtest and nextest, as
+    /// skipped by `list` and `run`, and fails when forced.
+    fn unsupported_tests_are_ignored_by_every_interface() {
+        let entry = unsupported_entry("fails");
+        // Entries for other packages are not this program's business.
+        let value = format!("{entry}, other::mod::test=not-checked");
+        let with = |args: &[&str]| {
+            let mut command = program("fixtures", args);
+            command.env(UNSUPPORTED, &value);
+            output(command)
+        };
+
+        let list = with(&["list", "fail"]);
+        assert_eq!(
+            stdout(&list),
+            format!("fixture::fails  A fixture. [unsupported: {ISSUE}]\n")
+        );
+
+        // nextest lists it as ignored, so it shows SKIP.
+        let ignored = with(&["--list", "--format", "terse", "--ignored"]);
+        assert_eq!(
+            stdout(&ignored),
+            "fixture::fails: test\nfixture::ignored: test\n"
+        );
+        let skipped = with(&["fixture::fails", "--exact", "--nocapture"]);
+        assert!(skipped.status.success());
+        assert!(stdout(&skipped).contains("1 ignored"));
+        // Under libtest the caller lists the entries; the program stays quiet.
+        assert!(!stderr(&skipped).contains("unsupported"));
+        assert!(!stderr(&ignored).contains("unsupported"));
+
+        for forced in ["--ignored", "--include-ignored"] {
+            let run = with(&["fixture::fails", "--exact", forced]);
+            assert_eq!(run.status.code(), Some(101), "{forced}");
+            assert!(
+                stdout(&run).contains(&format!(
+                    "unsupported: {ISSUE}; remove the entry from OPENSHELL_TEST_UNSUPPORTED to run it"
+                )),
+                "{forced}"
+            );
+            assert!(!stderr(&run).contains("fixture failure"), "{forced}");
+        }
+
+        // `run` is its own caller: it skips the test, announces it once, and passes the rest through to
+        // its test processes.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (path, junit_arg) = junit(dir.path());
+        let run = with(&["run", "passes", "fails", "--junit", &junit_arg]);
+        assert_eq!(run.status.code(), Some(0));
+        assert_eq!(
+            stderr(&run)
+                .matches("lists program::fixture::fails")
+                .count(),
+            1
+        );
+        assert!(stderr(&run).contains("1 passed, 0 failed, 1 skipped"));
+        assert!(stderr(&run).contains(&format!("SKIP fixture::fails: unsupported: {ISSUE}")));
+        let xml = std::fs::read_to_string(path).expect("junit report");
+        for expected in [
+            r#"<testsuite name="fixtures" tests="2" skipped="1""#,
+            &format!(r#"<skipped message="unsupported: {ISSUE}"/>"#),
+            &format!(r#"<property name="unsupported" value="{ISSUE}"/>"#),
+        ] {
+            assert!(xml.contains(expected), "missing {expected} in\n{xml}");
+        }
+
+        // A forced run refuses.
+        let forced = with(&["run", "fails", "--include-ignored"]);
+        assert_eq!(forced.status.code(), Some(1));
+        assert!(stdout(&forced).contains("remove the entry from OPENSHELL_TEST_UNSUPPORTED"));
+        assert!(!stderr(&forced).contains("fixture failure"));
+        // Selecting only unsupported tests leaves nothing to run.
+        let none = with(&["run", "fails"]);
+        assert_eq!(none.status.code(), Some(2));
+        assert!(stderr(&none).contains("no tests to run"));
+    }
+
+    fn bad_unsupported_entries_stop_the_program() {
+        let good = unsupported_entry("fails");
+        for (value, expected) in [
+            ("program::fixture::fails".to_string(), "malformed entry"),
+            (
+                format!("program::fixture::nope={ISSUE}"),
+                "is not a test in this program",
+            ),
+            (format!("{good} {good}"), "is listed twice"),
+            (
+                format!("program::fixture::ignored={ISSUE}"),
+                "already #[ignore]d",
+            ),
+            (
+                "program::fixture::fails=http://example.com/1".to_string(),
+                "must be an https:// URL",
+            ),
+        ] {
+            for args in [
+                &["list"][..],
+                &["run", "passes"],
+                &["--list", "--format", "terse"],
+                &["fixture::passes", "--exact"],
+            ] {
+                let mut command = program("fixtures", args);
+                command.env(UNSUPPORTED, &value);
+                let run = output(command);
+                assert_eq!(run.status.code(), Some(2), "{value} {args:?}");
+                assert!(stderr(&run).contains(expected), "{value} {args:?}");
+                // Nothing listed or run before the check.
+                assert!(stdout(&run).is_empty(), "{value} {args:?}");
+            }
+        }
     }
 
     /// Point the gateway lookup at a closed port, away from any registered

@@ -5,6 +5,8 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+pub(super) mod access_token;
+
 use crate::compute::MutationScope;
 #[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
@@ -34,6 +36,7 @@ use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
 use openshell_credential_issuer::refresh::CredentialRefresh;
+use openshell_credential_issuer::refresh::{minter, secret_refs};
 use openshell_policy::ProviderPolicyLayer;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -42,7 +45,7 @@ use tonic::Status;
 use tracing::warn;
 
 use super::validation::{validate_provider_fields, validate_provider_mutable_fields};
-use super::{MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PROVIDER_CONFIG_ENTRIES};
+use super::{MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_NAME_LEN, MAX_PROVIDER_CONFIG_ENTRIES};
 
 const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET";
 const EXTERNAL_STABLE_PLACEHOLDER_EPOCH: &str = "external-stable-placeholder-v1";
@@ -2663,20 +2666,21 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse,
     GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
     GetProviderRequest, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
+    InlineProviderRefreshSecretsRequest, InlineProviderRefreshSecretsResponse,
     LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
     ProviderProfileDiagnostic, ProviderProfileImportItem, ProviderProfileResponse,
     ProviderResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
-use openshell_core::spiffe::{
-    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
-    workload_api_endpoint,
-};
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
     validate_profile_set,
+};
+use openshell_spiffe::{
+    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
+    workload_api_endpoint,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -2691,7 +2695,7 @@ use openshell_core::oauth::{
     effective_token_type,
 };
 use openshell_core::token_grant_failure::{
-    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage, WORKLOAD_IDENTITY_CALL_TIMEOUT,
 };
 const DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 3600;
@@ -2728,17 +2732,23 @@ impl IntermediateTokenCache {
     }
 
     fn get(&self, key: &str) -> Option<oauth::OAuthTokenResponse> {
+        self.get_until(key).map(|(token, _)| token)
+    }
+
+    /// The unexpired token with the time its entry expires, in milliseconds.
+    fn get_until(&self, key: &str) -> Option<(oauth::OAuthTokenResponse, i64)> {
         let now_ms = crate::persistence::current_time_ms();
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(key)?;
         if cached.expires_at_ms <= now_ms {
             return None;
         }
-        Some(oauth::OAuthTokenResponse {
+        let token = oauth::OAuthTokenResponse {
             access_token: cached.access_token.clone(),
             expires_in: cached.expires_at_ms.saturating_sub(now_ms) / 1000,
             token_type: cached.token_type.clone(),
-        })
+        };
+        Some((token, cached.expires_at_ms))
     }
 
     fn set(&self, key: String, token: &oauth::OAuthTokenResponse, expires_at_ms: i64) {
@@ -3577,6 +3587,155 @@ fn validate_strategy_profile_binding(
         }
     }
     Ok(())
+}
+
+/// Inline material plus a placeholder for each key a workspace secret
+/// supplies, for checks that only need to know which keys are present.
+fn material_with_references(request: &ConfigureProviderRefreshRequest) -> HashMap<String, String> {
+    let mut supplied = request.material.clone();
+    for key in request.material_secrets.keys() {
+        supplied.insert(key.clone(), "workspace-secret".to_string());
+    }
+    supplied
+}
+
+/// Shape checks for `material_secrets` that need no stored state.
+fn validate_material_secret_references(
+    request: &ConfigureProviderRefreshRequest,
+) -> Result<(), Status> {
+    if request.material_secrets.len() > MAX_PROVIDER_CONFIG_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "material_secrets exceeds maximum entries ({} > {MAX_PROVIDER_CONFIG_ENTRIES})",
+            request.material_secrets.len()
+        )));
+    }
+    for (key, secret) in &request.material_secrets {
+        if key.is_empty() || key.len() > MAX_MAP_KEY_LEN {
+            return Err(Status::invalid_argument(format!(
+                "material_secrets key must be 1 to {MAX_MAP_KEY_LEN} bytes"
+            )));
+        }
+        if secret.trim().is_empty() || secret.len() > MAX_NAME_LEN {
+            return Err(Status::invalid_argument(format!(
+                "material_secrets entry '{key}' must name a secret"
+            )));
+        }
+        if request.material.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' cannot be supplied by both material and material_secrets"
+            )));
+        }
+        // Gateways that predate workspace secrets ignore material_secrets but
+        // reject a listed secret key with no inline value.
+        if !request
+            .secret_material_keys
+            .iter()
+            .any(|listed| listed == key)
+        {
+            return Err(Status::invalid_argument(format!(
+                "material_secrets key '{key}' must also be listed in secret_material_keys"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Material keys read when refresh is configured, not when it mints.
+const CONFIGURATION_MATERIAL_KEYS: &[&str] = &[
+    "token_url",
+    "token_uri",
+    "sts_endpoint_url",
+    "tenant_id",
+    "scope",
+    "scopes",
+    "refresh_before_seconds",
+    "max_lifetime_seconds",
+];
+
+/// Only secret minting material may come from a shared workspace secret, and
+/// never material the minter writes back for one provider.
+fn validate_material_secret_keys(
+    strategy: ProviderCredentialRefreshStrategy,
+    refresh_defaults: Option<&CredentialRefreshProfile>,
+    material_secrets: &HashMap<String, String>,
+) -> Result<(), Status> {
+    for key in material_secrets.keys() {
+        // Configure reads these from inline material only, so a reference would
+        // be recorded but silently ignored, even if a profile marks it secret.
+        if CONFIGURATION_MATERIAL_KEYS.contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' configures the refresh and cannot come from a workspace secret"
+            )));
+        }
+        if minter::strategy_rotated_material_keys(strategy).contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' is rotated per provider and cannot come from a workspace secret"
+            )));
+        }
+        let strategy_secret = crate::provider_refresh::strategy_secret_material_keys(strategy)
+            .contains(&key.as_str());
+        let profile_secret = refresh_defaults.is_some_and(|refresh| {
+            refresh
+                .material
+                .iter()
+                .any(|item| item.secret && item.name == *key)
+        });
+        if !strategy_secret && !profile_secret {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' is not secret material and cannot come from a workspace secret"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve referenced secrets to immutable IDs and check that the token
+/// endpoint this refresh will call is one each secret allows.
+async fn bind_material_secrets(
+    state: &ServerState,
+    workspace: &str,
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &HashMap<String, String>,
+    token_url: &str,
+    material_secrets: &HashMap<String, String>,
+) -> Result<secret_refs::MaterialSecretBindings, Status> {
+    let mut bindings = secret_refs::MaterialSecretBindings::new();
+    if material_secrets.is_empty() {
+        return Ok(bindings);
+    }
+    let endpoint = minter::effective_token_endpoint(&minter::MintRequest {
+        strategy: strategy as i32,
+        material: material.clone(),
+        token_url: token_url.to_string(),
+        ..Default::default()
+    })?;
+    let endpoint = openshell_credential_issuer::endpoint::normalize_token_endpoint(&endpoint)
+        .map_err(|reason| {
+            Status::failed_precondition(format!("refresh token endpoint {reason}"))
+        })?;
+    for (material_key, name) in material_secrets {
+        let secret = super::secret::get_live_secret(&state.store, workspace, name)
+            .await?
+            .ok_or_else(|| Status::not_found(format!("workspace secret '{name}' not found")))?;
+        let Some(refresh_use) = secret.refresh_use.as_ref() else {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{name}' is not enabled for provider refresh"
+            )));
+        };
+        if !refresh_use.allowed_endpoints.contains(&endpoint) {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{name}' does not allow token endpoint {endpoint}"
+            )));
+        }
+        bindings.insert(
+            material_key.clone(),
+            secret_refs::MaterialSecretBinding {
+                id: secret.object_id().to_string(),
+                name: name.clone(),
+            },
+        );
+    }
+    Ok(bindings)
 }
 
 fn validate_refresh_material(
@@ -4768,18 +4927,44 @@ fn jwt_exp_ms(token: &str) -> Option<i64> {
 }
 
 async fn fetch_gateway_jwt_svid(audience: &str) -> Result<String, Status> {
-    let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    fetch_gateway_jwt_svid_from(audience, None).await
+}
+
+async fn fetch_gateway_jwt_svid_from(
+    audience: &str,
+    broker_socket: Option<&str>,
+) -> Result<String, Status> {
+    let socket_path = broker_socket
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
-    let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
-        .await
-        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))?;
-    client
-        .fetch_jwt_token([audience], None)
-        .await
-        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))
+    // A wedged Workload API socket must not hold the grant past its deadline.
+    tokio::time::timeout(WORKLOAD_IDENTITY_CALL_TIMEOUT, async {
+        let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })?;
+        client
+            .fetch_jwt_token([audience], None)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })
+    })
+    .await
+    .map_err(|_| {
+        TokenGrantFailure::new(
+            TokenGrantFailureKind::Timeout,
+            TokenGrantStage::WorkloadIdentity,
+        )
+        .to_status()
+    })?
 }
 
 fn validate_gateway_jwt_svid_claims(
@@ -4999,6 +5184,10 @@ pub(super) async fn handle_configure_provider_refresh(
             )));
         }
     }
+    validate_material_secret_references(&request)?;
+    if !request.material_secrets.is_empty() {
+        super::secret::ensure_workspace_secrets_active(state).await?;
+    }
     if request
         .material
         .get("token_url")
@@ -5012,6 +5201,10 @@ pub(super) async fn handle_configure_provider_refresh(
             "refresh token endpoints must be defined by the provider profile, not material",
         ));
     }
+    // A key supplied by a workspace secret counts as present, so Basic client
+    // authentication accepts a client_secret that comes from a secret.
+    let supplied_material = material_with_references(&request);
+    crate::provider_refresh::validate_oauth_client_material(strategy as i32, &supplied_material)?;
     // The STS endpoint is always resolved from the region in production. Reject
     // any caller-supplied override so an AWS-signed AssumeRole request cannot be
     // redirected at an arbitrary service (CWE-918). Tests inject a mock endpoint
@@ -5031,7 +5224,10 @@ pub(super) async fn handle_configure_provider_refresh(
     let has_source_secret_key = request
         .material
         .get("aws_secret_access_key")
-        .is_some_and(|value| !value.trim().is_empty());
+        .is_some_and(|value| !value.trim().is_empty())
+        || request
+            .material_secrets
+            .contains_key("aws_secret_access_key");
     if has_source_access_key != has_source_secret_key {
         return Err(Status::invalid_argument(
             "aws_access_key_id and aws_secret_access_key must both be set or both omitted",
@@ -5112,16 +5308,21 @@ pub(super) async fn handle_configure_provider_refresh(
         refresh_defaults.as_ref(),
         &additional_output_keys,
     )?;
-    validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
+    validate_refresh_material(&supplied_material, refresh_defaults.as_ref())?;
     let mut secret_material_keys: HashSet<String> =
         request.secret_material_keys.iter().cloned().collect();
     for key in &request.secret_material_keys {
-        if !request.material.contains_key(key) {
+        if !supplied_material.contains_key(key) {
             return Err(Status::invalid_argument(format!(
                 "secret_material_keys entry '{key}' is not present in material"
             )));
         }
     }
+    validate_material_secret_keys(
+        strategy,
+        refresh_defaults.as_ref(),
+        &request.material_secrets,
+    )?;
     if let Some(refresh) = refresh_defaults.as_ref() {
         secret_material_keys.extend(
             refresh
@@ -5144,6 +5345,15 @@ pub(super) async fn handle_configure_provider_refresh(
         .as_ref()
         .map(|refresh| refresh.token_url.clone())
         .unwrap_or_default();
+    let material_secret_bindings = bind_material_secrets(
+        state,
+        &workspace,
+        strategy,
+        &request.material,
+        &token_url,
+        &request.material_secrets,
+    )
+    .await?;
     let scopes = if material_scopes.is_empty() {
         refresh_defaults
             .as_ref()
@@ -5256,6 +5466,16 @@ pub(super) async fn handle_configure_provider_refresh(
         }
     }
     crate::provider_refresh::set_refresh_expiration_presence(&mut state_record, has_expiration);
+    // A reconfiguration replaces every binding and drops endpoint constraints
+    // on copied values: the caller supplied all material again.
+    {
+        let metadata = state_record.metadata.get_or_insert_with(Default::default);
+        secret_refs::set_material_secret_bindings(metadata, &material_secret_bindings);
+        secret_refs::set_material_endpoint_constraints(
+            metadata,
+            &secret_refs::MaterialEndpointConstraints::new(),
+        );
+    }
     let material_staging_id = format!(
         "{}-refresh-config-{}",
         provider.object_id(),
@@ -5389,6 +5609,223 @@ pub(super) async fn handle_rotate_provider_credential(
             &refresh_state,
         )),
     }))
+}
+
+/// Copy referenced workspace secrets into provider-owned refresh material.
+///
+/// Unlike reconfiguration this keeps every other handle, including a refresh
+/// token the gateway rotated, and the authorization epoch. Each copied value
+/// keeps the endpoint constraint of the secret it came from. Not gated by the
+/// workspace-secrets activation, so it works while rolling back.
+pub(super) async fn handle_inline_provider_refresh_secrets(
+    state: &Arc<ServerState>,
+    request: Request<InlineProviderRefreshSecretsRequest>,
+) -> Result<Response<InlineProviderRefreshSecretsResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
+    let request = request.into_inner();
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let provider_name = request.provider.trim();
+    let credential_key = request.credential_key.trim();
+    if provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider is required"));
+    }
+    if credential_key.is_empty() {
+        return Err(Status::invalid_argument("credential_key is required"));
+    }
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
+    let provider = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, provider_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider not found"))?;
+    let mut refresh: StoredProviderCredentialRefreshState = state
+        .refresh
+        .get(&workspace, provider.object_id(), credential_key)
+        .await?
+        .as_ref()
+        .map(Into::into)
+        .ok_or_else(|| Status::not_found("provider refresh not found"))?;
+    if refresh
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
+    {
+        return Err(Status::failed_precondition(
+            "provider refresh is being deleted",
+        ));
+    }
+    // A mint persists this status before contacting the token endpoint and
+    // stages a rotated refresh token only if its version still matches.
+    // Replacing the state now would make it discard that token. A mint that
+    // starts after this read bumps the version, so the write below fails.
+    if matches!(
+        refresh.status.as_str(),
+        "refresh_in_progress" | "refresh_committing"
+    ) {
+        return Err(Status::aborted(
+            "a credential mint is in progress; retry once it finishes, or reconfigure the refresh if its outcome is uncertain",
+        ));
+    }
+    let bindings = secret_refs::material_secret_bindings(refresh.metadata.as_ref())?;
+    if bindings.is_empty() {
+        replay_facts.refresh(&refresh)?;
+        return Ok(Response::new(InlineProviderRefreshSecretsResponse {
+            status: Some(crate::provider_refresh::refresh_status_from_state(&refresh)),
+        }));
+    }
+    let mut constraints = secret_refs::material_endpoint_constraints(refresh.metadata.as_ref())?;
+    let mut values = HashMap::new();
+    for (material_key, binding) in &bindings {
+        let (value, allowed_endpoints) = read_workspace_secret(state, &workspace, binding).await?;
+        values.insert(material_key.clone(), value);
+        constraints.insert(material_key.clone(), allowed_endpoints);
+    }
+
+    let staging_id = format!(
+        "{}-refresh-inline-{}",
+        provider.object_id(),
+        uuid::Uuid::new_v4()
+    );
+    let staged = state
+        .credentials
+        .store_refresh_material_with_object_id(
+            crate::provider_refresh::refresh_material_scope(&refresh),
+            &staging_id,
+            &values,
+            &HashMap::new(),
+        )
+        .await?;
+    for (material_key, handle) in &staged {
+        if let Some(previous) = refresh
+            .secret_material_handles
+            .insert(material_key.clone(), handle.clone())
+        {
+            crate::provider_refresh::enqueue_pending_secret_deletion(
+                &mut refresh,
+                material_key,
+                previous,
+            );
+        }
+    }
+    let expected_version = {
+        let metadata = refresh.metadata.get_or_insert_with(Default::default);
+        secret_refs::set_material_secret_bindings(
+            metadata,
+            &secret_refs::MaterialSecretBindings::new(),
+        );
+        secret_refs::set_material_endpoint_constraints(metadata, &constraints);
+        metadata.resource_version
+    };
+    let persisted = state
+        .refresh
+        .replace((&refresh).into(), expected_version)
+        .await;
+    if !matches!(persisted, Ok(true)) {
+        if let Err(cleanup_err) = state
+            .credentials
+            .delete_refresh_material_handles(
+                crate::provider_refresh::refresh_material_scope(&refresh),
+                &staged,
+            )
+            .await
+        {
+            warn!(
+                provider_name = %provider.object_name(),
+                credential_key,
+                error = %cleanup_err,
+                "failed to clean up staged refresh material after inlining failed"
+            );
+        }
+        return Err(persisted.err().unwrap_or_else(|| {
+            Status::aborted("provider refresh was concurrently modified; retry")
+        }));
+    }
+
+    replay_facts.refresh(&refresh)?;
+    Ok(Response::new(InlineProviderRefreshSecretsResponse {
+        status: Some(crate::provider_refresh::refresh_status_from_state(&refresh)),
+    }))
+}
+
+/// Read a referenced workspace secret's value and endpoint constraint. A
+/// concurrent `UpdateSecret` can delete the handle read from the record, so a
+/// failed read re-reads the record once, as minting does.
+async fn read_workspace_secret(
+    state: &ServerState,
+    workspace: &str,
+    binding: &secret_refs::MaterialSecretBinding,
+) -> Result<(String, Vec<String>), Status> {
+    let mut last_error = None;
+    for _ in 0..2 {
+        let secret = state
+            .store
+            .get_message::<crate::storage_proto::StoredWorkspaceSecret>(&binding.id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch workspace secret failed: {e}")))?
+            .filter(|secret| {
+                secret.object_workspace() == workspace
+                    && secret.create_pending_since.is_none()
+                    && secret
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_time.is_none())
+            });
+        let Some((secret, handle)) = secret.and_then(|secret| {
+            let handle = secret.value_handle.clone()?;
+            Some((secret, handle))
+        }) else {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{}' no longer exists; reconfigure the refresh grant",
+                binding.name
+            )));
+        };
+        match state
+            .credentials
+            .resolve_secrets(
+                openshell_credential_issuer::SecretOwner::workspace_secret(workspace, &binding.id),
+                &HashMap::from([(secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(), handle)]),
+                0,
+            )
+            .await
+        {
+            Ok(mut resolved) => {
+                if let Some(value) = resolved
+                    .values
+                    .remove(secret_refs::WORKSPACE_SECRET_VALUE_KEY)
+                    .filter(|value| !value.is_empty())
+                {
+                    let allowed_endpoints = secret
+                        .refresh_use
+                        .map(|refresh_use| refresh_use.allowed_endpoints)
+                        .unwrap_or_default();
+                    return Ok((value, allowed_endpoints));
+                }
+                last_error = Some("credential storage returned no value".to_string());
+            }
+            Err(err) => last_error = Some(err.message().to_string()),
+        }
+    }
+    Err(Status::unavailable(format!(
+        "workspace secret '{}' could not be read: {}",
+        binding.name,
+        last_error.unwrap_or_default()
+    )))
 }
 
 /// Remove the expiry for each key the refresh still owns — one whose stored
@@ -5825,6 +6262,54 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn broker_failure_log_names_authenticated_sandbox() {
+            let state = test_server_state_without_provider_profiles().await;
+            let mut request = Request::new(
+                openshell_core::proto::GetSandboxProviderAccessTokenRequest {
+                    credential_key: SECRET.to_string(),
+                },
+            );
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: "broker-sandbox".to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: SECRET.to_string(),
+                        auth_epoch: None,
+                    },
+                    trust_domain: None,
+                }));
+            request
+                .metadata_mut()
+                .insert("x-request-id", REQUEST_ID.parse().unwrap());
+
+            let output = GrantTraceBuffer::default();
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let error = access_token::handle(&state, request).await.unwrap_err();
+            drop(capture);
+
+            let failure = assert_generic(&error, Code::Unauthenticated);
+            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains(&format!(
+                    "dynamic token grant failed request_id={REQUEST_ID} code={} stage={}",
+                    failure.code(),
+                    failure.stage().code(),
+                )),
+                "{logs}"
+            );
+            assert!(logs.contains("sandbox_id=broker-sandbox"), "{logs}");
+            assert!(!logs.contains(SECRET), "{logs}");
+        }
+
+        #[tokio::test]
         async fn missing_expired_or_unresolvable_subject_credential_is_generic() {
             let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
             let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
@@ -5952,7 +6437,7 @@ mod tests {
             let claims = SpiffeJwtClaims {
                 iss: SECRET.to_string(),
                 sub: SECRET.to_string(),
-                aud: openshell_core::spiffe::AudienceClaim::One(SECRET.to_string()),
+                aud: openshell_spiffe::AudienceClaim::One(SECRET.to_string()),
                 exp: 0,
             };
             let gateway =
@@ -8462,6 +8947,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8555,6 +9041,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8695,6 +9182,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            material_secrets: HashMap::new(),
         };
         handle_configure_provider_refresh(&state, authed_request(request("original-secret")))
             .await
@@ -8768,6 +9256,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn configure_refresh_rejects_basic_auth_without_client_secret() {
+        let state = test_server_state().await;
+        let request = ConfigureProviderRefreshRequest {
+            request_id: String::new(),
+            provider: "any".to_string(),
+            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+            material: HashMap::from([
+                ("client_id".to_string(), "client-id".to_string()),
+                ("refresh_token".to_string(), "refresh".to_string()),
+                (
+                    "token_endpoint_auth_method".to_string(),
+                    "client_secret_basic".to_string(),
+                ),
+            ]),
+            secret_material_keys: vec!["refresh_token".to_string()],
+            expiration_time: None,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            material_secrets: HashMap::new(),
+        };
+        let status = handle_configure_provider_refresh(&state, authed_request(request))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("requires client_secret"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_refresh_configure_keeps_only_winner_material() {
         let first_state = test_server_state().await;
@@ -8792,17 +9310,20 @@ mod tests {
         // Model a second gateway replica: it shares the durable database and
         // credential backend, but owns an independent sandbox synchronization
         // guard, so process-local serialization cannot hide this race.
-        let second_state = Arc::new(ServerState::new_with_credentials(
-            first_state.config.clone(),
-            Arc::clone(&first_state.store),
-            crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            None,
-            first_state.credentials.clone(),
-        ));
+        let second_state = Arc::new(
+            ServerState::new_with_credentials(
+                first_state.config.clone(),
+                Arc::clone(&first_state.store),
+                crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+                None,
+                first_state.credentials.clone(),
+            )
+            .unwrap(),
+        );
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
             request_id: String::new(),
             provider: "configure-create-race".to_string(),
@@ -8818,6 +9339,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            material_secrets: HashMap::new(),
         };
         let (first_store_hit, release_first_store) = first_state.credentials.gate_next_store();
 
@@ -8949,6 +9471,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9108,6 +9631,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9178,6 +9702,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9292,6 +9817,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9544,6 +10070,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9627,6 +10154,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9649,6 +10177,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9715,6 +10244,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9735,6 +10265,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9792,6 +10323,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    material_secrets: HashMap::new(),
                 }),
             )
             .await
@@ -12635,6 +13167,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            material_secrets: HashMap::new(),
         };
         handle_configure_provider_refresh(&state, authed_request(configure()))
             .await
@@ -15160,6 +15693,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15225,6 +15759,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15302,6 +15837,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15361,6 +15897,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15414,6 +15951,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15495,6 +16033,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15592,6 +16131,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15647,6 +16187,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15833,6 +16374,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -15911,6 +16453,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             })
         };
 

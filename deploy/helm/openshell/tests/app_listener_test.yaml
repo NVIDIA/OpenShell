@@ -15,7 +15,7 @@ tests:
         openshell.supervisor.app_listener:
           enabled: false
           port: 9443
-          domain: services.example.com
+          base_url: https://services.example.com
         openshell.drivers.kubernetes.sandbox_runtime.app_listener:
           tls_secret_name: app-tls
     asserts:
@@ -39,7 +39,7 @@ tests:
         openshell.supervisor.app_listener:
           enabled: true
           port: 9443
-          domain: services.example.com
+          base_url: https://services.example.com:10443
         openshell.drivers.kubernetes.sandbox_runtime.app_listener:
           tls_secret_name: app-tls
     asserts:
@@ -50,6 +50,12 @@ tests:
           content:
             name: OPENSHELL_APP_LISTEN_ADDRESS
             value: 0.0.0.0:9443
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_APP_BASE_URL
+            value: https://services.example.com:10443
         documentIndex: 0
       - contains:
           path: spec.template.spec.volumes
@@ -66,7 +72,7 @@ tests:
         openshell.supervisor.app_listener:
           enabled: true
           port: 5500
-          domain: services.example.com
+          base_url: https://services.example.com
         openshell.drivers.kubernetes.sandbox_runtime.app_listener:
           tls_secret_name: app-tls
     asserts:

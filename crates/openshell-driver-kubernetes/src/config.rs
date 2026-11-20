@@ -610,9 +610,6 @@ impl KubernetesComputeConfig {
                 {
                     return Err("supervisor.app_listener.port conflicts with shared_supervisor.runtime_port".into());
                 }
-                if self.provider_spiffe_enabled() {
-                    return Err("supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
-                }
                 if self.https_proxy.is_some()
                     || self.proxy_auth_secret_name.is_some()
                     || self.proxy_ca_bundle.is_some()
@@ -1178,9 +1175,9 @@ mod tests {
         assert!(!config.app_listener.common.enabled);
         assert!(config.validate().is_ok());
         config.app_listener.common = openshell_core::app_listener::AppListenerConfig {
+            base_url: Some("https://services.example.com".into()),
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
         };
         assert!(config.validate().is_ok());
         config.app_listener.common.port = config.boundary_port;

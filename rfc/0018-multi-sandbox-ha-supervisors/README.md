@@ -3,9 +3,9 @@ authors:
   - "@FrostGod"
 state: draft
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/4311
-  - https://github.com/NVIDIA/OpenShell/issues/2385
-  - https://github.com/NVIDIA/OpenShell/pull/3661
+  - https://github.com/ai-openshell/openshell/issues/4311
+  - https://github.com/ai-openshell/openshell/issues/2385
+  - https://github.com/ai-openshell/openshell/pull/3661
 ---
 
 # RFC 0018 - Multi-sandbox and HA Supervisors
@@ -59,7 +59,7 @@ The sandbox runtime, not the supervisor process, owns the actual workload proces
 - Saving or live-moving agent memory from a failed node.
 - Moving existing TCP, SSH, forwarding, or upstream HTTP connections to another supervisor.
 - Running arbitrary external side effects exactly once.
-- Backend-initiated suspend and wake ([#4352](https://github.com/NVIDIA/OpenShell/issues/4352)). This is a separate task, but the design leaves room for it: suspend can act as a planned release and wake as a new assignment.
+- Backend-initiated suspend and wake ([#4352](https://github.com/ai-openshell/openshell/issues/4352)). This is a separate task, but the design leaves room for it: suspend can act as a planned release and wake as a new assignment.
 - Removing the trusted sandbox runtime, the outer network fence, or per-sandbox authorization.
 
 ## Proposal
@@ -104,7 +104,7 @@ A shared supervisor keeps a separate gateway connection for each sandbox, so san
 
 A new per-sandbox record, `SupervisorAssignment`, names the enforcement owner. Gateways store it in PostgreSQL; supervisors and runtimes never talk to the database. It has a **lease**, a time limit on the owner's right to enforce that the owner renews through its gateway, and an **epoch**, a counter that goes up by one at every owner change. Gateways update it with compare-and-swap (CAS), a write that fails if someone changed the record first. The gateway's owner record carries the same epoch, and anything from an older epoch is rejected: relays, policy acknowledgements, readiness reports, and late cleanup. The same CAS also issues a new `gateway_token_id`, so the old supervisor's token stops working even though resume keeps the run.
 
-This must work in both config modes. In **poll** mode (today's default), the supervisor fetches policy and credentials with its token, so the new token ID cuts the old owner off. In **push** mode ([#4320](https://github.com/NVIDIA/OpenShell/pull/4320)), the gateway sends them down the already-open session, so the CAS must also close every session from an older epoch. In both modes, the new supervisor first receives its config on a session at the reserved epoch, with no relays, and acknowledges it before activation.
+This must work in both config modes. In **poll** mode (today's default), the supervisor fetches policy and credentials with its token, so the new token ID cuts the old owner off. In **push** mode ([#4320](https://github.com/ai-openshell/openshell/pull/4320)), the gateway sends them down the already-open session, so the CAS must also close every session from an older epoch. In both modes, the new supervisor first receives its config on a session at the reserved epoch, with no relays, and acknowledges it before activation.
 
 **Ready** has one meaning: policy loaded, network mediation running, ownership current, gateway connected, and enforcement confirmed by the runtime. As today, a sandbox stays Ready through a graceful gateway handoff.
 
@@ -262,11 +262,11 @@ Some details are left to implementation and are out of scope for this RFC: how a
 
 ## Related work
 
-- [Issue #4311: Multi-sandbox and HA Supervisors](https://github.com/NVIDIA/OpenShell/issues/4311): the original work item for supervising many sandboxes and for high availability.
-- [RFC 0012: Isolation Backend](https://github.com/NVIDIA/OpenShell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/rfc/0012-isolation-backend/README.md): roles that do not depend on placement, strict isolation for each boundary, and today's same-process recovery limit. This draft extends recovery. It does not change the enforcement rules.
-- [Kubernetes driver](https://github.com/NVIDIA/OpenShell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/crates/openshell-driver-kubernetes/README.md) and [runtime authentication](https://github.com/NVIDIA/OpenShell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/crates/openshell-sandbox-backend/src/sandbox_auth.rs): today's Pod identity and the limits on replacement processes.
-- [Gateway HA documentation](https://github.com/NVIDIA/OpenShell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/docs/kubernetes/high-availability.mdx) and [PR #3661](https://github.com/NVIDIA/OpenShell/pull/3661): placement of gateways by hashing, and durable routing ownership. Do not confuse these with enforcement ownership.
-- [Issue #2385](https://github.com/NVIDIA/OpenShell/issues/2385): an earlier proposal for shared supervision, with Pod-density requirements.
+- [Issue #4311: Multi-sandbox and HA Supervisors](https://github.com/ai-openshell/openshell/issues/4311): the original work item for supervising many sandboxes and for high availability.
+- [RFC 0012: Isolation Backend](https://github.com/ai-openshell/openshell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/rfc/0012-isolation-backend/README.md): roles that do not depend on placement, strict isolation for each boundary, and today's same-process recovery limit. This draft extends recovery. It does not change the enforcement rules.
+- [Kubernetes driver](https://github.com/ai-openshell/openshell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/crates/openshell-driver-kubernetes/README.md) and [runtime authentication](https://github.com/ai-openshell/openshell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/crates/openshell-sandbox-backend/src/sandbox_auth.rs): today's Pod identity and the limits on replacement processes.
+- [Gateway HA documentation](https://github.com/ai-openshell/openshell/blob/e1f3c82caa3ed3b65de22889ae7ef32a774878ef/docs/kubernetes/high-availability.mdx) and [PR #3661](https://github.com/ai-openshell/openshell/pull/3661): placement of gateways by hashing, and durable routing ownership. Do not confuse these with enforcement ownership.
+- [Issue #2385](https://github.com/ai-openshell/openshell/issues/2385): an earlier proposal for shared supervision, with Pod-density requirements.
 
 ## Open questions
 

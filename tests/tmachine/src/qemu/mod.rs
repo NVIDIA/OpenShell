@@ -14,6 +14,6 @@ mod vm;
 pub use cleanup::until_signal;
 pub use install::install;
 pub use session::Session;
-pub use setup::setup;
+pub use setup::{setup, setup_layer_key};
 pub use test::test;
 pub use vm::ssh_port;

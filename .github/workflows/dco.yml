@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   DCOAssistant:
-    if: github.repository_owner == 'NVIDIA'
+    if: github.repository_owner == 'ai-openshell'
     runs-on: ubuntu-latest
     steps:
       - name: "DCO Assistant"
@@ -39,14 +39,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: "dco-signatures.json"
-          path-to-document: "https://github.com/NVIDIA/OpenShell/blob/main/DCO"
+          path-to-document: "https://github.com/ai-openshell/openshell/blob/main/DCO"
           branch: "signatures"
           allowlist: "dependabot[bot]"
           create-file-commit-message: "chore: create file to store dco signatures"
           signed-commit-message: "chore: $contributorName has signed the dco in #$pullRequestNo"
           custom-notsigned-prcomment: >-
             Thank you for your submission! We ask that $you sign our
-            [Developer Certificate of Origin](https://github.com/NVIDIA/OpenShell/blob/main/DCO)
+            [Developer Certificate of Origin](https://github.com/ai-openshell/openshell/blob/main/DCO)
             before we can accept your contribution. You can sign the DCO by
             adding a comment below using this text:
           custom-pr-sign-comment: ${{ env.DCO_SIGN_COMMENT }}

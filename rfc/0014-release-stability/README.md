@@ -3,8 +3,8 @@ authors:
   - "@drew"
 state: review
 links:
-  - https://github.com/NVIDIA/OpenShell/pull/2148
-  - https://github.com/NVIDIA/OpenShell/pull/2695
+  - https://github.com/ai-openshell/openshell/pull/2148
+  - https://github.com/ai-openshell/openshell/pull/2695
 ---
 
 # RFC 0014 - Alpha Exit Criteria and Stable Release Policy

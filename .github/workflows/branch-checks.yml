@@ -3,9 +3,7 @@ name: Branch Checks
 on:
   merge_group:
     types: [checks_requested]
-  push:
-    branches:
-      - "pull-request/[0-9]+"
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -18,42 +16,27 @@ permissions:
   packages: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  pr_metadata:
-    name: Resolve PR metadata
+  reviewer-roster:
+    name: Reviewer Roster
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-      base_sha: ${{ steps.gate.outputs.base_sha }}
-      pr_number: ${{ steps.pr-number.outputs.number }}
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - id: gate
-        uses: ./.github/actions/pr-gate
-
-      - id: pr-number
-        shell: bash
+      - name: Validate reviewer collaborator membership
         env:
-          PR_REF: ${{ github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = push ] && [[ "$PR_REF" =~ ^pull-request/([0-9]+)$ ]]; then
-            echo "number=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "number=0" >> "$GITHUB_OUTPUT"
-          fi
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 tasks/scripts/check_reviewer_collaborators.py --repo "$GH_REPO"
 
   compatibility-review:
     name: Compatibility Review (advisory)
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
       pull-requests: read
@@ -63,17 +46,17 @@ jobs:
       source_sha: ${{ github.sha }}
       base_ref: >-
         ${{ github.event.merge_group.base_sha
-            || needs.pr_metadata.outputs.base_sha
+            || github.event.pull_request.base.sha
             || format('refs/remotes/origin/{0}', github.event.repository.default_branch) }}
-      pr_number: ${{ fromJSON(needs.pr_metadata.outputs.pr_number) }}
+      pr_number: ${{ github.event.pull_request.number || 0 }}
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
 
   compatibility-comment:
     name: Comment on detected breaking changes
-    needs: [pr_metadata, compatibility-review]
+    needs: compatibility-review
     if: >-
-      ${{ !cancelled() && needs.pr_metadata.outputs.pr_number != '0'
+      ${{ !cancelled() && github.event_name == 'pull_request'
           && needs.compatibility-review.outputs.has_findings == 'true'
           && needs.compatibility-review.outputs.report_artifact != '' }}
     runs-on: ubuntu-latest
@@ -92,8 +75,8 @@ jobs:
       - name: Post new or materially updated findings
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          PR_NUMBER: ${{ needs.pr_metadata.outputs.pr_number }}
-          SOURCE_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
         with:
           script: |
             const fs = require('node:fs');
@@ -115,9 +98,7 @@ jobs:
 
   protobuf-compatibility:
     name: Protobuf Compatibility
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,12 +112,10 @@ jobs:
             ${{ github.event_name == 'workflow_dispatch'
                 && format('refs/remotes/origin/{0}', github.event.repository.default_branch)
                 || github.event.merge_group.base_sha
-                || needs.pr_metadata.outputs.base_sha }}
+                || github.event.pull_request.base.sha }}
 
   monitoring-changes:
     name: Detect monitoring mixin changes
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -151,7 +130,7 @@ jobs:
         id: changes
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.merge_group.base_sha || needs.pr_metadata.outputs.base_sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
@@ -172,12 +151,12 @@ jobs:
 
   monitoring:
     name: Monitoring Mixin
-    needs: [pr_metadata, monitoring-changes]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.monitoring-changes.outputs.changed == 'true'
-    runs-on: linux-amd64-cpu8
+    needs: monitoring-changes
+    if: needs.monitoring-changes.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -195,12 +174,10 @@ jobs:
 
   mise-lockfile:
     name: mise Lockfile
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -220,12 +197,10 @@ jobs:
 
   license-headers:
     name: License Headers
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -240,9 +215,7 @@ jobs:
 
   cargo-deny:
     name: Cargo Deny
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -270,9 +243,7 @@ jobs:
 
   rust-format:
     name: Rust format
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -294,15 +265,14 @@ jobs:
           cargo fmt --manifest-path tests/tmachine/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/runner/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/conformance/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/suites/continuity/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/drivers/podman/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/suites/features/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/support/Cargo.toml --all -- --check
 
   cargo-lockfiles:
     name: Cargo lockfiles
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -320,15 +290,13 @@ jobs:
 
   rust-lint:
     name: Rust lint (${{ matrix.system }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-amd64-cpu8
+          - runner: ubuntu-24.04
             system: x86_64-linux
-          - runner: linux-arm64-cpu8
+          - runner: ubuntu-24.04-arm
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -359,21 +327,20 @@ jobs:
           cargo clippy --locked --manifest-path tests/tmachine/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/runner/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/conformance/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/suites/continuity/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/drivers/podman/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/suites/features/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings
 
   rust-test:
     name: Rust test (${{ matrix.system }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-amd64-cpu8
+          - runner: ubuntu-24.04
             system: x86_64-linux
-          - runner: linux-arm64-cpu8
+          - runner: ubuntu-24.04-arm
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -456,11 +423,9 @@ jobs:
 
   rust-postgres-test:
     name: Rust PostgreSQL tests
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     # Bare runner: the test script starts a disposable PostgreSQL container
     # with the host's Docker.
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -486,15 +451,13 @@ jobs:
 
   rust-build-modes:
     name: Rust build modes (${{ matrix.system }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-amd64-cpu8
+          - runner: ubuntu-24.04
             system: x86_64-linux
-          - runner: linux-arm64-cpu8
+          - runner: ubuntu-24.04-arm
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -546,9 +509,7 @@ jobs:
 
   rust-feature-alias:
     name: Rust feature alias
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -571,9 +532,7 @@ jobs:
 
   rust-gateway-core-features:
     name: Rust gateway core features
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -598,9 +557,7 @@ jobs:
 
   rust-gateway-extended-features:
     name: Rust gateway extended features
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -624,16 +581,14 @@ jobs:
 
   python:
     name: Python (${{ matrix.runner }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -677,10 +632,9 @@ jobs:
     # add or change them. Deleting files is allowed (the removal PR). The paths
     # are the ones the import moved: all of python/ plus the two SDK build
     # scripts. The shared root pyproject.toml and uv.lock stay editable.
-    # Merge queue runs skip this job; the PR already passed it on its mirror.
+    # Merge queue runs skip this job; the PR already passed it.
     name: Python SDK Freeze
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true' && github.event_name == 'push'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -691,7 +645,7 @@ jobs:
 
       - name: Reject changes to the Python SDK
         env:
-          BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
@@ -708,12 +662,10 @@ jobs:
 
   markdown:
     name: Markdown
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -726,40 +678,42 @@ jobs:
       - name: Lint
         run: mise run markdown:lint
 
-  sdk-typescript:
-    name: TypeScript SDK
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+  typescript-sdk-freeze:
+    name: TypeScript SDK Freeze
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Check TypeScript SDK
-        run: mise run sdk:ts:ci
-
-      # Exercise the full release publish path (version stamp, dist-tag,
-      # prepublishOnly, tarball) without uploading. Uses the off-tag dev
-      # version, which validates the prerelease dist-tag branch too.
-      - name: Verify publishable artifact (dry-run)
+      - name: Reject changes to the TypeScript SDK
         env:
-          OPENSHELL_NPM_PUBLISH_ARGS: --dry-run
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
-            mise run sdk:ts:publish
+          set -euo pipefail
+          # The package is a stub that re-exports @ai-openshell/sdk. Its files stay
+          # editable so the stub and its moved notice can be maintained.
+          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- sdk/typescript \
+            ':(exclude)sdk/typescript/package.json' \
+            ':(exclude)sdk/typescript/README.md' \
+            ':(exclude)sdk/typescript/index.js' \
+            ':(exclude)sdk/typescript/index.d.ts' \
+            ':(exclude)sdk/typescript/raw.js' \
+            ':(exclude)sdk/typescript/raw.d.ts')
+          if [ -z "$changed" ]; then
+            echo "No added or changed TypeScript SDK files."
+            exit 0
+          fi
+          echo "::error title=TypeScript SDK moved::Open TypeScript SDK changes at https://github.com/ai-openshell/sdk-typescript. Drop sdk/typescript changes from this PR. Core proto changes need no TypeScript bindings here; sdk-typescript generates them from core releases."
+          echo "Changed TypeScript SDK files:"
+          echo "$changed"
+          exit 1
 
   install-script:
     name: install.sh
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

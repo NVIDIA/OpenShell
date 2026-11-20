@@ -434,9 +434,12 @@ fn probe_socket_virtualization() -> Result<()> {
         .into_diagnostic()
         .wrap_err("resolve socket probe executable")?;
     let sandbox_tgid = std::process::id();
-    let mut child_hardening = openshell_sandbox::linux::child_seccomp::prepare(sandbox_tgid)
-        .into_diagnostic()
-        .wrap_err("prepare socket probe child hardening")?;
+    // The probe listener below notifies only socket calls, so no broker checks
+    // scheduling or limit targets for this child.
+    let mut child_hardening =
+        openshell_sandbox::linux::child_seccomp::prepare_without_broker(sandbox_tgid)
+            .into_diagnostic()
+            .wrap_err("prepare socket probe child hardening")?;
     let (listener_tx, listener_rx) = mpsc::sync_channel::<std::io::Result<NotificationListener>>(1);
     let (child_tx, child_rx) = mpsc::sync_channel::<std::io::Result<std::process::Child>>(1);
     let launcher = std::thread::Builder::new()
@@ -2107,8 +2110,8 @@ mod tests {
         Ok(())
     }
 
-    /// The production child filter rejects every self-protection probe with
-    /// EPERM. Running `probe_child_self_protection` against that exact filter
+    /// The probe child's production filter rejects every self-protection probe
+    /// with EPERM. Running `probe_child_self_protection` against that exact filter
     /// keeps each hoisted probe result wired to its own errno check. The test
     /// re-executes itself in a fresh process so the rlimit and filter changes
     /// never touch the test harness process.
@@ -2123,7 +2126,7 @@ mod tests {
         prepare_probe_child().expect("prepare probe child");
         let tgid = std::process::id();
         let sandbox_tgid = libc::pid_t::try_from(tgid).expect("test pid fits pid_t");
-        let mut program = openshell_sandbox::linux::child_seccomp::prepare(tgid)
+        let mut program = openshell_sandbox::linux::child_seccomp::prepare_without_broker(tgid)
             .expect("prepare production child filter");
         program.install().expect("install production child filter");
         probe_child_self_protection(sandbox_tgid, -1)

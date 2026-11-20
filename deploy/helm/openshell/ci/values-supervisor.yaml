@@ -7,3 +7,6 @@
 gatewayConfig:
   openshell.drivers.kubernetes:
     supervisor_topology: gateway
+
+supervisor:
+  replicas: 1

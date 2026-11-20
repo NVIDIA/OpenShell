@@ -24,13 +24,13 @@ This keeps the complete access contract in one place:
 
 ## Define and Attach a Hosted Provider
 
-Start from the [NVIDIA example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/nvidia.yaml),
+Start from the [NVIDIA example profile](https://github.com/ai-openshell/openshell/blob/main/providers/nvidia.yaml),
 review its access, and import an edited copy under a new ID. A new gateway has
 no profiles to export. Download the example so you can add the Python paths
 used by this workload:
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/nvidia.yaml -o nvidia-native.yaml
+curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/providers/nvidia.yaml -o nvidia-native.yaml
 ```
 
 In `nvidia-native.yaml`, change `id` to `nvidia-native`, give the profile a
@@ -97,7 +97,7 @@ does not select or rewrite a model.
 The gateway resolves a provider against the profiles you imported, so a provider
 whose profile is missing fails at sandbox creation with a message naming the
 profile and the import command. Treat the example profiles in
-[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers) as
+[`providers/`](https://github.com/ai-openshell/openshell/tree/main/providers) as
 starting templates you copy and adapt, not as defaults.
 
 ## Attach a Provider to a Running Sandbox

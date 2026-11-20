@@ -379,6 +379,15 @@ message ResolvedBinaryIdentity {
   ExecutableIdentity executable = 1;
   repeated ExecutableIdentity ancestors = 2;
   repeated string cmdline_paths = 3;
+  // Audit context; never authorizes. Absent when the backend cannot observe it.
+  ProcessInstance process = 4;
+}
+// One process in the workload's PID namespace. The start time tells apart two
+// processes that had the same PID.
+message ProcessInstance {
+  uint32 pid = 1;
+  uint32 parent_pid = 2;
+  google.protobuf.Timestamp start_time = 3;
 }
 message BinaryIdentity {
   oneof result {

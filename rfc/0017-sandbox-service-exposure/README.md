@@ -4,17 +4,17 @@ authors:
   - "@TaylorMutch"
 state: draft
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/4266
-  - https://github.com/NVIDIA/OpenShell/pull/4267
-  - https://github.com/NVIDIA/OpenShell/issues/994
-  - https://github.com/NVIDIA/OpenShell/issues/1791
-  - https://github.com/NVIDIA/OpenShell/issues/4210
-  - https://github.com/NVIDIA/OpenShell/pull/4213
-  - https://github.com/NVIDIA/OpenShell/issues/1794
-  - https://github.com/NVIDIA/OpenShell/issues/3402
-  - https://github.com/NVIDIA/OpenShell/issues/4229
-  - https://github.com/NVIDIA/OpenShell/issues/2469
-  - https://github.com/NVIDIA/OpenShell/issues/3715
+  - https://github.com/ai-openshell/openshell/issues/4266
+  - https://github.com/ai-openshell/openshell/pull/4267
+  - https://github.com/ai-openshell/openshell/issues/994
+  - https://github.com/ai-openshell/openshell/issues/1791
+  - https://github.com/ai-openshell/openshell/issues/4210
+  - https://github.com/ai-openshell/openshell/pull/4213
+  - https://github.com/ai-openshell/openshell/issues/1794
+  - https://github.com/ai-openshell/openshell/issues/3402
+  - https://github.com/ai-openshell/openshell/issues/4229
+  - https://github.com/ai-openshell/openshell/issues/2469
+  - https://github.com/ai-openshell/openshell/issues/3715
 ---
 
 # RFC 0017 - Sandbox service exposure
@@ -186,7 +186,7 @@ Start with one sandbox per supervisor while preserving routing boundaries needed
 
 ## Prior art
 
-- #4266 and [PR #4267](https://github.com/NVIDIA/OpenShell/pull/4267) define the original requirements and options. This revision proposes supervisor listeners with an optional proxy.
+- #4266 and [PR #4267](https://github.com/ai-openshell/openshell/pull/4267) define the original requirements and options. This revision proposes supervisor listeners with an optional proxy.
 - [RFC 0012](../0012-isolation-backend/README.md) provides the protected loopback connector into each sandbox.
 - #994 and #1791 cover service declarations and Kubernetes ingress; #1794 and #3402 cover bearer handling and create-time exposure.
 - #4229 covers service health. #2469 and #3715 cover dedicated/shared ingress integrations.

@@ -17,6 +17,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::execute::{Run, Status};
 
 mod bundle;
+mod disruption;
 mod execute;
 mod test_env;
 
@@ -87,6 +88,11 @@ struct RunArgs {
     /// installers register `openshell`.
     #[arg(long, default_value = "openshell")]
     gateway: String,
+    /// For a continuity family: run each scenario's `seed` test, apply this
+    /// disruption to the environment, and then run each `verify` test, e.g.
+    /// `gateway-restart`.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["filter", "program"])]
+    disruption: Option<String>,
     /// Keep the VM running after the tests until Enter is pressed.
     #[arg(long)]
     keep: bool,
@@ -141,6 +147,11 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
     let results = std::path::absolute(&args.results)
         .with_context(|| format!("resolve {}", args.results.display()))?;
 
+    let disruption = args
+        .disruption
+        .as_deref()
+        .map(disruption::find)
+        .transpose()?;
     let mut filters = args.filter.clone();
     let bundle = if let Some(program) = &args.program {
         eprintln!("==> using the prebuilt {}", program.display());
@@ -172,6 +183,7 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
             filters: &filters,
             results: &results,
             keep: args.keep,
+            disruption,
         },
     )
     .await;

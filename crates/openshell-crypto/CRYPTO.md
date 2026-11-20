@@ -118,6 +118,11 @@ is migrated or deleted.
 The other wrappers in `deny.toml` cover dependency-owned operations: SSH,
 TLS/X.509/JWT, AWS SigV4, OAuth PKCE, database protocols, archive handling,
 artifact/content hashing, and implementation-to-implementation dependencies.
+
+RSA 0.10's `hmac` dependency implements HMAC-SHA256 fallback derivation for
+PKCS#1 v1.5 implicit rejection, mitigating timing attacks. The `rsa` wrapper
+allows this dependency-owned operation outside `openshell-crypto` backend dispatch.
+
 The existing Rustls/Ring exceptions support the Z3 downloader; wrapper rules
 constrain direct parents, not an entire ancestry exclusively to Z3. Dependency
 upgrades that introduce a new parent must receive review instead of automatically

@@ -143,7 +143,7 @@ async fn wait_for_sandbox_pod(name: &str, timeout_secs: u64) -> Result<(), Strin
 }
 
 // Disabled by default — not reachable from any project-controlled cluster
-// and brittle by design. See https://github.com/NVIDIA/OpenShell/issues/1597
+// and brittle by design. See https://github.com/ai-openshell/openshell/issues/1597
 // for the tracking issue context. Re-enable with `cargo test -- --ignored`
 // after the issues below are addressed.
 //

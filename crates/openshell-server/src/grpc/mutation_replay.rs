@@ -37,6 +37,9 @@ use crate::persistence::{
     ObjectType, PersistenceError, SetResourceVersion, Store, WriteCondition, current_time_ms,
 };
 
+/// Response header marking an answer served from a stored result.
+pub const REPLAYED_HEADER: &str = "openshell-replayed";
+
 const OBJECT_TYPE: &str = crate::persistence::MUTATION_ADMISSION_OBJECT_TYPE;
 const SWEEP_BATCH: u32 = 1000;
 // Bound work detached from request cancellation across all service instances.
@@ -317,11 +320,11 @@ async fn execute_owned<M: Mutation>(
                 return Err(replay_unavailable());
             }
             let success = previous.success.ok_or_else(uncertain)?;
-            let mut response = Response::new(M::restore(&state.store, success).await?);
-            response.metadata_mut().insert(
-                "openshell-replayed",
-                "true".parse().expect("static metadata"),
-            );
+            let output = M::restore(&state.store, success).await?;
+            let mut response = Response::new(output);
+            response
+                .metadata_mut()
+                .insert(REPLAYED_HEADER, "true".parse().expect("static metadata"));
             return Ok(response);
         }
         let payload = serde_json::to_vec(&admission)

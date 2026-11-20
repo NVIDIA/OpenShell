@@ -63,7 +63,7 @@
 # Other realms use their realm domain instead of oraclecloud.com: copy the
 # profile and add a matching endpoint entry. Signed OCI transports (API key
 # signing, security token, instance/resource principal, OKE workload identity)
-# need proxy-side request signing; see https://github.com/NVIDIA/OpenShell/issues/3879.
+# need proxy-side request signing; see https://github.com/ai-openshell/openshell/issues/3879.
 
 id: oci-genai
 display_name: OCI Generative AI

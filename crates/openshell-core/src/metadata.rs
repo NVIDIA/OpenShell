@@ -6,8 +6,8 @@
 //! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
 use crate::proto::{
-    ObjectForTest, Provider, Sandbox, SandboxStatus, SandboxWorkloadTemplate, ServiceEndpoint,
-    SshSession, Workspace, WorkspaceMember,
+    ObjectForTest, Provider, Sandbox, SandboxStatus, SandboxWorkloadTemplate, Secret,
+    ServiceEndpoint, SshSession, Workspace, WorkspaceMember,
 };
 use std::collections::HashMap;
 
@@ -144,6 +144,25 @@ impl ObjectWorkspace for SandboxWorkloadTemplate {
 
     fn requires_workspace() -> bool {
         true
+    }
+}
+
+// Implementations for Secret
+impl ObjectId for Secret {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for Secret {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl GetResourceVersion for Secret {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
     }
 }
 

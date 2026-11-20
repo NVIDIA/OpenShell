@@ -10,6 +10,8 @@ const CREATE: ActivityId = ActivityId::Open;
 const UPDATE: ActivityId = ActivityId::Reset;
 const DELETE: ActivityId = ActivityId::Fail;
 const OTHER: ActivityId = ActivityId::Other;
+/// API Activity Read (2).
+const READ: ActivityId = ActivityId::Close;
 
 macro_rules! openshell {
     ($method:literal) => {
@@ -45,7 +47,12 @@ const CATALOG: &[(&str, ActivityId)] = &[
     (openshell!("DeleteProviderProfile"), DELETE),
     (openshell!("ConfigureProviderRefresh"), UPDATE),
     (openshell!("DeleteProviderRefresh"), DELETE),
+    (openshell!("InlineProviderRefreshSecrets"), UPDATE),
     (openshell!("RotateProviderCredential"), UPDATE),
+    (openshell!("CreateSecret"), CREATE),
+    (openshell!("UpdateSecret"), UPDATE),
+    (openshell!("DeleteSecret"), DELETE),
+    (openshell!("RevealSecret"), READ),
     (openshell!("UpdateConfig"), UPDATE),
     (openshell!("ApproveDraftChunk"), UPDATE),
     (openshell!("ApproveAllDraftChunks"), UPDATE),
@@ -82,7 +89,13 @@ mod tests {
                     .is_some_and(|scope| scope.ends_with(":write"))
             })
             .collect();
-        let cataloged: BTreeSet<&str> = CATALOG.iter().map(|(path, ..)| *path).collect();
+        // Reads are audited only when they return secret values.
+        let audited_reads = BTreeSet::from([openshell!("RevealSecret")]);
+        let cataloged: BTreeSet<&str> = CATALOG
+            .iter()
+            .map(|(path, ..)| *path)
+            .filter(|path| !audited_reads.contains(path))
+            .collect();
 
         let missing: Vec<_> = write_scoped.difference(&cataloged).collect();
         let stale: Vec<_> = cataloged.difference(&write_scoped).collect();
@@ -95,7 +108,7 @@ mod tests {
             "audit catalog names RPCs that are not write-scoped: {stale:?}"
         );
         assert_eq!(
-            cataloged.len(),
+            cataloged.len() + audited_reads.len(),
             CATALOG.len(),
             "audit catalog lists an RPC twice"
         );

@@ -22,6 +22,8 @@ openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
+openshell-spiffe = { path = "../openshell-spiffe" }
+openshell-spire = { path = "../openshell-spire" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
@@ -40,6 +42,7 @@ libc = "0.2"
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tonic-reflection = { workspace = true }
+tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
@@ -72,7 +75,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
-# OpenTelemetry (OTLP trace and OCSF log export, opt-in via [openshell.gateway.otlp])
+# OpenTelemetry (OTLP export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -80,6 +83,7 @@ tracing-opentelemetry = { workspace = true }
 # Metrics
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+metrics-util = { workspace = true, features = ["registry"] }
 
 # Utilities
 base64 = { workspace = true }
@@ -99,10 +103,11 @@ sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 spiffe = { workspace = true }
 async-trait = "0.1"
+async-stream = "0.3"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.65.0"
+russh = "0.65.2"
 rand = { workspace = true }
 rand-ssh = { package = "rand", version = "0.10" }
 petname = "2"
@@ -121,7 +126,7 @@ default = ["telemetry"]
 telemetry = ["openshell-core/telemetry"]
 vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
-test-support = ["openshell-credential-issuer/test-support"]
+test-support = ["dep:tonic-prost", "openshell-credential-issuer/test-support"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
@@ -140,7 +145,7 @@ openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 base64 = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging"] }
 rcgen = { workspace = true }
-rsa = { version = "0.9", features = ["pem"] }
+rsa = "0.10"
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"

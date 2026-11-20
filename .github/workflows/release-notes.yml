@@ -131,7 +131,7 @@ jobs:
             ### Quick install
 
             ```bash
-            curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ inputs.release-tag }} sh
+            curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | OPENSHELL_VERSION=${{ inputs.release-tag }} sh
             ```
 
             ### Upgrade notes

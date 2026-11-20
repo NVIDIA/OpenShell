@@ -8,7 +8,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/ai-openshell/openshell"
 publish = false
 
 [lib]
@@ -30,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = { package = "noyalib", version = "0.0.53", default-features = false, features = ["std", "compat-serde-yaml"] }
 tempfile = "3"
-tokio = { version = "1.43", features = ["macros", "process", "rt", "time"] }
+tokio = { version = "1.43", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tonic = "0.14"
 
 [target.'cfg(unix)'.dependencies]

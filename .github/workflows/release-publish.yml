@@ -27,10 +27,6 @@ on:
         description: Release version without the v prefix
         required: true
         type: string
-      npm-version:
-        description: TypeScript package version
-        required: true
-        type: string
     secrets:
       BUF_TOKEN:
         required: false
@@ -51,7 +47,7 @@ defaults:
 jobs:
   assemble:
     name: Assemble Release Assets
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -190,7 +186,7 @@ jobs:
   tag-ghcr-release:
     name: Publish GHCR Images
     needs: assemble
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
@@ -317,7 +313,7 @@ jobs:
   release:
     name: Publish Release Assets
     needs: [assemble, release-helm]
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -529,20 +525,6 @@ jobs:
     secrets:
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
-  publish-sdk-typescript:
-    name: Publish TypeScript SDK
-    needs: release
-    if: ${{ !inputs.is-prerelease }}
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/sdk-typescript-publish.yml
-    with:
-      release-tag: ${{ inputs.release-tag }}
-      source-ref: ${{ inputs.source-sha }}
-      npm-version: ${{ inputs.npm-version }}
-      make-latest: ${{ inputs.make-latest }}
-
   # GitHub treats skipped jobs as passing, so a publisher that never ran would
   # leave the run green. Fail when any publisher expected for this release kind
   # did not succeed, so callers' failure notifications fire.
@@ -555,7 +537,6 @@ jobs:
       - release
       - publish-snap
       - publish-prerelease-snap
-      - publish-sdk-typescript
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -570,11 +551,8 @@ jobs:
           expected=(assemble tag-ghcr-release release-helm release)
           if [[ "${IS_PRERELEASE}" == "true" ]]; then
             expected+=(publish-prerelease-snap)
-          else
-            expected+=(publish-sdk-typescript)
-            if [[ "${MAKE_LATEST}" == "true" ]]; then
-              expected+=(publish-snap)
-            fi
+          elif [[ "${MAKE_LATEST}" == "true" ]]; then
+            expected+=(publish-snap)
           fi
           failed=0
           for job in "${expected[@]}"; do

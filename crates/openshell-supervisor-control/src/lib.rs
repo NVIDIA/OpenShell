@@ -19,6 +19,8 @@
 //!   driver is handed: validated persist-before-assign launches, recovery
 //!   from durable records, and interpretation of observations.
 //! - [`credential`]: delivery of the supervisor token with retry.
+//! - [`pool_limits`]: the configured size of a pool and its members, shared
+//!   by the gateway and every member.
 //!
 //! The private wire protocol is generated in `openshell-core` and re-exported
 //! as [`proto`]. The supervisor process consumes the registration and status
@@ -27,6 +29,7 @@
 pub mod controller;
 pub mod coordinator;
 pub mod credential;
+pub mod pool_limits;
 pub mod pool_timing;
 pub mod registration;
 pub mod status;
@@ -38,10 +41,9 @@ pub mod proto {
 }
 
 pub use controller::{
-    AssignmentError, ConnectedMember, HostIdentity, InstanceOwner, MAX_ASSIGNED_INSTANCES,
-    MAX_POOL_INSTANCES, MAX_REPORTED_INSTANCES, MemberReport, MemberView, ObservedInstance,
-    POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_RANGE, POOL_RECOVERY_TIMEOUT_SECS, PoolView,
-    SupervisorCredential, SupervisorHostController,
+    AssignmentError, ConnectedMember, HostIdentity, InstanceOwner, MemberReport, MemberView,
+    ObservedInstance, POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_RANGE,
+    POOL_RECOVERY_TIMEOUT_SECS, PoolView, SupervisorCredential, SupervisorHostController,
 };
 pub use coordinator::{
     InstancePlacement, InstanceSupervision, LaunchError, PlacementFuture, PlacementRequest,
@@ -50,6 +52,10 @@ pub use coordinator::{
 pub use credential::deliver_credentials;
 /// Recovery deadlines, in seconds, a supervisor may offer a sandbox runtime.
 pub use openshell_sandbox_backend::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE;
+pub use pool_limits::{
+    DEFAULT_MAX_INSTANCES_PER_MEMBER, DEFAULT_MAX_MEMBERS_PER_GATEWAY, MAX_INSTANCES_PER_MEMBER,
+    MAX_POOL_INSTANCES_CEILING, PoolLimits, PoolLimitsError,
+};
 pub use registration::{
     INSTANCE_REMOVAL_GRACE, MAX_LAUNCH_MATERIAL_BYTES, ProxyCaMaterial, RegistrationError,
     RegistrationTraceContext, SandboxInstanceRegistration, SecretPem,
