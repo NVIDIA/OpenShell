@@ -1,8 +1,0 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-# Contributor agent harness tasks
-
-["agents:setup"]
-description = "Generate local Claude Code and OpenCode adapters from .agents/"
-run = "uv run --no-project python tasks/scripts/agent_adapters.py"

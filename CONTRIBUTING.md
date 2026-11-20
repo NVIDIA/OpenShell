@@ -97,8 +97,6 @@ Public skills use `openshell --help` for installed command syntax and published 
 
 Contributor and maintainer skills live in `.agents/skills/`. They are marked internal so the Agent Skills CLI excludes them from ordinary public discovery, but repository-aware agent harnesses can discover and load them natively. Internal metadata is a discovery filter, not an access-control boundary.
 
-Codex and OpenCode read `.agents/skills/` directly. Claude Code reads only `.claude/`, and OpenCode reads sub-agents only from `.opencode/`. Both directories are ignored; run `mise run agents:setup` to generate the Claude Code skills link and the [principal engineer reviewer](.agents/agents/principal-engineer-reviewer/README.md) sub-agent for both tools. Rerun it after pulling changes to `.agents/agents/`.
-
 | Category        | Skill                     | Purpose                                                                                             |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |

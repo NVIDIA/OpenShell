@@ -32,7 +32,6 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 | CI diagnostics | `watch-github-actions` |
 | Native Windows builds, runtime, or release branch guidance | `build-openshell-mxc-windows`; keep Windows implementation links on `windows` even in docs merged to `main` |
 | Gator supervision | `launch-openshell-gator` |
-| Sub-agent prompts or harness adapters in `.agents/agents/` | `launch-openshell-gator`; run `mise run test:agent-adapters` and keep `tasks/scripts/agent_adapters.py` and the Gator manifest pointed at the canonical prompt |
 | SBOM workflow | `sbom` |
 | RFC workflow | `create-rfc` |
 
