@@ -21,9 +21,9 @@ use openshell_core::{Error, Result};
 #[cfg(unix)]
 use openshell_otel::TraceContextInterceptor;
 use openshell_server::AcquiredRemoteDriverEndpoint;
-#[cfg(unix)]
-use openshell_server::ManagedDriverProcess;
 use openshell_server::config_file::OtlpConfig;
+#[cfg(unix)]
+use openshell_server::{DriverProcessState, ManagedDriverProcess};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -306,6 +306,7 @@ pub async fn launch(
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     let name = driver.name;
     let driver_bin = resolve_driver_bin(driver)?;
+    check_driver_binary_trust(&driver_bin, current_euid())?;
     let socket_path = socket_path(driver);
     prepare_socket_path(driver, &socket_path)?;
 
@@ -334,9 +335,94 @@ pub async fn launch(
     remove_startup_document(&startup_path);
     let channel = ready?;
     let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
+    watch_for_exit(
+        Arc::downgrade(&process),
+        name.to_string(),
+        EXIT_POLL_INTERVAL,
+        |message| {
+            tracing::error!("{message}");
+            std::process::exit(1);
+        },
+    );
     Ok(AcquiredRemoteDriverEndpoint::managed(
         name, channel, process,
     ))
+}
+
+#[cfg(unix)]
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Call `on_exit` with a message naming the driver if the process ends while
+/// the gateway still holds it. A driver the gateway shut down is not reported.
+/// The gateway cannot serve sandboxes without its driver, so the caller exits
+/// and leaves a restart to the init system.
+#[cfg(unix)]
+fn watch_for_exit(
+    process: std::sync::Weak<ManagedDriverProcess>,
+    name: String,
+    interval: Duration,
+    on_exit: impl FnOnce(String) + Send + 'static,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(process) = process.upgrade() else {
+                return;
+            };
+            match process.poll_exit() {
+                DriverProcessState::Running => {}
+                DriverProcessState::Released => return,
+                DriverProcessState::Exited(status) => {
+                    on_exit(format!(
+                        "{name} compute driver exited unexpectedly with status {status}"
+                    ));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Refuse a driver binary, or the directory that holds it, that another user
+/// could replace: it must be owned by the gateway's effective user or root and
+/// must not be group- or world-writable.
+#[cfg(unix)]
+fn check_driver_binary_trust(binary: &Path, expected_uid: u32) -> Result<()> {
+    let binary = binary.canonicalize().map_err(|error| {
+        Error::config(format!(
+            "failed to resolve compute driver binary '{}': {error}",
+            binary.display()
+        ))
+    })?;
+    let directory = binary.parent().ok_or_else(|| {
+        Error::config(format!(
+            "compute driver binary '{}' has no parent directory",
+            binary.display()
+        ))
+    })?;
+    for (label, path) in [("binary", binary.as_path()), ("directory", directory)] {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            Error::config(format!(
+                "failed to inspect compute driver {label} '{}': {error}",
+                path.display()
+            ))
+        })?;
+        if metadata.uid() != expected_uid && metadata.uid() != 0 {
+            return Err(Error::config(format!(
+                "compute driver {label} '{}' is owned by uid {}, not root or the gateway's uid {expected_uid}",
+                path.display(),
+                metadata.uid()
+            )));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(Error::config(format!(
+                "compute driver {label} '{}' is group- or world-writable (mode {mode:o})",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// File name of the startup document, written beside the driver socket in its
@@ -488,14 +574,17 @@ async fn connect_compute_driver(name: &str, socket_path: &Path) -> Result<Channe
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        DriverProcess, apply_trace_headers_env, current_euid, prepare_socket_path,
-        prepare_state_dir, resolve_driver_bin, resolve_driver_search_dirs, socket_path,
-        startup_document_path, write_startup_document,
+        DriverProcess, apply_trace_headers_env, check_driver_binary_trust, current_euid,
+        prepare_socket_path, prepare_state_dir, resolve_driver_bin, resolve_driver_search_dirs,
+        socket_path, startup_document_path, watch_for_exit, write_startup_document,
     };
+    use openshell_server::ManagedDriverProcess;
     use openshell_server::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     /// Owned inputs for a [`DriverProcess`] in tests.
@@ -791,5 +880,105 @@ mod tests {
 
         drop(listener);
         assert!(!socket_path.exists());
+    }
+
+    fn driver_binary(dir: &Path, binary_mode: u32, dir_mode: u32) -> PathBuf {
+        let binary = dir.join("openshell-driver-test");
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(binary_mode)).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(dir_mode)).unwrap();
+        binary
+    }
+
+    #[test]
+    fn a_driver_binary_owned_by_the_gateway_user_is_trusted() {
+        let dir = tempdir().unwrap();
+        let binary = driver_binary(dir.path(), 0o755, 0o755);
+        check_driver_binary_trust(&binary, current_euid()).unwrap();
+    }
+
+    #[test]
+    fn a_writable_driver_binary_or_directory_is_refused() {
+        let dir = tempdir().unwrap();
+        for (binary_mode, dir_mode, what) in [(0o775, 0o755, "binary"), (0o757, 0o755, "binary")] {
+            let binary = driver_binary(dir.path(), binary_mode, dir_mode);
+            let error = check_driver_binary_trust(&binary, current_euid()).unwrap_err();
+            assert!(error.to_string().contains(what), "{error}");
+            assert!(error.to_string().contains("writable"), "{error}");
+        }
+        let binary = driver_binary(dir.path(), 0o755, 0o777);
+        let error = check_driver_binary_trust(&binary, current_euid()).unwrap_err();
+        assert!(error.to_string().contains("directory"), "{error}");
+        assert!(error.to_string().contains("writable"), "{error}");
+    }
+
+    #[test]
+    fn a_driver_binary_owned_by_another_user_is_refused() {
+        let dir = tempdir().unwrap();
+        let binary = driver_binary(dir.path(), 0o755, 0o755);
+        // The binary is owned by the test user, so pretend the gateway runs as
+        // someone else. Root-owned files remain acceptable, so skip as root.
+        if current_euid() == 0 {
+            return;
+        }
+        let error = check_driver_binary_trust(&binary, current_euid() + 1).unwrap_err();
+        assert!(error.to_string().contains("owned by uid"), "{error}");
+    }
+
+    fn spawn_sleeper(seconds: &str) -> tokio::process::Child {
+        tokio::process::Command::new("sleep")
+            .arg(seconds)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_exits_after_it_was_ready_is_reported_by_name() {
+        let dir = tempdir().unwrap();
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let process = Arc::new(ManagedDriverProcess::new(child, dir.path().join("d.sock")));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        watch_for_exit(
+            Arc::downgrade(&process),
+            "vm".to_string(),
+            Duration::from_millis(10),
+            move |message| {
+                let _ = sender.send(message);
+            },
+        );
+        let message = tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            message.contains("vm compute driver exited unexpectedly"),
+            "{message}"
+        );
+        assert!(message.contains("exit status: 3"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_running_driver_is_not_reported() {
+        let dir = tempdir().unwrap();
+        let process = Arc::new(ManagedDriverProcess::new(
+            spawn_sleeper("30"),
+            dir.path().join("d.sock"),
+        ));
+        let (sender, mut receiver) = tokio::sync::oneshot::channel::<String>();
+        watch_for_exit(
+            Arc::downgrade(&process),
+            "vm".to_string(),
+            Duration::from_millis(10),
+            move |message| {
+                let _ = sender.send(message);
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(receiver.try_recv().is_err());
+        drop(process);
     }
 }

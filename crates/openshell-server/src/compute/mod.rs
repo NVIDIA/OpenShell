@@ -560,6 +560,17 @@ const ORPHAN_GRACE_PERIOD: Duration = Duration::from_mins(5);
 // Re-export the shared error type under the name used by this module.
 pub use openshell_core::ComputeDriverError as ComputeError;
 
+/// State of a gateway-managed driver process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverProcessState {
+    Running,
+    /// The process ended without the gateway asking it to. Carries the exit
+    /// status.
+    Exited(String),
+    /// The gateway took the process to shut it down.
+    Released,
+}
+
 #[derive(Debug)]
 pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
@@ -572,6 +583,22 @@ impl ManagedDriverProcess {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
+        }
+    }
+
+    /// Report whether the driver process is still running, without waiting.
+    #[cfg(unix)]
+    pub fn poll_exit(&self) -> DriverProcessState {
+        let Ok(mut guard) = self.child.lock() else {
+            return DriverProcessState::Released;
+        };
+        let Some(child) = guard.as_mut() else {
+            return DriverProcessState::Released;
+        };
+        match child.try_wait() {
+            Ok(None) => DriverProcessState::Running,
+            Ok(Some(status)) => DriverProcessState::Exited(status.to_string()),
+            Err(error) => DriverProcessState::Exited(format!("status unavailable: {error}")),
         }
     }
 
