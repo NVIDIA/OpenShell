@@ -3,3 +3,5 @@
 
 ---
 oidc_gateway_operator_script: /usr/local/libexec/openshell-test/operator-client-cert
+# OPENSHELL_LOCAL_TLS_DIR in the packaged gateway's unit.
+oidc_gateway_tls_dir: "{{ openshell_gateway_home }}/.local/state/openshell/tls"

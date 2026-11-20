@@ -36,6 +36,15 @@
       [openshell.gateway.mtls_auth]
       operator_enabled = true
 
+      # `config preflight` accepts operator authentication only with an
+      # explicit client CA; it doesn't use the local TLS files the packaged
+      # gateway otherwise finds on its own. These are the paths
+      # `generate-certs` writes to.
+      [openshell.gateway.tls]
+      cert_path = "{{ oidc_gateway_tls_dir }}/server/tls.crt"
+      key_path = "{{ oidc_gateway_tls_dir }}/server/tls.key"
+      client_ca_path = "{{ oidc_gateway_tls_dir }}/ca.crt"
+
 - name: Create the test scripts directory
   become: true
   ansible.builtin.file:
