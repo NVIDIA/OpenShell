@@ -16,6 +16,8 @@ compile_error!(
      build a telemetry-free gateway with `--no-default-features --features defaults-without-telemetry`"
 );
 
+pub mod startup_document;
+
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 mod vm;
 

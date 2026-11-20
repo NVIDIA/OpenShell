@@ -4893,6 +4893,7 @@ dependencies = [
  "openshell-driver-kubernetes",
  "openshell-driver-mxc",
  "openshell-driver-podman",
+ "openshell-driver-sdk",
  "openshell-otel",
  "openshell-policy",
  "openshell-server",
