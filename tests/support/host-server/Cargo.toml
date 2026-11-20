@@ -22,4 +22,5 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 tungstenite = "0.26"
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1.43", features = ["macros", "rt"] }

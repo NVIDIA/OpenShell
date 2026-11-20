@@ -225,7 +225,8 @@ impl HttpRecorder {
                     match tls {
                         None => respond(stream, local_addr, handler, requests).await,
                         Some(tls) => {
-                            if let Ok(stream) = tls.accept(stream).await {
+                            let handshake = tokio::time::timeout(READ_TIMEOUT, tls.accept(stream));
+                            if let Ok(Ok(stream)) = handshake.await {
                                 respond(stream, local_addr, handler, requests).await;
                             }
                         }

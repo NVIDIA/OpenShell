@@ -12,7 +12,9 @@ tests to read. A tmachine environment publishes its variables with
 `tests/tmachine/ansible/playbooks/test-env.yaml`, and `openshell-test-runner`
 passes them to the tests. To run a suite against your own deployment, set them
 yourself. A fixture fails the test when a variable it needs is missing; it
-never skips it. Add a row when you add a variable.
+never skips it. Add a row when you add a variable. The runner also sets
+`OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, which testkit reads; see
+[Running against a gateway](../testkit/README.md#running-against-a-gateway).
 
 | Variable | Set by | Read by | Meaning |
 |---|---|---|---|
@@ -27,7 +29,7 @@ never skips it. Add a row when you add a variable.
 | `OPENSHELL_TEST_OTLP_ENDPOINT` | `<podman base>-otlp` | `otlp-support` | The collector endpoint in the gateway's `[openshell.gateway.otlp]`, which also enables the agent trace relay. Tests check that sandboxes never see it. |
 | `OPENSHELL_TEST_SPIFFE_GATEWAY_LISTEN` | `<podman base>-spiffe` (`playbooks/spiffe.yaml`) | `spiffe-support` | The Unix socket the test's gateway Workload API listens on. The gateway's `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET` names it. |
 | `OPENSHELL_TEST_SPIFFE_SUPERVISOR_LISTEN` | `<podman base>-spiffe` | `spiffe-support` | The TCP address the test's supervisor Workload API listens on, such as `0.0.0.0:17690`. The driver's `provider_spiffe_workload_api_socket` reaches it as `tcp:127.0.0.1:<port>`. |
-| `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | `<base>-additional-ca` (`playbooks/additional-ca.yaml`), which configures the gateway's `additional_ca_bundle` | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the gateway trusts. |
+| `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | `<base>-additional-ca` (`playbooks/additional-ca.yaml`), which sets the driver's `additional_ca_bundle` | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the supervisor trusts for sandbox egress. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | `<base>-additional-ca` | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |
 | `OPENSHELL_TEST_PYTHON_IMAGE` | Optional; `e2e/rust/e2e-kubernetes.sh` and `e2e-vm.sh` set a pullable image | `testkit::python_image()` | The workload image for tests that run `python3`, curl, git or openssl. Unset, it is `openshell/e2e-python:dev`, which the tmachine installers load. |
@@ -39,11 +41,11 @@ purpose: unit-test child-process markers, the re-entry markers in
 `tests/support/environment.rs`, Nix guest-cache settings, `install.sh` test
 hooks and crate test settings.
 
-### Addresses the environment chooses
+### Ports the environment chooses
 
-When a test must listen on an address the environment picked, because the
-gateway or another service is configured to call it, the environment
-publishes it as `OPENSHELL_TEST_<SERVICE>_LISTEN` and the test binds it, for
-example with `HttpRecorder::builder().port(port)` from `host-server-support`.
-The test never picks the address itself. Tests that bind the same address can't
-run at the same time.
+When a test must listen on a port the environment picked, because the gateway
+or another service is configured to call it, the environment publishes it as
+`OPENSHELL_TEST_<SERVICE>_PORT` and the test binds that port on every host
+address, for example with `HttpRecorder::builder().port(port)` from
+`host-server-support`. The test never picks the port itself. Tests that bind
+the same port can't run at the same time.

@@ -9,7 +9,7 @@
 //! - [`TestCa::new`] makes a CA that only the test knows, so nothing trusts it
 //!   unless the test hands over [`TestCa::cert_pem`].
 //! - [`TestCa::from_env`] loads the environment's additional CA, which the
-//!   gateway is configured to trust (`additional_ca_bundle`). The environment
+//!   supervisor trusts for sandbox egress (`additional_ca_bundle`). The environment
 //!   publishes the paths of its PEM certificate and key in
 //!   `OPENSHELL_TEST_ADDITIONAL_CA_CERT` and `OPENSHELL_TEST_ADDITIONAL_CA_KEY`.
 
@@ -82,9 +82,23 @@ impl TestCa {
             "parse the CA certificate {}",
             cert.display()
         )))?;
-        let key = KeyPair::from_pem(&key_pem)
+        let key_pair = KeyPair::from_pem(&key_pem)
             .map_err(failed(format!("parse the CA key {}", key.display())))?;
-        let issuer = pki::issuer_from_der(&der, key)
+        // issuer_from_der reads the certificate's metadata only, so check the
+        // key here rather than at the first client handshake.
+        let key_der = key_pair
+            .serialize_der()
+            .map_err(failed(format!("export the CA key {}", key.display())))?;
+        openshell_crypto::tls::try_server_builder()
+            .map_err(failed("build a TLS server configuration"))?
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], PrivateKeyDer::Pkcs8(key_der.into()))
+            .map_err(failed(format!(
+                "load the CA key {} with the CA certificate {}",
+                key.display(),
+                cert.display()
+            )))?;
+        let issuer = pki::issuer_from_der(&der, key_pair)
             .map_err(failed(format!("load the CA {}", cert.display())))?;
         Ok(Self { cert_pem, issuer })
     }
@@ -107,6 +121,8 @@ impl TestCa {
         params.distinguished_name.push(DnType::CommonName, first);
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        // Strict verifiers, such as Python 3.13 and later, require it.
+        params.use_authority_key_identifier_extension = true;
         let key = pki::generate_keypair().map_err(failed("generate a server key"))?;
         let cert = pki::signed_by_issuer(params, &key, &self.issuer)
             .map_err(failed(format!("sign a server certificate for {names:?}")))?;
@@ -178,6 +194,7 @@ mod tests {
     use std::path::PathBuf;
 
     use rustls::pki_types::ServerName;
+    use tempfile::TempDir;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
@@ -217,12 +234,10 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    fn write_ca(dir: &str) -> (PathBuf, PathBuf, String) {
+    fn write_ca(dir: &TempDir) -> (PathBuf, PathBuf, String) {
         let key = pki::generate_keypair().unwrap();
         let cert = pki::self_signed(ca_params(), &key).unwrap();
-        let dir = std::env::temp_dir().join(format!("{dir}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (cert_path, key_path) = (dir.join("ca.pem"), dir.join("ca-key.pem"));
+        let (cert_path, key_path) = (dir.path().join("ca.pem"), dir.path().join("ca-key.pem"));
         std::fs::write(&cert_path, cert.pem()).unwrap();
         std::fs::write(&key_path, key.serialize_pem().unwrap()).unwrap();
         (cert_path, key_path, cert.pem())
@@ -269,7 +284,8 @@ mod tests {
 
     #[tokio::test]
     async fn from_vars_loads_the_environment_ca() {
-        let (cert, key, cert_pem) = write_ca("host-server-env-ca");
+        let dir = TempDir::new().unwrap();
+        let (cert, key, cert_pem) = write_ca(&dir);
         let ca = TestCa::from_vars(|name| match name {
             ADDITIONAL_CA_CERT_ENV => Some(cert.display().to_string()),
             ADDITIONAL_CA_KEY_ENV => Some(key.display().to_string()),
@@ -298,6 +314,30 @@ mod tests {
         assert!(
             error.to_string().contains(ADDITIONAL_CA_CERT_ENV),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn from_files_rejects_a_key_from_another_ca() {
+        let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (cert, _, _) = write_ca(&a);
+        let (_, other_key, _) = write_ca(&b);
+        let error = TestCa::from_files(&cert, &other_key).err().unwrap();
+        assert!(
+            error.to_string().contains("with the CA certificate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn leaf_names_its_issuer_key() {
+        const AUTHORITY_KEY_IDENTIFIER: &[u8] = &[0x06, 0x03, 0x55, 0x1d, 0x23];
+        let leaf = TestCa::new().unwrap().leaf(&["localhost"]).unwrap();
+        assert!(
+            leaf.cert_der
+                .windows(AUTHORITY_KEY_IDENTIFIER.len())
+                .any(|window| window == AUTHORITY_KEY_IDENTIFIER),
+            "the server certificate has no authority key identifier"
         );
     }
 
