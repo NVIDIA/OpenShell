@@ -149,7 +149,9 @@ tramp
 /docs/superpowers/
 .codex/
 .pi/
-.claude/
+# Track only the link Claude Code needs to find `.agents/skills`.
+.claude/*
+!.claude/skills
 .opencode/
 
 # =============================================================================
