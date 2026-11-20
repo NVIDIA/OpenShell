@@ -59,6 +59,39 @@ pub fn is_available() -> bool {
     result.available
 }
 
+/// Have the Podman driver validate the document the gateway would launch it
+/// with. Values the gateway only knows once it serves, such as its TLS CA and
+/// the staged network trust bundle, are left out.
+pub fn preflight(
+    gateway_log_level: &str,
+    gateway_name: &str,
+    gateway_port: u16,
+    driver_config: toml::Table,
+) -> Result<()> {
+    let state_dir = default_state_dir();
+    let process = DriverProcess {
+        name: "podman",
+        binary_name: DRIVER_BIN_NAME,
+        driver_dir: None,
+        driver_dir_key: None,
+        state_dir: &state_dir,
+    };
+    launcher::preflight(&process, launcher::PREFLIGHT_TIMEOUT, |socket_path| {
+        podman_startup_document(
+            PodmanLaunch {
+                gateway_log_level,
+                gateway_name,
+                gateway_port,
+                tls_ca: None,
+                otlp_config: None,
+                network_trust: None,
+                driver_config,
+            },
+            socket_path,
+        )
+    })
+}
+
 /// Launch the Podman driver and return a managed endpoint for it.
 pub async fn spawn(launch: PodmanLaunch<'_>) -> Result<AcquiredRemoteDriverEndpoint> {
     let state_dir = default_state_dir();

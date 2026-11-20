@@ -99,6 +99,41 @@ pub async fn spawn(launch: VmLaunch<'_>) -> Result<AcquiredRemoteDriverEndpoint>
     .await
 }
 
+/// Have the VM driver validate the document the gateway would launch it with.
+/// Values the gateway only knows once it serves, such as its TLS CA and the
+/// staged network trust bundle, are left out.
+pub fn preflight(
+    gateway_log_level: &str,
+    gateway_name: &str,
+    gateway_port: u16,
+    driver_config: toml::Table,
+) -> Result<()> {
+    let settings = VmLaunchSettings::from_table(&driver_config)?;
+    let state_dir = settings.state_dir();
+    let process = DriverProcess {
+        name: "vm",
+        binary_name: DRIVER_BIN_NAME,
+        driver_dir: settings.driver_dir.as_deref(),
+        driver_dir_key: Some(DRIVER_DIR_KEY),
+        state_dir: &state_dir,
+    };
+    launcher::preflight(&process, launcher::PREFLIGHT_TIMEOUT, |socket_path| {
+        vm_startup_document(
+            VmLaunch {
+                gateway_log_level,
+                gateway_name,
+                gateway_port,
+                tls_ca: None,
+                otlp_config: None,
+                network_trust: None,
+                settings: &settings,
+                driver_config,
+            },
+            socket_path,
+        )
+    })
+}
+
 /// The VM driver's `[driver_config]`: the operator's table, passed through,
 /// without the launcher-owned `driver_dir`.
 fn vm_driver_config_table(mut table: toml::Table) -> toml::Table {

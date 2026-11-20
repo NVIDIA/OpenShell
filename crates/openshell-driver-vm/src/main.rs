@@ -283,8 +283,34 @@ struct Args {
     vm_mount: Vec<String>,
 }
 
+/// `preflight --config <path>` validates the startup document's configuration
+/// and reports on stdout. It starts nothing and creates no state.
+fn run_preflight(arguments: &[std::ffi::OsString]) -> ! {
+    use openshell_driver_sdk::preflight::PreflightResult;
+
+    let result = match arguments {
+        [flag, path] if flag == "--config" => {
+            match parse_args_from([
+                std::ffi::OsString::from("openshell-driver-vm"),
+                flag.clone(),
+                path.clone(),
+            ]) {
+                Ok(_) => PreflightResult::ok(),
+                Err(error) => PreflightResult::rejected(error.message()),
+            }
+        }
+        _ => PreflightResult::rejected("usage: preflight --config <path>"),
+    };
+    println!("{}", result.to_json());
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "preflight") {
+        run_preflight(&arguments[1..]);
+    }
     let args = parse_args().map_err(|err| miette::miette!("{err}"))?;
     if let Some(request) = args.internal_prepare_image {
         openshell_driver_vm::driver::run_image_preparation_worker(&request)
@@ -470,7 +496,6 @@ enum ArgsError {
     Config(String),
 }
 
-#[cfg(test)]
 impl ArgsError {
     fn message(&self) -> String {
         match self {

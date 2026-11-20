@@ -257,8 +257,27 @@ fn run_probe() -> ! {
     std::process::exit(0);
 }
 
+/// `preflight --config <path>` validates the startup document's configuration
+/// and reports on stdout. It starts nothing.
+fn run_preflight(arguments: &[std::ffi::OsString]) -> ! {
+    use openshell_driver_sdk::preflight::PreflightResult;
+
+    let result = match arguments {
+        [flag, path] if flag == "--config" => StartupDocument::read(std::path::Path::new(path))
+            .and_then(|document| config_from_document(&document))
+            .map_or_else(PreflightResult::rejected, |_| PreflightResult::ok()),
+        _ => PreflightResult::rejected("usage: preflight --config <path>"),
+    };
+    println!("{}", result.to_json());
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "preflight") {
+        run_preflight(&arguments[1..]);
+    }
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "probe") {
         if std::env::args_os().len() > 2 {
             return Err(miette::miette!("probe takes no arguments"));

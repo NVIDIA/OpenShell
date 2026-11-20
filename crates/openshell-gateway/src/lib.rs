@@ -476,14 +476,25 @@ struct PodmanFactory;
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for PodmanFactory {
-    // The driver validates its own configuration at startup. Validation
-    // without launching returns with the driver `preflight` command.
     fn supports_config_preflight(&self) -> bool {
-        false
+        true
     }
 
     fn supports_network_supervisor_trust(&self) -> bool {
         true
+    }
+
+    // The driver validates its own configuration through `preflight`.
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        podman::preflight(
+            context.gateway_log_level(),
+            context.gateway_name(),
+            context.gateway_port(),
+            context.driver_config()?,
+        )
     }
 
     async fn build(
@@ -515,10 +526,21 @@ struct VmFactory;
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for VmFactory {
-    // The driver validates its own configuration at startup. Validation
-    // without launching returns with the driver `preflight` command.
     fn supports_config_preflight(&self) -> bool {
-        false
+        true
+    }
+
+    // The driver validates its own configuration through `preflight`.
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        vm::preflight(
+            context.gateway_log_level(),
+            context.gateway_name(),
+            context.gateway_port(),
+            vm_driver_table(context)?,
+        )
     }
 
     async fn preflight_host_tools(

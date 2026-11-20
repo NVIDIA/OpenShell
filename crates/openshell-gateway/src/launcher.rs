@@ -354,6 +354,63 @@ pub async fn launch(
 #[cfg(unix)]
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Run `<binary> <args>` with no input and return its standard output.
+///
+/// The command gets `timeout` to exit successfully and may print at most
+/// `max_output` bytes. A command that fails, runs out of time, or prints more
+/// than that returns an error message.
+#[cfg(unix)]
+fn run_bounded(
+    binary: &Path,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+    max_output: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let mut child = std::process::Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to run '{}': {error}", binary.display()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Err(error) => return Err(format!("failed to wait for the process: {error}")),
+        }
+    };
+    if !status.success() {
+        return Err(format!("exited with {status}"));
+    }
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(max_output as u64 + 1)
+            .read_to_end(&mut output)
+            .map_err(|error| format!("failed to read output: {error}"))?;
+    }
+    Ok(output)
+}
+
+/// Resolve the driver binary and check that the gateway can trust it.
+#[cfg(unix)]
+fn trusted_driver_bin(driver: &DriverProcess<'_>) -> Result<PathBuf> {
+    let binary = resolve_driver_bin(driver)?;
+    check_driver_binary_trust(&binary, current_euid())?;
+    Ok(binary)
+}
+
 /// Run `<binary> probe` and report whether the driver is usable here.
 ///
 /// A missing or untrusted binary, a failed or timed-out probe, and oversized or
@@ -365,53 +422,81 @@ pub fn probe(
     timeout: Duration,
 ) -> openshell_driver_sdk::probe::ProbeResult {
     use openshell_driver_sdk::probe::{MAX_PROBE_OUTPUT_BYTES, ProbeResult};
-    use std::io::Read as _;
 
     let name = driver.name;
     let unavailable = |reason: String| ProbeResult::unavailable(format!("{name} driver: {reason}"));
-    let binary = match resolve_driver_bin(driver)
-        .and_then(|binary| check_driver_binary_trust(&binary, current_euid()).map(|()| binary))
-    {
+    let binary = match trusted_driver_bin(driver) {
         Ok(binary) => binary,
         Err(error) => return unavailable(error.to_string()),
     };
-    let mut child = match std::process::Command::new(&binary)
-        .arg("probe")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => return unavailable(format!("failed to run '{}': {error}", binary.display())),
+    let output = match run_bounded(
+        &binary,
+        &["probe".as_ref()],
+        timeout,
+        MAX_PROBE_OUTPUT_BYTES,
+    ) {
+        Ok(output) => output,
+        Err(error) => return unavailable(format!("probe {error}")),
     };
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return unavailable(format!("probe timed out after {}s", timeout.as_secs()));
-            }
-            Err(error) => return unavailable(format!("failed to wait for probe: {error}")),
-        }
-    };
-    if !status.success() {
-        return unavailable(format!("probe exited with {status}"));
-    }
-    let mut output = Vec::new();
-    if let Some(stdout) = child.stdout.take()
-        && let Err(error) = stdout
-            .take(MAX_PROBE_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut output)
-    {
-        return unavailable(format!("failed to read probe output: {error}"));
-    }
     ProbeResult::parse(&output).unwrap_or_else(unavailable)
+}
+
+/// How long `preflight` may take before the driver counts as failed.
+#[cfg(unix)]
+pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Have the driver validate the startup document it would receive, without
+/// starting it.
+///
+/// The document is the one [`launch`] would write, in a private temporary
+/// directory that is removed afterwards, so no driver state is created.
+///
+/// # Errors
+///
+/// Returns an error naming the driver when it cannot be run, fails, times out,
+/// prints unusable output, or rejects the configuration.
+#[cfg(unix)]
+pub fn preflight(
+    driver: &DriverProcess<'_>,
+    timeout: Duration,
+    build_document: impl FnOnce(&Path) -> Result<openshell_driver_sdk::StartupDocument>,
+) -> Result<()> {
+    use openshell_driver_sdk::preflight::{MAX_PREFLIGHT_OUTPUT_BYTES, PreflightResult};
+
+    let name = driver.name;
+    let binary = trusted_driver_bin(driver)?;
+    let directory = tempfile::Builder::new()
+        .prefix("openshell-preflight-")
+        .tempdir()
+        .map_err(|error| {
+            Error::execution(format!("failed to create preflight directory: {error}"))
+        })?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).map_err(
+        |error| Error::execution(format!("failed to restrict preflight directory: {error}")),
+    )?;
+    let document_path = directory.path().join(STARTUP_DOCUMENT_NAME);
+    let document = build_document(&directory.path().join(COMPUTE_DRIVER_SOCKET_NAME))?;
+    write_startup_document(&document_path, &document)?;
+    let output = run_bounded(
+        &binary,
+        &[
+            "preflight".as_ref(),
+            "--config".as_ref(),
+            document_path.as_os_str(),
+        ],
+        timeout,
+        MAX_PREFLIGHT_OUTPUT_BYTES,
+    )
+    .map_err(|error| Error::config(format!("{name} compute driver preflight {error}")))?;
+    let result = PreflightResult::parse(&output)
+        .map_err(|error| Error::config(format!("{name} compute driver: {error}")))?;
+    if result.ok {
+        Ok(())
+    } else {
+        Err(Error::config(result.error.unwrap_or_else(|| {
+            format!("{name} compute driver rejected its configuration")
+        })))
+    }
 }
 
 #[cfg(unix)]
@@ -1105,5 +1190,64 @@ mod tests {
             state_dir: &state,
         };
         assert!(!super::probe(&driver, Duration::from_secs(1)).available);
+    }
+
+    fn run_preflight(body: &str, timeout: Duration) -> openshell_core::Result<()> {
+        let dir = tempdir().unwrap();
+        probe_script(dir.path(), body);
+        let state = dir.path().join("state");
+        let driver = DriverProcess {
+            name: "test",
+            binary_name: "openshell-driver-test",
+            driver_dir: Some(dir.path()),
+            driver_dir_key: None,
+            state_dir: &state,
+        };
+        let result = super::preflight(&driver, timeout, |socket| {
+            assert_eq!(socket.file_name().unwrap(), "compute-driver.sock");
+            Ok(openshell_driver_sdk::StartupDocument::new(
+                openshell_driver_sdk::GatewayContext {
+                    bind_socket: socket.to_path_buf(),
+                    expected_peer_pid: 1,
+                    log_level: "info".into(),
+                    gateway_name: "g".into(),
+                    gateway_port: 8080,
+                    tls_ca: None,
+                    telemetry: openshell_driver_sdk::Telemetry::default(),
+                    network_trust: None,
+                },
+                toml::Table::new(),
+            ))
+        });
+        assert!(!state.exists(), "preflight must not create driver state");
+        result
+    }
+
+    #[test]
+    fn preflight_passes_the_document_and_reports_the_drivers_verdict() {
+        // The script checks it received `preflight --config <existing file>`
+        // whose mode is private.
+        let accepted = "test \"$1\" = preflight && test \"$2\" = --config && test -f \"$3\" && test \"$(ls -l \"$3\" | cut -c1-10)\" = -rw------- && echo '{\"ok\":true}'";
+        run_preflight(accepted, Duration::from_secs(10)).unwrap();
+
+        let error = run_preflight(
+            "echo '{\"ok\":false,\"error\":\"vcpus must be positive\"}'",
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("vcpus must be positive"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_broken_preflight_fails_and_names_the_driver() {
+        for body in ["exit 1", "echo nope", "sleep 30"] {
+            let error = run_preflight(body, Duration::from_millis(500))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("test compute driver"), "{body}: {error}");
+        }
     }
 }
