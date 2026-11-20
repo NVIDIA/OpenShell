@@ -543,8 +543,11 @@ jobs:
     needs: [release-dev, tag-ghcr-dev]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Only jobs in this environment can trade their OIDC token for the Quay robot.
+    environment: release
     permissions:
-      packages: write
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
