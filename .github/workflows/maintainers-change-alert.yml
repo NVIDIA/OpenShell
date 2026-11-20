@@ -20,7 +20,7 @@ concurrency:
 jobs:
   describe-change:
     name: Comment on the approver set change if MAINTAINERS.md has changed
-    if: github.repository_owner == 'NVIDIA'
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

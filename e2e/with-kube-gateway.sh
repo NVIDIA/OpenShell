@@ -43,7 +43,7 @@
 #     mirrors the Skaffold local-dev path.
 #   - Existing-context mode pulls from
 #     ${OPENSHELL_REGISTRY}/{gateway,sandbox,supervisor}:${IMAGE_TAG}
-#     (defaults: ghcr.io/nvidia/openshell, latest). CI sets IMAGE_TAG to the
+#     (defaults: ghcr.io/ai-openshell/openshell, latest). CI sets IMAGE_TAG to the
 #     commit SHA and preloads or publishes the images before running this script.
 #
 # Database backend scenarios:
@@ -1300,7 +1300,7 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   REGISTRY_VALUE="${OPENSHELL_REGISTRY:-openshell}"
   IMAGE_TAG_VALUE="${IMAGE_TAG:-e2e-${CLUSTER_NAME:-local}}"
 else
-  REGISTRY_VALUE="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+  REGISTRY_VALUE="${OPENSHELL_REGISTRY:-ghcr.io/ai-openshell/openshell}"
   IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
 fi
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"

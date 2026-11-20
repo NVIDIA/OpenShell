@@ -8,9 +8,6 @@ inputs:
   cluster-name:
     description: kind cluster name
     required: true
-  image-tag:
-    description: OpenShell image tag to load
-    required: true
   images:
     description: Space-separated OpenShell image components to load
     required: false
@@ -18,7 +15,7 @@ inputs:
   registry:
     description: Container registry and namespace
     required: false
-    default: ghcr.io/nvidia/openshell
+    default: ghcr.io/ai-openshell/openshell
   registry-username:
     description: Registry username
     required: true
@@ -103,7 +100,7 @@ runs:
           -o "$RUNNER_TEMP/calico.yaml"
         sed 's@192.168.0.0/16@10.244.0.0/16@g' "$RUNNER_TEMP/calico.yaml" > "$RUNNER_TEMP/calico-kind.yaml"
         # The kind node's containerd pulls Docker Hub anonymously and is rate
-        # limited. The host daemon pulls through the runner's registry mirror.
+        # limited. GitHub-hosted runners' Docker daemon is not.
         for component in cni node kube-controllers; do
           image="docker.io/calico/$component:$CALICO_VERSION"
           archive="$RUNNER_TEMP/calico-$component-linux-amd64.tar"
@@ -125,26 +122,13 @@ runs:
         kind get kubeconfig --name "$CLUSTER_NAME" > "$GITHUB_WORKSPACE/kubeconfig"
         chmod 600 "$GITHUB_WORKSPACE/kubeconfig"
 
-    - name: Load OpenShell images into kind
-      shell: bash
-      env:
-        CLUSTER_NAME: ${{ inputs.cluster-name }}
-        IMAGE_COMPONENTS: ${{ inputs.images }}
-        IMAGE_TAG: ${{ inputs.image-tag }}
-        REGISTRY: ${{ inputs.registry }}
-      run: |
-        set -euo pipefail
-        for component in $IMAGE_COMPONENTS; do
-          case "$component" in
-            gateway | sandbox | supervisor) ;;
-            *) echo "ERROR: unsupported OpenShell image component: $component" >&2; exit 1 ;;
-          esac
-          image="${REGISTRY}/${component}:${IMAGE_TAG}"
-          archive="${RUNNER_TEMP:-/tmp}/openshell-${component}-linux-amd64.tar"
-          docker pull --platform linux/amd64 "$image"
-          docker image save --platform linux/amd64 --output "$archive" "$image"
-          kind load image-archive "$archive" --name "$CLUSTER_NAME"
-        done
+    # The external-driver lane also inspects these images in the host daemon.
+    - name: Load OpenShell images into Docker and kind
+      uses: ./.github/actions/load-e2e-images
+      with:
+        images: ${{ inputs.images }}
+        kind-cluster: ${{ inputs.cluster-name }}
+        platform-arch: amd64
 
     - name: Preload default sandbox image into kind
       shell: bash

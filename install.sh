@@ -11,7 +11,7 @@
 set -e
 
 APP_NAME="openshell"
-REPO="NVIDIA/OpenShell"
+REPO="ai-openshell/openshell"
 GITHUB_URL="https://github.com/${REPO}"
 RELEASE_TAG="${OPENSHELL_VERSION:-}"
 RELEASE_ASSET_DIR=""

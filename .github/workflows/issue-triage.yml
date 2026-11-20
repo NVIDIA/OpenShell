@@ -10,7 +10,7 @@ permissions:
 jobs:
   label-non-maintainer-issues:
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'NVIDIA'
+    if: github.event.repository.fork == false
     steps:
       - name: Check contributor permissions
         id: contributor
