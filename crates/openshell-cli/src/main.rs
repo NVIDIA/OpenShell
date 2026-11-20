@@ -2780,15 +2780,20 @@ fn run_main() -> Result<()> {
 async fn run_async() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
-    let mut args = Cli::command().get_matches();
-    // A named command-line selection takes precedence over an endpoint
-    // inherited from another gateway. An explicit endpoint remains authoritative.
-    if args.value_source("gateway") == Some(clap::parser::ValueSource::CommandLine)
-        && args.value_source("gateway_endpoint") == Some(clap::parser::ValueSource::EnvVariable)
-    {
-        args.remove_one::<String>("gateway_endpoint");
-    }
-    let cli = Cli::from_arg_matches_mut(&mut args).unwrap_or_else(|err| err.exit());
+    let (cli, explicit_gateway) = {
+        let mut args = Cli::command().get_matches();
+        let explicit_gateway =
+            args.value_source("gateway") == Some(clap::parser::ValueSource::CommandLine);
+        if explicit_gateway
+            && args.value_source("gateway_endpoint") == Some(clap::parser::ValueSource::EnvVariable)
+        {
+            args.remove_one::<String>("gateway_endpoint");
+        }
+        (
+            Cli::from_arg_matches_mut(&mut args).unwrap_or_else(|err| err.exit()),
+            explicit_gateway,
+        )
+    };
 
     // Resolve colorization before anything is printed, so no command can emit
     // escape sequences into a pipe.
@@ -3853,7 +3858,7 @@ async fn run_async() -> Result<()> {
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::print_ssh_config(&ctx.name, &name, &cli.workspace);
+                            run::print_ssh_config(&ctx.name, &name, &cli.workspace)?;
                         }
                         SandboxCommands::Provider(command) => match command {
                             SandboxProviderCommands::List {
@@ -4325,22 +4330,33 @@ async fn run_async() -> Result<()> {
         }) => {
             if let Some(handle) = handoff {
                 let (grant, peer) = openshell_core::ssh_handoff::receive(&handle).await?;
-                let mut tls = tls.with_gateway_name(&grant.profile);
-                apply_auth(&mut tls, &grant.profile)?;
+                let mut tls = tls.with_gateway_name(&grant.gateway_name);
+                apply_auth(&mut tls, &grant.gateway_name)?;
                 openshell_cli::ssh::relay_prepared_ssh(grant, peer, &name, &cli.workspace, &tls)
                     .await?;
             } else {
                 // A saved profile resolves its own endpoint. A local --server
                 // can explicitly pair an endpoint with the chosen profile.
-                let endpoint = if gateway_name.is_some() {
-                    server
+                let (profile, endpoint) = if server.is_some() {
+                    (
+                        gateway_name.or_else(|| cli.gateway.filter(|_| explicit_gateway)),
+                        server,
+                    )
+                } else if gateway_name.is_some() {
+                    (gateway_name, None)
                 } else {
-                    server.or(cli.gateway_endpoint)
+                    (cli.gateway, cli.gateway_endpoint)
                 };
-                let ctx = resolve_gateway(&gateway_name.or(cli.gateway), &endpoint)?;
-                let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name)?;
-                run::sandbox_ssh_proxy_by_name(&ctx.endpoint, &name, &tls, &cli.workspace).await?;
+                let endpoint = match (profile, endpoint) {
+                    (None, Some(endpoint)) => endpoint,
+                    (profile, endpoint) => {
+                        let ctx = resolve_gateway(&profile, &endpoint)?;
+                        tls = tls.with_gateway_name(&ctx.name);
+                        apply_auth(&mut tls, &ctx.name)?;
+                        ctx.endpoint
+                    }
+                };
+                run::sandbox_ssh_proxy_by_name(&endpoint, &name, &tls, &cli.workspace).await?;
             }
         }
 

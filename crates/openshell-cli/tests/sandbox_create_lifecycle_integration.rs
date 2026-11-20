@@ -77,6 +77,8 @@ struct SandboxState {
     provisional_container_exit_sent: Arc<Notify>,
     ssh_session_failures_remaining: Arc<AtomicUsize>,
     ssh_session_requests: Arc<AtomicUsize>,
+    ssh_requests_with_cached_bearer: Arc<AtomicUsize>,
+    replace_after_first_ssh_revoke: Arc<AtomicBool>,
     ssh_session_revocations: Arc<AtomicUsize>,
     /// Reject token-less `ForwardTcp` inits the way a gateway that predates
     /// principal-authorized TCP forwards does.
@@ -91,6 +93,17 @@ struct SandboxState {
     template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
     template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
     template_delete_requests: Arc<Mutex<Vec<DeleteSandboxTemplateRequest>>>,
+}
+
+impl SandboxState {
+    fn ssh_sandbox_id(&self, name: &str) -> String {
+        if self.replace_after_first_ssh_revoke.load(Ordering::SeqCst)
+            && self.ssh_session_revocations.load(Ordering::SeqCst) > 0
+        {
+            return format!("replacement-{name}");
+        }
+        format!("id-{name}")
+    }
 }
 
 #[derive(Clone, Default)]
@@ -198,7 +211,7 @@ impl OpenShell for TestOpenShell {
         let name = request.name;
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: format!("id-{name}"),
+                id: self.state.ssh_sandbox_id(&name),
                 name,
                 created_time: None,
                 labels: HashMap::new(),
@@ -395,6 +408,16 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
+        if request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            == Some("Bearer cached-access-token")
+        {
+            self.state
+                .ssh_requests_with_cached_bearer
+                .fetch_add(1, Ordering::SeqCst);
+        }
         self.state
             .ssh_session_requests
             .fetch_add(1, Ordering::SeqCst);
@@ -409,7 +432,7 @@ impl OpenShell for TestOpenShell {
             return Err(Status::failed_precondition("sandbox is not ready"));
         }
         let request = request.into_inner();
-        let sandbox_id = format!("id-{}", request.sandbox);
+        let sandbox_id = self.state.ssh_sandbox_id(&request.sandbox);
         Ok(Response::new(CreateSshSessionResponse {
             sandbox_id,
             token: "test-token".to_string(),
@@ -920,23 +943,6 @@ fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "ssh", "#!/bin/sh\nexit 0\n")
 }
 
-// Run the generated proxy against the test gateway without an SSH handshake.
-fn install_proxying_ssh(dir: &TempDir) {
-    install_executable_script(
-        dir,
-        "ssh",
-        r#"#!/bin/sh
-for arg do
-  case "$arg" in
-    *--token*|*test-token*) exit 1 ;;
-    ProxyCommand=*) proxy=${arg#ProxyCommand=} ;;
-  esac
-done
-exec sh -c "exec $proxy" </dev/null
-"#,
-    );
-}
-
 fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "pgrep", "#!/bin/sh\nexit 1\n")
 }
@@ -1126,8 +1132,8 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --server https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --gateway-name test-gateway -o ExitOnForwardFailure=yes -o SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id -L $forward sandbox" > '@COMMAND_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --server https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --gateway-name test-gateway" -o ExitOnForwardFailure=yes -o "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id" -L "$forward" sandbox
+printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --sandbox $sandbox_name --workspace $workspace --handoff test-handle -o ExitOnForwardFailure=yes -o SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id -L $forward sandbox" > '@COMMAND_PATH@'
+exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --sandbox $sandbox_name --workspace $workspace --handoff test-handle" -o ExitOnForwardFailure=yes -o "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id" -L "$forward" sandbox
 "#
         .replace("@PID_PATH@", &pid_path.display().to_string())
         .replace("@COMMAND_PATH@", &command_path.display().to_string())
@@ -1200,7 +1206,7 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --server https://127.0.0.1:9443 --sandbox $sandbox_id --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
+exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --sandbox $sandbox_id --handoff test-handle" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
 "#
         .replace("@LOG_PATH@", &log_path.display().to_string())
         .replace("@PID_PATH@", &pid_path.display().to_string())
@@ -2343,25 +2349,28 @@ async fn sandbox_create_accepts_ready_before_create_returns() {
         &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
     )
     .run_async(async {
-        prepare_cli_xdg(&server, &xdg_dir);
-        install_proxying_ssh(&fake_ssh_dir);
-        let result = tokio::time::timeout(
+        let tls = test_tls(&server);
+        install_fake_ssh(&fake_ssh_dir);
+
+        let exit_code = tokio::time::timeout(
             Duration::from_secs(10),
-            run_cli_sandbox_create_with_xdg_and_env(
-                &server,
-                &xdg_dir,
-                "already-ready",
-                &["--keep", "--", "echo", "OK"],
-                &[("OPENSHELL_PROVISION_TIMEOUT", "1")],
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("already-ready"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
             ),
         )
         .await
-        .expect("creation must finish while the watch remains open");
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        .expect("creation must finish while the watch remains open")
+        .expect("an already-Ready sandbox must not wait for a new provisioning transition");
+
+        assert_eq!(exit_code, 0);
         assert_eq!(create_requests(&server).await.len(), 1);
         assert_eq!(
             server
@@ -2475,20 +2484,24 @@ async fn sandbox_create_retries_terminal_attachment_until_relay_registers() {
 
     test_env(&fake_ssh_dir, &xdg_dir)
         .run_async(async {
-            prepare_cli_xdg(&server, &xdg_dir);
-            install_proxying_ssh(&fake_ssh_dir);
-            let result = run_cli_sandbox_create_with_xdg(
-                &server,
-                &xdg_dir,
-                "fast-command",
-                &["--keep", "--", "echo", "OK"],
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+
+            let exit_code = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("fast-command"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
             )
-            .await;
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
+            .await
+            .expect("sandbox create should wait for the declared terminal attachment relay");
+
+            assert_eq!(exit_code, 0);
             assert_eq!(
                 server
                     .openshell
@@ -2879,6 +2892,98 @@ async fn service_expose_forwards_bearer_passthrough_mode() {
 }
 
 #[tokio::test]
+async fn copy_retry_refuses_and_revokes_a_same_name_replacement() {
+    let bin = helpers::tempdir().unwrap();
+    let xdg = helpers::tempdir().unwrap();
+    test_env(&bin, &xdg)
+        .run_async(async {
+            install_executable_script(&bin, "ssh", "#!/bin/sh\nexit 255\n");
+            let file = xdg.path().join("payload");
+            fs::write(&file, b"original data").unwrap();
+            for upload in [true, false] {
+                let server = run_server().await;
+                let state = &server.openshell.state;
+                state
+                    .replace_after_first_ssh_revoke
+                    .store(true, Ordering::SeqCst);
+                let tls = test_tls(&server);
+                let result = if upload {
+                    run::sandbox_sync_up(
+                        &server.endpoint,
+                        "copy",
+                        &file,
+                        Some("/target/"),
+                        &tls,
+                        "default",
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    run::sandbox_sync_down(
+                        &server.endpoint,
+                        "copy",
+                        "payload",
+                        file.to_str().unwrap(),
+                        &tls,
+                        "default",
+                    )
+                    .await
+                };
+                let err = result.unwrap_err();
+                assert!(
+                    err.chain()
+                        .any(|cause| cause.to_string().contains("sandbox was replaced")),
+                    "{err:?}"
+                );
+                assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 2);
+                assert_eq!(state.ssh_session_revocations.load(Ordering::SeqCst), 2);
+                assert_eq!(fs::read(&file).unwrap(), b"original data");
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn ssh_profile_credentials_follow_the_selected_endpoint() {
+    let server = run_server().await;
+    let xdg = helpers::tempdir().unwrap();
+    prepare_cli_xdg(&server, &xdg);
+    write_oidc_test_credentials(&server, &xdg, "https://unused.invalid", 4_102_444_800);
+    let state = &server.openshell.state;
+    state
+        .ssh_session_failures_remaining
+        .store(3, Ordering::SeqCst);
+    for args in [
+        vec!["--gateway", "openshell", "sandbox", "connect", "demo"],
+        vec!["ssh-proxy", "--gateway", "openshell", "--name", "demo"],
+        vec![
+            "--gateway",
+            "openshell",
+            "ssh-proxy",
+            "--server",
+            &server.endpoint,
+            "--name",
+            "demo",
+        ],
+    ] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+            .args(args)
+            .env("OPENSHELL_GATEWAY_ENDPOINT", "http://127.0.0.1:1")
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .env("OPENSHELL_TELEMETRY_ENABLED", "false")
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("sandbox is not ready"));
+    }
+    assert_eq!(
+        state.ssh_requests_with_cached_bearer.load(Ordering::SeqCst),
+        3
+    );
+}
+
+#[tokio::test]
 async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails() {
     let server = run_server().await;
     let fake_ssh_dir = helpers::tempdir().unwrap();
@@ -2896,6 +3001,24 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
             .await;
             result.expect(
                 "background forward should track the owned SSH child without PID discovery",
+            );
+            // The fake openssh opened the listener without collecting its grant.
+            // A successful background handoff must still revoke before the CLI exits.
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .ssh_session_requests
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .ssh_session_revocations
+                    .load(Ordering::SeqCst),
+                1
             );
             let record =
                 openshell_core::forward::read_forward_pid("default", "owned-forward", forward_port)

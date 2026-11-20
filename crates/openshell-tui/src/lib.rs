@@ -955,14 +955,13 @@ async fn handle_shell_connect(
     let Some(id) = app.sandbox_ids.get(app.sandbox_selected) else {
         return Ok(());
     };
-    let target = SshTarget {
-        name: sandbox_name,
-        id: id.clone(),
-        endpoint: app.endpoint.clone(),
-        profile: app.gateway_name.clone(),
-        workspace: app.selected_sandbox_workspace(),
-        replica: None,
-    };
+    let target = SshTarget::new(
+        &app.endpoint,
+        &app.gateway_name,
+        &sandbox_name,
+        &app.selected_sandbox_workspace(),
+        id,
+    );
     run_sandbox_ssh(app, terminal, events, &target, &[]).await
 }
 
@@ -973,7 +972,7 @@ async fn run_sandbox_ssh(
     target: &SshTarget,
     args: &[String],
 ) -> Result<()> {
-    if target.profile != app.gateway_name || target.endpoint != app.endpoint {
+    if target.gateway_name != app.gateway_name || target.endpoint != app.endpoint {
         app.status_text = "Gateway changed before SSH startup".into();
         return Ok(());
     }
@@ -1005,25 +1004,24 @@ async fn run_sandbox_ssh(
     if !args.is_empty() {
         command.arg(build_exec_command(args));
     }
-    // Cancel log stream and pause event handler before suspending.
-    app.cancel_log_stream();
-    app.cancel_list_refresh();
-    events.pause();
-    // Wait for the reader task to finish its current poll cycle (tick_rate = 2s max).
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Suspend TUI — leave alternate screen, disable raw mode.
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .into_diagnostic()?;
-    disable_raw_mode().into_diagnostic()?;
-
-    // Spawn SSH as child process and wait.
     let result = proxy
         .run(async {
+            // Cancel log stream and pause event handler before suspending.
+            app.cancel_log_stream();
+            app.cancel_list_refresh();
+            events.pause();
+            // Wait for the reader task to finish its current poll cycle (tick_rate = 2s max).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Suspend TUI — leave alternate screen, disable raw mode.
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )
+            .into_diagnostic()?;
+            disable_raw_mode().into_diagnostic()?;
+
             tokio::process::Command::from(command)
                 .kill_on_drop(true)
                 .status()
@@ -1375,14 +1373,13 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             )));
             return;
         };
-        let target = SshTarget {
-            name: created.object_name().into(),
-            id: created.object_id().into(),
-            workspace,
-            endpoint,
-            profile: gateway_name,
-            replica: None,
-        };
+        let mut target = SshTarget::new(
+            &endpoint,
+            &gateway_name,
+            created.object_name(),
+            &workspace,
+            created.object_id(),
+        );
         // If ports or command are set, wait for Ready before finishing.
         if need_ready {
             let mut attempts = 0;
@@ -1403,8 +1400,10 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     )),
                 };
                 // Retry on transient errors.
-                if let Ok(resp) = client.get_sandbox(req).await
-                    && let Some(sandbox) = resp.into_inner().sandbox
+                if let Ok(resp) = client
+                    .get_sandbox(openshell_core::replica_routing::with_owner_hint(req))
+                    .await
+                    && let Some(sandbox) = resp.get_ref().sandbox.as_ref()
                 {
                     if sandbox.object_id() != target.id {
                         let _ = tx.send(Event::CreateResult(Err(
@@ -1413,6 +1412,8 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                         return;
                     }
                     if sandbox.phase() == SandboxPhase::Ready as i32 {
+                        target.replica = openshell_core::replica_routing::owner_replica(&resp)
+                            .and_then(|owner| owner.to_str().ok().map(str::to_owned));
                         break;
                     }
                     if sandbox.phase() == SandboxPhase::Error as i32 {

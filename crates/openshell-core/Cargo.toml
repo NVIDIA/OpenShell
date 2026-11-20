@@ -24,6 +24,7 @@ tonic-prost = { workspace = true }
 tonic-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }

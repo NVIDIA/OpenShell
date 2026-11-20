@@ -34,11 +34,12 @@ type Client<I> = OpenShellClient<InterceptedService<Channel, I>>;
 #[derive(Clone, Debug)]
 pub struct SshTarget {
     pub endpoint: String,
-    pub profile: String,
+    pub gateway_name: String,
     pub name: String,
     pub workspace: String,
     pub id: String,
     pub replica: Option<String>,
+    revocations: tokio_util::task::TaskTracker,
 }
 
 #[derive(Message)]
@@ -48,7 +49,7 @@ pub struct RelayGrant {
     #[prost(string, tag = "2")]
     pub endpoint: String,
     #[prost(string, tag = "3")]
-    pub profile: String,
+    pub gateway_name: String,
     #[prost(string, optional, tag = "4")]
     pub replica: Option<String>,
 }
@@ -60,15 +61,30 @@ pub struct PreparedProxy {
 }
 
 impl SshTarget {
+    pub fn new(endpoint: &str, gateway_name: &str, name: &str, workspace: &str, id: &str) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            gateway_name: gateway_name.into(),
+            name: name.into(),
+            workspace: workspace.into(),
+            id: id.into(),
+            replica: None,
+            revocations: tokio_util::task::TaskTracker::new(),
+        }
+    }
+
+    /// An interrupted transfer drops its in-flight SSH future. Drain the
+    /// associated revocations before the caller can shut down its runtime.
+    pub async fn wait_for_revocations(&self) {
+        self.revocations.close();
+        self.revocations.wait().await;
+    }
+
     pub async fn prepare<I: Interceptor + Clone + Send + Sync + 'static>(
         &self,
         mut client: Client<I>,
         registration_timeout: Option<Duration>,
     ) -> Result<PreparedProxy> {
-        let id = Uuid::new_v4();
-        let listener = ipc::Listener::bind(id).into_diagnostic()?;
-        let handle = format!("{}-{id}", std::process::id());
-        let command = build_proxy_command(&handle, &self.name, &self.workspace)?;
         let request = CreateSshSessionRequest {
             sandbox: self.name.clone(),
             workspace_scope: Some(workspace_selector(self.workspace.clone())),
@@ -86,44 +102,38 @@ impl SshTarget {
                 Err(status) => return Err(status).into_diagnostic(),
             }
         };
-        let validation = validate_ssh_session_response(&session)
-            .map_err(|err| miette::miette!("gateway returned invalid SSH session response: {err}"))
-            .and_then(|()| {
-                if session.sandbox_id == self.id {
-                    Ok(())
-                } else {
-                    Err(miette::miette!(
-                        "sandbox was replaced before opening the SSH relay"
-                    ))
-                }
-            });
-        let token = session.token.clone();
-        let revoke = async move {
-            let request = RevokeSshSessionRequest {
-                token,
-                allow_missing: true,
-            };
-            if !matches!(
-                tokio::time::timeout(Duration::from_secs(2), client.revoke_ssh_session(request))
-                    .await,
-                Ok(Ok(_))
-            ) {
-                eprintln!("Warning: could not revoke the SSH session token");
+        let revoke = revoke_grant(client, session.token.clone());
+        let setup = || {
+            validate_ssh_session_response(&session).map_err(|err| {
+                miette::miette!("gateway returned invalid SSH session response: {err}")
+            })?;
+            if session.sandbox_id != self.id {
+                return Err(miette::miette!(
+                    "sandbox was replaced before opening the SSH relay"
+                ));
+            }
+            let id = Uuid::new_v4();
+            let listener = ipc::Listener::bind(id).into_diagnostic()?;
+            let handle = format!("{}-{id}", std::process::id());
+            let command = build_proxy_command(&handle, &self.name, &self.workspace)?;
+            Ok((listener, command))
+        };
+        let (listener, command) = match setup() {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.revocations.spawn(revoke).await.into_diagnostic()?;
+                return Err(error);
             }
         };
-        if let Err(error) = validation {
-            revoke.await;
-            return Err(error);
-        }
         let payload = RelayGrant {
             session,
             endpoint: self.endpoint.clone(),
-            profile: self.profile.clone(),
+            gateway_name: self.gateway_name.clone(),
             replica: self.replica.clone(),
         }
         .encode_to_vec();
         let (cancel, cancelled) = oneshot::channel();
-        let cleanup = tokio::spawn(async move {
+        let cleanup = self.revocations.spawn(async move {
             let serve = async {
                 let mut peer = listener.accept().await?;
                 peer.write_u32(u32::try_from(payload.len()).map_err(std::io::Error::other)?)
@@ -147,6 +157,19 @@ impl SshTarget {
             cancel,
             cleanup,
         })
+    }
+}
+
+pub async fn revoke_grant<I: Interceptor + Clone>(mut client: Client<I>, token: String) {
+    let request = RevokeSshSessionRequest {
+        token,
+        allow_missing: true,
+    };
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(2), client.revoke_ssh_session(request)).await,
+        Ok(Ok(_))
+    ) {
+        eprintln!("Warning: could not revoke the SSH session token");
     }
 }
 
@@ -186,4 +209,30 @@ pub async fn receive(handle: &str) -> Result<(RelayGrant, impl AsyncRead + Async
             .map_err(|_| miette::miette!("invalid SSH handoff message"))?,
         peer,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn proxy_rejects_a_different_issuer_pid_before_reading_a_grant() {
+        let id = Uuid::new_v4();
+        let listener = ipc::Listener::bind(id).unwrap();
+        let handle = format!("{}-{id}", std::process::id() + 1);
+        // Leave the server alive without writing a frame. A client that trusts
+        // the handle alone would hang waiting for credentials.
+        let result = tokio::time::timeout(Duration::from_secs(2), receive(&handle))
+            .await
+            .unwrap();
+        let Err(error) = result else {
+            panic!("accepted an unrelated issuer")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(&std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string())
+        );
+        drop(listener);
+    }
 }
