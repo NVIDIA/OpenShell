@@ -48,9 +48,9 @@ jobs:
       candidate_ref: ${{ inputs.release-tag }}
       fail-on-static-findings: false
       images: |
-        ghcr.io/nvidia/openshell/gateway:${{ inputs.source-sha }}
-        ghcr.io/nvidia/openshell/sandbox:${{ inputs.source-sha }}
-        ghcr.io/nvidia/openshell/supervisor:${{ inputs.source-sha }}
+        ghcr.io/ai-openshell/openshell/gateway:${{ inputs.source-sha }}
+        ghcr.io/ai-openshell/openshell/sandbox:${{ inputs.source-sha }}
+        ghcr.io/ai-openshell/openshell/supervisor:${{ inputs.source-sha }}
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
@@ -93,6 +93,21 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+  continuity-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-suites.yml
+    with:
+      family: continuity
+      upgrade-source: true
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
   feature-specific-integration:
     needs: prepare-integration
     permissions:
@@ -116,7 +131,7 @@ jobs:
     with:
       image-tag: ${{ inputs.source-sha }}
       checkout-ref: ${{ inputs.source-sha }}
-      runner: linux-arm64-cpu8
+      runner: ubuntu-24.04-arm
 
   vm-e2e:
     permissions:
@@ -129,7 +144,7 @@ jobs:
 
   protobuf-compatibility:
     name: Protobuf Compatibility
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -161,6 +176,7 @@ jobs:
       - protobuf-compatibility
       - security
       - conformance-integration
+      - continuity-integration
       - feature-specific-integration
       - docker-e2e
       - vm-e2e
@@ -179,6 +195,7 @@ jobs:
         id: summary
         env:
           CONFORMANCE_RESULT: ${{ needs.conformance-integration.result }}
+          CONTINUITY_RESULT: ${{ needs.continuity-integration.result }}
           DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
           FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
           IS_PRERELEASE: ${{ inputs.is-prerelease }}
@@ -210,6 +227,7 @@ jobs:
             echo "| Protobuf API compatibility | ${PROTO_COMPATIBILITY_RESULT} |"
             echo "| Security | ${SECURITY_RESULT} |"
             echo "| Conformance integration | ${CONFORMANCE_RESULT} |"
+            echo "| Continuity integration | ${CONTINUITY_RESULT} |"
             echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"
             echo "| Docker E2E | ${DOCKER_E2E_RESULT} |"
             echo "| VM E2E | ${VM_E2E_RESULT} |"
@@ -249,7 +267,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
-          ref="ghcr.io/nvidia/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          ref="ghcr.io/ai-openshell/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
           oras push "${ref}" \
             --artifact-type application/vnd.nvidia.openshell.qualification.v1 \
             --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \

@@ -65,11 +65,11 @@ cmd_start() {
         keycloak_args=(start-dev --http-host=127.0.0.1 --http-port="${KEYCLOAK_PORT}" --import-realm)
 
         # The Docker daemon runs on the runner host. /__w exists only
-        # inside the job container; /home/runner/_work is mounted at the
+        # inside the job container; /home/runner/work is mounted at the
         # same path in both namespaces.
         case "$REALM_FILE" in
             /__w/*)
-                local host_realm_file="/home/runner/_work/${REALM_FILE#/__w/}"
+                local host_realm_file="/home/runner/work/${REALM_FILE#/__w/}"
                 ;;
             *)
                 echo "Error: unexpected GitHub workspace path: $REALM_FILE" >&2

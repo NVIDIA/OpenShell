@@ -51,7 +51,7 @@ defaults:
 jobs:
   assemble:
     name: Assemble Release Assets
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -190,7 +190,7 @@ jobs:
   tag-ghcr-release:
     name: Publish GHCR Images
     needs: assemble
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
@@ -317,7 +317,7 @@ jobs:
   release:
     name: Publish Release Assets
     needs: [assemble, release-helm]
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
