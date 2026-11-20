@@ -23,6 +23,8 @@ never skips it. Add a row when you add a variable.
 | `OPENSHELL_TEST_KEYCLOAK_CLIENT_ID` | `<base>-keycloak` | `keycloak-support` | A client in that realm that allows password grants. |
 | `OPENSHELL_TEST_KEYCLOAK_USERNAME` | `<base>-keycloak` | `keycloak-support` | The realm user that tests sign in as. |
 | `OPENSHELL_TEST_KEYCLOAK_PASSWORD` | `<base>-keycloak` | `keycloak-support` | That user's password. |
+| `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which configures the gateway's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the gateway trusts. |
+| `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | The additional-CA environment | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |
 | `OPENSHELL_TEST_PYTHON_IMAGE` | Optional; `e2e/rust/e2e-kubernetes.sh` and `e2e-vm.sh` set a pullable image | `testkit::python_image()` | The workload image for tests that run `python3`, curl, git or openssl. Unset, it is `openshell/e2e-python:dev`, which the tmachine installers load. |
 | `OPENSHELL_TEST_UNSUPPORTED` | CI, from `tests/suites/conformance/unsupported.yaml` (`tasks/scripts/conformance-unsupported.sh`), and `e2e/support/conformance.sh` for the host lanes; the runner passes it to the tests | testkit programs | Tests the environment can't pass yet, as `<test>=<issue>` entries. See [Unsupported tests](../testkit/README.md#unsupported-tests). |

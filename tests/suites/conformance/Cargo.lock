@@ -1285,9 +1285,13 @@ dependencies = [
 name = "host-server-support"
 version = "0.0.0"
 dependencies = [
+ "openshell-crypto",
  "openshell-testkit",
+ "rcgen",
+ "rustls",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
