@@ -4,75 +4,13 @@
 #![cfg(feature = "e2e")]
 
 use std::io::Write;
-use std::process::Stdio;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::is_e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
-use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-
-const BINDING_PROVIDER_A_NAME: &str = "e2e-static-endpoint-binding-provider-a";
-const BINDING_PROVIDER_B_NAME: &str = "e2e-static-endpoint-binding-provider-b";
-const BINDING_PROFILE_A_ID: &str = "e2e-static-endpoint-binding-a";
-const BINDING_PROFILE_B_ID: &str = "e2e-static-endpoint-binding-b";
-
-async fn run_cli(args: &[&str]) -> Result<String, String> {
-    let mut cmd = openshell_cmd();
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("failed to spawn openshell {}: {e}", args.join(" ")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{stdout}{stderr}");
-
-    if !output.status.success() {
-        return Err(format!(
-            "openshell {} failed (exit {:?}):\n{combined}",
-            args.join(" "),
-            output.status.code()
-        ));
-    }
-
-    Ok(combined)
-}
-
-async fn wait_for_sandbox_logs(
-    sandbox_name: &str,
-    expected: impl Fn(&str) -> bool,
-) -> Result<String, String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-
-    loop {
-        let logs = run_cli(&[
-            "logs",
-            sandbox_name,
-            "-n",
-            "500",
-            "--since",
-            "2m",
-            "--source",
-            "sandbox",
-        ])
-        .await?;
-        if expected(&logs) {
-            return Ok(logs);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for expected sandbox logs:\n{logs}"
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-}
 
 struct HostServer {
     port: u16,
@@ -81,13 +19,6 @@ struct HostServer {
 
 impl HostServer {
     async fn start(response_body: &str) -> Result<Self, String> {
-        Self::start_with_auth_check(response_body, None).await
-    }
-
-    async fn start_with_auth_check(
-        response_body: &str,
-        expected_authorization: Option<&str>,
-    ) -> Result<Self, String> {
         let listener = TcpListener::bind(("0.0.0.0", 0))
             .await
             .map_err(|e| format!("bind host test server: {e}"))?;
@@ -96,14 +27,12 @@ impl HostServer {
             .map_err(|e| format!("read host test server address: {e}"))?
             .port();
         let response_body = response_body.as_bytes().to_vec();
-        let expected_authorization = expected_authorization.map(str::to_string);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
                 let body = response_body.clone();
-                let expected_authorization = expected_authorization.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
@@ -119,17 +48,6 @@ impl HostServer {
                             break;
                         }
                     }
-
-                    let body = expected_authorization.map_or(body, |expected| {
-                        let request = String::from_utf8_lossy(&request);
-                        format!(
-                            r#"{{"authorized":{}}}"#,
-                            request.lines().any(|line| {
-                                line.eq_ignore_ascii_case(&format!("Authorization: {expected}"))
-                            })
-                        )
-                        .into_bytes()
-                    });
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -147,114 +65,11 @@ impl HostServer {
     }
 }
 
-fn write_binding_profile(
-    id: &str,
-    display_name: &str,
-    env_var: &str,
-    host: &str,
-    port: u16,
-) -> Result<NamedTempFile, String> {
-    let mut file = TempFileBuilder::new()
-        .suffix(".yaml")
-        .tempfile()
-        .map_err(|e| format!("create provider profile: {e}"))?;
-    let profile = format!(
-        r#"id: {id}
-display_name: {display_name}
-category: other
-credentials:
-  - name: bound_token
-    env_vars: [{env_var}]
-    required: true
-    auth_style: bearer
-    header_name: authorization
-endpoints:
-  - host: {host}
-    port: {port}
-    path: /allowed/**
-    protocol: rest
-    access: full
-    enforcement: enforce
-binaries: [/usr/bin/bash]
-"#
-    );
-    file.write_all(profile.as_bytes())
-        .map_err(|e| format!("write provider profile: {e}"))?;
-    file.flush()
-        .map_err(|e| format!("flush provider profile: {e}"))?;
-    Ok(file)
-}
-
-fn write_binding_policy(port: u16) -> Result<NamedTempFile, String> {
-    let mut file = NamedTempFile::new().map_err(|e| format!("create binding policy: {e}"))?;
-    let policy = format!(
-        r#"version: 1
-
-filesystem_policy:
-  include_workdir: true
-  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-
-landlock:
-  compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
-network_policies:
-  binding_test:
-    name: binding_test
-    endpoints:
-      - host: host.openshell.internal
-        port: {port}
-        path: /**
-        protocol: rest
-        access: full
-        enforcement: enforce
-      - host: host.docker.internal
-        port: {port}
-        path: /**
-        protocol: rest
-        access: full
-        enforcement: enforce
-    binaries:
-      - path: /usr/bin/bash
-"#
-    );
-    file.write_all(policy.as_bytes())
-        .map_err(|e| format!("write binding policy: {e}"))?;
-    file.flush()
-        .map_err(|e| format!("flush binding policy: {e}"))?;
-    Ok(file)
-}
-
 impl Drop for HostServer {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
-
-async fn delete_provider(name: &str) {
-    let mut cmd = openshell_cmd();
-    cmd.arg("provider")
-        .arg("delete")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = cmd.status().await;
-}
-
-async fn delete_provider_profile(id: &str) {
-    let mut cmd = openshell_cmd();
-    cmd.arg("profile")
-        .arg("delete")
-        .arg(id)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = cmd.status().await;
-}
-
 fn write_policy(port: u16) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
     let policy = format!(
@@ -411,158 +226,4 @@ printf 'RESPONSE_EOF\n'
         );
         sandbox.cleanup().await;
     }
-}
-
-#[tokio::test]
-async fn static_provider_credentials_are_bound_to_profile_endpoints() {
-    let server = HostServer::start_with_auth_check("", Some("Bearer e2e-bound-secret"))
-        .await
-        .expect("start credential echo server");
-    let profile_a = write_binding_profile(
-        BINDING_PROFILE_A_ID,
-        "E2E static endpoint binding A",
-        "BOUND_TOKEN_A",
-        "host.openshell.internal",
-        server.port,
-    )
-    .expect("write provider A binding profile");
-    let profile_b = write_binding_profile(
-        BINDING_PROFILE_B_ID,
-        "E2E static endpoint binding B",
-        "BOUND_TOKEN_B",
-        "host.docker.internal",
-        server.port,
-    )
-    .expect("write provider B binding profile");
-    let policy = write_binding_policy(server.port).expect("write binding policy");
-    let profile_a_path = profile_a.path().to_string_lossy().into_owned();
-    let profile_b_path = profile_b.path().to_string_lossy().into_owned();
-    let policy_path = policy.path().to_string_lossy().into_owned();
-
-    delete_provider(BINDING_PROVIDER_A_NAME).await;
-    delete_provider(BINDING_PROVIDER_B_NAME).await;
-    delete_provider_profile(BINDING_PROFILE_A_ID).await;
-    delete_provider_profile(BINDING_PROFILE_B_ID).await;
-    run_cli(&["profile", "import", "--file", &profile_a_path])
-        .await
-        .expect("import provider A endpoint-binding profile");
-    run_cli(&["profile", "import", "--file", &profile_b_path])
-        .await
-        .expect("import provider B endpoint-binding profile");
-    run_cli(&[
-        "provider",
-        "create",
-        "--name",
-        BINDING_PROVIDER_A_NAME,
-        "--type",
-        BINDING_PROFILE_A_ID,
-        "--credential",
-        "BOUND_TOKEN_A=e2e-bound-secret",
-    ])
-    .await
-    .expect("create endpoint-bound provider A");
-    run_cli(&[
-        "provider",
-        "create",
-        "--name",
-        BINDING_PROVIDER_B_NAME,
-        "--type",
-        BINDING_PROFILE_B_ID,
-        "--credential",
-        "BOUND_TOKEN_B=e2e-provider-b-secret",
-    ])
-    .await
-    .expect("create endpoint-bound provider B");
-
-    let command = format!(
-        r#"
-http_request() {{
-  local host="$1" path="$2" status_line line
-  HTTP_STATUS= HTTP_BODY=
-  if ! exec 3<>"/dev/tcp/$host/{port}"; then
-    HTTP_STATUS=connect-denied
-    return 1
-  fi
-  printf 'GET %s HTTP/1.1\r\nHost: %s:{port}\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' "$path" "$host" "$BOUND_TOKEN_A" >&3
-  IFS= read -r status_line <&3 || return 1
-  status_line="${{status_line%$'\r'}}"
-  HTTP_STATUS="${{status_line#* }}"
-  HTTP_STATUS="${{HTTP_STATUS%% *}}"
-  while IFS= read -r line <&3; do
-    line="${{line%$'\r'}}"
-    [[ -z "$line" ]] && break
-  done
-  while IFS= read -r line <&3 || [[ -n "$line" ]]; do HTTP_BODY+="$line"; done
-  exec 3>&- 3<&-
-}}
-http_request host.openshell.internal /allowed/check; allowed="$HTTP_BODY"
-http_request host.docker.internal /allowed/check || true; host_denied="$HTTP_STATUS"
-http_request host.openshell.internal /other/check; path_denied="$HTTP_STATUS"
-printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied"
-"#,
-        port = server.port,
-    );
-    let mut guard = SandboxGuard::create(&[
-        "--policy",
-        &policy_path,
-        "--provider",
-        BINDING_PROVIDER_A_NAME,
-        "--provider",
-        BINDING_PROVIDER_B_NAME,
-        "--no-auto-providers",
-        "--",
-        "/usr/bin/bash",
-        "-c",
-        &command,
-    ])
-    .await
-    .expect("run endpoint-binding requests");
-
-    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
-        logs.contains("openshell.provider_credential.endpoint_mismatch")
-            && logs.contains("credential_endpoint_mismatch")
-    })
-    .await
-    .expect("fetch endpoint mismatch logs");
-    assert!(
-        guard
-            .create_output
-            .contains(r#"ALLOWED={"authorized":true}"#),
-        "credential should resolve at the bound endpoint:\n{}\nlogs:\n{logs}",
-        guard.create_output,
-    );
-    let expected_host_denial = if is_e2e_driver("podman") {
-        "HOST_DENIED=connect-denied"
-    } else {
-        "HOST_DENIED=403"
-    };
-    assert!(
-        guard.create_output.contains(expected_host_denial),
-        "same placeholder must be denied at an unbound host:\n{}",
-        guard.create_output
-    );
-    assert!(
-        guard.create_output.contains("PATH_DENIED=403"),
-        "same placeholder must be denied at an unbound path on its bound host:\n{}",
-        guard.create_output
-    );
-
-    assert!(
-        logs.contains("openshell.provider_credential.endpoint_mismatch")
-            && logs.contains("credential_endpoint_mismatch"),
-        "OCSF logs should explain the endpoint-binding denial without secret material:\n{logs}"
-    );
-    assert!(
-        !logs.contains("e2e-bound-secret")
-            && !logs.contains("e2e-provider-b-secret")
-            && !logs.contains("BOUND_TOKEN_A")
-            && !logs.contains("BOUND_TOKEN_B"),
-        "OCSF logs must not contain credential values or environment keys:\n{logs}"
-    );
-
-    guard.cleanup().await;
-    delete_provider(BINDING_PROVIDER_A_NAME).await;
-    delete_provider(BINDING_PROVIDER_B_NAME).await;
-    delete_provider_profile(BINDING_PROFILE_A_ID).await;
-    delete_provider_profile(BINDING_PROFILE_B_ID).await;
 }

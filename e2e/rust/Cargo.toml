@@ -199,11 +199,6 @@ path = "tests/credential_drivers.rs"
 required-features = ["e2e-kubernetes-credential-drivers"]
 
 [[test]]
-name = "websocket_conformance"
-path = "tests/websocket_conformance.rs"
-required-features = ["e2e-host-gateway"]
-
-[[test]]
 name = "user_namespaces"
 path = "tests/user_namespaces.rs"
 required-features = ["e2e-kubernetes"]
@@ -214,29 +209,9 @@ path = "tests/host_gateway_alias.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
-name = "forward_proxy_l7_bypass"
-path = "tests/forward_proxy_l7_bypass.rs"
-required-features = ["e2e-host-gateway"]
-
-[[test]]
-name = "forward_proxy_graphql_l7"
-path = "tests/forward_proxy_graphql_l7.rs"
-required-features = ["e2e-host-gateway"]
-
-[[test]]
-name = "forward_proxy_jsonrpc_l7"
-path = "tests/forward_proxy_jsonrpc_l7.rs"
-required-features = ["e2e-host-gateway"]
-
-[[test]]
 name = "supervisor_middleware_http_hooks"
 path = "tests/supervisor_middleware_http_hooks.rs"
 required-features = ["e2e-docker"]
-
-[[test]]
-name = "proxy_egress_pipeline"
-path = "tests/proxy_egress_pipeline.rs"
-required-features = ["e2e-host-gateway"]
 
 [[test]]
 name = "workspace_namespace_managed"

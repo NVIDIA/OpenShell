@@ -566,26 +566,6 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Spawn `openshell forward start` as a background process.
-    ///
-    /// Returns the child process handle. The caller is responsible for killing
-    /// it (or it will be killed on drop since `kill_on_drop(true)` is set).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the process cannot be spawned.
-    pub fn spawn_forward(&self, port: u16) -> Result<tokio::process::Child, String> {
-        let mut cmd = openshell_cmd();
-        cmd.arg("forward")
-            .arg("start")
-            .arg(port.to_string())
-            .arg(&self.name);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        cmd.spawn()
-            .map_err(|e| format!("failed to spawn port forward: {e}"))
-    }
-
     /// Delete the sandbox explicitly.
     ///
     /// Also kills the background child process if one exists. This is called

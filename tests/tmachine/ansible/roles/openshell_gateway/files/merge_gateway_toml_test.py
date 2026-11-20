@@ -98,3 +98,25 @@ def test_creates_from_default_else_minimal(tmp_path):
     run, base = merge(other, None, '[openshell.drivers.podman]\nuserns = "auto"\n')
     parsed = tomllib.loads(base.read_text())
     assert parsed["openshell"]["version"] == 2
+
+
+def test_applies_every_marked_block(tmp_path):
+    overrides = (
+        "# BEGIN podman-userns\n[openshell.drivers.podman]\nuserns = \"auto\"\n# END podman-userns\n"
+        "# BEGIN config-push\n[openshell.gateway]\nconfig_delivery_mode = \"push\"\n# END config-push\n"
+    )
+    run, base = merge(tmp_path, BASE, overrides)
+    assert run.returncode == 0, run.stderr
+    parsed = tomllib.loads(base.read_text())
+    assert parsed["openshell"]["drivers"]["podman"]["userns"] == "auto"
+    assert parsed["openshell"]["gateway"]["config_delivery_mode"] == "push"
+
+
+def test_rejects_blocks_that_declare_the_same_table(tmp_path):
+    overrides = (
+        "# BEGIN cdi\n[openshell.drivers.podman]\nallow_driver_config = true\n# END cdi\n"
+        "# BEGIN podman-userns\n[openshell.drivers.podman]\nuserns = \"auto\"\n# END podman-userns\n"
+    )
+    run, base = merge(tmp_path, BASE, overrides)
+    assert run.returncode != 0
+    assert base.read_text() == BASE

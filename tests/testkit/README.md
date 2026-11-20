@@ -66,19 +66,21 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `cx.sandbox(suffix)` to build a sandbox with a run-unique name
   (`test-<run-id>-<suffix>`), then
   `create()` it or `create_ready()` to also wait for Ready. Set its image
-  with `image(..)`, its policy with `policy(..)` and its providers with
-  `providers(..)`. A long-running sandbox is
-  `.command(["sleep", "infinity"])`; add `.image(testkit::python_image())`
-  when a test runs Python clients in it. The returned
+  with `image(..)`, its policy with `policy(..)`, its providers with
+  `providers(..)`, and the template's driver-keyed `driver_config(json)`. A
+  long-running sandbox is `.command(["sleep", "infinity"])`; add
+  `.image(testkit::python_image())` when a test runs Python clients in it. The
+  returned
   `Sandbox` can wait for ready or finished, stop, start, exec or
   `poll_exec` until the output matches, read its config and draft policy, set
   a setting, read `sandbox get` JSON with `get_json()`, read its policy
   revisions and active policy with `policy_revisions()` and
-  `active_policy()`, and delete. Its `expect_listed`, `expect_absent` and
-  `wait_absent` check list and get. `run_python(script, args)` runs a script
-  with `python3 -c` and fails unless it exits 0. Exec output has `success()`,
-  `failure()`, `expect_stdout()`, and `last_json()` for the last JSON object
-  or array line of stdout, such as a client script's result.
+  `active_policy()`, read its supervisor logs with `logs()` or wait for a
+  line with `logs_until(..)`, and delete. Its `expect_listed`, `expect_absent`
+  and `wait_absent` check list and get. `run_python(script, args)` runs a
+  script with `python3 -c` and fails unless it exits 0. Exec output has
+  `success()`, `failure()`, `expect_stdout()`, and `last_json()` for the last
+  JSON object or array line of stdout, such as a client script's result.
 - `cx.cli_sandbox(suffix)` for a sandbox only `openshell sandbox create`
   can make, such as one with `policy_yaml(...)` or `--no-keep`. `create()`
   detaches and returns the `Sandbox`, `create_ready()` also waits for Ready,
@@ -91,7 +93,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   create, so a create that fails after the gateway accepted it is still cleaned
   up. `cx.adopt(name)` returns a `Sandbox` handle for one the CLI created.
 - `cx.expect_compute_driver(name)` to fail unless the gateway runs only that
-  compute driver. Driver suites call it first.
+  compute driver. Driver suites call it first. `cx.compute_driver()` returns
+  the driver's name, for setup that depends on it, such as a driver config.
 - `testkit::base_image()` for the image to create sandboxes from or build on:
   `OPENSHELL_TEST_BASE_IMAGE`, or OpenShell's default sandbox image.
 - `testkit::python_image()` for sandboxes that run `python3`, curl, git, or
@@ -122,7 +125,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   configures (`.rest(Access::Full)`, `.credential_binding(provider)`, ...).
   Pass the result to `cx.sandbox(..).policy(policy)`, or `policy::to_yaml`
   for the CLI. `policy::binaries_yaml(binaries)` writes a `binaries:` list
-  into policy YAML a test writes by hand.
+  into policy YAML a test writes by hand. `policy::base_with(yaml)` adds YAML
+  sections, such as L7 rules, to the base policy. `policy::from_yaml` reads a
+  policy file, and `policy::set(&sandbox, &policy)` replaces a running
+  sandbox's policy and waits until it is loaded.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
 - `cx.import_profile(profile)` to import a provider profile and return its
   `id`, and `cx.create_provider(name, type, credentials)` to create a
