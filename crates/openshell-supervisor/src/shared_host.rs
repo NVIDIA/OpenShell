@@ -764,6 +764,11 @@ impl SharedHost {
         dir: &Path,
     ) -> Result<(crate::SandboxInstanceBindings, SandboxInstanceBody), ControlError> {
         let failure = |error: miette::Report| ControlError::Unavailable(error.to_string());
+        let bootstrap = registration
+            .bootstrap
+            .map(|config| self.router.register_bootstrap(&registration.route, config))
+            .transpose()
+            .map_err(|error| ControlError::Invalid(error.to_string()))?;
         let main_process =
             openshell_core::sandbox_env::MainProcessConfig::decode(&registration.main_process_spec)
                 .map_err(ControlError::Invalid)?;
@@ -840,7 +845,7 @@ impl SharedHost {
             otlp_agent_endpoint: None,
             otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
-        crate::sandbox_instance_host::sandbox_instance_launch(
+        let (bindings, body) = crate::sandbox_instance_host::sandbox_instance_launch(
             Box::new(crate::backend_setup::RoutedBackendSetup::new(
                 self.router.clone(),
                 registration.route,
@@ -848,7 +853,17 @@ impl SharedHost {
             config,
             dir,
         )
-        .map_err(failure)
+        .map_err(failure)?;
+        Ok((
+            bindings,
+            Box::new(move |controls| {
+                let future = body(controls);
+                Box::pin(async move {
+                    let _bootstrap = bootstrap;
+                    future.await
+                })
+            }),
+        ))
     }
 }
 

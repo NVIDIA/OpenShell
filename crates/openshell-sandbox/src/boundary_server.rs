@@ -274,11 +274,14 @@ mod linux {
                 .enable_all()
                 .build()
                 .map_err(|error| format!("create bootstrap runtime: {error}"))?;
-            runtime.block_on(bootstrap::fetch(
+            runtime.block_on(bootstrap::fetch_routed(
                 address,
                 input(bootstrap::SERVER_NAME_ENV)?,
                 &input(bootstrap::CA_ENV)?,
                 &input(bootstrap::TOKEN_ENV)?,
+                Some(input(bootstrap::ROUTE_ENV)?)
+                    .filter(|route| !route.is_empty())
+                    .as_deref(),
             ))?
         };
         validate_config(&config)?;

@@ -154,10 +154,6 @@ struct Args {
     )]
     sandbox_runtime_boundary_port: u16,
 
-    /// Experimental token-based boundary configuration fetch from a dedicated supervisor.
-    #[arg(long, env = "OPENSHELL_K8S_BOOTSTRAP_OVER_WIRE")]
-    bootstrap_over_wire: bool,
-
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
     https_proxy: Option<String>,
@@ -297,7 +293,6 @@ async fn main() -> Result<()> {
                 app_listener:
                     openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
-                bootstrap_over_wire: args.bootstrap_over_wire,
             },
             runtime_bootstrap_grace_seconds: args.runtime_bootstrap_grace_seconds,
             sandbox_attach_request_timeout_seconds: args.sandbox_attach_request_timeout_seconds,

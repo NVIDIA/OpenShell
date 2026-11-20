@@ -1236,15 +1236,16 @@ Do not edit the annotation, Service selector, or `os-control-<id>` policy:
 reconciliation suspends a sandbox whose Service or control policy no longer
 matches its recorded mode.
 
-With experimental `sandbox_runtime.bootstrap_over_wire = true`, dedicated
-supervisors also serve boundary bootstrap over pinned TLS on port 5502. Check
-that `os-supervisor-<id>` exposes that port and `os-control-<id>` allows it
-between the paired Pods. The workload Secret has `bootstrap-token` and trust
-inputs instead of `boundary.json`; inspect key names only, never print token
-values. A bootstrap timeout occurs before normal Sandbox Protocol admission.
-Use matching images in a fresh test deployment; changing bootstrap modes on a
-running deployment is unsupported. The supervisor still receives its inputs
-through its own Secret, and boundary TLS files remain staged.
+New and restarted sandbox generations fetch boundary bootstrap using a
+short-lived JWT over pinned TLS. Dedicated supervisors use port 5502: check
+`os-bootstrap-<id>` Service and NetworkPolicy for connectivity between the
+paired Pods. Shared supervisors use their existing routed runtime listener;
+check instance assignment and the pool's route directory. The workload Secret
+has `bootstrap-token` and trust inputs instead of `boundary.json`; inspect key
+names only, never print token values. A bootstrap timeout occurs before normal
+Sandbox Protocol admission. Deploy matching gateway, supervisor, and sandbox
+images together. Dedicated supervisor inputs remain in its private Secret;
+shared inputs travel with instance assignments. Boundary TLS files remain staged.
 
 The supervisor loads its startup configuration through the polling RPCs and
 opens `ConnectSupervisor` once the workload runs. When the gateway runs with

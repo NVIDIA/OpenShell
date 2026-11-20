@@ -71,9 +71,6 @@ async fn workload_secret(name: &str) -> String {
 
 #[tokio::test]
 async fn token_bootstrap_starts_and_restarts_without_a_boundary_config_file() {
-    if std::env::var("OPENSHELL_E2E_BOOTSTRAP_OVER_WIRE").as_deref() != Ok("1") {
-        return;
-    }
     let mut sandbox = SandboxGuard::create(&[])
         .await
         .expect("create token-bootstrapped sandbox");

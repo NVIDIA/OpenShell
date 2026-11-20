@@ -1430,15 +1430,14 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.sandbox_runtime]
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
-# Experimental; requires matching gateway, supervisor, and sandbox images.
-# Fetch boundary configuration from a dedicated supervisor over TLS on port 5502.
-bootstrap_over_wire = false
 ```
 
-`sandbox_runtime.bootstrap_over_wire` enables experimental token-based bootstrap
-for dedicated supervisors. Use a fresh test deployment; changing it on a running
-deployment is not supported. It cannot be combined with `supervisor_topology`,
-and `boundary_port` must differ from 5502. The default keeps file bootstrap.
+Kubernetes sandboxes fetch boundary configuration from their supervisor using a
+short-lived bootstrap token. No bootstrap setting is required. Dedicated
+supervisors use port 5502; `boundary_port` must differ from 5502. Shared
+supervisors use their configured runtime listener. Deploy matching gateway,
+supervisor, and sandbox images together; new and restarted generations use
+token bootstrap.
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
 releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress

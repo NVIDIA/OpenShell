@@ -30,7 +30,7 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
 #[cfg(target_os = "linux")]
-const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
+const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 2] = ["tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
 #[cfg(target_os = "linux")]
@@ -1608,9 +1608,6 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     fs::create_dir(&bundle_tmp).into_diagnostic()?;
     fs::set_permissions(&bundle_tmp, fs::Permissions::from_mode(0o700)).into_diagnostic()?;
     for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
-        if name == "boundary.json" && source.join("bootstrap-token").exists() {
-            continue;
-        }
         copy_projected_secret_file(source, name, &bundle_tmp.join(name), 0o600)?;
     }
     fs::rename(&bundle_tmp, &bundle_final).into_diagnostic()?;

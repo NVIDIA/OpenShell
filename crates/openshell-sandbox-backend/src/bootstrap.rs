@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Experimental, version-locked boundary bootstrap over a dedicated TLS channel.
+//! Version-locked boundary bootstrap over a launch-pinned TLS channel.
 //! The supervisor stages one immutable launch; only its bootstrap JWT may fetch it.
 
 use std::net::SocketAddr;
@@ -23,8 +23,10 @@ pub const TOKEN_ENV: &str = "OPENSHELL_BOUNDARY_BOOTSTRAP_TOKEN";
 pub const ADDRESS_ENV: &str = "OPENSHELL_BOUNDARY_BOOTSTRAP_ADDRESS";
 pub const CA_ENV: &str = "OPENSHELL_BOUNDARY_BOOTSTRAP_CA";
 pub const SERVER_NAME_ENV: &str = "OPENSHELL_BOUNDARY_BOOTSTRAP_SERVER_NAME";
-pub const ENV_KEYS: [(&str, &str); 4] = [
+pub const ROUTE_ENV: &str = "OPENSHELL_BOUNDARY_BOOTSTRAP_ROUTE";
+pub const ENV_KEYS: [(&str, &str); 5] = [
     (TOKEN_ENV, "bootstrap-token"),
+    (ROUTE_ENV, "bootstrap-route"),
     (ADDRESS_ENV, "bootstrap-address"),
     (CA_ENV, "bootstrap-ca"),
     (SERVER_NAME_ENV, "bootstrap-server-name"),
@@ -35,7 +37,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Trusted supervisor-only input, mounted through its existing Secret.
 /// Deliberately has no Debug implementation: it includes workload secrets.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapServerConfig {
     pub listen: SocketAddr,
@@ -46,13 +48,12 @@ pub struct BootstrapServerConfig {
     pub private_key_pem: String,
 }
 
-/// Starts before normal admission, avoiding a dependency on sandbox readiness.
-/// Dropping the returned handle stops the listener and all pending exchanges.
-pub async fn serve(config: BootstrapServerConfig) -> Result<BootstrapServer, String> {
+/// Validate and prepare the immutable launch before accepting connections.
+pub(crate) fn prepare(config: BootstrapServerConfig) -> Result<Exchange, String> {
     let verifier = SessionJwtVerifier::new(
         &config.config.gateway_id,
         SessionTokenProfile::BoundaryBootstrap,
-        [config.verification_key],
+        [config.verification_key.clone()],
         Arc::new(SystemJwtClock),
     )
     .map_err(|_| "invalid bootstrap verification key")?;
@@ -66,49 +67,97 @@ pub async fn serve(config: BootstrapServerConfig) -> Result<BootstrapServer, Str
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|_| "invalid bootstrap TLS identity")?;
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .map_err(|error| format!("bind bootstrap listener: {error}"))?;
-    let address = listener.local_addr().map_err(|error| error.to_string())?;
     let response = serde_json::to_vec(&config.config).map_err(|_| "encode boundary bootstrap")?;
     if response.len() > MAX_CONFIG_BYTES {
         return Err("boundary bootstrap exceeds 1 MiB".into());
     }
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    Ok(Exchange {
+        acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls)),
+        verifier,
+        config,
+        response,
+        redeemed: tokio::sync::Mutex::new(false),
+        pending: tokio::sync::Semaphore::new(4),
+    })
+}
+
+/// A serialized, launch-pinned exchange, also served through the shared router.
+pub(crate) struct Exchange {
+    acceptor: tokio_rustls::TlsAcceptor,
+    verifier: SessionJwtVerifier,
+    config: BootstrapServerConfig,
+    response: Vec<u8>,
+    redeemed: tokio::sync::Mutex<bool>,
+    pending: tokio::sync::Semaphore,
+}
+
+impl Exchange {
+    pub(crate) async fn exchange(&self, stream: tokio::net::TcpStream) -> Result<(), String> {
+        let _permit = self
+            .pending
+            .try_acquire()
+            .map_err(|_| "bootstrap exchange limit reached")?;
+        let exchange = async {
+            let mut redeemed = self.redeemed.lock().await;
+            if *redeemed {
+                return Err("bootstrap already acknowledged".to_string());
+            }
+            let mut stream = self
+                .acceptor
+                .accept(stream)
+                .await
+                .map_err(|_| "bootstrap TLS handshake")?;
+            let token = read_frame(&mut stream, MAX_TOKEN_BYTES)
+                .await
+                .map_err(|_| "read bootstrap token")?;
+            let token = std::str::from_utf8(&token).map_err(|_| "invalid bootstrap token")?;
+            let identity = self
+                .verifier
+                .verify(token)
+                .map_err(|_| "unauthorized bootstrap token")?;
+            if identity.token_id.to_string() != self.config.token_id
+                || identity.sandbox_id.to_string() != self.config.config.boundary_id
+                || identity.runtime_generation.to_string() != self.config.config.generation
+                || identity.auth_epoch != self.config.config.auth_epoch
+            {
+                return Err("bootstrap token does not name this launch".into());
+            }
+            write_frame(&mut stream, &self.response)
+                .await
+                .map_err(|_| "write bootstrap config")?;
+            if stream
+                .read_u8()
+                .await
+                .map_err(|_| "read bootstrap acknowledgment")?
+                != 1
+            {
+                return Err("invalid bootstrap acknowledgment".into());
+            }
+            *redeemed = true;
+            Ok(())
+        };
+        tokio::time::timeout(EXCHANGE_TIMEOUT, exchange)
+            .await
+            .map_err(|_| "bootstrap exchange timed out")?
+    }
+}
+
+/// Starts before normal admission, avoiding a dependency on sandbox readiness.
+/// Dropping the returned handle stops the listener and all pending exchanges.
+pub async fn serve(config: BootstrapServerConfig) -> Result<BootstrapServer, String> {
+    let listen = config.listen;
+    let exchange = prepare(config)?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|error| format!("bind bootstrap listener: {error}"))?;
+    let address = listener.local_addr().map_err(|error| error.to_string())?;
     let task = tokio::spawn(async move {
-        // One exchange at a time keeps retries and acknowledgment serialized.
-        // Every connection, including its TLS handshake, has a bounded lifetime.
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             openshell_core::net::set_tcp_nodelay_best_effort(&stream);
-            let exchange = async {
-                let mut stream = acceptor.accept(stream).await.map_err(|_| ())?;
-                let token = read_frame(&mut stream, MAX_TOKEN_BYTES)
-                    .await
-                    .map_err(|_| ())?;
-                let token = std::str::from_utf8(&token).map_err(|_| ())?;
-                let identity = verifier.verify(token).map_err(|_| ())?;
-                if identity.token_id.to_string() != config.token_id
-                    || identity.sandbox_id.to_string() != config.config.boundary_id
-                    || identity.runtime_generation.to_string() != config.config.generation
-                    || identity.auth_epoch != config.config.auth_epoch
-                {
-                    return Err(());
-                }
-                write_frame(&mut stream, &response).await.map_err(|_| ())?;
-                // A dropped response can be fetched again. Successful receipt
-                // retires the listener for the lifetime of this supervisor.
-                if stream.read_u8().await.map_err(|_| ())? != 1 {
-                    return Err(());
-                }
-                Ok::<_, ()>(())
-            };
-            if matches!(
-                tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await,
-                Ok(Ok(()))
-            ) {
+            if exchange.exchange(stream).await.is_ok() {
                 break;
             }
         }
@@ -135,6 +184,20 @@ pub async fn fetch(
     ca_pem: &str,
     token: &str,
 ) -> Result<BoundaryConfig, String> {
+    fetch_routed(address, server_name, ca_pem, token, None).await
+}
+
+/// Fetch through the shared supervisor's existing route directory when supplied.
+pub async fn fetch_routed(
+    address: SocketAddr,
+    server_name: String,
+    ca_pem: &str,
+    token: &str,
+    route: Option<&str>,
+) -> Result<BoundaryConfig, String> {
+    if let Some(route) = route {
+        crate::runtime_routed::validate_route_handle(route).map_err(|error| error.to_string())?;
+    }
     if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
         return Err("invalid bootstrap token length".into());
     }
@@ -155,11 +218,36 @@ pub async fn fetch(
     let name = ServerName::try_from(server_name).map_err(|_| "invalid bootstrap server name")?;
     // Covers service/pod startup races; each exchange is independently bounded.
     tokio::time::timeout(Duration::from_mins(2), async {
+        let mut target = address;
+        let mut redirects = 0;
         loop {
             let exchange = async {
-                let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+                let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(target)
                     .await
                     .map_err(|_| "connect bootstrap supervisor")?;
+                if let Some(route) = route {
+                    use crate::runtime_routed::{RouteReply, negotiate_route};
+                    match negotiate_route(&mut stream, route)
+                        .await
+                        .map_err(|_| "bootstrap route negotiation")?
+                    {
+                        RouteReply::Accept(_) => {}
+                        RouteReply::Redirect(owner) => {
+                            redirects += 1;
+                            target = if redirects <= 8 {
+                                owner
+                            } else {
+                                redirects = 0;
+                                address
+                            };
+                            return Err("bootstrap route redirected");
+                        }
+                        RouteReply::Unknown => {
+                            target = address;
+                            return Err("bootstrap route not yet assigned");
+                        }
+                    }
+                }
                 let mut stream = connector
                     .connect(name.clone(), stream)
                     .await
@@ -182,8 +270,15 @@ pub async fn fetch(
                     .map_err(|_| "flush bootstrap acknowledgment")?;
                 Ok::<BoundaryConfig, &str>(config)
             };
-            if let Ok(Ok(config)) = tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
-                return config;
+            match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
+                Ok(Ok(config)) => return config,
+                Ok(Err("bootstrap route redirected")) => {}
+                // Reconsult the Service's directory if an owner vanished or
+                // lost the route while this boundary was still bootstrapping.
+                _ => {
+                    target = address;
+                    redirects = 0;
+                }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -415,6 +510,132 @@ mod tests {
                 .is_err()
         );
         assert!(fetch(server.address, f.name, &f.ca, &f.token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shared_bootstrap_routes_redirects_authenticates_and_retires_each_launch() {
+        use crate::runtime_routed::{RouteReply, RuntimeRouter, negotiate_route};
+        let owner = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let other = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let route = "rt-0123456789abcdef";
+        let handle = format!("boot-{route}");
+        other.set_directory(
+            Some(other.local_addr()),
+            [(route.into(), owner.local_addr())].into(),
+        );
+        owner.set_directory(
+            Some(owner.local_addr()),
+            [(route.into(), owner.local_addr())].into(),
+        );
+        let f = fixture();
+        let g = fixture();
+        let lease = owner.register_bootstrap(route, f.server.clone()).unwrap();
+        let _second = owner
+            .register_bootstrap("rt-fedcba9876543210", g.server)
+            .unwrap();
+        assert!(owner.register_bootstrap(route, f.server).is_err());
+
+        // A valid token for another launch does not consume this configuration.
+        let mut raw = openshell_core::net::connect_tcp_nodelay_best_effort(owner.local_addr())
+            .await
+            .unwrap();
+        assert!(matches!(
+            negotiate_route(&mut raw, &handle).await.unwrap(),
+            RouteReply::Accept(_)
+        ));
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(f.ca.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let tls = openshell_crypto::tls::client_builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut stream = tokio_rustls::TlsConnector::from(Arc::new(tls))
+            .connect(ServerName::try_from(f.name.clone()).unwrap(), raw)
+            .await
+            .unwrap();
+        write_frame(&mut stream, g.token.as_bytes()).await.unwrap();
+        assert!(read_frame(&mut stream, MAX_CONFIG_BYTES).await.is_err());
+
+        let received = fetch_routed(
+            other.local_addr(),
+            f.name.clone(),
+            &f.ca,
+            &f.token,
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.child_env["BOOTSTRAP_TEST_SECRET"], "private-value");
+        // Retirement is per launch: the other registered sandbox still boots.
+        assert!(
+            fetch_routed(
+                owner.local_addr(),
+                g.name,
+                &g.ca,
+                &g.token,
+                Some("boot-rt-fedcba9876543210")
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(400),
+                fetch_routed(owner.local_addr(), f.name, &f.ca, &f.token, Some(&handle))
+            )
+            .await
+            .is_err()
+        );
+        drop(lease);
+        let mut raw = openshell_core::net::connect_tcp_nodelay_best_effort(owner.local_addr())
+            .await
+            .unwrap();
+        assert_eq!(
+            negotiate_route(&mut raw, &handle).await.unwrap(),
+            RouteReply::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_bootstrap_reconsults_directory_after_redirected_owner_fails() {
+        use crate::runtime_routed::RuntimeRouter;
+        let owner = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let entry = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead_address = dead.local_addr();
+        drop(dead);
+        let route = "rt-0123456789abcdef";
+        let f = fixture();
+        let _lease = owner.register_bootstrap(route, f.server).unwrap();
+        entry.set_directory(
+            Some(entry.local_addr()),
+            [(route.into(), dead_address)].into(),
+        );
+        let directory = entry.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            directory.set_directory(
+                Some(directory.local_addr()),
+                [(route.into(), owner.local_addr())].into(),
+            );
+            owner
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            fetch_routed(
+                entry.local_addr(),
+                f.name,
+                &f.ca,
+                &f.token,
+                Some("boot-rt-0123456789abcdef"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.boundary_id, "test");
+        let _owner = task.await.unwrap();
     }
 
     #[tokio::test]

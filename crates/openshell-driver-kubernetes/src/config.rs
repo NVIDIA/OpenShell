@@ -118,8 +118,6 @@ impl FromStr for KubernetesControlConnection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
-    /// Experimental dedicated-supervisor bootstrap over TLS instead of boundary.json.
-    pub bootstrap_over_wire: bool,
     pub app_listener: KubernetesAppListenerConfig,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
@@ -130,7 +128,6 @@ impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
-            bootstrap_over_wire: false,
             app_listener: KubernetesAppListenerConfig::default(),
         }
     }
@@ -149,9 +146,7 @@ pub struct KubernetesAppListenerConfig {
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.app_listener.common.validate()?;
-        if self.bootstrap_over_wire
-            && self.boundary_port == openshell_sandbox_backend::bootstrap::PORT
-        {
+        if self.boundary_port == openshell_sandbox_backend::bootstrap::PORT {
             return Err("boundary_port conflicts with bootstrap port 5502".into());
         }
         if self.app_listener.common.enabled {
@@ -159,8 +154,7 @@ impl KubernetesSandboxRuntimeConfig {
                 return Err("sandbox_runtime.app_listener.tls_secret_name is required when the app listener is enabled".into());
             }
             if [self.boundary_port, 5501].contains(&self.app_listener.common.port)
-                || (self.bootstrap_over_wire
-                    && self.app_listener.common.port == openshell_sandbox_backend::bootstrap::PORT)
+                || self.app_listener.common.port == openshell_sandbox_backend::bootstrap::PORT
             {
                 return Err("supervisor.app_listener.port conflicts with a supervisor runtime or health port".into());
             }
@@ -601,9 +595,6 @@ impl KubernetesComputeConfig {
     /// holds no per-sandbox workload identity, upstream proxy credential, or
     /// proxy CA.
     pub fn validate_supervisor_topology(&self) -> Result<(), String> {
-        if self.sandbox_runtime.bootstrap_over_wire && self.supervisor_topology.is_some() {
-            return Err("bootstrap_over_wire currently requires dedicated supervisors".into());
-        }
         match self.supervisor_topology {
             None => {
                 if self.shared_supervisor.is_some() {
