@@ -24,6 +24,9 @@ pub mod startup_document;
 ))]
 mod launcher;
 
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
+mod podman;
+
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 mod vm;
 
@@ -500,23 +503,20 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config = podman_config(context.config_context())?;
-        config.supervisor_otlp = context
-            .otlp_config()
-            .map(OtlpConfig::supervisor_otlp)
-            .unwrap_or_default();
-        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
+        let driver_config: toml::Table = context.config_context().driver_config()?;
         require_guest_tls_for_local_driver(&context, "podman")?;
-        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
-        let driver = openshell_driver_podman::PodmanComputeDriver::new(
-            config,
-            context.network_trust_bundle().cloned(),
-        )
-        .await
-        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
-        let driver = openshell_driver_podman::ComputeDriverService::new_in_process(driver);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
+        let endpoint = podman::spawn(podman::PodmanLaunch {
+            gateway_log_level: context.gateway_log_level(),
+            gateway_name: context.gateway_name(),
+            gateway_port: context.gateway_port(),
+            tls_ca: context.guest_tls_ca(),
+            otlp_config: context.otlp_config(),
+            network_trust: context.network_trust_bundle(),
+            driver_config,
+        })
+        .await?;
+        Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
+            endpoint,
         ))
     }
 }
