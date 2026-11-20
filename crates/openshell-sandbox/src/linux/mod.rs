@@ -9,6 +9,8 @@
 pub mod child_seccomp;
 pub mod landlock;
 pub mod proc_fd;
+pub mod proc_status;
+pub mod process_sched;
 pub mod process_signal;
 pub mod seccomp_notify;
 pub mod socket_confinement;

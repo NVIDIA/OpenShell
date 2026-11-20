@@ -320,7 +320,8 @@ async fn execute_owned<M: Mutation>(
                 return Err(replay_unavailable());
             }
             let success = previous.success.ok_or_else(uncertain)?;
-            let mut response = Response::new(M::restore(&state.store, success).await?);
+            let output = M::restore(&state.store, success).await?;
+            let mut response = Response::new(output);
             response
                 .metadata_mut()
                 .insert(REPLAYED_HEADER, "true".parse().expect("static metadata"));

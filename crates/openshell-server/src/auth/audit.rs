@@ -699,10 +699,10 @@ impl AuthzDenial<'_> {
     }
 }
 
-/// Longest identifier recorded on an event.
+/// Longest identifier or value recorded on an event.
 const MAX_ID_LEN: usize = 128;
 
-/// Cap an identifier so a caller cannot inflate events.
+/// Cap a value so a caller cannot inflate events.
 fn bounded(value: &str) -> String {
     if value.len() <= MAX_ID_LEN {
         return value.to_string();
@@ -775,16 +775,20 @@ fn emit_denial(
         .request_id
         .clone()
         .or_else(|| finding.then(|| uuid::Uuid::new_v4().to_string()));
+    if let Some(resource) = denial.resource().filter(|r| !resources.contains(r)) {
+        resources.push(resource);
+    }
+    let (resources, omitted) = limited_resources(resources);
     let mut builder = api_activity(&ctx, path, origin, principal)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .status_detail(category)
-        .message(format!("authorization denied: {category}"));
-    if let Some(resource) = denial.resource().filter(|r| !resources.contains(r)) {
-        resources.push(resource);
-    }
+        .message(with_omitted(
+            format!("authorization denied: {category}"),
+            omitted,
+        ));
     for resource in resources {
         builder = builder.resource(resource);
     }
@@ -870,8 +874,51 @@ fn api_activity<'a>(
     builder
 }
 
-/// Most resources one mutation record lists.
+/// Most resources one record lists: the first ones recorded and the last,
+/// which is what the change produced.
 const MAX_RECORDED_RESOURCES: usize = 16;
+
+/// `data` with every string in it bounded.
+fn bounded_data(data: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match data {
+        Value::String(value) => Value::String(bounded(&value)),
+        Value::Array(values) => values.into_iter().map(bounded_data).collect(),
+        Value::Object(fields) => fields
+            .into_iter()
+            .map(|(key, value)| (bounded(&key), bounded_data(value)))
+            .collect(),
+        scalar => scalar,
+    }
+}
+
+/// At most [`MAX_RECORDED_RESOURCES`] of `resources`, every field bounded,
+/// and how many were left out.
+fn limited_resources(mut resources: Vec<ResourceDetails>) -> (Vec<ResourceDetails>, usize) {
+    let omitted = resources.len().saturating_sub(MAX_RECORDED_RESOURCES);
+    if omitted > 0 {
+        resources.drain(MAX_RECORDED_RESOURCES - 1..resources.len() - 1);
+    }
+    let resources = resources
+        .into_iter()
+        .map(|resource| ResourceDetails {
+            name: resource.name.as_deref().map(bounded),
+            uid: resource.uid.as_deref().map(bounded),
+            type_label: resource.type_label,
+            data: resource.data.map(bounded_data),
+        })
+        .collect();
+    (resources, omitted)
+}
+
+/// `message`, noting the `omitted` resources a record does not list.
+fn with_omitted(message: String, omitted: usize) -> String {
+    if omitted == 0 {
+        message
+    } else {
+        format!("{message}; {omitted} more resources not listed")
+    }
+}
 
 /// Emit the record of a mutation that ended with `code`, or that never
 /// finished when `code` is `None`.
@@ -880,16 +927,9 @@ fn emit_mutation(request: &RequestContext, principal: &Principal, code: Option<C
     let mutation = std::mem::take(&mut *lock(&request.mutation));
     let ctx = crate::gateway_ocsf::context("", "");
     let mut builder = api_activity(&ctx, path, origin, principal);
-    let omitted = mutation
-        .resources
-        .len()
-        .saturating_sub(MAX_RECORDED_RESOURCES);
-    for resource in mutation.resources.into_iter().take(MAX_RECORDED_RESOURCES) {
-        builder = builder.resource(ResourceDetails {
-            name: resource.name.as_deref().map(bounded),
-            uid: resource.uid.as_deref().map(bounded),
-            ..resource
-        });
+    let (resources, omitted) = limited_resources(mutation.resources);
+    for resource in resources {
+        builder = builder.resource(resource);
     }
     let code = code.map(|code| match mutation.outcome {
         Some(Outcome::Rejected(rejected)) if code == Code::Ok => rejected,
@@ -922,12 +962,10 @@ fn emit_mutation(request: &RequestContext, principal: &Principal, code: Option<C
             Some(failure),
         ),
     };
-    let message = if omitted == 0 {
-        message
-    } else {
-        format!("{message}; {omitted} more resources not listed")
-    };
-    builder = builder.severity(severity).status(status).message(message);
+    builder = builder
+        .severity(severity)
+        .status(status)
+        .message(with_omitted(message, omitted));
     if let Some(detail) = detail {
         builder = builder.status_detail(detail);
     }

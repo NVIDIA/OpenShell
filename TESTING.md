@@ -180,6 +180,11 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
+To run Python in a testkit sandbox, use `Sandbox::run_python` with a sandbox
+from `testkit::python_image()`, not the Python SDK's `exec_python` described
+under Python E2E. [Writing a sandbox client](tests/testkit/README.md#writing-a-sandbox-client)
+covers scripts that probe the network from inside a sandbox.
+
 The conformance crate also builds `openshell-conformance`, a program that
 runs the conformance suite against a gateway without cargo or nextest
 (`openshell-conformance list`, `ready`, `run`). It covers only the
@@ -305,11 +310,11 @@ service.
   setup playbook starts the service (with a restart policy, since setup is
   cached as a disk) and writes the variables as `KEY=VALUE` lines to
   `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
-  through the environment's setup `inputs`, and add them to the tmachine disk
-  cache key in `e2e-suites.yml`. The runner rejects names without the
-  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
-  values never appear in a runner command. Values are taken literally, without
-  quoting.
+  through the environment's setup `inputs`; they are part of the setup layer's
+  hash, which CI's disk cache keys on too. The runner rejects names without
+  the `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest,
+  so values never appear in a runner command. Values are taken literally,
+  without quoting.
 - **Fixture.** Put the service's fixture in a support crate under
   `tests/support/<service>`, named `<service>-support`, so any suite can
   depend on it, or reuse the existing one. It defines the variable names as constants and a
@@ -344,6 +349,41 @@ expects. Any environment that creates matching devices and sets the variable
 can run the suite. The expectations characterize the sandbox's behavior today,
 not a specification, and the `echo-socket` check needs `perl` in the workload
 image, which the default image has.
+
+### Continuity suites (`tests/suites/continuity/`)
+
+A continuity scenario checks that state created before a disruption survives it.
+Each scenario is a module with a `seed` test and a `verify` test that share a
+run id through `CONTINUITY_RUN_ID` and derive resource names from it
+(`scenario::name`). `seed` creates state through the CLI, so testkit's cleanup
+leaves it in place. `verify` adopts it and checks it, then does something new.
+
+`openshell-test-runner run --disruption <name>` runs the `seed` tests, applies the
+disruption in the guest, waits for the gateway, and runs the `verify` tests.
+Scenarios run under every disruption. The installer provides each disruption as an
+executable in `/var/lib/openshell-qualification/disruptions/<name>`, because how to
+restart or upgrade OpenShell depends on how it is installed. The runner stops
+before seeding if the installer doesn't provide the one you ask for.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family continuity --disruption gateway-restart
+```
+
+The `upgrade` disruption installs the candidate over a released package. Use the
+`deb-upgrade-source` installer, which installs the latest release as the baseline.
+The candidate is this checkout's `nix run .#build-artifacts` output, which CI also
+builds. CI downloads the baseline; locally, put the release's Debian package at
+`artifacts/upgrade/deb/source/openshell.deb` and its sandbox and supervisor images,
+saved with `docker save`, at
+`artifacts/upgrade/source-images/openshell-{sandbox,supervisor}-tmachine.tar`.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb-upgrade-source \
+  --family continuity --disruption upgrade
+```
 
 ### Python E2E (`e2e/python/`)
 
@@ -844,7 +884,7 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_TLS` | `1` reaches the gateway over mTLS through the port-forward; pair it with an overlay that keeps gateway TLS on, such as `ci/values-tls-port-forward.yaml` |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
-| `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |
+| `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/ai-openshell/openshell`) |
 | `GATEWAY_IMAGE` | Kubernetes gateway image repository or complete tagged/digest-pinned image reference; digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
 | `SUPERVISOR_IMAGE` | Gateway/supervisor image repository or complete tagged/digest-pinned image reference; Kubernetes digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
 | `SANDBOX_IMAGE` | Trusted sandbox runtime image repository or complete tagged/digest-pinned image reference |

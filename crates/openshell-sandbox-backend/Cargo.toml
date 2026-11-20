@@ -43,8 +43,11 @@ libc = "0.2"
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
+openshell-otel = { path = "../openshell-otel" }
+openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 tokio = { workspace = true, features = ["test-util"] }
 jsonwebtoken = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -9,6 +9,8 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
+pub use openshell_core::app_listener::service_route_hash_label;
+use openshell_core::app_listener::service_route_label;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{
     Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
@@ -19,7 +21,6 @@ use openshell_ocsf::{
     HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -162,6 +163,9 @@ pub fn endpoint_url(
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
+    if !config.service_routing.enabled {
+        return None;
+    }
     let host = endpoint_host(
         config.service_routing_discriminator(),
         &config.service_routing,
@@ -198,77 +202,10 @@ fn endpoint_host(
     service: &str,
 ) -> Option<String> {
     let base_domain = config.base_domains.first()?;
-    Some(discriminator.map_or_else(
-        || {
-            format!(
-                "{}.{base_domain}",
-                service_route_readable_label(workspace, sandbox, service)
-            )
-        },
-        |gateway_name| {
-            format!(
-                "{}.{}",
-                service_route_hash_label(
-                    gateway_name,
-                    workspace,
-                    sandbox,
-                    (!service.is_empty()).then_some(service),
-                ),
-                base_domain
-            )
-        },
+    Some(format!(
+        "{}.{base_domain}",
+        service_route_label(discriminator, workspace, sandbox, service)
     ))
-}
-
-/// Readable DNS label shared by discovery and gateway routing.
-pub fn service_route_readable_label(workspace: &str, sandbox: &str, service: &str) -> String {
-    if service.is_empty() {
-        format!("{workspace}--{sandbox}")
-    } else {
-        format!("{workspace}--{sandbox}--{service}")
-    }
-}
-
-/// Returns the stable, one-label DNS name for a service route.
-pub fn service_route_hash_label(
-    gateway_name: &str,
-    workspace: &str,
-    sandbox: &str,
-    service: Option<&str>,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(gateway_name.as_bytes());
-    hasher.update([0]);
-    hasher.update(workspace.as_bytes());
-    hasher.update([0]);
-    hasher.update(sandbox.as_bytes());
-    hasher.update([0]);
-    hasher.update(service.unwrap_or("").as_bytes());
-    let digest = hasher.finalize();
-    base32_lower_no_padding(&digest[..10])
-}
-
-fn base32_lower_no_padding(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut output = String::with_capacity(16);
-    let mut accumulator = 0_u32;
-    let mut bits = 0_u8;
-    for byte in bytes {
-        accumulator = (accumulator << 8) | u32::from(*byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            output.push(char::from(
-                ALPHABET[((accumulator >> bits) & 0x1f) as usize],
-            ));
-        }
-    }
-    if bits > 0 {
-        output.push(char::from(
-            ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize],
-        ));
-    }
-    output
 }
 
 /// A resolved service-route destination.
@@ -576,6 +513,12 @@ pub async fn proxy_sandbox_service_request(
     state: Arc<ServerState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
+    if !state.config.service_routing.enabled {
+        return service_error_response(
+            StatusCode::NOT_FOUND,
+            "Gateway service routing is disabled",
+        );
+    }
     let Some(host) = request_host(&req).map(str::to_string) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1432,6 +1375,96 @@ mod tests {
     use super::*;
     use openshell_core::config::ServiceHostnameFormat;
 
+    #[tokio::test]
+    async fn disabled_gateway_routing_does_not_rebuild_the_hashed_index() {
+        use tower::ServiceExt as _;
+
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.service_routing.enabled = false;
+        inner.config.name = "gateway-a".into();
+        inner.config.service_routing.service_hostname_format = ServiceHostnameFormat::Hashed;
+        inner.service_route_index = Arc::new(ServiceRouteIndex::new(Some("gateway-a".into())));
+
+        for router in [
+            crate::http_router(state.clone()),
+            crate::service_http_router(state.clone()),
+        ] {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/app")
+                        .header(header::HOST, "enh47uqyj7bpyttz.openshell.localhost")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(
+                state
+                    .service_route_index
+                    .last_rebuild
+                    .read()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_gateway_routing_rejects_http_and_websocket_on_both_routers() {
+        use tower::ServiceExt as _;
+
+        for hashed in [false, true] {
+            for listener_enabled in [false, true] {
+                let mut state = crate::grpc::test_support::test_server_state().await;
+                let inner = Arc::get_mut(&mut state).unwrap();
+                inner.config.service_routing.enabled = false;
+                inner.config.supervisor_app_listener.enabled = listener_enabled;
+                inner.config.name = "gateway-a".into();
+                inner.config.service_routing.service_hostname_format = if hashed {
+                    ServiceHostnameFormat::Hashed
+                } else {
+                    ServiceHostnameFormat::Readable
+                };
+                inner.service_route_index =
+                    Arc::new(ServiceRouteIndex::new(Some("gateway-a".into())));
+                inner
+                    .service_route_index
+                    .register("default", "my-sandbox", "web")
+                    .unwrap();
+                let host = if hashed {
+                    "enh47uqyj7bpyttz.openshell.localhost"
+                } else {
+                    "default--my-sandbox--web.openshell.localhost"
+                };
+                for service_only in [false, true] {
+                    for websocket in [false, true] {
+                        let router = if service_only {
+                            crate::service_http_router(state.clone())
+                        } else {
+                            crate::http_router(state.clone())
+                        };
+                        let mut request = Request::builder().uri("/app").header(header::HOST, host);
+                        if websocket {
+                            request = request
+                                .header(header::CONNECTION, "upgrade")
+                                .header(header::UPGRADE, "websocket")
+                                .header("sec-websocket-version", "13")
+                                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+                        }
+                        let response = router
+                            .oneshot(request.body(Body::empty()).unwrap())
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                    }
+                }
+            }
+        }
+    }
+
     fn endpoint() -> ServiceEndpoint {
         ServiceEndpoint {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -1534,6 +1567,47 @@ mod tests {
             endpoint_url(&cfg, "staging", "my-sandbox", "web").as_deref(),
             Some("http://staging--my-sandbox--web.dev.openshell.localhost:8080/")
         );
+    }
+
+    #[test]
+    fn switching_ingress_preserves_public_urls_in_both_hostname_modes() {
+        for format in [
+            ServiceHostnameFormat::Readable,
+            ServiceHostnameFormat::Hashed,
+        ] {
+            let mut cfg = openshell_core::Config::new(Some(tls_config()))
+                .with_bind_address("0.0.0.0:443".parse().unwrap())
+                .with_server_sans(["*.apps.example.com"])
+                .with_name("gateway-a")
+                .with_service_hostname_format(format);
+            cfg.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+                enabled: true,
+                port: 9443,
+                base_url: Some("https://apps.example.com".into()),
+            };
+            for workspace in ["default", "team-a"] {
+                for service in ["", "web"] {
+                    let application_url = cfg
+                        .supervisor_app_listener
+                        .service_url(
+                            workspace,
+                            "my-sandbox",
+                            service,
+                            cfg.service_routing_discriminator(),
+                        )
+                        .unwrap();
+                    // Switching to gateway ingress removes listener configuration,
+                    // but preserves the installation identity and public origin.
+                    let listener = std::mem::take(&mut cfg.supervisor_app_listener);
+                    let gateway_url = endpoint_url(&cfg, workspace, "my-sandbox", service).unwrap();
+                    assert_eq!(
+                        application_url, gateway_url,
+                        "{format:?}: {workspace}/{service}"
+                    );
+                    cfg.supervisor_app_listener = listener;
+                }
+            }
+        }
     }
 
     #[test]

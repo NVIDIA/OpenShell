@@ -374,26 +374,13 @@ pub async fn scenario(cx: &Context, name: &str) -> Result {
     let Scenario { device, checks } = load(name)?;
     let driver = compute_driver(cx).await?;
 
-    let sandbox = cx.name("cdi");
-    cx.track(&sandbox);
     let config = json!({driver: {"cdi_devices": [device]}}).to_string();
     let probe = probe_script(&checks);
     let output = cx
-        .cli([
-            "sandbox",
-            "create",
-            "--name",
-            &sandbox,
-            "--no-tty",
-            "--gpu",
-            "1",
-            "--driver-config-json",
-            &config,
-            "--",
-            "sh",
-            "-c",
-            &probe,
-        ])
+        .cli_sandbox("cdi")
+        .args(["--gpu", "1", "--driver-config-json", &config])
+        .command(["sh", "-c", &probe])
+        .run()
         .await?;
 
     let output = output

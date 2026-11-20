@@ -188,14 +188,14 @@ network_policies:
                 let request = read_http_headers(&mut upstream).await;
                 assert!(String::from_utf8_lossy(&request).starts_with("GET /allowed HTTP/1.1\r\n"));
                 upstream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
                     .await
                     .unwrap();
                 upstream.flush().await.unwrap();
                 released.await.unwrap();
-                upstream.write_all(b"ok").await.unwrap();
-                // Clean TLS EOF too: the HTTP declared-length failure must
-                // reach the non-benign outer relay-error callsite.
+                upstream.write_all(b"invalid\r\n").await.unwrap();
+                // Invalid chunk framing reaches the non-benign outer error
+                // callsite; transport EOF is handled by the relay itself.
                 upstream.shutdown().await.unwrap();
             };
             let exchange = async {
@@ -244,7 +244,10 @@ network_policies:
                 // The downstream TLS stream may omit close_notify when its
                 // failed HTTP relay drops it. The captured event is the oracle.
                 let _ = client.read_to_end(&mut body).await;
-                assert_eq!(body, b"ok");
+                assert!(
+                    body.is_empty(),
+                    "malformed chunk framing must not be forwarded"
+                );
                 receipt
             };
             let ((), receipt) = tokio::join!(serve, exchange);
@@ -294,7 +297,7 @@ network_policies:
                 terminal["message"]
                     .as_str()
                     .unwrap()
-                    .contains("2 bytes remaining")
+                    .contains("Invalid HTTP chunk size token")
             );
             assert_eq!(terminal["class_uid"], 4001);
             assert_eq!(terminal["unmapped"]["http_event_kind"], "connection");
@@ -477,17 +480,22 @@ network_policies:
             .unwrap();
     result.unwrap();
     let spans = capture.spans();
-    let expected = (!matches!(outcome, Outcome::UpstreamClosed)).then_some(if policy_denied {
+    let upstream_failure = matches!(outcome, Outcome::UpstreamClosed);
+    let expected = if policy_denied {
         403
     } else if credential_failure {
         500
+    } else if upstream_failure {
+        502
     } else {
         200
-    });
+    };
     let response = String::from_utf8(response).unwrap();
     let records = capture.events.json_events();
     let expected_records = if policy_denied || credential_failure {
         1
+    } else if upstream_failure {
+        3
     } else {
         2
     };
@@ -508,12 +516,20 @@ network_policies:
     assert_eq!(record["firewall_rule"]["type"], "l7");
     assert!(record.get("status_id").is_none());
     assert!(record.get("status_detail").is_none());
-    for control in &records {
-        assert_eq!(control["http_request"]["url"]["path"], path);
-        assert!(control.get("http_response").is_none());
+    for (index, control) in records.iter().enumerate() {
+        if upstream_failure && index == 1 {
+            assert_eq!(control["status_detail"], "upstream_http_transport_failure");
+            assert_eq!(control["status_id"], 2);
+            assert_eq!(control["http_request"]["http_method"], "GET");
+            assert!(control["http_request"].get("url").is_none());
+            assert_eq!(control["http_response"]["code"], 502);
+        } else {
+            assert_eq!(control["http_request"]["url"]["path"], path);
+            assert!(control.get("http_response").is_none());
+        }
     }
     if !policy_denied && !credential_failure {
-        let forwarded = &records[1];
+        let forwarded = records.last().unwrap();
         assert!(
             forwarded["message"]
                 .as_str()
@@ -526,33 +542,30 @@ network_policies:
     }
     let receipt = record["metadata"]["correlation_uid"].as_str().unwrap();
     assert!(uuid::Uuid::parse_str(receipt).is_ok());
+    if upstream_failure {
+        assert_eq!(records[1]["unmapped"]["request_id"], receipt);
+        assert!(response.contains("Connection: close\r\n"));
+    }
     assert_request_record_sequence(&records, receipt);
     assert!(!format!("{records:?}").contains("SENTINEL"));
     assert!(!format!("{records:?}").contains("forged-receipt"));
     assert!(!format!("{records:?}").contains("%ff"));
-    if let Some(expected) = expected {
+    assert!(
+        response.starts_with(&format!("HTTP/1.1 {expected} ")),
+        "{response}"
+    );
+    assert_eq!(response_request_id(response.as_bytes()), receipt);
+    if policy_denied {
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["error"], "policy_denied");
         assert!(
-            response.starts_with(&format!("HTTP/1.1 {expected} ")),
-            "{response}"
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("GET {ip}:{port}{path} denied by L7 policy: "))
         );
-        assert_eq!(response_request_id(response.as_bytes()), receipt);
-        if policy_denied {
-            let (_, body) = response.split_once("\r\n\r\n").unwrap();
-            let body: serde_json::Value = serde_json::from_str(body).unwrap();
-            assert_eq!(body["error"], "policy_denied");
-            assert!(
-                body["detail"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with(&format!("GET {ip}:{port}{path} denied by L7 policy: "))
-            );
-            assert_eq!(body.as_object().unwrap().len(), 2);
-        }
-    } else {
-        assert!(
-            response.is_empty(),
-            "upstream EOF must not synthesize a response"
-        );
+        assert_eq!(body.as_object().unwrap().len(), 2);
     }
     assert_eq!(record["action_id"], if policy_denied { 2 } else { 1 });
     let created = capture.created_span_names();
@@ -606,18 +619,10 @@ network_policies:
                 root.span_context.trace_id().to_string()
             );
         }
-        if let Some(expected) = expected {
-            assert!(root.attributes.iter().any(|attribute| {
-                attribute.key.as_str() == "http.response.status_code"
-                    && attribute.value == opentelemetry::Value::I64(expected)
-            }));
-        } else {
-            assert!(
-                root.attributes
-                    .iter()
-                    .all(|attribute| attribute.key.as_str() != "http.response.status_code")
-            );
-        }
+        assert!(root.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "http.response.status_code"
+                && attribute.value == opentelemetry::Value::I64(expected)
+        }));
         assert!(root.attributes.iter().any(|attribute| {
             attribute.key.as_str() == "openshell.request.id" && attribute.value.as_str() == receipt
         }));

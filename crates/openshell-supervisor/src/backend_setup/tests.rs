@@ -857,7 +857,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             main_exit_marker: Some(marker.clone()),
             attach_request_timeout: Duration::from_mins(5),
             trace_context: None,
-            provider_workload_api_socket: None,
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
             // The binary loads the proxy trust directory from its environment.
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
             takeover: None,
@@ -1075,7 +1075,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             main_exit_marker: Some(marker.clone()),
             attach_request_timeout: Duration::from_mins(5),
             trace_context: None,
-            provider_workload_api_socket: None,
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
             // The binary loads the proxy trust directory from its environment.
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
             takeover: None,

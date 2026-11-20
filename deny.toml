@@ -14,9 +14,9 @@ yanked = "warn"
 unmaintained = "workspace"
 maximum-db-staleness = "P30D"
 ignore = [
-    # chrono 0.4.45 is unmaintained with no patched release. Replacing the
-    # logging/time APIs and the Kubernetes, OAuth2, and OCI dependency paths
-    # requires a coordinated migration beyond a compatible dependency update.
+    # chrono 0.4.45 is unmaintained with no patched release. Migration requires
+    # changes to OpenShell's time and logging APIs and to dependencies including
+    # oauth2, oci-client, russh-sftp, and russh-util.
     # https://github.com/chronotope/chrono/issues/1768
     { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; remove after first-party time APIs and all covered dependency graphs migrate to maintained alternatives and pass validation" },
 ]

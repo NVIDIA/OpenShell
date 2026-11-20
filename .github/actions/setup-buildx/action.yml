@@ -1,23 +1,13 @@
 name: Setup Docker Buildx
 description: >
   Create a Docker Buildx builder on the local docker-container driver. Pair
-  with cache-to/cache-from=type=gha on build steps for persistence. Works on
-  nv-gha-runners; no EKS BuildKit service is required.
+  with cache-to/cache-from=type=gha on build steps for persistence.
   Cleanup is automatic when the job finishes (docker/setup-buildx-action default).
 
 inputs:
   name:
     description: Builder instance name
     default: openshell
-  buildkitd-config:
-    description: >
-      Path to a buildkitd.toml to configure the builder with (e.g. the
-      nv-gha-runners Docker Hub mirror at /etc/buildkit/buildkitd.toml).
-      Must be readable *from where this action runs* — in a containerized
-      job that means the caller must bind-mount the host path into the job
-      container (e.g. `volumes: [/etc/buildkit:/etc/buildkit:ro]`). Empty
-      disables the config (default).
-    default: ""
 
 runs:
   using: composite
@@ -28,4 +18,3 @@ runs:
         name: ${{ inputs.name }}
         driver: docker-container
         platforms: linux/amd64,linux/arm64
-        buildkitd-config: ${{ inputs.buildkitd-config }}

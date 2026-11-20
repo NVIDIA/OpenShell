@@ -12,7 +12,7 @@ on:
       runner:
         required: false
         type: string
-        default: linux-amd64-cpu8
+        default: ubuntu-24.04
       checkout-ref:
         required: false
         type: string
@@ -46,20 +46,20 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.suite-matrix) }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70@sha256:ffa96b8009de6e28bbf157060440c3abb312d3bcda444e9571c539c8c6115615
+      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --privileged
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
-        - /home/runner/_work:/home/runner/_work
+        - /home/runner/work:/home/runner/work
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
-      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
-      OPENSHELL_SANDBOX_RUNTIME_IMAGE: ${{ format('ghcr.io/nvidia/openshell/sandbox:{0}', inputs.image-tag) }}
-      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+      OPENSHELL_REGISTRY: ghcr.io/ai-openshell/openshell
+      OPENSHELL_SANDBOX_RUNTIME_IMAGE: ${{ format('ghcr.io/ai-openshell/openshell/sandbox:{0}', inputs.image-tag) }}
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/ai-openshell/openshell/supervisor:{0}', inputs.image-tag) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,6 +73,10 @@ jobs:
       - uses: ./.github/actions/setup-e2e-gateway
         with:
           artifact-name: ${{ inputs.gateway-artifact }}
+
+      - uses: ./.github/actions/load-e2e-images
+        with:
+          images: sandbox supervisor
 
       - name: Check out MCP conformance tests
         if: matrix.mcp

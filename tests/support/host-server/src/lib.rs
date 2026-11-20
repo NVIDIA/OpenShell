@@ -21,6 +21,9 @@ use tokio::net::TcpListener;
 pub use http::{HttpRecorder, Request};
 pub use websocket::WebSocketRecorder;
 
+/// The name a sandbox reaches these servers by.
+pub const TEST_HOST: &str = "host.openshell.internal";
+
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
