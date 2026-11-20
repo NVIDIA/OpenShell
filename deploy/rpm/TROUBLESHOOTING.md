@@ -173,7 +173,7 @@ grep $USER /etc/subuid /etc/subgid
 sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
 ```
 
-**Image pull failure.** Verify ghcr.io is reachable:
+**Image pull failure.** Verify quay.io is reachable:
 
 ```shell
 podman pull nvcr.io/nvidia/base/ubuntu:24.04
@@ -186,7 +186,7 @@ and cached. To update:
 
 ```shell
 podman pull nvcr.io/nvidia/base/ubuntu:24.04
-podman pull ghcr.io/nvidia/openshell/supervisor:latest
+podman pull quay.io/ai-openshell/supervisor:latest
 ```
 
 Or set `image_pull_policy = "always"` in
@@ -238,7 +238,7 @@ in CONFIGURATION.md and `openshell-gateway --help`.
 To pick up new container images after an upgrade:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell/supervisor:latest
+podman pull quay.io/ai-openshell/supervisor:latest
 podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 

@@ -49,7 +49,7 @@ Pass the cert-manager values override when installing or upgrading the chart:
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set certManager.enabled=true
@@ -70,7 +70,7 @@ real `Issuer` or `ClusterIssuer` instead, for example a LetsEncrypt/ACME issuer:
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set certManager.enabled=true \

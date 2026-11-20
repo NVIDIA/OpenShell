@@ -157,8 +157,8 @@ change the default, and users can select an explicit image with `--from`.
 
 | Image | Reference | Pulled When |
 |---|---|---|
-| Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
-| Sandbox runtime | `ghcr.io/nvidia/openshell/sandbox:latest` | A supported runtime stages `openshell-sandbox` into a workload boundary |
+| Gateway | `quay.io/ai-openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
+| Sandbox runtime | `quay.io/ai-openshell/sandbox:latest` | A supported runtime stages `openshell-sandbox` into a workload boundary |
 | Default workload | `nvcr.io/nvidia/base/ubuntu:24.04` | First sandbox creation unless preloaded or overridden |
 
 The Helm chart in `deploy/helm/openshell` deploys the gateway workload, service account, service, optional persistent storage, and network policy for Kubernetes. It defaults to a StatefulSet for SQLite-backed installs and can render a Deployment for external database-backed installs.

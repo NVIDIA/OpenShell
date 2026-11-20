@@ -489,7 +489,7 @@ namespace              = "openshell"
 grpc_endpoint          = "https://openshell-gateway.openshell.svc:8080"
 default_image          = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Defaults to the gateway version; override to pin a specific build.
-# supervisor_image     = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image     = "quay.io/ai-openshell/supervisor:<version>"
 client_tls_secret_name = "openshell-client-tls"
 service_account_name   = "openshell-sandbox"
 host_gateway_ip        = "10.0.0.1"
@@ -1567,10 +1567,10 @@ image_pull_secrets             = ["regcred"]
 # runtime_bootstrap_grace_seconds = 900
 # sandbox_attach_request_timeout_seconds = 900
 # Defaults to the gateway version; override to pin a specific build.
-# sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# sandbox_runtime_image        = "quay.io/ai-openshell/sandbox:<version>"
 sandbox_runtime_image_pull_policy = "if_not_present"
 # Defaults to the gateway version; override to pin a specific build.
-# supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image             = "quay.io/ai-openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
 # Optional corporate forward proxy for policy-approved TLS egress. The sandbox
@@ -1829,9 +1829,9 @@ supervisor_network_mode = "host"
 # Optional override. Omit for automatic host or bridge callback selection.
 # grpc_endpoint = "https://gateway.example.com:17670"
 # Workload-side runtime. Defaults to the gateway version.
-# sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# sandbox_runtime_image = "quay.io/ai-openshell/sandbox:<version>"
 # Supervisor runtime. Defaults to the gateway version.
-# supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image = "quay.io/ai-openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
@@ -1950,9 +1950,9 @@ gateway_port            = 17670
 ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
 # Statically linked workload-side runtime. Defaults to the gateway version.
-# sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# sandbox_runtime_image = "quay.io/ai-openshell/sandbox:<version>"
 # Dynamically linked supervisor runtime. Defaults to the gateway version.
-# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
+# supervisor_image      = "quay.io/ai-openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Podman local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.

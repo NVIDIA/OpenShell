@@ -46,7 +46,7 @@ security posture.
 
 ```shell
 oc create ns openshell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell
 ```
@@ -161,7 +161,7 @@ The listener TLS Secret should contain the certificate for the external hostname
 Install the chart with the GRPCRoute and BackendTLSPolicy enabled. The certgen hook automatically creates the backend CA ConfigMap from the generated PKI bundle:
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set podSecurityContext.fsGroup=null \
@@ -213,7 +213,7 @@ CLI users via OIDC, not mTLS, so the gateway must know the OIDC issuer URL.
 Install the chart with:
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set podSecurityContext.fsGroup=null \

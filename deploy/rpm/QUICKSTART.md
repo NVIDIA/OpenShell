@@ -47,8 +47,8 @@ systemctl --user enable --now podman.socket
 
 ### Network access
 
-The gateway pulls container images from ghcr.io on first sandbox
-creation. Ensure the host can reach ghcr.io over HTTPS (port 443).
+The gateway pulls container images from quay.io on first sandbox
+creation. Ensure the host can reach quay.io over HTTPS (port 443).
 
 For air-gapped environments, pre-load images with `podman pull` and
 set `image_pull_policy = "never"` in
@@ -117,7 +117,7 @@ openshell sandbox create -- claude
 ```
 
 The CLI detects the agent, prompts to create a credential provider
-from your local environment, pulls the sandbox image from ghcr.io,
+from your local environment, pulls the sandbox image from quay.io,
 and connects you to the running sandbox.
 
 Other agents:

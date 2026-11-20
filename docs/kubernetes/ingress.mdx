@@ -54,7 +54,7 @@ Enable the GRPCRoute and let the chart create a Gateway resource in the `openshe
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set grpcRoute.enabled=true \
@@ -70,7 +70,7 @@ Set `grpcRoute.gateway.className` to any GatewayClass installed by your Gateway 
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set grpcRoute.enabled=true \
@@ -87,7 +87,7 @@ To attach OpenShell to a platform-managed Gateway, disable Gateway creation and 
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set grpcRoute.enabled=true \
@@ -149,7 +149,7 @@ Enable an HTTPS listener, point it at the Secret, disable gateway-pod TLS so Env
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set grpcRoute.enabled=true \
@@ -196,7 +196,7 @@ The certgen hook automatically creates the backend CA ConfigMap when `backendTLS
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set server.tls.enableMtls=false \
@@ -237,7 +237,7 @@ If you see the error `remote connection failure, transport failure reason: TLS e
 3. If the secret exists but the ConfigMap doesn't, run `helm upgrade` to create it:
 
    ```shell
-   helm upgrade <release-name> oci://ghcr.io/nvidia/openshell/helm-chart \
+   helm upgrade <release-name> oci://quay.io/ai-openshell/charts/openshell \
      --reuse-values --namespace <namespace>
    ```
 
@@ -250,7 +250,7 @@ For OpenShift 4.22+, see [OpenShift](/kubernetes/openshift#end-to-end-tls-using-
 With more than one gateway replica, a sandbox's SSH, port-forward, and exec connections can land on a replica that does not hold the sandbox's supervisor session, and that replica relays them to the one that does. Enable replica routing to send those connections straight to the owning replica:
 
 ```shell
-helm upgrade <release-name> oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade <release-name> oci://quay.io/ai-openshell/charts/openshell \
   --reuse-values --namespace <namespace> \
   --set workload.kind=statefulset \
   --set workload.allowMultiReplicaStatefulSet=true \
@@ -291,7 +291,7 @@ each gateway a unique routing name:
 
 ```shell
 helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set server.name=gateway-a \

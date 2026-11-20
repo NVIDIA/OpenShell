@@ -231,8 +231,8 @@ overrides that persist across package upgrades.
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
 | `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
 | `[openshell.drivers.podman].default_image` | `nvcr.io/nvidia/base/ubuntu:24.04` | Default sandbox image. |
-| `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Trusted sandbox runtime image. `OPENSHELL_SANDBOX_RUNTIME_IMAGE` overrides this field. |
-| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Trusted supervisor image. `OPENSHELL_SUPERVISOR_IMAGE` overrides this field. |
+| `[openshell.drivers.podman].sandbox_runtime_image` | `quay.io/ai-openshell/sandbox:latest` | Trusted sandbox runtime image. `OPENSHELL_SANDBOX_RUNTIME_IMAGE` overrides this field. |
+| `[openshell.drivers.podman].supervisor_image` | `quay.io/ai-openshell/supervisor:latest` | Trusted supervisor image. `OPENSHELL_SUPERVISOR_IMAGE` overrides this field. |
 | `[openshell.gateway].guest_tls_ca` | auto-generated path | Gateway CA injected into the selected local driver for supervisor-to-gateway TLS. Sandbox identity uses a bearer token. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
@@ -273,7 +273,7 @@ pulled once and then cached by Podman.
 To update cached images:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell/supervisor:latest
+podman pull quay.io/ai-openshell/supervisor:latest
 podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
@@ -284,8 +284,8 @@ To pin specific image versions instead of `:latest`, set these values in
 `[openshell.drivers.podman]`:
 
 ```toml
-sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:v0.0.37"
-supervisor_image = "ghcr.io/nvidia/openshell/supervisor:v0.0.37"
+sandbox_runtime_image = "quay.io/ai-openshell/sandbox:<version>"
+supervisor_image = "quay.io/ai-openshell/supervisor:<version>"
 default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
 ```
 
@@ -294,9 +294,9 @@ For air-gapped environments:
 1. On a connected machine, pull and save the images:
 
    ```shell
-   podman pull ghcr.io/nvidia/openshell/supervisor:latest
+   podman pull quay.io/ai-openshell/supervisor:latest
    podman pull nvcr.io/nvidia/base/ubuntu:24.04
-   podman save -o supervisor.tar ghcr.io/nvidia/openshell/supervisor:latest
+   podman save -o supervisor.tar quay.io/ai-openshell/supervisor:latest
    podman save -o sandbox.tar nvcr.io/nvidia/base/ubuntu:24.04
    ```
 

@@ -46,7 +46,7 @@ Set `gatewayConfig.openshell.gateway.oidc.issuer` to enable OIDC. The gateway va
 
 ```shell
 helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set 'gatewayConfig.openshell\.gateway\.oidc.issuer=https://your-idp.example.com/realms/openshell' \
@@ -92,7 +92,7 @@ the assigned role:
 
 ```shell
 helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set 'gatewayConfig.openshell\.gateway\.oidc.issuer=https://your-idp.example.com/realms/openshell' \
@@ -129,7 +129,7 @@ When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gatew
 
 ```shell
 helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --set server.disableTls=true \
