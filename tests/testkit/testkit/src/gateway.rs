@@ -17,7 +17,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use openshell_sdk::{ClientConfig, ClientIdentity, Health, OpenShellClient, ServiceStatus};
+use openshell_sdk::{
+    AuthConfig, ClientConfig, ClientIdentity, Health, OpenShellClient, ServiceStatus,
+};
 
 use crate::error::{Error, Result, ResultExt};
 
@@ -121,9 +123,10 @@ impl Gateway {
         })
     }
 
-    /// The directory holding the gateway's CA and client certificate, for
-    /// an mTLS gateway.
-    pub(crate) fn mtls_dir(&self) -> Option<&Path> {
+    /// The directory holding the gateway's CA (`ca.crt`) and the client
+    /// certificate and key (`tls.crt`, `tls.key`) for mTLS, or `None` for a
+    /// gateway testkit reaches without a client certificate.
+    pub fn mtls_dir(&self) -> Option<&Path> {
         self.mtls_dir.as_deref()
     }
 
@@ -161,6 +164,21 @@ impl Gateway {
         OpenShellClient::connect(config)
             .await
             .context(format!("connect to {}", self.endpoint))
+    }
+
+    /// Connect to the gateway as the user `token` names, a bearer token such
+    /// as an OIDC access token, or with no credentials for `None`. The
+    /// connection verifies the gateway with its CA and presents no client
+    /// certificate, so the gateway sees only the token.
+    pub async fn connect_with_token(&self, token: Option<&str>) -> Result<OpenShellClient> {
+        let mut config = ClientConfig::new(self.endpoint.clone());
+        if let Some(dir) = &self.mtls_dir {
+            config.ca_cert = Some(read(&dir.join("ca.crt"))?);
+        }
+        config.auth = token.map(AuthConfig::oidc);
+        OpenShellClient::connect(config)
+            .await
+            .context(format!("connect to {} with a token", self.endpoint))
     }
 
     /// Wait until the gateway accepts a connection and reports itself

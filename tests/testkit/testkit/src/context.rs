@@ -171,6 +171,11 @@ impl Context {
         &self.handles.client
     }
 
+    /// The SDK client for the whole gateway, not scoped to a workspace.
+    pub(crate) fn gateway_client(&self) -> &OpenShellClient {
+        &self.handles.grpc.client
+    }
+
     /// A resource name unique to this run: `test-<run-id>-<suffix>`.
     ///
     /// Sandbox names can't exceed [`MAX_SANDBOX_NAME_LEN`], so a sandbox

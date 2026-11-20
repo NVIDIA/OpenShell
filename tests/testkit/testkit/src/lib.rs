@@ -45,6 +45,7 @@ mod ready;
 mod registry;
 mod run;
 pub mod service;
+mod workspace;
 mod yaml_file;
 
 pub use cleanup::CLEANUP_TIMEOUT;
@@ -70,6 +71,7 @@ pub use run::{TestInfo, run};
 pub use service::{SERVICE_REQUEST_TIMEOUT, ServiceResponse};
 pub use testkit_macros::test;
 pub use tonic::Code as GrpcCode;
+pub use workspace::Workspace;
 pub use yaml_file::YamlFile;
 
 #[doc(hidden)]

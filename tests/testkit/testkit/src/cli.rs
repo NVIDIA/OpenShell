@@ -8,7 +8,7 @@
 //! those and observe through the SDK where they can. Rely on the CLI's exit
 //! code and structured output (`--output json`), not on its table text.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -30,6 +30,7 @@ pub(crate) const BIN_ENV: &str = "OPENSHELL_BIN";
 pub struct Cli {
     binary: PathBuf,
     gateway: Gateway,
+    env: Vec<(OsString, OsString)>,
 }
 
 /// The buffered result of one CLI invocation.
@@ -50,7 +51,17 @@ impl Cli {
         Self {
             binary,
             gateway: gateway.clone(),
+            env: Vec::new(),
         }
+    }
+
+    /// This CLI with `name` set to `value` in its environment on every run,
+    /// such as `XDG_CONFIG_HOME` for a CLI that reads another user's
+    /// credentials. The gateway and workspace selection still wins.
+    #[must_use]
+    pub fn with_env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
     }
 
     /// `binary` in place of the CLI, pointed at an unregistered gateway.
@@ -62,6 +73,7 @@ impl Cli {
                 "http://127.0.0.1:1".to_string(),
                 "default".to_string(),
             ),
+            env: Vec::new(),
         }
     }
 
@@ -172,6 +184,7 @@ impl Cli {
     /// `ssh` with the `ProxyCommand` from `sandbox ssh-config`.
     pub fn apply_env(&self, process: &mut tokio::process::Command) {
         process
+            .envs(self.env.iter().map(|(name, value)| (name, value)))
             .env("NO_COLOR", "1")
             .env(WORKSPACE_ENV, &self.gateway.workspace);
         // Select exactly the gateway the SDK connected to.
