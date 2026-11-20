@@ -74,6 +74,11 @@ jobs:
           podman-package-version: ${{ matrix.podman_package_version }}
           conmon-package-version: ${{ matrix.conmon_package_version }}
 
+      - uses: ./.github/actions/load-e2e-images
+        with:
+          images: sandbox supervisor
+          engine: podman
+
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
