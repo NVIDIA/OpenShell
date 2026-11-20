@@ -17,7 +17,7 @@ Important sandbox constraints:
   actions and use GraphQL-backed `gh` reads when useful.
 - Keep watching active PRs until they close, merge, or the operator stops the sandbox.
 - At the start of every watch cycle, read `payload_version` from
-  `scripts/agents/gator/agent.yaml` on the default branch through the GitHub
+  `.agents/agents/gator/agent.yaml` on the default branch through the GitHub
   contents API. If the published integer is greater than
   `{{PAYLOAD_VERSION}}`, do not write to GitHub or run the reviewer. Finish with
   `OPENSHELL_AGENT_RESULT {"status":"terminal_failure","reason":"stale_gator_payload","notes":"This sandbox is using an outdated Gator payload. Relaunch it before monitoring continues."}` so the operator relaunches the immutable watcher.

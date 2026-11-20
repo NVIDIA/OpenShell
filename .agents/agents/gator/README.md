@@ -2,6 +2,8 @@
 
 Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShell issues and pull requests. The default and currently only supported harness is Codex.
 
+The agent-root entry point is `.agents/agents/gator/run.sh`.
+
 ## Prerequisites
 
 - `gh` is authenticated on the host and has access to `NVIDIA/OpenShell`.
@@ -13,14 +15,13 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 ## Usage
 
 ```shell
-./scripts/agents/run.sh \
-  --agent gator \
+./.agents/agents/gator/run.sh \
   --gateway docker-dev \
   --harness codex \
   "Run gator on PR 1536 and keep watching until it closes or merges."
 ```
 
-By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox image source. It builds `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes a task-independent prompt template, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, then passes the resulting image reference to `openshell sandbox create`.
+By default the launcher uses `.agents/agents/gator/Dockerfile` as the sandbox image source. It builds `.agents/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes a task-independent prompt template, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, then passes the resulting image reference to `openshell sandbox create`.
 
 The PR assignment, operator test authorization, harness selection, watch mode, and polling interval are runtime inputs, not rendered image contents. The launcher supplies the non-secret assignment as `OPENSHELL_AGENT_TASK` in the canonical process command. The supervisor assembles the prompt once in memory and sends it to each harness cycle on stdin; cycles do not read task instructions from an agent-writable file. Assignment text is literal data, so shell syntax and template tokens inside it are not evaluated. Do not put credentials in assignments; use providers. Runtime command metadata can contain the assignment. This separates reusable tooling from per-run instructions; it does not make prompt instructions a security boundary.
 
@@ -41,8 +42,8 @@ requires the matching current kube context and a running local cluster, builds
 with Docker, and imports the image into that cluster before creating a sandbox:
 
 ```shell
-OPENSHELL_WORKSPACE=gator mise exec k3d@5.9.0 -- ./scripts/agents/run.sh \
-  --agent gator --gateway openshell-dev-main \
+OPENSHELL_WORKSPACE=gator mise exec k3d@5.9.0 -- ./.agents/agents/gator/run.sh \
+  --gateway openshell-dev-main \
   --k3d-cluster openshell-dev-main --name gtr-pr-1234 --watch \
   "Review and monitor PR #1234 through the gator-gate workflow."
 ```
@@ -57,8 +58,8 @@ changing gateway settings, importing providers, reading provider credentials,
 or launching a sandbox:
 
 ```shell
-./scripts/agents/run.sh --agent gator --gateway remote-kube \
-  --publish-image registry.example.com/team/gator:payload-13 --build-only
+./.agents/agents/gator/run.sh --gateway remote-kube \
+  --publish-image registry.example.com/team/gator:payload-14 --build-only
 ```
 
 The builder uses existing Docker/Podman registry authentication. Both local and
@@ -71,8 +72,8 @@ The launcher prints `Tooling image: REGISTRY/REPOSITORY@sha256:DIGEST` after a
 successful push. Reuse that full reference for subsequent tasks:
 
 ```shell
-OPENSHELL_WORKSPACE=gator ./scripts/agents/run.sh \
-  --agent gator --gateway remote-kube --name gtr-pr-1234 --watch \
+OPENSHELL_WORKSPACE=gator ./.agents/agents/gator/run.sh \
+  --gateway remote-kube --name gtr-pr-1234 --watch \
   --image "$GATOR_IMAGE" \
   "Review and monitor PR #1234 through the gator-gate workflow."
 ```
@@ -122,7 +123,7 @@ The launcher:
   Gator-owned GitHub review thread without touching human review threads.
 - Installs `gator/bin/validate-review-findings` to downgrade blockers that lack the required reachability, ownership, base-vs-head, impact, and reproducer evidence.
 - Keeps that normalized evidence as Gator's internal review contract, then renders validated blockers for people as a read-aloud `Summary`, an actionable `Fix`, and a deterministic `Verify`. Exact paths and only the additional provenance an implementation agent needs appear in collapsed `Agent context`; raw evidence headings such as `Base` and `Head` are not posted publicly. Review-process provenance, docs and E2E disposition, SHAs, and state codes appear at the end of the summary in collapsed `Gator metadata`, while required human actions remain visible.
-- Bakes `scripts/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
+- Bakes `.agents/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
 - Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
@@ -138,13 +139,8 @@ The launcher preserves existing gateway-owned Codex refresh material by default 
 
 ## Tests
 
+The test suite requires Bash, Ruby, Node.js, jq, and ripgrep on the host. It mocks image, gateway, credential, and GitHub operations.
+
 ```shell
-bash scripts/agents/gator/bin/gh_guard_test.sh
-bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
-bash scripts/agents/gator/bin/resolve_gator_review_threads_test.sh
-bash scripts/agents/runtime/harnesses/codex/exec_test.sh
-bash scripts/agents/run_test.sh
-bash scripts/agents/image_test.sh
-bash scripts/agents/runtime/launch_test.sh
-bash scripts/agents/runtime/supervisor_test.sh
+mise run test:gator
 ```

@@ -34,7 +34,7 @@ usage() {
     cat <<'EOF'
 
 Options:
-  --agent NAME|PATH       Agent manifest directory or name under scripts/agents/
+  --agent NAME|PATH       Agent manifest directory or name under .agents/agents/
   --gateway NAME          Gateway name to use
   --name NAME             Sandbox name (DNS-1123 label, at most 19 characters)
   --from DOCKERFILE|DIR   Local Dockerfile source for the sandbox image
@@ -189,7 +189,7 @@ case "$AGENT_ARG" in
         AGENT_DIR="$AGENT_ARG"
         ;;
     *)
-        AGENT_DIR="$SCRIPT_DIR/$AGENT_ARG"
+        AGENT_DIR="$ROOT_DIR/.agents/agents/$AGENT_ARG"
         ;;
 esac
 
