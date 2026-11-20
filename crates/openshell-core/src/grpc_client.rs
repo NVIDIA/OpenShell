@@ -388,7 +388,7 @@ fn configure_gateway_tls(
         .wrap_err("failed to configure TLS")
 }
 
-/// Build the plain (un-intercepted) gRPC channel.
+/// Configure the plain (un-intercepted) gRPC endpoint.
 ///
 /// When the endpoint uses `https://`, server-authenticated TLS is configured
 /// using this env var:
@@ -396,7 +396,7 @@ fn configure_gateway_tls(
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
-async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+fn build_plain_endpoint(endpoint: &str) -> Result<Endpoint> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
         .wrap_err("invalid gRPC endpoint")?
@@ -431,7 +431,12 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref())?;
     }
 
-    ep.connect()
+    Ok(ep)
+}
+
+async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+    build_plain_endpoint(endpoint)?
+        .connect()
         .await
         .into_diagnostic()
         .wrap_err("failed to connect to OpenShell server")
@@ -1702,6 +1707,106 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
+/// Final provider access tokens for one sandbox instance over one reused
+/// gateway channel.
+///
+/// The lazy channel connects when used, so initialization never waits on a
+/// network connection. Concurrent requests share it without holding a
+/// lock across the call, and tonic reconnects it after transport loss. Each
+/// request reads the instance's current bearer, so renewal and revocation
+/// apply without reconnecting, and the gateway authorizes every request.
+pub struct SandboxProviderTokenClient {
+    // The validated endpoint shares the instance's rotating credentials.
+    gateway: std::result::Result<(url::Url, GatewayEndpoint), TokenGrantFailure>,
+    client: tokio::sync::OnceCell<OpenShellClient<AuthedChannel>>,
+    deadline: Duration,
+}
+
+impl SandboxProviderTokenClient {
+    #[must_use]
+    pub fn new(gateway: GatewayEndpoint) -> Self {
+        Self::with_deadline(
+            gateway,
+            crate::token_grant_failure::BROKERED_TOKEN_CLIENT_DEADLINE,
+        )
+    }
+
+    fn with_deadline(gateway: GatewayEndpoint, deadline: Duration) -> Self {
+        Self {
+            gateway: token_grant_gateway_endpoint(gateway.url()).map(|endpoint| {
+                let gateway = gateway.with_url(endpoint.as_str());
+                (endpoint, gateway)
+            }),
+            client: tokio::sync::OnceCell::new(),
+            deadline,
+        }
+    }
+
+    /// Obtain only the final access token; the gateway selects and verifies
+    /// the sandbox identity and resolves all grant parameters from its
+    /// configuration.
+    ///
+    /// One deadline bounds connection readiness and the call. Network failures
+    /// do not serialize channel initialization for concurrent requests.
+    #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
+    pub async fn get_access_token(
+        &self,
+        credential_key: &str,
+        request_id: Option<&str>,
+    ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+        let (endpoint, gateway) = self.gateway.as_ref().map_err(|failure| *failure)?;
+        // Like connect(), refuse locally revoked sandbox instance credentials
+        // before the call; the response boundary rejects them again.
+        let unavailable = || gateway_grant_failure(TokenGrantFailureKind::Unavailable);
+        if gateway.credentials().is_revoked() {
+            return Err(unavailable());
+        }
+        let key = crate::dynamic_credential_key::unscoped_owned_key(credential_key)
+            .ok_or_else(|| gateway_grant_failure(TokenGrantFailureKind::Configuration))?;
+        let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
+            credential_key: key,
+        });
+        if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
+            request.metadata_mut().insert("x-request-id", value);
+        }
+        let response = tokio::time::timeout(self.deadline, async {
+            let mut client = self
+                .client
+                .get_or_try_init(|| async {
+                    let channel = build_plain_endpoint(gateway.url())?.connect_lazy();
+                    let intercepted = InterceptedService::new(
+                        channel.clone(),
+                        AuthInterceptor::new(gateway.credentials.inner.bearer.clone()),
+                    );
+                    gateway
+                        .credentials
+                        .start_renewal(&intercepted, &channel, gateway.url());
+                    Ok::<_, miette::Report>(OpenShellClient::new(intercepted))
+                })
+                .await
+                .map_err(|_| unavailable())?
+                .clone();
+            client
+                .get_sandbox_provider_access_token(request)
+                .await
+                .map_err(|status| provider_subject_token_exchange_status(&status, endpoint))
+        })
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))??
+        .into_inner();
+        if gateway.credentials().is_revoked() {
+            return Err(gateway_grant_failure(
+                TokenGrantFailureKind::WorkloadIdentityRejected,
+            ));
+        }
+        provider_subject_token_exchange_result(crate::proto::ExchangeProviderSubjectTokenResponse {
+            access_token: response.access_token,
+            expires_after: response.expires_after,
+            token_type: response.token_type,
+        })
+    }
+}
+
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.
 ///
 /// A value that is not valid metadata is omitted, never rewritten.
@@ -1826,6 +1931,53 @@ mod token_grant_exchange_tests {
             assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
         }
         assert!(token_grant_gateway_endpoint("https://localhost:8443").is_ok());
+    }
+
+    #[tokio::test]
+    async fn access_token_deadline_bounds_connection_and_call_for_each_request() {
+        // The gateway accepts connections but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let credentials = GatewayCredentials::new(
+            AsciiMetadataValue::from_static("Bearer test"),
+            TokenSource::Env,
+        );
+        let deadline = Duration::from_millis(300);
+        let client = SandboxProviderTokenClient::with_deadline(
+            GatewayEndpoint::new(format!("http://{address}"), credentials),
+            deadline,
+        );
+        let started = tokio::time::Instant::now();
+        let results: [_; 2] = tokio::join!(
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+        )
+        .into();
+        for result in results {
+            let failure = result.err().expect("unanswered gateway times out");
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Timeout);
+        }
+        assert!(
+            client.client.get().is_some(),
+            "an unresponsive gateway must not prevent channel initialization"
+        );
+        // Concurrent requests share one budget rather than queueing behind it.
+        assert!(started.elapsed() < deadline * 3);
+        held.abort();
+
+        let invalid = SandboxProviderTokenClient::new(GatewayEndpoint::new(
+            "https://localhost/SECRET",
+            GatewayCredentials::new(
+                AsciiMetadataValue::from_static("Bearer test"),
+                TokenSource::Env,
+            ),
+        ));
+        let failure = invalid.get_access_token("key", None).await.err().unwrap();
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
     }
 
     #[test]

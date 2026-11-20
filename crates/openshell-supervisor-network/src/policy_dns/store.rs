@@ -46,6 +46,8 @@ pub(crate) struct PublishRequest {
     pub(crate) allocation_identity: [u8; 32],
     pub(crate) policy_generation: u64,
     pub(crate) ttl: Duration,
+    /// Authored ports eligible for refresh, before DNS address filtering.
+    pub(crate) eligible_ports: BTreeSet<u16>,
     pub(crate) contracts: Vec<ResolvedPortContract>,
 }
 
@@ -59,6 +61,7 @@ pub(crate) struct ResolvedEndpointRecord {
     pub(crate) mapping_id: Uuid,
     pub(crate) created_at: Instant,
     pub(crate) expires_at: Instant,
+    pub(crate) eligible_ports: BTreeSet<u16>,
     pub(crate) contracts: Vec<ResolvedPortContract>,
 }
 
@@ -260,13 +263,14 @@ struct Publication {
     key: AllocationKey,
     policy_generation: u64,
     ttl: Duration,
+    eligible_ports: BTreeSet<u16>,
     contracts: Vec<ResolvedPortContract>,
 }
 
 struct StoreState {
     records: BTreeMap<IpAddr, ResolvedEndpointRecord>,
     allocations: BTreeMap<AllocationKey, IpAddr>,
-    expired_allocations: BTreeSet<IpAddr>,
+    expired_allocations: BTreeMap<IpAddr, ResolvedEndpointRecord>,
     next_ipv4: u32,
     end_ipv4: u32,
     next_ipv6: u128,
@@ -291,7 +295,7 @@ impl ResolvedEndpointStore {
             state: RwLock::new(StoreState {
                 records: BTreeMap::new(),
                 allocations: BTreeMap::new(),
-                expired_allocations: BTreeSet::new(),
+                expired_allocations: BTreeMap::new(),
                 next_ipv4,
                 end_ipv4,
                 next_ipv6,
@@ -304,6 +308,34 @@ impl ResolvedEndpointStore {
         }
     }
 
+    /// Recover refresh identity without authorizing expired upstream addresses.
+    pub(super) fn expired_for_connect(
+        &self,
+        address: IpAddr,
+        port: u16,
+        generation: u64,
+    ) -> Result<ResolvedEndpointRecord, MappingLookupError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| MappingLookupError::LockPoisoned)?;
+        let record = state
+            .records
+            .get(&address)
+            .or_else(|| state.expired_allocations.get(&address))
+            .ok_or(MappingLookupError::Missing)?;
+        if record.policy_generation != generation {
+            return Err(MappingLookupError::StalePolicy);
+        }
+        if record.is_observation() {
+            return Err(MappingLookupError::Expired);
+        }
+        if !record.eligible_ports.contains(&port) {
+            return Err(MappingLookupError::PortMismatch);
+        }
+        Ok(record.clone())
+    }
+
     pub(crate) fn publish(
         &self,
         request: PublishRequest,
@@ -314,9 +346,11 @@ impl ResolvedEndpointStore {
             return Err(PublishError::StalePolicy);
         }
         if request.ttl.is_zero()
+            || request.eligible_ports.contains(&0)
             || request.contracts.is_empty()
             || request.contracts.iter().any(|contract| {
                 contract.port == 0
+                    || !request.eligible_ports.contains(&contract.port)
                     || contract.pinned_addresses.is_empty()
                     || contract
                         .pinned_addresses
@@ -336,6 +370,7 @@ impl ResolvedEndpointStore {
                 },
                 policy_generation: request.policy_generation,
                 ttl: request.ttl,
+                eligible_ports: request.eligible_ports,
                 contracts: request.contracts,
             },
             now,
@@ -365,6 +400,7 @@ impl ResolvedEndpointStore {
                 },
                 policy_generation,
                 ttl: super::MAX_MAPPING_TTL,
+                eligible_ports: BTreeSet::new(),
                 contracts: Vec::new(),
             },
             now,
@@ -390,6 +426,7 @@ impl ResolvedEndpointStore {
             key,
             policy_generation,
             ttl,
+            eligible_ports,
             contracts,
         } = publication;
         let family = key.family;
@@ -461,6 +498,7 @@ impl ResolvedEndpointStore {
             mapping_id: Uuid::new_v4(),
             created_at: now,
             expires_at: now + ttl,
+            eligible_ports,
             contracts,
         };
         state.expired_allocations.remove(&synthetic_address);
@@ -534,8 +572,9 @@ impl ResolvedEndpointStore {
             .filter_map(|(address, record)| (now >= record.expires_at).then_some(*address))
             .collect::<Vec<_>>();
         for address in &expired {
-            state.records.remove(address);
-            state.expired_allocations.insert(*address);
+            if let Some(record) = state.records.remove(address) {
+                state.expired_allocations.insert(*address, record);
+            }
         }
         Ok(expired.len())
     }
@@ -548,7 +587,7 @@ fn live_record(
     now: Instant,
 ) -> Result<&ResolvedEndpointRecord, MappingLookupError> {
     let Some(record) = state.records.get(&synthetic_address) else {
-        return if state.expired_allocations.contains(&synthetic_address) {
+        return if state.expired_allocations.contains_key(&synthetic_address) {
             Err(MappingLookupError::Expired)
         } else {
             Err(MappingLookupError::Missing)
@@ -622,6 +661,7 @@ mod tests {
             allocation_identity: [1; 32],
             policy_generation: generation,
             ttl,
+            eligible_ports: BTreeSet::from([5432]),
             contracts: vec![ResolvedPortContract {
                 endpoint_id: PolicyEndpointId {
                     policy_name: "database".to_string(),
@@ -1039,6 +1079,7 @@ mod tests {
         let mut other_port = second.clone();
         other_port.port = 443;
         other_port.pinned_addresses = vec!["203.0.113.10".parse().unwrap()];
+        request.eligible_ports.insert(443);
         request
             .contracts
             .extend([second.clone(), unrelated.clone(), other_port]);

@@ -13,6 +13,45 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: disables gateway service routing by default on Kubernetes
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_gateway_service_routing\s*=\s*false$'
+
+  - it: allows explicitly enabling gateway service routing
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          enable_gateway_service_routing: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_gateway_service_routing\s*=\s*true$'
+
+  - it: defaults gateway routing off when saved configuration omits the gateway table
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway: null
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_gateway_service_routing\s*=\s*false$'
+
+  - it: defaults gateway routing off when saved configuration omits the flag
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          enable_gateway_service_routing: null
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_gateway_service_routing\s*=\s*false$'
+
   - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
     template: templates/gateway-config.yaml
     asserts:

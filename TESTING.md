@@ -180,6 +180,11 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
+To run Python in a testkit sandbox, use `Sandbox::run_python` with a sandbox
+from `testkit::python_image()`, not the Python SDK's `exec_python` described
+under Python E2E. [Writing a sandbox client](tests/testkit/README.md#writing-a-sandbox-client)
+covers scripts that probe the network from inside a sandbox.
+
 The conformance crate also builds `openshell-conformance`, a program that
 runs the conformance suite against a gateway without cargo or nextest
 (`openshell-conformance list`, `ready`, `run`). It covers only the
@@ -305,11 +310,11 @@ service.
   setup playbook starts the service (with a restart policy, since setup is
   cached as a disk) and writes the variables as `KEY=VALUE` lines to
   `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
-  through the environment's setup `inputs`, and add them to the tmachine disk
-  cache key in `e2e-suites.yml`. The runner rejects names without the
-  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
-  values never appear in a runner command. Values are taken literally, without
-  quoting.
+  through the environment's setup `inputs`; they are part of the setup layer's
+  hash, which CI's disk cache keys on too. The runner rejects names without
+  the `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest,
+  so values never appear in a runner command. Values are taken literally,
+  without quoting.
 - **Fixture.** Put the service's fixture in a support crate under
   `tests/support/<service>`, named `<service>-support`, so any suite can
   depend on it, or reuse the existing one. It defines the variable names as constants and a
@@ -649,6 +654,12 @@ host through `host.openshell.internal`. CI runs it on Docker rootful, Podman
 rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
+
+The `connect-ssh-supervision` feature suite
+(`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
+supervises its `ssh` process: it reconnects after losing the SSH transport and
+forwards a SIGTERM to `ssh`. The tests find those processes in `/proc`, so they
+need a Linux test host. CI runs them on Docker rootful.
 
 Run the VM-backed Rust CLI e2e suite:
 

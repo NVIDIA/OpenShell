@@ -48,6 +48,7 @@ mod refresh_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+mod spiffe_broker;
 mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
@@ -74,11 +75,13 @@ use hyper_util::{
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
+use openshell_core::token_grant_failure::TokenGrantFailure;
 use openshell_core::{Config, Error, NetworkSupervisorTrustBundle, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
+use openshell_spiffe::SandboxIdentityProvider;
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -430,6 +433,7 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+    pub(crate) provider_token_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 
     /// Immutable public reflection index and its per-query rate limiter.
     pub(crate) reflection_service: reflection::GatewayReflectionServer,
@@ -445,6 +449,11 @@ pub struct ServerState {
     /// Gateway-local provider profile sources. User-imported profiles are read
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
+
+    /// Source of sandbox JWT-SVIDs for brokered provider tokens, built once
+    /// from the SPIRE broker settings. `None` when disabled.
+    pub(crate) sandbox_identity:
+        Option<Arc<dyn SandboxIdentityProvider<Error = TokenGrantFailure>>>,
 
     /// OIDC admin role name for workspace-level authorization.
     /// Empty when OIDC is not configured — `authorize_workspace()` treats
@@ -595,6 +604,12 @@ fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool
 
 impl ServerState {
     /// Create new server state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `config` holds credential-driver or SPIRE broker
+    /// settings that startup validation would reject. Gateway startup uses
+    /// [`Self::new_with_credentials`], which reports those as errors.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -621,10 +636,18 @@ impl ServerState {
             oidc_cache,
             credentials,
         )
+        .expect("server config should be validated before ServerState::new")
     }
 
     /// Create new server state with an already-initialized credential runtime.
-    #[must_use]
+    ///
+    /// Parses the SPIRE broker settings into the state that serves every
+    /// provider access-token request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the SPIRE broker settings are
+    /// invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_credentials(
         config: Config,
@@ -636,7 +659,9 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
         credentials: credentials::CredentialRuntime,
-    ) -> Self {
+    ) -> Result<Self> {
+        let sandbox_identity =
+            spiffe_broker::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
         let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());
@@ -646,6 +671,7 @@ impl ServerState {
         compute.configure_service_route_index(Arc::clone(&service_route_index));
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let provider_token_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let reflection_service = reflection::build_gateway_reflection_service(&config)
             .expect("compiled public gateway descriptors must be valid");
         let admin_role = config
@@ -655,7 +681,7 @@ impl ServerState {
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         let refresh = provider_refresh::runtime(&store, Some(&credentials), Some(&compute));
-        Self {
+        Ok(Self {
             config,
             store,
             compute,
@@ -690,12 +716,14 @@ impl ServerState {
             peer_authenticator: None,
             logons: auth::audit::Logons::default(),
             grpc_rate_limiter,
+            provider_token_rate_limiter,
             reflection_service,
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
+            sandbox_identity,
             admin_role,
-        }
+        })
     }
 }
 
@@ -703,7 +731,7 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
     if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
         && !endpoint.trim().is_empty()
     {
-        return Some(endpoint.trim().to_string());
+        return Some(bracket_ipv6_host(endpoint.trim()));
     }
 
     let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
@@ -725,6 +753,22 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
         namespace = namespace.trim(),
         port = config.bind_address.port()
     ))
+}
+
+/// The chart renders `$(OPENSHELL_POD_IP)` into the endpoint without brackets.
+fn bracket_ipv6_host(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if host.parse::<std::net::Ipv6Addr>().is_ok() && port.parse::<u16>().is_ok() =>
+        {
+            format!("{scheme}://[{host}]:{port}{path}")
+        }
+        _ => endpoint.to_string(),
+    }
 }
 
 /// Reject a plaintext peer endpoint on a gateway that serves TLS.
@@ -759,6 +803,7 @@ pub(crate) async fn run_server(
     startup: ServerStartupConfig,
     tracing_log_bus: TracingLogBus,
     compute_drivers: ComputeDriverRegistry,
+    metrics_recorder: Option<gateway_metrics::OtlpRecorder>,
 ) -> Result<()> {
     let ServerStartupConfig {
         config,
@@ -971,7 +1016,7 @@ pub(crate) async fn run_server(
         supervisor_sessions,
         oidc_cache,
         credentials,
-    );
+    )?;
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
@@ -1129,17 +1174,14 @@ pub(crate) async fn run_server(
     // Install the recorder before the endpoint-status startup reconciliation so
     // the lock waits and timeouts recorded there are exported. Its listener
     // binds with the others.
-    let metrics_endpoint = config
-        .metrics_bind_address
-        .map(|metrics_bind_address| {
-            gateway_metrics::install_global_recorder(
-                supervisor_session::RELAY_CAPACITY,
-                store.mutation_lock_connections(),
-            )
-            .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
-        })
-        .transpose()
-        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    let prometheus_handle = gateway_metrics::install_global_recorder(
+        config.metrics_bind_address.is_some(),
+        metrics_recorder,
+        supervisor_session::RELAY_CAPACITY,
+        store.mutation_lock_connections(),
+    )
+    .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    let metrics_endpoint = config.metrics_bind_address.zip(prometheus_handle);
 
     grpc::policy::backfill_legacy_policy_history(&state)
         .await
@@ -1637,10 +1679,11 @@ async fn connect_store(
     let mut delay = DATABASE_CONNECT_RETRY_INITIAL_DELAY;
     let mut waiting = false;
     loop {
-        let attempt = Store::try_connect_with_pool_sizes(
+        let attempt = Store::try_connect_with_database_auth(
             database_url,
             config.database_max_connections,
             config.database_lock_max_connections,
+            config.database_auth,
         );
         let result = if waiting {
             tokio::select! {
@@ -2615,7 +2658,7 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         MetricsTlsHandshakeLogLimiter, MetricsTlsHandshakeLogLimiters, MultiplexService,
         ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listener,
-        classify_initial_bytes, configured_compute_driver, extension_token_ttl,
+        bracket_ipv6_host, classify_initial_bytes, configured_compute_driver, extension_token_ttl,
         is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
         log_metrics_tls_handshake_timeout, metrics_tls_acceptor_or_disable,
         mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
@@ -2727,6 +2770,25 @@ mod tests {
         )
         .expect("failed to write test client key");
         (cert_path, key_path)
+    }
+
+    #[test]
+    fn peer_endpoint_brackets_only_unbracketed_ipv6_hosts() {
+        for (input, expected) in [
+            (
+                "http://fd00:10:244::16:8080",
+                "http://[fd00:10:244::16]:8080",
+            ),
+            ("https://[fd00::5]:8080", "https://[fd00::5]:8080"),
+            ("https://10.0.0.1:8080", "https://10.0.0.1:8080"),
+            (
+                "https://gw-1.peers.ns.svc:8080",
+                "https://gw-1.peers.ns.svc:8080",
+            ),
+        ] {
+            assert_eq!(bracket_ipv6_host(input), expected);
+            assert!(expected.parse::<http::Uri>().is_ok());
+        }
     }
 
     #[test]
@@ -3125,11 +3187,22 @@ mod tests {
 
     async fn start_plaintext_gateway_listener()
     -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        start_plaintext_gateway_listener_with_service_routing(true).await
+    }
+
+    async fn start_plaintext_gateway_listener_with_service_routing(
+        enabled: bool,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind test listener");
         let listen_addr = listener.local_addr().expect("failed to read local addr");
-        let state = test_state(listen_addr, false).await;
+        let mut state = test_state(listen_addr, false).await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .service_routing
+            .enabled = enabled;
         let service = MultiplexService::new(state);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(serve_gateway_listener(
@@ -3143,6 +3216,21 @@ mod tests {
             shutdown_rx,
         ));
         (listen_addr, shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn gateway_routing_opt_out_keeps_control_plane_available() {
+        let (addr, shutdown, handle) =
+            start_plaintext_gateway_listener_with_service_routing(false).await;
+        let mut client = OpenShellClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        client.health(HealthRequest {}).await.unwrap();
+        let response = send_plain_http(addr, format!(
+            "GET /app HTTP/1.1\r\nHost: default--demo--web.openshell.localhost:{}\r\nConnection: close\r\n\r\n", addr.port()
+        )).await;
+        assert!(response.starts_with("HTTP/1.1 404"));
+        stop_listener(shutdown, handle).await;
     }
 
     #[tokio::test]

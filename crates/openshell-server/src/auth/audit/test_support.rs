@@ -58,7 +58,11 @@ where
         let routed = async {
             let output = call.await;
             let response = match &output {
-                Ok(_) => http::Response::new(tonic::body::Body::empty()),
+                Ok(response) => {
+                    let mut http = http::Response::new(tonic::body::Body::empty());
+                    *http.headers_mut() = response.metadata().clone().into_headers();
+                    http
+                }
                 Err(status) => status.clone().into_http(),
             };
             result = Some(output);

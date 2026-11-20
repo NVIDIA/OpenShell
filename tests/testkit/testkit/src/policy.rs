@@ -75,6 +75,18 @@ pub fn to_yaml(policy: &proto::SandboxPolicy) -> Result<String> {
         .context("serialize the policy")
 }
 
+/// `binaries` as the flow-style list a network policy's `binaries:` key
+/// takes in YAML, such as `[{path: "/usr/bin/python*"}]`. Use it in policy
+/// YAML a test writes by hand, for example with
+/// `binaries_yaml(PYTHON_BINARIES)`.
+pub fn binaries_yaml(binaries: &[&str]) -> String {
+    let paths: Vec<String> = binaries
+        .iter()
+        .map(|path| format!("{{path: {}}}", serde_json::Value::from(*path)))
+        .collect();
+    format!("[{}]", paths.join(", "))
+}
+
 /// Settings for an endpoint from [`allow`], named as in policy YAML.
 pub trait Endpoint {
     /// `protocol: rest` with `access`.

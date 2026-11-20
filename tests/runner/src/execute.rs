@@ -241,10 +241,18 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         !openshell_bin.is_empty(),
         "the installer did not put openshell on the guest's PATH"
     );
-    let env = [
+    let mut env = vec![
         format!("OPENSHELL_GATEWAY={}", run.gateway),
         format!("OPENSHELL_BIN={openshell_bin}"),
     ];
+    // The tests the environment can't pass yet, for the program to skip. The
+    // guest doesn't inherit the runner's environment, so pass it on.
+    if let Some(unsupported) = std::env::var("OPENSHELL_TEST_UNSUPPORTED")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        env.push(format!("OPENSHELL_TEST_UNSUPPORTED={unsupported}"));
+    }
     test_env::check(session)
         .await
         .context("check the variables the environment publishes for tests")?;

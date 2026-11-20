@@ -32,4 +32,25 @@ if [[ ! -s "${work}/program" ]]; then
     echo "error: openshell-conformance lists no tests" >&2
     exit 1
 fi
+# unsupported.yaml must pass the program's own checks (known tests, https
+# issues, no duplicates) for every environment it names, and name only
+# environments that exist.
+unsupported_file="${OPENSHELL_UNSUPPORTED_FILE:-${root}/tests/suites/conformance/unsupported.yaml}"
+# Environments are the conformance rows of e2e-suites.yml (<environment>/<installer>)
+# and the host lanes; a misspelled name would never apply.
+known="$(yq '.jobs.select.steps[] | select(.id == "rows") | .run' "${root}/.github/workflows/e2e-suites.yml" \
+    | sed -n "/rows='\[/,/^ *\]'/p" | sed "1s/.*rows='//; \$s/'.*//" \
+    | yq '.[] | select(.family == "conformance") | .environment + "/" + .installer')
+docker
+podman
+kubernetes
+vm"
+while IFS= read -r environment; do
+    if ! grep -qxF "${environment}" <<< "${known}"; then
+        echo "error: unsupported.yaml: unknown environment ${environment}; use a conformance row of e2e-suites.yml (<environment>/<installer>), docker, podman, kubernetes or vm" >&2
+        exit 1
+    fi
+    OPENSHELL_TEST_UNSUPPORTED="$("${root}/tasks/scripts/conformance-unsupported.sh" "${environment}")" \
+        cargo run --quiet --locked --manifest-path "${manifest}" --bin openshell-conformance -- list > /dev/null
+done < <(yq -r '.[].environments[]' "${unsupported_file}" | sort -u)
 echo "openshell-conformance lists the same $(wc -l < "${work}/program" | tr -d ' ') tests as nextest"

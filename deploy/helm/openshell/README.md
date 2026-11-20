@@ -211,6 +211,55 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
+### Sandbox service routing
+
+Gateway-mediated sandbox service routing is disabled by default in this Kubernetes
+chart to avoid an unintended alternate application access path. Control-plane API
+access is unchanged.
+
+For service ingress directly through supervisors, enable
+`[openshell.supervisor.app_listener].enabled` and pair it with an ingress solution
+that routes requests to the app listener on the supervisor owning each sandbox:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    enable_gateway_service_routing: false
+  openshell.supervisor.app_listener:
+    enabled: true
+    port: 9443
+    base_url: https://services.example.com
+  openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+    tls_secret_name: openshell-app-tls
+```
+
+Provision `openshell-app-tls` with a certificate for `*.services.example.com`.
+Pair the listener with a TLS-passthrough proxy or a compatible Kubernetes
+ingress/Gateway API integration. The integration consumes service discovery to
+map each advertised hostname to the current owning supervisor's IP and configured
+app-listener port, preserving the application hostname as Host and TLS SNI.
+Configure DNS and NetworkPolicy for that path. Enabling the listener alone does
+not provision DNS or external ingress routes, and the chart does not enable it
+automatically.
+
+To use gateway-mediated service routing instead, explicitly enable forwarding;
+that path does not require the app listener:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    enable_gateway_service_routing: true
+```
+
+Existing Helm installations that rely on gateway service URLs must set this
+explicitly before upgrading. Missing saved values receive the disabled chart
+default; explicit choices are preserved. If neither routing mode is enabled,
+startup logs warn that sandbox service routing is disabled.
+
+The core runtime continues to default gateway routing to enabled, preserving
+Docker, Podman, and VM deployments outside this chart. Gateway service
+authentication remains independently opt-in.
+
 ### Additional destination CAs
 
 Create an operator-owned ConfigMap with a `ca.crt` key when sandboxes must reach
@@ -532,7 +581,7 @@ JWT signing Secret.
 ## SPIFFE/SPIRE provider token grants
 
 Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
-to let sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
+to let dedicated sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
 grants. The chart keeps supervisor-to-gateway authentication on gateway-minted
 sandbox JWTs and passes the configured socket path to the Kubernetes driver.
 
@@ -548,6 +597,17 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this path does not require access to the SPIRE OIDC
 discovery endpoint or its TLS CA.
+
+For `supervisor_topology: gateway`, configure
+`gatewayConfig.openshell.gateway.spiffe_broker` instead. Only the gateway mounts
+the CSI Workload API socket and obtains stable sandbox identities through the
+Broker API; shared supervisors receive final access tokens.
+Set `node_local_port: 8443` instead of `endpoint` to use the gateway's local
+agent directly. The chart injects its node address from `status.hostIP`;
+the agent must expose its Broker port on that address. This path needs no
+Broker Service. See
+[gateway configuration](https://docs.nvidia.com/openshell/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api)
+for peer identity policies, multi-node registrations, and authorization.
 
 ## Values
 
@@ -577,7 +637,9 @@ discovery endpoint or its TLS CA.
 | gateway.image.registry | string | `""` | Gateway image registry. Empty uses global.image.registry. |
 | gateway.image.repository | string | `"openshell/gateway"` | Gateway image repository. |
 | gateway.image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
-| gatewayConfig | object | `{"openshell":{"version":2}}` | Non-secret gateway application configuration. Top-level keys name TOML tables and are rendered into the mounted gateway.toml file. Kubernetes resource inputs remain outside this map; template expressions derive the corresponding runtime values from their resource owner. |
+| gateway.listenAddress | string | `"0.0.0.0"` | Gateway listener IP. Use `::` for IPv6. |
+| gatewayConfig | object | `{"openshell":{"version":2},"openshell.gateway":{"enable_gateway_service_routing":false}}` | Non-secret gateway application configuration. Top-level keys name TOML tables and are rendered into the mounted gateway.toml file. Kubernetes resource inputs remain outside this map; template expressions derive the corresponding runtime values from their resource owner. |
+| gatewayConfig."openshell.gateway".enable_gateway_service_routing | bool | `false` | Opt in to gateway-mediated sandbox service URLs and forwarding. Disabled for Kubernetes; configure application-listener ingress or explicitly enable this path. |
 | global.image.pullPolicy | string | `"IfNotPresent"` | Shared OpenShell image pull policy. Individual image pull policies take precedence. |
 | global.image.registry | string | `"ghcr.io/nvidia"` | Shared OpenShell image registry. Individual image registries take precedence. |
 | global.image.tag | string | `""` | Shared OpenShell image tag. Defaults to the chart appVersion when empty. |
@@ -756,6 +818,7 @@ discovery endpoint or its TLS CA.
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.listenAddress | string | `"0.0.0.0"` | Shared supervisor listener IP. Use `::` for IPv6. |
 | supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
 | supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
 | supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
