@@ -2854,6 +2854,7 @@ async fn service_expose_forwards_bearer_passthrough_mode() {
         "codex",
         4500,
         openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+        openshell_core::proto::ServiceBackendHttpVersion::Http1,
         "default",
         &tls,
     )

@@ -20,7 +20,9 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
+use openshell_core::proto::{
+    GpuResourceRequirements, ServiceAuthorizationMode, ServiceBackendHttpVersion,
+};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -802,6 +804,24 @@ impl From<CliServiceAuthorizationMode> for ServiceAuthorizationMode {
         match value {
             CliServiceAuthorizationMode::Strip => Self::Strip,
             CliServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CliServiceBackendHttpVersion {
+    #[default]
+    #[value(name = "1.1")]
+    Http1,
+    #[value(name = "2")]
+    Http2,
+}
+
+impl From<CliServiceBackendHttpVersion> for ServiceBackendHttpVersion {
+    fn from(value: CliServiceBackendHttpVersion) -> Self {
+        match value {
+            CliServiceBackendHttpVersion::Http1 => Self::Http1,
+            CliServiceBackendHttpVersion::Http2 => Self::Http2,
         }
     }
 }
@@ -2501,6 +2521,10 @@ enum ServiceCommands {
         /// Handling for an incoming application Authorization header.
         #[arg(long, value_enum, default_value_t)]
         authorization_mode: CliServiceAuthorizationMode,
+
+        /// HTTP version on the sandbox loopback port. HTTP/2 requires the supervisor application listener.
+        #[arg(long, value_enum, default_value_t)]
+        backend_http_version: CliServiceBackendHttpVersion,
     },
 
     /// List exposed sandbox service endpoints.
@@ -3153,6 +3177,7 @@ async fn run_async() -> Result<()> {
                     service,
                     target_port,
                     authorization_mode,
+                    backend_http_version,
                 } => {
                     let service = service.unwrap_or_default();
                     run::service_expose(
@@ -3161,6 +3186,7 @@ async fn run_async() -> Result<()> {
                         &service,
                         target_port,
                         authorization_mode.into(),
+                        backend_http_version.into(),
                         &cli.workspace,
                         &tls,
                     )
@@ -7357,12 +7383,14 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        backend_http_version,
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
                 assert_eq!(target_port, 8080);
                 assert_eq!(service.as_deref(), Some("api"));
                 assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
+                assert_eq!(backend_http_version, CliServiceBackendHttpVersion::Http1);
             }
             other => panic!("expected service expose command, got: {other:?}"),
         }
@@ -7381,6 +7409,7 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
@@ -7393,7 +7422,7 @@ mod tests {
     }
 
     #[test]
-    fn service_expose_parses_bearer_passthrough() {
+    fn service_expose_parses_bearer_passthrough_and_http2_backend() {
         let cli = Cli::try_parse_from([
             "openshell",
             "service",
@@ -7402,19 +7431,26 @@ mod tests {
             "4500",
             "--authorization-mode",
             "bearer-passthrough",
+            "--backend-http-version",
+            "2",
         ])
-        .expect("service authorization mode should parse");
+        .expect("service authorization mode and backend HTTP version should parse");
 
         match cli.command {
             Some(Commands::Service {
                 command:
                     Some(ServiceCommands::Expose {
-                        authorization_mode, ..
+                        authorization_mode,
+                        backend_http_version,
+                        ..
                     }),
-            }) => assert_eq!(
-                authorization_mode,
-                CliServiceAuthorizationMode::BearerPassthrough
-            ),
+            }) => {
+                assert_eq!(
+                    authorization_mode,
+                    CliServiceAuthorizationMode::BearerPassthrough
+                );
+                assert_eq!(backend_http_version, CliServiceBackendHttpVersion::Http2);
+            }
             other => panic!("expected service expose command, got: {other:?}"),
         }
     }

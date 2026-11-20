@@ -582,6 +582,17 @@ Pass an optional service name to create a named service URL:
 openshell service expose my-sandbox 8080 web
 ```
 
+For a native gRPC server or another service that needs HTTP/2 on loopback,
+enable the supervisor application listener and expose the service with
+`--backend-http-version 2`. [Supervisor application listener setup](/how-it-works/gateways/configuration#supervisor-application-listener)
+
+```shell
+openshell service expose demo 50051 agent --backend-http-version 2
+```
+
+Use the printed HTTPS URL with an HTTP/2 client. The sandbox server must accept
+cleartext HTTP/2 with prior knowledge on the declared loopback port.
+
 OpenShell strips the incoming `Authorization` header by default. Opt a service
 into forwarding one valid bearer credential unchanged when the application
 performs its own authentication:
@@ -610,9 +621,7 @@ edge authentication cookies remain stripped.
 
 <Warning>
 Bearer passthrough delivers the caller's credential to the sandbox service.
-Enable it only when that service is trusted to receive the credential. Exposed
-services still use the gateway listener and its TLS configuration in this
-release.
+Enable it only when that service is trusted to receive the credential.
 </Warning>
 
 For example, Codex App Server can keep the raw capability outside the sandbox

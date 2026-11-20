@@ -2001,6 +2001,8 @@ message ExposeServiceRequest {
   string request_id = 6;
   // Application authorization behavior. Omission resolves to STRIP.
   ServiceAuthorizationMode authorization_mode = 7;
+  // HTTP version on the loopback hop. Omission uses HTTP/1.1.
+  ServiceBackendHttpVersion backend_http_version = 8;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
@@ -2069,6 +2071,8 @@ message ServiceEndpoint {
   bool domain = 6;
   // Effective application authorization behavior for ingress requests.
   ServiceAuthorizationMode authorization_mode = 7;
+  // HTTP version on the loopback hop. Omission uses HTTP/1.1.
+  ServiceBackendHttpVersion backend_http_version = 8;
 }
 
 // Service addresses. A configured address does not establish readiness.
@@ -4548,4 +4552,14 @@ message DiscoveredServiceRoute {
   string installation_version = 6;
   uint64 declaration_revision = 7;
   google.protobuf.Timestamp expires_at = 8;
+}
+
+// HTTP version the supervisor uses to connect to a sandbox service.
+enum ServiceBackendHttpVersion {
+  // Omission uses HTTP/1.1.
+  SERVICE_BACKEND_HTTP_VERSION_UNSPECIFIED = 0;
+  // Cleartext HTTP/1.1.
+  SERVICE_BACKEND_HTTP_VERSION_HTTP1 = 1;
+  // Cleartext HTTP/2 with prior knowledge, via the supervisor app listener.
+  SERVICE_BACKEND_HTTP_VERSION_HTTP2 = 2;
 }

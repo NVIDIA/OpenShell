@@ -7,8 +7,8 @@ use std::sync::Arc;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
     DeleteServiceRequest, DeleteServiceResponse, ExposeServiceRequest, GetServiceRequest,
-    ListServicesRequest, ListServicesResponse, Sandbox, ServiceAuthorizationMode, ServiceEndpoint,
-    ServiceEndpointResponse,
+    ListServicesRequest, ListServicesResponse, Sandbox, ServiceAuthorizationMode,
+    ServiceBackendHttpVersion, ServiceEndpoint, ServiceEndpointResponse,
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message as _;
@@ -54,6 +54,21 @@ pub(super) async fn handle_expose_service(
             .ensure_active()?;
     let authorization_mode =
         validate_service_exposure_request(&req.name, req.target_port, req.authorization_mode)?;
+    let backend_http_version = match ServiceBackendHttpVersion::try_from(req.backend_http_version) {
+        Ok(ServiceBackendHttpVersion::Unspecified | ServiceBackendHttpVersion::Http1) => {
+            // Older supervisors omit zero-valued fields in their installation reports.
+            ServiceBackendHttpVersion::Unspecified
+        }
+        Ok(ServiceBackendHttpVersion::Http2) if state.config.supervisor_app_listener.enabled => {
+            ServiceBackendHttpVersion::Http2
+        }
+        Ok(ServiceBackendHttpVersion::Http2) => {
+            return Err(Status::failed_precondition(
+                "HTTP/2 backends require the supervisor application listener",
+            ));
+        }
+        Err(_) => return Err(Status::invalid_argument("backend_http_version is invalid")),
+    };
     expose_service_endpoint(
         state,
         &workspace,
@@ -61,6 +76,7 @@ pub(super) async fn handle_expose_service(
         &req.name,
         req.target_port,
         authorization_mode,
+        backend_http_version,
     )
     .await
 }
@@ -92,6 +108,7 @@ pub(super) async fn expose_service_endpoint(
     service: &str,
     target_port: u32,
     authorization_mode: ServiceAuthorizationMode,
+    backend_http_version: ServiceBackendHttpVersion,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     // Hold the hardening guard across sandbox validation, route counting and
     // persistence. Acquisition is unconditional because advertisements also
@@ -186,6 +203,7 @@ pub(super) async fn expose_service_endpoint(
         target_port,
         domain: true,
         authorization_mode: authorization_mode as i32,
+        backend_http_version: backend_http_version as i32,
     };
 
     let route_reserved = state
@@ -452,6 +470,7 @@ pub(super) fn configured_app_routes_from_endpoints(
                 name: ep.name.clone(),
                 target_port: ep.target_port,
                 authorization_mode: ep.authorization_mode,
+                backend_http_version: ep.backend_http_version,
                 resource_version: ep.metadata.as_ref().map_or(0, |m| m.resource_version),
                 application_hostname: state
                     .config
@@ -511,10 +530,7 @@ async fn get_service_endpoint(
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))
 }
 
-fn service_endpoint_response(
-    state: &Arc<ServerState>,
-    mut endpoint: ServiceEndpoint,
-) -> ServiceEndpointResponse {
+pub(super) fn service_response_endpoint(mut endpoint: ServiceEndpoint) -> ServiceEndpoint {
     endpoint.authorization_mode =
         match ServiceAuthorizationMode::try_from(endpoint.authorization_mode) {
             Ok(ServiceAuthorizationMode::BearerPassthrough) => {
@@ -523,8 +539,18 @@ fn service_endpoint_response(
             Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip)
             | Err(_) => ServiceAuthorizationMode::Strip as i32,
         };
+    if endpoint.backend_http_version == ServiceBackendHttpVersion::Unspecified as i32 {
+        endpoint.backend_http_version = ServiceBackendHttpVersion::Http1 as i32;
+    }
+    endpoint
+}
+
+fn service_endpoint_response(
+    state: &Arc<ServerState>,
+    endpoint: ServiceEndpoint,
+) -> ServiceEndpointResponse {
     let mut response = ServiceEndpointResponse {
-        endpoint: Some(endpoint),
+        endpoint: Some(service_response_endpoint(endpoint)),
         ..Default::default()
     };
     refresh_response_urls(state, &mut response);
@@ -541,13 +567,17 @@ fn refresh_response_urls(state: &ServerState, response: &mut ServiceEndpointResp
     let Some(endpoint) = response.endpoint.as_ref() else {
         return;
     };
-    response.gateway_url = service_routing::endpoint_url(
-        &state.config,
-        endpoint.object_workspace(),
-        &endpoint.sandbox,
-        &endpoint.name,
-    )
-    .unwrap_or_default();
+    response.gateway_url = if endpoint.backend_http_version() == ServiceBackendHttpVersion::Http2 {
+        String::new()
+    } else {
+        service_routing::endpoint_url(
+            &state.config,
+            endpoint.object_workspace(),
+            &endpoint.sandbox,
+            &endpoint.name,
+        )
+        .unwrap_or_default()
+    };
     response.application_url = state
         .config
         .supervisor_app_listener
@@ -660,6 +690,7 @@ mod tests {
                     target_port: 8080,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 })
                 .await
                 .unwrap();
@@ -781,6 +812,10 @@ mod tests {
                     .await
                     .unwrap()
                     .into_inner();
+                    assert_eq!(
+                        created.endpoint.as_ref().unwrap().backend_http_version(),
+                        ServiceBackendHttpVersion::Http1
+                    );
                     assert_eq!(!created.gateway_url.is_empty(), gateway_enabled);
                     assert_eq!(!created.application_url.is_empty(), application_enabled);
                     if application_enabled {
@@ -814,6 +849,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn http2_service_requires_application_ingress_and_reaches_its_route() {
+        let mut state = test_server_state().await;
+        seed_sandbox(&state, "demo").await;
+        let mut request = ExposeServiceRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            sandbox: "demo".into(),
+            name: "agent".into(),
+            target_port: 50051,
+            backend_http_version: ServiceBackendHttpVersion::Http2 as i32,
+            ..Default::default()
+        };
+
+        let error = handle_expose_service(&state, authed_request(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.service_routing.enabled = true;
+        config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            base_url: Some("https://services.example.com:10443".into()),
+        };
+
+        let response = handle_expose_service(&state, authed_request(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response.url,
+            "https://default--demo--agent.services.example.com:10443/"
+        );
+        assert!(response.gateway_url.is_empty());
+        let endpoint = response.endpoint.unwrap();
+        assert_eq!(
+            endpoint.backend_http_version(),
+            ServiceBackendHttpVersion::Http2
+        );
+
+        request.backend_http_version = 99;
+        let error = handle_expose_service(&state, authed_request(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        let stored = get_service_endpoint(&state, "default", "demo", "agent")
+            .await
+            .unwrap()
+            .unwrap();
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(&stored.sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let routes = configured_app_routes_from_endpoints(&state, &sandbox, vec![stored]).unwrap();
+        assert_eq!(
+            routes[0].backend_http_version,
+            ServiceBackendHttpVersion::Http2 as i32
+        );
     }
 
     #[tokio::test]
@@ -1156,6 +1255,7 @@ mod tests {
                 target_port: 8080,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1352,6 +1452,7 @@ mod tests {
                     target_port: 8080,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1371,6 +1472,7 @@ mod tests {
                     target_port: 9090,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1424,6 +1526,7 @@ mod tests {
                 target_port: 7070,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1444,6 +1547,7 @@ mod tests {
                     target_port: 8080,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1463,6 +1567,7 @@ mod tests {
                     target_port: 9090,
                     domain: true,
                     authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                    backend_http_version: 0,
                 }),
             )
             .await
@@ -1554,6 +1659,7 @@ mod tests {
                 target_port: 8080,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1571,6 +1677,7 @@ mod tests {
                 target_port: 9090,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await
@@ -1715,6 +1822,7 @@ mod tests {
                 target_port: 3000,
                 domain: true,
                 authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                backend_http_version: 0,
             }),
         )
         .await

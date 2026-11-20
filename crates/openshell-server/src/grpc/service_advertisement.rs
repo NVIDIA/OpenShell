@@ -1002,6 +1002,7 @@ mod tests {
             name: "web".into(),
             target_port: 8080,
             authorization_mode: 1,
+            backend_http_version: 0,
             resource_version: 2,
             application_hostname: String::new(),
         }
@@ -1177,6 +1178,10 @@ mod tests {
             ..Default::default()
         };
         validate_routes(&report, std::slice::from_ref(&declared)).unwrap();
+        report.routes[0].backend_http_version =
+            openshell_core::proto::ServiceBackendHttpVersion::Http2 as i32;
+        assert!(validate_routes(&report, std::slice::from_ref(&declared)).is_err());
+        report.routes[0] = declared.clone();
         report.routes[0].target_port = 9090;
         assert!(validate_routes(&report, std::slice::from_ref(&declared)).is_err());
         report.routes = vec![declared.clone(), declared.clone()];
@@ -1273,6 +1278,7 @@ pub(super) mod test_support {
             target_port: 8080,
             domain: true,
             authorization_mode: 1,
+            backend_http_version: 0,
         };
         state.store.put_message(&endpoint).await.unwrap();
         let owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)

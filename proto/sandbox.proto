@@ -494,6 +494,8 @@ message SandboxServiceRoute {
   // Includes the application domain, without a scheme or port. An empty value
   // from an older gateway retains readable workspace--sandbox[--service] routing.
   string application_hostname = 6;
+  // ServiceBackendHttpVersion from the public service declaration.
+  int32 backend_http_version = 7;
 }
 
 // Connection details for one operator-registered supervisor middleware service.
