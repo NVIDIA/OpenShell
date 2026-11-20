@@ -207,13 +207,6 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 - The Python SDK moved to [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), which publishes `openshell` to PyPI. Open SDK changes there.
 - `python/` and the SDK build script `tasks/scripts/generate_python_proto.py` are frozen until core removes them; Branch Checks fails PRs that change them. Put tests for core Python scripts next to the scripts, not under `python/`.
 
-## TypeScript SDK (`sdk/typescript/`)
-
-- Open TypeScript SDK changes in [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript).
-- `sdk/typescript/` holds only the deprecated `@nvidia/openshell-sdk` stub, which depends on `@ai-openshell/sdk` and re-exports it. Branch Checks rejects other additions and modifications there. Deletions remain allowed for removal.
-- Core proto changes need no TypeScript bindings here. The standalone SDK generates bindings from its pinned core release.
-- Core releases publish the stub to GitHub Packages with a dependency on the same `@ai-openshell/sdk` minor line, so release `@ai-openshell/sdk` first.
-
 ## Python
 
 - Always use `uv` for Python commands (e.g., `uv pip install`, `uv run`, `uv venv`)
