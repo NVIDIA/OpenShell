@@ -5,10 +5,12 @@
 //! longer than its `idle_stop_after_seconds` setting.
 //!
 //! The supervisor reports OSC 7501 program status with relative ages. The
-//! gateway records it as the `ProgramStatus` condition in gateway time,
-//! writing only on state changes or coarse input progress, and the idle sweep
-//! reads the stored condition. A sandbox with no program reports is never
-//! idle.
+//! replica that holds a sandbox's supervisor session keeps the latest report
+//! of that session in memory, with exact input time, and decides idleness
+//! from it alone. The stored `ProgramStatus` condition is for display: it is
+//! written only on state changes or coarse input progress, can lag, and can
+//! outlive the session that reported it, so it never authorizes a stop. A
+//! sandbox with no report on its current session is never idle.
 
 use std::time::{Duration, SystemTime};
 
@@ -20,9 +22,13 @@ use openshell_core::proto::{
 
 pub use openshell_core::metadata::IDLE_STOPPED_REASON;
 
-/// How often the reconciler-lease holder looks for idle sandboxes.
+/// How often each replica looks for idle sandboxes among its sessions.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-/// Input progress smaller than this does not rewrite the stored condition.
+/// Longest delay before the supervisor reports new input: one check interval
+/// plus the minimum spacing of input reports. Idle stops wait this much past
+/// the timeout so a keystroke not yet reported still counts.
+pub const INPUT_REPORT_LAG: Duration = Duration::from_secs(15);
+/// Input progress smaller than this does not rewrite the displayed condition.
 pub const INPUT_WRITE_GRANULARITY: Duration = Duration::from_mins(1);
 /// Durable marker that the in-flight stop was started by the idle sweep. It
 /// survives gateway restarts and driver snapshots that rewrite conditions.
@@ -56,10 +62,6 @@ fn state_reason(state: WorkloadProgramState) -> Option<&'static str> {
     })
 }
 
-fn waiting_reason(reason: &str) -> bool {
-    matches!(reason, "Idle" | "Done" | "Blocked" | "Error")
-}
-
 fn condition_message(report: &SupervisorWorkloadActivity, reason: &str) -> String {
     let app: String = report
         .app
@@ -79,6 +81,35 @@ fn condition_message(report: &SupervisorWorkloadActivity, reason: &str) -> Strin
         _ => "",
     };
     format!("{program} is {}{waits_for}", reason.to_ascii_lowercase())
+}
+
+/// The latest report of a supervisor session, in gateway time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveActivity {
+    pub session_id: String,
+    pub instance_id: String,
+    pub state: WorkloadProgramState,
+    /// The later of the state change and the latest client input.
+    pub since: SystemTime,
+}
+
+/// Live activity for a report received at `now` on `session_id`.
+pub fn live_from_report(
+    report: &SupervisorWorkloadActivity,
+    session_id: &str,
+    instance_id: &str,
+    now: SystemTime,
+) -> LiveActivity {
+    let state_since = before(now, report.state_age.as_ref()).unwrap_or(now);
+    let since =
+        before(now, report.input_age.as_ref()).map_or(state_since, |input| input.max(state_since));
+    LiveActivity {
+        session_id: session_id.to_string(),
+        instance_id: instance_id.to_string(),
+        state: WorkloadProgramState::try_from(report.state)
+            .unwrap_or(WorkloadProgramState::Unspecified),
+        since,
+    }
 }
 
 /// The `ProgramStatus` condition for a supervisor report received at `now`,
@@ -166,31 +197,41 @@ pub fn timeout_from_setting(seconds: Option<i64>) -> Option<Duration> {
 
 /// When the sandbox began waiting on the user, or `None` while it is not.
 ///
-/// A program waits while it reported idle, done, blocked, or error and
-/// nothing is working. The later of the condition time (state change or
-/// client input) and the main-process start marks the beginning.
-pub fn idle_since(sandbox: &Sandbox) -> Option<SystemTime> {
+/// The program waits while the current session last reported idle, done,
+/// blocked, or error. The later of that report's time (state change or client
+/// input) and the main-process start marks the beginning. A report from
+/// another main-process instance does not count.
+pub fn idle_since(sandbox: &Sandbox, live: &LiveActivity) -> Option<SystemTime> {
     let status = sandbox.status.as_ref()?;
-    if status.phase != SandboxPhase::Ready as i32 {
+    if status.phase != SandboxPhase::Ready as i32
+        || (!status.main_process_instance_id.is_empty()
+            && status.main_process_instance_id != live.instance_id)
+    {
         return None;
     }
-    let program = program_condition(sandbox)?;
-    if !waiting_reason(&program.reason) {
+    if !matches!(
+        live.state,
+        WorkloadProgramState::Idle
+            | WorkloadProgramState::Done
+            | WorkloadProgramState::Blocked
+            | WorkloadProgramState::Error
+    ) {
         return None;
     }
-    [
-        system_time(program.transition_time.as_ref()),
-        system_time(status.main_process_started_time.as_ref()),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
+    let started = system_time(status.main_process_started_time.as_ref());
+    Some(started.map_or(live.since, |started| started.max(live.since)))
 }
 
-/// How long the sandbox has waited, when that reaches `timeout`.
-pub fn idle_stop_due(sandbox: &Sandbox, timeout: Duration, now: SystemTime) -> Option<Duration> {
-    let idle = now.duration_since(idle_since(sandbox)?).ok()?;
-    (idle >= timeout).then_some(idle)
+/// How long the sandbox has waited, when that reaches `timeout` plus the
+/// input report lag.
+pub fn idle_stop_due(
+    sandbox: &Sandbox,
+    live: &LiveActivity,
+    timeout: Duration,
+    now: SystemTime,
+) -> Option<Duration> {
+    let idle = now.duration_since(idle_since(sandbox, live)?).ok()?;
+    (idle >= timeout + INPUT_REPORT_LAG).then_some(idle)
 }
 
 /// The Ready condition of an idle-stopped sandbox. Driver snapshots of the
@@ -249,16 +290,25 @@ mod tests {
         condition_from_report(&report(state, 0, None), at(received)).unwrap()
     }
 
-    fn ready_sandbox(program: SandboxCondition, started: u64) -> Sandbox {
+    fn ready_sandbox(started: u64) -> Sandbox {
         Sandbox {
             status: Some(SandboxStatus {
                 phase: SandboxPhase::Ready.into(),
+                main_process_instance_id: "instance-1".into(),
                 main_process_started_time: timestamp(at(started)),
-                conditions: vec![program],
                 ..Default::default()
             }),
             ..Default::default()
         }
+    }
+
+    fn live(state: WorkloadProgramState, received: u64, input_age: Option<i64>) -> LiveActivity {
+        live_from_report(
+            &report(state, 0, input_age),
+            "session-1",
+            "instance-1",
+            at(received),
+        )
     }
 
     #[test]
@@ -323,30 +373,56 @@ mod tests {
     }
 
     #[test]
-    fn waiting_programs_become_due_after_the_latest_activity() {
-        let sandbox = ready_sandbox(condition(WorkloadProgramState::Done, 100), 0);
-        assert_eq!(idle_since(&sandbox), Some(at(100)));
-        assert_eq!(idle_stop_due(&sandbox, secs(600), at(699)), None);
-        assert_eq!(idle_stop_due(&sandbox, secs(600), at(700)), Some(secs(600)));
+    fn waiting_programs_become_due_after_the_timeout_and_report_lag() {
+        let sandbox = ready_sandbox(0);
+        let done = live(WorkloadProgramState::Done, 100, None);
+        assert_eq!(idle_since(&sandbox, &done), Some(at(100)));
+        let lag = INPUT_REPORT_LAG.as_secs();
+        assert_eq!(
+            idle_stop_due(&sandbox, &done, secs(600), at(699 + lag)),
+            None
+        );
+        assert_eq!(
+            idle_stop_due(&sandbox, &done, secs(600), at(700 + lag)),
+            Some(secs(600 + lag))
+        );
         // A later main-process start restarts the wait.
-        let restarted = ready_sandbox(condition(WorkloadProgramState::Done, 100), 500);
-        assert_eq!(idle_since(&restarted), Some(at(500)));
+        assert_eq!(idle_since(&ready_sandbox(500), &done), Some(at(500)));
     }
 
     #[test]
-    fn working_and_non_ready_sandboxes_are_never_idle() {
-        let working = ready_sandbox(condition(WorkloadProgramState::Working, 0), 0);
-        assert_eq!(idle_since(&working), None);
-        let mut stopping = ready_sandbox(condition(WorkloadProgramState::Done, 0), 0);
+    fn input_moves_the_wait_forward_exactly() {
+        // Blocked at 0; input at 45 reported at 50. The timeout counts from 45.
+        let sandbox = ready_sandbox(0);
+        let blocked = live_from_report(
+            &report(WorkloadProgramState::Blocked, 50, Some(5)),
+            "session-1",
+            "instance-1",
+            at(50),
+        );
+        assert_eq!(idle_since(&sandbox, &blocked), Some(at(45)));
+        assert_eq!(idle_stop_due(&sandbox, &blocked, secs(60), at(60)), None);
+    }
+
+    #[test]
+    fn working_other_instances_and_non_ready_sandboxes_are_never_idle() {
+        let sandbox = ready_sandbox(0);
+        assert_eq!(
+            idle_since(&sandbox, &live(WorkloadProgramState::Working, 0, None)),
+            None
+        );
+        assert_eq!(
+            idle_since(&sandbox, &live(WorkloadProgramState::Unspecified, 0, None)),
+            None
+        );
+        let mut stale = live(WorkloadProgramState::Done, 0, None);
+        stale.instance_id = "instance-old".into();
+        assert_eq!(idle_since(&sandbox, &stale), None);
+        let mut stopping = ready_sandbox(0);
         stopping.status.as_mut().unwrap().phase = SandboxPhase::Stopping.into();
-        assert_eq!(idle_since(&stopping), None);
-        let unreported = Sandbox {
-            status: Some(SandboxStatus {
-                phase: SandboxPhase::Ready.into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert_eq!(idle_since(&unreported), None);
+        assert_eq!(
+            idle_since(&stopping, &live(WorkloadProgramState::Done, 0, None)),
+            None
+        );
     }
 }

@@ -148,10 +148,18 @@ message SupervisorWorkloadActivity {
 
 Ages are relative so supervisor and gateway clocks need not agree. The
 supervisor sends the summary when each gateway session starts, on every change,
-and when client input advances by a minute. Idle timeouts are minutes long, so
-coarser input data costs nothing in accuracy.
+and within 15 seconds of new client input, including the last keystroke before
+typing stops. The latest input time outlives the terminal that received it.
+`reporting_terminals` counts terminals with a current report, whether or not
+their program sent the support query.
 
-The gateway records the latest report as a `ProgramStatus` condition in the
+The supervisor applies reports, OSC 133 `A` prompts, and full resets (RIS) in
+output order, however reads split them. A prompt ends only the reports before
+it, and a reset clears the terminal's records as the spec requires.
+
+The replica holding the supervisor session keeps that session's latest report
+in memory. Only that live report authorizes an idle stop. The gateway also
+records the latest report as a `ProgramStatus` condition in the
 existing `SandboxStatus.conditions` list. This keeps the public `Sandbox`
 messages unchanged: SDK users who build exhaustive `SandboxStatus` literals
 still compile, as the `sandbox_status_compatibility` fixture requires.
@@ -164,8 +172,10 @@ still compile, as the `sandbox_status_compatibility` fixture requires.
 
 The gateway writes the condition only when its reason or message changes, or
 when input moves its time forward by a minute or more. That bounds
-resource-version churn for the reconcile sweep. Writes are fenced to the running
-main-process instance. Driver snapshots keep the condition, and every lifecycle
+resource-version churn for the reconcile sweep. Writes retry on conflict and are
+fenced to the running main-process instance. The condition is for display only:
+it can lag input by a minute, a failed write can leave it stale, and it outlives
+the session that reported it. Driver snapshots keep the condition, and every lifecycle
 phase change removes it. `openshell sandbox get` and `WatchSandbox` show it
 like any other condition.
 
@@ -174,10 +184,11 @@ like any other condition.
 A sandbox is idle when all of these hold:
 
 - its phase is `Ready`;
-- `workload_activity.state` is `idle`, `done`, `blocked`, or `error`, and no
+- the live report from its current supervisor session, for the running
+  main-process instance, is `idle`, `done`, `blocked`, or `error`, so no
   terminal is `working`;
-- the later of the condition's time and `main_process_started_time` is older
-  than the sandbox's idle timeout.
+- the later of that report's time and `main_process_started_time` is older
+  than the idle timeout plus a 15-second input report lag.
 
 The timeout is a new runtime setting, `idle_stop_after_seconds`, set with
 `openshell settings set` at gateway or sandbox scope. As with every runtime
@@ -185,18 +196,23 @@ setting, gateway scope wins over sandbox scope. It can be changed on a running
 sandbox. Unset, zero, or negative disables idle stop, and values above 30 days
 are capped. No new `SandboxSpec` field or gateway TOML key is needed.
 
-The idle sweep runs in the restart loop every 30 seconds, so it inherits that
-loop's reconciler-lease ownership in single- and multi-replica gateways. It
-reads settings only for sandboxes that are already waiting. Each due sandbox
-goes through the existing stop path on its own task, with an idle cause. The
-stop re-checks idleness under the lifecycle lock, so input that arrives after
-the sweep read keeps the sandbox running.
+Every replica sweeps the sandboxes of its own supervisor sessions every 30
+seconds and reads settings only for those already waiting. A gateway that
+restarts, or a session that moves to another replica, stops nothing until the
+new session reports, so a workload that resumed work during an outage is not
+stopped on a stale record. Each due sandbox goes through the existing stop path
+on its own task, with an idle cause. Under the lifecycle lock, the stop re-reads
+the live report and the setting. New input, a new turn, or a timeout that was
+disabled or extended since the sweep keeps the sandbox running.
 
 The idle request writes the internal annotation `internal.openshell.ai/idle-stop`
 with the reason `IdleStopping`. The annotation survives gateway recovery and
 driver snapshots that rewrite conditions. The Ready condition then settles as
 `IdleStopped` instead of `Stopped`, so users and the CLI can tell an idle stop
-from an explicit one. The next lifecycle transition removes the annotation. The
+from an explicit one. The gateway reapplies that reason when a driver snapshot
+of the stopped runtime rewrites it. Any other lifecycle write removes the
+annotation. An explicit `sandbox stop` of an idle-stopped sandbox rewrites it as
+an ordinary stop, so `sandbox connect` no longer starts it. The
 gateway logs each idle stop with the sandbox, the program, and how long it
 waited.
 
@@ -258,8 +274,10 @@ report content. `msg` and `title` are validated per the spec, then discarded.
 4. **Wake on connect.** Auto-start `IdleStopped` sandboxes in
    `openshell sandbox connect`.
 5. **Validation.** Add the `idle_stop` conformance test, which runs a
-   scripted OSC 7501 agent through idle → `IdleStopped` → start → reporting
-   again on every driver. Check Claude Code and Codex manually inside Docker
+   scripted OSC 7501 agent on every driver through two sequences.
+   `IdleStopped`, then `sandbox connect`, starts it again.
+   `IdleStopped`, then an explicit stop, then `sandbox connect`, leaves it
+   stopped. Check Claude Code and Codex manually inside Docker
    and Kubernetes sandboxes, with provider credentials.
 6. **Phase 2 (separate change).** Choose `suspend` instead of `stop` when the
    driver advertises `openshell.compute.suspend-resume`, and implement Podman
@@ -284,10 +302,11 @@ sets a gateway value or a user opts in per sandbox.
   on storage that survives stop: the Docker writable layer or workspace volume,
   the Kubernetes PVC, the VM overlay. Agents restarted with their plain command
   start a fresh conversation unless the user runs their resume flag.
-- **Store churn.** Activity writes bump the resource version that the
+- **Store churn.** Display writes bump the resource version that the
   reconcile sweep compares. The one-minute input threshold and
   transition-only state writes limit this. An active agent still writes twice
-  per turn (`working`, then `done`).
+  per turn (`working`, then `done`). Decisions use in-memory reports, so this
+  throttling never delays an input from counting.
 
 ## Alternatives
 

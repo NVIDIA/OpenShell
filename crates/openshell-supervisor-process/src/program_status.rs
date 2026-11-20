@@ -123,15 +123,25 @@ pub enum Terminator {
     Bel,
 }
 
+/// Something in the output stream that changes a terminal's records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalEvent {
+    Report(Report),
+    /// The shell started a new prompt (OSC 133 `A`), ending the program that
+    /// ran before it.
+    Prompt,
+    /// A full terminal reset (RIS, `ESC c`) removes every record.
+    Reset,
+}
+
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Scan {
     /// Output to forward to attached clients.
     pub forward: Vec<u8>,
-    pub reports: Vec<Report>,
+    /// Record changes in the order they appeared in the output.
+    pub events: Vec<TerminalEvent>,
     /// Support queries removed from `forward`, in order.
     pub queries: Vec<Terminator>,
-    /// The shell started a new prompt (OSC 133 `A`).
-    pub prompt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,7 +250,7 @@ impl Scanner {
                     self.state = ScanState::Escape;
                 }
             }
-            ScanState::Escape => self.after_escape(byte),
+            ScanState::Escape => self.after_escape(byte, scan),
             ScanState::Osc => match byte {
                 BEL => self.finish(scan),
                 ESC => self.state = ScanState::OscEscape,
@@ -252,13 +262,16 @@ impl Scanner {
                     self.finish(scan);
                 } else {
                     // ESC interrupted the string; it introduces what follows.
-                    self.after_escape(byte);
+                    self.after_escape(byte, scan);
                 }
             }
         }
     }
 
-    fn after_escape(&mut self, byte: u8) {
+    fn after_escape(&mut self, byte: u8, scan: &mut Scan) {
+        if byte == b'c' {
+            scan.events.push(TerminalEvent::Reset);
+        }
         self.state = match byte {
             b']' => {
                 self.tracking = Tracking::Undecided;
@@ -301,10 +314,10 @@ impl Scanner {
     fn finish(&mut self, scan: &mut Scan) {
         self.state = ScanState::Ground;
         match self.tracking {
-            Tracking::Prompt => scan.prompt = true,
+            Tracking::Prompt => scan.events.push(TerminalEvent::Prompt),
             Tracking::Report if self.body != QUERY_BODY => {
                 if let Some(report) = parse_report(&self.body[REPORT_PREFIX.len()..]) {
-                    scan.reports.push(report);
+                    scan.events.push(TerminalEvent::Report(report));
                 }
             }
             _ => {}
@@ -495,8 +508,6 @@ impl Records {
 struct TerminalStatus {
     records: Records,
     last_output: Instant,
-    last_input: Option<Instant>,
-    supported: bool,
 }
 
 /// Sandbox-wide status that changes only on program state transitions.
@@ -508,8 +519,8 @@ pub struct ActivitySummary {
     pub app: Option<String>,
     /// Open workload terminals.
     pub terminals: usize,
-    /// Terminals whose program asked whether reports are supported.
-    pub supported_terminals: usize,
+    /// Terminals with a current program report.
+    pub reporting_terminals: usize,
 }
 
 /// Point-in-time activity including timestamps that change on every byte.
@@ -527,6 +538,9 @@ struct Inner {
     next_terminal: u64,
     terminals: BTreeMap<u64, TerminalStatus>,
     state_since: Instant,
+    /// Latest client input to any workload terminal, kept after the terminal
+    /// closes so a short session still counts as recent input.
+    last_input: Option<Instant>,
 }
 
 /// Program status across every workload terminal in one sandbox.
@@ -545,6 +559,7 @@ impl ProgramActivity {
                 next_terminal: 0,
                 terminals: BTreeMap::new(),
                 state_since: Instant::now(),
+                last_input: None,
             }),
             changes,
         })
@@ -562,7 +577,7 @@ impl ProgramActivity {
         ActivitySnapshot {
             summary: summarize(&inner),
             last_output: inner.terminals.values().map(|t| t.last_output).max(),
-            last_input: inner.terminals.values().filter_map(|t| t.last_input).max(),
+            last_input: inner.last_input,
             state_since: inner.state_since,
         }
     }
@@ -580,8 +595,6 @@ impl ProgramActivity {
                 TerminalStatus {
                     records: Records::default(),
                     last_output: Instant::now(),
-                    last_input: None,
-                    supported: false,
                 },
             );
             id
@@ -625,8 +638,8 @@ impl ProgramActivity {
     fn touch_input(&self, id: u64) {
         // Input never changes the summary; skip the change notification.
         let mut inner = self.inner.lock().expect("program activity lock poisoned");
-        if let Some(terminal) = inner.terminals.get_mut(&id) {
-            terminal.last_input = Some(Instant::now());
+        if inner.terminals.contains_key(&id) {
+            inner.last_input = Some(Instant::now());
         }
     }
 }
@@ -642,7 +655,11 @@ fn summarize(inner: &Inner) -> ActivitySummary {
         kind: dominant.as_ref().and_then(|(_, kind, _)| *kind),
         app: dominant.and_then(|(_, _, app)| app),
         terminals: inner.terminals.len(),
-        supported_terminals: inner.terminals.values().filter(|t| t.supported).count(),
+        reporting_terminals: inner
+            .terminals
+            .values()
+            .filter(|terminal| !terminal.records.records.is_empty())
+            .count(),
     }
 }
 
@@ -668,17 +685,16 @@ impl TerminalTap {
                 Terminator::Bel => REPLY_BEL,
             });
         }
-        let supported = !scan.queries.is_empty();
-        let prompt = scan.prompt;
-        let reports = scan.reports;
+        let events = scan.events;
         self.activity.with_terminal(self.id, |terminal| {
             terminal.last_output = Instant::now();
-            terminal.supported |= supported;
-            if prompt {
-                terminal.records.drop_running();
-            }
-            for report in reports {
-                terminal.records.apply(report);
+            // Wire order matters: a prompt ends only the reports before it.
+            for event in events {
+                match event {
+                    TerminalEvent::Report(report) => terminal.records.apply(report),
+                    TerminalEvent::Prompt => terminal.records.drop_running(),
+                    TerminalEvent::Reset => terminal.records.apply(Report::Clear { id: None }),
+                }
             }
         });
         scan.forward
@@ -782,7 +798,7 @@ pub fn spawn_transition_log(activity: &Arc<ProgramActivity>) -> tokio::task::Joi
                 kind = summary.kind.map(BlockedKind::as_str),
                 app = summary.app.as_deref(),
                 terminals = summary.terminals,
-                supported_terminals = summary.supported_terminals,
+                reporting_terminals = summary.reporting_terminals,
                 "workload program status changed"
             );
         }
@@ -790,10 +806,11 @@ pub fn spawn_transition_log(activity: &Arc<ProgramActivity>) -> tokio::task::Joi
 }
 
 /// How often the reporter checks for input that changed nothing else.
-const INPUT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-/// Input newer than the last report by less than this is not reported alone.
-/// Idle timeouts are minutes long, so coarser input data costs no accuracy.
-const INPUT_REPORT_GRANULARITY: std::time::Duration = std::time::Duration::from_mins(1);
+const INPUT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Minimum spacing of input-only reports while a client keeps typing. New
+/// input is always reported within this interval plus one check, including
+/// the last keystroke before the client stops.
+const INPUT_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn proto_state(state: Option<ProgramState>) -> openshell_core::proto::WorkloadProgramState {
     use openshell_core::proto::WorkloadProgramState as Proto;
@@ -832,7 +849,7 @@ pub fn activity_report(
         app: snapshot.summary.app.clone().unwrap_or_default(),
         state_age: proto_age(snapshot.state_since),
         input_age: snapshot.last_input.and_then(proto_age),
-        reporting_terminals: u32::try_from(snapshot.summary.supported_terminals)
+        reporting_terminals: u32::try_from(snapshot.summary.reporting_terminals)
             .unwrap_or(u32::MAX),
     }
 }
@@ -847,7 +864,7 @@ impl Drop for ReporterGuard {
 }
 
 /// Report activity on one gateway session: once at start, on every summary
-/// change, and when client input advances by the report granularity.
+/// change, and within seconds of new client input.
 pub fn spawn_activity_reporter(
     activity: &Arc<ProgramActivity>,
     tx: tokio::sync::mpsc::Sender<openshell_core::proto::SupervisorMessage>,
@@ -859,18 +876,15 @@ pub fn spawn_activity_reporter(
         let mut input_check = tokio::time::interval(INPUT_CHECK_INTERVAL);
         input_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut reported_input: Option<Instant> = None;
+        let mut last_send: Option<Instant> = None;
         let mut send_now = true;
         loop {
             let snapshot = activity.snapshot();
-            let input_advanced = match (snapshot.last_input, reported_input) {
-                (Some(latest), Some(reported)) => {
-                    latest.saturating_duration_since(reported) >= INPUT_REPORT_GRANULARITY
-                }
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
+            let input_advanced = snapshot.last_input != reported_input
+                && last_send.is_none_or(|sent| sent.elapsed() >= INPUT_REPORT_INTERVAL);
             if send_now || input_advanced {
                 reported_input = snapshot.last_input;
+                last_send = Some(Instant::now());
                 let message = SupervisorMessage {
                     payload: Some(Payload::WorkloadActivity(activity_report(&snapshot))),
                 };
@@ -982,7 +996,10 @@ mod tests {
         let input = b"hi\x1b]7501;?\x1b\\\x1b[c\x1b]7501;state=working\x07there";
         let scan = scanner.scan(input);
         assert_eq!(scan.queries, vec![Terminator::St]);
-        assert_eq!(scan.reports, vec![set(ProgramState::Working)]);
+        assert_eq!(
+            scan.events,
+            vec![TerminalEvent::Report(set(ProgramState::Working))]
+        );
         assert_eq!(
             scan.forward,
             b"hi\x1b[c\x1b]7501;state=working\x07there".to_vec()
@@ -1009,8 +1026,8 @@ mod tests {
                 vec![Terminator::Bel]
             );
             assert_eq!(
-                [first.reports, second.reports].concat(),
-                vec![set(ProgramState::Done)]
+                [first.events, second.events].concat(),
+                vec![TerminalEvent::Report(set(ProgramState::Done))]
             );
         }
     }
@@ -1036,8 +1053,7 @@ mod tests {
         input.extend(std::iter::repeat_n(b'A', MAX_SEQUENCE));
         input.extend(b"\x1b\\\x1b]0;title\x07\x1b]133;A\x07");
         let scan = scanner.scan(&input);
-        assert!(scan.reports.is_empty());
-        assert!(scan.prompt);
+        assert_eq!(scan.events, vec![TerminalEvent::Prompt]);
         assert_eq!(scan.forward, input);
     }
 
@@ -1092,7 +1108,7 @@ mod tests {
         assert_eq!(summary.state, Some(ProgramState::Done));
         assert_eq!(summary.app.as_deref(), Some("claude-code"));
         assert_eq!(summary.terminals, 2);
-        assert_eq!(summary.supported_terminals, 1);
+        assert_eq!(summary.reporting_terminals, 1);
 
         shell.output(b"\x1b]7501;state=working\x07");
         assert_eq!(
@@ -1115,11 +1131,67 @@ mod tests {
     }
 
     #[test]
+    fn prompts_and_reports_apply_in_wire_order_for_every_chunking() {
+        let input: &[u8] = b"\x1b]7501;state=working\x07\x1b]133;A\x07";
+        let finals: Vec<Option<ProgramState>> = (0..=input.len())
+            .map(|split| {
+                let activity = ProgramActivity::new();
+                let mut tap = activity.register(|_| {});
+                tap.output(&input[..split]);
+                tap.output(&input[split..]);
+                activity.snapshot().summary.state
+            })
+            .collect();
+        assert!(
+            finals.iter().all(Option::is_none),
+            "a prompt after a report ends it however the bytes arrive: {finals:?}"
+        );
+
+        // A report after the prompt belongs to the next program.
+        let activity = ProgramActivity::new();
+        let mut tap = activity.register(|_| {});
+        tap.output(b"\x1b]133;A\x07\x1b]7501;state=blocked\x07");
+        assert_eq!(
+            activity.snapshot().summary.state,
+            Some(ProgramState::Blocked)
+        );
+    }
+
+    #[test]
+    fn full_terminal_reset_clears_records() {
+        let activity = ProgramActivity::new();
+        let mut tap = activity.register(|_| {});
+        let forward = tap.output(b"\x1b]7501;state=done\x07\x1bc");
+        assert_eq!(forward, b"\x1b]7501;state=done\x07\x1bc".to_vec());
+        assert_eq!(activity.snapshot().summary.state, None);
+        // ESC c interrupting an unterminated OSC also resets.
+        tap.output(b"\x1b]7501;state=done\x07\x1b]7501;state=wor\x1bc");
+        assert_eq!(activity.snapshot().summary.state, None);
+    }
+
+    #[test]
+    fn reports_without_a_probe_count_and_input_outlives_its_terminal() {
+        let activity = ProgramActivity::new();
+        let mut probing = activity.register(|_| {});
+        probing.output(b"\x1b]7501;?\x07");
+        let mut codex = activity.register(|_| {});
+        codex.output(b"\x1b]7501;state=working:app=codex\x07");
+        assert_eq!(activity.snapshot().summary.reporting_terminals, 1);
+
+        let marker = probing.input_marker();
+        marker.mark();
+        let typed = activity.snapshot().last_input;
+        drop(probing);
+        assert!(typed.is_some());
+        assert_eq!(activity.snapshot().last_input, typed);
+    }
+
+    #[test]
     fn echoed_replies_are_not_queries() {
         for reply in [REPLY_ST, REPLY_BEL] {
             let scan = Scanner::new().scan(reply);
             assert!(scan.queries.is_empty());
-            assert!(scan.reports.is_empty());
+            assert!(scan.events.is_empty());
             assert_eq!(scan.forward, reply.to_vec());
         }
     }

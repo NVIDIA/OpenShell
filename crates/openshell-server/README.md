@@ -169,20 +169,24 @@ diagnosis or storage. This lifecycle behavior also applies when updates are disa
 
 ## Idle stop
 
-Supervisor `SupervisorWorkloadActivity` reports become the `ProgramStatus`
-condition, in gateway time. The condition is written only when its state
-changes or terminal input moves its time forward by a minute, is fenced to the
-running main-process instance, survives driver snapshots, and is removed on
-every phase change.
+The replica that holds a sandbox's supervisor session keeps that session's
+latest `SupervisorWorkloadActivity` report in memory, in gateway time, and only
+that report authorizes an idle stop. After a gateway restart or a session
+change, nothing stops until the current session reports. The report also
+becomes the `ProgramStatus` condition for display. The condition is written,
+with conflict retries, only when its state changes or input moves its time
+forward by a minute. It is fenced to the running main-process instance,
+survives driver snapshots, and is removed on every phase change.
 
-The restart loop, which runs only on the reconciler-lease holder, sweeps every
-30 seconds. A Ready sandbox whose program is idle, done, blocked, or in error
-is stopped once `idle_stop_after_seconds` (gateway scope, then sandbox scope)
-has elapsed since the later of that condition's time and the main-process
-start. The stop re-checks idleness under the lifecycle lock and records the
-`internal.openshell.ai/idle-stop` annotation with `IdleStopping`. That marker
-survives gateway recovery and settles the stop as `IdleStopped`. The next
-lifecycle transition removes it.
+Every replica sweeps its own sessions every 30 seconds. A Ready sandbox whose
+program is idle, done, blocked, or in error is stopped once
+`idle_stop_after_seconds` (gateway scope, then sandbox scope) plus a 15-second
+input report lag has elapsed since the later of the report's time and the
+main-process start. Under the lifecycle lock, the stop re-reads the live report
+and the setting. It records the `internal.openshell.ai/idle-stop` annotation
+with `IdleStopping`; that marker survives gateway recovery and settles the stop
+as `IdleStopped`. Any other lifecycle write removes it, and an explicit stop of
+an idle-stopped sandbox rewrites it as an ordinary stop.
 
 ## Static credential delivery
 

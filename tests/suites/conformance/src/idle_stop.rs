@@ -19,14 +19,19 @@ const AGENT: &str = r"printf '\033]7501;?\033\\'; sleep 1; printf '\033]7501;sta
 
 /// The supervisor reports within a second; allow for session setup.
 const REPORT_DEADLINE: Duration = Duration::from_secs(30);
-/// The gateway sweeps for idle sandboxes every 30 seconds.
+/// The timeout, the 15 second input report lag, and the 30 second sweep.
 const IDLE_STOP_DEADLINE: Duration = Duration::from_secs(90);
+/// Connect prints its notice, then starts the sandbox and waits for Ready.
+const WAKE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// A sandbox whose program reports `done` is stopped with reason
-/// `IdleStopped` once its idle timeout passes, and a start brings back a
-/// program that reports again.
+/// `IdleStopped` once its idle timeout passes, and `sandbox connect` starts it
+/// again. After a later idle stop, an explicit `sandbox stop` keeps it
+/// stopped: `sandbox connect` then fails instead of starting it.
 #[testkit::test]
-async fn reported_waiting_program_is_stopped_and_restarts(cx: &mut Context) -> testkit::Result {
+async fn idle_stopped_sandbox_wakes_on_connect_until_stopped_explicitly(
+    cx: &mut Context,
+) -> testkit::Result {
     let sandbox = cx
         .sandbox("idle")
         .command(["sh", "-c", AGENT])
@@ -34,23 +39,55 @@ async fn reported_waiting_program_is_stopped_and_restarts(cx: &mut Context) -> t
         .create_ready()
         .await?;
     expect_program_status(&sandbox, "Done").await?;
-
     set_idle_timeout(&sandbox, 1).await?;
+    expect_idle_stopped(&sandbox).await?;
+
+    let mut connect = cx.cli_spawn(["sandbox", "connect", sandbox.name()])?;
+    connect
+        .stderr_until(WAKE_DEADLINE, |line| line.contains("stopped while idle"))
+        .await?;
+    // Connect reports the start only after the sandbox is Ready again.
+    connect
+        .stdout_until(WAKE_DEADLINE, |line| line.contains("Started sandbox"))
+        .await?;
+    sandbox.wait_ready().await?;
+    connect.kill().await?;
+
+    // The restarted program reports again and is idle-stopped again.
+    expect_program_status(&sandbox, "Done").await?;
+    expect_idle_stopped(&sandbox).await?;
+
+    sandbox.stop().await?;
+    let reason = ready_reason(&sandbox.get_json().await?);
+    testkit::ensure!(
+        reason != "IdleStopped",
+        "an explicit stop kept the idle reason, so connect would start it"
+    );
+    let connected = cx.cli(["sandbox", "connect", sandbox.name()]).await?;
+    testkit::ensure!(
+        connected.exit_code != 0,
+        "sandbox connect succeeded against an explicitly stopped sandbox"
+    );
+    let phase = sandbox.get().await?.phase;
+    testkit::ensure!(
+        phase == SandboxPhase::Stopped,
+        "sandbox connect changed an explicitly stopped sandbox to {phase:?}"
+    );
+    Ok(())
+}
+
+/// Wait for an idle stop and check that it kept its own reason.
+async fn expect_idle_stopped(sandbox: &Sandbox) -> testkit::Result {
     sandbox
         .wait_phase(SandboxPhase::Stopped, IDLE_STOP_DEADLINE)
         .await?;
-    let stopped = sandbox.get_json().await?;
-    let reason = ready_reason(&stopped);
+    let reason = ready_reason(&sandbox.get_json().await?);
     testkit::ensure!(
         reason == "IdleStopped",
         "sandbox {} stopped with reason {reason:?}; expected IdleStopped",
         sandbox.name()
     );
-
-    // Disable the timeout so the restarted sandbox stays up while it is read.
-    set_idle_timeout(&sandbox, 0).await?;
-    sandbox.start().await?;
-    expect_program_status(&sandbox, "Done").await
+    Ok(())
 }
 
 /// Set the sandbox's idle timeout and check the effective value, which a

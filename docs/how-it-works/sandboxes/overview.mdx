@@ -1041,7 +1041,9 @@ programs never report status is never stopped. `openshell sandbox get` shows the
 latest report as the `ProgramStatus` condition.
 
 An idle stop moves the sandbox to `Stopped` with the reason `IdleStopped`.
-`openshell sandbox connect` starts such a sandbox before connecting. Process
+`openshell sandbox connect` starts such a sandbox before connecting. Running
+`openshell sandbox stop` on it makes the stop explicit, and connect then
+reports it as stopped instead. Process
 memory is not retained: the canonical command starts fresh, so resume the
 agent's conversation with its own option, such as `claude --continue`. Workspace
 files persist as they do for any stop.

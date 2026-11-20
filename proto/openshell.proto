@@ -3467,9 +3467,9 @@ message SupervisorMessage {
   }
 }
 
-// Program status summary across workload terminals. Sent when the summary
-// changes and, while clients type, at most once a minute. Ages are relative so
-// supervisor and gateway clocks need not agree.
+// Program status summary across workload terminals. Sent when each session
+// starts, when the summary changes, and within seconds of new client input.
+// Ages are relative so supervisor and gateway clocks need not agree.
 message SupervisorWorkloadActivity {
   WorkloadProgramState state = 1;
   WorkloadBlockedKind blocked_kind = 2;
@@ -3479,6 +3479,7 @@ message SupervisorWorkloadActivity {
   // Time since the latest client input to a workload terminal. Absent when no
   // client has written to one.
   google.protobuf.Duration input_age = 5;
+  // Workload terminals with a current program report.
   uint32 reporting_terminals = 6;
 }
 
