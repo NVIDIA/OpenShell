@@ -26,6 +26,7 @@ target (`harness = false`), so `openshell-conformance run`,
 | `network-egress` | Transparent egress: policy reloads close open connections, ambiguous updates are rejected, `tls: skip` relays raw bytes, middleware redacts or blocks traffic, pipelined requests are authorized one at a time |
 | `policy-update` | `policy set` and `policy update`: revisions and versions, repeated updates, scoped endpoint changes, the revision for a sparse initial policy |
 | `port-forward` | `forward start` reaches a server on the sandbox's loopback; `forward stop` closes the port |
+| `providers` | Provider profile files: path, mode, config update, detach; `sandbox create --auto-providers` creates a provider from local credentials and injects a placeholder |
 | `image` | A sandbox runs the default image or the one it is created from |
 | `labels` | Labels are stored and select sandboxes in `sandbox list` |
 | `templates` | A sandbox created from a template uses its workload; duplicate, deleted and missing templates return the right errors |

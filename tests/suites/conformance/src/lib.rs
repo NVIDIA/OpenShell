@@ -26,6 +26,7 @@ mod policy_advisor;
 mod policy_update;
 mod port_forward;
 mod process;
+mod providers;
 mod settings;
 mod smoke;
 mod ssh;

@@ -133,8 +133,16 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `cx.import_profile(profile)` to import a provider profile and return its
   `id`, and `cx.create_provider(name, type, credentials)` to create a
   provider, each with cleanup. `cx.install_provider(name, profile,
-  credentials)` does both.
+  credentials)` does both. Chain `.config(key, value)` before the `.await`
+  to set provider config. Build the profile with `testkit::Profile` and
+  `testkit::Credential`, whose setters are named after the profile YAML
+  fields; `policy::Endpoint` configures its endpoints. `profile.to_yaml()`
+  renders it for these calls.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
+- `cx.service_get(service_url, headers)` to request an exposed sandbox
+  service. It connects to the gateway's endpoint and sends the service URL's
+  host as the Host header, so the test machine doesn't need to resolve
+  service hosts. It returns the status and body whatever the status.
 - `cx.client()` for SDK calls testkit does not wrap.
 - In `tests/support`: `host-server` starts servers on the machine that runs
   the tests, which sandboxes reach as `host_server_support::TEST_HOST`, and
