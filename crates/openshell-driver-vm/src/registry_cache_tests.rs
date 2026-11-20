@@ -566,6 +566,41 @@ async fn bootstrap_registry_cache_hit_for_a_digest_pin_makes_no_registry_request
 }
 
 #[tokio::test]
+async fn empty_bootstrap_layers_reuse_one_staging_directory() {
+    let empty = tests::gzip_bytes(&[]);
+    let mut layers = vec![("application/vnd.oci.image.layer.v1.tar+gzip", empty); 3];
+    layers.push((
+        "application/vnd.oci.image.layer.v1.tar",
+        tests::tar_bytes_with_file("over-limit", b"x"),
+    ));
+    let registry = Registry::with_layers(layers).await;
+    let image = registry.reference(None);
+    let state = tempfile::tempdir().unwrap();
+    let mut driver = driver(state.path());
+    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(1);
+    let stage = state.path().join("stage");
+    let error = driver
+        .pull_registry_image_rootfs(
+            "test",
+            &client(),
+            &parse_registry_reference(&image).unwrap(),
+            &RegistryAuth::Anonymous,
+            &image,
+            &stage,
+            &stage.join("rootfs"),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("decoded layer tars"), "{error}");
+    let staging_dirs = fs::read_dir(stage.join("layers"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .count();
+    assert_eq!(staging_dirs, 1);
+}
+
+#[tokio::test]
 async fn bootstrap_extraction_limit_spans_layers_and_cleans_failed_build() {
     let mut lower = tar::Builder::new(Vec::new());
     let mut dir = tar::Header::new_gnu();

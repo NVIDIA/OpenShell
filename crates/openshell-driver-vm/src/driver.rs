@@ -6293,11 +6293,11 @@ impl VmDriver {
             DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES,
             std::num::NonZeroU64::get,
         );
+        let layer_root = staging_dir.join("layers/root");
         let rootfs = rootfs.to_owned();
         tokio::task::spawn_blocking(move || {
             let mut budget = BootstrapExtractionBudget::new(limit);
             for layer in layers {
-                let layer_root = layer.blob_path.with_extension("root");
                 extract_layer_blob_to_dir(
                     &layer.blob_path,
                     &layer.media_type,
