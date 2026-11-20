@@ -36,7 +36,9 @@ async fn reported_waiting_program_is_stopped_and_restarts(cx: &mut Context) -> t
     expect_program_status(&sandbox, "Done").await?;
 
     set_idle_timeout(&sandbox, 1).await?;
-    sandbox.wait_phase(SandboxPhase::Stopped, IDLE_STOP_DEADLINE).await?;
+    sandbox
+        .wait_phase(SandboxPhase::Stopped, IDLE_STOP_DEADLINE)
+        .await?;
     let stopped = sandbox.get_json().await?;
     let reason = ready_reason(&stopped);
     testkit::ensure!(
@@ -73,7 +75,10 @@ async fn set_idle_timeout(sandbox: &Sandbox, seconds: i64) -> testkit::Result {
 /// Wait until the sandbox's `ProgramStatus` condition has `reason`.
 async fn expect_program_status(sandbox: &Sandbox, reason: &str) -> testkit::Result {
     poll_until(
-        &format!("sandbox {} to report program status {reason}", sandbox.name()),
+        &format!(
+            "sandbox {} to report program status {reason}",
+            sandbox.name()
+        ),
         REPORT_DEADLINE,
         Duration::from_secs(1),
         async || {

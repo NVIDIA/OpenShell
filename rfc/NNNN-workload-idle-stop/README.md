@@ -206,8 +206,8 @@ sequenceDiagram
     participant S as Supervisor
     participant G as Gateway
     participant D as Compute driver
-    A->>S: OSC 7501 ; ?
-    S->>A: OSC 7501 ; ? (reply)
+    A->>S: OSC 7501 support query
+    S->>A: Support reply
     A->>S: state=done:app=claude-code
     S->>G: SupervisorWorkloadActivity(done, state_age)
     G->>G: record ProgramStatus condition
