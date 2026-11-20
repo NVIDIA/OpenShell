@@ -33,7 +33,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: ${{ github.workflow }}-integration-${{ inputs.category }}-${{ github.ref }}
+  group: ${{ github.workflow }}-integration-${{ inputs.category }}-${{ github.ref }}-${{ inputs['source-sha'] }}
   cancel-in-progress: true
 
 jobs:

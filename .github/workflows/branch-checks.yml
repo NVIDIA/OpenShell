@@ -3,9 +3,7 @@ name: Branch Checks
 on:
   merge_group:
     types: [checks_requested]
-  push:
-    branches:
-      - "pull-request/[0-9]+"
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -18,42 +16,12 @@ permissions:
   packages: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  pr_metadata:
-    name: Resolve PR metadata
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-      base_sha: ${{ steps.gate.outputs.base_sha }}
-      pr_number: ${{ steps.pr-number.outputs.number }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - id: gate
-        uses: ./.github/actions/pr-gate
-
-      - id: pr-number
-        shell: bash
-        env:
-          PR_REF: ${{ github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = push ] && [[ "$PR_REF" =~ ^pull-request/([0-9]+)$ ]]; then
-            echo "number=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "number=0" >> "$GITHUB_OUTPUT"
-          fi
-
   compatibility-review:
     name: Compatibility Review (advisory)
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
       pull-requests: read
@@ -63,17 +31,17 @@ jobs:
       source_sha: ${{ github.sha }}
       base_ref: >-
         ${{ github.event.merge_group.base_sha
-            || needs.pr_metadata.outputs.base_sha
+            || github.event.pull_request.base.sha
             || format('refs/remotes/origin/{0}', github.event.repository.default_branch) }}
-      pr_number: ${{ fromJSON(needs.pr_metadata.outputs.pr_number) }}
+      pr_number: ${{ github.event.pull_request.number || 0 }}
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
 
   compatibility-comment:
     name: Comment on detected breaking changes
-    needs: [pr_metadata, compatibility-review]
+    needs: compatibility-review
     if: >-
-      ${{ !cancelled() && needs.pr_metadata.outputs.pr_number != '0'
+      ${{ !cancelled() && github.event_name == 'pull_request'
           && needs.compatibility-review.outputs.has_findings == 'true'
           && needs.compatibility-review.outputs.report_artifact != '' }}
     runs-on: ubuntu-latest
@@ -92,8 +60,8 @@ jobs:
       - name: Post new or materially updated findings
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          PR_NUMBER: ${{ needs.pr_metadata.outputs.pr_number }}
-          SOURCE_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
         with:
           script: |
             const fs = require('node:fs');
@@ -115,8 +83,6 @@ jobs:
 
   protobuf-compatibility:
     name: Protobuf Compatibility
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -131,12 +97,10 @@ jobs:
             ${{ github.event_name == 'workflow_dispatch'
                 && format('refs/remotes/origin/{0}', github.event.repository.default_branch)
                 || github.event.merge_group.base_sha
-                || needs.pr_metadata.outputs.base_sha }}
+                || github.event.pull_request.base.sha }}
 
   monitoring-changes:
     name: Detect monitoring mixin changes
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -151,7 +115,7 @@ jobs:
         id: changes
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.merge_group.base_sha || needs.pr_metadata.outputs.base_sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
@@ -172,8 +136,8 @@ jobs:
 
   monitoring:
     name: Monitoring Mixin
-    needs: [pr_metadata, monitoring-changes]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.monitoring-changes.outputs.changed == 'true'
+    needs: monitoring-changes
+    if: needs.monitoring-changes.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     container:
@@ -195,8 +159,6 @@ jobs:
 
   mise-lockfile:
     name: mise Lockfile
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
@@ -220,8 +182,6 @@ jobs:
 
   license-headers:
     name: License Headers
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
@@ -240,8 +200,6 @@ jobs:
 
   cargo-deny:
     name: Cargo Deny
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -270,8 +228,6 @@ jobs:
 
   rust-format:
     name: Rust format
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -301,8 +257,6 @@ jobs:
 
   cargo-lockfiles:
     name: Cargo lockfiles
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -321,8 +275,6 @@ jobs:
 
   rust-lint:
     name: Rust lint (${{ matrix.system }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -367,8 +319,6 @@ jobs:
 
   rust-test:
     name: Rust test (${{ matrix.system }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -458,8 +408,6 @@ jobs:
 
   rust-postgres-test:
     name: Rust PostgreSQL tests
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     # Bare runner: the test script starts a disposable PostgreSQL container
     # with the host's Docker.
     runs-on: ubuntu-24.04
@@ -488,8 +436,6 @@ jobs:
 
   rust-build-modes:
     name: Rust build modes (${{ matrix.system }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -548,8 +494,6 @@ jobs:
 
   rust-feature-alias:
     name: Rust feature alias
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -573,8 +517,6 @@ jobs:
 
   rust-gateway-core-features:
     name: Rust gateway core features
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -600,8 +542,6 @@ jobs:
 
   rust-gateway-extended-features:
     name: Rust gateway extended features
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -626,8 +566,6 @@ jobs:
 
   python:
     name: Python (${{ matrix.runner }})
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -679,10 +617,9 @@ jobs:
     # add or change them. Deleting files is allowed (the removal PR). The paths
     # are the ones the import moved: all of python/ plus the two SDK build
     # scripts. The shared root pyproject.toml and uv.lock stay editable.
-    # Merge queue runs skip this job; the PR already passed it on its mirror.
+    # Merge queue runs skip this job; the PR already passed it.
     name: Python SDK Freeze
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true' && github.event_name == 'push'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -693,7 +630,7 @@ jobs:
 
       - name: Reject changes to the Python SDK
         env:
-          BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
@@ -710,8 +647,6 @@ jobs:
 
   markdown:
     name: Markdown
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
@@ -730,8 +665,6 @@ jobs:
 
   sdk-typescript:
     name: TypeScript SDK
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
@@ -760,8 +693,6 @@ jobs:
 
   install-script:
     name: install.sh
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

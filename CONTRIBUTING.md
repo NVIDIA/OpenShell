@@ -517,7 +517,7 @@ Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor br
 
 For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. A PR without an issue omits the issue ID, such as `fix/flaky-sandbox-tests/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
 
-Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
+Branches created by automation, such as Dependabot, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 
 ### Choose Verification for the Change
 
@@ -611,7 +611,7 @@ git commit --signoff --message "feat(sandbox): add new capability"
 DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
 
 - **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
-- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+- **Cryptographic commit signing** applies to org members and collaborators only; see [CI.md](CI.md#commit-signing) for setup.
 
 ### PR testing checklist
 
@@ -619,4 +619,4 @@ Only mark a checklist item as complete after you have run and verified it, not a
 
 ## CI
 
-How PR CI runs, the `test:e2e` and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels, E2E for fork PRs, and commit-signing setup are documented in [CI.md](CI.md).

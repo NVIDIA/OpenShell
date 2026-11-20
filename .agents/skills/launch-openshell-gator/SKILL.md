@@ -16,7 +16,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 - Keep normal gator launches supervised: use `--watch` and let the in-sandbox supervisor own sleeping and relaunching bounded cycles.
 - Do not add passive `sleep` loops in the operator session to watch gator. Check logs or status once, then report the current state or launch a proper watcher outside the model session only when explicitly asked.
 - Do not change the default gator model in `scripts/agents/gator/agent.yaml` for experiments. Use `CODEX_MODEL=...` and, if needed, a temporary `--from` Docker context or `--codex-bin` override.
-- Do not push to contributor branches, approve, merge, post `/ok to test`, or broaden gator scope unless the operator explicitly authorized that action.
+- Do not push to contributor branches, approve, merge, dispatch Branch E2E Checks, or broaden gator scope unless the operator explicitly authorized that action.
 - Scope each launch prompt to the requested issue/PR set. Avoid repo-wide gator scans unless the operator asked for repo-wide processing.
 - Leave unrelated local files alone, including `.opencode/` artifacts and old gator logs unless the user asks for cleanup.
 
@@ -238,7 +238,7 @@ sandbox_name="gtr-pr-${pr_number}-watch"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test with the full 40-character current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label and, for a fork PR, dispatching Branch E2E Checks with the full 40-character current head SHA."
 ```
 
 ## Model Or Image Experiments
