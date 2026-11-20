@@ -615,7 +615,8 @@ which takes a name and the tables to change, such as `[openshell.gateway]` or
 
 The role writes each name as its own marked block in
 `/etc/openshell-test/gateway-overrides.toml`, so writers keep each other's
-settings. Two blocks must not declare the same table. Don't write the file
+settings, and `gateway_overrides_state: absent` removes a name's block.
+Two blocks must not declare the same table. Don't write the file
 directly. The file is not a complete configuration. Each installer applies it
 to the gateway's own file:
 
