@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Load E2E images
+description: >
+  Load the OpenShell images that build-images.yml exported as per-platform
+  Docker archives, so E2E jobs never pull them from a registry. Fork pull
+  requests cannot push images, so this is what lets them run E2E.
+
+inputs:
+  images:
+    description: Space-separated OpenShell image components to load
+    required: false
+    default: gateway sandbox supervisor
+  engine:
+    description: Container engine to load the images into (docker or podman)
+    required: false
+    default: docker
+  kind-cluster:
+    description: Also load the images into this kind cluster
+    required: false
+    default: ""
+  platform-arch:
+    description: Image architecture (amd64 or arm64); defaults to the runner's
+    required: false
+    default: ""
+  run-id:
+    description: Workflow run that built the images; defaults to this run
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve image architecture
+      id: arch
+      shell: bash
+      env:
+        PLATFORM_ARCH: ${{ inputs.platform-arch }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        arch="$PLATFORM_ARCH"
+        if [ -z "$arch" ]; then
+          case "$RUNNER_ARCH_NAME" in
+            X64) arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *) echo "ERROR: unsupported runner architecture: $RUNNER_ARCH_NAME" >&2; exit 1 ;;
+          esac
+        fi
+        echo "arch=$arch" >> "$GITHUB_OUTPUT"
+
+    - name: Download image archives
+      if: inputs.run-id == ''
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        pattern: e2e-image-*-linux-${{ steps.arch.outputs.arch }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/e2e-images
+
+    - name: Download image archives from run ${{ inputs.run-id }}
+      if: inputs.run-id != ''
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        pattern: e2e-image-*-linux-${{ steps.arch.outputs.arch }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/e2e-images
+        github-token: ${{ github.token }}
+        run-id: ${{ inputs.run-id }}
+
+    - name: Load images
+      shell: bash
+      env:
+        ARCH: ${{ steps.arch.outputs.arch }}
+        ENGINE: ${{ inputs.engine }}
+        IMAGE_COMPONENTS: ${{ inputs.images }}
+        KIND_CLUSTER: ${{ inputs.kind-cluster }}
+        ARCHIVE_DIR: ${{ runner.temp }}/e2e-images
+      run: |
+        set -euo pipefail
+        case "$ENGINE" in
+          docker | podman) ;;
+          *) echo "ERROR: unsupported container engine: $ENGINE" >&2; exit 1 ;;
+        esac
+        for component in $IMAGE_COMPONENTS; do
+          case "$component" in
+            gateway | sandbox | supervisor) ;;
+            *) echo "ERROR: unsupported OpenShell image component: $component" >&2; exit 1 ;;
+          esac
+          archive="$ARCHIVE_DIR/${component}-linux-${ARCH}.tar"
+          "$ENGINE" load --input "$archive"
+          if [ -n "$KIND_CLUSTER" ]; then
+            kind load image-archive "$archive" --name "$KIND_CLUSTER"
+          fi
+        done

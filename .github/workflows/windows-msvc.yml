@@ -4,14 +4,20 @@ on:
   push:
     branches:
       - windows
-      - "pull-request/[0-9]+"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Labeling a PR with anything but test:windows starts a run that skips every
+# job. Give that run its own group so it cannot cancel a real one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{
+    github.event.action == 'labeled' && github.event.label.name != 'test:windows'
+    && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
@@ -20,30 +26,12 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  pr_metadata:
-    name: Resolve PR metadata
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      should_run: ${{ github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true' }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - id: gate
-        if: github.ref != 'refs/heads/windows'
-        uses: ./.github/actions/pr-gate
-        with:
-          required_label: test:windows
-
   pr-check:
     name: PR lint and test (${{ matrix.arch }})
-    needs: pr_metadata
     if: >-
-      needs.pr_metadata.outputs.should_run == 'true' &&
-      github.ref != 'refs/heads/windows' &&
-      github.event_name != 'workflow_dispatch'
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'test:windows') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'test:windows')
     strategy:
       fail-fast: false
       matrix:
@@ -106,10 +94,7 @@ jobs:
     name: Seed cache (${{ matrix.arch }})
     # Keep release-branch Windows validation advisory while the lane matures.
     continue-on-error: true
-    needs: pr_metadata
-    if: >-
-      needs.pr_metadata.outputs.should_run == 'true' &&
-      github.ref == 'refs/heads/windows'
+    if: github.ref == 'refs/heads/windows'
     strategy:
       fail-fast: false
       matrix:
