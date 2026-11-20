@@ -18,6 +18,12 @@ compile_error!(
 
 pub mod startup_document;
 
+#[cfg(all(
+    not(target_os = "windows"),
+    any(feature = "compute-driver-vm", feature = "compute-driver-podman")
+))]
+mod launcher;
+
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 mod vm;
 
