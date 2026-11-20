@@ -101,7 +101,7 @@ fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::D
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
+    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward,
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{

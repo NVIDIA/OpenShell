@@ -920,6 +920,23 @@ fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "ssh", "#!/bin/sh\nexit 0\n")
 }
 
+// Run the generated proxy against the test gateway without an SSH handshake.
+fn install_proxying_ssh(dir: &TempDir) {
+    install_executable_script(
+        dir,
+        "ssh",
+        r#"#!/bin/sh
+for arg do
+  case "$arg" in
+    *--token*|*test-token*) exit 1 ;;
+    ProxyCommand=*) proxy=${arg#ProxyCommand=} ;;
+  esac
+done
+exec sh -c "exec $proxy" </dev/null
+"#,
+    );
+}
+
 fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "pgrep", "#!/bin/sh\nexit 1\n")
 }
@@ -1109,8 +1126,8 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --token test-token --gateway-name test-gateway -o ExitOnForwardFailure=yes -o SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id -L $forward sandbox" > '@COMMAND_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -o "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id" -L "$forward" sandbox
+printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --server https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --gateway-name test-gateway -o ExitOnForwardFailure=yes -o SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id -L $forward sandbox" > '@COMMAND_PATH@'
+exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --server https://127.0.0.1:9443 --sandbox $sandbox_name --workspace $workspace --gateway-name test-gateway" -o ExitOnForwardFailure=yes -o "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID=$immutable_id" -L "$forward" sandbox
 "#
         .replace("@PID_PATH@", &pid_path.display().to_string())
         .replace("@COMMAND_PATH@", &command_path.display().to_string())
@@ -1183,7 +1200,7 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
+exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --server https://127.0.0.1:9443 --sandbox $sandbox_id --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
 "#
         .replace("@LOG_PATH@", &log_path.display().to_string())
         .replace("@PID_PATH@", &pid_path.display().to_string())
@@ -2326,28 +2343,25 @@ async fn sandbox_create_accepts_ready_before_create_returns() {
         &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
     )
     .run_async(async {
-        let tls = test_tls(&server);
-        install_fake_ssh(&fake_ssh_dir);
-
-        let exit_code = tokio::time::timeout(
+        prepare_cli_xdg(&server, &xdg_dir);
+        install_proxying_ssh(&fake_ssh_dir);
+        let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run::sandbox_create(
-                &server.endpoint,
-                "openshell",
-                run::SandboxCreateConfig {
-                    name: Some("already-ready"),
-                    command: &["echo".into(), "OK".into()],
-                    ..test_config()
-                },
-                "default",
-                &tls,
+            run_cli_sandbox_create_with_xdg_and_env(
+                &server,
+                &xdg_dir,
+                "already-ready",
+                &["--keep", "--", "echo", "OK"],
+                &[("OPENSHELL_PROVISION_TIMEOUT", "1")],
             ),
         )
         .await
-        .expect("creation must finish while the watch remains open")
-        .expect("an already-Ready sandbox must not wait for a new provisioning transition");
-
-        assert_eq!(exit_code, 0);
+        .expect("creation must finish while the watch remains open");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         assert_eq!(create_requests(&server).await.len(), 1);
         assert_eq!(
             server
@@ -2461,24 +2475,20 @@ async fn sandbox_create_retries_terminal_attachment_until_relay_registers() {
 
     test_env(&fake_ssh_dir, &xdg_dir)
         .run_async(async {
-            let tls = test_tls(&server);
-            install_fake_ssh(&fake_ssh_dir);
-
-            let exit_code = run::sandbox_create(
-                &server.endpoint,
-                "openshell",
-                run::SandboxCreateConfig {
-                    name: Some("fast-command"),
-                    command: &["echo".into(), "OK".into()],
-                    ..test_config()
-                },
-                "default",
-                &tls,
+            prepare_cli_xdg(&server, &xdg_dir);
+            install_proxying_ssh(&fake_ssh_dir);
+            let result = run_cli_sandbox_create_with_xdg(
+                &server,
+                &xdg_dir,
+                "fast-command",
+                &["--keep", "--", "echo", "OK"],
             )
-            .await
-            .expect("sandbox create should wait for the declared terminal attachment relay");
-
-            assert_eq!(exit_code, 0);
+            .await;
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
             assert_eq!(
                 server
                     .openshell
@@ -3217,7 +3227,11 @@ async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
     let xdg_dir = helpers::tempdir().unwrap();
     test_env(&fake_ssh_dir, &xdg_dir)
         .run_async(async {
-            install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+            install_executable_script(
+                &fake_ssh_dir,
+                "ssh",
+                "#!/bin/sh\n: > \"$0.called\"\nexit 7\n",
+            );
             let source = tempfile::tempdir().unwrap();
             fs::write(source.path().join("marker.txt"), "dummy content").unwrap();
             let args = ["--detach", "--upload", source.path().to_str().unwrap()];
@@ -3240,12 +3254,7 @@ async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
             assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
             assert_eq!(create_requests(&server).await.len(), 1);
             assert!(
-                server
-                    .openshell
-                    .state
-                    .ssh_session_requests
-                    .load(Ordering::SeqCst)
-                    > 0,
+                fake_ssh_dir.path().join("ssh.called").is_file(),
                 "an upload outside a repository must reach the SSH transport",
             );
         })

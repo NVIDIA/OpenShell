@@ -64,6 +64,7 @@ pub mod sandbox_session;
 pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
+pub mod ssh_handoff;
 pub mod shell;
 pub mod telemetry;
 pub mod time;
