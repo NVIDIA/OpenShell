@@ -76,7 +76,7 @@ Wait for the entire Pre-release run to pass before promoting it. Stable tag push
 start Release. Release Auto-Tag creates and dispatches prereleases on `main`.
 
 Stable releases serialize across branches. A release older than the highest
-stable Git tag publishes versioned artifacts without moving GHCR `latest`, the
+stable Git tag publishes versioned artifacts without moving Quay `latest`, the
 GitHub latest release, npm `latest`, or snap `latest/stable`. Its npm package
 uses `release-X.Y`; snap files remain available in its GitHub Release rather than
 updating a Snap Store support track. Docs retain an
