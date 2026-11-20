@@ -94,11 +94,6 @@ path = "tests/vm_bind_mount.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
-name = "docker_corporate_proxy"
-path = "tests/docker_corporate_proxy.rs"
-required-features = ["e2e-docker"]
-
-[[test]]
 name = "additional_ca"
 path = "tests/additional_ca.rs"
 required-features = ["e2e-additional-ca"]
@@ -136,11 +131,6 @@ required-features = ["e2e-podman"]
 [[test]]
 name = "ocsf_jsonl_conformance"
 path = "tests/ocsf_jsonl_conformance.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
-name = "podman_corporate_proxy"
-path = "tests/podman_corporate_proxy.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
