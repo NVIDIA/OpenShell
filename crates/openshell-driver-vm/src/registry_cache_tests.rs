@@ -578,7 +578,7 @@ async fn empty_bootstrap_layers_reuse_one_staging_directory() {
     let state = tempfile::tempdir().unwrap();
     let mut driver = driver(state.path());
     driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(1);
-    let stage = state.path().join("stage");
+    let scratch = state.path().join("stage");
     let error = driver
         .pull_registry_image_rootfs(
             "test",
@@ -586,13 +586,13 @@ async fn empty_bootstrap_layers_reuse_one_staging_directory() {
             &parse_registry_reference(&image).unwrap(),
             &RegistryAuth::Anonymous,
             &image,
-            &stage,
-            &stage.join("rootfs"),
+            &scratch,
+            &scratch.join("rootfs"),
         )
         .await
         .unwrap_err();
     assert!(error.message().contains("decoded layer tars"), "{error}");
-    let staging_dirs = fs::read_dir(stage.join("layers"))
+    let staging_dirs = fs::read_dir(scratch.join("layers"))
         .unwrap()
         .map(Result::unwrap)
         .filter(|entry| entry.file_type().unwrap().is_dir())
