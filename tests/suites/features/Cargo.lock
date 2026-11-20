@@ -3071,6 +3071,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "provider-token-exchange"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+ "spiffe-support",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3822,6 +3833,25 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spiffe-support"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures-util",
+ "hex",
+ "jsonwebtoken",
+ "openshell-crypto",
+ "openshell-testkit",
+ "prost",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tower",
 ]
 
 [[package]]
