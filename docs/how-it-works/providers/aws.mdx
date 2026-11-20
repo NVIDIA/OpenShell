@@ -21,7 +21,7 @@ Import the `aws` profile first; a gateway serves only the profiles you
 imported:
 
 ```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/aws.yaml --global
+openshell profile import --url https://raw.githubusercontent.com/ai-openshell/openshell/main/providers/aws.yaml --global
 ```
 
 Create a provider with AWS credentials:
@@ -45,11 +45,51 @@ openshell provider create \
   --credential AWS_SESSION_TOKEN=FwoGZX...
 ```
 
+### Gateway-Managed STS Credentials
+
 To have the gateway mint and rotate STS credentials for you instead of supplying
 them statically, use the `aws` or `aws-s3` profile with the `aws_sts_assume_role`
-refresh strategy. A single `sts:AssumeRole` mints all three env vars
-(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) that the
-signer reads. See [Manage Providers](/how-it-works/providers/overview#aws-sts).
+refresh strategy. The gateway calls `sts:AssumeRole` and writes
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` to the
+provider record atomically. The profiles declare `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN` as `additional_outputs` of the `AWS_ACCESS_KEY_ID` refresh,
+so create the provider with `--runtime-credentials` and no placeholder
+credential:
+
+```shell
+openshell provider create --name my-aws --type aws-s3 --runtime-credentials
+
+openshell provider refresh configure my-aws \
+  --credential-key AWS_ACCESS_KEY_ID \
+  --strategy aws-sts-assume-role \
+  --material role_arn="arn:aws:iam::123456789012:role/SandboxS3Writer" \
+  --material session_name="openshell-sandbox"
+
+openshell provider refresh rotate my-aws --credential-key AWS_ACCESS_KEY_ID
+```
+
+The gateway resolves its own AWS credentials using the default credential chain
+(instance role, IRSA, ECS task role, environment variables). For gateways not
+running on AWS, provide explicit IAM keys as refresh material:
+
+```shell
+openshell provider refresh configure my-aws \
+  --credential-key AWS_ACCESS_KEY_ID \
+  --strategy aws-sts-assume-role \
+  --material role_arn="arn:aws:iam::123456789012:role/SandboxS3Writer" \
+  --material aws_access_key_id="$AWS_ACCESS_KEY_ID" \
+  --secret-material-env aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+```
+
+Pass the long-lived secret with `--secret-material-env` so the CLI reads it
+from its own environment instead of expanding it into a process argument, where
+it would be visible in the host process table. For temporary source credentials
+(AWS SSO or a prior `AssumeRole`), also pass
+`--secret-material-env aws_session_token=AWS_SESSION_TOKEN`. It requires the
+`aws_access_key_id` and `aws_secret_access_key` pair.
+
+Use the generic `aws` profile for multi-service access and scope endpoints with
+sandbox network policy. Use `aws-s3` for S3-specific endpoint rules.
 
 ## Policy Configuration
 

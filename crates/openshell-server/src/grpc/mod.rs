@@ -11,6 +11,7 @@ pub mod provider;
 mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
+pub mod secret;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
@@ -71,6 +72,12 @@ use openshell_core::proto::{
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
+};
+use openshell_core::proto::{
+    CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, GetSecretRequest,
+    InlineProviderRefreshSecretsRequest, InlineProviderRefreshSecretsResponse, ListSecretsRequest,
+    ListSecretsResponse, RevealSecretRequest, RevealSecretResponse, SecretResponse,
+    UpdateSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -591,6 +598,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        mutation_audit::record_exec_targets(request.get_ref());
         mutation_replay::run(&self.state, request).await
     }
 
@@ -619,7 +627,18 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
-        sandbox::handle_create_ssh_session(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.sandbox)],
+            )
+        };
+        mutation_audit::audited(
+            targets,
+            sandbox::handle_create_ssh_session(&self.state, request),
+        )
+        .await
     }
 
     async fn expose_service(
@@ -674,7 +693,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
-        sandbox::handle_revoke_ssh_session(&self.state, request).await
+        mutation_audit::audited(
+            Vec::new(),
+            sandbox::handle_revoke_ssh_session(&self.state, request),
+        )
+        .await
     }
 
     // --- Providers ---
@@ -822,6 +845,23 @@ impl OpenShell for OpenShellService {
         mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
+    async fn inline_provider_refresh_secrets(
+        &self,
+        request: Request<InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<InlineProviderRefreshSecretsResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
     async fn delete_provider_refresh(
         &self,
         request: Request<DeleteProviderRefreshRequest>,
@@ -865,6 +905,78 @@ impl OpenShell for OpenShellService {
             )
         };
         mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    // --- Workspace secrets ---
+
+    async fn create_secret(
+        &self,
+        request: Request<CreateSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn get_secret(
+        &self,
+        request: Request<GetSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        secret::handle_get_secret(&self.state, request).await
+    }
+
+    async fn list_secrets(
+        &self,
+        request: Request<ListSecretsRequest>,
+    ) -> Result<Response<ListSecretsResponse>, Status> {
+        secret::handle_list_secrets(&self.state, request).await
+    }
+
+    async fn update_secret(
+        &self,
+        request: Request<UpdateSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn delete_secret(
+        &self,
+        request: Request<DeleteSecretRequest>,
+    ) -> Result<Response<DeleteSecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn reveal_secret(
+        &self,
+        request: Request<RevealSecretRequest>,
+    ) -> Result<Response<RevealSecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, secret::handle_reveal_secret(&self.state, request)).await
     }
 
     // --- Config / Policy ---
@@ -1626,6 +1738,8 @@ pub mod test_support {
 
 #[cfg(test)]
 mod mutation_tests;
+#[cfg(test)]
+mod secret_refresh_tests;
 
 #[cfg(test)]
 mod tests {

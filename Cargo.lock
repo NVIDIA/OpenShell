@@ -4418,6 +4418,7 @@ version = "0.0.0"
 dependencies = [
  "openshell-crypto",
  "openshell-isolation-interface",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -5137,6 +5138,8 @@ dependencies = [
  "openshell-core",
  "openshell-crypto",
  "openshell-isolation-interface",
+ "openshell-otel",
+ "openshell-otel-test-support",
  "prost",
  "prost-types",
  "rcgen",
@@ -5154,6 +5157,7 @@ dependencies = [
  "tonic-prost",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -5378,6 +5382,7 @@ dependencies = [
  "openshell-core",
  "openshell-otel",
  "openshell-sandbox-backend",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",

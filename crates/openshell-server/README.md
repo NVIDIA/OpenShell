@@ -398,3 +398,15 @@ Cache reuse adds at most one refresh interval to collection freshness; consumers
 must independently honor the advertised lease expiry.
 Reconnect and relist on stream termination; revisions are opaque
 equality tokens, not resumable cursors or an ordering across gateway replicas.
+
+## Application URL publication
+
+See [Supervisor application listener](../../docs/how-it-works/gateways/configuration.mdx#supervisor-application-listener)
+for public URL configuration, response fields, and replay behavior.
+
+Application hostname mode follows `service_hostname_format` for both access
+paths. The gateway sends each canonical app hostname in `SandboxServiceRoute`;
+URL responses and discovery agree with that installed name. A mode or gateway
+name change changes configuration identity, withdrawing old discovery evidence
+until the supervisor acknowledges the replacement. Hash inputs and encoding are
+shared with gateway-mediated routing in `openshell-core::app_listener`.

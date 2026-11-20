@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::program::Unsupported;
 use crate::run::TestInfo;
 
 /// Every `#[testkit::test]` linked into the program.
@@ -36,6 +37,19 @@ impl Test {
             Some((_crate, module)) => format!("{module}::{}", self.info.name),
             None => self.info.name.to_string(),
         }
+    }
+
+    /// The name with its crate in front, as `OPENSHELL_TEST_UNSUPPORTED`
+    /// entries write it. The crate is the package name, with `_` for `-`.
+    pub fn qualified_name(&self) -> String {
+        format!("{}::{}", self.module_path, self.info.name)
+    }
+
+    /// The crate the test is defined in.
+    pub fn package(&self) -> &'static str {
+        self.module_path
+            .split_once("::")
+            .map_or(self.module_path, |(package, _)| package)
     }
 
     pub fn family(&self) -> &'static str {
@@ -73,14 +87,19 @@ pub struct Selection {
     pub filters: Vec<String>,
     /// Run `#[ignore]`d tests too, instead of reporting them as skipped.
     pub include_ignored: bool,
+    /// Tests this environment does not support.
+    pub unsupported: Unsupported,
 }
 
 /// What a selection does with one test.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disposition {
     Run,
     /// Selected, but ignored and not asked for.
     Skip,
+    /// Selected, but listed in `OPENSHELL_TEST_UNSUPPORTED` with this issue,
+    /// and not forced to run.
+    Unsupported(String),
 }
 
 impl Selection {
@@ -106,6 +125,12 @@ impl Selection {
                 .any(|filter| name.contains(filter.as_str()))
         {
             return None;
+        }
+        if let Some(issue) = self.unsupported.issue(test) {
+            // A forced run still starts the test, which refuses and fails.
+            if !self.include_ignored {
+                return Some(Disposition::Unsupported(issue.to_string()));
+            }
         }
         if test.ignored && !self.include_ignored {
             Some(Disposition::Skip)
@@ -184,6 +209,7 @@ pub(crate) mod tests {
         let include = Selection {
             filters: vec!["lifecycle".into()],
             include_ignored: true,
+            ..Selection::default()
         };
         assert_eq!(
             names(&include),

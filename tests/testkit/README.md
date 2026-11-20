@@ -255,7 +255,7 @@ A test that is stopped does not clean up: sandboxes it created stay on the
 gateway. Run against a gateway you can throw away, or delete them by hand.
 
 Without a subcommand, the program takes libtest's arguments instead. A
-`[[test]]` target with `harness = false` therefore also runs under `cargo test`
+test target with `harness = false` therefore also runs under `cargo test`
 and nextest. In that mode tests run in one process, one at a time unless
 `--test-threads` says otherwise.
 
@@ -264,6 +264,44 @@ name, as in nextest. Its family, which groups tests in the JUnit report, is
 the first directory under the last `suites` directory in the crate's path:
 `conformance` for `tests/suites/conformance`, `features` for
 `tests/suites/features/<name>`.
+
+### Unsupported tests
+
+When a conformance, features or drivers test can't pass in one CI environment,
+keep it in the row and skip it there instead of using `#[ignore]` everywhere:
+
+1. File an issue for the bug.
+2. Add the test, issue URL and affected environments to the shared
+   [`unsupported.yaml`](../suites/unsupported.yaml). Each environment is an
+   [E2E matrix row](../../.github/workflows/e2e-suites.yml)
+   (`<environment>/<installer>`, such as `ubuntu-k3s/k3s-ha`) or a host lane
+   (`docker`, `podman`, `kubernetes` or `vm`).
+3. Delete the entry in the PR that fixes the bug.
+
+CI validates the entries and passes those for each row as
+`OPENSHELL_TEST_UNSUPPORTED`. To do the same locally, use `<test>=<issue>`
+entries separated by commas or whitespace:
+
+```shell
+export OPENSHELL_TEST_UNSUPPORTED="cdi::read_only_file=https://github.com/ai-openshell/openshell/issues/1234"
+```
+
+`<test>` is the crate name (`conformance` for conformance, the `[[test]]` target
+name for features and drivers, with `_` for `-`), then `::` and the name listed
+by nextest. Features and drivers integration targets need a unique `[[test]]`
+name, `harness = false`, and a `main` that returns `testkit::main()`.
+
+`cargo test` and nextest treat unsupported tests as ignored. Testkit's `list`
+marks them `[unsupported: <issue>]`, and its `run` prints the entries and
+includes them in its summary and JUnit report.
+
+A program applies only the entries for crates it links, so one value can serve
+several programs. Branch Checks rejects unknown crates. A bad entry for a
+crate it links exits 2 before anything is listed or run (nextest exits 104,
+because its listing fails). Forcing an unsupported test to run
+(`--include-ignored`, `--ignored`, nextest's `--run-ignored`) fails it with
+`unsupported: <issue>; remove the entry from OPENSHELL_TEST_UNSUPPORTED to run
+it`.
 
 ## Checks
 

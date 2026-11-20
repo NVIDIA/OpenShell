@@ -161,7 +161,11 @@ slots, update the imported profile with explicit placement and upgrade the
 gateway before the supervisor. Older gateways cannot forward placement metadata;
 older supervisors retain their previous behavior. Updating example YAML does not
 update an imported profile. Check provider readiness after changing placement and
-launch a new process if retained references were revoked.
+launch a new process if retained references were revoked. For path-based APIs
+that use one token across multiple methods, select `auth_style: path_subtree`
+and set `path_template` to the base path, such as `/bot{credential}`. This
+authorizes the base and its descendants at the bound endpoint. With
+`auth_style: path`, the template matches exactly, including literal stars.
 
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port
@@ -244,6 +248,8 @@ openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 ```
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
+
+When many providers share one OAuth client secret, store it once as a workspace secret and reference it with `--material-secret client_secret=NAME`. Rotating it with `openshell secret update` reaches every referencing provider at its next refresh. A secret only reaches the token endpoints it was created with (`--allowed-endpoint`); one created without them is reveal-only and cannot be referenced. and `openshell secret delete` fails while a refresh references it; run `openshell provider refresh inline-secrets` to copy the value into the provider first. The gateway operator must set `enable_workspace_secrets`. See `openshell secret --help`.
 
 The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in

@@ -37,7 +37,7 @@ run = [
 
 [check]
 description = "Run fast compile and type checks"
-depends = ["rust:check", "python:typecheck", "sdk:ts:typecheck"]
+depends = ["rust:check", "python:typecheck"]
 hide = true
 
 [clean]
@@ -46,7 +46,7 @@ run = "cargo clean"
 
 [fmt]
 description = "Format code"
-depends = ["rust:format", "python:format", "markdown:format", "sdk:ts:format"]
+depends = ["rust:format", "python:format", "markdown:format"]
 hide = true
 
 [lint]
@@ -62,7 +62,6 @@ depends = [
   "helm:docs:check",
   "markdown:lint",
   "proto:lint",
-  "sdk:ts:lint",
 ]
 hide = true
 

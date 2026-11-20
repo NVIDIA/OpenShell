@@ -1,6 +1,107 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod sandbox_deletion {
+    use super::*;
+    use http_body_util::BodyExt as _;
+
+    async fn delete_after_concurrent_change(current_uid: &'static str) -> Result<bool, String> {
+        use http::{Method, StatusCode};
+        use serde_json::json;
+
+        const CR: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
+        const NAMED_CR: &str =
+            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/default--demo";
+        const POD: &str = "/api/v1/namespaces/openshell/pods/default--demo";
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_attempts = attempts.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let attempts = attempts.clone();
+            async move {
+                let (code, body) = match (request.method(), request.uri().path()) {
+                    (&Method::GET, CR) => (
+                        StatusCode::OK,
+                        json!({
+                            "apiVersion": "agents.x-k8s.io/v1beta1",
+                            "kind": "SandboxList",
+                            "items": [{
+                                "apiVersion": "agents.x-k8s.io/v1beta1",
+                                "kind": "Sandbox",
+                                "metadata": {
+                                    "name": "default--demo",
+                                    "namespace": "openshell",
+                                    "uid": "original",
+                                    "resourceVersion": "41"
+                                }
+                            }]
+                        }),
+                    ),
+                    (&Method::DELETE, NAMED_CR) => {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        let params: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        let conditions = &params["preconditions"];
+                        assert_eq!(conditions["uid"], "original");
+                        // The controller wrote version 42 after the list. A
+                        // same-name replacement also has a different UID.
+                        if conditions["uid"] != current_uid
+                            || (!conditions["resourceVersion"].is_null()
+                                && conditions["resourceVersion"] != "42")
+                        {
+                            (
+                                StatusCode::CONFLICT,
+                                json!({
+                                    "status": "Failure", "reason": "Conflict", "code": 409,
+                                    "message": "deletion precondition failed"
+                                }),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                json!({
+                                    "apiVersion": "v1", "kind": "Status", "status": "Success"
+                                }),
+                            )
+                        }
+                    }
+                    (&Method::GET, POD | NAMED_CR) if current_uid == "original" => (
+                        StatusCode::NOT_FOUND,
+                        json!({"status": "Failure", "reason": "NotFound", "code": 404}),
+                    ),
+                    _ => panic!("unexpected Kubernetes request: {request:?}"),
+                };
+                Ok::<_, std::convert::Infallible>(kube_test_response(code, body))
+            }
+        });
+        let (mut driver, _, _) = scripted_driver(KubernetesComputeConfig::default(), vec![]);
+        driver.client = Client::new(service, "openshell");
+        driver
+            .sandbox_api_version
+            .set(SANDBOX_VERSION_V1BETA1)
+            .expect("set test Sandbox API version");
+        let result = driver.delete_sandbox("sandbox-id").await;
+        assert_eq!(
+            observed_attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_survives_a_controller_status_update() {
+        assert!(delete_after_concurrent_change("original").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_conflict_does_not_delete_replacement_or_claim_absence() {
+        let error = delete_after_concurrent_change("replacement")
+            .await
+            .unwrap_err();
+        assert!(error.contains("deletion precondition failed"), "{error}");
+    }
+}
+
 mod lifecycle_reconciliation {
     use super::*;
 

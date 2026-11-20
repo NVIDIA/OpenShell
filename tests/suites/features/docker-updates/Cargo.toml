@@ -10,6 +10,11 @@ rust-version = "1.94"
 license = "Apache-2.0"
 publish = false
 
+[[test]]
+name = "docker-updates"
+path = "tests/update.rs"
+harness = false
+
 [dependencies]
 openshell-testkit = { path = "../../../testkit/testkit" }
 serde_json = "1"

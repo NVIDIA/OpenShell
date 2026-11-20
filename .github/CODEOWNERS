@@ -1,9 +1,6 @@
 # No wildcard rule. The maintainer-approval workflow checks maintainer reviews.
 # Explicit ownership below protects the review and CI machinery.
 
-## Vouch list — maintainers only (bot commits bypass, but manual edits need review)
-.github/VOUCHED.td @NVIDIA/openshell-codeowners
-
 ## Merge enforcement — these paths decide who can merge, so they notify the full
 # list of maintainers to raise scrutiny on changes here.
 #
@@ -13,36 +10,34 @@
 #
 # The whole workflows directory is covered, not just the approval gate, because
 # any workflow can claim a required check context or ask for a broader token.
-#
-# Normally, we'd use a GitHub team to cover all maintainers, but org-level
-# policies prevent outside collaborators from being on a GH team at this time
-# so we spell them out explicitly.
 
 # Core check mechanisms
-/.github/workflows/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/.github/actions/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/.github/CODEOWNERS @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/.github/zizmor.yml @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/.github/workflows/ @ai-openshell/maintainers
+/.github/actions/ @ai-openshell/maintainers
+/.github/CODEOWNERS @ai-openshell/maintainers
+/.github/zizmor.yml @ai-openshell/maintainers
 
 # `MAINTAINERS.md` maintainer approval checks
-/MAINTAINERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/check_maintainer_approval.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/alert_maintainer_change.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/check_maintainer_approval_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/alert_maintainer_change_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/MAINTAINERS.md @ai-openshell/maintainers
+/tasks/scripts/check_maintainer_approval.py @ai-openshell/maintainers
+/tasks/scripts/alert_maintainer_change.py @ai-openshell/maintainers
+/tasks/scripts/check_maintainer_approval_test.py @ai-openshell/maintainers
+/tasks/scripts/alert_maintainer_change_test.py @ai-openshell/maintainers
 
 # Reviewer routing registry and helper
-/REVIEWERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/check_review_readiness.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/check_review_readiness_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/REVIEWERS.md @ai-openshell/maintainers
+/tasks/scripts/check_review_readiness.py @ai-openshell/maintainers
+/tasks/scripts/check_review_readiness_test.py @ai-openshell/maintainers
+/tasks/scripts/check_reviewer_collaborators.py @ai-openshell/maintainers
+/tasks/scripts/check_reviewer_collaborators_test.py @ai-openshell/maintainers
 
 # PR issue acceptance checks
-/tasks/scripts/check_issue_acceptance.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/check_issue_acceptance.test.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_issue_acceptance.cjs @ai-openshell/maintainers
+/tasks/scripts/check_issue_acceptance.test.cjs @ai-openshell/maintainers
 
 # Accepted-work classification
-/tasks/scripts/label_accepted_work.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
-/tasks/scripts/label_accepted_work_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/label_accepted_work.py @ai-openshell/maintainers
+/tasks/scripts/label_accepted_work_test.py @ai-openshell/maintainers
 
 # Auditable SBOM check
-/tasks/scripts/verify-image-sbom.sh @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/verify-image-sbom.sh @ai-openshell/maintainers

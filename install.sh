@@ -11,7 +11,7 @@
 set -e
 
 APP_NAME="openshell"
-REPO="NVIDIA/OpenShell"
+REPO="ai-openshell/openshell"
 GITHUB_URL="https://github.com/${REPO}"
 RELEASE_TAG="${OPENSHELL_VERSION:-}"
 RELEASE_ASSET_DIR=""
@@ -45,10 +45,10 @@ usage() {
 install.sh - Install OpenShell
 
 USAGE:
-    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh -o install.sh
+    curl -fsSL https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh -o install.sh
     sh install.sh
 
-    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | sh
 
 OPTIONS:
     --help       Print this help message
@@ -324,7 +324,7 @@ After cleanup, rerun this installer or follow the installation guide:
 
 If you have already backed up and cleaned up the old runtime, rerun with:
 
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+    curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
 
 EOF
 }
@@ -377,7 +377,7 @@ installation before continuing. For package and service instructions, see:
 
 If you have already backed up and cleaned up the non-snap installation, rerun with:
 
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+    curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
 
 EOF
 }

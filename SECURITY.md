@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report OpenShell vulnerabilities through [GitHub's private reporting form](https://github.com/NVIDIA/OpenShell/security/advisories/new). Submitting a report does not publish an advisory. Do not disclose vulnerabilities in public issues, discussions, or pull requests.
+Report OpenShell vulnerabilities through [GitHub's private reporting form](https://github.com/ai-openshell/openshell/security/advisories/new). Submitting a report does not publish an advisory. Do not disclose vulnerabilities in public issues, discussions, or pull requests.
 
 Every report must use the [advisory template](.agents/skills/create-security-advisory/assets/advisory-template.md). The [private reporting form](.github/VULNERABILITY_REPORT.yml) requires its three core sections. Keep its core headings and include:
 
@@ -12,7 +12,7 @@ Every report must use the [advisory template](.agents/skills/create-security-adv
 - Relevant deployment and policy configuration, with secrets and personal information removed.
 - Known mitigations, existing CVE identifiers, or disclosure deadlines, if any.
 
-The [OpenShell maintainers](https://github.com/NVIDIA/OpenShell/blob/main/MAINTAINERS.md) acknowledge and assess reports, request additional details when needed, and coordinate remediation. Follow-up discussions, decisions, and progress updates remain in the private report or advisory thread.
+The [OpenShell maintainers](https://github.com/ai-openshell/openshell/blob/main/MAINTAINERS.md) acknowledge and assess reports, request additional details when needed, and coordinate remediation. Follow-up discussions, decisions, and progress updates remain in the private report or advisory thread.
 
 ### Report quality and agent skills
 
@@ -30,7 +30,7 @@ We aim to publish an advisory with a fix or mitigation. Active exploitation or d
 
 ## Supported versions
 
-In line with [RFC 0014](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0014-release-stability/README.md#maintenance-and-backports), security support applies to the newest patch of each maintained line:
+In line with [RFC 0014](https://github.com/ai-openshell/openshell/blob/main/rfc/0014-release-stability/README.md#maintenance-and-backports), security support applies to the newest patch of each maintained line:
 
 | Release line | Security updates |
 | --- | --- |
@@ -44,4 +44,4 @@ Pre-release and development builds are for testing. Reports affecting them or ol
 
 ## Security bulletins
 
-Published [GitHub Security Advisories (GHSA)](https://github.com/NVIDIA/OpenShell/security/advisories) describe impact, affected and fixed versions, and mitigation or upgrade instructions.
+Published [GitHub Security Advisories (GHSA)](https://github.com/ai-openshell/openshell/security/advisories) describe impact, affected and fixed versions, and mitigation or upgrade instructions.

@@ -4,7 +4,7 @@
 //! Sandbox lifecycle suite.
 //!
 //! These tests are adapted from the `sandbox-lifecycle` suite in
-//! NVIDIA/OpenShell#4629 by Evan Lezar. Tests that need a driver with a
+//! ai-openshell/openshell#4629 by Evan Lezar. Tests that need a driver with a
 //! persistent workspace live in `persistent_workspace.rs`.
 
 use std::time::Duration;

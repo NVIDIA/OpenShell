@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::{CredentialPlacement, SecretResolver};
+use crate::secrets::{CREDENTIAL_PATH_SLOT, CredentialPlacement, SecretResolver};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -100,8 +100,6 @@ impl std::error::Error for StaticCredentialBindingError {}
 
 /// Reserved entries in the existing credential map carry static placement only.
 pub const STATIC_CREDENTIAL_METADATA_PREFIX: &str = "static-env:";
-
-const CREDENTIAL_PATH_SLOT: &str = "{credential}";
 
 fn split_static_credential_metadata(
     credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
@@ -1175,7 +1173,7 @@ fn compile_credential_placement(
         {
             CredentialPlacement::QueryParam(metadata.query_param.trim().to_string())
         }
-        "path"
+        "path" | "path_subtree"
             if metadata.path_template.starts_with('/')
                 && metadata.path_template.matches(CREDENTIAL_PATH_SLOT).count() == 1
                 && !metadata
@@ -1183,7 +1181,11 @@ fn compile_credential_placement(
                     .chars()
                     .any(|c| c.is_control() || "?#".contains(c)) =>
         {
-            CredentialPlacement::PathTemplate(metadata.path_template.clone())
+            if style == "path_subtree" {
+                CredentialPlacement::PathSubtree(metadata.path_template.clone())
+            } else {
+                CredentialPlacement::PathTemplate(metadata.path_template.clone())
+            }
         }
         _ => {
             return Err(binding_error(
@@ -1610,7 +1612,7 @@ mod tests {
 
     #[test]
     fn static_metadata_selects_one_location_and_preserves_other_providers() {
-        for style in ["bearer", "header", "basic", "query", "path"] {
+        for style in ["bearer", "header", "basic", "query", "path", "path_subtree"] {
             let env = HashMap::from([
                 ("API_KEY".into(), "synthetic".into()),
                 ("OTHER_KEY".into(), "other-secret".into()),
@@ -1641,7 +1643,7 @@ mod tests {
             }
             .into();
             declaration.query_param = "api_key".into();
-            declaration.path_template = "/v1/{credential}/events".into();
+            declaration.path_template = "/v1/{credential}/**".into();
             assert_eq!(
                 state
                     .install_bound_environment(8, env, HashMap::new(), metadata, bindings, vec![])
@@ -1674,17 +1676,99 @@ mod tests {
                 &format!("/v1/chat?api_key={reference}"),
                 &resolver,
             );
-            let path = crate::secrets::rewrite_target_for_eval(
-                &format!("/v1/{reference}/events"),
-                &resolver,
-            );
+            let path =
+                crate::secrets::rewrite_target_for_eval(&format!("/v1/{reference}/**"), &resolver);
             assert_eq!(
                 header.is_ok(),
                 matches!(style, "bearer" | "header" | "basic")
             );
             assert_eq!(query.is_ok(), style == "query");
-            assert_eq!(path.is_ok(), style == "path");
+            assert_eq!(path.is_ok(), matches!(style, "path" | "path_subtree"));
+            let descendant = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/{reference}/**/events"),
+                &resolver,
+            );
+            assert_eq!(descendant.is_ok(), style == "path_subtree");
+            // Even when subtree matching is selected, stars in the base are literal.
+            assert!(
+                crate::secrets::rewrite_target_for_eval(
+                    &format!("/v1/{reference}/events"),
+                    &resolver,
+                )
+                .is_err()
+            );
         }
+    }
+
+    #[test]
+    fn path_styles_require_one_slot_in_an_absolute_path() {
+        for style in ["path", "path_subtree"] {
+            for invalid in [
+                "",
+                "/bot/**",
+                "/{credential}/{credential}",
+                "bot{credential}",
+                "/{credential}?query",
+                "/{credential}#fragment",
+                "/{credential}/\n",
+            ] {
+                let metadata = crate::proto::ProviderProfileCredential {
+                    auth_style: style.into(),
+                    path_template: invalid.into(),
+                    ..Default::default()
+                };
+                assert!(
+                    compile_credential_placement(&metadata).is_err(),
+                    "{style}: {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subtree_path_template_serves_every_method_with_one_credential() {
+        let env = HashMap::from([("API_KEY".into(), "123456:synthetic".into())]);
+        let bindings =
+            HashMap::from([("API_KEY".into(), binding("bot-api.example.com", 443, "/**"))]);
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            env.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            bindings.clone(),
+            vec![],
+        )
+        .unwrap();
+        let mut metadata = placement_metadata("path_subtree");
+        metadata.values_mut().next().unwrap().path_template = "/bot{credential}".into();
+        assert_eq!(
+            state
+                .install_bound_environment(8, env, HashMap::new(), metadata, bindings, vec![])
+                .unwrap(),
+            1
+        );
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        for method in ["sendMessage", "getUpdates", "editMessageText"] {
+            let target = format!("/bot{reference}/{method}");
+            let resolver = state
+                .resolver_for_endpoint("bot-api.example.com", 443, &target)
+                .unwrap();
+            assert_eq!(
+                crate::secrets::rewrite_target_for_eval(&target, &resolver)
+                    .unwrap()
+                    .resolved,
+                format!("/bot123456:synthetic/{method}")
+            );
+        }
+        let moved = format!("/v1/{reference}/getMe");
+        let resolver = state
+            .resolver_for_endpoint("bot-api.example.com", 443, &moved)
+            .unwrap();
+        assert!(
+            crate::secrets::rewrite_target_for_eval(&moved, &resolver)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
     }
 
     #[test]

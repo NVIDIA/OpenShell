@@ -160,7 +160,7 @@ single flag-day cutover.
   or moves behind a local adapter boundary; preserve startup/failure behavior
   either way.
 - Keep the local-routing and destination contracts extensible for issue
-  [#1633](https://github.com/NVIDIA/OpenShell/issues/1633), while leaving its
+  [#1633](https://github.com/ai-openshell/openshell/issues/1633), while leaving its
   policy surface and host-loopback authorization to separate feature work.
 - Remove compatibility endpoint queries only after Phase 3 is authoritative.
 - Remove duplicated destination/relay plumbing without centralizing

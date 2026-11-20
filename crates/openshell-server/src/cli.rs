@@ -332,6 +332,10 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_SERVICE_HOSTNAME_FORMAT")]
     service_hostname_format: Option<ServiceHostnameFormat>,
 
+    /// Publish gateway service URLs and enable gateway-mediated application routing.
+    #[arg(long, env = "OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING", default_value_t = true, action = ArgAction::Set)]
+    enable_gateway_service_routing: bool,
+
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[arg(
         long,
@@ -354,6 +358,15 @@ struct RunArgs {
     /// and settling its outstanding driver operations. See HA upgrade guidance.
     #[arg(long, env = "OPENSHELL_ENABLE_SANDBOX_UPDATES", default_value_t = false, action = ArgAction::Set)]
     enable_sandbox_updates: bool,
+
+    /// Activate workspace secrets only after every gateway that can serve traffic supports
+    /// them. See the workspace secrets activation guidance.
+    #[arg(long, env = "OPENSHELL_ENABLE_WORKSPACE_SECRETS", default_value_t = false, action = ArgAction::Set)]
+    enable_workspace_secrets: bool,
+
+    /// Allow `RevealSecret` to return workspace secret values to mTLS operators.
+    #[arg(long, env = "OPENSHELL_ENABLE_SECRET_REVEAL", default_value_t = false, action = ArgAction::Set)]
+    enable_secret_reveal: bool,
 }
 
 pub fn command() -> Command {
@@ -660,6 +673,7 @@ fn prepare_server_config_with_drivers(
         )
         .with_server_sans(args.server_sans.clone())
         .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
+        .with_service_routing(args.enable_gateway_service_routing)
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
     config
@@ -668,6 +682,8 @@ fn prepare_server_config_with_drivers(
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
 
     config.enable_sandbox_updates = args.enable_sandbox_updates;
+    config.workspace_secrets.enabled = args.enable_workspace_secrets;
+    config.workspace_secrets.reveal_enabled = args.enable_secret_reveal;
 
     config.supervisor_app_listener = file
         .as_ref()
@@ -1051,6 +1067,25 @@ async fn run_from_args(
     }
     if prepared.config.auth.allow_unauthenticated_users {
         warn!("{UNAUTHENTICATED_USERS_WARNING}");
+    }
+
+    if !prepared.config.service_routing.enabled && !prepared.config.supervisor_app_listener.enabled
+    {
+        warn!(
+            "Sandbox service routing disabled: neither gateway routing nor the app listener is enabled"
+        );
+    }
+
+    if prepared.config.supervisor_app_listener.enabled {
+        info!(
+            domain = %prepared.config.supervisor_app_listener.domain(),
+            port = prepared.config.supervisor_app_listener.port,
+            "App-listener-based service routing enabled"
+        );
+    }
+
+    if prepared.config.service_routing.enabled {
+        info!("Gateway-based service routing enabled");
     }
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
@@ -1648,6 +1683,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.service_hostname_format = Some(*format);
     }
+    if let Some(enabled) = file.enable_gateway_service_routing
+        && arg_defaulted(matches, "enable_gateway_service_routing")
+    {
+        args.enable_gateway_service_routing = enabled;
+    }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
     {
@@ -1662,6 +1702,16 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_sandbox_updates")
     {
         args.enable_sandbox_updates = enabled;
+    }
+    if let Some(enabled) = file.enable_workspace_secrets
+        && arg_defaulted(matches, "enable_workspace_secrets")
+    {
+        args.enable_workspace_secrets = enabled;
+    }
+    if let Some(enabled) = file.enable_secret_reveal
+        && arg_defaulted(matches, "enable_secret_reveal")
+    {
+        args.enable_secret_reveal = enabled;
     }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
@@ -4981,6 +5031,44 @@ enable_loopback_service_http = false
     }
 
     #[test]
+    fn gateway_service_routing_defaults_on_and_honors_config_precedence() {
+        Environment::new()
+            .remove("OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                assert!(args.enable_gateway_service_routing);
+                assert!(openshell_core::Config::new(None).service_routing.enabled);
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nenable_gateway_service_routing = false\n",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_gateway_service_routing);
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-routing=true",
+                ]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(args.enable_gateway_service_routing);
+            });
+        Environment::new()
+            .set("OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING", "true")
+            .run(|| {
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nenable_gateway_service_routing = false\n",
+                );
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(args.enable_gateway_service_routing);
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-routing=false",
+                ]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_gateway_service_routing);
+            });
+    }
+
+    #[test]
     fn server_config_preparation_applies_and_validates_hashed_hostnames() {
         let state = tempfile::tempdir().unwrap();
         let local_tls = tempfile::tempdir().unwrap();
@@ -4992,11 +5080,12 @@ enable_loopback_service_http = false
                 local_tls.path().to_str().unwrap(),
             )
             .remove("OPENSHELL_SERVICE_HOSTNAME_FORMAT")
+            .remove("OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING")
             .run(|| {
                 let config_path = state.path().join("gateway.toml");
                 std::fs::write(
                     &config_path,
-                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\n",
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\nenable_gateway_service_routing = false\n",
                 )
                 .unwrap();
 
@@ -5013,6 +5102,7 @@ enable_loopback_service_http = false
 
                 let prepared = super::prepare_server_config(&mut args, &matches)
                     .expect("server config is prepared");
+                assert!(!prepared.config.service_routing.enabled);
                 assert_eq!(
                     prepared.config.service_routing_discriminator(),
                     Some("gateway-west")

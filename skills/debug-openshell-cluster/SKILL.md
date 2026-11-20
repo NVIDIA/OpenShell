@@ -1374,9 +1374,23 @@ and enabling or disabling autoscaling on an existing release.
 
 With `supervisor_topology = "gateway"`, the gateway always coordinates the
 shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
-`supervisor.replicas` members (default 1, which has no failover). The chart
-renders only `[openshell.gateway.supervisor_pool] recovery_timeout_secs` (the
-driver's `shared_supervisor` table carries no pool settings), rolls one member
+`supervisor.replicas` members (default 1). The chart renders
+`[openshell.gateway.supervisor_pool]` `recovery_timeout_secs`,
+`max_instances_per_member` (Helm `supervisor.pool.maxInstancesPerMember`,
+1 to 1024, default 128, also passed to each member as
+`OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`), and `max_members_per_gateway`
+(`supervisor.pool.maxMembersPerGateway`, 1 or more, default 32); the driver's
+`shared_supervisor` table carries no pool settings. Rendering fails when
+`supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds the
+gateway replica count times `maxMembersPerGateway`. A create that finds every
+member at its cap, or the pool at gateway replicas × members × instances
+(never above 131072), fails with `FAILED_PRECONDITION` "sandbox capacity
+reached"; the gateway log warns "every supervisor is at its sandbox limit" or
+"supervisor pool is at its sandbox limit" to say which. Raise the cap or add
+members. Supervisor container
+resources come from `supervisor.resources` (unset by default; the chart
+recommends requests 250m and 768Mi with a 1.5Gi memory limit for 128
+sandboxes per supervisor). The chart rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control
 supervisor scheduling; top-level `affinity` applies only to the gateway), gives
 each member a 60-second grace period to leave,
@@ -1684,7 +1698,7 @@ credential failures.
 | Shared sandbox workloads terminate after a supervisor Pod or node failure (`sandbox-supervisor-recovery-expired`) | One supervisor replica (no member to fail over to), no live pool member took over, or the recovery timeout is shorter than detection plus takeover | `supervisor.replicas` and the `<release>-supervisor` PodDisruptionBudget; gateway `taking over a shared sandbox instance` logs; workload Pod `sandbox-supervisor-*` findings; `supervisor.recoveryTimeoutSeconds`. See "Shared supervisor high availability" in Step 6 |
 | Shared-sandbox grants fail with `code=unavailable stage=workload_identity` | The gateway cannot reach the SPIFFE Broker endpoint or obtain credentials from its CSI Workload API socket | Gateway logs for `dynamic token grant failed`; check Broker endpoint connectivity, the gateway's Workload API CSI mount and agent health |
 | Shared-sandbox grants fail with `code=workload_identity_rejected stage=workload_identity` | Broker mTLS verification fails, an agent has no Sandbox UID registration, or the gateway lacks `impersonate-via-spire` authorization | Check trust, the exact or prefix peer policy, and Sandbox registrations on the gateway's node-local agent or the configured endpoint's agents. Verify the gateway SPIFFE identity's namespace-scoped authorization. Use a node alias to cover eligible agents |
-| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
+| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/ai-openshell/openshell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
@@ -1750,7 +1764,8 @@ manual schema-v2 migration in the Gateway Configuration reference.
 ## Supervisor application ingress
 
 When `[openshell.supervisor.app_listener]` is explicitly enabled, check its
-`port` and `domain` separately from the gateway API and supervisor runtime ports.
+`port` and `base_url` separately from the gateway API and supervisor runtime ports.
+Derive the domain from the HTTPS `base_url`; do not configure a `domain` key.
 The Kubernetes TLS Secret is configured with `tls_secret_name` under
 `[openshell.drivers.kubernetes.sandbox_runtime.app_listener]`. Disabled listeners
 create no app TLS mount or app port. TLS material is mounted only in supervisors
@@ -1764,16 +1779,28 @@ NetworkPolicy forwarding; also test from a permitted in-cluster client. Operator
 provide ingress network rules. Running supervisors retain their startup listener
 configuration until restarted.
 
+Gateway, compute-driver, and supervisor images must match. After upgrading from
+the `domain` configuration, replace existing dedicated sandbox Pods with the
+matching supervisor image; a gateway rollout alone does not update them. Old
+supervisors cannot acknowledge the new hostname declarations, so their services
+drop out of discovery. New supervisors require `OPENSHELL_APP_BASE_URL` from the
+driver; `OPENSHELL_APP_SERVICE_DOMAIN` is not a compatibility input. Plan for
+service interruption when replacing dedicated Pods.
+
 Service changes arrive through polling or push configuration. Only admitted
 service declarations are installed. Polling and accepted live push sessions
 renew a 30-second lease; rejected configuration or expired freshness closes
 routes. When the listener is enabled, polling delays are capped at five seconds
 even if the configured interval is longer; failed polls do not renew the lease.
 App traffic uses application/edge authentication independently of gateway
-user authentication. The discovery API publishes accepted listener installations; public URLs
-printed by the CLI continue to use the gateway path.
+user authentication. The discovery API publishes accepted listener installations. CLI URLs use the
+configured application origin when `base_url` is set, otherwise the gateway path.
 
-When enabled application routes are not published, check the authenticated
+When enabled application routes are not published, inspect supervisor OCSF events
+whose message starts with `App listener service routes rejected` for the reason
+and configuration revision. Identical rejections are suppressed until the
+configuration instance/revision or reason changes, or installation succeeds.
+Then check the authenticated
 supervisor session and installed configuration before checking ingress. The
 gateway requests installation evidence every five seconds with a fifteen-second
 lease measured from challenge issuance. Instances report only when their serving
@@ -1809,6 +1836,29 @@ admits 16 unary requests (four per principal, eight per workspace), and 32 watch
 record/route/byte limits; `UNAVAILABLE` means storage or collection timeout.
 Watches recheck bearer credentials and membership every second. Allow one refresh
 interval for withdrawals; route lease expiry remains independently enforced.
+
+For incorrect public service URLs, inspect
+`[openshell.gateway].enable_gateway_service_routing` first. The Helm chart defaults it
+to false; the core runtime and non-Kubernetes deployments retain true. To retain
+gateway forwarding in a Helm deployment or upgrade, set
+`gatewayConfig."openshell.gateway".enable_gateway_service_routing: true` explicitly.
+When false, gateway URL fields
+are empty and gateway application requests return `404`; direct listener and
+discovery behavior is independent. Then inspect
+`[openshell.supervisor.app_listener].base_url`. It is the external HTTPS base origin
+whose hostname supplies the service domain; its port is independent of the listener port.
+Service responses identify the application and gateway paths separately. A
+configured application URL must retain its public port even when the CLI uses a
+gateway port-forward. Inspect discovery and ingress acceptance separately:
+URL publication alone proves neither installation nor public reachability.
+
+Application URLs and discovery follow the gateway's `service_hostname_format`.
+In hashed mode, check the returned hostname against the supervisor's accepted
+`application_hostname` route, and preserve that exact SNI/Host through ingress.
+Do not reconstruct it from sandbox names. Distinct gateway installations sharing
+an app domain need distinct gateway names; replicas of one installation share
+its name. Changing the mode or installation name requires fresh route
+installation before discovery can advertise the replacement.
 
 ## Azure PostgreSQL workload identity
 

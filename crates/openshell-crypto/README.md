@@ -8,7 +8,7 @@ application default; an optional system-OpenSSL backend supports explicit contex
 selection by embedders. The facade preserves TLS algorithms, Ed25519 gateway
 JWTs, P-256 certificate keys, native trust roots, and credential envelope formats.
 The OpenSSL implementation builds on the standalone proof of concept following
-[the generic backend refactor](https://github.com/NVIDIA/OpenShell/pull/3351).
+[the generic backend refactor](https://github.com/ai-openshell/openshell/pull/3351).
 Application-wide OpenSSL selection and downstream FIPS qualification remain
 separate work; enabling this backend is not a FIPS build or compliance claim.
 
@@ -250,6 +250,7 @@ not a whole-application crypto coverage claim:
 | DNS policy contract fingerprints (`openshell-supervisor-network::policy_dns`) | These bind cached DNS state to policy and are security-relevant. They remain outside this migration; migrating the cache identity API and its failure handling is required for exclusive backend ownership. |
 | Credential-storage names (`credentials`, Kubernetes Secrets, Vault) | Deterministic namespace derivation, not encryption or proof of authorization. These retain their current hashing implementation and stored names; backend coverage is not asserted for them. |
 | Provider-refresh advisory-lock keys | Deterministic database lock selection for coordinating refreshes, not authentication or encryption. These remain outside the selected-backend contract. |
+| Service-routing hostname labels (`openshell-core::app_listener`) | Deterministic public DNS naming, not authentication or proof of authorization. The existing truncated SHA-256/base32 encoding remains unchanged and uses `sha2`; gateway and application paths share the implementation. |
 | Endpoint IDs and pagination fingerprints | Deterministic identification/request matching, not authentication. These remain outside the selected-backend contract. |
 | Debug token fingerprints | Diagnostic display only; direct hashing remains outside the contract even though the input is a credential. |
 | Destination-trust generation labels (`openshell-server` network trust, Podman operator staging, Kubernetes ConfigMap naming, VM staged-snapshot checks) | Deterministic identity derivation for naming and generation equality, not encryption or proof of authorization. Trust decisions use the gateway's normalization, immutable staging, exact-byte validation, and TLS verification rather than these digests. These retain `sha2` directly. |

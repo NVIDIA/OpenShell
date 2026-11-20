@@ -19,14 +19,14 @@ endpoints, and executable paths an agent may use.
 
 This example runs OpenCode
 against OpenRouter. Review the
-[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/openrouter.yaml),
+[example profile](https://github.com/ai-openshell/openshell/blob/main/providers/openrouter.yaml),
 which allows `/usr/local/bin/opencode` to reach `openrouter.ai`, then import
 it and [create a provider](/how-it-works/providers/overview#create-a-provider)
 that stores its credentials.
 
 ```shell
 openshell profile import \
-  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/openrouter.yaml
+  --url https://raw.githubusercontent.com/ai-openshell/openshell/main/providers/openrouter.yaml
 
 openshell provider create \
   --name openrouter \

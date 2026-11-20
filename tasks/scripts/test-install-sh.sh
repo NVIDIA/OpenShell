@@ -1027,7 +1027,7 @@ if ! grep -Fq 'actions/artifacts?name=openshell-v0.1.0-pre.9-linux-amd64-deb' "$
   cat "$mock_gh_log" >&2
   exit 1
 fi
-if ! grep -Fq 'run download 123456 --repo NVIDIA/OpenShell --name openshell-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
+if ! grep -Fq 'run download 123456 --repo ai-openshell/openshell --name openshell-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
   echo "FAIL: prerelease download did not select the current platform artifact" >&2
   cat "$mock_gh_log" >&2
   exit 1

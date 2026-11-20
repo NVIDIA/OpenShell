@@ -2377,14 +2377,14 @@ pub fn validate_profile_set(
                         ));
                     }
                 }
-                "path" => {
+                "path" | "path_subtree" => {
                     let path_template = credential.path_template.trim();
                     if path_template.is_empty() {
                         diagnostics.push(ProfileValidationDiagnostic::error(
                             source,
                             profile_id,
                             "credentials.path_template",
-                            "path_template is required for path auth",
+                            format!("path_template is required for {auth_style} auth"),
                         ));
                     } else {
                         let count = path_template
@@ -5322,6 +5322,10 @@ credentials:
     env_vars: [PATH_TOKEN]
     auth_style: path
     path_template: /v1/{credential}/resources
+  - name: bot_cred
+    env_vars: [BOT_TOKEN]
+    auth_style: path_subtree
+    path_template: /bot{credential}
 ",
         )
         .expect("profile should parse");
@@ -5350,6 +5354,8 @@ credentials:
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         let reparsed = parse_profile_yaml(&exported).expect("re-parse");
         assert_eq!(reparsed.credentials[1].header_name, "authorization");
+        assert_eq!(reparsed.credentials[4].auth_style, "path_subtree");
+        assert_eq!(reparsed.credentials[4].path_template, "/bot{credential}");
         assert_eq!(reparsed.credentials[2].query_param, "api_key");
         assert_eq!(
             reparsed.credentials[3].path_template,
@@ -5859,7 +5865,7 @@ credentials:
 
     #[test]
     fn validate_profile_set_rejects_token_grant_query_or_path_auth_style() {
-        for auth_style in ["query", "path"] {
+        for auth_style in ["query", "path", "path_subtree"] {
             let profile = parse_profile_yaml(&format!(
                 r"
 id: unsupported-token-grant-style

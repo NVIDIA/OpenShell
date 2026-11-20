@@ -17,6 +17,62 @@ use openshell_core::proto::{
 };
 use tonic::Code;
 
+#[tokio::test]
+async fn legacy_url_receipts_restore_the_recorded_gateway_addresses() {
+    let state = test_server_state().await;
+    let sandbox = run(
+        &state,
+        authed_request(CreateSandboxRequest {
+            name: "legacy-url-receipt".into(),
+            spec: Some(SandboxSpec::default()),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .sandbox
+    .unwrap();
+    let url = "https://default--legacy-url-receipt--web.openshell.localhost/";
+    let outcome: Outcome = serde_json::from_value(serde_json::json!({"Sandbox": {
+        "id": sandbox.object_id(), "changed": false, "service_urls": {"web": url}
+    }}))
+    .unwrap();
+    let replay = restore_sandbox_response(&state.store, outcome)
+        .await
+        .unwrap();
+    assert_eq!(replay.service_urls["web"], url);
+    assert_eq!(replay.gateway_service_urls, replay.service_urls);
+    assert!(replay.application_service_urls.is_empty());
+
+    let exposed = run(
+        &state,
+        authed_request(ExposeServiceRequest {
+            sandbox: "legacy-url-receipt".into(),
+            name: "web".into(),
+            target_port: 8080,
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let outcome: Outcome = serde_json::from_value(serde_json::json!({"Service": {
+        "reference": Reference::new(exposed.endpoint.as_ref().unwrap()),
+        "sandbox_id": sandbox.object_id(), "url": url
+    }}))
+    .unwrap();
+    let replay =
+        <ExposeServiceRequest as Mutation>::restore(&state.store, Success::Ordinary(outcome))
+            .await
+            .unwrap();
+    assert_eq!(replay.url, url);
+    assert_eq!(replay.gateway_url, url);
+    assert!(replay.application_url.is_empty());
+}
+
 async fn protected_state() -> (tempfile::TempDir, Arc<ServerState>) {
     let directory = tempfile::tempdir().unwrap();
     let mut state = test_server_state().await;
