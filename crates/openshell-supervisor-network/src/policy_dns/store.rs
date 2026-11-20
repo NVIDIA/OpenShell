@@ -482,8 +482,10 @@ impl ResolvedEndpointStore {
         Ok(record)
     }
 
-    /// The live mapping to pin an authorized connection to. Observations pin
-    /// no address and are refused.
+    /// The live mapping at `synthetic_address`, without refreshing it; for
+    /// tests. Connections pin through `PolicyDnsService::lookup_for_pin`.
+    /// Observations pin no address and are refused.
+    #[cfg(test)]
     pub(crate) fn lookup(
         &self,
         synthetic_address: IpAddr,

@@ -106,6 +106,17 @@ pub(crate) enum ConnectLookupError {
     Backoff,
 }
 
+impl ConnectLookupError {
+    /// The mapping failure a denial reports. A failed or backed-off refresh
+    /// leaves the mapping expired.
+    pub(crate) fn mapping_error(&self) -> MappingLookupError {
+        match self {
+            Self::Mapping(error) => *error,
+            Self::Refresh(_) | Self::Backoff => MappingLookupError::Expired,
+        }
+    }
+}
+
 impl<R: TrustedResolver> PolicyDnsService<R> {
     pub(crate) fn new(
         policy: Arc<OpaEngine>,
@@ -167,6 +178,25 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             return Err(MappingLookupError::PolicyChanged.into());
         }
         lookup().map_err(Into::into)
+    }
+
+    /// The live mapping to pin an authorized connection to. Authorization runs
+    /// between [`Self::lookup_for_connect`] and this lookup, and a short-lived
+    /// mapping can expire meanwhile, so an expired mapping is refreshed here
+    /// too. Observations pin no address and are refused.
+    pub(crate) async fn lookup_for_pin(
+        &self,
+        address: IpAddr,
+        port: u16,
+    ) -> Result<MappingLookup, MappingLookupError> {
+        let lookup = self
+            .lookup_for_connect(address, port)
+            .await
+            .map_err(|error| error.mapping_error())?;
+        if lookup.record.is_observation() {
+            return Err(MappingLookupError::EndpointMismatch);
+        }
+        Ok(lookup)
     }
 
     pub(crate) async fn answer_query(
@@ -403,6 +433,10 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         }
     }
 
+    /// The bare store, for tests. Connections look mappings up through
+    /// [`Self::lookup_for_connect`] and [`Self::lookup_for_pin`], which refresh
+    /// expired mappings.
+    #[cfg(test)]
     pub(crate) fn store(&self) -> &Arc<ResolvedEndpointStore> {
         &self.store
     }
@@ -1082,6 +1116,48 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         })
         .await
         .expect("one DNS response must satisfy all waiting connects");
+    }
+
+    /// Authorization runs between the connect lookup and the pin lookup. A
+    /// TTL-0 mapping that expires in between is refreshed, not refused.
+    #[tokio::test]
+    async fn pin_lookup_refreshes_a_mapping_that_expired_during_authorization() {
+        let service = scripted_service(
+            BASE_POLICY,
+            vec![Ok(dns_answer(&["8.8.8.8"])), Ok(dns_answer(&["8.8.4.4"]))],
+        );
+        let answer = service
+            .answer_query("db.example", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+        let connect = service
+            .lookup_for_connect(answer.address, 5432)
+            .await
+            .unwrap();
+        assert_eq!(connect.record.mapping_id, answer.mapping_id);
+
+        tokio::time::sleep(MIN_MAPPING_TTL + Duration::from_millis(100)).await;
+        let pinned = service.lookup_for_pin(answer.address, 5432).await.unwrap();
+        assert_eq!(pinned.record.synthetic_address, answer.address);
+        assert_ne!(pinned.record.mapping_id, answer.mapping_id);
+        assert_eq!(
+            pinned.record.pinned_addresses,
+            ["8.8.4.4".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pin_lookup_refuses_an_observation() {
+        let service = service(BASE_POLICY, vec![]);
+        let observed = service
+            .answer_query("unknown.example", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.lookup_for_pin(observed.address, 443).await.err(),
+            Some(MappingLookupError::EndpointMismatch)
+        );
     }
 
     #[tokio::test]
