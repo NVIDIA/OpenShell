@@ -30,7 +30,8 @@ pub(crate) const BIN_ENV: &str = "OPENSHELL_BIN";
 pub struct Cli {
     binary: PathBuf,
     gateway: Gateway,
-    env: Vec<(OsString, OsString)>,
+    /// Variables to set, or with `None`, to remove, on every run.
+    env: Vec<(OsString, Option<OsString>)>,
 }
 
 /// The buffered result of one CLI invocation.
@@ -60,7 +61,23 @@ impl Cli {
     /// credentials. The gateway and workspace selection still wins.
     #[must_use]
     pub fn with_env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
-        self.env.push((name.into(), value.into()));
+        self.env.push((name.into(), Some(value.into())));
+        self
+    }
+
+    /// This CLI with `name` removed from its environment on every run, such
+    /// as a variable the test process inherits that changes how the CLI
+    /// logs in.
+    #[must_use]
+    pub fn without_env(mut self, name: impl Into<OsString>) -> Self {
+        self.env.push((name.into(), None));
+        self
+    }
+
+    /// This CLI pointed at `workspace` on the same gateway.
+    #[must_use]
+    pub fn in_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.gateway.workspace = workspace.into();
         self
     }
 
@@ -183,8 +200,13 @@ impl Cli {
     /// invocation is. Use it for a program that runs the CLI itself, such as
     /// `ssh` with the `ProxyCommand` from `sandbox ssh-config`.
     pub fn apply_env(&self, process: &mut tokio::process::Command) {
+        for (name, value) in &self.env {
+            match value {
+                Some(value) => process.env(name, value),
+                None => process.env_remove(name),
+            };
+        }
         process
-            .envs(self.env.iter().map(|(name, value)| (name, value)))
             .env("NO_COLOR", "1")
             .env(WORKSPACE_ENV, &self.gateway.workspace);
         // Select exactly the gateway the SDK connected to.

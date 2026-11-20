@@ -117,8 +117,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `Cli::apply_env` to point another program at the same gateway, such as `ssh`
   with the `ProxyCommand` from `sandbox ssh-config`. `Cli::gateway` says which
   gateway that is.
-- `Cli::with_env(name, value)` for a CLI with extra environment on every
-  run, such as `XDG_CONFIG_HOME` holding another user's session.
+- `Cli::with_env(name, value)` and `Cli::without_env(name)` for a CLI with
+  changed environment on every run, such as `XDG_CONFIG_HOME` holding
+  another user's session. `Cli::in_workspace(name)` points it at another
+  workspace.
 - `cx.cli_handle().gateway().connect_with_token(token)` for an SDK client that sends a
   bearer token, such as an OIDC access token, and no client certificate.
 - `cx.workspace(suffix)` to create a workspace with cleanup. Its
