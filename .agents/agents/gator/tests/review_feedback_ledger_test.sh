@@ -386,12 +386,12 @@ done
 exec "$LEDGER_TEST_REAL_GIT" "${args[@]}"
 SH
 chmod +x "$tmp/mock-bin/gh" "$tmp/mock-bin/git"
-PATH="$tmp/mock-bin:$PATH" "$LEDGER" NVIDIA OpenShell 4288 > "$tmp/live-ledger.json"
+PATH="$tmp/mock-bin:$PATH" "$LEDGER" ai-openshell openshell 4288 > "$tmp/live-ledger.json"
 jq -e --arg patch "$expected_patch" --arg head "$head" '
   .current_patch_id == $patch and .review_scope.current_head_sha == $head
 ' "$tmp/live-ledger.json" >/dev/null
 PATH="$tmp/mock-bin:$PATH" LEDGER_TEST_FETCH_FAIL=1 \
-    "$LEDGER" NVIDIA OpenShell 4288 > "$tmp/no-patch-ledger.json"
+    "$LEDGER" ai-openshell openshell 4288 > "$tmp/no-patch-ledger.json"
 jq -e '
   .current_patch_id == null and
   .review_scope.rebase_equivalent == false and
@@ -417,7 +417,7 @@ ruby -ryaml -e '
 rg -Fq 'manifest.fetch("resources", [])' "$ROOT_DIR/scripts/agents/run.sh"
 rg -Fq 'Gator payload version: {{PAYLOAD_VERSION}}' \
     "$GATOR_DIR/prompts/gator.md"
-rg -q 'review-feedback-ledger NVIDIA OpenShell <pr-number>' \
+rg -q 'review-feedback-ledger ai-openshell openshell <pr-number>' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'Every prior Gator finding is a durable review disposition' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"

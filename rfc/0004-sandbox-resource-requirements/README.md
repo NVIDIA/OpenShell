@@ -3,12 +3,12 @@ authors:
   - "@elezar"
 state: accepted
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1338
-  - https://github.com/NVIDIA/OpenShell/pull/1340
-  - https://github.com/NVIDIA/OpenShell/pull/1360
-  - https://github.com/NVIDIA/OpenShell/issues/1492
-  - https://github.com/NVIDIA/OpenShell/pull/1675
-  - https://github.com/NVIDIA/OpenShell/pull/1815
+  - https://github.com/ai-openshell/openshell/issues/1338
+  - https://github.com/ai-openshell/openshell/pull/1340
+  - https://github.com/ai-openshell/openshell/pull/1360
+  - https://github.com/ai-openshell/openshell/issues/1492
+  - https://github.com/ai-openshell/openshell/pull/1675
+  - https://github.com/ai-openshell/openshell/pull/1815
 ---
 
 # RFC 0004 - Sandbox Resource Requirements

@@ -8,7 +8,7 @@ application default; an optional system-OpenSSL backend supports explicit contex
 selection by embedders. The facade preserves TLS algorithms, Ed25519 gateway
 JWTs, P-256 certificate keys, native trust roots, and credential envelope formats.
 The OpenSSL implementation builds on the standalone proof of concept following
-[the generic backend refactor](https://github.com/NVIDIA/OpenShell/pull/3351).
+[the generic backend refactor](https://github.com/ai-openshell/openshell/pull/3351).
 Application-wide OpenSSL selection and downstream FIPS qualification remain
 separate work; enabling this backend is not a FIPS build or compliance claim.
 

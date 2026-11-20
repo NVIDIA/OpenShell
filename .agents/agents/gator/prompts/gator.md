@@ -10,7 +10,7 @@ Load and follow this skill exactly:
 
 Important sandbox constraints:
 
-- GitHub REST write access is scoped to NVIDIA/OpenShell.
+- GitHub REST write access is scoped to ai-openshell/openshell.
 - GitHub GraphQL access is read-only except for the named
   `ResolveGatorReviewThread` mutation used by
   `resolve-gator-review-threads`. Prefer REST endpoints for all other write
