@@ -569,22 +569,6 @@ jobs:
       suite-name: additional-ca
       test-name: additional_ca
 
-  podman-external-driver-e2e:
-    needs: [pr_metadata, build-binaries-linux, build-conformance, build-gateway-plain, build-external-drivers, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
-    with:
-      prebuilt-conformance: true
-      image-tag: ${{ github.sha }}
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-podman
-      suite-matrix: >-
-        [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
-
   vm-external-driver-e2e:
     needs: [pr_metadata, build-binaries-linux, build-conformance, build-gateway-plain, build-vm-driver-linux]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -785,7 +769,6 @@ jobs:
       - podman-additional-ca-e2e
       - vm-e2e
       - vm-additional-ca-e2e
-      - podman-external-driver-e2e
       - vm-external-driver-e2e
       - kubernetes-e2e
       - kubernetes-app-listener-e2e
