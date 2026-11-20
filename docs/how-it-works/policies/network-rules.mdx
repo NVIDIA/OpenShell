@@ -687,13 +687,14 @@ payload addresses.
 OpenShell answers DNS queries for the hosts in your rules with placeholder
 addresses whose TTL is between 1 and 30 seconds. This applies to every endpoint, not
 only `protocol: tcp`. The sandbox applies no DNS search domains, so request each
-hostname exactly as your rules name it. When a new connection uses a cached
-placeholder after its DNS mapping expires, OpenShell refreshes the destination
-through its trusted resolver and validates the new addresses before connecting.
-The placeholder stays the same while its endpoint policy is unchanged. A failed
-refresh denies the connection; OpenShell does not use expired upstream addresses.
-Policy changes can still invalidate cached mappings and require a new client DNS
-lookup. OpenShell returns an
+hostname exactly as your rules name it. A placeholder keeps standing for its
+hostname for the life of the sandbox, so clients can cache it past its TTL and
+across policy changes. Each new connection is authorized by the current policy.
+When a new connection uses a placeholder whose DNS mapping has expired, OpenShell
+refreshes the destination through its trusted resolver and validates the new
+addresses before connecting. A failed refresh, or a hostname the current policy
+no longer allows, denies the connection; OpenShell does not use expired upstream
+addresses. OpenShell returns an
 empty answer to AAAA queries, so dual-stack clients must fall back to the A
 record.
 
