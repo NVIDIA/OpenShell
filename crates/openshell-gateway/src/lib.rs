@@ -482,21 +482,14 @@ struct PodmanFactory;
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for PodmanFactory {
+    // The driver validates its own configuration at startup. Validation
+    // without launching returns with the driver `preflight` command.
     fn supports_config_preflight(&self) -> bool {
-        true
+        false
     }
 
     fn supports_network_supervisor_trust(&self) -> bool {
         true
-    }
-
-    fn validate_config(
-        &self,
-        context: openshell_server::ComputeDriverConfigContext<'_>,
-    ) -> openshell_core::Result<()> {
-        podman_config(context)?
-            .validate_configuration()
-            .map_err(|error| openshell_core::Error::config(error.to_string()))
     }
 
     async fn build(
@@ -519,26 +512,6 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
             endpoint,
         ))
     }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
-fn podman_config(
-    context: openshell_server::ComputeDriverConfigContext<'_>,
-) -> openshell_core::Result<openshell_driver_podman::PodmanComputeConfig> {
-    let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
-    config.gateway_port = context.gateway_port();
-    config.sandbox_runtime_image = prefer_environment(
-        config.sandbox_runtime_image,
-        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
-    );
-    config.supervisor_image = prefer_environment(
-        config.supervisor_image,
-        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
-    );
-    if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-        config.socket_path = Some(path.into());
-    }
-    Ok(config)
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
