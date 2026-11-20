@@ -118,6 +118,13 @@ let
       bases = podmanBases;
       setup.playbooks = [ "ansible/playbooks/otlp.yaml" ];
     };
+    # Test-run SPIFFE Workload APIs for the gateway and supervisors, for the
+    # provider-token-exchange suite. Supervisors reach theirs over loopback,
+    # which needs Podman's host-network supervisors.
+    spiffe = {
+      bases = podmanBases;
+      setup.playbooks = [ "ansible/playbooks/spiffe.yaml" ];
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases
