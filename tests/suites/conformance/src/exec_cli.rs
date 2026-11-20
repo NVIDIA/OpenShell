@@ -3,8 +3,6 @@
 
 //! `sandbox exec` through the `openshell` CLI: large output, piped stdin, and
 //! early exit.
-//!
-//! Ported from `e2e/rust/tests/sandbox_lifecycle.rs`.
 
 use std::time::Duration;
 

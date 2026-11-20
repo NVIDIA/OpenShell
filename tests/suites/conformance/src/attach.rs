@@ -5,8 +5,8 @@
 //! owner, read-only viewers, retained history on reconnect, and the main
 //! process's exit code.
 //!
-//! Ported from `e2e/rust/tests/sandbox_lifecycle.rs`. The CLI-side transport
-//! recovery and signal tests are in `tests/suites/features/connect-ssh-supervision`.
+//! CLI-side transport recovery and signal tests are in
+//! `tests/suites/features/connect-ssh-supervision`.
 
 use std::process::Stdio;
 use std::time::Duration;

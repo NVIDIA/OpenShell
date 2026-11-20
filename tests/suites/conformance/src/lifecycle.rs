@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use testkit::sdk::{SandboxPhase, SandboxRestartPolicy};
-use testkit::{Context, ResultExt as _, Sandbox, with_deadline};
+use testkit::{Context, Poll, ResultExt as _, Sandbox, poll_until, with_deadline};
 
 /// A long-running sandbox becomes ready, runs a command with exec, and is gone
 /// from get and list after delete.
@@ -162,6 +162,96 @@ async fn run_to_completion_exit_delete(cx: &mut Context) -> testkit::Result {
 
     sandbox.delete().await?;
     sandbox.expect_absent().await
+}
+
+/// Under OnFailure, a failed main command is replaced by a new instance,
+/// the workspace survives, and the gateway reports one restart.
+#[testkit::test]
+async fn on_failure_policy_restarts_main_and_keeps_workspace(cx: &mut Context) -> testkit::Result {
+    const MARKER_TIMEOUT: Duration = Duration::from_secs(15);
+    const RESTART_TIMEOUT: Duration = Duration::from_secs(60);
+    const SCRIPT: &str = r#"
+marker=/sandbox/.openshell-restart-e2e
+if [ -e "$marker" ]; then
+  printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
+  sleep 300
+else
+  touch "$marker"
+  printf 'initial-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/initial-run
+  while [ ! -e /sandbox/.openshell-restart-release ]; do sleep 0.05; done
+  exit 17
+fi
+"#;
+
+    let sandbox = cx
+        .sandbox("of")
+        .image(testkit::python_image())
+        .command(["sh", "-lc", SCRIPT])
+        .restart_policy(SandboxRestartPolicy::OnFailure)
+        .create_ready()
+        .await?;
+    sandbox
+        .poll_exec(
+            "the initial main command to write its workspace marker",
+            MARKER_TIMEOUT,
+            ["cat", "/sandbox/initial-run"],
+            |output| output.exit_code == 0 && output.stdout.contains("initial-"),
+        )
+        .await?;
+
+    let initial = sandbox.get_json().await?;
+    let initial_instance = initial["main_process_instance_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            testkit::Error::msg(format!(
+                "sandbox get reports no main process instance: {initial}"
+            ))
+        })?;
+    sandbox
+        .exec(["touch", "/sandbox/.openshell-restart-release"])
+        .await?
+        .success()?;
+
+    let restarted = poll_until(
+        "the on-failure restart",
+        RESTART_TIMEOUT,
+        Duration::from_millis(250),
+        async || {
+            let details = sandbox.get_json().await?;
+            let replaced = details["main_process_instance_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty() && id != initial_instance);
+            if details["phase"] == "Ready" && details["restart_count"] == 1 && replaced {
+                Ok(Poll::Ready(details))
+            } else {
+                Ok(Poll::Pending(format!("sandbox state: {details}")))
+            }
+        },
+    )
+    .await?;
+    sandbox
+        .poll_exec(
+            "the replacement main command to find the workspace and write its marker",
+            MARKER_TIMEOUT,
+            ["cat", "/sandbox/initial-run", "/sandbox/replacement-run"],
+            |output| {
+                output.exit_code == 0
+                    && output.stdout.contains("initial-")
+                    && output.stdout.contains("replacement-")
+            },
+        )
+        .await?;
+    let final_details = sandbox.get_json().await?;
+    testkit::ensure!(
+        final_details["phase"] == "Ready"
+            && final_details["restart_count"] == 1
+            && final_details["main_process_instance_id"] == restarted["main_process_instance_id"]
+            && final_details["restart_policy"] == "on-failure",
+        "expected the same Ready replacement after reading the workspace, with one restart and the on-failure policy; \
+         replacement: {restarted}; final state: {final_details}"
+    );
+    Ok(())
 }
 
 /// A main command that exits during provisioning is reported as the
