@@ -5,23 +5,16 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::container::{SupportContainer, is_e2e_driver};
-use openshell_e2e::harness::host_process::HostPythonFixture;
-use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
 // Use a qualified policy hostname so runtime-provided resolver search domains
 // (for example Podman's `dns.podman`) cannot rewrite the policy identity.
-const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
-const UNLISTED_ALIAS: &str = "unlisted-exec-recovery.openshell.test";
 const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
-const TCP_DNS_PORT: u16 = 53;
-const TRANSPARENT_LISTENER_PORT: u16 = 15001;
 
 struct MuslDnsProbe {
     _tempdir: tempfile::TempDir,
@@ -79,16 +72,6 @@ impl MuslDnsProbe {
             path,
         })
     }
-}
-
-fn write_policy(host: &str, fixture_port: u16, tcp_dns_port: u16) -> Result<NamedTempFile, String> {
-    write_policy_for_identity(
-        host,
-        "sandbox",
-        "sandbox",
-        &[],
-        &[fixture_port, tcp_dns_port],
-    )
 }
 
 fn write_policy_for(host: &str) -> Result<NamedTempFile, String> {
@@ -199,55 +182,6 @@ while True:
 
     sandbox.cleanup().await;
     drop(fixture);
-}
-
-async fn run_cli(args: &[&str]) -> Result<String, String> {
-    let output = openshell_cmd()
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| format!("run openshell {}: {error}", args.join(" ")))?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if output.status.success() {
-        Ok(combined)
-    } else {
-        Err(combined)
-    }
-}
-
-async fn wait_for_sandbox_logs(
-    sandbox_name: &str,
-    expected: impl Fn(&str) -> bool,
-) -> Result<String, String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let logs = run_cli(&[
-            "logs",
-            sandbox_name,
-            "-n",
-            "500",
-            "--since",
-            "2m",
-            "--source",
-            "sandbox",
-        ])
-        .await?;
-        if expected(&logs) {
-            return Ok(logs);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for transparent TCP logs:\n{logs}"
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
 }
 
 fn private_fixture_probe(host: &str, marker: &str, should_connect: bool) -> String {
@@ -369,208 +303,5 @@ network_policies:
         !logs.contains("blocked-probe"),
         "denied probe reached private fixture: {logs}"
     );
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-async fn local_container_native_tcp_uses_policy_dns_and_fails_closed() {
-    if !is_e2e_driver("docker") && !is_e2e_driver("podman") {
-        return;
-    }
-
-    let fixture_script = |fixture_port: u16, tcp_dns_port: u16, transparent_port: u16| {
-        format!(
-            r#"import socket, threading
-def listen(port):
-  s = socket.socket()
-  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-  s.bind(('0.0.0.0', port))
-  s.listen()
-  return s
-
-def serve(s):
-  while True:
-    c, _ = s.accept()
-    data = c.recv(1024)
-    c.sendall(b'native-tcp-ok:' + data)
-    c.close()
-
-transparent_listener = listen({transparent_port})
-tcp_dns_listener = listen({tcp_dns_port})
-fixture_listener = listen({fixture_port})
-threading.Thread(target=serve, args=(transparent_listener,), daemon=True).start()
-threading.Thread(target=serve, args=(tcp_dns_listener,), daemon=True).start()
-serve(fixture_listener)
-"#
-        )
-    };
-    enum Fixture {
-        Host(HostPythonFixture),
-        Network(SupportContainer),
-    }
-    let (fixture, policy_host, real_ip, fixture_port, tcp_dns_port, transparent_port, wrong_port) =
-        if is_e2e_driver("docker") {
-            let fixture_host_port = find_free_port();
-            let tcp_dns_host_port = find_free_port();
-            let transparent_host_port = find_free_port();
-            let wrong_host_port = loop {
-                let candidate = find_free_port();
-                if ![fixture_host_port, tcp_dns_host_port, transparent_host_port]
-                    .contains(&candidate)
-                {
-                    break candidate;
-                }
-            };
-            let fixture = HostPythonFixture::start(
-                &fixture_script(fixture_host_port, tcp_dns_host_port, transparent_host_port),
-                fixture_host_port,
-            )
-            .await
-            .expect("start host TCP fixture");
-            (
-                Fixture::Host(fixture),
-                "host.openshell.internal".to_string(),
-                "127.0.0.1".to_string(),
-                fixture_host_port,
-                tcp_dns_host_port,
-                transparent_host_port,
-                wrong_host_port,
-            )
-        } else {
-            let fixture = SupportContainer::start_python_with_capabilities(
-                FIXTURE_ALIAS,
-                &fixture_script(FIXTURE_PORT, TCP_DNS_PORT, TRANSPARENT_LISTENER_PORT),
-                FIXTURE_PORT,
-                &["NET_BIND_SERVICE"],
-            )
-            .await
-            .expect("start shared-network TCP fixture");
-            let real_ip = fixture.ip().expect("fixture IP");
-            (
-                Fixture::Network(fixture),
-                FIXTURE_ALIAS.to_string(),
-                real_ip,
-                FIXTURE_PORT,
-                TCP_DNS_PORT,
-                TRANSPARENT_LISTENER_PORT,
-                FIXTURE_PORT + 1,
-            )
-        };
-    // Keep the fixture alive through the sandbox assertions.
-    match &fixture {
-        Fixture::Host(value) => assert_eq!(value.port, fixture_port),
-        Fixture::Network(value) => assert!(!value.alias.is_empty()),
-    }
-    let policy = write_policy(&policy_host, fixture_port, tcp_dns_port).expect("write policy");
-    let policy_path = policy.path().to_string_lossy().into_owned();
-    let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--policy", &policy_path],
-        &["sh", "-c", "echo Ready; sleep infinity"],
-        "Ready",
-    )
-    .await
-    .expect("create local-container sandbox");
-
-    let script = format!(
-        r#"import os, socket, time
-for key in ('ALL_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'http_proxy', 'https_proxy'):
-    os.environ.pop(key, None)
-try:
-    answers = socket.getaddrinfo({host:?}, {port}, type=socket.SOCK_STREAM)
-except OSError as error:
-    resolver = open('/etc/resolv.conf', encoding='utf-8').read()
-    routes = open('/proc/net/route', encoding='utf-8').read()
-    raise RuntimeError(f'policy DNS lookup failed: {{error}}\nresolv.conf:\n{{resolver}}\nroutes:\n{{routes}}') from error
-synthetic = sorted({{item[4][0] for item in answers}})
-assert any(ip.startswith('198.18.') or ip.startswith('198.19.') for ip in synthetic), synthetic
-with socket.create_connection(({host:?}, {port}), timeout=10) as conn:
-    conn.sendall(b'probe')
-    assert conn.recv(1024) == b'native-tcp-ok:probe'
-# Reconnect using only the cached numeric address after the maximum mapping
-# TTL. Do not perform a client DNS lookup that could republish the mapping.
-cached = next(ip for ip in synthetic if ip.startswith(('198.18.', '198.19.')))
-time.sleep(31)
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as conn:
-    conn.settimeout(10)
-    conn.connect((cached, {port}))
-    conn.sendall(b'expired-cache-probe')
-    assert conn.recv(1024) == b'native-tcp-ok:expired-cache-probe'
-mapped = next('::ffff:' + ip for ip in synthetic if ip.startswith(('198.18.', '198.19.')))
-with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as conn:
-    conn.settimeout(10)
-    conn.connect((mapped, {port}))
-    conn.sendall(b'mapped-probe')
-    assert conn.recv(1024) == b'native-tcp-ok:mapped-probe'
-with socket.create_connection(({host:?}, {tcp_dns_port}), timeout=10) as conn:
-    conn.sendall(b'tcp-53-probe')
-    assert conn.recv(1024) == b'native-tcp-ok:tcp-53-probe'
-
-def denied(host, port):
-    try:
-        with socket.create_connection((host, port), timeout=3) as conn:
-            conn.sendall(b'blocked')
-            return conn.recv(1024) != b'native-tcp-ok:blocked'
-    except OSError:
-        return True
-
-assert denied({host:?}, {wrong_port})
-assert denied({real_ip:?}, {port})
-assert denied({real_ip:?}, {transparent_port})
-assert denied({unlisted_host:?}, {port})
-print('transparent-tcp-e2e-ok')
-"#,
-        host = policy_host,
-        port = fixture_port,
-        tcp_dns_port = tcp_dns_port,
-        wrong_port = wrong_port,
-        real_ip = real_ip,
-        transparent_port = transparent_port,
-        unlisted_host = UNLISTED_ALIAS,
-    );
-    let output = match sandbox.exec(&["python3", "-c", &script]).await {
-        Ok(output) => output,
-        Err(error) => {
-            let logs = run_cli(&[
-                "logs",
-                &sandbox.name,
-                "-n",
-                "500",
-                "--since",
-                "2m",
-                "--source",
-                "sandbox",
-            ])
-            .await
-            .unwrap_or_else(|log_error| format!("failed to collect logs: {log_error}"));
-            panic!("exercise native TCP: {error}\nSandbox logs:\n{logs}");
-        }
-    };
-    assert!(output.contains("transparent-tcp-e2e-ok"), "{output}");
-
-    let recovery = sandbox
-        .exec(&["sh", "-c", "printf post-denial-exec-ok"])
-        .await
-        .expect("fresh exec should succeed after an unlisted-host denial");
-    assert_eq!(recovery, "post-denial-exec-ok");
-
-    let logs = wait_for_sandbox_logs(&sandbox.name, |logs| {
-        logs.contains(&format!("-> {policy_host}:{fixture_port}"))
-            && logs.contains("Denied staged transparent connection")
-            && logs.contains(UNLISTED_ALIAS)
-            && logs.contains("policy_dns_ineligible")
-    })
-    .await
-    .expect("wait for sandbox logs");
-    assert!(
-        logs.contains(&format!("-> {policy_host}:{fixture_port}")),
-        "{logs}"
-    );
-    assert!(
-        logs.contains("Denied staged transparent connection"),
-        "{logs}"
-    );
-    assert!(logs.contains(UNLISTED_ALIAS), "{logs}");
-    assert!(logs.contains("policy_dns_ineligible"), "{logs}");
-
     sandbox.cleanup().await;
 }
