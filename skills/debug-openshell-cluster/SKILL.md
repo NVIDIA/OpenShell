@@ -1283,6 +1283,17 @@ Do not edit the annotation, Service selector, or `os-control-<id>` policy:
 reconciliation suspends a sandbox whose Service or control policy no longer
 matches its recorded mode.
 
+New and restarted sandbox generations fetch boundary bootstrap using a
+short-lived JWT over pinned TLS. Dedicated supervisors use port 5502: check
+`os-bootstrap-<id>` Service and NetworkPolicy for connectivity between the
+paired Pods. Shared supervisors use their existing routed runtime listener;
+check instance assignment and the pool's route directory. The workload Secret
+has `bootstrap-token` and trust inputs instead of `boundary.json`; inspect key
+names only, never print token values. A bootstrap timeout occurs before normal
+Sandbox Protocol admission. Deploy matching gateway, supervisor, and sandbox
+images together. Dedicated supervisor inputs remain in its private Secret;
+shared inputs travel with instance assignments. Boundary TLS files remain staged.
+
 The supervisor loads its startup configuration through the polling RPCs and
 opens `ConnectSupervisor` once the workload runs. When the gateway runs with
 `config_delivery_mode = "push"`, it accepts the session with

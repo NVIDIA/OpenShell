@@ -246,23 +246,54 @@ mod linux {
         config_path: &Path,
         qualification: crate::RuntimeQualification,
     ) -> Result<(), String> {
+        run_boundary_source(Some(config_path), qualification)
+    }
+
+    pub fn run_remote_boundary(qualification: crate::RuntimeQualification) -> Result<(), String> {
+        run_boundary_source(None, qualification)
+    }
+
+    fn run_boundary_source(
+        config_path: Option<&Path>,
+        qualification: crate::RuntimeQualification,
+    ) -> Result<(), String> {
         install_boundary_signal_handlers()?;
         make_boundary_nondumpable()?;
         disable_core_dumps()?;
-        let bytes = std::fs::read(config_path)
-            .map_err(|error| format!("read boundary config {}: {error}", config_path.display()))?;
-        let config: BoundaryConfig = serde_json::from_slice(&bytes).map_err(|error| {
-            format!("decode boundary config {}: {error}", config_path.display())
-        })?;
+        let config: BoundaryConfig = if let Some(path) = config_path {
+            let bytes = std::fs::read(path)
+                .map_err(|error| format!("read boundary config {}: {error}", path.display()))?;
+            serde_json::from_slice(&bytes).map_err(|_| "decode boundary config".to_string())?
+        } else {
+            use openshell_sandbox_backend::bootstrap;
+            let input = |name| std::env::var(name).map_err(|_| format!("missing {name}"));
+            let address = input(bootstrap::ADDRESS_ENV)?
+                .parse()
+                .map_err(|_| "invalid bootstrap address")?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("create bootstrap runtime: {error}"))?;
+            runtime.block_on(bootstrap::fetch(
+                address,
+                input(bootstrap::SERVER_NAME_ENV)?,
+                &input(bootstrap::CA_ENV)?,
+                &input(bootstrap::TOKEN_ENV)?,
+                Some(input(bootstrap::ROUTE_ENV)?)
+                    .filter(|route| !route.is_empty())
+                    .as_deref(),
+            ))?
+        };
         validate_config(&config)?;
         validate_runtime_resource_claims(&config)?;
         validate_running_identity(
             &config.workload_identity,
             allows_runtime_supplementary_groups(&config),
         )?;
-        std::fs::remove_file(config_path).map_err(|error| {
-            format!("consume boundary config {}: {error}", config_path.display())
-        })?;
+        if let Some(path) = config_path {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("consume boundary config {}: {error}", path.display()))?;
+        }
         crate::process::install_boundary_user_environment(config.child_env.clone())?;
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
@@ -10947,6 +10978,9 @@ mod linux {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+pub use linux::run_remote_boundary;
 
 #[cfg(target_os = "linux")]
 pub fn run_boundary(

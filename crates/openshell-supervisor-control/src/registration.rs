@@ -107,6 +107,9 @@ pub struct SandboxInstanceRegistration {
     pub sandbox_name: String,
     /// Supervisor-side launch descriptor using the routed transport.
     pub runtime_descriptor: SandboxRuntimeDescriptor,
+    /// Launch-pinned bootstrap served through this instance's routed listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<openshell_sandbox_backend::bootstrap::BootstrapServerConfig>,
     /// Gateway-issued credentials for exactly this generation.
     pub auth: openshell_core::jwt::SupervisorAuthBundle,
     /// Encoded `MainProcessConfig` for the canonical process.
@@ -163,6 +166,16 @@ impl SandboxInstanceRegistration {
         {
             return Err(RegistrationError::new(
                 "launch credentials do not match the runtime generation",
+            ));
+        }
+        if let Some(bootstrap) = &self.bootstrap
+            && (bootstrap.config.boundary_id != descriptor.boundary_id
+                || bootstrap.config.generation != descriptor.generation
+                || bootstrap.config.session_id != descriptor.session_id
+                || bootstrap.config.auth_epoch != self.auth.auth_epoch)
+        {
+            return Err(RegistrationError::new(
+                "bootstrap does not match the runtime generation",
             ));
         }
         self.auth

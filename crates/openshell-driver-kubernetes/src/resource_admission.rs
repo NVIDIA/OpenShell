@@ -143,6 +143,17 @@ fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, 
                 return Err(deny());
             }
             for env in container["env"].as_array().into_iter().flatten() {
+                // Only driver-authored bootstrap inputs from this generation's
+                // private Secret may cross into the trusted boundary process.
+                // Its launcher strips the reserved namespace from workload env.
+                if field == "containers" && container["name"] == "agent"
+                    && container["command"] == serde_json::json!(["/.openshell/runtime/openshell-sandbox", "--bootstrap-remote"])
+                    && openshell_sandbox_backend::bootstrap::ENV_KEYS.iter().any(|(name, key)| {
+                        *env == serde_json::json!({"name": name, "valueFrom": {"secretKeyRef": {"name": private_secret, "key": key}}})
+                    })
+                {
+                    continue;
+                }
                 if !env["valueFrom"]["secretKeyRef"].is_null()
                     || !env["valueFrom"]["configMapKeyRef"].is_null()
                 {

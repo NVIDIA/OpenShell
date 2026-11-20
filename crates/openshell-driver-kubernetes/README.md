@@ -180,6 +180,35 @@ container again from gateway config, so a sandbox created by an older gateway
 starts with the current sandbox runtime image. The shared network fence
 remains for the lifetime of the namespace.
 
+### Boundary bootstrap
+
+Every new Kubernetes sandbox generation receives a 15-minute bootstrap JWT,
+supervisor address, pinned TLS trust, and the boundary certificate/key through
+its workload Secret. It contains no `boundary.json`. The sandbox fetches its
+configuration into memory before normal admission. Stop/start creates fresh
+credentials and Secret references. Deploy matching gateway, supervisor, and
+sandbox images together.
+
+Dedicated supervisors serve bootstrap on port 5502 through the per-sandbox
+`os-bootstrap-<id>` Service and NetworkPolicy, independently of the Sandbox
+Protocol connection direction. Shared supervisors serve each instance through
+its existing routed runtime listener, including pool-owner redirects. Their
+bootstrap input travels in the gateway's instance assignment. Dedicated
+supervisors receive it through their existing private Secret.
+
+Bootstrap reuses the session JWT implementation with a separate audience,
+token type, and sandbox component. The trusted driver issues the token with an
+ephemeral per-launch key. The supervisor checks the registered token ID,
+sandbox, generation, and epoch. A response lost before acknowledgment can be
+fetched again. Acknowledgment retires that launch's exchange in memory; a
+supervisor restart or reassignment resets retirement while the token is valid.
+Fetch retries are bounded to two minutes and never fall back to a file.
+Boundary TLS files remain staged. Existing running generations retain their
+launch inputs; their next start uses token bootstrap.
+
+The standard `mise run e2e:kubernetes` suite checks creation, workload
+environment isolation, absence of the boundary config file, and stop/start.
+
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals
 must not create permissive policies, create Pods, read bootstrap Secrets, or

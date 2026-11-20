@@ -11,6 +11,7 @@
 //! `openshell-sandbox` runtime implements the generated server services.
 
 mod audit;
+pub mod bootstrap;
 pub mod boundary_protocol;
 pub mod delegated;
 pub mod isolation_protocol;

@@ -30,7 +30,7 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
 #[cfg(target_os = "linux")]
-const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
+const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 2] = ["tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
 #[cfg(target_os = "linux")]
@@ -56,8 +56,16 @@ const LINUX_SIGNAL_LIMIT: i32 = 65;
 #[command(about = "OpenShell in-workload isolation boundary")]
 struct BoundaryArgs {
     /// Protected one-use bootstrap configuration staged by the driver.
+    #[arg(
+        long,
+        required_unless_present = "bootstrap_remote",
+        conflicts_with = "bootstrap_remote"
+    )]
+    bootstrap: Option<std::path::PathBuf>,
+
+    /// Fetch configuration from the supervisor using protected bootstrap environment inputs.
     #[arg(long)]
-    bootstrap: std::path::PathBuf,
+    bootstrap_remote: bool,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
@@ -1792,6 +1800,11 @@ fn seed_kubernetes_workspace() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+    run_boundary_source(Some(bootstrap), log_level)
+}
+
+#[cfg(target_os = "linux")]
+fn run_boundary_source(bootstrap: Option<&Path>, log_level: &str) -> Result<()> {
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
@@ -1804,7 +1817,10 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
         )
         .try_init();
     let (qualification, _) = qualify_runtime()?;
-    openshell_sandbox::run(bootstrap, qualification)
+    bootstrap.map_or_else(
+        || openshell_sandbox::run_remote(qualification),
+        |path| openshell_sandbox::run(path, qualification),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1853,7 +1869,14 @@ fn main() -> Result<()> {
     }
 
     let args = BoundaryArgs::parse();
-    run_boundary(&args.bootstrap, &args.log_level)
+    #[cfg(target_os = "linux")]
+    {
+        run_boundary_source(args.bootstrap.as_deref(), &args.log_level)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(miette::miette!("openshell-sandbox requires Linux"))
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
