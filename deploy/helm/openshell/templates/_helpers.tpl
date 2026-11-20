@@ -191,7 +191,7 @@ Name of the gateway ClusterRoleBinding.
 
 {{/* Official sandbox runtime repository used by the gateway's built-in default. */}}
 {{- define "openshell.defaultSandboxRuntimeRepository" -}}
-ghcr.io/nvidia/openshell/sandbox
+quay.io/ai-openshell/sandbox
 {{- end }}
 
 {{/* Whether Helm must propagate a sandbox runtime image override. */}}
@@ -684,7 +684,7 @@ absent fields so every chart consumer observes the same configuration.
 {{- end -}}
 {{- $legacySupervisor := .Values.supervisor.image | default dict -}}
 {{- $legacySupervisorImage := include "openshell.supervisorImage" . -}}
-{{- $defaultSupervisorImage := printf "ghcr.io/nvidia/openshell/supervisor:%s" .Chart.AppVersion -}}
+{{- $defaultSupervisorImage := printf "quay.io/ai-openshell/supervisor:%s" .Chart.AppVersion -}}
 {{- if and (ne $legacySupervisorImage $defaultSupervisorImage) (not (hasKey $kubernetes "supervisor_image")) -}}
 {{- $_ := set $kubernetes "supervisor_image" $legacySupervisorImage -}}
 {{- end -}}

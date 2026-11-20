@@ -95,7 +95,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/nvidia/openshell/gateway:release-test
+          value: quay.io/ai-openshell/gateway:release-test
 
   - it: preserves digest precedence over a gateway tag for the workload
     template: templates/statefulset.yaml
@@ -105,7 +105,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/nvidia/openshell/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          value: quay.io/ai-openshell/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
   - it: preserves digest precedence over a gateway tag for the certgen Job
     template: templates/certgen.yaml
@@ -116,11 +116,11 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/nvidia/openshell/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          value: quay.io/ai-openshell/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
   - it: leaves the appVersion image fallback unchanged
     template: templates/statefulset.yaml
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/nvidia/openshell/gateway:0.1.9+build.1
+          value: quay.io/ai-openshell/gateway:0.1.9+build.1

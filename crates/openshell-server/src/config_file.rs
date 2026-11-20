@@ -2044,8 +2044,8 @@ dangerously_allow_insecure_http = false
 
 [openshell.drivers.kubernetes]
 namespace = "agents"
-default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
+default_image = "quay.io/ai-openshell/sandbox:latest"
+supervisor_image = "quay.io/ai-openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
 service_account_name = "openshell-sandbox"
 grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
@@ -2095,7 +2095,7 @@ namespace = "agents"
             kubernetes
                 .get("default_image")
                 .and_then(toml::Value::as_str),
-            Some("ghcr.io/nvidia/openshell/sandbox:latest")
+            Some("quay.io/ai-openshell/sandbox:latest")
         );
         assert!(
             file.openshell

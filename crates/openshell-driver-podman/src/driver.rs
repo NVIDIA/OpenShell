@@ -3871,25 +3871,25 @@ mod tests {
     #[test]
     fn supervisor_pull_policy_refreshes_mutable_tags_only() {
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:dev"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor:dev"),
             "newer"
         );
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:latest"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor:latest"),
             "newer"
         );
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor"),
             "newer"
         );
         assert_eq!(
             runtime_image_pull_policy(
-                "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
+                "quay.io/ai-openshell/supervisor:0.0.47-dev.13-g57b71c68f"
             ),
             "missing"
         );
         assert_eq!(
-            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor@sha256:abc123"),
+            runtime_image_pull_policy("quay.io/ai-openshell/supervisor@sha256:abc123"),
             "missing"
         );
     }

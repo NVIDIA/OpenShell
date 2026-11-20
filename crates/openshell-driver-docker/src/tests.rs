@@ -4264,10 +4264,10 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
 }
 
 #[test]
-fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
+fn default_docker_supervisor_image_uses_quay_repo() {
     let image = openshell_core::config::default_supervisor_image();
     assert!(
-        image.starts_with("ghcr.io/nvidia/openshell/supervisor:"),
+        image.starts_with("quay.io/ai-openshell/supervisor:"),
         "unexpected default image reference: {image}",
     );
 }
@@ -4300,19 +4300,19 @@ fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
 #[test]
 fn docker_supervisor_image_refreshes_mutable_tags_only() {
     assert!(supervisor_image_should_refresh(
-        "ghcr.io/nvidia/openshell/supervisor:dev"
+        "quay.io/ai-openshell/supervisor:dev"
     ));
     assert!(supervisor_image_should_refresh(
-        "ghcr.io/nvidia/openshell/supervisor:latest"
+        "quay.io/ai-openshell/supervisor:latest"
     ));
     assert!(supervisor_image_should_refresh(
-        "ghcr.io/nvidia/openshell/supervisor"
+        "quay.io/ai-openshell/supervisor"
     ));
     assert!(!supervisor_image_should_refresh(
-        "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
+        "quay.io/ai-openshell/supervisor:0.0.47-dev.13-g57b71c68f"
     ));
     assert!(!supervisor_image_should_refresh(
-        "ghcr.io/nvidia/openshell/supervisor@sha256:abc123"
+        "quay.io/ai-openshell/supervisor@sha256:abc123"
     ));
 }
 

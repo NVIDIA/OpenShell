@@ -156,10 +156,10 @@ impl FromStr for PolicyValidationFailureMode {
 }
 
 /// Default OCI repository for the supervisor image (no tag).
-pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
+pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "quay.io/ai-openshell/supervisor";
 
 /// Default OCI repository for the sandbox runtime image (no tag).
-pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/sandbox";
+pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "quay.io/ai-openshell/sandbox";
 
 /// Process-level default for the trusted sandbox runtime image.
 pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = "OPENSHELL_SANDBOX_RUNTIME_IMAGE";
@@ -2207,12 +2207,12 @@ mod tests {
     fn default_supervisor_image_is_version_pinned() {
         use super::{compiled_sandbox_runtime_image, compiled_supervisor_image};
         let image = compiled_supervisor_image();
-        assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
+        assert!(image.starts_with("quay.io/ai-openshell/supervisor:"));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
 
         let sandbox_image = compiled_sandbox_runtime_image();
-        assert!(sandbox_image.starts_with("ghcr.io/nvidia/openshell/sandbox:"));
+        assert!(sandbox_image.starts_with("quay.io/ai-openshell/sandbox:"));
         let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
         assert!(!sandbox_tag.is_empty());
     }

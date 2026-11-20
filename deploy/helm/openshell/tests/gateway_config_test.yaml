@@ -340,10 +340,10 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:v0\.1\.0"'
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/ai-openshell/supervisor:v0\.1\.0"'
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'sandbox_runtime_image\s*=\s*"registry\.example\.com/openshell/sandbox:v0\.1\.0"'
+          pattern: 'sandbox_runtime_image\s*=\s*"registry\.example\.com/ai-openshell/sandbox:v0\.1\.0"'
 
   - it: lets an individual registry override the global registry
     template: templates/statefulset.yaml
@@ -365,7 +365,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: registry.example.com/openshell/gateway:v0.1.0
+          value: registry.example.com/ai-openshell/gateway:v0.1.0
 
   - it: defaults a repository-only sandbox image to latest
     template: templates/gateway-config.yaml
@@ -946,7 +946,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:0\.0\.0"'
+          pattern: 'supervisor_image\s*=\s*"quay\.io/ai-openshell/supervisor:0\.0\.0"'
 
   - it: uses the gateway built-in sandbox runtime image by default
     template: templates/gateway-config.yaml
@@ -995,7 +995,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:1\.2\.3"'
+          pattern: 'supervisor_image\s*=\s*"quay\.io/ai-openshell/supervisor:1\.2\.3"'
 
   - it: renders a supervisor repository override with the default chart tag
     template: templates/gateway-config.yaml
