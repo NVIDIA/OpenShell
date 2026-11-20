@@ -173,14 +173,23 @@ impl HttpRecorder {
     pub async fn serve(
         handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
     ) -> Result<Self> {
-        Self::listen(None, handler).await
+        Self::builder().serve(handler).await
+    }
+
+    /// A recorder on a chosen port or with TLS, such as on a port the
+    /// environment published:
+    ///
+    /// ```ignore
+    /// let upstream = HttpRecorder::builder().port(port).tls(&identity).start("ok").await?;
+    /// ```
+    pub fn builder() -> HttpRecorderBuilder {
+        HttpRecorderBuilder::default()
     }
 
     /// Answer every request over TLS with `200` and `body`, presenting
     /// `identity`'s certificate.
     pub async fn start_tls(identity: &Identity, body: impl Into<String>) -> Result<Self> {
-        let body = body.into();
-        Self::serve_tls(identity, move |_| Response::text(body.clone())).await
+        Self::builder().tls(identity).start(body).await
     }
 
     /// Answer every request over TLS with `handler`'s response, presenting
@@ -190,14 +199,15 @@ impl HttpRecorder {
         identity: &Identity,
         handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
     ) -> Result<Self> {
-        Self::listen(Some(identity.acceptor()?), handler).await
+        Self::builder().tls(identity).serve(handler).await
     }
 
     async fn listen(
+        port: u16,
         tls: Option<TlsAcceptor>,
         handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
     ) -> Result<Self> {
-        let (listener, port) = bind().await?;
+        let (listener, port) = bind(port).await?;
         let handler: Arc<Handler> = Arc::new(handler);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
@@ -215,7 +225,8 @@ impl HttpRecorder {
                     match tls {
                         None => respond(stream, local_addr, handler, requests).await,
                         Some(tls) => {
-                            if let Ok(stream) = tls.accept(stream).await {
+                            let handshake = tokio::time::timeout(READ_TIMEOUT, tls.accept(stream));
+                            if let Ok(Ok(stream)) = handshake.await {
                                 respond(stream, local_addr, handler, requests).await;
                             }
                         }
@@ -263,6 +274,47 @@ impl HttpRecorder {
             },
         )
         .await
+    }
+}
+
+/// Options for an [`HttpRecorder`], from [`HttpRecorder::builder`].
+#[derive(Debug, Default)]
+pub struct HttpRecorderBuilder {
+    port: u16,
+    tls: Option<Identity>,
+}
+
+impl HttpRecorderBuilder {
+    /// Listen on `port` instead of a random free one. Fails to start if
+    /// something already listens there.
+    #[must_use]
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Serve TLS, presenting `identity`'s certificate. A connection that
+    /// fails the TLS handshake counts in
+    /// [`connections`](HttpRecorder::connections) but records no request.
+    #[must_use]
+    pub fn tls(mut self, identity: &Identity) -> Self {
+        self.tls = Some(identity.clone());
+        self
+    }
+
+    /// Answer every request with `200` and `body`.
+    pub async fn start(self, body: impl Into<String>) -> Result<HttpRecorder> {
+        let body = body.into();
+        self.serve(move |_| Response::text(body.clone())).await
+    }
+
+    /// Answer every request with `handler`'s response.
+    pub async fn serve(
+        self,
+        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> Result<HttpRecorder> {
+        let tls = self.tls.as_ref().map(Identity::acceptor).transpose()?;
+        HttpRecorder::listen(self.port, tls, handler).await
     }
 }
 
@@ -439,6 +491,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(upgrade).unwrap(),
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_recorder_listens_on_a_chosen_port() {
+        let port = crate::free_port().await.unwrap();
+        let recorder = HttpRecorder::builder()
+            .port(port)
+            .start("fixed")
+            .await
+            .unwrap();
+        assert_eq!(recorder.port, port);
+        let mut stream = connect(port).await;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_to_end(&mut stream).await.ends_with("fixed"));
+
+        let error = HttpRecorder::builder()
+            .port(port)
+            .start("taken")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains(&format!("port {port}")),
+            "{error}"
         );
     }
 

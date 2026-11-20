@@ -6,7 +6,7 @@
 # `podman_userns_mode` is default, auto, keep-id or private. Every mode except
 # default adds its `[openshell.drivers.podman]` settings to the gateway
 # overrides (the gateway_overrides role), which every installer applies to the
-# gateway's configuration. Default mode adds nothing, so userns, uidmap and
+# gateway's configuration. Default mode removes them, so userns, uidmap and
 # gidmap stay unset. The Podman support crate (tests/support/podman) reads the
 # published mode and runs Podman's own reference container in it.
 ---
@@ -47,7 +47,7 @@
       vars:
         gateway_overrides_name: podman-userns
         gateway_overrides_content: "{{ podman_userns_settings[podman_userns_mode] }}"
-      when: podman_userns_mode != "default"
+        gateway_overrides_state: "{{ 'absent' if podman_userns_mode == 'default' else 'present' }}"
 
     - name: Publish Podman user-namespace test variables
       ansible.builtin.include_tasks: ../../test-env.yaml

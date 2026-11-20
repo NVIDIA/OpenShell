@@ -12,7 +12,9 @@ tests to read. A tmachine environment publishes its variables with
 `tests/tmachine/ansible/playbooks/test-env.yaml`, and `openshell-test-runner`
 passes them to the tests. To run a suite against your own deployment, set them
 yourself. A fixture fails the test when a variable it needs is missing; it
-never skips it. Add a row when you add a variable.
+never skips it. Add a row when you add a variable. The runner also sets
+`OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, which testkit reads; see
+[Running against a gateway](../testkit/README.md#running-against-a-gateway).
 
 | Variable | Set by | Read by | Meaning |
 |---|---|---|---|
@@ -27,7 +29,7 @@ never skips it. Add a row when you add a variable.
 | `OPENSHELL_TEST_KEYCLOAK_USER_PASSWORD` | `<base>-oidc` | `keycloak-support` | That user's password. |
 | `OPENSHELL_TEST_KEYCLOAK_USER_B_USERNAME` | `<base>-oidc` | `keycloak-support` (`User::UserB`) | A second such user, for tests across two users' workspaces. |
 | `OPENSHELL_TEST_KEYCLOAK_USER_B_PASSWORD` | `<base>-oidc` | `keycloak-support` | That user's password. |
-| `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which configures the gateway's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the gateway trusts. |
+| `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which sets the driver's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the supervisor trusts for sandbox egress. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | The additional-CA environment | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |
 | `OPENSHELL_TEST_PYTHON_IMAGE` | Optional; `e2e/rust/e2e-kubernetes.sh` and `e2e-vm.sh` set a pullable image | `testkit::python_image()` | The workload image for tests that run `python3`, curl, git or openssl. Unset, it is `openshell/e2e-python:dev`, which the tmachine installers load. |
@@ -39,10 +41,11 @@ purpose: unit-test child-process markers, the re-entry markers in
 `tests/support/environment.rs`, Nix guest-cache settings, `install.sh` test
 hooks and crate test settings.
 
-### Addresses the environment chooses
+### Ports the environment chooses
 
-When a test must listen on an address the environment picked, because the
-gateway or another service is configured to call it, the environment
-publishes it as `OPENSHELL_TEST_<SERVICE>_LISTEN` and the test binds it. The
-test never picks the address itself. Tests that bind the same address can't
-run at the same time.
+When a test must listen on a port the environment picked, because the gateway
+or another service is configured to call it, the environment publishes it as
+`OPENSHELL_TEST_<SERVICE>_PORT` and the test binds that port on every host
+address, for example with `HttpRecorder::builder().port(port)` from
+`host-server-support`. The test never picks the port itself. Tests that bind
+the same port can't run at the same time.
