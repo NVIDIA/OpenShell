@@ -637,7 +637,6 @@ Prerequisites:
 
 - All commits include a DCO sign-off (`git commit -s`).
 - Org members and collaborators sign their commits (see [Commit signing](#commit-signing)).
-- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
 
 Flow:
 
