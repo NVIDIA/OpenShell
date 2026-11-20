@@ -52,6 +52,9 @@ async fn network_events_are_json_on_supervisor_stderr_only(cx: &mut Context) -> 
         .image(&image)
         .command(["sleep", "infinity"])
         .policy(allowed)
+        // The shorthand layer logs at info. Podman's supervisor defaults to
+        // warn, where Docker's follows the gateway's level.
+        .log_level("info")
         .create_ready()
         .await?;
     let supervisor = engine
