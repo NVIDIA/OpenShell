@@ -4814,75 +4814,64 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions, pod_name, placement) =
-            match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
-                Ok(Ok(list)) => {
-                    if let Some(obj) = list.items.into_iter().next() {
-                        match obj.metadata.name.clone() {
-                            Some(name) => {
-                                let ns = obj
-                                    .metadata
-                                    .namespace
-                                    .clone()
-                                    .unwrap_or_else(|| self.config.namespace.clone());
-                                let ws = obj
-                                    .metadata
-                                    .labels
-                                    .as_ref()
-                                    .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
-                                    .unwrap_or_default();
-                                // An unreadable placement leaves any instance to reconciliation.
-                                let placement = supervisor_placement(&obj).ok();
-                                let pc = Preconditions {
-                                    uid: obj.metadata.uid,
-                                    resource_version: obj.metadata.resource_version,
-                                };
-                                let pod_name = obj
-                                    .metadata
-                                    .annotations
-                                    .as_ref()
-                                    .and_then(|annotations| {
-                                        annotations.get(SANDBOX_POD_NAME_ANNOTATION)
-                                    })
-                                    .cloned()
-                                    .unwrap_or_else(|| name.clone());
-                                (name, ns, ws, pc, pod_name, placement)
-                            }
-                            None => return Ok(false),
-                        }
-                    } else {
-                        debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
-                        return Ok(false);
-                    }
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "Failed to list sandbox for deletion from Kubernetes"
-                    );
-                    return Err(err.to_string());
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                        "Timed out listing sandbox for deletion from Kubernetes"
-                    );
-                    return Err(format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ));
-                }
-            };
+        let list = match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
+            Ok(Ok(list)) => list,
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "Failed to list sandbox for deletion from Kubernetes"
+                );
+                return Err(err.to_string());
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out listing sandbox for deletion from Kubernetes"
+                );
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        };
+        let Some(obj) = list.items.into_iter().next() else {
+            debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+            return Ok(false);
+        };
+        // An unreadable placement leaves any instance to reconciliation.
+        let placement = supervisor_placement(&obj).ok();
+        let kube_name = obj.metadata.name.ok_or("Sandbox CR has no name")?;
+        let obj_namespace = obj
+            .metadata
+            .namespace
+            .unwrap_or_else(|| self.config.namespace.clone());
+        let uid = obj
+            .metadata
+            .uid
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| format!("Sandbox CR {obj_namespace}/{kube_name} has no UID"))?;
+        let pod_name = obj
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+            .cloned()
+            .unwrap_or_else(|| kube_name.clone());
 
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
-        let dp = DeleteParams::default().preconditions(preconditions);
+        // Delete this identity, not this revision. A controller status write
+        // must not block deletion, and a same-name replacement has another UID.
+        let dp = DeleteParams::default().preconditions(Preconditions {
+            uid: Some(uid),
+            resource_version: None,
+        });
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
-                info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
+                info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Kubernetes accepted Sandbox CR deletion");
                 // The workload is going away, so its sandbox instance cannot
                 // stop it gracefully; end the instance without delaying the
                 // delete.
@@ -4923,11 +4912,14 @@ impl KubernetesComputeDriver {
                 }
                 Ok(true)
             }
-            Ok(Err(KubeError::Api(err))) if err.code == 404 || err.code == 409 => {
-                debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted or replaced)");
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
                 Ok(false)
             }
             Ok(Err(err)) => {
+                // In particular, a 409 is not proof of absence. Returning
+                // false would let the gateway release the name without a
+                // deletion event or an independent lookup.
                 warn!(
                     sandbox_id = %sandbox_id,
                     error = %err,
