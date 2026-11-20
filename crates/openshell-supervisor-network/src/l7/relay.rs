@@ -38,7 +38,7 @@ use openshell_ocsf::{
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 #[cfg(test)]
@@ -1643,6 +1643,19 @@ where
             return Ok(());
         }
 
+        // Wait for a request before capturing its observation authority. A
+        // keep-alive connection can follow an unrelated reload while idle;
+        // partial headers and bodies must still retain the captured epoch.
+        let ready = parse_next_http_request(
+            async { Ok((!client.fill_buf().await.into_diagnostic()?.is_empty()).then_some(())) },
+            upstream,
+            ctx,
+        )
+        .await?;
+        if ready.is_none() || close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
         // Pin observation authority before parsing can await or a later
         // provider lookup can select state from another installation.
         let observation_context = ctx
@@ -3206,8 +3219,21 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let mut client_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let client = &mut client_buffer;
     loop {
         if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let ready = parse_next_http_request(
+            async { Ok((!client.fill_buf().await.into_diagnostic()?.is_empty()).then_some(())) },
+            upstream,
+            ctx,
+        )
+        .await?;
+        if ready.is_none() || close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 

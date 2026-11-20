@@ -755,7 +755,7 @@ fn build_mapping_publication_event(
 pub(crate) fn test_service(
     policy: Arc<OpaEngine>,
     store: Arc<ResolvedEndpointStore>,
-    addresses: Vec<std::net::IpAddr>,
+    addresses: Vec<IpAddr>,
 ) -> PolicyDnsService<impl TrustedResolver> {
     test_service_with_gateway(policy, store, addresses, None)
 }
@@ -765,10 +765,10 @@ pub(crate) fn test_service(
 pub(crate) fn test_service_with_gateway(
     policy: Arc<OpaEngine>,
     store: Arc<ResolvedEndpointStore>,
-    addresses: Vec<std::net::IpAddr>,
-    trusted_host_gateway: Option<std::net::IpAddr>,
+    addresses: Vec<IpAddr>,
+    trusted_host_gateway: Option<IpAddr>,
 ) -> PolicyDnsService<impl TrustedResolver> {
-    struct FixedResolver(Vec<std::net::IpAddr>);
+    struct FixedResolver(Vec<IpAddr>);
 
     impl TrustedResolver for FixedResolver {
         async fn resolve(
@@ -1571,13 +1571,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             let exact =
                 build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], true).unwrap();
             assert!(mapping.pinned_plan(&exact).is_ok());
-            let wildcard =
-                build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], false).unwrap();
-            let on_443 = service.store.lookup(answer.address, 443, now).unwrap();
-            assert!(matches!(
-                on_443.pinned_plan(&wildcard),
-                Err(MappingLookupError::InvalidMapping)
-            ));
+            let denial = build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], false)
+                .expect_err("a wildcard cannot authorize an internal IP literal");
+            assert_eq!(denial.kind, DestinationDenialKind::InternalAddress);
         }
     }
 

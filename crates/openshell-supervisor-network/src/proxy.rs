@@ -1511,6 +1511,7 @@ fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
 
 /// Why [`pin_transparent_tcp`] refused an authorized connection.
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum TransparentPinRefusal {
     /// The deciding endpoint's destination rules could not be built.
     Destination(DestinationDenial),

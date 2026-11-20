@@ -194,7 +194,7 @@ impl CredentialVersions {
         self.statics = Arc::new(statics);
         self.grants = grants;
         self.observed = Some(Arc::clone(&inner.current));
-        self.observed_resolver = inner.current_resolver.clone();
+        self.observed_resolver.clone_from(&inner.current_resolver);
     }
 }
 

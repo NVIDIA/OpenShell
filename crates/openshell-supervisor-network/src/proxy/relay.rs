@@ -2002,7 +2002,7 @@ network_policies:
     /// Publish the endpoint-status inventory of the policy `config` came from,
     /// as the supervisor does after installing a configuration.
     async fn publish_mcp_inventory(
-        sender: &openshell_core::endpoint_status::EndpointObservationSender,
+        sender: &EndpointObservationSender,
         receiver: &mut openshell_core::endpoint_status::EndpointStatusReceiver,
         config: &crate::l7::L7EndpointConfig,
     ) {
@@ -2105,11 +2105,15 @@ network_policies:
     async fn mcp_status_across_reload(
         reload_to: Option<openshell_core::proto::SandboxPolicy>,
         publish_for: Option<openshell_core::proto::SandboxPolicy>,
+        route_selection: bool,
     ) -> McpStatusAcrossReload {
         let initial = example_mcp_proto_policy("initialize", &[]);
         let engine = Arc::new(OpaEngine::from_proto(&initial).unwrap());
         let decision = authorized_decision(&engine);
-        let route = inspected_route(&decision);
+        let mut route = inspected_route(&decision);
+        if route_selection {
+            route.configs.push(route.configs[0].clone());
+        }
         let (sender, mut receiver) = openshell_core::endpoint_status::endpoint_status_channel();
         publish_mcp_inventory(&sender, &mut receiver, &route.configs[0].config).await;
         let mut request = http_context(
@@ -2164,17 +2168,24 @@ network_policies:
     /// exchanges, against the new policy.
     #[tokio::test]
     async fn mcp_tunnel_keeps_reporting_endpoint_status_after_an_unrelated_reload() {
-        let reloaded = example_mcp_proto_policy("initialize", &["other.example.net"]);
-        let reloaded_hash = mcp_endpoint_config(&reloaded).policy_hash;
+        for route_selection in [false, true] {
+            let reloaded = example_mcp_proto_policy("initialize", &["other.example.net"]);
+            let reloaded_hash = mcp_endpoint_config(&reloaded).policy_hash;
 
-        let outcome = mcp_status_across_reload(Some(reloaded.clone()), Some(reloaded)).await;
+            let outcome = Box::pin(mcp_status_across_reload(
+                Some(reloaded.clone()),
+                Some(reloaded),
+                route_selection,
+            ))
+            .await;
 
-        assert!(outcome.second_forwarded, "the tunnel must stay open");
-        assert_eq!(
-            outcome.second_reported,
-            Some(reloaded_hash),
-            "the exchange must be reported against the policy now in force"
-        );
+            assert!(outcome.second_forwarded, "the tunnel must stay open");
+            assert_eq!(
+                outcome.second_reported,
+                Some(reloaded_hash),
+                "the exchange must be reported against the policy now in force"
+            );
+        }
     }
 
     /// Until the supervisor publishes the reloaded policy's
@@ -2184,7 +2195,7 @@ network_policies:
     async fn mcp_tunnel_reports_nothing_until_the_reloaded_policy_inventory_is_published() {
         let reloaded = example_mcp_proto_policy("initialize", &["other.example.net"]);
 
-        let outcome = mcp_status_across_reload(Some(reloaded), None).await;
+        let outcome = Box::pin(mcp_status_across_reload(Some(reloaded), None, false)).await;
 
         assert_eq!(outcome.second_reported, None);
     }
@@ -2195,7 +2206,7 @@ network_policies:
     async fn mcp_tunnel_reports_nothing_against_an_inventory_published_ahead_of_its_policy() {
         let upcoming = example_mcp_proto_policy("initialize", &["other.example.net"]);
 
-        let outcome = mcp_status_across_reload(None, Some(upcoming)).await;
+        let outcome = Box::pin(mcp_status_across_reload(None, Some(upcoming), false)).await;
 
         assert!(
             outcome.second_forwarded,
@@ -2210,7 +2221,12 @@ network_policies:
     async fn mcp_tunnel_closes_and_reports_nothing_when_its_rules_change() {
         let reloaded = example_mcp_proto_policy("tools/list", &[]);
 
-        let outcome = mcp_status_across_reload(Some(reloaded.clone()), Some(reloaded)).await;
+        let outcome = Box::pin(mcp_status_across_reload(
+            Some(reloaded.clone()),
+            Some(reloaded),
+            false,
+        ))
+        .await;
 
         assert!(!outcome.second_forwarded);
         assert_eq!(outcome.second_reported, None);
@@ -2219,21 +2235,30 @@ network_policies:
     // --- Credentials injected through a stable-handle placeholder ---
 
     /// `API_KEY` bound to example.com:80 with a stable workload handle, so its
-    /// placeholder survives rotations, plus an unbound `OTHER_TOKEN`.
+    /// placeholder survives rotations, plus a separately bound `OTHER_TOKEN`.
     fn stable_handle_bindings()
     -> std::collections::HashMap<String, openshell_core::proto::StaticCredentialBinding> {
-        std::collections::HashMap::from([(
-            "API_KEY".to_string(),
-            openshell_core::proto::StaticCredentialBinding {
-                endpoints: vec![openshell_core::proto::StaticCredentialEndpointBinding {
-                    host: "example.com".to_string(),
-                    port: 80,
-                    path: "/**".to_string(),
-                }],
-                credential_identity: "provider:API_KEY".to_string(),
-                workload_credential_handle: "a".repeat(64),
-            },
-        )])
+        ["API_KEY", "OTHER_TOKEN"]
+            .into_iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    openshell_core::proto::StaticCredentialBinding {
+                        endpoints: vec![openshell_core::proto::StaticCredentialEndpointBinding {
+                            host: "example.com".to_string(),
+                            port: 80,
+                            path: "/**".to_string(),
+                        }],
+                        credential_identity: format!("provider:{key}"),
+                        workload_credential_handle: if key == "API_KEY" {
+                            "a".repeat(64)
+                        } else {
+                            String::new()
+                        },
+                    },
+                )
+            })
+            .collect()
     }
 
     fn stable_handle_tokens(
@@ -2531,7 +2556,7 @@ network_policies:
         assert!(pin_policy_generation(&engine, &decision, None).is_err());
         assert!(prepare_raw_relay(None, &engine, &decision).is_none());
         assert!(prepare_http_relay(Some(&route), &engine, &decision, &request).is_none());
-        let mut hydrated_later = route.clone();
+        let mut hydrated_later = route;
         hydrated_later.l7_policy_generation = engine.current_generation();
         assert!(prepare_http_relay(Some(&hydrated_later), &engine, &decision, &request).is_none());
     }
