@@ -122,7 +122,7 @@ async fn span_emitted_before_exit_is_delivered(cx: &mut Context) -> testkit::Res
     let mut ids = HashMap::new();
     for (index, name) in names.iter().enumerate() {
         let sandbox = cx
-            .cli_sandbox(&format!("otlpx{index}"))
+            .cli_sandbox(&format!("otlp{index}"))
             .image(testkit::python_image())
             .command(["python3", "-c", &exit_script(&encoded_request(name))])
             .create()
