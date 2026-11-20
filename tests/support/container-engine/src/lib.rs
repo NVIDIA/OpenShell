@@ -18,7 +18,10 @@
 //! Under `openshell-test-runner`, the tmachine environment's setup publishes
 //! it. A missing variable fails the test; it never skips it.
 
+mod tar;
+
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use testkit::{Context, Error, Result, ResultExt as _};
 use tokio::process::Command;
@@ -26,6 +29,8 @@ use tokio::process::Command;
 pub const ENGINE_ENV: &str = "OPENSHELL_TEST_CONTAINER_ENGINE";
 /// The label the Docker and Podman drivers put on a sandbox's containers.
 pub const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
+/// The label with the ID of the sandbox a container belongs to.
+pub const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 /// The label that tells a sandbox's workload (`sandbox`) and `supervisor`
 /// containers apart.
 pub const ISOLATION_ROLE_LABEL: &str = "openshell.ai/isolation-role";
@@ -146,9 +151,111 @@ impl Engine {
             .await
     }
 
+    /// The IDs of every container, running or not, that the driver labeled
+    /// with sandbox ID `sandbox_id`. Sandbox IDs are unique, so this finds
+    /// only the containers of the sandbox the test created.
+    pub async fn containers_for_sandbox_id(&self, sandbox_id: &str) -> Result<Vec<String>> {
+        let ids = self
+            .output([
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                &format!("label={SANDBOX_ID_LABEL}={sandbox_id}"),
+            ])
+            .await?;
+        Ok(ids.split_whitespace().map(str::to_string).collect())
+    }
+
+    /// Whether container `id` is running.
+    pub async fn is_running(&self, id: &str) -> Result<bool> {
+        match self
+            .inspect_container(id, "{{.State.Running}}")
+            .await?
+            .as_str()
+        {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(Error::msg(format!(
+                "container {id} has running state {other:?}; expected true or false"
+            ))),
+        }
+    }
+
+    /// Wait until container `id` is running (`running`) or stopped.
+    pub async fn wait_running(&self, id: &str, running: bool, timeout: Duration) -> Result {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last = match self.is_running(id).await {
+                Ok(now) if now == running => return Ok(()),
+                Ok(now) => format!("running={now}"),
+                Err(err) => err.to_string(),
+            };
+            testkit::ensure!(
+                Instant::now() < deadline,
+                "container {id} did not reach running={running} within {timeout:?}; last state: {last}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Copy file `path` out of container `id` and return its contents.
+    ///
+    /// The engine writes the file to stdout as a tar archive. A copy to a host
+    /// path would belong to the engine's user, which under rootful Podman the
+    /// test can't read.
+    pub async fn copy_from(&self, id: &str, path: &str) -> Result<Vec<u8>> {
+        let output = self.run(["cp", &format!("{id}:{path}"), "-"]).await?;
+        tar::first_file(&output.stdout).context(format!("read {path} copied from container {id}"))
+    }
+
+    /// The standard output and standard error container `id` has logged so
+    /// far, kept apart.
+    pub async fn logs(&self, id: &str) -> Result<ContainerLogs> {
+        let output = self.run(["logs", id]).await?;
+        Ok(ContainerLogs {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    /// Create volume `openshell-test-<name>-<run id>` with `labels` and
+    /// remove it when the test ends. Sandboxes created after it that mount it
+    /// are deleted first, because cleanup runs last registered first.
+    pub async fn create_test_volume(
+        &self,
+        cx: &Context,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Result<String> {
+        let volume = format!("openshell-test-{name}-{}", cx.run_id());
+        let mut args = vec!["volume".to_string(), "create".to_string()];
+        for (key, value) in labels {
+            args.extend(["--label".to_string(), format!("{key}={value}")]);
+        }
+        args.push(volume.clone());
+        self.output(args).await?;
+        let (engine, created) = (self.clone(), volume.clone());
+        cx.on_cleanup(format!("remove volume {volume}"), async move || {
+            engine.output(["volume", "rm", &created]).await.map(drop)
+        });
+        Ok(volume)
+    }
+
     /// Run the engine with `args` and return its trimmed standard output.
     /// A non-zero exit is an error that includes the engine's output.
     pub async fn output<I, S>(&self, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let output = self.run(args).await?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Run the engine with `args`. A non-zero exit is an error that includes
+    /// the engine's output.
+    async fn run<I, S>(&self, args: I) -> Result<std::process::Output>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -178,8 +285,15 @@ impl Engine {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(output)
     }
+}
+
+/// What a container logged, by stream.
+#[derive(Clone, Debug, Default)]
+pub struct ContainerLogs {
+    pub stdout: String,
+    pub stderr: String,
 }
 
 fn utf8(path: &Path) -> Result<&str> {

@@ -23,10 +23,8 @@ source "${ROOT}/e2e/support/conformance.sh"
 # stabilized and can be added here.
 PODMAN_CI_TESTS=(
   ephemeral_cleanup
-  driver_config_volume
   edge_tunnel_e2e
   host_gateway_alias
-  local_driver_token_restart
   ocsf_jsonl_conformance
   otlp_relay
   podman_corporate_proxy

@@ -114,6 +114,12 @@ let
       bases = dockerBases ++ podmanBases;
       setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
+    # Caller driver config with volume and bind mounts, for the driver-config
+    # suite.
+    driver-config = {
+      bases = dockerBases ++ podmanBases;
+      setup.playbooks = [ "ansible/playbooks/driver-config.yaml" ];
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases

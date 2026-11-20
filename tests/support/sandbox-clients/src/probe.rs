@@ -10,6 +10,7 @@ use serde::Deserialize;
 use testkit::{Result, ResultExt as _, Sandbox};
 
 use crate::message::{Http, Request};
+use crate::python::Python;
 use crate::scripts;
 
 /// How long a connect may take, as the clients the probes replace allowed.
@@ -85,27 +86,56 @@ pub enum ReadEnd {
 /// Open a TCP connection from `sandbox` to `host:port`, then close it.
 /// A connect that fails or times out is a result, not an error.
 pub async fn connect(sandbox: &Sandbox, host: &str, port: u16) -> Result<Connect> {
-    let probe = run(sandbox, host, port, None, Duration::ZERO).await?;
-    Ok(Connect {
-        outcome: probe.connect,
-        elapsed: probe.connect_elapsed,
-    })
+    Python::default().connect(sandbox, host, port).await
 }
 
 /// Send `request` from `sandbox` to `host:port` and read the reply until the
 /// server closes the connection. The request asks it to, with
 /// `Connection: close`, unless it sets its own `Connection` header.
 pub async fn http(sandbox: &Sandbox, host: &str, port: u16, request: &Request) -> Result<Http> {
-    let bytes = request.encode(host, port);
-    let probe = run(sandbox, host, port, Some(&bytes), Duration::ZERO).await?;
-    Ok(Http::from_probe(probe, request.is_head()))
+    Python::default().http(sandbox, host, port, request).await
 }
 
 /// Send `bytes` as they are from `sandbox` to `host:port`, and read the reply
 /// until the connection ends or goes quiet for two seconds. Use it for
 /// requests [`Request`] can't make, or bytes that aren't HTTP at all.
 pub async fn http_raw(sandbox: &Sandbox, host: &str, port: u16, bytes: &[u8]) -> Result<Http> {
-    let probe = run(sandbox, host, port, Some(bytes), RAW_IDLE_TIMEOUT).await?;
+    Python::default().http_raw(sandbox, host, port, bytes).await
+}
+
+pub(crate) async fn connect_with(
+    python: &Python,
+    sandbox: &Sandbox,
+    host: &str,
+    port: u16,
+) -> Result<Connect> {
+    let probe = run(python, sandbox, host, port, None, Duration::ZERO).await?;
+    Ok(Connect {
+        outcome: probe.connect,
+        elapsed: probe.connect_elapsed,
+    })
+}
+
+pub(crate) async fn http_with(
+    python: &Python,
+    sandbox: &Sandbox,
+    host: &str,
+    port: u16,
+    request: &Request,
+) -> Result<Http> {
+    let bytes = request.encode(host, port);
+    let probe = run(python, sandbox, host, port, Some(&bytes), Duration::ZERO).await?;
+    Ok(Http::from_probe(probe, request.is_head()))
+}
+
+pub(crate) async fn http_raw_with(
+    python: &Python,
+    sandbox: &Sandbox,
+    host: &str,
+    port: u16,
+    bytes: &[u8],
+) -> Result<Http> {
+    let probe = run(python, sandbox, host, port, Some(bytes), RAW_IDLE_TIMEOUT).await?;
     Ok(Http::from_probe(probe, false))
 }
 
@@ -119,6 +149,7 @@ pub(crate) struct Probe {
 }
 
 async fn run(
+    python: &Python,
     sandbox: &Sandbox,
     host: &str,
     port: u16,
@@ -135,8 +166,8 @@ async fn run(
         idle_timeout.as_secs_f64().to_string(),
     ];
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = sandbox
-        .run_python(scripts::TCP_PROBE, &args)
+    let output = python
+        .run(sandbox, scripts::TCP_PROBE, &args)
         .await
         .context(format!(
             "probe {host}:{port} from sandbox {}",

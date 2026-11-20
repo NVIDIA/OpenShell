@@ -350,6 +350,11 @@ can run the suite. The expectations characterize the sandbox's behavior today,
 not a specification, and the `echo-socket` check needs `perl` in the workload
 image, which the default image has.
 
+The `<base>-driver-config` environments let callers pass driver config with
+volume and bind mounts, and turn off resource admission, which blocks bind
+mounts. The driver-config suite (`tests/suites/features/driver-config`) runs
+there on Docker and Podman.
+
 ### Continuity suites (`tests/suites/continuity/`)
 
 A continuity scenario checks that state created before a disruption survives it.
@@ -607,8 +612,7 @@ nix run .#generate-podman-e2e-ci-tests
 The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
 store. The E2E archive excludes binaries that still depend on wrapper-owned
-gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
-guest setup. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
+gateway controls, SPIFFE fixtures, or other guest setup. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
@@ -616,9 +620,12 @@ Driver suites live in `tests/suites/drivers/<driver>`, with the package named
 after the driver. Each driver suite is its own workspace with its own lockfile,
 so a change to one driver's tests or dependencies doesn't touch another's. Add
 a new one to the `rust:format`, `rust:format:check` and `rust:lint` tasks, the
-matching lines in `branch-checks.yml`, and `ALIGNED_WORKSPACES`. The Podman
-driver suite (`tests/suites/drivers/podman`) compares OpenShell and direct
-Podman user-namespace mappings.
+matching lines in `branch-checks.yml`, `ALIGNED_WORKSPACES`, and the bundle
+builds in `branch-e2e.yml` and `rust-cache.yml`. The Docker and Podman driver
+suites (`tests/suites/drivers/{docker,podman}`) check what the driver does with
+a sandbox's containers when its workload stops or an ephemeral sandbox
+finishes. The Podman suite also compares OpenShell and direct Podman
+user-namespace mappings.
 Each `fedora-podman-{rootful,rootless}-userns-<mode>` environment configures
 the gateway with one mode (`default`, `auto`, `keep-id` or `private`) and works
 with every installer; CI runs it with `rpm`:

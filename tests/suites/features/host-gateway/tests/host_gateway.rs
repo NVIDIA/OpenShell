@@ -9,10 +9,13 @@
 //! Python test image ([`testkit::python_image`]) that requests a page from that
 //! server through the name.
 
+use std::time::Duration;
+
 use host_server_support::{HttpRecorder, TEST_HOST};
+use sandbox_clients_support::{Request, http};
 use testkit::policy;
 use testkit::sdk::raw::proto;
-use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
+use testkit::{Context, PYTHON_BINARIES, Poll, ResultExt as _, Sandbox};
 
 /// The image's Python, which needs nothing beyond its standard library. The
 /// policy allows [`PYTHON_BINARIES`], the real paths behind `python3` in
@@ -68,6 +71,57 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
         client.stderr
     );
     Ok(())
+}
+
+/// `host.openshell.internal` still reaches the host after the sandbox is
+/// stopped and started, when the driver recreates its containers or pod.
+#[testkit::test]
+async fn host_server_reachable_after_stop_start(cx: &mut Context) -> testkit::Result {
+    let marker = format!("host-gateway-restart-{}", cx.run_id());
+    let server = HttpRecorder::start(marker.clone()).await?;
+    let sandbox = cx
+        .sandbox("hgss")
+        .image(testkit::python_image())
+        .command(["sleep", "infinity"])
+        .policy(policy(server.port))
+        .create_ready()
+        .await?;
+
+    expect_reachable(&sandbox, server.port, &marker)
+        .await
+        .context("before the restart")?;
+    sandbox.stop().await?;
+    sandbox.start().await?;
+    expect_reachable(&sandbox, server.port, &marker)
+        .await
+        .context("after the restart")
+}
+
+/// Request a page from the host server until the reply has `marker`, for up
+/// to 40 seconds, as the legacy test retried.
+async fn expect_reachable(sandbox: &Sandbox, port: u16, marker: &str) -> testkit::Result {
+    testkit::poll_until(
+        &format!("the host server on port {port} from {}", sandbox.name()),
+        Duration::from_secs(40),
+        Duration::from_secs(1),
+        async || {
+            Ok(
+                match http(sandbox, TEST_HOST, port, &Request::get("/")).await {
+                    Ok(reply)
+                        if reply
+                            .response
+                            .as_ref()
+                            .is_some_and(|response| response.body_text().contains(marker)) =>
+                    {
+                        Poll::Ready(())
+                    }
+                    Ok(reply) => Poll::Pending(format!("{reply:?}")),
+                    Err(error) => Poll::Pending(format!("{error:#}")),
+                },
+            )
+        },
+    )
+    .await
 }
 
 /// A sandbox policy that allows the image's Python ([`PYTHON`]) to

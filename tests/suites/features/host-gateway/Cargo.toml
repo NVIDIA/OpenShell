@@ -14,3 +14,4 @@ publish = false
 [dependencies]
 host-server-support = { path = "../../../support/host-server" }
 openshell-testkit = { path = "../../../testkit/testkit" }
+sandbox-clients-support = { path = "../../../support/sandbox-clients" }

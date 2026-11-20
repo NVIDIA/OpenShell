@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Let callers pass driver config with volume and bind mounts. Resource admission
+# blocks bind mounts, which can't carry approval labels, so this disables it, as
+# the legacy e2e gateways did. Every installer merges
+# /etc/openshell-test/gateway-overrides.toml into the gateway's configuration
+# (see openshell_gateway/tasks/merge-settings.yaml).
+---
+- name: Caller driver config for tests
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create the test settings directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/openshell-test
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Allow caller driver config and bind mounts
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/openshell-test/gateway-overrides.toml
+        content: |
+          [openshell.drivers.{{ environment_driver }}]
+          allow_driver_config = true
+          enable_bind_mounts = true
+
+          [openshell.drivers.{{ environment_driver }}.resource_admission]
+          enabled = false
+        owner: root
+        group: root
+        mode: "0644"

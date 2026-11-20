@@ -191,6 +191,7 @@ impl Context {
             handles: self.handles.clone(),
             policy: None,
             driver_config: None,
+            log_level: None,
             spec: SandboxSpec {
                 name: Some(self.sandbox_name(suffix)),
                 ..SandboxSpec::default()
@@ -294,7 +295,13 @@ impl Context {
     /// tests whose setup depends on it. Fails unless gateway info reports
     /// exactly one driver, under the same configured and driver name.
     pub async fn compute_driver(&self) -> Result<String> {
-        let info = self
+        single_compute_driver(&self.gateway_info().await?)
+    }
+
+    /// The gateway's info: its version, compute drivers and their reported
+    /// capabilities, and negotiated extensions.
+    pub async fn gateway_info(&self) -> Result<proto::GetGatewayInfoResponse> {
+        Ok(self
             .handles
             .grpc
             .client()
@@ -302,8 +309,7 @@ impl Context {
             .get_gateway_info(proto::GetGatewayInfoRequest {})
             .await
             .context("get gateway info")?
-            .into_inner();
-        single_compute_driver(&info)
+            .into_inner())
     }
 
     /// Run the cleanup hooks, including deleting the sandboxes the test
@@ -426,6 +432,7 @@ pub struct SandboxBuilder {
     handles: Handles,
     policy: Option<proto::SandboxPolicy>,
     driver_config: Option<serde_json::Value>,
+    log_level: Option<String>,
     spec: SandboxSpec,
 }
 
@@ -483,6 +490,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run the sandbox's supervisor at `level`, such as `info`, instead of the
+    /// driver's default.
+    pub fn log_level(mut self, level: impl Into<String>) -> Self {
+        self.log_level = Some(level.into());
+        self
+    }
+
     /// Full access to the spec for fields without a builder method.
     pub fn spec(mut self, update: impl FnOnce(&mut SandboxSpec)) -> Self {
         update(&mut self.spec);
@@ -502,7 +516,10 @@ impl SandboxBuilder {
     pub async fn create(self) -> Result<Sandbox> {
         let name = self.spec.name.clone().unwrap_or_default();
         self.handles.track(&name);
-        let id = if self.policy.is_none() && self.driver_config.is_none() {
+        let id = if self.policy.is_none()
+            && self.driver_config.is_none()
+            && self.log_level.is_none()
+        {
             self.handles
                 .client
                 .create_sandbox(self.spec)
@@ -510,17 +527,18 @@ impl SandboxBuilder {
                 .context(format!("create sandbox {name}"))?
                 .id
         } else {
-            // The SDK's spec has no policy or driver config, so create
-            // through gRPC.
+            // The SDK's spec has no policy, driver config or log level, so
+            // create through gRPC.
             crate::ensure!(
                 !self.spec.gpu && self.spec.service_exposures.is_empty(),
-                "testkit doesn't create a sandbox with a policy or driver config and a GPU or service exposures"
+                "testkit doesn't create a sandbox with a policy, driver config or log level and a GPU or service exposures"
             );
             let driver_config = self.driver_config.map(driver_config_struct).transpose()?;
             let request = grpc_create_request(
                 self.spec,
                 self.policy,
                 driver_config,
+                self.log_level,
                 self.handles.grpc.scope(),
             );
             self.handles
@@ -567,6 +585,7 @@ fn grpc_create_request(
     spec: SandboxSpec,
     policy: Option<proto::SandboxPolicy>,
     driver_config: Option<prost_types::Struct>,
+    log_level: Option<String>,
     workspace_scope: Option<proto::datamodel::v1::WorkspaceSelector>,
 ) -> proto::CreateSandboxRequest {
     let SandboxSpec {
@@ -598,6 +617,7 @@ fn grpc_create_request(
             command,
             tty,
             policy,
+            log_level: log_level.unwrap_or_default(),
             restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
             ..proto::SandboxSpec::default()
         }),
@@ -1078,7 +1098,7 @@ mod tests {
         };
         let policy = crate::policy::base();
 
-        let spec = grpc_create_request(spec, Some(policy.clone()), None, None)
+        let spec = grpc_create_request(spec, Some(policy.clone()), None, None, None)
             .spec
             .expect("spec");
 
@@ -1096,9 +1116,15 @@ mod tests {
         }))
         .expect("an object converts");
 
-        let spec = grpc_create_request(SandboxSpec::default(), None, Some(config.clone()), None)
-            .spec
-            .expect("spec");
+        let spec = grpc_create_request(
+            SandboxSpec::default(),
+            None,
+            Some(config.clone()),
+            None,
+            None,
+        )
+        .spec
+        .expect("spec");
 
         let template = spec.template.expect("a template for the driver config");
         assert_eq!(template.image, "", "an empty image selects the default");
@@ -1108,10 +1134,24 @@ mod tests {
 
     #[test]
     fn grpc_create_request_omits_an_empty_template() {
-        let spec = grpc_create_request(SandboxSpec::default(), None, None, None)
+        let spec = grpc_create_request(SandboxSpec::default(), None, None, None, None)
             .spec
             .expect("spec");
         assert_eq!(spec.template, None);
+    }
+
+    #[test]
+    fn grpc_create_request_carries_the_log_level() {
+        let spec = grpc_create_request(
+            SandboxSpec::default(),
+            None,
+            None,
+            Some("info".to_string()),
+            None,
+        )
+        .spec
+        .expect("spec");
+        assert_eq!(spec.log_level, "info");
     }
 
     #[test]

@@ -3,30 +3,23 @@
 
 #![cfg(feature = "e2e")]
 
-//! Local-driver E2E regression for sandbox bootstrap JWT material and terminal
-//! main-process semantics. Launch-scoped bootstrap tokens must remain valid long
-//! enough for local-driver recovery. Stopping a Docker or Podman sandbox
-//! workload is terminal and must not relaunch its canonical process; restarting
-//! the VM gateway still exercises driver recovery without deliberately stopping
-//! the sandbox.
+//! VM-driver E2E regression for sandbox bootstrap JWT material. Launch-scoped
+//! bootstrap tokens must remain valid long enough for driver recovery, so
+//! restarting the VM gateway reconnects the running sandbox. The Docker and
+//! Podman stop-is-terminal checks live in `tests/suites/drivers`.
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use openshell_e2e::harness::cli::{wait_for_healthy, wait_for_sandbox_exec_contains};
-use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
+use openshell_e2e::harness::container::e2e_driver;
 use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use prost::Message;
-use tokio::time::sleep;
 
 const READY_MARKER: &str = "local-driver-token-restart-ready";
-const RESTART_FILE: &str = "/sandbox/local-driver-token-restart-state";
-const CONTAINER_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 const VM_STATE_DIR_ENV: &str = "OPENSHELL_E2E_VM_STATE_DIR";
 
 #[derive(Clone, PartialEq, Message)]
@@ -41,160 +34,6 @@ struct PersistedDriverSandbox {
 struct PersistedDriverSandboxSpec {
     #[prost(string, tag = "11")]
     sandbox_token: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocalDriver {
-    Docker,
-    Podman,
-    Vm,
-}
-
-impl LocalDriver {
-    fn from_env() -> Option<Self> {
-        match e2e_driver().as_deref() {
-            Some("docker") => Some(Self::Docker),
-            Some("podman") => Some(Self::Podman),
-            Some("vm") => Some(Self::Vm),
-            _ => None,
-        }
-    }
-
-    fn is_container(self) -> bool {
-        matches!(self, Self::Docker | Self::Podman)
-    }
-
-    fn container_filters(self, namespace: &str, sandbox_name: &str, role: &str) -> Vec<String> {
-        match self {
-            Self::Docker => vec![
-                "label=openshell.ai/managed-by=openshell".to_string(),
-                format!("label=openshell.ai/isolation-role={role}"),
-                format!("label=openshell.ai/sandbox-namespace={namespace}"),
-                format!("label=openshell.ai/sandbox-name={sandbox_name}"),
-            ],
-            Self::Podman => vec![
-                "label=openshell.managed=true".to_string(),
-                format!("label=openshell.ai/isolation-role={role}"),
-                format!("label=openshell.ai/sandbox-name={sandbox_name}"),
-            ],
-            Self::Vm => Vec::new(),
-        }
-    }
-}
-
-fn run_engine(engine: &ContainerEngine, args: &[String]) -> Result<String, String> {
-    let output = engine
-        .command()
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| format!("failed to run {} {}: {err}", engine.name(), args.join(" ")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-    if !output.status.success() {
-        return Err(format!(
-            "{} {} failed (exit {:?}):\n{combined}",
-            engine.name(),
-            args.join(" "),
-            output.status.code()
-        ));
-    }
-    Ok(stdout.trim().to_string())
-}
-
-fn container_id_for_role(
-    engine: &ContainerEngine,
-    driver: LocalDriver,
-    namespace: &str,
-    sandbox_name: &str,
-    role: &str,
-) -> Result<String, String> {
-    let mut args = vec!["ps".to_string(), "-aq".to_string()];
-    for filter in driver.container_filters(namespace, sandbox_name, role) {
-        args.push("--filter".to_string());
-        args.push(filter);
-    }
-
-    let stdout = run_engine(engine, &args)?;
-    let ids = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    match ids.as_slice() {
-        [id] => Ok((*id).to_string()),
-        [] => Err(format!(
-            "no {driver:?} {role} container found for sandbox '{sandbox_name}' in namespace '{namespace}'"
-        )),
-        _ => Err(format!(
-            "multiple {driver:?} {role} containers found for sandbox '{sandbox_name}' in namespace '{namespace}': {ids:?}"
-        )),
-    }
-}
-
-fn container_running(engine: &ContainerEngine, container_id: &str) -> Result<bool, String> {
-    let output = run_engine(
-        engine,
-        &[
-            "inspect".to_string(),
-            "-f".to_string(),
-            "{{.State.Running}}".to_string(),
-            container_id.to_string(),
-        ],
-    )?;
-    match output.trim() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(format!(
-            "unexpected running state for container {container_id}: {other}"
-        )),
-    }
-}
-
-async fn wait_for_container_running(
-    engine: &ContainerEngine,
-    container_id: &str,
-    expected: bool,
-    timeout: Duration,
-) -> Result<(), String> {
-    let start = Instant::now();
-
-    loop {
-        let last_state = match container_running(engine, container_id) {
-            Ok(running) if running == expected => return Ok(()),
-            Ok(running) => format!("running={running}"),
-            Err(err) => err,
-        };
-
-        if start.elapsed() > timeout {
-            return Err(format!(
-                "container {container_id} did not reach running={expected} within {}s. Last state: {last_state}",
-                timeout.as_secs()
-            ));
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-}
-
-fn copy_bootstrap_token(engine: &ContainerEngine, container_id: &str) -> Result<String, String> {
-    let tempdir = tempfile::tempdir().map_err(|err| format!("create token tempdir: {err}"))?;
-    let destination = tempdir.path().join("sandbox.jwt");
-    run_engine(
-        engine,
-        &[
-            "cp".to_string(),
-            format!("{container_id}:{CONTAINER_TOKEN_MOUNT_PATH}"),
-            destination.display().to_string(),
-        ],
-    )?;
-    fs::read_to_string(&destination).map_err(|err| {
-        format!(
-            "read copied bootstrap token '{}': {err}",
-            destination.display()
-        )
-    })
 }
 
 fn read_vm_bootstrap_token(sandbox_name: &str) -> Result<String, String> {
@@ -288,65 +127,6 @@ fn require_unexpired_token(token: &str, context: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn stop_container_sandbox(
-    engine: &ContainerEngine,
-    driver: LocalDriver,
-    namespace: &str,
-    sandbox_name: &str,
-) -> Result<(), String> {
-    let workload_id = container_id_for_role(engine, driver, namespace, sandbox_name, "sandbox")?;
-    run_engine(
-        engine,
-        &[
-            "exec".to_string(),
-            workload_id.clone(),
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            format!("test ! -r {CONTAINER_TOKEN_MOUNT_PATH}"),
-        ],
-    )
-    .map_err(|error| {
-        format!("sandbox workload must not be able to read its bootstrap JWT: {error}")
-    })?;
-
-    if driver == LocalDriver::Podman {
-        let supervisor_id =
-            container_id_for_role(engine, driver, namespace, sandbox_name, "supervisor")?;
-        let token = copy_bootstrap_token(engine, &supervisor_id)?;
-        require_unexpired_token(&token, "local-driver bootstrap JWT")?;
-    }
-
-    run_engine(engine, &["stop".to_string(), workload_id.clone()])?;
-    wait_for_container_running(engine, &workload_id, false, Duration::from_mins(1)).await
-}
-
-async fn wait_for_sandbox_error(sandbox_name: &str, timeout: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let mut last_output = String::new();
-    while Instant::now() < deadline {
-        let mut cmd = openshell_e2e::harness::binary::openshell_cmd();
-        cmd.args(["sandbox", "get", sandbox_name])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = cmd
-            .output()
-            .await
-            .map_err(|err| format!("failed to run sandbox get: {err}"))?;
-        last_output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if output.status.success() && strip_ansi(&last_output).contains("Phase: Error") {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    Err(format!(
-        "sandbox {sandbox_name} did not enter Error within {timeout:?}:\n{last_output}"
-    ))
-}
-
 async fn restart_vm_sandbox(gateway: &ManagedGateway, sandbox_name: &str) -> Result<(), String> {
     let token = read_vm_bootstrap_token(sandbox_name)?;
     require_unexpired_token(&token, "VM bootstrap JWT")?;
@@ -356,107 +136,40 @@ async fn restart_vm_sandbox(gateway: &ManagedGateway, sandbox_name: &str) -> Res
     wait_for_healthy(Duration::from_mins(2)).await
 }
 
-async fn wait_for_driver_reconnect(driver: LocalDriver, sandbox_name: &str) -> Result<(), String> {
-    match driver {
-        LocalDriver::Docker | LocalDriver::Podman => {
-            wait_for_sandbox_exec_contains(
-                sandbox_name,
-                &["cat", RESTART_FILE],
-                "before-local-driver-restart",
-                Duration::from_mins(4),
-            )
-            .await
-        }
-        LocalDriver::Vm => {
-            wait_for_sandbox_exec_contains(
-                sandbox_name,
-                &["echo", "vm-reconnect-ok"],
-                "vm-reconnect-ok",
-                Duration::from_mins(4),
-            )
-            .await
-        }
-    }
-}
-
 #[tokio::test]
-async fn local_driver_restart_or_stop_respects_main_process_lifecycle() {
-    let Some(driver) = LocalDriver::from_env() else {
-        eprintln!("Skipping local-driver lifecycle test: e2e driver is not Docker, Podman, or VM");
+async fn vm_gateway_restart_reconnects_sandbox() {
+    if e2e_driver().as_deref() != Some("vm") {
+        eprintln!("Skipping VM driver restart test: e2e driver is not VM");
         return;
-    };
-    let namespace = if driver.is_container() {
-        let Some(namespace) = std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        else {
-            eprintln!(
-                "Skipping local-driver lifecycle test: OPENSHELL_E2E_SANDBOX_NAMESPACE is unavailable"
-            );
-            return;
-        };
-        Some(namespace)
-    } else {
-        None
-    };
-    let engine = if driver.is_container() {
-        Some(
-            ContainerEngine::from_env()
-                .unwrap_or_else(|err| panic!("resolve e2e container engine: {err}")),
-        )
-    } else {
-        None
-    };
-    let gateway = if driver == LocalDriver::Vm {
-        let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
-        else {
-            eprintln!(
-                "Skipping local-driver lifecycle test: VM e2e gateway is not managed by this test run"
-            );
-            return;
-        };
-        Some(gateway)
-    } else {
-        None
+    }
+    let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
+    else {
+        eprintln!(
+            "Skipping VM driver restart test: VM e2e gateway is not managed by this test run"
+        );
+        return;
     };
 
     wait_for_healthy(Duration::from_secs(30))
         .await
         .expect("gateway should start healthy");
 
-    let script = format!(
-        "echo before-local-driver-restart > {RESTART_FILE}; echo {READY_MARKER}; while true; do sleep 1; done"
-    );
+    let script = format!("echo {READY_MARKER}; while true; do sleep 1; done");
     let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], READY_MARKER)
         .await
-        .expect("create long-running local-driver sandbox");
+        .expect("create long-running VM sandbox");
 
-    match driver {
-        LocalDriver::Docker | LocalDriver::Podman => {
-            let engine = engine.as_ref().expect("container engine should be set");
-            let namespace = namespace
-                .as_deref()
-                .expect("container namespace should be set");
-            stop_container_sandbox(engine, driver, namespace, &sandbox.name)
-                .await
-                .expect("stop sandbox container");
-            wait_for_sandbox_error(&sandbox.name, Duration::from_secs(30))
-                .await
-                .expect("stopped canonical process should make sandbox terminal");
-        }
-        LocalDriver::Vm => {
-            let gateway = gateway.as_ref().expect("managed VM gateway should be set");
-            restart_vm_sandbox(gateway, &sandbox.name)
-                .await
-                .expect("restart e2e VM gateway");
-        }
-    }
-
-    if driver == LocalDriver::Vm {
-        wait_for_driver_reconnect(driver, &sandbox.name)
-            .await
-            .expect("sandbox supervisor should reconnect after VM driver restart");
-    }
+    restart_vm_sandbox(&gateway, &sandbox.name)
+        .await
+        .expect("restart e2e VM gateway");
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["echo", "vm-reconnect-ok"],
+        "vm-reconnect-ok",
+        Duration::from_mins(4),
+    )
+    .await
+    .expect("sandbox supervisor should reconnect after VM driver restart");
 
     sandbox.cleanup().await;
 }

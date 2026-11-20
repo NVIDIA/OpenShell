@@ -96,7 +96,7 @@ jobs:
         run: |
           set -euo pipefail
           nix build --no-link .#openshell-test-runner || nix build --no-link .#openshell-test-runner
-          for family in features drivers/podman; do
+          for family in features drivers/docker drivers/podman; do
             nix run .#openshell-test-runner -- build \
               --family "$family" --out "$RUNNER_TEMP/e2e-bundles/${family//\//-}"
           done

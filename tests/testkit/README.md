@@ -95,6 +95,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `cx.expect_compute_driver(name)` to fail unless the gateway runs only that
   compute driver. Driver suites call it first. `cx.compute_driver()` returns
   the driver's name, for setup that depends on it, such as a driver config.
+  `cx.gateway_info()` returns the whole gateway info, such as the resource
+  capabilities the driver reports.
 - `testkit::base_image()` for the image to create sandboxes from or build on:
   `OPENSHELL_TEST_BASE_IMAGE`, or OpenShell's default sandbox image.
 - `testkit::python_image()` for sandboxes that run `python3`, curl, git, or
@@ -166,7 +168,9 @@ A script only one test uses can stay beside that test, as a `const` or an
 `include_str!`. Move it to `tests/support/sandbox-clients/scripts/`, with a
 constant in its `scripts` module, once a second test or suite needs it, so no
 suite reads another workspace's files. If its result has a fixed shape, add a
-typed probe there too, like `connect` and `http`. `sandbox-clients` holds
+typed probe there too, like `connect` and `http`, and run it through
+`Python`, so a test can run it under another interpreter, such as a copy of
+`python3` a policy names. `sandbox-clients` holds
 network clients; put file-system or system-call probes in a sibling crate.
 
 ## Running against a gateway

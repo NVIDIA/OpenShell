@@ -395,9 +395,11 @@ const EPHEMERAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// command exits, whether the command succeeds or fails.
 ///
 /// This checks only what the gateway shows: get and list stop returning the
-/// sandbox. Conformance can't see driver resources, so the check that the
-/// driver removed its containers, pods or VM state stays in the legacy
-/// `e2e/rust/tests/ephemeral_cleanup.rs` until the driver suites replace it.
+/// sandbox. Conformance can't see driver resources: the Docker and Podman
+/// driver suites (`tests/suites/drivers/{docker,podman}`) check that the
+/// driver removed its containers, and the legacy
+/// `e2e/rust/tests/ephemeral_cleanup.rs` still checks Kubernetes pods and VM
+/// state.
 #[testkit::test]
 async fn detached_no_keep_sandbox_is_removed_after_main_exits(cx: &mut Context) -> testkit::Result {
     let mut sandboxes = Vec::new();
