@@ -415,9 +415,7 @@ These are the primary `mise` tasks for day-to-day development:
 
 ## TypeScript SDK contributions
 
-Open TypeScript SDK PRs in [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript), including dependency and security updates. Core's `sdk/typescript/` holds only `@nvidia/openshell-sdk`, a deprecated stub that re-exports `@ai-openshell/sdk`. Branch Checks rejects added or modified files there other than the stub's own files; deletions remain allowed for removal. Core proto changes need no TypeScript bindings here because the standalone SDK generates bindings from its pinned release.
-
-Core releases still publish the stub to GitHub Packages, and the publish fails until a matching `@ai-openshell/sdk` minor line is on npmjs.org. `proto:lint` uses the core-owned Buf tool.
+The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript); open TypeScript SDK PRs there.
 
 ## Project Structure
 
