@@ -267,24 +267,36 @@ the first directory under the last `suites` directory in the crate's path:
 
 ### Unsupported tests
 
-An environment that cannot pass a test yet lists it in
-`OPENSHELL_TEST_UNSUPPORTED`, instead of putting `#[ignore]` on the test, which
-turns it off everywhere. The value is `<test>=<issue>` entries separated by
-commas and/or whitespace, so an issue URL can't contain either:
+When a conformance, features or drivers test can't pass in one CI environment,
+keep it in the row and skip it there instead of using `#[ignore]` everywhere:
+
+1. File an issue for the bug.
+2. Add the test, issue URL and affected environments to the shared
+   [`unsupported.yaml`](../suites/unsupported.yaml). Each environment is an
+   [E2E matrix row](../../.github/workflows/e2e-suites.yml)
+   (`<environment>/<installer>`, such as `ubuntu-k3s/k3s-ha`) or a host lane
+   (`docker`, `podman`, `kubernetes` or `vm`).
+3. Delete the entry in the PR that fixes the bug.
+
+CI validates the entries and passes those for each row as
+`OPENSHELL_TEST_UNSUPPORTED`. To do the same locally, use `<test>=<issue>`
+entries separated by commas or whitespace:
 
 ```shell
-OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVIDIA/OpenShell/issues/1234"
+export OPENSHELL_TEST_UNSUPPORTED="cdi::read_only_file=https://github.com/NVIDIA/OpenShell/issues/1234"
 ```
 
-`<test>` is the crate name (`_` for `-`), then the name libtest shows. The
-program reads the variable under every interface, so `openshell-conformance
-run`, `cargo test` and nextest agree: the test is ignored, so each shows SKIP,
-and `list` marks it `[unsupported: <issue>]`. `run` prints the entries to stderr
-and lists them in its summary and JUnit report; under `cargo test` and nextest
-the program stays quiet, so whatever starts them should print the entries.
+`<test>` is the crate name (`conformance` for conformance, the `[[test]]` target
+name for features and drivers, with `_` for `-`), then `::` and the name listed
+by nextest. Features and drivers integration targets need a unique `[[test]]`
+name, `harness = false`, and a `main` that returns `testkit::main()`.
+
+`cargo test` and nextest treat unsupported tests as ignored. Testkit's `list`
+marks them `[unsupported: <issue>]`, and its `run` prints the entries and
+includes them in its summary and JUnit report.
 
 A program applies only the entries for crates it links, so one value can serve
-several programs, and a misspelled crate name is ignored. A bad entry for a
+several programs. Branch Checks rejects unknown crates. A bad entry for a
 crate it links exits 2 before anything is listed or run (nextest exits 104,
 because its listing fails). Forcing an unsupported test to run
 (`--include-ignored`, `--ignored`, nextest's `--run-ignored`) fails it with

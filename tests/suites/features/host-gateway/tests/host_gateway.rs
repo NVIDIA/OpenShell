@@ -14,6 +14,10 @@ use testkit::policy;
 use testkit::sdk::raw::proto;
 use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// The image's Python, which needs nothing beyond its standard library. The
 /// policy allows [`PYTHON_BINARIES`], the real paths behind `python3` in
 /// `testkit::python_image()` images, because a rule matches the executable

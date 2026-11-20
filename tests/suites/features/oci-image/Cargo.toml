@@ -11,6 +11,11 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 publish = false
 
+[[test]]
+name = "oci-image"
+path = "tests/oci_image.rs"
+harness = false
+
 [dependencies]
 container-engine-support = { path = "../../../support/container-engine" }
 openshell-testkit = { path = "../../../testkit/testkit" }

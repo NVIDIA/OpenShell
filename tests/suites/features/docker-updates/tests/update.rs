@@ -13,6 +13,10 @@ use serde_json::Value;
 use testkit::sdk::raw::{AuthedGrpcClient, AuthedSandboxUpdatesClient, proto};
 use testkit::{Context, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const POLICY: &str = "version: 1
 filesystem_policy:
   include_workdir: true

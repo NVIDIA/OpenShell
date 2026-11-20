@@ -11,6 +11,11 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 publish = false
 
+[[test]]
+name = "host-gateway"
+path = "tests/host_gateway.rs"
+harness = false
+
 [dependencies]
 host-server-support = { path = "../../../support/host-server" }
 openshell-testkit = { path = "../../../testkit/testkit" }
