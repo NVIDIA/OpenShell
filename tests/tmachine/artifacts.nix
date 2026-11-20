@@ -91,11 +91,10 @@ let
     # `enable_bind_mounts`), which the tmachine gateway does not enable. Wrapper
     # lane.
     "driver_config_volume"
-    # The next three self-skip without wrapper-owned gateway metadata (restart
+    # The next two self-skip without wrapper-owned gateway metadata (restart
     # and configuration control), so exclude them rather than report false
     # passes. Wrapper lane.
     "local_driver_token_restart"
-    "podman_corporate_proxy"
     "podman_gateway_start"
     # Its move to conformance is deferred until the isolation work in #4120; see
     # #4246.

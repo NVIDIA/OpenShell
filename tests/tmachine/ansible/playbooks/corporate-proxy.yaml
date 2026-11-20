@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Run a corporate proxy, point the gateway's driver at it and publish how
+# tests read it. The corporate-proxy fixture (tests/support/corporate-proxy)
+# reads the variables published below.
+---
+- name: Corporate proxy for tests
+  hosts: all
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+  roles:
+    - corporate_proxy
+  tasks:
+    - name: Publish corporate proxy test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: corporate-proxy
+        test_env_vars:
+          OPENSHELL_TEST_CORPORATE_PROXY_URL: "https://{{ corporate_proxy_host }}:{{ corporate_proxy_port }}"
+          OPENSHELL_TEST_CORPORATE_PROXY_CA_CERT: "{{ corporate_proxy_config_dir }}/ca.pem"
+          OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_PORT: "{{ corporate_proxy_bypass_port }}"
+          OPENSHELL_TEST_CORPORATE_PROXY_LOG: "{{ corporate_proxy_log }}"

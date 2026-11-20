@@ -29,7 +29,6 @@ PODMAN_CI_TESTS=(
   local_driver_token_restart
   ocsf_jsonl_conformance
   otlp_relay
-  podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
   provider_token_exchange

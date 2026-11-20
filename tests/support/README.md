@@ -25,6 +25,10 @@ never skips it. Add a row when you add a variable. The runner also sets
 | `OPENSHELL_TEST_KEYCLOAK_CLIENT_ID` | `<base>-keycloak` | `keycloak-support` | A client in that realm that allows password grants. |
 | `OPENSHELL_TEST_KEYCLOAK_USERNAME` | `<base>-keycloak` | `keycloak-support` | The realm user that tests sign in as. |
 | `OPENSHELL_TEST_KEYCLOAK_PASSWORD` | `<base>-keycloak` | `keycloak-support` | That user's password. |
+| `OPENSHELL_TEST_CORPORATE_PROXY_URL` | `<base>-corporate-proxy` (`playbooks/corporate-proxy.yaml`) | `corporate-proxy-support` | The corporate proxy URL that the gateway's driver sends sandbox egress through, such as `https://host.openshell.internal:3128`. |
+| `OPENSHELL_TEST_CORPORATE_PROXY_CA_CERT` | `<base>-corporate-proxy` | `corporate-proxy-support` | The path of the proxy's CA certificate, in PEM. It signs the proxy's listener certificate and the certificates it re-signs tunnels with. |
+| `OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_PORT` | `<base>-corporate-proxy` | `corporate-proxy-support` | The port a test listens on for a destination that the gateway's `no_proxy` sends direct. |
+| `OPENSHELL_TEST_CORPORATE_PROXY_LOG` | `<base>-corporate-proxy` | `corporate-proxy-support` | The path of the proxy's log, one JSON line per CONNECT, readable by the test user. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which sets the driver's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the supervisor trusts for sandbox egress. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | The additional-CA environment | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |

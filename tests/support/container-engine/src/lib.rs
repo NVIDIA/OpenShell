@@ -146,6 +146,15 @@ impl Engine {
             .await
     }
 
+    /// Whether a secret named exactly `name` exists. Podman only: Docker
+    /// lists secrets only in swarm mode.
+    pub async fn secret_exists(&self, name: &str) -> Result<bool> {
+        let names = self
+            .output(["secret", "ls", "--format", "{{.Name}}"])
+            .await?;
+        Ok(names.lines().any(|line| line.trim() == name))
+    }
+
     /// Run the engine with `args` and return its trimmed standard output.
     /// A non-zero exit is an error that includes the engine's output.
     pub async fn output<I, S>(&self, args: I) -> Result<String>

@@ -1,0 +1,179 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Run a corporate proxy in the guest and point the gateway's driver at it.
+# The proxy (files/corporate-proxy.py) serves TLS, requires Basic auth and
+# intercepts the TLS in every tunnel, all with one CA of its own.
+---
+- name: Require the environment's compute driver
+  ansible.builtin.assert:
+    that: [environment_driver is defined]
+    fail_msg: environment_driver names the gateway driver and comes from the environment's base in config.nix
+
+- name: Install OpenSSL and Python
+  become: true
+  ansible.builtin.package:
+    name: [openssl, python3]
+    state: present
+
+- name: Require Python 3.11 or later for TLS inside TLS
+  ansible.builtin.command:
+    argv: [/usr/bin/python3, -c, "import sys; sys.exit(sys.version_info < (3, 11))"]
+  changed_when: false
+
+- name: Create the corporate proxy directories
+  become: true
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ corporate_proxy_config_dir }}", mode: "0755" }
+    - { path: "{{ corporate_proxy_key_dir }}", mode: "0700" }
+    - { path: "{{ corporate_proxy_script | dirname }}", mode: "0755" }
+    - { path: "{{ corporate_proxy_log | dirname }}", mode: "0755" }
+
+# The listener certificate must be a leaf: rustls rejects a CA certificate
+# presented as a server's. Python 3.13 and later also require its authority
+# key identifier. The same leaf re-signs every tunnel, since sandboxes
+# reach every destination by corporate_proxy_host.
+- name: Create the corporate proxy CA and listener certificate
+  become: true
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      umask 077
+      keys={{ corporate_proxy_key_dir }}
+      conf={{ corporate_proxy_config_dir }}
+      work=$(mktemp -d)
+      trap 'rm -rf "$work"' EXIT
+      openssl req -x509 -newkey rsa:2048 -nodes -days {{ corporate_proxy_cert_days }} \
+        -keyout "$keys/ca-key.pem" -out "$work/ca.pem" \
+        -subj '/CN=OpenShell test corporate proxy CA' \
+        -addext 'basicConstraints=critical,CA:TRUE' \
+        -addext 'keyUsage=critical,keyCertSign,cRLSign'
+      openssl req -newkey rsa:2048 -nodes -subj '/CN={{ corporate_proxy_host }}' \
+        -keyout "$keys/proxy-key.pem" -out "$work/proxy.csr"
+      printf '%s\n' 'basicConstraints=critical,CA:FALSE' \
+        'subjectAltName=DNS:{{ corporate_proxy_host }}' \
+        'extendedKeyUsage=serverAuth' \
+        'keyUsage=critical,digitalSignature,keyEncipherment' \
+        'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' > "$work/proxy.ext"
+      openssl x509 -req -in "$work/proxy.csr" -CA "$work/ca.pem" -CAkey "$keys/ca-key.pem" \
+        -CAcreateserial -days {{ corporate_proxy_cert_days }} -extfile "$work/proxy.ext" \
+        -out "$work/proxy.pem"
+      cat "$work/proxy.pem" "$work/ca.pem" > "$work/proxy-chain.pem"
+      install -m 0644 "$work/proxy-chain.pem" "$conf/proxy-chain.pem"
+      install -m 0644 "$work/ca.pem" "$conf/ca.pem"
+    creates: "{{ corporate_proxy_config_dir }}/ca.pem"
+
+# Every gateway user (root, tmachine or the package's) must read these.
+- name: Write the corporate proxy credentials
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ corporate_proxy_config_dir }}/auth"
+    content: "{{ corporate_proxy_username }}:{{ corporate_proxy_password }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the corporate proxy
+  become: true
+  ansible.builtin.copy:
+    src: corporate-proxy.py
+    dest: "{{ corporate_proxy_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+# Tests read the log as the tmachine user.
+- name: Create the corporate proxy log
+  become: true
+  ansible.builtin.file:
+    path: "{{ corporate_proxy_log }}"
+    state: touch
+    owner: root
+    group: root
+    mode: "0644"
+    access_time: preserve
+    modification_time: preserve
+
+- name: Install the corporate proxy unit
+  become: true
+  ansible.builtin.template:
+    src: openshell-corporate-proxy.service.j2
+    dest: /etc/systemd/system/{{ corporate_proxy_service }}
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Start the corporate proxy
+  block:
+    - name: Start the corporate proxy service
+      become: true
+      ansible.builtin.systemd_service:
+        name: "{{ corporate_proxy_service }}"
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    # Check what a sandbox's supervisor relies on: the listener's certificate
+    # verifies against the CA for corporate_proxy_host, and a CONNECT without
+    # credentials gets a 407.
+    - name: Check that the corporate proxy serves TLS and requires auth
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import socket, ssl, sys, time
+            ca, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+            context = ssl.create_default_context(cafile=ca)
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.5)
+            with context.wrap_socket(raw, server_hostname=host) as conn:
+                conn.sendall(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+                status = conn.recv(4096).split(b"\r\n", 1)[0]
+            sys.exit(0 if b" 407 " in status else f"expected a 407, got {status!r}")
+          - "{{ corporate_proxy_config_dir }}/ca.pem"
+          - "{{ corporate_proxy_host }}"
+          - "{{ corporate_proxy_port }}"
+      changed_when: false
+
+  rescue:
+    - name: Collect corporate proxy diagnostics
+      become: true
+      ansible.builtin.shell: |
+        systemctl status {{ corporate_proxy_service }} --no-pager -l
+        journalctl -u {{ corporate_proxy_service }} --no-pager -n 40
+      changed_when: false
+      failed_when: false
+      register: corporate_proxy_diagnostics
+
+    - name: Report why the corporate proxy did not start
+      ansible.builtin.fail:
+        msg: "{{ corporate_proxy_service }} did not start:\n{{ corporate_proxy_diagnostics.stdout }}\n{{ corporate_proxy_diagnostics.stderr }}"
+
+# Basic credentials go over the proxy's TLS listener, so the gateway needs no
+# proxy_auth_allow_insecure. The CA covers the listener and the re-signed
+# tunnels, for both the supervisor and the workload.
+- name: Point the gateway's driver at the corporate proxy
+  ansible.builtin.include_role:
+    name: gateway_overrides
+  vars:
+    gateway_overrides_name: corporate-proxy
+    gateway_overrides_content: |
+      [openshell.drivers.{{ environment_driver }}]
+      https_proxy = "https://{{ corporate_proxy_host }}:{{ corporate_proxy_port }}"
+      proxy_auth_file = "{{ corporate_proxy_config_dir }}/auth"
+      proxy_ca_bundle = "{{ corporate_proxy_config_dir }}/ca.pem"
+      no_proxy = "{{ corporate_proxy_host }}:{{ corporate_proxy_bypass_port }}"
