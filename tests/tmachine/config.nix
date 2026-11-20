@@ -112,6 +112,12 @@ let
       bases = dockerBases ++ podmanBases;
       setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
+    # A test-run OTLP collector for the gateway and the agent trace relay, for
+    # the otlp-relay suite. Its endpoint names Podman's host alias.
+    otlp = {
+      bases = podmanBases;
+      setup.playbooks = [ "ansible/playbooks/otlp.yaml" ];
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases

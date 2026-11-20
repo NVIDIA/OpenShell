@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Point the gateway's OTLP export and agent trace relay at a collector the
+# tests run, and publish where the tests listen.
+#
+# Nothing listens on the port until a test starts its collector. Supervisors
+# connect lazily, so sandboxes created before then only fail their exports.
+# Supervisors in Podman containers reach the test VM as
+# host.containers.internal. The OTLP fixture (tests/support/otlp) reads the
+# variables published below.
+---
+- name: OTLP collector for tests
+  hosts: all
+  gather_facts: false
+  vars:
+    otlp_port: 4317
+    otlp_endpoint: "http://host.containers.internal:{{ otlp_port }}"
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Export traces and relay agent traces to the test collector
+      ansible.builtin.include_role:
+        name: gateway_overrides
+      vars:
+        gateway_overrides_name: otlp
+        gateway_overrides_content: |
+          [openshell.gateway.otlp]
+          endpoint = "{{ otlp_endpoint }}"
+
+          [openshell.gateway.otlp.agent]
+          enabled = true
+
+    - name: Publish OTLP test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: otlp
+        test_env_vars:
+          OPENSHELL_TEST_OTLP_LISTEN: "0.0.0.0:{{ otlp_port }}"
+          OPENSHELL_TEST_OTLP_ENDPOINT: "{{ otlp_endpoint }}"
