@@ -1472,14 +1472,16 @@ mod tests {
     /// registered root is already stopped while the scan has not returned.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "races on 4-vCPU CI runners; see issue #5811"]
     fn terminal_group_signal_precedes_the_first_descendant_collect() {
         use std::io::BufRead as _;
         use std::os::unix::process::CommandExt as _;
 
         let runtime = BoundaryRuntimeState::new();
+        // The root must `exec` its sleep. Otherwise dash starts it with vfork,
+        // and a SIGSTOP that lands before the child execs stops the child and
+        // leaves the root in an uninterruptible vfork wait instead of stopped.
         let mut root = std::process::Command::new("/bin/sh")
-            .args(["-c", "echo ready; sleep 600"])
+            .args(["-c", "echo ready; exec sleep 600"])
             .process_group(0)
             .stdout(std::process::Stdio::piped())
             .spawn()
