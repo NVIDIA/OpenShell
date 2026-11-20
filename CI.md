@@ -12,6 +12,10 @@ PR CI runs on standard GitHub-hosted runners. `Branch Checks` and `Helm Lint` tr
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### TypeScript SDK freeze
+
+The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript), and the `TypeScript SDK Freeze` job rejects changes to `sdk/typescript/` other than the `@nvidia/openshell-sdk` re-export stub.
+
 ### Monitoring dashboards
 
 `Monitoring Mixin` runs in Branch Checks when files under
@@ -98,9 +102,9 @@ qualification. Branch checks compare the prospective merge tree with its target,
 using workflow-revision review tooling and the target's tag-derived train policy.
 Release qualification reviews the cumulative diff from the previous reachable
 stable release to the exact candidate commit, using the same tag-derived
-patch/minor policy as the protobuf check. It reviews public Rust, Python, and
-TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
-and persisted state.
+patch/minor policy as the protobuf check. It reviews the public Rust and Python
+SDKs, API behavior, CLI contracts, configuration, policy, Helm, and persisted
+state.
 Both Codex workflows share the `codex-release-review` concurrency group with
 `queue: max`, so only one review runs at a time and up to 100 pending reviews
 are retained across branch, release, and manual runs. The release compatibility
@@ -714,7 +718,7 @@ Each step that publishes to an external registry, store, or site lives in its ow
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance, continuity, and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
-| `.github/workflows/sdk-typescript-publish.yml` | Publishes the TypeScript SDK to GitHub Packages. Called by stable Release; manual dispatch publishes a given tag and npm version. |
+| `.github/workflows/sdk-typescript-publish.yml` | Publishes the deprecated `@nvidia/openshell-sdk` stub to GitHub Packages. Manual dispatch only: run it for a stable tag after ai-openshell/sdk-typescript publishes the matching `@ai-openshell/sdk` release. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

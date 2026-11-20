@@ -64,7 +64,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK (frozen) | Moved to ai-openshell/sdk-python; kept until removal |
-| `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
+| `sdk/typescript/` | TypeScript SDK stub (deprecated) | `@nvidia/openshell-sdk` re-exports `@ai-openshell/sdk` from ai-openshell/sdk-typescript |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
 | `tests/suites/` | E2E suites | One directory per test family, such as `conformance` |
@@ -206,14 +206,6 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 
 - The Python SDK moved to [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), which publishes `openshell` to PyPI. Open SDK changes there.
 - `python/` and the SDK build script `tasks/scripts/generate_python_proto.py` are frozen until core removes them; Branch Checks fails PRs that change them. Put tests for core Python scripts next to the scripts, not under `python/`.
-
-## TypeScript SDK (`sdk/typescript/`)
-
-- Run `mise run sdk:ts:ci` for codegen, proto lint, Biome lint, type checking, unit tests, coverage, and build validation.
-- Proto bindings are generated with `mise run sdk:ts:proto` from the files selected in `sdk/typescript/buf.gen.yaml`.
-- Generated files under `sdk/typescript/src/gen/` are build outputs and must not be committed.
-- Keep the curated API free of generated wire types; expose full generated messages and RPCs through `@nvidia/openshell-sdk/raw`.
-- The release workflow publishes the package to GitHub Packages. Branch checks exercise the publish path with `npm publish --dry-run`.
 
 ## Python
 

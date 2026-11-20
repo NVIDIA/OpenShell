@@ -415,6 +415,10 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run monitoring:check` | Check and render the monitoring mixin            |
 | `mise run clean`     | Clean build artifacts                                   |
 
+## TypeScript SDK contributions
+
+The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript); open TypeScript SDK PRs there.
+
 ## Project Structure
 
 | Path            | Purpose                                       |
@@ -423,7 +427,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
-| `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
+| `sdk/typescript/` | Deprecated `@nvidia/openshell-sdk` stub re-exporting `@ai-openshell/sdk` (moved to ai-openshell/sdk-typescript) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |

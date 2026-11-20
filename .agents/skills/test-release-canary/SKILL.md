@@ -43,11 +43,6 @@ The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
 the release-tooling and package lifecycle tests before relying on the canary.
 
-The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
-validation lives in the `TypeScript SDK` branch check, including a publish
-dry-run. The tagged release workflow publishes the package to GitHub Packages;
-verify that job directly when diagnosing SDK publication failures.
-
 ## Trigger paths
 
 The workflow has two triggers:

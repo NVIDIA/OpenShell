@@ -113,9 +113,10 @@ needed.
 
 ## Required surfaces
 
-Account for every surface: `rust-sdk`, `python-sdk`, `typescript-sdk`,
-`api-behavior`, `cli`, `configuration`, `policy`, `helm`, and `state`. The Go
-SDK moved to ai-openshell/sdk-go and is not a surface of this repository.
+Account for every surface: `rust-sdk`, `python-sdk`, `api-behavior`, `cli`,
+`configuration`, `policy`, `helm`, and `state`. The Go SDK moved to
+ai-openshell/sdk-go and is not a surface of this repository. The TypeScript SDK
+moved to ai-openshell/sdk-typescript and is not a surface of this repository.
 
 Scope `rust-sdk` to the public API reachable through `openshell-sdk`, including
 its `raw` module and transitive public re-exports. Trace the export path before
