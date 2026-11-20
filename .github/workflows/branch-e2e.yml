@@ -131,9 +131,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-gnu
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
           - triple: aarch64-unknown-linux-gnu
-            runner: linux-arm64-cpu8
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -167,9 +167,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
           - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -220,7 +220,7 @@ jobs:
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       contents: read
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -276,15 +276,15 @@ jobs:
           - package: openshell-driver-docker
             binary: openshell-driver-docker
             triple: x86_64-unknown-linux-gnu
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
           - package: openshell-driver-podman
             binary: openshell-driver-podman
             triple: x86_64-unknown-linux-gnu
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
           - package: openshell-driver-kubernetes
             binary: openshell-driver-kubernetes
             triple: x86_64-unknown-linux-gnu
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -511,7 +511,7 @@ jobs:
     with:
       prebuilt-conformance: true
       image-tag: ${{ github.sha }}
-      runner: linux-arm64-cpu8
+      runner: ubuntu-24.04-arm
 
   podman-e2e:
     needs: [pr_metadata, build-binaries-linux, build-conformance, build-images]

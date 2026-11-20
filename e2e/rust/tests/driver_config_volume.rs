@@ -534,6 +534,6 @@ fn github_actions_host_work_path(path: &Path) -> Option<PathBuf> {
     }
 
     let relative = path.strip_prefix("/__w").ok()?;
-    let mapped = Path::new("/home/runner/_work").join(relative);
+    let mapped = Path::new("/home/runner/work").join(relative);
     mapped.exists().then_some(mapped)
 }

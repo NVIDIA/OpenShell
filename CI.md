@@ -251,8 +251,7 @@ A local run does not replace the required PR E2E gate.
 
 ## Informational security reports
 
-Security workflow compute runs directly on GitHub-hosted runners instead of
-NVIDIA self-hosted runners. The PR-oriented workflows receive no secrets and run
+Security workflows run on GitHub-hosted runners. The PR-oriented workflows receive no secrets and run
 on fork pull requests without waiting for copy-pr-bot. Codex Security release
 qualification is the exception: it runs only for maintainer-created
 pre-release tags and receives a scoped NVIDIA Inference API key for the scan
@@ -313,8 +312,7 @@ Cargo Deny, and Workflow Security Reports (Actionlint/Zizmor) in parallel for a
 release tag. Codex Security runs separately as an advisory prerelease
 qualification job. Run the parent manually from
 Actions or call it from another workflow. All applicable children analyze the
-candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
-CI container.
+candidate snapshot. Cargo Deny runs in the CI container.
 
 Tagged releases treat Cargo Deny findings as failures of the
 currently implemented qualification profile. A profile failure prevents stable

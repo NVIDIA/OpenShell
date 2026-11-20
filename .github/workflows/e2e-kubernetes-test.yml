@@ -11,7 +11,7 @@ on:
         description: "GitHub Actions runner label"
         required: false
         type: string
-        default: "linux-amd64-cpu8"
+        default: "ubuntu-24.04"
       checkout-ref:
         description: "Git ref to check out for test inputs (defaults to the workflow SHA)"
         required: false
