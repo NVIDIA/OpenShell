@@ -1838,7 +1838,6 @@ version = "0.0.0"
 dependencies = [
  "keycloak-support",
  "openshell-testkit",
- "tempfile",
 ]
 
 [[package]]
@@ -2852,6 +2851,15 @@ name = "protoc-bin-vendored-win32"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
+
+[[package]]
+name = "provider-refresh"
+version = "0.0.0"
+dependencies = [
+ "host-server-support",
+ "openshell-testkit",
+ "serde_json",
+]
 
 [[package]]
 name = "pulldown-cmark"
