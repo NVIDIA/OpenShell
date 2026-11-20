@@ -125,6 +125,9 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   bearer token, such as an OIDC access token, and no client certificate.
 - `cx.workspace(suffix)` to create a workspace with cleanup. Its
   `add_member(subject, role)` and `remove_member(subject)` manage members.
+  `track_sandbox(name)` and `track_provider(name)` delete what another
+  identity creates in it; call them before the create. `import_profile(yaml)`
+  imports a provider profile into it.
 - `cx.on_cleanup(name, hook)` to remove something when the test ends.
 - `testkit::policy` for sandbox policies: `policy::base()` reads
   `testkit/src/base-policy.yaml`, which allows no network access, and

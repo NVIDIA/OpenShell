@@ -176,6 +176,10 @@ impl Context {
         &self.handles.grpc.client
     }
 
+    pub(crate) fn cleanup_list(&self) -> &Cleanup {
+        &self.handles.cleanup
+    }
+
     /// A resource name unique to this run: `test-<run-id>-<suffix>`.
     ///
     /// Sandbox names can't exceed [`MAX_SANDBOX_NAME_LEN`], so a sandbox
@@ -345,7 +349,7 @@ fn single_compute_driver(info: &proto::GetGatewayInfoResponse) -> Result<String>
 
 /// Register the cleanup hook that deletes sandbox `name`, unless it is
 /// already tracked.
-fn track_sandbox(cleanup: &Cleanup, client: &WorkspaceScopedClient, name: &str) {
+pub(crate) fn track_sandbox(cleanup: &Cleanup, client: &WorkspaceScopedClient, name: &str) {
     let client = client.clone();
     let owned = name.to_string();
     // The timeout wraps the whole hook, not just the wait, so a gateway that
