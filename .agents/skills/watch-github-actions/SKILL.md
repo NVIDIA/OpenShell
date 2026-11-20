@@ -137,7 +137,9 @@ Branch Checks Linux amd64 jobs from ai-openshell/openshell branches run on the
 `openshell-ci-amd64` ARC scale set during the GKE trial. Fork, ARM, and macOS jobs
 keep their hosted runners. Confirm the runner name in the job details before
 attributing a result to GKE. For a job-container or PostgreSQL startup failure,
-check the runner pod's Docker sidecar first. Rust jobs report shared memcached
+check the runner pod's Docker sidecar first. A missing `gh` executable or
+Cachix's `$USER must be set` error indicates incomplete runner bootstrap.
+Rust jobs report shared memcached
 sccache statistics; distinguish backend connectivity errors from compiler/test
 failures. See `CI.md` for the trial scope and cache setup.
 

@@ -333,7 +333,7 @@ jobs:
           cargo clippy --locked --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings
 
       - name: Shared sccache statistics
-        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
         run: sccache --show-stats
 
   rust-test:
@@ -426,7 +426,7 @@ jobs:
           tasks/scripts/check-conformance-program.sh
 
       - name: Shared sccache statistics
-        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
         run: sccache --show-stats
 
   rust-postgres-test:
@@ -458,7 +458,7 @@ jobs:
         run: tasks/scripts/run-postgres-tests.sh --locked --profile ci
 
       - name: Shared sccache statistics
-        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
         run: sccache --show-stats
 
   rust-build-modes:
@@ -520,7 +520,7 @@ jobs:
           fi
 
       - name: Shared sccache statistics
-        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
         run: sccache --show-stats
 
   rust-feature-alias:
@@ -547,7 +547,7 @@ jobs:
           git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
 
       - name: Shared sccache statistics
-        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
         run: sccache --show-stats
 
   rust-gateway-core-features:
@@ -576,7 +576,7 @@ jobs:
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
 
       - name: Shared sccache statistics
-        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
         run: sccache --show-stats
 
   rust-gateway-extended-features:
@@ -604,7 +604,7 @@ jobs:
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
       - name: Shared sccache statistics
-        if: ${{ always() && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
+        if: ${{ always() && env.RUSTC_WRAPPER != '' && runner.environment == 'self-hosted' && startsWith(runner.name, 'openshell-ci-amd64-') }}
         run: sccache --show-stats
 
   python:

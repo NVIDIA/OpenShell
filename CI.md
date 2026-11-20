@@ -16,6 +16,8 @@ in the Actions tab.
 
 The GKE scale set maintains five idle runners and permits twenty total. Each
 runner has an isolated Docker daemon for job containers and Docker-backed tests.
+Runner bootstrap provides GitHub CLI, compression utilities, and the `USER`
+environment variable expected by the existing checks and Cachix.
 Rust jobs use the shared memcached sccache backend and report cache statistics;
 the existing GitHub Rust target/registry cache remains enabled. Inspect the job's
 runner name to confirm whether it ran on GKE. ARM, macOS, and fork jobs do not
