@@ -40,7 +40,7 @@ capture_build() {
     fi
 }
 
-capture_build first 'TASK_FIRST_UNIQUE Review PR #123; /ok to test' --watch 15
+capture_build first 'TASK_FIRST_UNIQUE Review PR #123; authorize workflow approval' --watch 15
 capture_build second 'TASK_SECOND_UNIQUE Review PR #456; do not test' --once 30
 if grep -R -E 'TASK_FIRST_UNIQUE|TASK_SECOND_UNIQUE' "$tmp/first" "$tmp/second"; then
     echo 'task leaked into image build context' >&2
@@ -77,9 +77,9 @@ image="registry.test/team/gator@sha256:$(printf 'a%.0s' {1..64})"
 PATH="$tmp/bin:$PATH" OPENSHELL_BIN="$tmp/bin/openshell" \
     CODEX_AUTH_ACCOUNT_ID=fixture-account LAUNCH_ARGS="$tmp/launch.args" \
     bash "$SCRIPT_DIR/run.sh" --agent "$tmp/agent" --gateway test --name fixture \
-    --image "$image" --watch 'RUNTIME_ONLY_TASK; /ok to test' > "$tmp/launch.log" 2>&1
+    --image "$image" --watch 'RUNTIME_ONLY_TASK; authorize workflow approval' > "$tmp/launch.log" 2>&1
 grep -Fxq "$image" "$tmp/launch.args"
-grep -Fxq 'OPENSHELL_AGENT_TASK=RUNTIME_ONLY_TASK; /ok to test' "$tmp/launch.args"
+grep -Fxq 'OPENSHELL_AGENT_TASK=RUNTIME_ONLY_TASK; authorize workflow approval' "$tmp/launch.args"
 grep -Fxq 'OPENSHELL_AGENT_RUN_MODE=watch' "$tmp/launch.args"
 grep -Fxq '/etc/openshell/agent-payload/runtime/launch.sh' "$tmp/launch.args"
 echo 'ok - prebuilt Kubernetes launch carries task and watch mode at runtime'

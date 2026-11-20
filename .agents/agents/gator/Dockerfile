@@ -87,11 +87,12 @@ COPY bin/gh /usr/local/bin/gh-gator
 COPY bin/review-feedback-ledger /usr/local/bin/review-feedback-ledger
 COPY bin/resolve-gator-review-threads /usr/local/bin/resolve-gator-review-threads
 COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
+COPY bin/approve-gator-workflow /usr/local/bin/approve-gator-workflow
 RUN rm -f /usr/local/bin/gh && \
     cp /usr/local/bin/gh-gator /usr/local/bin/gh && \
     chmod 755 /usr/local/bin/gh /usr/local/bin/review-feedback-ledger \
         /usr/local/bin/resolve-gator-review-threads \
-        /usr/local/bin/validate-review-findings
+        /usr/local/bin/validate-review-findings /usr/local/bin/approve-gator-workflow
 
 RUN printf 'export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
         > /sandbox/.bashrc && \
