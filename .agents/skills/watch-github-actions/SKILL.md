@@ -14,6 +14,10 @@ Monitor GitHub Actions workflow runs using the `gh` CLI.
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
 
+## SDK migration failures
+
+`TypeScript SDK Freeze` rejects additions and modifications under `sdk/typescript/` in pull requests, except the re-export stub's files. Move those changes to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no regenerated TypeScript bindings. Deletions are allowed for removal. The job skips merge groups, matching `Python SDK Freeze`.
+
 ## Quick Status Check
 
 List recent workflow runs for the current branch:
@@ -128,6 +132,10 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 `Release Dev` finishes its active run and replaces pending runs when new commits arrive. Other callers retain E2E cancellation. Inspect job annotations for cancellation reasons.
 
 ## View Job Logs
+
+For Branch Checks `Reviewer Roster` failures, the log lists non-collaborators in
+`REVIEWERS.md`. Remove those entries or arrange repository access before rerunning.
+Lookup errors fail the check rather than treating missing results as eligibility.
 
 For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
 `results/app-listener/cni-setup/` evidence. It includes node and Calico pod

@@ -152,6 +152,7 @@ network_policies:
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         }),
         None,
         None,
@@ -386,6 +387,7 @@ network_policies:
         },
         ancestors: Vec::new(),
         cmdline_paths: vec![executable_path("/workspace/investigate.py")],
+        process: None,
     });
     let expect_export = matches!(sampler, Some(Sampler::AlwaysOn));
     let capture = RequestTracing::new(sampler);
@@ -830,6 +832,7 @@ network_policies:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             });
             let mut proxy: ProxyClient = tokio::io::BufReader::new(Box::new(proxy));
             Box::pin(handle_forward_proxy(

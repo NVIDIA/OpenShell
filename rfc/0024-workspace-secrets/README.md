@@ -3,11 +3,11 @@ authors:
   - "@mrunalp"
 state: review
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/5563
-  - https://github.com/NVIDIA/OpenShell/issues/5663
-  - https://github.com/NVIDIA/OpenShell/issues/896
-  - https://github.com/NVIDIA/OpenShell/pull/5139
-  - https://github.com/NVIDIA/OpenShell/pull/5699
+  - https://github.com/ai-openshell/openshell/issues/5563
+  - https://github.com/ai-openshell/openshell/issues/5663
+  - https://github.com/ai-openshell/openshell/issues/896
+  - https://github.com/ai-openshell/openshell/pull/5139
+  - https://github.com/ai-openshell/openshell/pull/5699
 ---
 
 # RFC 0024 - Workspace Secrets
@@ -35,7 +35,7 @@ delivery and `GetProviderCredentials` never return workspace secrets.
 A confidential OAuth client has one client secret shared by every user who
 connects through it. OpenShell today stores refresh material per provider: each
 user's provider holds its own copy of `client_secret` next to its refresh token
-([#5563](https://github.com/NVIDIA/OpenShell/issues/5563)). Rotating the client
+([#5563](https://github.com/ai-openshell/openshell/issues/5563)). Rotating the client
 secret means updating every provider. That is not just tedious, it is not
 possible without reauthorizing every user:
 `ConfigureProviderRefresh` replaces the whole material set and schedules every
@@ -53,9 +53,9 @@ after a client-secret rotation to use the new secret. OCC also needs the secret
 outside OpenShell.
 
 Related work makes this more pressing.
-[#5663](https://github.com/NVIDIA/OpenShell/issues/5663) adds
+[#5663](https://github.com/ai-openshell/openshell/issues/5663) adds
 `client_secret_basic` and resource indicators to refresh, so OpenShell can own
-refresh for more OAuth servers. [RFC 0023](https://github.com/NVIDIA/OpenShell/pull/5139)
+refresh for more OAuth servers. [RFC 0023](https://github.com/ai-openshell/openshell/pull/5139)
 moves all secret values behind the credential issuer, and the owner kinds it
 introduces give this feature a natural home.
 

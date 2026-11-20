@@ -181,6 +181,11 @@ impl SharedSupervision {
             .set_recovery_timeout_secs(recovery_timeout_secs);
     }
 
+    /// Size the pool and each member by `limits` instead of the defaults.
+    pub fn set_pool_limits(&self, limits: crate::PoolLimits) {
+        self.controller.set_pool_limits(limits);
+    }
+
     /// The controller the gateway serves to the host and publishes the
     /// supervisor token into.
     #[must_use]

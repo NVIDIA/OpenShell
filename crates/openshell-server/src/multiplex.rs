@@ -303,7 +303,14 @@ impl MultiplexService {
             SupervisorHostServer::new(crate::grpc::supervisor_host::SupervisorHostService::new(
                 self.state.clone(),
             ))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE),
+            .max_decoding_message_size(
+                self.state
+                    .compute
+                    .supervisor_host()
+                    .map_or(MAX_GRPC_DECODE_SIZE, |controller| {
+                        controller.pool_limits().max_host_message_bytes()
+                    }),
+            ),
             openshell,
         );
         let reflection = self.state.reflection_service.clone();
@@ -4499,6 +4506,39 @@ mod tests {
             assert_boundary_finding(&events[0], &events[1]);
         }
 
+        /// Answers every request with `status` and its details, in the
+        /// response headers, or in the trailers of a stream when `streamed`.
+        #[derive(Clone)]
+        struct DetailedStatusHandler {
+            status: tonic::Status,
+            streamed: bool,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for DetailedStatusHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                use http_body::Frame;
+                use http_body_util::StreamBody;
+                let response = self.status.clone().into_http::<tonic::body::Body>();
+                if !self.streamed {
+                    return Box::pin(async move { Ok(response) });
+                }
+                let trailers = response.headers().clone();
+                let body = tonic::body::Body::new(StreamBody::new(tokio_stream::iter([
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"frame"))),
+                    Ok(Frame::trailers(trailers)),
+                ])));
+                Box::pin(async move { Ok(Response::new(body)) })
+            }
+        }
+
         /// Answers every request with `code`.
         #[derive(Clone)]
         struct StatusHandler(tonic::Code);
@@ -4749,6 +4789,70 @@ mod tests {
                     detail,
                     "{event}"
                 );
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_mutation_records_the_gateway_error_reason() {
+            use http_body_util::BodyExt;
+            use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
+            let with_reason = |reason: &str, domain: &str| {
+                tonic::Status::with_error_details(
+                    tonic::Code::Aborted,
+                    "refused",
+                    ErrorDetails::with_error_info(reason, domain, std::collections::HashMap::new()),
+                )
+            };
+            let cases = [
+                (
+                    openshell_core::rpc_error::resource_version_conflict("stale", Some(7)),
+                    "rejected:aborted:RESOURCE_VERSION_CONFLICT",
+                ),
+                (
+                    openshell_core::rpc_error::failed_precondition(
+                        "REQUEST_OUTCOME_UNCERTAIN",
+                        "uncertain",
+                    ),
+                    "rejected:failed_precondition:REQUEST_OUTCOME_UNCERTAIN",
+                ),
+                (
+                    with_reason("UPSTREAM_REASON", "example.com"),
+                    "rejected:aborted",
+                ),
+                (
+                    with_reason("not a reason", ERROR_DOMAIN),
+                    "rejected:aborted",
+                ),
+                (
+                    with_reason(&"A".repeat(65), ERROR_DOMAIN),
+                    "rejected:aborted",
+                ),
+            ];
+            for streamed in [false, true] {
+                for (status, detail) in &cases {
+                    let capture = OcsfCapture::default();
+                    let _guard = capture.install();
+
+                    let handler = DetailedStatusHandler {
+                        status: status.clone(),
+                        streamed,
+                    };
+                    let res = user_router(handler)
+                        .call(request_with_id("/openshell.v1.OpenShell/UpdateConfig"))
+                        .await
+                        .unwrap();
+                    res.into_body().collect().await.unwrap();
+
+                    let events = authorization_events(&capture);
+                    assert_eq!(events.len(), 1, "{events:?}");
+                    let event = &events[0];
+                    assert_eq!(event["status_id"], 2, "{event}");
+                    assert_eq!(
+                        event["status_detail"], *detail,
+                        "streamed={streamed} {event}"
+                    );
+                    assert_eq!(event["message"], format!("mutation failed: {detail}"));
+                }
             }
         }
 

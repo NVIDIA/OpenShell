@@ -5,6 +5,9 @@ manifest plus prompt assets that the shared launcher turns into an OpenShell
 sandbox run. Agents do not own harness implementations. Harness-specific setup
 and execution live in `runtime/harnesses/<name>/`.
 
+Agent-specific bundles live in `.agents/agents/<name>/`; see the
+[agent layout](../../.agents/agents/README.md).
+
 ## Directory Layout
 
 ```text

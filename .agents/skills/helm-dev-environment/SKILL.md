@@ -79,7 +79,7 @@ gatewayConfig:
 ```
 
 The gateway chart creates a shared supervisor Deployment (`supervisor.replicas`,
-default one), Service, NetworkPolicy, and an empty
+default two), Service, NetworkPolicy, and an empty
 `<release>-supervisor-token` Secret in
 the release namespace, regardless of shared/managed/operator workspace mode.
 The gateway mints a supervisor token from its sandbox-JWT signing key, writes
@@ -166,9 +166,11 @@ expects Helm to own replicas. Changing HPA bounds or target must leave the
 gateway config and supervisor Pod template unchanged, as checked by
 `deploy/helm/test-supervisor-pool-scaling.sh`. With the gateway topology the
 chart renders the gateway's
-`[openshell.gateway.supervisor_pool]` tuning table (only
-`recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
-the driver's `shared_supervisor` table stays unchanged), a
+`[openshell.gateway.supervisor_pool]` tuning table (`recovery_timeout_secs`
+from `supervisor.recoveryTimeoutSeconds`, default 60, plus
+`max_instances_per_member` and `max_members_per_gateway` from
+`supervisor.pool.maxInstancesPerMember` and `.maxMembersPerGateway`; the
+driver's `shared_supervisor` table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with a 60-second
 grace period, no affinity unless `supervisor.affinity` is set (top-level
 `affinity` applies only to the gateway), the pool identity env vars

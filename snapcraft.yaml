@@ -94,9 +94,9 @@ confinement: strict
 assumes: [snapd2.76]
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
-source-code: https://github.com/NVIDIA/OpenShell
-issues: https://github.com/NVIDIA/OpenShell/issues
-contact: https://github.com/NVIDIA/OpenShell/security/policy
+source-code: https://github.com/ai-openshell/openshell
+issues: https://github.com/ai-openshell/openshell/issues
+contact: https://github.com/ai-openshell/openshell/security/policy
 platforms:
   amd64:
     build-on: [amd64]

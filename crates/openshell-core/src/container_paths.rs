@@ -28,7 +28,7 @@ pub const OCI_RUNTIME_MOUNT_ROOTS: &[&str] = &["/proc", "/sys", "/dev"];
 /// High-level namespaces mounted or created by `OpenShell` inside sandboxes.
 ///
 /// This is intentionally not a general Linux system-path denylist. Kernel and
-/// image-provided paths have separate trust models; see NVIDIA/OpenShell#2578.
+/// image-provided paths have separate trust models; see ai-openshell/openshell#2578.
 pub const CONTROL_ROOTS: &[&str] = &[
     OPT_ROOT,
     ETC_ROOT,

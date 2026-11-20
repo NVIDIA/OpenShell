@@ -1374,9 +1374,23 @@ and enabling or disabling autoscaling on an existing release.
 
 With `supervisor_topology = "gateway"`, the gateway always coordinates the
 shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
-`supervisor.replicas` members (default 1, which has no failover). The chart
-renders only `[openshell.gateway.supervisor_pool] recovery_timeout_secs` (the
-driver's `shared_supervisor` table carries no pool settings), rolls one member
+`supervisor.replicas` members (default 1). The chart renders
+`[openshell.gateway.supervisor_pool]` `recovery_timeout_secs`,
+`max_instances_per_member` (Helm `supervisor.pool.maxInstancesPerMember`,
+1 to 1024, default 128, also passed to each member as
+`OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`), and `max_members_per_gateway`
+(`supervisor.pool.maxMembersPerGateway`, 1 or more, default 32); the driver's
+`shared_supervisor` table carries no pool settings. Rendering fails when
+`supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds the
+gateway replica count times `maxMembersPerGateway`. A create that finds every
+member at its cap, or the pool at gateway replicas × members × instances
+(never above 131072), fails with `FAILED_PRECONDITION` "sandbox capacity
+reached"; the gateway log warns "every supervisor is at its sandbox limit" or
+"supervisor pool is at its sandbox limit" to say which. Raise the cap or add
+members. Supervisor container
+resources come from `supervisor.resources` (unset by default; the chart
+recommends requests 250m and 768Mi with a 1.5Gi memory limit for 128
+sandboxes per supervisor). The chart rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control
 supervisor scheduling; top-level `affinity` applies only to the gateway), gives
 each member a 60-second grace period to leave,
@@ -1684,7 +1698,7 @@ credential failures.
 | Shared sandbox workloads terminate after a supervisor Pod or node failure (`sandbox-supervisor-recovery-expired`) | One supervisor replica (no member to fail over to), no live pool member took over, or the recovery timeout is shorter than detection plus takeover | `supervisor.replicas` and the `<release>-supervisor` PodDisruptionBudget; gateway `taking over a shared sandbox instance` logs; workload Pod `sandbox-supervisor-*` findings; `supervisor.recoveryTimeoutSeconds`. See "Shared supervisor high availability" in Step 6 |
 | Shared-sandbox grants fail with `code=unavailable stage=workload_identity` | The gateway cannot reach the SPIFFE Broker endpoint or obtain credentials from its CSI Workload API socket | Gateway logs for `dynamic token grant failed`; check Broker endpoint connectivity, the gateway's Workload API CSI mount and agent health |
 | Shared-sandbox grants fail with `code=workload_identity_rejected stage=workload_identity` | Broker mTLS verification fails, an agent has no Sandbox UID registration, or the gateway lacks `impersonate-via-spire` authorization | Check trust, the exact or prefix peer policy, and Sandbox registrations on the gateway's node-local agent or the configured endpoint's agents. Verify the gateway SPIFFE identity's namespace-scoped authorization. Use a node alias to cover eligible agents |
-| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
+| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/ai-openshell/openshell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |

@@ -3,7 +3,7 @@ authors:
   - "@anewberry"
 state: accepted
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1919
+  - https://github.com/ai-openshell/openshell/issues/1919
 ---
 
 # RFC 0010 - Gateway Interceptors
