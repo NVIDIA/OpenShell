@@ -32,3 +32,13 @@
     - name: Prepare packaged OpenShell gateway
       ansible.builtin.include_role:
         name: openshell_packaged_gateway
+
+    # The packaged configuration sets no network_name, so the gateway uses the
+    # Podman driver's default. See tests/support/container-engine.
+    - name: Publish the container network test variable
+      ansible.builtin.include_tasks: test-env.yaml
+      when: openshell_gateway_driver == "podman"
+      vars:
+        test_env_name: container-network
+        test_env_vars:
+          OPENSHELL_TEST_CONTAINER_NETWORK: openshell

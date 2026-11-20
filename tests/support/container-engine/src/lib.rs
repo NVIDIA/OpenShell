@@ -17,7 +17,14 @@
 //! The value is split on whitespace, so it can't hold arguments with spaces.
 //! Under `openshell-test-runner`, the tmachine environment's setup publishes
 //! it. A missing variable fails the test; it never skips it.
+//!
+//! Podman environments also publish `OPENSHELL_TEST_CONTAINER_NETWORK`, the
+//! network the gateway attaches sandboxes to, so a test can start a fixture
+//! container there, such as an [`EchoContainer`], and reach it by its network
+//! alias. Docker environments don't: their tests reach fixtures on
+//! the host instead.
 
+mod echo;
 mod tar;
 
 use std::path::Path;
@@ -26,7 +33,11 @@ use std::time::{Duration, Instant};
 use testkit::{Context, Error, Result, ResultExt as _};
 use tokio::process::Command;
 
+pub use echo::EchoContainer;
+
 pub const ENGINE_ENV: &str = "OPENSHELL_TEST_CONTAINER_ENGINE";
+/// The container network the gateway attaches sandboxes to.
+pub const NETWORK_ENV: &str = "OPENSHELL_TEST_CONTAINER_NETWORK";
 /// The label the Docker and Podman drivers put on a sandbox's containers.
 pub const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 /// The label with the ID of the sandbox a container belongs to.
@@ -67,6 +78,66 @@ impl Engine {
             "{ENGINE_ENV} is not set; this suite needs the gateway's container engine, such as docker, podman or `sudo -n podman` (see the container-engine-support crate docs)"
         );
         Ok(Self { command })
+    }
+
+    /// The network named by [`NETWORK_ENV`]. A missing variable is an error.
+    pub fn network_from_env() -> Result<String> {
+        std::env::var(NETWORK_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "{NETWORK_ENV} is not set; this test needs the container network the gateway attaches sandboxes to"
+                ))
+            })
+    }
+
+    /// Start a detached container named `openshell-test-<name>-<run id>`
+    /// with `args`: `run` options, then the image and its command. The
+    /// container is removed when the test ends, after the sandboxes created
+    /// later. Returns its ID.
+    pub async fn run_test_container<I, S>(
+        &self,
+        cx: &Context,
+        name: &str,
+        args: I,
+    ) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let container = format!("openshell-test-{name}-{}", cx.run_id());
+        let mut command = vec![
+            "run".to_string(),
+            "--detach".to_string(),
+            "--name".to_string(),
+            container.clone(),
+        ];
+        command.extend(args.into_iter().map(|arg| arg.as_ref().to_string()));
+        let id = self.output(command).await?;
+        let (engine, started) = (self.clone(), container.clone());
+        cx.on_cleanup(format!("remove container {container}"), async move || {
+            engine.output(["rm", "--force", &started]).await.map(drop)
+        });
+        Ok(id)
+    }
+
+    /// The address container `id` has on `network`.
+    pub async fn container_ip(&self, id: &str, network: &str) -> Result<String> {
+        let ip = self
+            .inspect_container(
+                id,
+                &format!(
+                    "{{{{with index .NetworkSettings.Networks \"{network}\"}}}}{{{{.IPAddress}}}}{{{{end}}}}"
+                ),
+            )
+            .await?;
+        testkit::ensure!(
+            !ip.is_empty(),
+            "container {id} has no address on network {network}"
+        );
+        Ok(ip)
     }
 
     /// Build `containerfile` as `tag`. The build context is empty.

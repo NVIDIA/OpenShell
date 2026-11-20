@@ -8,3 +8,13 @@
   roles:
     - openshell_gateway
     - openshell_client
+  tasks:
+    # The network_name in roles/openshell_gateway/templates/gateway-podman.toml.j2.
+    # See tests/support/container-engine.
+    - name: Publish the container network test variable
+      ansible.builtin.include_tasks: test-env.yaml
+      when: openshell_gateway_driver == "podman"
+      vars:
+        test_env_name: container-network
+        test_env_vars:
+          OPENSHELL_TEST_CONTAINER_NETWORK: tmachine
