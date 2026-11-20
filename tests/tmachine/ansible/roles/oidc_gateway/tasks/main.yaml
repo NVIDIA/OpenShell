@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Make the packaged gateway trust the environment's Keycloak realm (the
+# keycloak role) and keep testkit's mTLS connection working as an operator.
+#
+# With an OIDC issuer set, the gateway maps a client certificate to a user
+# only when mTLS user authentication is on, and that user has no platform
+# role. An operator certificate (OU=operator) has full access instead, so
+# testkit's setup and cleanup work. The operator script re-signs the
+# packaged gateway's client certificate on every start, after
+# `generate-certs`, through a drop-in on the gateway's systemd user unit.
+# Only the deb and rpm installers run that unit.
+---
+- name: Detect the gateway user
+  ansible.builtin.include_role:
+    name: openshell_gateway
+    tasks_from: detect.yaml
+
+- name: Trust the Keycloak realm and operator certificates
+  ansible.builtin.include_role:
+    name: gateway_overrides
+  vars:
+    gateway_overrides_name: oidc
+    gateway_overrides_content: |
+      [openshell.gateway.oidc]
+      issuer = "http://127.0.0.1:{{ keycloak_port }}/realms/{{ keycloak_realm }}"
+      dangerously_allow_insecure_http = true
+      audience = "openshell-cli"
+      jwks_ttl_secs = 60
+      roles_claim = "realm_access.roles"
+      admin_role = "openshell-admin"
+      user_role = "openshell-user"
+      scopes_claim = "scope"
+
+      [openshell.gateway.mtls_auth]
+      operator_enabled = true
+
+- name: Create the test scripts directory
+  become: true
+  ansible.builtin.file:
+    path: "{{ oidc_gateway_operator_script | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the operator certificate script
+  become: true
+  ansible.builtin.copy:
+    src: operator-client-cert.sh
+    dest: "{{ oidc_gateway_operator_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create the gateway unit's drop-in directory
+  become: true
+  ansible.builtin.file:
+    path: "{{ openshell_gateway_home }}/{{ item }}"
+    state: directory
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0755"
+  loop:
+    - .config
+    - .config/systemd
+    - .config/systemd/user
+    - .config/systemd/user/openshell-gateway.service.d
+
+- name: Run the operator certificate script before the gateway starts
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_home }}/.config/systemd/user/openshell-gateway.service.d/oidc-operator.conf"
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0644"
+    content: |
+      [Service]
+      ExecStartPre={{ oidc_gateway_operator_script }}

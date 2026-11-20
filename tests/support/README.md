@@ -23,6 +23,10 @@ never skips it. Add a row when you add a variable.
 | `OPENSHELL_TEST_KEYCLOAK_CLIENT_ID` | `<base>-keycloak` | `keycloak-support` | A client in that realm that allows password grants. |
 | `OPENSHELL_TEST_KEYCLOAK_USERNAME` | `<base>-keycloak` | `keycloak-support` | The realm user that tests sign in as. |
 | `OPENSHELL_TEST_KEYCLOAK_PASSWORD` | `<base>-keycloak` | `keycloak-support` | That user's password. |
+| `OPENSHELL_TEST_KEYCLOAK_USER_USERNAME` | `<base>-oidc` (`playbooks/oidc.yaml`) | `keycloak-support` (`User::User`) | A realm user with no platform admin role, which the gateway signs in. |
+| `OPENSHELL_TEST_KEYCLOAK_USER_PASSWORD` | `<base>-oidc` | `keycloak-support` | That user's password. |
+| `OPENSHELL_TEST_KEYCLOAK_USER_B_USERNAME` | `<base>-oidc` | `keycloak-support` (`User::UserB`) | A second such user, for tests across two users' workspaces. |
+| `OPENSHELL_TEST_KEYCLOAK_USER_B_PASSWORD` | `<base>-oidc` | `keycloak-support` | That user's password. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which configures the gateway's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the gateway trusts. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | The additional-CA environment | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |
