@@ -13,6 +13,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
+const MIN_ENTRY_BYTES: u64 = 4096;
+
 /// Both limits span every layer of one bootstrap build. Tar headers and padding
 /// consume decoded bytes. Sparse holes and copies of hard links consume output
 /// bytes even when there is little or no corresponding data in the tar.
@@ -38,11 +40,11 @@ impl BootstrapExtractionBudget {
         ))
     }
 
-    fn reserve_output(&mut self, bytes: u64) -> io::Result<()> {
+    fn reserve_entry(&mut self, bytes: u64) -> io::Result<()> {
         self.output_left = self
             .output_left
-            .checked_sub(bytes)
-            .ok_or_else(|| self.exceeded("extracted file data"))?;
+            .checked_sub(bytes.max(MIN_ENTRY_BYTES))
+            .ok_or_else(|| self.exceeded("filesystem output"))?;
         Ok(())
     }
 
@@ -73,20 +75,40 @@ impl BootstrapExtractionBudget {
         let mut directories = Vec::new();
         for entry in archive.entries()? {
             let mut entry = entry?;
-            if entry.header().entry_type().is_dir() {
-                directories.push(entry);
+            let kind = entry.header().entry_type();
+            if kind.is_pax_global_extensions()
+                || kind.is_pax_local_extensions()
+                || kind.is_gnu_longname()
+                || kind.is_gnu_longlink()
+            {
                 continue;
             }
-            let bytes = if entry.header().entry_type().is_symlink() {
+            // unpack_in can create every parent of a member, even if the tar
+            // has no entries for those directories. Reserve before it writes.
+            for _ in entry
+                .path()?
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .skip(1)
+            {
+                self.reserve_entry(0)?;
+            }
+            let bytes = if kind.is_symlink() {
                 entry
                     .link_name_bytes()
                     .map_or(0, |target| target.len() as u64)
+            } else if kind.is_dir() {
+                0
             } else {
                 // tar resolves PAX size overrides and GNU sparse extents here.
                 entry.size()
             };
-            self.reserve_output(bytes)?;
-            entry.unpack_in(dest)?;
+            self.reserve_entry(bytes)?;
+            if kind.is_dir() {
+                directories.push(entry);
+            } else {
+                entry.unpack_in(dest)?;
+            }
         }
         directories.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
         for mut directory in directories {
@@ -232,11 +254,12 @@ impl LayerApplier {
             let metadata = fs::symlink_metadata(&source_path)
                 .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
             let file_type = metadata.file_type();
-            if file_type.is_file() || file_type.is_symlink() {
-                budget
-                    .reserve_output(metadata.len())
-                    .map_err(|err| err.to_string())?;
-            }
+            let bytes = if file_type.is_dir() {
+                0
+            } else {
+                metadata.len()
+            };
+            budget.reserve_entry(bytes).map_err(|err| err.to_string())?;
 
             if file_type.is_dir() {
                 let plan = self.plan_directory_merge(&dest_path)?;
@@ -313,11 +336,12 @@ impl LayerApplier {
             let metadata = fs::symlink_metadata(&source_path)
                 .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
             let file_type = metadata.file_type();
-            if file_type.is_file() || file_type.is_symlink() {
-                budget
-                    .reserve_output(metadata.len())
-                    .map_err(|err| err.to_string())?;
-            }
+            let bytes = if file_type.is_dir() {
+                0
+            } else {
+                metadata.len()
+            };
+            budget.reserve_entry(bytes).map_err(|err| err.to_string())?;
 
             if file_type.is_dir() {
                 let plan = self.plan_directory_merge(target_dir, &file_name)?;
@@ -871,7 +895,7 @@ mod tests {
             .merge_directory(
                 &upper,
                 &opened,
-                &mut super::BootstrapExtractionBudget::new(1024),
+                &mut super::BootstrapExtractionBudget::new(4096),
             )
             .unwrap();
 

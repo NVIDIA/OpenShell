@@ -2105,8 +2105,10 @@ grpc_endpoint    = "https://host.openshell.internal:17670"
 bootstrap_image  = "nvcr.io/nvidia/base/ubuntu:24.04"
 # On a registry bootstrap cache miss, this limit applies across all layers.
 # It caps both the total decoded tar bytes (including trailing data) and the
-# total logical bytes written while unpacking and merging files. Sparse holes
-# count at their logical size, and each copy into the merged rootfs counts.
+# output budget for staging and merging. Each entry costs at least 4 KiB.
+# Staging also charges 4 KiB per parent component, including repeated parents.
+# Larger files count at their logical size, including sparse holes. Each copy
+# into the merged rootfs counts again.
 # Defaults to 10 GiB. Downloads and the final ext4 disk use additional space.
 # bootstrap_extraction_max_bytes = 10737418240
 krun_log_level   = 1

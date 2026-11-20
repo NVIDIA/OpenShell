@@ -6262,7 +6262,7 @@ impl VmDriver {
             .iter()
             .map(|layer| layer.size.max(0))
             .fold(0, i64::saturating_add);
-        let mut layers = futures::stream::iter(manifest.layers.iter().cloned().enumerate())
+        let mut layers = futures::stream::iter(manifest.layers.into_iter().enumerate())
             .map(|(index, layer)| async move {
                 self.publish_registry_layer_progress(
                     sandbox_id,
@@ -12373,7 +12373,8 @@ mod tests {
 
     #[test]
     fn bootstrap_extraction_bounds_decoded_tar_through_eof_for_each_compression() {
-        let tar = tar_bytes_with_file("tool", b"contents");
+        let mut tar = tar_bytes_with_file("tool", b"contents");
+        tar.resize(8192, 0);
         let tail = b"after the tar end marker";
         let decoded_bytes = (tar.len() + tail.len()) as u64;
         let gzip = [gzip_bytes(&tar), gzip_bytes(tail)].concat();
@@ -12413,7 +12414,8 @@ mod tests {
 
     #[test]
     fn bootstrap_extraction_counts_decoded_tar_across_layers() {
-        let tar = tar_bytes_with_file("tool", b"small");
+        let mut tar = tar_bytes_with_file("tool", b"small");
+        tar.resize(8192, 0);
         let temp = tempfile::tempdir().unwrap();
         let mut budget = BootstrapExtractionBudget::new(2 * tar.len() as u64 - 1);
         budget
@@ -12423,6 +12425,46 @@ mod tests {
             .unpack_tar(tar.as_slice(), &temp.path().join("upper"))
             .unwrap_err();
         assert!(error.to_string().contains("decoded layer tars"), "{error}");
+    }
+
+    #[test]
+    fn bootstrap_extraction_global_pax_header_only_spends_decoded_bytes() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        let comment = b"13 comment=x\n";
+        header.set_entry_type(tar::EntryType::XGlobalHeader);
+        header.set_mode(0o644);
+        header.set_size(comment.len() as u64);
+        builder
+            .append_data(&mut header, "pax", &comment[..])
+            .unwrap();
+        append_test_tar_file(&mut builder, "payload", &[1; 8192]);
+        let tar = builder.into_inner().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("layer");
+        let root = temp.path().join("root");
+        let mut budget = BootstrapExtractionBudget::new(2 * 8192);
+        budget.unpack_tar(&tar[..], &stage).unwrap();
+        budget.apply_layer(&stage, &root).unwrap();
+        assert_eq!(fs::read(root.join("payload")).unwrap(), [1; 8192]);
+        assert!(!root.join("pax").exists());
+    }
+
+    #[test]
+    fn bootstrap_extraction_bounds_path_entries_before_creating_parents() {
+        let tar = tar_bytes_with_file("a/b/c/empty", b"");
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("layer");
+        let root = temp.path().join("root");
+        let mut too_small = BootstrapExtractionBudget::new(4 * 4096 - 1);
+        let err = too_small.unpack_tar(&tar[..], &stage).unwrap_err();
+        assert!(err.to_string().contains("filesystem output"), "{err}");
+        assert!(!stage.join("a").exists());
+
+        let mut budget = BootstrapExtractionBudget::new(8 * 4096);
+        budget.unpack_tar(&tar[..], &stage).unwrap();
+        budget.apply_layer(&stage, &root).unwrap();
+        assert!(root.join("a/b/c/empty").is_file());
     }
 
     #[test]
@@ -12446,7 +12488,7 @@ mod tests {
             let error = BootstrapExtractionBudget::new(1024 * 1024 - 1)
                 .unpack_tar(&tar[..], dest)
                 .unwrap_err();
-            assert!(error.to_string().contains("extracted file data"), "{error}");
+            assert!(error.to_string().contains("filesystem output"), "{error}");
             assert!(!dest.join("sparse").exists());
             if logical_size == 1024 * 1024 {
                 BootstrapExtractionBudget::new(logical_size)
@@ -12464,20 +12506,20 @@ mod tests {
     fn bootstrap_extraction_checks_pax_size_before_creating_file() {
         let mut builder = tar::Builder::new(Vec::new());
         builder
-            .append_pax_extensions([("size", &b"4096"[..])])
+            .append_pax_extensions([("size", &b"8192"[..])])
             .unwrap();
         let mut header = tar::Header::new_gnu();
         header.set_size(1);
         header.set_mode(0o644);
         builder
-            .append_data(&mut header, "file", &[7; 4096][..])
+            .append_data(&mut header, "file", &[7; 8192][..])
             .unwrap();
         let tar = builder.into_inner().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let error = BootstrapExtractionBudget::new(4095)
+        let error = BootstrapExtractionBudget::new(8191)
             .unpack_tar(tar.as_slice(), temp.path())
             .unwrap_err();
-        assert!(error.to_string().contains("extracted file data"), "{error}");
+        assert!(error.to_string().contains("filesystem output"), "{error}");
         assert!(!temp.path().join("file").exists());
     }
 
@@ -12497,11 +12539,11 @@ mod tests {
         let root = temp.path().join("root");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("c"), b"old").unwrap();
-        // Staging writes one payload. The merge copies the payload three times.
-        let mut budget = BootstrapExtractionBudget::new(4 * 4096 - 1);
+        // Three staged entries and three merged copies each consume one block.
+        let mut budget = BootstrapExtractionBudget::new(6 * 4096 - 1);
         budget.unpack_tar(&tar[..], &staged).unwrap();
         let error = budget.apply_layer(&staged, &root).unwrap_err();
-        assert!(error.contains("extracted file data"), "{error}");
+        assert!(error.contains("filesystem output"), "{error}");
         assert_eq!(fs::read(root.join("b")).unwrap(), [3; 4096]);
         assert_eq!(fs::read(root.join("c")).unwrap(), b"old");
     }

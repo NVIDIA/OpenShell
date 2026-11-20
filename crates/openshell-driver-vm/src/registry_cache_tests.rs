@@ -597,8 +597,9 @@ async fn bootstrap_extraction_limit_spans_layers_and_cleans_failed_build() {
     let attempt = state.path().join("attempt");
     fs::create_dir(&attempt).unwrap();
     driver.preparation_root = Some(attempt.clone());
-    // Both versions of the file are unpacked and copied, even though only the upper one survives.
-    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(4 * 4096 - 1);
+    // Four path components staged and three entries merged in the lower layer.
+    // The upper file is charged again when staged and when merged.
+    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(9 * 4096 - 1);
     let error = ensure_image(&driver, &image, &client, true)
         .await
         .unwrap_err();
@@ -615,7 +616,7 @@ async fn bootstrap_extraction_limit_spans_layers_and_cleans_failed_build() {
         "a rejected image must not leave a cache entry"
     );
 
-    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(4 * 4096);
+    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(9 * 4096);
     let staging = state.path().join("retry");
     let rootfs = staging.join("rootfs");
     driver
