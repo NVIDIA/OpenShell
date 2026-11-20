@@ -53,6 +53,7 @@ let
       driver = "docker";
       use_galaxy = true;
       playbooks = [
+        "ansible/playbooks/disable-unattended-upgrades.yaml"
         "ansible/playbooks/nextest.yaml"
         "ansible/playbooks/test-tools.yaml"
         "ansible/playbooks/docker.yaml"
@@ -62,6 +63,7 @@ let
       machine = "ubuntu";
       use_galaxy = false;
       playbooks = [
+        "ansible/playbooks/disable-unattended-upgrades.yaml"
         "ansible/playbooks/nextest.yaml"
         "ansible/playbooks/test-tools.yaml"
         "ansible/playbooks/k3s.yaml"

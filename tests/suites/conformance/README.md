@@ -2,9 +2,11 @@
 
 The `conformance` crate holds the testkit suites for sandbox behavior that every
 compute driver must provide. The family is this one crate, its own workspace.
-It is a library: each module in `src/` is one suite, and `cargo test` and
-nextest run the tests as the library's unit tests. The crate also builds the
-`openshell-conformance` program, which runs the same tests.
+It is a library of suites, one module each in `src/`, and the
+`openshell-conformance` program that runs them. The program is the crate's test
+target (`harness = false`), so `openshell-conformance run`,
+`cargo test --bin openshell-conformance` and
+`cargo nextest run --bin openshell-conformance` all run the same code.
 
 | Suite | Covers |
 |---|---|
@@ -65,6 +67,24 @@ Feature and driver suites are not part of it. The
 [testkit README](../../testkit/README.md#test-programs) describes the commands
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
+
+### Marking a test unsupported in CI
+
+When a test can't pass in one environment yet, for example because of a driver
+bug, keep the test and mark it unsupported there:
+
+1. File an issue for the bug.
+2. Add an entry to [`unsupported.yaml`](unsupported.yaml): the test, the issue,
+   and the environments it fails in, each a tmachine row
+   (`<environment>/<installer>`, such as `ubuntu-k3s/k3s-ha`) or a host lane
+   (`docker`, `podman`, `kubernetes` or `vm`).
+3. Delete the entry in the PR that fixes the bug.
+
+CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`; the
+[testkit README](../../testkit/README.md#unsupported-tests) describes what the
+program does with it. Branch Checks runs the program with each environment's
+entries, so an unknown test, a bad issue URL or an unknown environment name
+fails there.
 
 ## Adding a test
 
