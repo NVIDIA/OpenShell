@@ -3,16 +3,16 @@ authors:
   - "@johntmyers"
 state: review
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1107
-  - https://github.com/NVIDIA/OpenShell/pull/2155
-  - https://github.com/NVIDIA/OpenShell/pull/1083
-  - https://github.com/NVIDIA/OpenShell/pull/1151
-  - https://github.com/NVIDIA/OpenShell/pull/1286
-  - https://github.com/NVIDIA/OpenShell/pull/1511
-  - https://github.com/NVIDIA/OpenShell/pull/1738
-  - https://github.com/NVIDIA/OpenShell/pull/2027
-  - https://github.com/NVIDIA/OpenShell/pull/1865
-  - https://github.com/NVIDIA/OpenShell/pull/1938
+  - https://github.com/ai-openshell/openshell/issues/1107
+  - https://github.com/ai-openshell/openshell/pull/2155
+  - https://github.com/ai-openshell/openshell/pull/1083
+  - https://github.com/ai-openshell/openshell/pull/1151
+  - https://github.com/ai-openshell/openshell/pull/1286
+  - https://github.com/ai-openshell/openshell/pull/1511
+  - https://github.com/ai-openshell/openshell/pull/1738
+  - https://github.com/ai-openshell/openshell/pull/2027
+  - https://github.com/ai-openshell/openshell/pull/1865
+  - https://github.com/ai-openshell/openshell/pull/1938
 ---
 
 # RFC 0005 - Sandbox Proxy Egress Adapter Model
@@ -89,7 +89,7 @@ authorization or relay logic.
 - Use eBPF connect hooks for transparent capture. Native TCP capture needs a
   userland proxy in the byte stream for TLS termination and protocol parsing.
 - Add policy-declared supervisor-proxied host-local endpoints. Issue
-  [#1633](https://github.com/NVIDIA/OpenShell/issues/1633) can consume these
+  [#1633](https://github.com/ai-openshell/openshell/issues/1633) can consume these
   boundaries in separate feature work.
 - Change the existing endpoint-only runtime's process-identity semantics during
   the compatibility refactor. Future identity-less deployment modes require an

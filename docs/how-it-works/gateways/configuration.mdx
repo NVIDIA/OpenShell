@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Configu
 position: 5
 ---
 
-The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. When neither is set, the gateway reads `$XDG_CONFIG_HOME/openshell/gateway.toml` if that file exists. If no config file exists, the gateway starts from built-in defaults. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
+The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. When neither is set, the gateway reads `$XDG_CONFIG_HOME/openshell/gateway.toml` if that file exists. If no config file exists, the gateway starts from built-in defaults. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/ai-openshell/openshell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
 
 ## Source Precedence
 
@@ -1768,7 +1768,7 @@ sandbox and 64 per gateway, including when token caching is disabled.
 
 The MXC driver runs native Windows workloads through `wxc-exec`. Use this
 configuration with a build from the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows). Keep
+[`windows` branch](https://github.com/ai-openshell/openshell/tree/windows). Keep
 `openshell-supervisor.exe` and `openshell-windows-sandbox.exe` beside the gateway.
 
 ```toml
@@ -1793,7 +1793,7 @@ etw_audit = true
 or membership in Windows Performance Log Users. See
 [OCSF JSON Export](/observability/ocsf-json-export) for durable audit output.
 
-Follow the [Windows configuration guide](https://github.com/NVIDIA/OpenShell/blob/windows/docs/how-it-works/gateways/configuration.mdx#mxc)
+Follow the [Windows configuration guide](https://github.com/ai-openshell/openshell/blob/windows/docs/how-it-works/gateways/configuration.mdx#mxc)
 for host prerequisites, TLS setup, sandbox creation, and runtime limitations.
 
 ### Docker

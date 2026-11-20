@@ -15,7 +15,7 @@ These tests require a Linux host with Landlock support (kernel 5.13+).
 GitHub Actions Linux runners satisfy this requirement. Docker Desktop
 linuxkit kernels also support Landlock (ABI v5+).
 
-Related: https://github.com/NVIDIA/OpenShell/issues/803
+Related: https://github.com/ai-openshell/openshell/issues/803
 """
 
 from __future__ import annotations

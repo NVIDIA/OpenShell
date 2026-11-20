@@ -50,17 +50,17 @@ Consumers do not need the OpenShell checkout or mise. Install the mixin with jso
 
 ```shell
 jb init
-jb install github.com/NVIDIA/OpenShell/deploy/openshell-mixin@COMMIT_SHA
+jb install github.com/ai-openshell/openshell/deploy/openshell-mixin@COMMIT_SHA
 mkdir -p dashboards
-jsonnet -J vendor -m dashboards -e '(import "github.com/NVIDIA/OpenShell/deploy/openshell-mixin/mixin.libsonnet").grafanaDashboards'
+jsonnet -J vendor -m dashboards -e '(import "github.com/ai-openshell/openshell/deploy/openshell-mixin/mixin.libsonnet").grafanaDashboards'
 ```
 
-Replace `COMMIT_SHA` with a published immutable revision containing this package. Import `github.com/NVIDIA/OpenShell/deploy/openshell-mixin/mixin.libsonnet` from the consumer's vendor directory and compose its exports into your existing monitoring resources, including kube-prometheus ConfigMaps where applicable.
+Replace `COMMIT_SHA` with a published immutable revision containing this package. Import `github.com/ai-openshell/openshell/deploy/openshell-mixin/mixin.libsonnet` from the consumer's vendor directory and compose its exports into your existing monitoring resources, including kube-prometheus ConfigMaps where applicable.
 
 Each dashboard module contributes `grafanaDashboards+::`. The final defaults layer exposes the standard dashboard export. Consumers can extend it with ordinary Jsonnet inheritance:
 
 ```jsonnet
-(import 'github.com/NVIDIA/OpenShell/deploy/openshell-mixin/mixin.libsonnet') + {
+(import 'github.com/ai-openshell/openshell/deploy/openshell-mixin/mixin.libsonnet') + {
   _config+:: { openshell+: { uidPrefix: 'prod-', refresh: '1m' } },
   grafanaDashboards+: {
     'openshell-operational-health.json'+: { title: 'Production OpenShell' },
@@ -89,7 +89,7 @@ RPC and HTTP summaries show weighted means, not aggregate p95. Streaming RPC com
 
 ## Validate in your environment
 
-The local checks use `uv`, with pinned `promql-parser==0.12.0`, to validate standard exports, dashboard identity, datasource references, portability, composition, configuration overrides, and generated PromQL syntax. A consumer integration test snapshots the current package into a temporary Git repository, runs a real `jb install` into a fresh consumer, and renders through `vendor/github.com/NVIDIA/OpenShell/deploy/openshell-mixin/`. Git URL rewriting directs only that package to the local fixture; Grafonnet dependencies are installed from the pinned manifests. These checks require Git and network access for dependency installation:
+The local checks use `uv`, with pinned `promql-parser==0.12.0`, to validate standard exports, dashboard identity, datasource references, portability, composition, configuration overrides, and generated PromQL syntax. A consumer integration test snapshots the current package into a temporary Git repository, runs a real `jb install` into a fresh consumer, and renders through `vendor/github.com/ai-openshell/openshell/deploy/openshell-mixin/`. Git URL rewriting directs only that package to the local fixture; Grafonnet dependencies are installed from the pinned manifests. These checks require Git and network access for dependency installation:
 
 ```shell
 mise run monitoring:check

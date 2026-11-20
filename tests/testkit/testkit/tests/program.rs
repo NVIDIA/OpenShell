@@ -35,7 +35,7 @@ async fn registered_needs_a_gateway(cx: &mut testkit::Context) -> testkit::Resul
 
 /// Ignored until later.
 #[testkit::test]
-#[ignore = "https://github.com/NVIDIA/OpenShell/issues/1"]
+#[ignore = "https://github.com/ai-openshell/openshell/issues/1"]
 async fn registered_ignored(_cx: &mut testkit::Context) -> testkit::Result {
     Ok(())
 }
@@ -265,7 +265,7 @@ mod unix {
         assert_eq!(
             lines[0],
             "registered_ignored          Ignored until later. \
-             [ignored: https://github.com/NVIDIA/OpenShell/issues/1]"
+             [ignored: https://github.com/ai-openshell/openshell/issues/1]"
         );
         assert_eq!(lines[1], "registered_needs_a_gateway  Needs a gateway.");
 
@@ -485,7 +485,7 @@ mod unix {
     }
 
     const UNSUPPORTED: &str = "OPENSHELL_TEST_UNSUPPORTED";
-    const ISSUE: &str = "https://github.com/NVIDIA/OpenShell/issues/7";
+    const ISSUE: &str = "https://github.com/ai-openshell/openshell/issues/7";
 
     fn unsupported_entry(test: &str) -> String {
         format!("program::fixture::{test}={ISSUE}")

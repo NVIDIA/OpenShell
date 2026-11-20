@@ -25,15 +25,15 @@ to each driver crate:
 
 | Driver | Crate |
 |---|---|
-| Docker | [`openshell-driver-docker`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md) |
-| Podman | [`openshell-driver-podman`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) |
-| MicroVM | [`openshell-driver-vm`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md) |
-| Kubernetes | [`openshell-driver-kubernetes`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md) |
-| Windows MXC | [`openshell-driver-mxc`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-mxc/README.md) |
+| Docker | [`openshell-driver-docker`](https://github.com/ai-openshell/openshell/blob/main/crates/openshell-driver-docker/README.md) |
+| Podman | [`openshell-driver-podman`](https://github.com/ai-openshell/openshell/blob/main/crates/openshell-driver-podman/README.md) |
+| MicroVM | [`openshell-driver-vm`](https://github.com/ai-openshell/openshell/blob/main/crates/openshell-driver-vm/README.md) |
+| Kubernetes | [`openshell-driver-kubernetes`](https://github.com/ai-openshell/openshell/blob/main/crates/openshell-driver-kubernetes/README.md) |
+| Windows MXC | [`openshell-driver-mxc`](https://github.com/ai-openshell/openshell/blob/main/crates/openshell-driver-mxc/README.md) |
 
 ### Using an External Compute Driver
 
-External compute drivers must implement [`compute_driver.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/compute_driver.proto).
+External compute drivers must implement [`compute_driver.proto`](https://github.com/ai-openshell/openshell/blob/main/proto/compute_driver.proto).
 Refer to [Protocol Negotiation](/extensibility/overview#protocol-negotiation) for the metadata and capability requirements, and
 [Isolation Backends](/extensibility/isolation-backends) for the workload runtime
 contract. Your driver must also acknowledge the gateway's
@@ -76,11 +76,11 @@ For implementation details, refer to each driver crate:
 
 | Driver | Crate |
 |---|---|
-| Database | [`openshell-driver-db-credstore`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-db-credstore) |
-| Kubernetes Secrets | [`openshell-driver-kubernetes-secrets`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-kubernetes-secrets) |
-| Vault | [`openshell-driver-vault`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-vault) |
+| Database | [`openshell-driver-db-credstore`](https://github.com/ai-openshell/openshell/tree/main/crates/openshell-driver-db-credstore) |
+| Kubernetes Secrets | [`openshell-driver-kubernetes-secrets`](https://github.com/ai-openshell/openshell/tree/main/crates/openshell-driver-kubernetes-secrets) |
+| Vault | [`openshell-driver-vault`](https://github.com/ai-openshell/openshell/tree/main/crates/openshell-driver-vault) |
 
-External credential drivers implement [`credential_driver.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/credential_driver.proto).
+External credential drivers implement [`credential_driver.proto`](https://github.com/ai-openshell/openshell/blob/main/proto/credential_driver.proto).
 
 ## Compatibility
 

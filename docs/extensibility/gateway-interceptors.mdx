@@ -9,7 +9,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Gateway Interceptors, Extens
 ---
 Gateway interceptors let operators add deployment-specific governance to OpenShell control-plane operations without modifying the gateway. An external gRPC service can modify or validate selected API writes before the gateway handles them, then observe successful responses after commit.
 
-See the [governance interceptor example](https://github.com/NVIDIA/OpenShell/tree/main/examples/governance-interceptor) for a complete service that vends provider profiles, applies a signed policy to new sandboxes, and rejects attempts to weaken that policy.
+See the [governance interceptor example](https://github.com/ai-openshell/openshell/tree/main/examples/governance-interceptor) for a complete service that vends provider profiles, applies a signed policy to new sandboxes, and rejects attempts to weaken that policy.
 
 ## When to Use Gateway Interceptors
 
@@ -43,7 +43,7 @@ The gateway runs built-in operation and driver validation after `modify_operatio
 
 ## Implement an Interceptor Service
 
-An interceptor implements the `openshell.gateway_interceptor.v1.GatewayInterceptor` gRPC service defined in [`proto/gateway_interceptor.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto):
+An interceptor implements the `openshell.gateway_interceptor.v1.GatewayInterceptor` gRPC service defined in [`proto/gateway_interceptor.proto`](https://github.com/ai-openshell/openshell/blob/main/proto/gateway_interceptor.proto):
 
 - `Describe` declares the service's bindings and capabilities.
 - `Evaluate` handles one selected operation phase.
@@ -107,7 +107,7 @@ Start with the invariant the interceptor must preserve, then identify every gate
 
 To gate sandbox activation, bind `validate` to `CreateSandbox`, `StartSandbox`, and `ResumeSandbox`. Bind `post_commit` to `StopSandbox` and `SuspendSandbox` to observe successful stop and suspend requests.
 
-The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
+The gateway maintains the canonical [interceptable route allowlist](https://github.com/ai-openshell/openshell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
 
 Choose a phase by intent:
 

@@ -48,7 +48,7 @@ css:
 
 navbar-links:
   - type: github
-    value: https://github.com/NVIDIA/OpenShell
+    value: https://github.com/ai-openshell/openshell
 
 experimental:
   mdx-components:

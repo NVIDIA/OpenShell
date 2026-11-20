@@ -4,7 +4,7 @@
 //! Credential gating: which endpoints a provider credential may reach, and
 //! what the supervisor forwards upstream in REST bodies and WebSocket frames.
 //!
-//! Ported from the e2e tests added in NVIDIA/OpenShell#5264, the credential
+//! Ported from the e2e tests added in ai-openshell/openshell#5264, the credential
 //! test in `proxy_egress_pipeline`, and `websocket_conformance`. The upstream
 //! servers run on the test host ([`host_server_support`]), so the suite
 //! requires sandboxes to reach the test host as `host.openshell.internal`.

@@ -3,8 +3,8 @@ authors:
   - "@shailendra-nv"
 state: review
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/2050
-  - https://github.com/NVIDIA/OpenShell/pull/2071
+  - https://github.com/ai-openshell/openshell/issues/2050
+  - https://github.com/ai-openshell/openshell/pull/2071
 ---
 
 # RFC 0013 - Native Windows Support via the MXC Compute Driver

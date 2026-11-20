@@ -36,7 +36,7 @@ target (`harness = false`), so `openshell-conformance run`,
 
 `smoke` is the smallest end-to-end check that the runner can run a real test in a
 tmachine environment on CI. The other suites are ports of the old
-`conformance/cli` scenarios and of Evan Lezar's suites in NVIDIA/OpenShell#4629
+`conformance/cli` scenarios and of Evan Lezar's suites in ai-openshell/openshell#4629
 (credited in each file). `file-transfer` runs `git` on the machine that runs the
 tests, so a test environment needs it installed
 (`tests/tmachine/ansible/playbooks/test-tools.yaml` does that for the tmachine
@@ -68,7 +68,7 @@ tests/suites/conformance/target/debug/openshell-conformance run --junit conforma
 The program runs only this suite: passing it means a gateway meets the
 conformance contract below. The machine that runs it must be reachable from
 sandboxes as `host.openshell.internal`, which rules out a gateway on a remote
-Kubernetes cluster ([#5409](https://github.com/NVIDIA/OpenShell/issues/5409)).
+Kubernetes cluster ([#5409](https://github.com/ai-openshell/openshell/issues/5409)).
 Feature and driver suites are not part of it. The
 [testkit README](../../testkit/README.md#test-programs) describes the commands
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it

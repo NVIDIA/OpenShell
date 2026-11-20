@@ -16,7 +16,7 @@ from label_accepted_work import (
     is_accepted_work,
 )
 
-REPO = "NVIDIA/OpenShell"
+REPO = "ai-openshell/openshell"
 PR = {"number": 7, "user": {"login": "contributor"}}
 
 
@@ -103,9 +103,7 @@ class PredicateTests(unittest.TestCase):
             )
         )
         self.assertTrue(
-            self.decide(
-                issues=[facts(repository="nvidia/openshell", author="contributor")]
-            )
+            self.decide(issues=[facts(repository=REPO.upper(), author="contributor")])
         )
 
     def test_bots_do_not_receive_an_implicit_exemption(self):

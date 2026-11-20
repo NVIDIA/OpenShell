@@ -8,13 +8,13 @@
 
 <!-- markdownlint-enable MD033 MD041 -->
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/ai-openshell/openshell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 [![Security Policy](https://img.shields.io/badge/Security-Report%20a%20Vulnerability-red)](SECURITY.md)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
 
 > [!NOTE]
-> 🚧 OpenShell is now part of the CNCF! We’re in the process of moving development to [ai-openshell](https://github.com/ai-openshell) and governance to the CNCF. Until the move is complete, please continue to use the [NVIDIA/OpenShell](https://github.com/NVIDIA/OpenShell) repo for code, issues, and pull requests.
+> OpenShell is now part of the CNCF! Development has moved to [ai-openshell/openshell](https://github.com/ai-openshell/openshell). Use this repository for code, issues, and pull requests.
 
 <!-- Separate the two GitHub alert blocks. -->
 
@@ -37,13 +37,13 @@ See [Architecture](https://docs.nvidia.com/openshell/latest/about/architecture) 
 You need Linux, macOS on Apple Silicon, or Windows with WSL 2 (experimental), plus Docker, Podman, or host virtualization. See the [Support Matrix](https://docs.nvidia.com/openshell/latest/about/support-matrix) for details.
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | sh
 openshell sandbox create --name demo
 ```
 
 The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent): it runs OpenCode against a free OpenRouter model and shows how to approve new access as the agent needs it.
 
-For native Windows support through Microsoft MXC, see the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) for setup and current limitations.
+For native Windows support through Microsoft MXC, see the [Windows build and runtime guide](https://github.com/ai-openshell/openshell/blob/windows/WINDOWS.md) for setup and current limitations.
 
 ## Explore Further
 
@@ -61,7 +61,7 @@ For native Windows support through Microsoft MXC, see the [Windows build and run
 Install the public OpenShell skills for your coding agent:
 
 ```shell
-npx skills add NVIDIA/OpenShell
+npx skills add ai-openshell/openshell
 ```
 
 The skills teach your agent to drive the OpenShell CLI, write sandbox policies, and debug gateways and inference routing. They live in [`skills/`](skills/) and work without an OpenShell source checkout.
@@ -73,14 +73,14 @@ SDKs connect applications to an OpenShell gateway. They do not install the CLI. 
 | Language | Install | Docs |
 |---|---|---|
 | Python | `uv add openshell` | [README](python/openshell/) |
-| TypeScript | `npm install @nvidia/openshell-sdk` (GitHub Packages) | [README](sdk/typescript/README.md) |
+| TypeScript | `npm install @ai-openshell/sdk` | [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript) |
 | Go | `go get github.com/ai-openshell/sdk-go@vX.Y.Z` | [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) |
-| Rust | `cargo add openshell-sdk --git https://github.com/NVIDIA/OpenShell --tag <release-tag>` | [Installation and usage](docs/sdk/rust.mdx) |
+| Rust | `cargo add openshell-sdk --git https://github.com/ai-openshell/openshell --tag <release-tag>` | [Installation and usage](docs/sdk/rust.mdx) |
 
 ## Community
 
-- **Questions and discussion:** [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions)
-- **Bug reports and feature requests:** [GitHub Issues](https://github.com/NVIDIA/OpenShell/issues), using the issue templates
+- **Questions and discussion:** [GitHub Discussions](https://github.com/ai-openshell/openshell/discussions)
+- **Bug reports and feature requests:** [GitHub Issues](https://github.com/ai-openshell/openshell/issues), using the issue templates
 - **Security vulnerabilities:** follow [SECURITY.md](SECURITY.md). Do not open a GitHub issue.
 - **Roadmap:** [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) and the [RFC board](https://github.com/orgs/NVIDIA/projects/233/views/6)
 - **Try it in the cloud:** [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg)
@@ -97,4 +97,4 @@ This software automatically retrieves, accesses or interacts with external mater
 
 ## License
 
-This project is licensed under the [Apache License 2.0](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE).
+This project is licensed under the [Apache License 2.0](https://github.com/ai-openshell/openshell/blob/main/LICENSE).

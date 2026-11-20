@@ -488,7 +488,7 @@ where
             Ok(pending.follow(response))
         }
         Err(error) => {
-            pending.record(Some(Code::Unknown));
+            pending.record(Some(Ending::code(Code::Unknown)));
             Err(error)
         }
     }
@@ -510,11 +510,11 @@ impl PendingMutation {
         response: http::Response<tonic::body::Body>,
     ) -> http::Response<tonic::body::Body> {
         if let Some(status) = Status::from_header_map(response.headers()) {
-            self.record(Some(status.code()));
+            self.record(Some(Ending::of(&status)));
             return response;
         }
         if http_body::Body::is_end_stream(response.body()) {
-            self.record(Some(Code::Ok));
+            self.record(Some(Ending::code(Code::Ok)));
             return response;
         }
         response.map(|body| {
@@ -525,15 +525,15 @@ impl PendingMutation {
         })
     }
 
-    fn record(mut self, code: Option<Code>) {
-        self.record_once(code);
+    fn record(mut self, ending: Option<Ending>) {
+        self.record_once(ending);
     }
 
-    fn record_once(&mut self, code: Option<Code>) {
+    fn record_once(&mut self, ending: Option<Ending>) {
         if !std::mem::replace(&mut self.recorded, true)
             && !self.request.denied.load(Ordering::Relaxed)
         {
-            emit_mutation(&self.request, &self.principal, code);
+            emit_mutation(&self.request, &self.principal, ending);
         }
     }
 }
@@ -551,9 +551,9 @@ struct AuditedBody {
 }
 
 impl AuditedBody {
-    fn record(&mut self, code: Code) {
+    fn record(&mut self, ending: Ending) {
         if let Some(pending) = self.pending.take() {
-            pending.record(Some(code));
+            pending.record(Some(ending));
         }
     }
 }
@@ -567,17 +567,17 @@ impl http_body::Body for AuditedBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        let code = match &polled {
+        let ending = match &polled {
             std::task::Poll::Ready(Some(Ok(frame))) => frame
                 .trailers_ref()
                 .and_then(Status::from_header_map)
-                .map(|status| status.code()),
-            std::task::Poll::Ready(Some(Err(status))) => Some(status.code()),
-            std::task::Poll::Ready(None) => Some(Code::Ok),
+                .map(|status| Ending::of(&status)),
+            std::task::Poll::Ready(Some(Err(status))) => Some(Ending::of(status)),
+            std::task::Poll::Ready(None) => Some(Ending::code(Code::Ok)),
             std::task::Poll::Pending => None,
         };
-        if let Some(code) = code {
-            self.record(code);
+        if let Some(ending) = ending {
+            self.record(ending);
         }
         polled
     }
@@ -594,7 +594,7 @@ impl http_body::Body for AuditedBody {
 impl Drop for AuditedBody {
     fn drop(&mut self) {
         if http_body::Body::is_end_stream(&self.inner) {
-            self.record(Code::Ok);
+            self.record(Ending::code(Code::Ok));
         }
     }
 }
@@ -920,9 +920,9 @@ fn with_omitted(message: String, omitted: usize) -> String {
     }
 }
 
-/// Emit the record of a mutation that ended with `code`, or that never
-/// finished when `code` is `None`.
-fn emit_mutation(request: &RequestContext, principal: &Principal, code: Option<Code>) {
+/// Emit the record of a mutation that ended as `ending` says, or that
+/// never finished when `ending` is `None`.
+fn emit_mutation(request: &RequestContext, principal: &Principal, ending: Option<Ending>) {
     let RequestContext { path, origin, .. } = request;
     let mutation = std::mem::take(&mut *lock(&request.mutation));
     let ctx = crate::gateway_ocsf::context("", "");
@@ -931,11 +931,11 @@ fn emit_mutation(request: &RequestContext, principal: &Principal, code: Option<C
     for resource in resources {
         builder = builder.resource(resource);
     }
-    let code = code.map(|code| match mutation.outcome {
-        Some(Outcome::Rejected(rejected)) if code == Code::Ok => rejected,
-        _ => code,
+    let ending = ending.map(|ending| match mutation.outcome {
+        Some(Outcome::Rejected(rejected)) if ending.code == Code::Ok => Ending::code(rejected),
+        _ => ending,
     });
-    let (severity, status, message, detail) = match code.map(failure) {
+    let (severity, status, message, detail) = match ending.map(Ending::failure) {
         None => (
             SeverityId::Medium,
             StatusId::Unknown,
@@ -973,6 +973,55 @@ fn emit_mutation(request: &RequestContext, principal: &Principal, code: Option<C
         builder = builder.correlation_uid(request_id);
     }
     ocsf_emit!(builder.build());
+}
+
+/// How a call ended: its gRPC code and, on failure, the reason the gateway
+/// gave in its `ErrorInfo`.
+struct Ending {
+    code: Code,
+    reason: Option<String>,
+}
+
+impl Ending {
+    fn code(code: Code) -> Self {
+        Self { code, reason: None }
+    }
+
+    fn of(status: &Status) -> Self {
+        let reason = (status.code() != Code::Ok)
+            .then(|| gateway_reason(status))
+            .flatten();
+        Self {
+            code: status.code(),
+            reason,
+        }
+    }
+
+    /// The failure category, followed by the gateway's reason when it gave one.
+    fn failure(self) -> Option<String> {
+        let failure = failure(self.code)?;
+        Some(match self.reason {
+            Some(reason) => format!("{failure}:{reason}"),
+            None => failure,
+        })
+    }
+}
+
+/// Longest `ErrorInfo` reason recorded.
+const MAX_REASON_LEN: usize = 64;
+
+/// The `ErrorInfo` reason of `status` when it is in the gateway's domain and
+/// shaped like one: `UPPER_SNAKE_CASE`, at most [`MAX_REASON_LEN`] bytes.
+fn gateway_reason(status: &Status) -> Option<String> {
+    let details = openshell_core::rpc_error::decode_details(status)?;
+    let info = details.error_info()?;
+    let reason = info.reason.as_str();
+    let shaped = reason.len() <= MAX_REASON_LEN
+        && reason.starts_with(|c: char| c.is_ascii_uppercase())
+        && reason
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    (info.domain == openshell_core::rpc_error::ERROR_DOMAIN && shaped).then(|| reason.to_string())
 }
 
 /// The failure category for a gRPC `code`: `rejected:` when the gateway

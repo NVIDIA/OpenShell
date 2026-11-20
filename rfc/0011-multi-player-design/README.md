@@ -3,7 +3,7 @@ authors:
   - "@derekwaynecarr"
 state: draft
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1977
+  - https://github.com/ai-openshell/openshell/issues/1977
 ---
 
 # RFC 0011 - Multi-Player Support

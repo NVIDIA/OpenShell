@@ -97,7 +97,7 @@ mod tests {
     const PASSED: Test = test("sandbox::smoke", "create_exec_delete", false);
     const FAILED: Test = test("sandbox::lifecycle", "stop_start", false);
     const SKIPPED: Test = Test {
-        ignore_reason: Some("https://github.com/NVIDIA/OpenShell/issues/1"),
+        ignore_reason: Some("https://github.com/ai-openshell/openshell/issues/1"),
         ..test("sandbox::lifecycle", "later", true)
     };
 
@@ -122,7 +122,7 @@ mod tests {
             run(&SKIPPED, Outcome::Skipped, None),
             run(
                 &UNSUPPORTED,
-                Outcome::Unsupported("https://github.com/NVIDIA/OpenShell/issues/2".into()),
+                Outcome::Unsupported("https://github.com/ai-openshell/openshell/issues/2".into()),
                 None,
             ),
         ];
@@ -134,9 +134,9 @@ mod tests {
             r#"<property name="family" value="conformance"/>"#,
             r#"<property name="description" value="A test."/>"#,
             r#"<failure message="timed out after 1s" type="timeout"/>"#,
-            r#"<skipped message="ignored: https://github.com/NVIDIA/OpenShell/issues/1"/>"#,
-            r#"<skipped message="unsupported: https://github.com/NVIDIA/OpenShell/issues/2"/>"#,
-            r#"<property name="unsupported" value="https://github.com/NVIDIA/OpenShell/issues/2"/>"#,
+            r#"<skipped message="ignored: https://github.com/ai-openshell/openshell/issues/1"/>"#,
+            r#"<skipped message="unsupported: https://github.com/ai-openshell/openshell/issues/2"/>"#,
+            r#"<property name="unsupported" value="https://github.com/ai-openshell/openshell/issues/2"/>"#,
             "<system-out>out\n</system-out>",
         ] {
             assert!(xml.contains(expected), "missing {expected} in\n{xml}");

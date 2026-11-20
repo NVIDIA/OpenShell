@@ -3,7 +3,7 @@
 
 //! Sandbox file-transfer suite.
 //!
-//! Adapted from the `file-transfer` suite in NVIDIA/OpenShell#4629 by Evan Lezar.
+//! Adapted from the `file-transfer` suite in ai-openshell/openshell#4629 by Evan Lezar.
 //!
 //! Upload and download exist only in the CLI, which moves files over the
 //! sandbox's SSH session, so these tests act through `cx.cli`. They depend on
