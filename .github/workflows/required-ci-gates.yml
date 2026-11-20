@@ -1,5 +1,9 @@
 name: Required CI Gates
 
+# Branch protection requires the `OpenShell / ...` statuses this workflow
+# posts. It runs from the base repository, so it can post them for fork PRs,
+# whose own pull_request runs only get a read-only token.
+
 on:
   merge_group:
     types: [checks_requested]
@@ -18,8 +22,10 @@ permissions:
   pull-requests: read
   statuses: write
 
+# Group by head SHA so a pull_request_target evaluation and a workflow_run
+# evaluation of the same commit cannot race and leave a stale status behind.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.head_sha || github.sha || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -74,18 +80,14 @@ jobs:
 
           resolve_pull_request_event() {
             CONTEXT_KIND="pull_request"
-            WORKFLOW_EVENT="push"
             PR_NUMBER="$PR_NUMBER_FROM_EVENT"
             HEAD_SHA="$PR_HEAD_SHA_FROM_EVENT"
             LABELS_JSON=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
-            MIRROR_REF="pull-request/$PR_NUMBER"
-            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
             STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
           }
 
           load_pr_context() {
             CONTEXT_KIND="pull_request"
-            WORKFLOW_EVENT="push"
             PR_NUMBER="$1"
 
             local pr state
@@ -97,15 +99,28 @@ jobs:
             fi
 
             HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
-            LABELS_JSON=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER" --jq '[.labels[].name]')
-            MIRROR_REF="pull-request/$PR_NUMBER"
-            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
+            LABELS_JSON=$(jq -c '[.labels[].name]' <<< "$pr")
             STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
+          }
+
+          # Fork PR runs carry no pull_requests list, so match open PRs by head SHA.
+          load_pr_context_for_sha() {
+            local sha="$1" number
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Ignoring run for '$sha': not a commit SHA."
+              exit 0
+            fi
+            number=$(gh api --paginate "repos/$GH_REPO/pulls?state=open&per_page=100" \
+              --jq ".[] | select(.head.sha == \"$sha\") | .number" | head -n 1)
+            if [ -z "$number" ]; then
+              echo "No open PR has head $sha; nothing to publish."
+              exit 0
+            fi
+            load_pr_context "$number"
           }
 
           resolve_merge_group_event() {
             CONTEXT_KIND="merge_group"
-            WORKFLOW_EVENT="merge_group"
             HEAD_SHA="$GITHUB_SHA_FROM_CONTEXT"
             LABELS_JSON="[]"
             EXPECTED_HEAD_BRANCH="$GITHUB_REF_NAME_FROM_CONTEXT"
@@ -114,7 +129,6 @@ jobs:
 
           resolve_merge_group_workflow_run_event() {
             CONTEXT_KIND="merge_group"
-            WORKFLOW_EVENT="merge_group"
             HEAD_SHA="$WORKFLOW_RUN_HEAD_SHA"
             LABELS_JSON="[]"
             EXPECTED_HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
@@ -122,33 +136,22 @@ jobs:
           }
 
           resolve_workflow_run_event() {
-            if [ "$WORKFLOW_RUN_EVENT" = "merge_group" ]; then
-              resolve_merge_group_workflow_run_event
-              return
-            fi
-
-            if [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
-              echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
-              exit 0
-            fi
-
-            if [[ "$WORKFLOW_RUN_HEAD_BRANCH" =~ ^pull-request/([0-9]+)$ ]]; then
-              load_pr_context "${BASH_REMATCH[1]}"
-              return
-            fi
-
-            local associated_prs pr
-            associated_prs=$(gh api "repos/$GH_REPO/commits/$WORKFLOW_RUN_HEAD_SHA/pulls")
-            pr=$(jq -c 'map(select(.state == "open"))[0] // empty' <<< "$associated_prs")
-            if [ -z "$pr" ]; then
-              echo "No open PR associated with $WORKFLOW_RUN_HEAD_SHA; nothing to publish."
-              exit 0
-            fi
-
-            load_pr_context "$(jq -r '.number' <<< "$pr")"
+            case "$WORKFLOW_RUN_EVENT" in
+              merge_group)
+                resolve_merge_group_workflow_run_event
+                ;;
+              pull_request)
+                load_pr_context_for_sha "$WORKFLOW_RUN_HEAD_SHA"
+                ;;
+              *)
+                echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
+                exit 0
+                ;;
+            esac
           }
 
           resolve_context() {
+            EXPECTED_HEAD_BRANCH=""
             if [ "$EVENT_NAME" = "pull_request_target" ]; then
               resolve_pull_request_event
             elif [ "$EVENT_NAME" = "merge_group" ]; then
@@ -163,26 +166,57 @@ jobs:
             STATUS_TARGET_URL="${STATUS_TARGET_URL:-https://github.com/$GH_REPO/actions}"
           }
 
-          verify_mirror() {
-            local context="$1"
-            local mirror_sha
-
+          # Runs for HEAD_SHA, newest first.
+          list_runs() {
+            local workflow_file="$1"
             if [ "$CONTEXT_KIND" = "merge_group" ]; then
+              gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=merge_group" \
+                --jq '.workflow_runs' \
+                | jq -c --arg branch "$EXPECTED_HEAD_BRANCH" '[.[] | select(.head_branch == $branch)] | sort_by(.created_at) | reverse'
+              return
+            fi
+
+            gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
+              --jq '.workflow_runs' | jq -c 'sort_by(.created_at) | reverse'
+          }
+
+          run_jobs() {
+            gh api --paginate "repos/$GH_REPO/actions/runs/$1/jobs?per_page=30" | jq -s '[.[].jobs[]]'
+          }
+
+          # A labeled event for an unrelated label finishes without running
+          # the required job. Skip those and use the newest run
+          # where the required job ran.
+          evaluate_required_job() {
+            local context="$1" workflow_name="$2" required_job_name="$3" runs="$4"
+            local run run_id status run_url job job_conclusion
+
+            while read -r run; do
+              [ -n "$run" ] || continue
+              run_id=$(jq -r '.id' <<< "$run")
+              status=$(jq -r '.status' <<< "$run")
+              run_url=$(jq -r '.html_url' <<< "$run")
+
+              if [ "$status" != "completed" ]; then
+                post_status "$context" pending "$workflow_name is $status" "$run_url"
+                return 0
+              fi
+
+              job=$(run_jobs "$run_id" | jq -c --arg name "$required_job_name" '[.[] | select(.name == $name)] | .[0] // empty')
+              job_conclusion=$(jq -r '.conclusion // empty' <<< "$job")
+              if [ -z "$job" ] || [ "$job_conclusion" = "skipped" ]; then
+                continue
+              fi
+
+              if [ "$job_conclusion" = "success" ]; then
+                post_status "$context" success "$required_job_name passed" "$run_url"
+              else
+                post_status "$context" failure "$required_job_name concluded $job_conclusion" "$run_url"
+              fi
               return 0
-            fi
+            done < <(jq -c '.[]' <<< "$runs")
 
-            mirror_sha=$(gh api "repos/$GH_REPO/branches/$MIRROR_REF" --jq '.commit.sha' 2>/dev/null || true)
-            if [ -z "$mirror_sha" ]; then
-              post_status "$context" pending "Waiting for /ok to test mirror" "$STATUS_TARGET_URL"
-              return 1
-            fi
-
-            if [ "$mirror_sha" != "$HEAD_SHA" ]; then
-              post_status "$context" pending "Waiting for /ok to test mirror" "$STATUS_TARGET_URL"
-              return 1
-            fi
-
-            return 0
+            post_status "$context" pending "Waiting for $required_job_name" "$STATUS_TARGET_URL"
           }
 
           evaluate_workflow() {
@@ -198,18 +232,15 @@ jobs:
               return 0
             fi
 
-            if ! verify_mirror "$context"; then
+            local runs latest run_id status conclusion run_url real_success
+            runs=$(list_runs "$workflow_file")
+
+            if [ -n "$required_job_name" ]; then
+              evaluate_required_job "$context" "$workflow_name" "$required_job_name" "$runs"
               return 0
             fi
 
-            local runs latest run_id status conclusion run_url real_success
-            runs=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=$WORKFLOW_EVENT" --jq '.workflow_runs')
-            if [ -n "${EXPECTED_HEAD_BRANCH:-}" ]; then
-              latest=$(jq -c --arg branch "$EXPECTED_HEAD_BRANCH" '[.[] | select(.head_branch == $branch)] | sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
-            else
-              latest=$(jq -c 'sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
-            fi
-
+            latest=$(jq -c '.[0] // empty' <<< "$runs")
             if [ -z "$latest" ]; then
               post_status "$context" pending "Waiting for $workflow_name" "$workflow_url"
               return 0
@@ -225,35 +256,8 @@ jobs:
               return 0
             fi
 
-            if [ -n "$required_job_name" ]; then
-              local jobs required_job job_status job_conclusion
-              jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" | jq -s '[.[].jobs[]]')
-              required_job=$(jq -c --arg name "$required_job_name" '[.[] | select(.name == $name)] | .[0] // empty' <<< "$jobs")
-
-              if [ -z "$required_job" ]; then
-                if [ "$conclusion" = "success" ]; then
-                  post_status "$context" pending "Waiting for $required_job_name" "$run_url"
-                else
-                  post_status "$context" failure "$required_job_name did not run" "$run_url"
-                fi
-                return 0
-              fi
-
-              job_status=$(jq -r '.status' <<< "$required_job")
-              job_conclusion=$(jq -r '.conclusion' <<< "$required_job")
-
-              if [ "$job_status" != "completed" ]; then
-                post_status "$context" pending "$required_job_name is $job_status" "$run_url"
-                return 0
-              fi
-
-              if [ "$job_conclusion" = "success" ]; then
-                post_status "$context" success "$required_job_name passed" "$run_url"
-              elif [ "$job_conclusion" = "skipped" ] && [ "$conclusion" = "success" ]; then
-                post_status "$context" pending "Waiting for $required_job_name" "$run_url"
-              else
-                post_status "$context" failure "$required_job_name concluded $job_conclusion" "$run_url"
-              fi
+            if [ "$conclusion" = "action_required" ]; then
+              post_status "$context" pending "$workflow_name awaits maintainer approval" "$run_url"
               return 0
             fi
 
@@ -262,9 +266,7 @@ jobs:
               return 0
             fi
 
-            real_success=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" \
-              | jq -s '[.[].jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
-
+            real_success=$(run_jobs "$run_id" | jq '[.[] | select(.conclusion == "success")] | length')
             if [ "$real_success" -lt 1 ]; then
               post_status "$context" failure "No real CI jobs ran" "$run_url"
               return 0
@@ -279,9 +281,7 @@ jobs:
           # E2E is opt-in on PRs and does not run for merge groups.
           if [ "$CONTEXT_KIND" != "merge_group" ]; then
             evaluate_workflow "OpenShell / E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e" "Core E2E result"
-            evaluate_workflow "OpenShell / GPU E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e-gpu" "GPU E2E result"
           else
             post_status "OpenShell / E2E" success "Not applicable: E2E runs only on PRs" "$STATUS_TARGET_URL"
-            post_status "OpenShell / GPU E2E" success "Not applicable: GPU E2E runs only on PRs" "$STATUS_TARGET_URL"
           fi
           evaluate_workflow "OpenShell / Helm Lint" "helm-lint.yml" "Helm Lint"

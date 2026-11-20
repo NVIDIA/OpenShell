@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# The image's apt timer stamps date from image provisioning, so every test boot
+# catches up apt-daily-upgrade within the hour. Upgrading libc6 or systemd
+# re-executes PID 1, and a container start in that window fails in runc with
+# "Message recipient disconnected from message bus without replying".
+- name: Disable unattended upgrades
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Stop and mask the apt timers and unattended-upgrades
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - unattended-upgrades.service
