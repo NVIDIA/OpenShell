@@ -37,11 +37,11 @@ purpose: unit-test child-process markers, the re-entry markers in
 `tests/support/environment.rs`, Nix guest-cache settings, `install.sh` test
 hooks and crate test settings.
 
-### Addresses the environment chooses
+### Ports the environment chooses
 
-When a test must listen on an address the environment picked, because the
-gateway or another service is configured to call it, the environment
-publishes it as `OPENSHELL_TEST_<SERVICE>_LISTEN` and the test binds it, for
-example with `HttpRecorder::builder().port(port)` from `host-server-support`.
-The test never picks the address itself. Tests that bind the same address can't
-run at the same time.
+When a test must listen on a port the environment picked, because the gateway
+or another service is configured to call it, the environment publishes it as
+`OPENSHELL_TEST_<SERVICE>_PORT` and the test binds that port on every host
+address, for example with `HttpRecorder::builder().port(port)` from
+`host-server-support`. The test never picks the port itself. Tests that bind
+the same port can't run at the same time.
