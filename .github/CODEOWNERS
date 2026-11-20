@@ -28,6 +28,8 @@
 /REVIEWERS.md @ai-openshell/maintainers
 /tasks/scripts/check_review_readiness.py @ai-openshell/maintainers
 /tasks/scripts/check_review_readiness_test.py @ai-openshell/maintainers
+/tasks/scripts/check_reviewer_collaborators.py @ai-openshell/maintainers
+/tasks/scripts/check_reviewer_collaborators_test.py @ai-openshell/maintainers
 
 # PR issue acceptance checks
 /tasks/scripts/check_issue_acceptance.cjs @ai-openshell/maintainers
