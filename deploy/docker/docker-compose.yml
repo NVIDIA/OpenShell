@@ -52,7 +52,7 @@
 
 services:
   gateway:
-    image: &gateway-image ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG:-latest}
+    image: &gateway-image quay.io/ai-openshell/gateway:${IMAGE_TAG:-latest}
     restart: unless-stopped
 
     depends_on:

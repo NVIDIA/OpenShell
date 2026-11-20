@@ -45,9 +45,9 @@ gateway_id       = "openshell-docker"
 # Default image pulled for `openshell sandbox create` without --from.
 default_image     = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Sandbox runtime image from which the openshell-sandbox binary is extracted.
-sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:latest"
+sandbox_runtime_image = "quay.io/ai-openshell/sandbox:latest"
 # Image containing the external supervisor process.
-supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
+supervisor_image  = "quay.io/ai-openshell/supervisor:latest"
 # Only pull images that are not already cached locally.
 image_pull_policy = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
