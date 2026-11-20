@@ -43,6 +43,7 @@ hooks and crate test settings.
 
 When a test must listen on an address the environment picked, because the
 gateway or another service is configured to call it, the environment
-publishes it as `OPENSHELL_TEST_<SERVICE>_LISTEN` and the test binds it. The
-test never picks the address itself. Tests that bind the same address can't
+publishes it as `OPENSHELL_TEST_<SERVICE>_LISTEN` and the test binds it, for
+example with `HttpRecorder::builder().port(port)` from `host-server-support`.
+The test never picks the address itself. Tests that bind the same address can't
 run at the same time.
