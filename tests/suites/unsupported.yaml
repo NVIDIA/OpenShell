@@ -7,7 +7,7 @@
 # Each entry is one issue and the environments it breaks the test in:
 #
 #   - test: conformance::<module>::<name>
-#     issue: https://github.com/NVIDIA/OpenShell/issues/<n>
+#     issue: https://github.com/ai-openshell/OpenShell/issues/<n>
 #     environments:
 #       - ubuntu-k3s/k3s-ha   # a tmachine row: <environment>/<installer>
 #       - vm                  # a host lane: docker, podman, kubernetes or vm

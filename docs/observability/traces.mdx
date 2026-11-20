@@ -45,6 +45,10 @@ Each component names its spans after the operation it performs:
 | Compute drivers | The compute-driver RPC, with child spans prefixed by the driver name | `openshell.compute.v1.ComputeDriver/CreateSandbox`, `docker.provision` |
 | Sandbox supervisors | Lifecycle spans use `supervisor.`; inspected HTTP uses request and stage operation names | `supervisor.startup`, `supervisor.policy.load`, `openshell.http.request`, `openshell.policy.evaluate` |
 
+`supervisor.boundary.connect` measures the wait for an authenticated boundary connection. During policy discovery it is a child of `supervisor.boundary.discover_policy`, and the initial wait and its retries share one span. If the startup deadline cancels the connection wait, the connect span has no status and `supervisor.startup` records the error.
+
+`openshell.boundary.transport` identifies the transport. For `dial` and `backend`, `openshell.boundary.connect_attempts` counts attempts made by the supervisor. Inbound transports omit that attribute because the runtime makes the connection attempts.
+
 The gateway's client span and the driver's server span for a compute-driver call share the same name, which also appears in `rpc.method`. Their service names and span kinds tell them apart. A driver watch stream records a terminal status when it observes one. If the gateway stops consuming the stream first, the span status stays unset.
 
 ## Resource Attributes

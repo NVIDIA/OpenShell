@@ -283,7 +283,7 @@ CI validates the entries and passes those for each row as
 entries separated by commas or whitespace:
 
 ```shell
-export OPENSHELL_TEST_UNSUPPORTED="cdi::read_only_file=https://github.com/NVIDIA/OpenShell/issues/1234"
+export OPENSHELL_TEST_UNSUPPORTED="cdi::read_only_file=https://github.com/ai-openshell/OpenShell/issues/1234"
 ```
 
 `<test>` is the crate name (`conformance` for conformance, the `[[test]]` target

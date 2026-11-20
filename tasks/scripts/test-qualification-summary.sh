@@ -19,6 +19,7 @@ export GITHUB_RUN_ID=1234
 export GITHUB_RUN_ATTEMPT=2
 export SECURITY_RESULT=failure
 export CONFORMANCE_RESULT=success
+export CONTINUITY_RESULT=success
 export FEATURE_INTEGRATION_RESULT=success
 export DOCKER_E2E_RESULT=success
 export VM_E2E_RESULT=success
@@ -45,7 +46,10 @@ jq -e '
 export SECURITY_RESULT=success
 current_profile_passed=$("${GENERATOR}" "${TEST_DIR}/qualified-summary.json")
 [[ "${current_profile_passed}" == "true" ]]
-jq -e '.current_profile_passed == true' "${TEST_DIR}/qualified-summary.json" >/dev/null
+jq -e '.current_profile_passed == true and .suites.continuity_integration == "success"' "${TEST_DIR}/qualified-summary.json" >/dev/null
+
+CONTINUITY_RESULT=failure "${GENERATOR}" "${TEST_DIR}/continuity-failed-summary.json" >/dev/null
+jq -e '.current_profile_passed == false' "${TEST_DIR}/continuity-failed-summary.json" >/dev/null
 
 jq -e '
   (.suites | has("compatibility") | not)

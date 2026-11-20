@@ -212,7 +212,7 @@ backing cache:
 nix run .#test-guest-cache -- \
   --distro ubuntu-24-04 \
   --with docker \
-  --repository ghcr.io/nvidia/openshell/test-guest-cache \
+  --repository ghcr.io/ai-openshell/openshell/test-guest-cache \
   --digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
@@ -222,7 +222,7 @@ The command never publishes implicitly. Add `--push` after authenticating ORAS t
 nix run .#test-guest-cache -- \
   --distro ubuntu-24-04 \
   --with docker \
-  --repository ghcr.io/nvidia/openshell/test-guest-cache \
+  --repository ghcr.io/ai-openshell/openshell/test-guest-cache \
   --push
 ```
 
