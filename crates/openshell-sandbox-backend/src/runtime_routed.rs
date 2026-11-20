@@ -28,7 +28,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -358,7 +357,6 @@ impl RuntimeRouter {
             id,
             tls: tls.clone(),
             spares: tokio::sync::Mutex::new(spares),
-            connected: AtomicBool::new(false),
         }))
     }
 
@@ -389,8 +387,6 @@ pub struct RouteRegistration {
     id: u64,
     tls: SandboxTlsClientConfig,
     spares: tokio::sync::Mutex<mpsc::Receiver<BoundaryDuplexStream>>,
-    /// The runtime has delivered at least one authenticated connection.
-    connected: AtomicBool,
 }
 
 impl std::fmt::Debug for RouteRegistration {
@@ -419,20 +415,12 @@ impl RouteRegistration {
                 "runtime route is registered for a different sandbox instance".to_string(),
             ));
         }
-        let stream = self
-            .spares
+        self.spares
             .lock()
             .await
             .recv()
             .await
-            .ok_or_else(|| BackendError::Unavailable("runtime router stopped".to_string()))?;
-        self.connected.store(true, Ordering::Relaxed);
-        Ok(stream)
-    }
-
-    /// Whether the runtime has connected for this sandbox instance before.
-    pub(crate) fn has_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+            .ok_or_else(|| BackendError::Unavailable("runtime router stopped".to_string()))
     }
 }
 

@@ -37,12 +37,12 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
             cli_target: x86_64-unknown-linux-musl
             gateway_target: x86_64-unknown-linux-gnu
             prover_target: x86_64-unknown-linux-musl
           - arch: aarch64
-            runner: linux-arm64-cpu8
+            runner: ubuntu-24.04-arm
             cli_target: aarch64-unknown-linux-musl
             gateway_target: aarch64-unknown-linux-gnu
             prover_target: aarch64-unknown-linux-musl

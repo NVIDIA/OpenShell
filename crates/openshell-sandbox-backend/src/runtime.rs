@@ -48,9 +48,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// work before the boundary begins listening. Keep this aligned with the
 /// driver bootstrap grace period rather than the normal operation timeout.
 const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
-/// How long one control call keeps retrying boundary connect attempts. Boot-time
-/// callers retry whole calls above this; past boot, exhausting this window
-/// means the remote boundary (or its launcher) is gone rather than still starting.
+/// How long to wait for a replacement boundary connection after first contact.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds the liveness check that decides whether a stream failure lost the
 /// whole connection.
@@ -132,6 +130,21 @@ enum TransportSource {
     Routed(Arc<crate::runtime_routed::RouteRegistration>),
 }
 
+struct BoundaryConnectAttempts {
+    span: tracing::Span,
+    count: u64,
+}
+
+impl Drop for BoundaryConnectAttempts {
+    fn drop(&mut self) {
+        // Record the count once if any attempts began, including on cancellation.
+        if self.count > 0 {
+            self.span
+                .record("openshell.boundary.connect_attempts", self.count);
+        }
+    }
+}
+
 impl BoundaryTransport {
     /// Select the transport the descriptor requires. A runtime-initiated
     /// descriptor binds its control listener, so call this inside the
@@ -179,46 +192,67 @@ impl BoundaryTransport {
 
     /// Open one authenticated physical connection, retrying within the
     /// connect window while the remote boundary starts.
+    #[tracing::instrument(
+        name = "supervisor.boundary.connect",
+        skip_all,
+        fields(openshell.boundary.transport = match &self.0 {
+            TransportSource::Dial => "dial",
+            TransportSource::Connector(_) => "backend",
+            TransportSource::RuntimeInitiated(_) => "runtime_initiated",
+            TransportSource::Routed(_) => "routed",
+        }, openshell.boundary.connect_attempts = tracing::field::Empty, otel.status_code = tracing::field::Empty)
+    )]
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
-        initial_connect_timeout: Duration,
+        connect_timeout: Duration,
     ) -> Result<BoundaryDuplexStream, BackendError> {
-        let connector = match &self.0 {
-            TransportSource::Dial => None,
-            TransportSource::Connector(connector) => Some(connector.as_ref()),
-            TransportSource::RuntimeInitiated(listener) => {
-                return tokio::time::timeout(CONNECT_RETRY_TIMEOUT, listener.accept(descriptor))
-                    .await
-                    .map_err(|_| {
-                        BackendError::Unavailable(
-                            "timed out waiting for the sandbox runtime to connect".to_string(),
-                        )
-                    })?;
-            }
-            TransportSource::Routed(registration) => {
-                let window = if registration.has_connected() {
-                    CONNECT_RETRY_TIMEOUT
-                } else {
-                    initial_connect_timeout
-                };
-                return tokio::time::timeout(window, registration.accept(&descriptor.tls))
-                    .await
-                    .map_err(|_| {
-                        BackendError::Unavailable(
-                            "timed out waiting for the sandbox runtime to connect".to_string(),
-                        )
-                    })?;
-            }
+        let mut attempts = BoundaryConnectAttempts {
+            span: tracing::Span::current(),
+            count: 0,
         };
-        let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
-        loop {
-            match connect_boundary_using_connector(descriptor, connector).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        let result = async {
+            let connector = match &self.0 {
+                TransportSource::Dial => None,
+                TransportSource::Connector(connector) => Some(connector.as_ref()),
+                TransportSource::RuntimeInitiated(listener) => {
+                    return tokio::time::timeout(connect_timeout, listener.accept(descriptor))
+                        .await
+                        .map_err(|_| {
+                            BackendError::Unavailable(
+                                "timed out waiting for the sandbox runtime to connect".to_string(),
+                            )
+                        })?;
+                }
+                TransportSource::Routed(registration) => {
+                    return tokio::time::timeout(
+                        connect_timeout,
+                        registration.accept(&descriptor.tls),
+                    )
+                    .await
+                    .map_err(|_| {
+                        BackendError::Unavailable(
+                            "timed out waiting for the sandbox runtime to connect".to_string(),
+                        )
+                    })?;
+                }
+            };
+            let deadline = tokio::time::Instant::now() + connect_timeout;
+            loop {
+                attempts.count += 1;
+                match connect_boundary_using_connector(descriptor, connector).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
             }
         }
+        .await;
+        attempts.span.record(
+            "otel.status_code",
+            if result.is_ok() { "OK" } else { "ERROR" },
+        );
+        result
     }
 }
 
@@ -2334,7 +2368,9 @@ impl BoundaryClient {
         confirm: Option<&RequestEnvelope>,
         credential: &BoundaryCredential,
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
-        let (channel, transport) = self.build_grpc_channel(credential).await?;
+        let (channel, transport) = self
+            .build_grpc_channel(credential, CONNECT_RETRY_TIMEOUT)
+            .await?;
         let result = async {
             self.exchange_on_channel(channel.clone(), attach, credential)
                 .await?;
@@ -2494,7 +2530,11 @@ impl BoundaryClient {
             return Ok(cached.channel.clone());
         }
         let credential = BoundaryCredential::capture(&self.sandbox_bearer)?;
-        let (channel, transport) = self.build_grpc_channel(&credential).await?;
+        // Initial policy discovery and attach already have a startup deadline.
+        // Keep the transport wait in one connection span within that budget.
+        let (channel, transport) = self
+            .build_grpc_channel(&credential, self.attach_request_timeout)
+            .await?;
         *state = Some(CachedGrpcChannel {
             credential_epoch: credential.epoch,
             bearer_fingerprint: credential.fingerprint,
@@ -2510,10 +2550,10 @@ impl BoundaryClient {
     async fn build_grpc_channel(
         &self,
         credential: &BoundaryCredential,
+        connect_timeout: Duration,
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
         let runtime_descriptor = self.runtime_descriptor.clone();
         let source = self.transport.clone();
-        let initial_connect_timeout = self.attach_request_timeout;
         let transport = Arc::new(TransportAbort::default());
         let connector_transport = transport.clone();
         let authority = match &runtime_descriptor.transport {
@@ -2547,7 +2587,7 @@ impl BoundaryClient {
                         return Err(AbortableTransport::aborted_error());
                     }
                     source
-                        .connect(&runtime_descriptor, initial_connect_timeout)
+                        .connect(&runtime_descriptor, connect_timeout)
                         .await
                         .map(|inner| TokioIo::new(AbortableTransport { inner, abort }))
                         .map_err(|error| std::io::Error::other(error.to_string()))
@@ -3094,6 +3134,7 @@ pub mod test_support;
 
 #[cfg(test)]
 mod tests {
+    mod connection_tracing;
     mod credential_renewal;
     mod delegated;
     mod flow_control;
@@ -4449,7 +4490,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn configured_routed_bootstrap_wait_preserves_reconnect_window() {
+    async fn routed_connection_uses_the_callers_timeout() {
         let certificate = test_certificate();
         let mut descriptor =
             tls_runtime_descriptor("127.0.0.1:1".parse().unwrap(), certificate.client_tls);
@@ -4461,7 +4502,7 @@ mod tests {
             route: route.clone(),
         };
         let registration = router.register(&route, &descriptor.tls).unwrap();
-        let transport = BoundaryTransport::routed(&descriptor, registration.clone()).unwrap();
+        let transport = BoundaryTransport::routed(&descriptor, registration).unwrap();
         let budget = Duration::from_mins(15);
         let mut waiting = Box::pin(transport.connect(&descriptor, budget));
         poll_fn(|context| {
@@ -4500,12 +4541,28 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(waiting);
-        assert!(registration.has_connected());
         drop(stream);
         drop(runtime.await.unwrap());
 
         tokio::time::pause();
-        let mut reconnect = Box::pin(transport.connect(&descriptor, budget));
+        let mut attach = Box::pin(transport.connect(&descriptor, budget));
+        poll_fn(|context| {
+            assert!(attach.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(CONNECT_RETRY_TIMEOUT + Duration::from_secs(1)).await;
+        poll_fn(|context| {
+            assert!(
+                attach.as_mut().poll(context).is_pending(),
+                "a previous connection must not shorten the startup budget for attach"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        drop(attach);
+
+        let mut reconnect = Box::pin(transport.connect(&descriptor, CONNECT_RETRY_TIMEOUT));
         poll_fn(|context| {
             assert!(reconnect.as_mut().poll(context).is_pending());
             Poll::Ready(())
