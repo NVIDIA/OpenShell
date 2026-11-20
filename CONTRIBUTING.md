@@ -24,7 +24,7 @@ Pull requests from authors without write access must link an issue labeled `stat
 
 ### Finding Work
 
-Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
+Issues labeled [`good first issue`](https://github.com/ai-openshell/openshell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
 An open issue is not necessarily accepted or ready for implementation. Inspect the repository’s current `state:*` labels and ask a maintainer when its status is unclear. A direct user request authorizes an agent to perform the requested phase without changing the issue’s disposition.
 
@@ -50,7 +50,7 @@ The project includes optional [agent skills](#agent-skills) for using OpenShell 
 
 ### When NOT to Open an Issue
 
-- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions).
+- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/ai-openshell/openshell/discussions).
 - Security vulnerabilities — follow [SECURITY.md](SECURITY.md) instead.
 
 ## Before You Submit a Change
@@ -63,7 +63,7 @@ Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTA
 
 Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Once your pull request represents [accepted work](#accepted-work), apply exactly one `area:` label and any relevant `topic:` labels. Follow [Labeling and Notifications](#labeling-and-notifications) before applying classification labels. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR. The same workflow fails a ready PR from a personal fork that does not allow edits by maintainers; `gh pr create` enables that setting by default.
+Once your pull request represents [accepted work](#accepted-work), it needs exactly one `area:` label and any relevant `topic:` labels; see [Labeling and Notifications](#labeling-and-notifications) for guidance. The [reviewer routing workflow](.github/workflows/review-readiness.yml) adds reviewers from [REVIEWERS.md](REVIEWERS.md) based on these labels. The same workflow fails a ready PR from a personal fork that does not allow edits by maintainers; `gh pr create` enables that setting by default.
 
 Branch Checks requires accounts in `REVIEWERS.md` to appear in the repository collaborator list or have confirmed write or admin permission. Public read access alone does not qualify; read and triage accounts must appear in the collaborator list.
 
@@ -75,7 +75,7 @@ OpenShell keeps skills for using the product separate from skills for developing
 
 ### Skills for Using OpenShell
 
-Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add ai-openshell/openshell`.
 
 | Skill | Purpose |
 | --- | --- |
@@ -149,7 +149,7 @@ Apply `area:` and `topic:` classification labels only after the issue or PR meet
 
 Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
 
-Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/NVIDIA/OpenShell/issues/5261). Until that policy changes, defer classification labels until acceptance.
+Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/ai-openshell/openshell/issues/5261). Until that policy changes, defer classification labels until acceptance.
 
 ### Label Discovery
 
@@ -167,7 +167,7 @@ When recording a triage outcome, replace the previous assessment state rather th
 
 ## Prerequisites
 
-Native Windows development uses the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Native Windows development uses the [`windows` branch](https://github.com/ai-openshell/openshell/tree/windows).
 Follow [Native Windows support](WINDOWS.md) for checkout, MSVC prerequisites,
 runtime requirements, and limitations. Target Windows implementation PRs at
 `windows`. Shared documentation can merge into `main`, but Windows-specific
@@ -312,7 +312,7 @@ mise run --skip-tools windows:build:x64
 
 For ARM64, use `windows:build:arm64` with ARM64 MSVC components and host-native
 LLVM. Keep the matching `libz3.dll` staged by the build beside the executables.
-See [Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+See [Windows validation](https://github.com/ai-openshell/openshell/blob/windows/TESTING.md#native-windows-validation)
 for native tests and MXC E2E requirements. Docker is not required for the native
 Windows build or MXC runtime.
 
@@ -415,6 +415,10 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run monitoring:check` | Check and render the monitoring mixin            |
 | `mise run clean`     | Clean build artifacts                                   |
 
+## TypeScript SDK contributions
+
+The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript); open TypeScript SDK PRs there.
+
 ## Project Structure
 
 | Path            | Purpose                                       |
@@ -423,7 +427,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
-| `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
+| `sdk/typescript/` | Deprecated `@nvidia/openshell-sdk` stub re-exporting `@ai-openshell/sdk` (moved to ai-openshell/sdk-typescript) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
@@ -436,7 +440,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
-| `.agents/`      | Contributor skills and persona definitions    |
+| `.agents/`      | Contributor skills and [agents](.agents/agents/README.md) |
 
 ## RFCs
 

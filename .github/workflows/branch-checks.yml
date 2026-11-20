@@ -678,33 +678,39 @@ jobs:
       - name: Lint
         run: mise run markdown:lint
 
-  sdk-typescript:
-    name: TypeScript SDK
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    container:
-      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+  typescript-sdk-freeze:
+    name: TypeScript SDK Freeze
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Check TypeScript SDK
-        run: mise run sdk:ts:ci
-
-      # Exercise the full release publish path (version stamp, dist-tag,
-      # prepublishOnly, tarball) without uploading. Uses the off-tag dev
-      # version, which validates the prerelease dist-tag branch too.
-      - name: Verify publishable artifact (dry-run)
+      - name: Reject changes to the TypeScript SDK
         env:
-          OPENSHELL_NPM_PUBLISH_ARGS: --dry-run
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
-            mise run sdk:ts:publish
+          set -euo pipefail
+          # The package is a stub that re-exports @ai-openshell/sdk. Its files stay
+          # editable so the stub and its moved notice can be maintained.
+          changed=$(git diff --no-renames --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- sdk/typescript \
+            ':(exclude)sdk/typescript/package.json' \
+            ':(exclude)sdk/typescript/README.md' \
+            ':(exclude)sdk/typescript/index.js' \
+            ':(exclude)sdk/typescript/index.d.ts' \
+            ':(exclude)sdk/typescript/raw.js' \
+            ':(exclude)sdk/typescript/raw.d.ts')
+          if [ -z "$changed" ]; then
+            echo "No added or changed TypeScript SDK files."
+            exit 0
+          fi
+          echo "::error title=TypeScript SDK moved::Open TypeScript SDK changes at https://github.com/ai-openshell/sdk-typescript. Drop sdk/typescript changes from this PR. Core proto changes need no TypeScript bindings here; sdk-typescript generates them from core releases."
+          echo "Changed TypeScript SDK files:"
+          echo "$changed"
+          exit 1
 
   install-script:
     name: install.sh

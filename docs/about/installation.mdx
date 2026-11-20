@@ -15,7 +15,7 @@ Install OpenShell on a local workstation or Kubernetes.
 On Linux or macOS, install the CLI, policy prover, and a local gateway with one command:
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | sh
 ```
 
 The script picks a package for your platform and starts the gateway. Confirm the CLI can reach it:
@@ -24,7 +24,7 @@ The script picks a package for your platform and starts the gateway. Confirm the
 openshell status
 ```
 
-To install a specific release, set `OPENSHELL_VERSION` to a release tag. Release artifacts are also on the [GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
+To install a specific release, set `OPENSHELL_VERSION` to a release tag. Release artifacts are also on the [GitHub Releases](https://github.com/ai-openshell/openshell/releases) page.
 
 ## Prerelease and Development Builds
 
@@ -34,16 +34,16 @@ Prerelease packages are retained as GitHub Actions artifacts for 90 days and req
 
 ```shell
 gh auth login
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | \
   OPENSHELL_VERSION=pre sh
 ```
 
 The installer checks prerelease tags from newest to oldest, selects an unexpired published package for the current platform, and downloads only that artifact. The selected candidate may still be qualifying or may have failed qualification. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, explicit release tags use Debian or RPM packages, as do prereleases by default. Set `OPENSHELL_INSTALL_METHOD=snap` with `OPENSHELL_VERSION=pre` to track the newest published prerelease snap in `latest/beta`. Beta publication runs alongside qualification, so the channel may contain a candidate that later fails qualification.
 
-The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
+The rolling [`dev` release](https://github.com/ai-openshell/openshell/releases/tag/dev) does not require GitHub authentication:
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | \
   OPENSHELL_VERSION=dev sh
 ```
 
@@ -77,14 +77,14 @@ The local gateway auto-detects an available runtime. To pin one, set `compute_dr
 ## Windows
 
 Build native Windows x64 or ARM64 binaries from the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
-Follow the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+[`windows` branch](https://github.com/ai-openshell/openshell/tree/windows).
+Follow the [Windows build and runtime guide](https://github.com/ai-openshell/openshell/blob/windows/WINDOWS.md)
 for MSVC prerequisites, MXC host probing, and gateway setup. Select
 `compute_driver = "mxc"` in the gateway TOML file.
 
 Native Windows uses Microsoft MXC ProcessContainer isolation. It is under
 development and is not production-qualified; see the
-[current runtime limitations](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#runtime-and-current-limits).
+[current runtime limitations](https://github.com/ai-openshell/openshell/blob/windows/WINDOWS.md#runtime-and-current-limits).
 The installer and release channels above do not supply native Windows binaries.
 Running Linux OpenShell inside WSL 2 is a separate, experimental option.
 

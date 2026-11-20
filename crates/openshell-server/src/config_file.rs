@@ -273,6 +273,46 @@ pub struct SupervisorPoolConfig {
     /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_timeout_secs: Option<u32>,
+    /// Most sandbox instances the gateway places on one pool member, from 1
+    /// to 1024; unset places
+    /// [`openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER`].
+    /// Each member must run with the same cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances_per_member: Option<u32>,
+    /// Pool members one gateway replica is sized to serve, at least 1; unset
+    /// sizes for
+    /// [`openshell_supervisor_control::DEFAULT_MAX_MEMBERS_PER_GATEWAY`]. The
+    /// pool runs at most live replicas × this × `max_instances_per_member`
+    /// instances, never past
+    /// [`openshell_supervisor_control::MAX_POOL_INSTANCES_CEILING`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_members_per_gateway: Option<u32>,
+}
+
+impl SupervisorPoolConfig {
+    /// The configured pool limits, defaults filled in.
+    ///
+    /// # Errors
+    ///
+    /// A limit is outside its range.
+    pub fn limits(
+        &self,
+    ) -> Result<
+        openshell_supervisor_control::PoolLimits,
+        openshell_supervisor_control::PoolLimitsError,
+    > {
+        use openshell_supervisor_control as pool;
+        pool::PoolLimits::new(
+            self.max_instances_per_member
+                .map_or(pool::DEFAULT_MAX_INSTANCES_PER_MEMBER, |value| {
+                    value as usize
+                }),
+            self.max_members_per_gateway
+                .map_or(pool::DEFAULT_MAX_MEMBERS_PER_GATEWAY, |value| {
+                    value as usize
+                }),
+        )
+    }
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.
@@ -1618,6 +1658,24 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
             field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
             message: "must be between 30 and 300 seconds",
         });
+    }
+    if let Some(Err(error)) = file
+        .openshell
+        .gateway
+        .supervisor_pool
+        .map(|pool| pool.limits())
+    {
+        let (field, message) = match error {
+            openshell_supervisor_control::PoolLimitsError::InstancesPerMember => (
+                "openshell.gateway.supervisor_pool.max_instances_per_member",
+                "must be between 1 and 1024",
+            ),
+            openshell_supervisor_control::PoolLimitsError::MembersPerGateway => (
+                "openshell.gateway.supervisor_pool.max_members_per_gateway",
+                "must be at least 1",
+            ),
+        };
+        return Err(ConfigFileError::InvalidValue { field, message });
     }
     if let Some((name, _)) = file
         .openshell
@@ -3512,6 +3570,47 @@ database_lock_max_connections = 0
             assert!(
                 matches!(pool(unknown), Err(ConfigFileError::Parse { .. })),
                 "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_and_bounds_the_supervisor_pool_limits() {
+        let pool = |table: &str| {
+            let tmp = write_tmp(&format!("[openshell.gateway.supervisor_pool]\n{table}"));
+            load(tmp.path()).map(|file| file.openshell.gateway.supervisor_pool.unwrap())
+        };
+        assert_eq!(
+            pool("").unwrap().limits(),
+            Ok(openshell_supervisor_control::PoolLimits::default())
+        );
+        assert_eq!(
+            pool("max_instances_per_member = 16\nmax_members_per_gateway = 2\n")
+                .unwrap()
+                .limits(),
+            openshell_supervisor_control::PoolLimits::new(16, 2)
+        );
+        for valid in [
+            "max_instances_per_member = 1",
+            "max_members_per_gateway = 500",
+        ] {
+            assert!(pool(valid).is_ok(), "{valid}");
+        }
+        for (invalid, field) in [
+            ("max_instances_per_member = 0", "max_instances_per_member"),
+            (
+                "max_instances_per_member = 1025",
+                "max_instances_per_member",
+            ),
+            ("max_members_per_gateway = 0", "max_members_per_gateway"),
+        ] {
+            assert!(
+                matches!(
+                    pool(invalid),
+                    Err(ConfigFileError::InvalidValue { field: rejected, .. })
+                        if rejected.ends_with(field)
+                ),
+                "{invalid}"
             );
         }
     }

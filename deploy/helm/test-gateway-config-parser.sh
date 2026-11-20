@@ -135,4 +135,44 @@ for values in "${chart}"/ci/values-*.yaml; do
   preflight "${work_dir}/${name}.toml"
 done
 
+# Shared supervisor pool limits: the chart's range ends and the large-cluster
+# profile must pass the Rust loader, and the loader must refuse values the
+# chart would never render.
+supervisor_topology='gatewayConfig.openshell\.drivers\.kubernetes.supervisor_topology=gateway'
+for limits in "1 1" "128 32" "1024 500"; do
+  read -r instances members <<<"${limits}"
+  name="pool-${instances}-${members}"
+  render "${work_dir}/${name}.yaml" --set-string "${supervisor_topology}" \
+    --set supervisor.replicas=1 \
+    --set supervisor.pool.maxInstancesPerMember="${instances}" \
+    --set supervisor.pool.maxMembersPerGateway="${members}"
+  extract_toml "${work_dir}/${name}.yaml" "${work_dir}/${name}.toml"
+  preflight "${work_dir}/${name}.toml"
+  grep -Fx "max_instances_per_member = ${instances}" "${work_dir}/${name}.toml" >/dev/null
+  grep -Fx "max_members_per_gateway = ${members}" "${work_dir}/${name}.toml" >/dev/null
+done
+render "${work_dir}/scale-10k.yaml" \
+  --values "${chart}/values-scale-10k.yaml" --set server.externalDbSecret=parser-database
+extract_toml "${work_dir}/scale-10k.yaml" "${work_dir}/scale-10k.toml"
+preflight "${work_dir}/scale-10k.toml"
+pool_with() {
+  local line="$1"
+  grep -v "^${line%% =*} = " "${work_dir}/pool-128-32.toml" \
+    | awk -v line="${line}" '{ print } /^\[openshell\.gateway\.supervisor_pool\]$/ { print line }' \
+      >"${work_dir}/pool-edited.toml"
+}
+for valid in "max_instances_per_member = 64" "max_members_per_gateway = 8"; do
+  pool_with "${valid}"
+  preflight "${work_dir}/pool-edited.toml"
+done
+for invalid in "max_instances_per_member = 0" "max_instances_per_member = 1025" \
+  "max_members_per_gateway = 0"; do
+  pool_with "${invalid}"
+  if preflight "${work_dir}/pool-edited.toml" >"${work_dir}/pool-edited.err" 2>&1; then
+    echo "the gateway loader accepted ${invalid}" >&2
+    exit 1
+  fi
+  grep -F 'category=malformed' "${work_dir}/pool-edited.err" >/dev/null
+done
+
 echo "rendered gateway TOML passed Rust loader validation"

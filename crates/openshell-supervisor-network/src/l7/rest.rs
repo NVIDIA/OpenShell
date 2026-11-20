@@ -4423,6 +4423,8 @@ fn is_benign_close(err: &std::io::Error) -> bool {
     reason = "Test code: test fixtures and explicit value-shape assertions are idiomatic in tests."
 )]
 mod tests {
+    mod path_credentials;
+
     use super::*;
     use crate::opa::OpaEngine;
     use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
@@ -5312,7 +5314,7 @@ mod tests {
     fn deny_response_body_is_agent_readable_and_redacted() {
         let req = L7Request {
             action: "PUT".to_string(),
-            target: "/repos/NVIDIA/OpenShell/contents/README.md?access_token=secret-token"
+            target: "/repos/ai-openshell/openshell/contents/README.md?access_token=secret-token"
                 .to_string(),
             query_params: HashMap::new(),
             raw_header: Vec::new(),
@@ -5323,7 +5325,7 @@ mod tests {
             &req,
             "github-readonly",
             "no matching L7 allow rule",
-            Some("/repos/NVIDIA/OpenShell/contents/README.md"),
+            Some("/repos/ai-openshell/openshell/contents/README.md"),
             Some(DenyResponseContext {
                 host: Some("api.github.com"),
                 port: Some(443),
@@ -5341,17 +5343,20 @@ mod tests {
         assert_eq!(body["host"], "api.github.com");
         assert_eq!(body["port"], 443);
         assert_eq!(body["binary"], "/usr/bin/gh");
-        assert_eq!(body["path"], "/repos/NVIDIA/OpenShell/contents/README.md");
+        assert_eq!(
+            body["path"],
+            "/repos/ai-openshell/openshell/contents/README.md"
+        );
         assert_eq!(
             body["rule"],
-            "PUT /repos/NVIDIA/OpenShell/contents/README.md"
+            "PUT /repos/ai-openshell/openshell/contents/README.md"
         );
         assert_eq!(body["rule_missing"]["type"], "rest_allow");
         assert_eq!(body["rule_missing"]["layer"], "l7");
         assert_eq!(body["rule_missing"]["method"], "PUT");
         assert_eq!(
             body["rule_missing"]["path"],
-            "/repos/NVIDIA/OpenShell/contents/README.md"
+            "/repos/ai-openshell/openshell/contents/README.md"
         );
         assert_eq!(body["rule_missing"]["host"], "api.github.com");
         assert_eq!(body["rule_missing"]["port"], 443);
@@ -11281,7 +11286,7 @@ mod tests {
                 match *style {
                     "header" => credential.header_name = (*selector).into(),
                     "query" => credential.query_param = (*selector).into(),
-                    "path" => credential.path_template = (*selector).into(),
+                    "path" | "path_subtree" => credential.path_template = (*selector).into(),
                     _ => panic!("fixture needs an explicit placement"),
                 }
                 (
@@ -12257,6 +12262,85 @@ mod tests {
             "Upstream should see real token in URL path, got: {forwarded}"
         );
         assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_subtree_path_credential_for_every_method() {
+        let (child_env, resolver) = placed_test_resolver(
+            [(
+                "TELEGRAM_TOKEN".to_string(),
+                "123456:ABC-DEF1234ghIkl".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            "api.telegram.org",
+            &[("TELEGRAM_TOKEN", "path_subtree", "/bot{credential}")],
+        );
+        let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
+
+        for method in ["sendMessage", "getUpdates", "answerCallbackQuery"] {
+            let raw = format!(
+                "POST /bot{placeholder}/{method} HTTP/1.1\r\n\
+                 Host: api.telegram.org\r\n\
+                 Content-Length: 2\r\n\r\n{{}}"
+            );
+            let forwarded = relay_and_capture(
+                raw.into_bytes(),
+                BodyLength::ContentLength(2),
+                resolver.as_ref(),
+            )
+            .await
+            .expect("every method below the credential prefix should relay");
+
+            assert!(
+                forwarded.contains(&format!(
+                    "POST /bot123456:ABC-DEF1234ghIkl/{method} HTTP/1.1"
+                )),
+                "Upstream should see the real token for {method}, got: {forwarded}"
+            );
+            assert!(!forwarded.contains("openshell:resolve:env:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_subtree_path_credential_outside_the_declared_slot() {
+        let (child_env, resolver) = placed_test_resolver(
+            [(
+                "TELEGRAM_TOKEN".to_string(),
+                "123456:ABC-DEF1234ghIkl".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            "api.telegram.org",
+            &[("TELEGRAM_TOKEN", "path_subtree", "/bot{credential}")],
+        );
+        let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
+
+        for target in [
+            // The client wrote `{credential}` itself, so the real token would
+            // land in the wildcard tail.
+            format!("/bot%7Bcredential%7D/echo/{placeholder}"),
+            format!("/bot{placeholder}/echo/{placeholder}"),
+            format!("/echo/bot{placeholder}/getMe"),
+        ] {
+            let raw = format!(
+                "POST {target} HTTP/1.1\r\n\
+                 Host: api.telegram.org\r\n\
+                 Content-Length: 2\r\n\r\n{{}}"
+            );
+            let error = relay_and_capture(
+                raw.into_bytes(),
+                BodyLength::ContentLength(2),
+                resolver.as_ref(),
+            )
+            .await
+            .expect_err("a credential outside its declared slot must not relay");
+
+            assert!(
+                !format!("{error:?}").contains("123456:ABC-DEF1234ghIkl"),
+                "the rejection must not carry the credential"
+            );
+        }
     }
 
     #[tokio::test]

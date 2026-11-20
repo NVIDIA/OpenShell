@@ -62,7 +62,7 @@ When a sandbox principal is refused with `method_not_permitted`, `cross_sandbox`
 
 The gateway also emits an API Activity event for each call a user or mTLS operator makes to a write method, such as `CreateSandbox`, `UpdateConfig`, or `ExecSandbox`. `actor.user`, `src_endpoint`, `api.operation`, and `metadata.correlation_uid` are set as for authorization denials, and `activity_id` is Create (1), Update (3), Delete (4), or Other (99) for exec and port forwarding. When an authorization check refuses the call, the denial event above is its only record.
 
-`status_detail` qualifies the outcome: `no_op:<reason>` when a successful call changed nothing, `rejected:<code>` (Low) or `error:<code>` (Medium) with the gRPC code when it failed, and `unknown:cancelled` (Medium) when the client disconnected before the call finished, which may still have applied the change.
+`status_detail` qualifies the outcome: `no_op:<reason>` when a successful call changed nothing, `rejected:<code>` (Low) or `error:<code>` (Medium) with the gRPC code when it failed, followed by the gateway's error reason when it gives one, such as `rejected:aborted:RESOURCE_VERSION_CONFLICT`, and `unknown:cancelled` (Medium) when the client disconnected before the call finished, which may still have applied the change.
 
 `resources` names the workspace and the resources the call acted on. An exec's `exec` resource has as its `uid` the `channel_id` from the exec's `command started` line in the gateway's sandbox logs, so you can match the record to the command's log lines.
 
@@ -167,6 +167,7 @@ Some fields depend on the event class:
 
 - SSH Activity records name the supervisor's SSH server as `dst_endpoint`, with `svc_name: "ssh"` and the listen socket path in `name`, because the server listens on a Unix socket rather than a network address.
 - Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
+- Network and HTTP Activity records for connections the sandbox runtime mediates name the process that opened the connection as `actor.process`, with its `pid` as the sandbox sees it and its start time in `created_time`. When the parent process is identified, `parent_process` carries its `pid`. A `pid` can be reused after its process exits; `pid` and `created_time` together identify one process.
 - `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
 
 Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Supervisor records identify the sandbox under `device.container` and validate against OCSF v1.8.0 without a top-level `container` exception. Here is an example of a network connection event:
@@ -210,7 +211,12 @@ Each JSONL file line, or the payload after the stderr marker, is a complete OCSF
   "actor": {
     "process": {
       "name": "/usr/bin/curl",
-      "pid": 57
+      "pid": 57,
+      "created_time": 1775014138702,
+      "parent_process": {
+        "name": "/usr/bin/bash",
+        "pid": 42
+      }
     }
   },
   "firewall_rule": {
@@ -404,7 +410,7 @@ The bounded exporter queue does not cap span generation. Collector-side sampling
 reduces stored traces, not the supervisor's span-generation cost. The gateway's
 `OTEL_TRACES_SAMPLER` setting does not configure supervisor sampling; operator
 control is tracked in
-[#5362](https://github.com/NVIDIA/OpenShell/issues/5362).
+[#5362](https://github.com/ai-openshell/openshell/issues/5362).
 
 Leave supervisor trace export disabled if your deployment requires a
 denial-only volume bound. OCSF records and request receipts still work without it.

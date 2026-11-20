@@ -73,5 +73,5 @@ The release workflow also publishes GitHub artifact attestations for each
 runtime tarball. Verify a downloaded runtime with:
 
 ```bash
-gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/OpenShell
+gh attestation verify vm-runtime-linux-x86_64.tar.zst -R ai-openshell/openshell
 ```
