@@ -4869,9 +4869,6 @@ impl VmDriver {
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
             .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
-        tokio::fs::create_dir_all(&cache_dir)
-            .await
-            .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
 
         if tokio::fs::metadata(&staging_dir).await.is_ok() {
             remove_bootstrap_staging(&staging_dir)
@@ -4989,10 +4986,16 @@ impl VmDriver {
             return Err(Status::failed_precondition(err));
         }
 
-        self.publish_prepared_image(&prepared_image, &image_path)
-            .await?;
+        let published = async {
+            tokio::fs::create_dir_all(&cache_dir)
+                .await
+                .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
+            self.publish_prepared_image(&prepared_image, &image_path)
+                .await
+        }
+        .await;
         let _ = remove_bootstrap_staging(&staging_dir).await;
-        Ok(())
+        published
     }
 
     /// Watch the launcher child process and surface errors as driver

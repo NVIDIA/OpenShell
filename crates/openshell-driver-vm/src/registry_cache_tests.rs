@@ -607,13 +607,13 @@ async fn bootstrap_extraction_limit_spans_layers_and_cleans_failed_build() {
         "{error}"
     );
     assert!(attempt.read_dir().unwrap().next().is_none());
-    for cache_entry in fs::read_dir(image_cache_root_dir(state.path())).unwrap() {
-        let path = cache_entry.unwrap().path();
-        assert!(
-            fs::read_dir(&path).unwrap().next().is_none(),
-            "retained build output at {path:?}"
-        );
-    }
+    assert!(
+        fs::read_dir(image_cache_root_dir(state.path()))
+            .unwrap()
+            .next()
+            .is_none(),
+        "a rejected image must not leave a cache entry"
+    );
 
     driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(4 * 4096);
     let staging = state.path().join("retry");
