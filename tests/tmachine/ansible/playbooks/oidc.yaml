@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Sign gateway users in with the Keycloak realm keycloak.yaml runs, which
+# runs first, and publish the realm's plain users for the oidc-auth suite.
+---
+- name: OIDC gateway for tests
+  hosts: all
+  gather_facts: false
+  vars_files:
+    - ../roles/keycloak/defaults/main.yaml
+  roles:
+    - oidc_gateway
+  tasks:
+    # The values are the throwaway fixture realm's (scripts/keycloak-realm.json).
+    - name: Publish OIDC test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: oidc
+        test_env_vars:
+          OPENSHELL_TEST_KEYCLOAK_USER_USERNAME: user@test
+          OPENSHELL_TEST_KEYCLOAK_USER_PASSWORD: user
+          OPENSHELL_TEST_KEYCLOAK_USER_B_USERNAME: user-b@test
+          OPENSHELL_TEST_KEYCLOAK_USER_B_PASSWORD: user-b

@@ -3,7 +3,7 @@
 
 //! Sandbox policies for tests: [`base`], read from `base-policy.yaml`, plus
 //! [`allow`] and the [`Endpoint`] settings for the network access a test
-//! needs.
+//! needs. [`set`] applies a policy to a running sandbox.
 //!
 //! ```ignore
 //! let mut policy = testkit::policy::base();
@@ -14,7 +14,9 @@
 
 use openshell_sdk::raw::proto;
 
+use crate::context::Sandbox;
 use crate::error::{Error, Result, ResultExt as _};
+use crate::yaml_file::YamlFile;
 
 pub use proto::NetworkAccessPreset as Access;
 
@@ -87,6 +89,45 @@ pub fn binaries_yaml(binaries: &[&str]) -> String {
     format!("[{}]", paths.join(", "))
 }
 
+/// The policy `yaml` describes, as `sandbox create --policy` reads a file.
+/// Use it for a policy kept as a YAML file, such as an example; build one
+/// with [`base`] and [`allow`] otherwise.
+pub fn from_yaml(yaml: &str) -> Result<proto::SandboxPolicy> {
+    openshell_policy::parse_sandbox_policy(yaml)
+        .map_err(|error| Error::msg(format!("{error:?}")))
+        .context("parse the policy")
+}
+
+/// [`base`] with the top-level sections in `yaml`, such as
+/// `network_policies` or `network_middlewares`, added. Use it for policy
+/// settings [`Endpoint`] doesn't cover, such as L7 rules.
+pub fn base_with(yaml: &str) -> Result<proto::SandboxPolicy> {
+    from_yaml(&format!("{BASE}{yaml}"))
+}
+
+/// Replace `sandbox`'s policy with `policy` through `policy set --wait`, and
+/// wait up to two minutes until the sandbox has loaded it.
+pub async fn set(sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result {
+    let file = YamlFile::new(&to_yaml(policy)?)?;
+    sandbox
+        .handles()
+        .cli()
+        .run([
+            "policy",
+            "set",
+            sandbox.name(),
+            "--policy",
+            file.path()?,
+            "--wait",
+            "--timeout",
+            "120",
+        ])
+        .await?
+        .success()
+        .context(format!("set the policy of sandbox {}", sandbox.name()))?;
+    Ok(())
+}
+
 /// Settings for an endpoint from [`allow`], named as in policy YAML.
 pub trait Endpoint {
     /// `protocol: rest` with `access`.
@@ -101,6 +142,10 @@ pub trait Endpoint {
     fn credential_binding(&mut self, provider: &str) -> &mut Self;
     /// `allow_uninspected_credentials: true`.
     fn allow_uninspected_credentials(&mut self) -> &mut Self;
+    /// `enforcement: enforce`.
+    fn enforce(&mut self) -> &mut Self;
+    /// `path: <path>`.
+    fn path(&mut self, path: &str) -> &mut Self;
 }
 
 impl Endpoint for proto::NetworkEndpoint {
@@ -137,6 +182,16 @@ impl Endpoint for proto::NetworkEndpoint {
         self.allow_uninspected_credentials = true;
         self
     }
+
+    fn enforce(&mut self) -> &mut Self {
+        self.enforcement = proto::NetworkEnforcementMode::Enforce as i32;
+        self
+    }
+
+    fn path(&mut self, path: &str) -> &mut Self {
+        self.path = path.to_string();
+        self
+    }
 }
 
 #[cfg(test)]
@@ -167,7 +222,9 @@ mod tests {
             &["/usr/bin/python*"],
         )
         .websocket(Access::ReadWrite)
-        .allow_uninspected_credentials();
+        .allow_uninspected_credentials()
+        .enforce()
+        .path("/ws");
 
         let yaml = format!(
             "{BASE}network_policies:
@@ -186,6 +243,8 @@ mod tests {
         protocol: websocket
         access: read-write
         allow_uninspected_credentials: true
+        enforcement: enforce
+        path: /ws
     binaries:
       - path: /usr/bin/python*
 "
@@ -196,5 +255,17 @@ mod tests {
             openshell_policy::parse_sandbox_policy(&to_yaml(&policy).expect("serializes"))
                 .expect("the serialized policy parses");
         assert_eq!(round_trip, expected);
+        assert_eq!(from_yaml(&yaml).expect("the YAML parses"), expected);
+        assert_eq!(
+            base_with(yaml.strip_prefix(BASE).expect("starts with the base"))
+                .expect("the YAML parses"),
+            expected
+        );
+    }
+
+    #[test]
+    fn from_yaml_reports_an_invalid_policy() {
+        let error = from_yaml("network_policies: [").expect_err("invalid YAML");
+        assert!(error.to_string().contains("parse the policy"), "{error}");
     }
 }

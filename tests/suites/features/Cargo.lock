@@ -1317,8 +1317,13 @@ dependencies = [
 name = "host-server-support"
 version = "0.0.0"
 dependencies = [
+ "openshell-crypto",
  "openshell-testkit",
+ "rcgen",
+ "rustls",
+ "serde_json",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
@@ -1833,16 +1838,19 @@ version = "0.0.0"
 dependencies = [
  "keycloak-support",
  "openshell-testkit",
- "tempfile",
+ "prost-types",
 ]
 
 [[package]]
 name = "keycloak-support"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "openshell-testkit",
  "serde_json",
+ "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -2306,6 +2314,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oidc-auth"
+version = "0.0.0"
+dependencies = [
+ "keycloak-support",
+ "openshell-testkit",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2430,6 +2448,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-providers"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "noyalib",
+ "openshell-core",
+ "openshell-policy",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "openshell-sdk"
 version = "0.0.0"
 dependencies = [
@@ -2489,11 +2522,16 @@ dependencies = [
  "noyalib",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-policy",
+ "openshell-providers",
  "openshell-sdk",
  "openshell-testkit-macros",
+ "prost-types",
  "quick-junit",
  "rand 0.9.4",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -3114,6 +3152,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "routable-host-ip"
+version = "0.0.0"
+dependencies = [
+ "host-server-support",
+ "openshell-testkit",
+ "sandbox-clients-support",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3250,6 +3297,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox-clients-support"
+version = "0.0.0"
+dependencies = [
+ "httparse",
+ "openshell-testkit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3432,6 +3489,14 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "service-exposure"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
 ]
 
 [[package]]

@@ -324,7 +324,9 @@ service.
   clients there from the variables. A missing variable fails the test; it
   never skips it.
 - **Documentation.** Document the variables in the fixture's module docs, so
-  anyone can run the suite against their own deployment by setting them.
+  anyone can run the suite against their own deployment by setting them, and
+  add a row for each to the
+  [environment contract table](tests/support/README.md#environment-contract).
 
 The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
 with:
@@ -333,6 +335,15 @@ with:
 nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful-keycloak --installer deb \
   --family features --package keycloak-provider-refresh
+```
+
+The `oidc-auth` suite runs in `ubuntu-docker-rootful-oidc`, which adds a gateway
+that trusts the Keycloak realm and gives testkit an operator client certificate:
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful-oidc --installer deb \
+  --family features --package oidc-auth
 ```
 
 A suite that needs setup beyond a container engine runs in a feature
@@ -631,11 +642,27 @@ nix run .#openshell-test-runner -- run \
 
 #### Gateway overrides in an environment
 
-An environment overrides gateway settings by writing the tables to change to
-`/etc/openshell-test/gateway-overrides.toml` in a playbook that runs before the
-installer. The file holds whole tables, such as `[openshell.gateway]` or
-`[openshell.drivers.podman]`, and is not a complete configuration. Each
-installer applies it to the gateway's own file:
+An environment overrides gateway settings with the `gateway_overrides` role,
+which takes a name and the tables to change, such as `[openshell.gateway]` or
+`[openshell.drivers.podman]`:
+
+```yaml
+- name: Push configuration to supervisors
+  ansible.builtin.include_role:
+    name: gateway_overrides
+  vars:
+    gateway_overrides_name: config-push
+    gateway_overrides_content: |
+      [openshell.gateway]
+      config_delivery_mode = "push"
+```
+
+The role writes each name as its own marked block in
+`/etc/openshell-test/gateway-overrides.toml`, so writers keep each other's
+settings, and `gateway_overrides_state: absent` removes a name's block.
+Two blocks must not declare the same table. Don't write the file
+directly. The file is not a complete configuration. Each installer applies it
+to the gateway's own file:
 
 - `binaries` applies it to the `/etc/openshell/gateway.toml` it generates.
 - `deb` and `rpm` apply it to the service user's
@@ -690,11 +717,28 @@ rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
 
+The `routable-host-ip` feature suite (`tests/suites/features/routable-host-ip`)
+checks that a policy endpoint whose host is an IP literal reaches that address,
+with or without `allowed_ips`. The test reaches a host server by
+`host.openshell.internal`, then uses the address that request arrived at, or
+the host's outbound address when it arrived on loopback from a host-network
+supervisor. The address must be one the supervisor lets an IP literal reach.
+Rootless Podman's is link-local and always blocked, so CI runs the suite on
+Docker rootful, Podman rootful, and the `k3s` and `k3s-ha` installers.
+
 The `connect-ssh-supervision` feature suite
 (`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
 supervises its `ssh` process: it reconnects after losing the SSH transport and
 forwards a SIGTERM to `ssh`. The tests find those processes in `/proc`, so they
 need a Linux test host. CI runs them on Docker rootful.
+
+The `service-exposure` feature suite (`tests/suites/features/service-exposure`)
+exposes a service in a sandbox and checks how the gateway forwards the client's
+`Authorization` header. The test sends requests to the gateway's endpoint with
+the service URL's host as the Host header, so the test machine doesn't resolve
+service hosts. CI runs it on Docker rootful and Podman rootful and rootless. The
+Helm chart turns gateway service routing off, so the K3s installers have no
+service URLs.
 
 Run the VM-backed Rust CLI e2e suite:
 

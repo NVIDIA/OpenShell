@@ -109,6 +109,18 @@ let
         inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
       };
     };
+    # Keycloak plus a gateway that signs users in with it, for the oidc-auth
+    # suite. Needs the deb or rpm installer, whose gateway runs mTLS.
+    oidc = {
+      bases = dockerBases;
+      setup = {
+        playbooks = [
+          "ansible/playbooks/keycloak.yaml"
+          "ansible/playbooks/oidc.yaml"
+        ];
+        inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
+      };
+    };
     # Hardware-free CDI fixtures, for the cdi suite.
     cdi = {
       bases = dockerBases ++ podmanBases;

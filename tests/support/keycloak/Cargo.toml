@@ -13,5 +13,8 @@ publish = false
 
 [dependencies]
 openshell-testkit = { path = "../../testkit/testkit" }
+base64 = "0.22"
 serde_json = "1"
-tokio = { version = "1.43", features = ["io-util", "process"] }
+tempfile = "3"
+tokio = { version = "1.43", features = ["fs", "io-util", "process", "time"] }
+url = "2"

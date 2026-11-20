@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# An environment overrides gateway settings by writing the tables to change,
+# An environment overrides gateway settings by adding the tables to change,
 # such as `[openshell.drivers.podman]`, to
-# /etc/openshell-test/gateway-overrides.toml before the installer runs (for
-# example playbooks/drivers/podman/userns.yaml). Apply them to
+# /etc/openshell-test/gateway-overrides.toml with the gateway_overrides role
+# before the installer runs (for example playbooks/drivers/podman/userns.yaml).
+# Apply them to
 # `openshell_gateway_merge_target` without replacing the file; see
 # files/merge-gateway-toml.py.
 #
@@ -27,4 +28,4 @@
       {{ '--default ' ~ openshell_gateway_merge_default
          if openshell_gateway_merge_default | default('') else '' }}
     executable: /usr/bin/python3
-  when: openshell_gateway_overrides.stat.exists
+  when: openshell_gateway_overrides.stat.exists and openshell_gateway_overrides.stat.size > 0

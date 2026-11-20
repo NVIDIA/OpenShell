@@ -17,4 +17,13 @@
 # the bug. A test can appear more than once with different issues, but not twice
 # for one environment. Branch Checks runs the program with each environment's
 # entries to validate this file; see tests/suites/conformance/README.md.
-[]
+# A gateway replica holds only the logs of the sandboxes connected to it, so a
+# log read on k3s-ha can miss them (#5462).
+- test: conformance::credential_gating::profile_endpoints_bind_static_credentials
+  issue: https://github.com/NVIDIA/OpenShell/issues/5752
+  environments:
+    - ubuntu-k3s/k3s-ha
+- test: conformance::network_egress::fail_closed_middleware_blocks_uninspectable_traffic
+  issue: https://github.com/NVIDIA/OpenShell/issues/5752
+  environments:
+    - ubuntu-k3s/k3s-ha

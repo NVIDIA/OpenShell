@@ -542,6 +542,7 @@ dependencies = [
  "host-server-support",
  "openshell-crypto",
  "openshell-testkit",
+ "sandbox-clients-support",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1284,8 +1285,13 @@ dependencies = [
 name = "host-server-support"
 version = "0.0.0"
 dependencies = [
+ "openshell-crypto",
  "openshell-testkit",
+ "rcgen",
+ "rustls",
+ "serde_json",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
@@ -2370,6 +2376,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-providers"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "noyalib",
+ "openshell-core",
+ "openshell-policy",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "openshell-sdk"
 version = "0.0.0"
 dependencies = [
@@ -2417,11 +2438,16 @@ dependencies = [
  "noyalib",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-policy",
+ "openshell-providers",
  "openshell-sdk",
  "openshell-testkit-macros",
+ "prost-types",
  "quick-junit",
  "rand 0.9.4",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -3178,6 +3204,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox-clients-support"
+version = "0.0.0"
+dependencies = [
+ "httparse",
+ "openshell-testkit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -2357,6 +2357,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-providers"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "noyalib",
+ "openshell-core",
+ "openshell-policy",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "openshell-sdk"
 version = "0.0.0"
 dependencies = [
@@ -2404,11 +2419,16 @@ dependencies = [
  "noyalib",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-policy",
+ "openshell-providers",
  "openshell-sdk",
  "openshell-testkit-macros",
+ "prost-types",
  "quick-junit",
  "rand 0.9.4",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

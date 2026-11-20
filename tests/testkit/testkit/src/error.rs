@@ -99,6 +99,12 @@ impl From<serde_yml::Error> for Error {
     }
 }
 
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Self::from_error(&error)
