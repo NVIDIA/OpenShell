@@ -9,7 +9,7 @@
 //! - [`TestCa::new`] makes a CA that only the test knows, so nothing trusts it
 //!   unless the test hands over [`TestCa::cert_pem`].
 //! - [`TestCa::from_env`] loads the environment's additional CA, which the
-//!   gateway is configured to trust (`additional_ca_bundle`). The environment
+//!   supervisor trusts for sandbox egress (`additional_ca_bundle`). The environment
 //!   publishes the paths of its PEM certificate and key in
 //!   `OPENSHELL_TEST_ADDITIONAL_CA_CERT` and `OPENSHELL_TEST_ADDITIONAL_CA_KEY`.
 
@@ -82,9 +82,23 @@ impl TestCa {
             "parse the CA certificate {}",
             cert.display()
         )))?;
-        let key = KeyPair::from_pem(&key_pem)
+        let key_pair = KeyPair::from_pem(&key_pem)
             .map_err(failed(format!("parse the CA key {}", key.display())))?;
-        let issuer = pki::issuer_from_der(&der, key)
+        // issuer_from_der reads the certificate's metadata only, so check the
+        // key here rather than at the first client handshake.
+        let key_der = key_pair
+            .serialize_der()
+            .map_err(failed(format!("export the CA key {}", key.display())))?;
+        openshell_crypto::tls::try_server_builder()
+            .map_err(failed("build a TLS server configuration"))?
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], PrivateKeyDer::Pkcs8(key_der.into()))
+            .map_err(failed(format!(
+                "the CA key {} does not match the CA certificate {}",
+                key.display(),
+                cert.display()
+            )))?;
+        let issuer = pki::issuer_from_der(&der, key_pair)
             .map_err(failed(format!("load the CA {}", cert.display())))?;
         Ok(Self { cert_pem, issuer })
     }
@@ -299,6 +313,14 @@ mod tests {
             error.to_string().contains(ADDITIONAL_CA_CERT_ENV),
             "{error}"
         );
+    }
+
+    #[test]
+    fn from_files_rejects_a_key_from_another_ca() {
+        let (cert, _, _) = write_ca("host-server-mismatch-a");
+        let (_, other_key, _) = write_ca("host-server-mismatch-b");
+        let error = TestCa::from_files(&cert, &other_key).err().unwrap();
+        assert!(error.to_string().contains("does not match"), "{error}");
     }
 
     #[test]
