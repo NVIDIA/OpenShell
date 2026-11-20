@@ -1,22 +1,11 @@
 name: Branch E2E Checks
-# Required CI Gates finds a dispatched run for a PR by the SHA in its name.
-run-name: >-
-  ${{ github.event_name == 'workflow_dispatch'
-      && format('Branch E2E Checks for {0}', inputs.sha || github.sha)
-      || github.event.pull_request.title }}
 
+# Jobs load the images this run builds from workflow artifacts instead of a
+# registry, so fork PRs run E2E with their read-only token.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-  # Fork PRs get a read-only token and cannot push the images E2E needs, so a
-  # maintainer dispatches this workflow from main with the PR head SHA instead.
-  workflow_dispatch:
-    inputs:
-      sha:
-        description: Commit to test, such as a fork PR head SHA. Defaults to the dispatched ref.
-        required: false
-        type: string
-        default: ""
+  workflow_dispatch: {}
 
 permissions: {}
 
@@ -24,7 +13,7 @@ permissions: {}
 # job. Give that run its own group so it cannot cancel a real one.
 concurrency:
   group: >-
-    ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.sha || github.ref }}${{
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{
     github.event.action == 'labeled' && !startsWith(github.event.label.name, 'test:e2e')
     && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
@@ -50,10 +39,8 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_LABEL: ${{ github.event.label.name }}
           LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          REPO: ${{ github.repository }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          DISPATCH_SHA: ${{ inputs.sha || github.sha }}
+          DISPATCH_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -61,10 +48,7 @@ jobs:
           case "$EVENT_NAME" in
             pull_request)
               sha="$PR_HEAD_SHA"
-              if [ "$HEAD_REPO" != "$REPO" ]; then
-                echo "::notice::Fork PR: a maintainer runs E2E by dispatching this workflow with sha=$sha."
-                should_run=false
-              elif [ "$EVENT_ACTION" = labeled ] && [[ "$EVENT_LABEL" != test:e2e* ]]; then
+              if [ "$EVENT_ACTION" = labeled ] && [[ "$EVENT_LABEL" != test:e2e* ]]; then
                 should_run=false
               fi
               run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
@@ -74,10 +58,6 @@ jobs:
               ;;
             *)
               sha="$DISPATCH_SHA"
-              if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "::error::sha must be a full 40-character commit SHA."
-                exit 1
-              fi
               run_core_e2e=true
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
@@ -377,6 +357,7 @@ jobs:
     with:
       checkout-ref: ${{ needs.pr_metadata.outputs.sha }}
       image-tag: ${{ needs.pr_metadata.outputs.sha }}
+      push-images: false
 
   build-deb:
     name: Build Debian packages

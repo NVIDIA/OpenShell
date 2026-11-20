@@ -40,7 +40,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER_FROM_EVENT: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
-          PR_HEAD_REPO_FROM_EVENT: ${{ github.event.pull_request.head.repo.full_name }}
           PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           GITHUB_SHA_FROM_CONTEXT: ${{ github.sha }}
           GITHUB_REF_NAME_FROM_CONTEXT: ${{ github.ref_name }}
@@ -48,14 +47,10 @@ jobs:
           WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
-          WORKFLOW_RUN_TITLE: ${{ github.event.workflow_run.display_title }}
           WORKFLOW_RUN_HTML_URL: ${{ github.event.workflow_run.html_url }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # Must match the run-name of a dispatched Branch E2E Checks run.
-          E2E_DISPATCH_TITLE_PREFIX="Branch E2E Checks for "
 
           post_status() {
             local context="$1"
@@ -87,7 +82,6 @@ jobs:
             CONTEXT_KIND="pull_request"
             PR_NUMBER="$PR_NUMBER_FROM_EVENT"
             HEAD_SHA="$PR_HEAD_SHA_FROM_EVENT"
-            IS_FORK=$([ "$PR_HEAD_REPO_FROM_EVENT" != "$GH_REPO" ] && echo true || echo false)
             LABELS_JSON=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
             STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
           }
@@ -105,7 +99,6 @@ jobs:
             fi
 
             HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
-            IS_FORK=$(jq -r --arg repo "$GH_REPO" '.head.repo.full_name != $repo' <<< "$pr")
             LABELS_JSON=$(jq -c '[.labels[].name]' <<< "$pr")
             STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
           }
@@ -150,13 +143,6 @@ jobs:
               pull_request)
                 load_pr_context_for_sha "$WORKFLOW_RUN_HEAD_SHA"
                 ;;
-              workflow_dispatch)
-                if [[ "$WORKFLOW_RUN_TITLE" != "$E2E_DISPATCH_TITLE_PREFIX"* ]]; then
-                  echo "Ignoring dispatched run '$WORKFLOW_RUN_TITLE'."
-                  exit 0
-                fi
-                load_pr_context_for_sha "${WORKFLOW_RUN_TITLE#"$E2E_DISPATCH_TITLE_PREFIX"}"
-                ;;
               *)
                 echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
                 exit 0
@@ -166,7 +152,6 @@ jobs:
 
           resolve_context() {
             EXPECTED_HEAD_BRANCH=""
-            IS_FORK=false
             if [ "$EVENT_NAME" = "pull_request_target" ]; then
               resolve_pull_request_event
             elif [ "$EVENT_NAME" = "merge_group" ]; then
@@ -181,10 +166,9 @@ jobs:
             STATUS_TARGET_URL="${STATUS_TARGET_URL:-https://github.com/$GH_REPO/actions}"
           }
 
-          # Runs for HEAD_SHA, newest first. For PRs this includes Branch E2E
-          # Checks runs a maintainer dispatched for that SHA.
+          # Runs for HEAD_SHA, newest first.
           list_runs() {
-            local workflow_file="$1" runs
+            local workflow_file="$1"
             if [ "$CONTEXT_KIND" = "merge_group" ]; then
               gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=merge_group" \
                 --jq '.workflow_runs' \
@@ -192,22 +176,16 @@ jobs:
               return
             fi
 
-            runs=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" --jq '.workflow_runs')
-            if [ "$workflow_file" = "branch-e2e.yml" ]; then
-              local dispatched
-              dispatched=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?event=workflow_dispatch&per_page=100" \
-                | jq -c --arg title "$E2E_DISPATCH_TITLE_PREFIX$HEAD_SHA" '[.workflow_runs[] | select(.display_title == $title and .head_branch == "main")]')
-              runs=$(jq -c -s 'add' <<< "$runs $dispatched")
-            fi
-            jq -c 'sort_by(.created_at) | reverse' <<< "$runs"
+            gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
+              --jq '.workflow_runs' | jq -c 'sort_by(.created_at) | reverse'
           }
 
           run_jobs() {
             gh api --paginate "repos/$GH_REPO/actions/runs/$1/jobs?per_page=30" | jq -s '[.[].jobs[]]'
           }
 
-          # A labeled event for an unrelated label, or a fork PR run, finishes
-          # without running the required job. Skip those and use the newest run
+          # A labeled event for an unrelated label finishes without running
+          # the required job. Skip those and use the newest run
           # where the required job ran.
           evaluate_required_job() {
             local context="$1" workflow_name="$2" required_job_name="$3" runs="$4"
@@ -238,11 +216,7 @@ jobs:
               return 0
             done < <(jq -c '.[]' <<< "$runs")
 
-            if [ "$IS_FORK" = "true" ]; then
-              post_status "$context" pending "Fork PR: maintainer must dispatch $workflow_name" "$STATUS_TARGET_URL"
-            else
-              post_status "$context" pending "Waiting for $required_job_name" "$STATUS_TARGET_URL"
-            fi
+            post_status "$context" pending "Waiting for $required_job_name" "$STATUS_TARGET_URL"
           }
 
           evaluate_workflow() {

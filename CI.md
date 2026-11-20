@@ -8,7 +8,7 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 PR CI runs on standard GitHub-hosted runners. `Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`. Workflow runs from outside contributors wait for a maintainer to approve them in the Actions tab.
 
-`pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive and publish temporary images.
+`pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
@@ -631,45 +631,23 @@ If you already use an SSH key for `git push`, you can reuse it as a signing key.
 
    Push the branch and confirm GitHub shows the commit as **Verified**.
 
-## Pull request flows
-
-### PR from a branch in this repository
+## Pull request flow
 
 Prerequisites:
 
-- Org member or collaborator with Write access.
-- All commits cryptographically signed (see [Commit signing](#commit-signing)).
 - All commits include a DCO sign-off (`git commit -s`).
-
-Maintainers push their branches to this repository. A PR from a personal fork follows the fork flow below, even when a maintainer opens it.
+- Org members and collaborators sign their commits (see [Commit signing](#commit-signing)).
+- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
 
 Flow:
 
-1. Open the PR. `Branch Checks` and `Helm Lint` run on the `pull_request` event. `Required CI Gates` keeps the PR blocked until they succeed for the PR head SHA.
+1. Open the PR. `Branch Checks` and `Helm Lint` run on the `pull_request` event. For a PR from an outside contributor, a maintainer reviews the diff and approves each workflow run first. `Required CI Gates` keeps the PR blocked until the checks succeed for the PR head SHA.
 2. A maintainer applies `test:e2e`, `test:e2e-kubernetes`, and/or `test:e2e:continuity`. The `labeled` event starts `Branch E2E Checks`, which builds the images and runs the selected suites. Labeling a PR with anything else starts a run that skips every job and does not cancel a running E2E run.
 3. When the run finishes, `OpenShell / E2E` flips to green automatically.
 4. New commits re-run `Branch Checks`, `Helm Lint`, and any labeled E2E suites.
 5. When the PR is ready to merge, use **Add to merge queue** instead of merging directly. The queue validates the final integration state before updating `main`.
 
-### PR from a fork
-
-Prerequisites:
-
-- DCO sign-off (`git commit -s`) on every commit.
-- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
-
-Flow:
-
-1. Open the PR. A maintainer reviews the diff and approves the workflow runs. `Branch Checks` and `Helm Lint` then run with a read-only token and no secrets.
-2. E2E needs to push images, which a fork's `pull_request` run cannot do. After applying `test:e2e`, a maintainer reviews the diff and dispatches `Branch E2E Checks` from `main` for the PR head SHA:
-
-   ```shell
-   gh workflow run branch-e2e.yml --ref main -f sha="$(gh pr view <N> --json headRefOid -q .headRefOid)"
-   ```
-
-   The run executes the PR's code with the repository's token, which can push images and write the Nix cache, so the dispatch is the security review step. It tests exactly that commit. `Required CI Gates` matches it to the PR by the SHA in the run name. Until then, `OpenShell / E2E` stays pending with "Fork PR: maintainer must dispatch Branch E2E Checks".
-3. Every new commit needs a new dispatch for its SHA.
-4. When the PR is ready to merge, maintainers add it to the merge queue so the queued integration state is tested before it reaches `main`.
+PRs from forks follow the same flow. Their runs get a read-only token and no secrets, so `Branch E2E Checks` never pushes images: it builds them, uploads per-platform Docker archives as workflow artifacts, and every E2E job loads them from there (`.github/actions/load-e2e-images`). When approving a fork's run, check whether it changes `.github/`: the run uses the fork's own workflow files.
 
 ## Merge queue
 
@@ -698,9 +676,10 @@ Maintainers should add ready PRs to the queue rather than pressing a direct merg
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `pull_request` and on `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, Kubernetes HA, Kubernetes credential-driver, and continuity E2E. PRs from branches in this repository use the `test:e2e`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels; fork PRs need a maintainer dispatch with the head SHA; merge groups do not run E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, Kubernetes HA, Kubernetes credential-driver, and continuity E2E. PRs use the `test:e2e`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels; merge groups do not run E2E. Jobs load the images this run builds from workflow artifacts, so fork PRs need no registry write access. |
 | `.github/workflows/build-binaries-{linux,macos}.yml`, `build-vm-driver-{linux,macos}.yml` | Shared per-platform binary matrices used by branch and release workflows. Each platform is its own workflow, so a consumer depends only on the platforms it needs. The VM driver remains separate because its build consumes the runtime binaries. Its build steps stay inline rather than in a local action because release builds check out the release tag, which may predate the action. |
-| `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
+| `.github/workflows/build-images.yml` | Builds multi-platform images and uploads them as OCI archives plus per-platform Docker archives for E2E. Release callers also push them; Branch E2E Checks does not. |
+| `.github/actions/load-e2e-images` | Downloads the per-platform Docker archives and loads them into Docker, Podman, or kind, so E2E jobs never pull OpenShell images from a registry. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
 | `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |

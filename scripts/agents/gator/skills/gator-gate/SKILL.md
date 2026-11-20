@@ -17,7 +17,7 @@ Codex and other agent harnesses should load this skill from the repository path 
 
 - The `gh` CLI must be able to call GitHub APIs (`gh api user --jq '.login'`)
 - You must be in the OpenShell repository root
-- GitHub write permissions are required to apply labels, comment, close issues/PRs, or dispatch workflows
+- GitHub write permissions are required to apply labels, comment, close issues/PRs, or approve workflow runs
 
 Do not use `gh auth status` as the authentication health check inside provider-backed sandboxes. Scoped provider tokens may be exposed as `openshell:resolve:env:*` placeholders and `gh auth status` probes endpoints outside the gator policy, causing false "token is invalid" reports even when allowed `gh api` and `gh pr` calls succeed. Use `gh api user --jq '.login'` and a repo-scoped probe instead.
 
@@ -38,7 +38,7 @@ If the `principal-engineer-reviewer` sub-agent fails before producing usable rev
 
 - Do not push commits to a contributor's PR branch by default.
 - You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
-- Do not dispatch Branch E2E Checks for a fork PR unless the current GitHub user has maintainer authority.
+- Do not approve workflow runs for an outside contributor's PR unless the current GitHub user has maintainer authority.
 - Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
 - Surface security-related findings introduced or newly exposed by an unmerged
   PR in that PR's normal review, using the same evidence, severity, and blocker
@@ -53,7 +53,7 @@ Maintainer authority means one of:
 
 - User is in the NVIDIA `openshell-maintainers` team
 - User is a CODEOWNER listed in `.github/CODEOWNERS`
-- Repository permission is `admin`, `maintain`, or `write` for maintainer-only actions such as dispatching Branch E2E Checks
+- Repository permission is `admin`, `maintain`, or `write` for maintainer-only actions such as approving workflow runs
 
 Use these checks where needed:
 
@@ -454,7 +454,7 @@ Move to `gator:blocked` when any of these apply:
 - PR is blocked by the vouch system or was auto-closed for lack of vouch
 - DCO is missing or failing
 - PR has merge conflicts or `mergeStateStatus` indicates dirty/blocked for conflict reasons
-- A fork PR needs a Branch E2E Checks dispatch for its head SHA and the current user lacks maintainer authority
+- An outside contributor's workflow runs await approval and the current user lacks maintainer authority
 
 For auto-closed vouch-gate PRs, do not treat the proposal as invalid. Comment only if useful, then stop and wait until the author is vouched and the PR is reopened.
 
@@ -943,23 +943,9 @@ Add `test:e2e-kubernetes` for gateway high availability or Kubernetes Secrets an
 
 Apply `test:windows` whenever a PR affects Windows support. This includes Windows or MSVC CI and `mise` tasks, Windows lock-file platform entries, the MXC driver, and `cfg(windows)` implementations or tests in otherwise cross-platform crates. Apply it alongside any applicable E2E label; it is not a substitute for runtime coverage.
 
-Applying `test:e2e`, `test:e2e-kubernetes`, `test:e2e:continuity`, or `test:windows` starts the matching workflow for a PR from a branch in this repository.
+Applying `test:e2e`, `test:e2e-kubernetes`, `test:e2e:continuity`, or `test:windows` starts the matching workflow. For a PR from an outside contributor, each run waits until a maintainer approves it in the Actions tab. If runs are awaiting approval and you lack maintainer authority, or the operator did not authorize approving them, move to `gator:blocked` with reason `test_dispatch_required` and state that a maintainer must approve the pending runs.
 
-A fork PR cannot run E2E from its own `pull_request` run. If you have maintainer authority, dispatch Branch E2E Checks for the current head:
-
-```bash
-gh workflow run branch-e2e.yml --ref main -f sha=<full-head-sha>
-```
-
-`<full-head-sha>` MUST be the full 40-character SHA-1 of the current PR head. Read it fresh from GitHub immediately before dispatching instead of reusing a SHA from earlier in the cycle:
-
-```bash
-gh api repos/NVIDIA/OpenShell/pulls/<number> --jq .head.sha
-```
-
-Every new commit on a fork PR needs a new dispatch. If you do not have maintainer authority, or the operator did not authorize dispatching, move to `gator:blocked` with reason `test_dispatch_required` and state that a maintainer must dispatch Branch E2E Checks with the full current head SHA written out.
-
-Do not treat a test label or a dispatch as proof that testing started. Confirm that every required workflow has a check or run for the current head in `queued`, `in_progress`, or `completed` state before applying `gator:watch-pipeline`. Do not claim that CI monitoring is active until it does.
+Do not treat a test label as proof that testing started. Confirm that every required workflow has a check or run for the current head in `queued`, `in_progress`, or `completed` state before applying `gator:watch-pipeline`. Do not claim that CI monitoring is active until it does.
 
 ## Step 10: Pipeline Watch Loop
 

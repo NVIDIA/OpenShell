@@ -148,7 +148,6 @@ jobs:
         uses: ./.github/actions/setup-e2e-kind
         with:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
-          image-tag: ${{ inputs.image-tag }}
           images: ${{ inputs.cluster-images }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
