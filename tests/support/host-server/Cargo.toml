@@ -12,10 +12,15 @@ repository = "https://github.com/NVIDIA/OpenShell"
 publish = false
 
 [dependencies]
+openshell-crypto = { path = "../../../crates/openshell-crypto" }
 openshell-testkit = { path = "../../testkit/testkit" }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 serde_json = "1"
 tokio = { version = "1.43", features = ["io-util", "net", "rt", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 tungstenite = "0.26"
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1.43", features = ["macros", "rt"] }

@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Add gateway settings to /etc/openshell-test/gateway-overrides.toml, which
+# the `binaries`, `deb` and `rpm` installers apply to the gateway's
+# configuration (openshell_gateway/tasks/merge-settings.yaml; k3s installers
+# ignore it).
+#
+# Inputs:
+#   gateway_overrides_name     names the marked block, such as `cdi`; writing
+#                              the same name again replaces its block
+#   gateway_overrides_content  whole TOML tables, such as
+#                              `[openshell.drivers.podman]`
+#   gateway_overrides_state    `absent` removes the name's block and keeps the
+#                              others; the default is `present`
+#
+# Each name gets its own marked block, so writers keep each other's settings
+# and may run in any order. Two blocks must not declare the same table: TOML
+# rejects a table defined twice, and the installer fails on it.
+#
+# TODO: https://github.com/NVIDIA/OpenShell/pull/5489 reads gateway.d drop-in
+# files. When it lands, write each name to its own drop-in here instead.
+---
+- name: Require a gateway override name and content
+  ansible.builtin.assert:
+    that:
+      - gateway_overrides_name is defined
+      - gateway_overrides_name is match('^[a-z0-9][a-z0-9-]*$')
+      - gateway_overrides_state in ['present', 'absent']
+      - >-
+        gateway_overrides_state == 'absent' or
+        (gateway_overrides_content is defined and
+         gateway_overrides_content | trim is match('\\['))
+    fail_msg: >-
+      gateway_overrides needs gateway_overrides_name (lowercase letters,
+      digits and dashes), gateway_overrides_state present or absent, and
+      gateway_overrides_content that starts with a table header, such as
+      `[openshell.gateway]`, unless the state is absent
+
+- name: Create the test configuration directory
+  become: true
+  when: gateway_overrides_state == 'present'
+  ansible.builtin.file:
+    path: "{{ gateway_overrides_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write the {{ gateway_overrides_name }} gateway overrides
+  become: true
+  ansible.builtin.blockinfile:
+    path: "{{ gateway_overrides_path }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+    marker: "# {mark} {{ gateway_overrides_name }}"
+    block: "{{ gateway_overrides_content }}"
+  when: gateway_overrides_state == 'present'
+
+- name: Check for the gateway overrides file
+  ansible.builtin.stat:
+    path: "{{ gateway_overrides_path }}"
+  register: gateway_overrides_file
+  when: gateway_overrides_state == 'absent'
+
+- name: Remove the {{ gateway_overrides_name }} gateway overrides
+  become: true
+  ansible.builtin.blockinfile:
+    path: "{{ gateway_overrides_path }}"
+    marker: "# {mark} {{ gateway_overrides_name }}"
+    state: absent
+  when:
+    - gateway_overrides_state == 'absent'
+    - gateway_overrides_file.stat.exists

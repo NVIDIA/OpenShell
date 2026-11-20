@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use testkit::{Poll, Result};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
+use crate::tls::Identity;
 use crate::{MAX_REQUEST, READ_TIMEOUT, WAIT_INTERVAL, WAIT_TIMEOUT, bind, find, header};
 
 /// A request an [`HttpRecorder`] read. A chunked body arrives decoded.
@@ -172,7 +173,41 @@ impl HttpRecorder {
     pub async fn serve(
         handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
     ) -> Result<Self> {
-        let (listener, port) = bind().await?;
+        Self::builder().serve(handler).await
+    }
+
+    /// A recorder on a chosen port or with TLS, such as on a port the
+    /// environment published:
+    ///
+    /// ```ignore
+    /// let upstream = HttpRecorder::builder().port(port).tls(&identity).start("ok").await?;
+    /// ```
+    pub fn builder() -> HttpRecorderBuilder {
+        HttpRecorderBuilder::default()
+    }
+
+    /// Answer every request over TLS with `200` and `body`, presenting
+    /// `identity`'s certificate.
+    pub async fn start_tls(identity: &Identity, body: impl Into<String>) -> Result<Self> {
+        Self::builder().tls(identity).start(body).await
+    }
+
+    /// Answer every request over TLS with `handler`'s response, presenting
+    /// `identity`'s certificate. A connection that fails the TLS handshake
+    /// counts in [`connections`](Self::connections) but records no request.
+    pub async fn serve_tls(
+        identity: &Identity,
+        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::builder().tls(identity).serve(handler).await
+    }
+
+    async fn listen(
+        port: u16,
+        tls: Option<TlsAcceptor>,
+        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let (listener, port) = bind(port).await?;
         let handler: Arc<Handler> = Arc::new(handler);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
@@ -181,11 +216,22 @@ impl HttpRecorder {
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 task_connections.fetch_add(1, Ordering::AcqRel);
-                tokio::spawn(respond(
-                    stream,
-                    Arc::clone(&handler),
-                    Arc::clone(&task_requests),
-                ));
+                let _ = stream.set_nodelay(true);
+                let local_addr = stream.local_addr().ok();
+                let handler = Arc::clone(&handler);
+                let requests = Arc::clone(&task_requests);
+                let tls = tls.clone();
+                tokio::spawn(async move {
+                    match tls {
+                        None => respond(stream, local_addr, handler, requests).await,
+                        Some(tls) => {
+                            let handshake = tokio::time::timeout(READ_TIMEOUT, tls.accept(stream));
+                            if let Ok(Ok(stream)) = handshake.await {
+                                respond(stream, local_addr, handler, requests).await;
+                            }
+                        }
+                    }
+                });
             }
         });
         Ok(Self {
@@ -231,6 +277,47 @@ impl HttpRecorder {
     }
 }
 
+/// Options for an [`HttpRecorder`], from [`HttpRecorder::builder`].
+#[derive(Debug, Default)]
+pub struct HttpRecorderBuilder {
+    port: u16,
+    tls: Option<Identity>,
+}
+
+impl HttpRecorderBuilder {
+    /// Listen on `port` instead of a random free one. Fails to start if
+    /// something already listens there.
+    #[must_use]
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Serve TLS, presenting `identity`'s certificate. A connection that
+    /// fails the TLS handshake counts in
+    /// [`connections`](HttpRecorder::connections) but records no request.
+    #[must_use]
+    pub fn tls(mut self, identity: &Identity) -> Self {
+        self.tls = Some(identity.clone());
+        self
+    }
+
+    /// Answer every request with `200` and `body`.
+    pub async fn start(self, body: impl Into<String>) -> Result<HttpRecorder> {
+        let body = body.into();
+        self.serve(move |_| Response::text(body.clone())).await
+    }
+
+    /// Answer every request with `handler`'s response.
+    pub async fn serve(
+        self,
+        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> Result<HttpRecorder> {
+        let tls = self.tls.as_ref().map(Identity::acceptor).transpose()?;
+        HttpRecorder::listen(self.port, tls, handler).await
+    }
+}
+
 impl Drop for HttpRecorder {
     fn drop(&mut self) {
         self.task.abort();
@@ -239,10 +326,14 @@ impl Drop for HttpRecorder {
 
 /// Read requests, record each, and answer with `handler` until a response
 /// or request closes the connection.
-async fn respond(mut stream: TcpStream, handler: Arc<Handler>, requests: Arc<Mutex<Vec<Request>>>) {
-    let _ = stream.set_nodelay(true);
+async fn respond(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    local_addr: Option<SocketAddr>,
+    handler: Arc<Handler>,
+    requests: Arc<Mutex<Vec<Request>>>,
+) {
     let mut buffer = Vec::new();
-    while let Some(request) = read_request(&mut stream, &mut buffer).await {
+    while let Some(request) = read_request(&mut stream, local_addr, &mut buffer).await {
         let response = handler(&request);
         let close = !response.keep_alive
             || request
@@ -260,13 +351,18 @@ async fn respond(mut stream: TcpStream, handler: Arc<Handler>, requests: Arc<Mut
 }
 
 /// Read one request from `stream`, starting with the bytes already in
-/// `buffer`, and leave any bytes after it in `buffer`.
-pub(crate) async fn read_request(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<Request> {
+/// `buffer`, and leave any bytes after it in `buffer`. `local_addr` is the
+/// address the connection arrived on.
+pub(crate) async fn read_request(
+    stream: &mut (impl AsyncRead + Unpin),
+    local_addr: Option<SocketAddr>,
+    buffer: &mut Vec<u8>,
+) -> Option<Request> {
     let mut chunk = [0_u8; 4096];
     loop {
         if let Some((mut request, length)) = parse_request(buffer) {
             buffer.drain(..length);
-            request.local_addr = stream.local_addr().ok();
+            request.local_addr = local_addr;
             return Some(request);
         }
         match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
@@ -337,6 +433,8 @@ fn decode_chunked(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::net::TcpStream;
+
     use super::*;
 
     async fn connect(port: u16) -> TcpStream {
@@ -393,6 +491,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(upgrade).unwrap(),
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_recorder_listens_on_a_chosen_port() {
+        let port = crate::free_port().await.unwrap();
+        let recorder = HttpRecorder::builder()
+            .port(port)
+            .start("fixed")
+            .await
+            .unwrap();
+        assert_eq!(recorder.port, port);
+        let mut stream = connect(port).await;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_to_end(&mut stream).await.ends_with("fixed"));
+
+        let error = HttpRecorder::builder()
+            .port(port)
+            .start("taken")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains(&format!("port {port}")),
+            "{error}"
         );
     }
 
