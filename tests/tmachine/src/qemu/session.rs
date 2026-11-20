@@ -4,8 +4,10 @@
 //! A running machine that callers act on over SSH.
 
 use std::future::Future;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -24,7 +26,10 @@ const SSH_HOST: &str = "127.0.0.1";
 const SSH_USER: &str = "tmachine";
 const SSH_PASSWORD: &str = "tmachine";
 // Password authentication only: keys from the caller's agent or ~/.ssh would
-// otherwise use up the guest's authentication attempts first. The keep-alive
+// otherwise use up the guest's authentication attempts first. SSH reads the
+// password from `SSH_ASKPASS`, not from `sshpass`: under host load `sshpass`
+// sometimes answered the prompt with a password sshd rejected (about 3% of
+// logins on a busy host; none with `SSH_ASKPASS`). The keep-alive
 // options make SSH give up on a guest that stopped answering, after about a
 // minute, instead of waiting forever.
 const SSH_OPTIONS: &[&str] = &[
@@ -125,7 +130,7 @@ impl Session {
     }
 
     /// Like [`Session::exec`], with an explicit timeout. On timeout the local
-    /// `sshpass` process is killed and the result is an error. The remote
+    /// `ssh` process is killed and the result is an error. The remote
     /// command is not guaranteed to stop with it (there is no TTY to hang up),
     /// so treat the machine as unusable after a timeout and shut it down.
     pub async fn exec_timeout(&self, argv: &[&str], timeout: Duration) -> Result<Output> {
@@ -135,7 +140,7 @@ impl Session {
             .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
-        let mut command = ssh_command("ssh", &["-p", &ssh_port().to_string()]);
+        let mut command = ssh_command("ssh", &["-p", &ssh_port().to_string()])?;
         command
             .arg(format!("{SSH_USER}@{SSH_HOST}"))
             .arg("--")
@@ -164,7 +169,7 @@ impl Session {
 
     /// Open an interactive SSH shell in the machine.
     pub async fn shell(&self) -> Result<ExitStatus> {
-        ssh_command("ssh", &["-tt", "-p", &ssh_port().to_string()])
+        ssh_command("ssh", &["-tt", "-p", &ssh_port().to_string()])?
             .arg(format!("{SSH_USER}@{SSH_HOST}"))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -185,17 +190,34 @@ impl Session {
     }
 }
 
-fn ssh_command(program: &str, args: &[&str]) -> Command {
-    let mut command = Command::new("sshpass");
+/// A script that prints the guest's password, for `SSH_ASKPASS`. The password
+/// is a throwaway test credential, so the script is left in the temporary
+/// directory rather than cleaned up.
+fn askpass_script() -> Result<&'static Path> {
+    static SCRIPT: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(path) = SCRIPT.get() {
+        return Ok(path);
+    }
+    let dir = tempdir().context("create the SSH askpass directory")?;
+    let path = dir.path().join("askpass");
+    std::fs::write(&path, format!("#!/bin/sh\necho '{SSH_PASSWORD}'\n"))
+        .context("write the SSH askpass script")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    // Keep the directory for the life of the process.
+    let _ = dir.keep();
+    Ok(SCRIPT.get_or_init(|| path))
+}
+
+fn ssh_command(program: &str, args: &[&str]) -> Result<Command> {
+    let mut command = Command::new(program);
     command
-        .env("SSHPASS", SSH_PASSWORD)
-        .arg("-e")
-        .arg(program)
+        .env("SSH_ASKPASS", askpass_script()?)
+        .env("SSH_ASKPASS_REQUIRE", "force")
         .args(args)
         .args(SSH_OPTIONS);
     // Dropping the future that waits for the process, as a timeout does, stops it.
     command.kill_on_drop(true);
-    command
+    Ok(command)
 }
 
 /// Run a command to completion and capture its output, or give up after
@@ -213,7 +235,7 @@ async fn bounded<T>(timeout: Duration, work: impl Future<Output = T>) -> Result<
 }
 
 async fn scp(src: &str, dst: &str) -> Result<()> {
-    let mut command = ssh_command("scp", &["-r", "-P", &ssh_port().to_string()]);
+    let mut command = ssh_command("scp", &["-r", "-P", &ssh_port().to_string()])?;
     command.arg(src).arg(dst).stdin(Stdio::null());
     let output = output_within(command, DEFAULT_TIMEOUT)
         .await
@@ -264,6 +286,14 @@ mod tests {
     #[test]
     fn escapes_single_quotes() {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn the_askpass_script_prints_the_guest_password() {
+        let script = askpass_script().unwrap();
+        let output = std::process::Command::new(script).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), SSH_PASSWORD);
     }
 
     #[tokio::test(flavor = "current_thread")]
