@@ -1104,7 +1104,7 @@ pub async fn run_refresh_worker_tick(
     let watched_count = states.len();
     let due_count = states
         .iter()
-        .filter(|state| state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms)
+        .filter(|state| refresh_due(state, now_ms))
         .count();
     let rotation_requested_count = states
         .iter()
@@ -1129,14 +1129,22 @@ pub async fn run_refresh_worker_tick(
     Ok(Box::pin(refresh_states(runtime, states, now_ms).instrument(span)).await)
 }
 
+fn refresh_due(state: &RefreshState, now_ms: i64) -> bool {
+    // Older gateways scheduled the first installation mint using the previous token's expiry.
+    state.next_refresh_at_ms <= 0
+        || state.next_refresh_at_ms <= now_ms
+        || (state.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+            && state.first_mint_provider_version == 0
+            && state.status == "configured")
+}
+
 fn refresh_state_has_work(state: &RefreshState, now_ms: i64) -> bool {
     state
         .metadata
         .as_ref()
         .is_some_and(|metadata| metadata.deletion_time.is_some())
         || state.has_pending_deletions()
-        || state.next_refresh_at_ms <= 0
-        || state.next_refresh_at_ms <= now_ms
+        || refresh_due(state, now_ms)
         || state.status == "rotation_requested"
 }
 
@@ -1200,7 +1208,7 @@ pub async fn refresh_states(
             );
             continue;
         }
-        let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
+        let due = refresh_due(&state, now_ms);
         let rotation_requested = state.status == "rotation_requested";
         info!(
             provider = %state.provider_name,

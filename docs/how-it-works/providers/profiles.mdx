@@ -664,7 +664,8 @@ github-app-key --value-file /secure/path/replacement.pem` followed by
 to test key rotation without reconfiguring the provider. The allowed endpoint
 must contain the installation ID, not `{installation_id}`.
 
-Configuration stores refresh material and schedules minting. The explicit
+Configuration stores refresh material and schedules the first mint immediately,
+even if the previous credential has a future expiry. The explicit
 `rotate` command mints immediately, so check its result before creating a sandbox.
 For GitHub.com, choose either `GITHUB_TOKEN` or `GH_TOKEN` as the credential key. Only the chosen
 environment variable is injected, as a placeholder. The private key remains in
@@ -697,7 +698,10 @@ missing or empty scope rather than requesting installation-wide access. Use
 `permissions`, not OAuth `scopes`.
 
 The gateway honors GitHub's returned expiry and caps local token use at one hour
-or the configured shorter maximum lifetime. The example refreshes five minutes
+or the configured shorter maximum lifetime. You can shorten the current token's
+expiry with `provider update --credential-expires-at`. The gateway rejects
+requests to clear that expiry or extend it beyond the minted lifetime.
+The example refreshes five minutes
 before expiry. Routine refresh preserves workload handles, including bearer
 headers used by API clients and Basic authentication used by Git HTTPS. Configure
 Git's credential helper to use `x-access-token` as the username and the token
@@ -714,7 +718,9 @@ Reconfiguration immediately withdraws the previous token from gateway delivery.
 New callers need a successful mint with the new scope. Grants created before
 the gateway tracked token epochs also need one successful mint after upgrade.
 Use `refresh rotate` to mint immediately. The worker honors GitHub's rate-limit
-retry deadlines. Configuration failures appear in refresh status.
+retry deadlines. If GitHub reports a secondary rate limit without a retry
+deadline, the worker retries after one minute. Configuration failures appear in
+refresh status.
 A token already exported to a caller remains subject to GitHub's expiry and revocation.
 
 If rotation reports `github_token_endpoint_unavailable`, the gateway could not

@@ -23,7 +23,7 @@ pub use github_app::validate_configuration as validate_github_app_configuration;
 
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
-const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
 
 /// Owned, resolved input for one upstream exchange. Intentionally has no Debug
 /// or serialization implementation because material contains plaintext secrets.
@@ -640,7 +640,7 @@ async fn request_token(
     if let Some((id, secret)) = &request.basic_auth {
         builder = builder.basic_auth(id, Some(secret));
     }
-    let response = builder.send().await.map_err(|error| {
+    let mut response = builder.send().await.map_err(|error| {
         let error_kind = if error.is_timeout() {
             "timeout"
         } else if error.is_connect() {
@@ -680,7 +680,7 @@ async fn request_token(
         ));
     }
     if !status.is_success() {
-        let body = read_bounded_oauth_error_body(response).await;
+        let body = read_bounded_error_body(&mut response).await;
         return Err(classify_oauth_token_error(status, &body, grant_kind));
     }
     let token = response.json::<TokenResponse>().await.map_err(|_| {
@@ -734,13 +734,13 @@ async fn request_token(
     })
 }
 
-async fn read_bounded_oauth_error_body(mut response: reqwest::Response) -> Vec<u8> {
+async fn read_bounded_error_body(response: &mut reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while body.len() < MAX_OAUTH_ERROR_RESPONSE_BYTES {
+    while body.len() < MAX_ERROR_RESPONSE_BYTES {
         let Ok(Some(chunk)) = response.chunk().await else {
             break;
         };
-        let remaining = MAX_OAUTH_ERROR_RESPONSE_BYTES.saturating_sub(body.len());
+        let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(body.len());
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
         if chunk.len() >= remaining {
             break;
@@ -1408,19 +1408,19 @@ mod tests {
             .and(path("/oversized"))
             .respond_with(ResponseTemplate::new(400).set_body_bytes(vec![
                 b'x';
-                MAX_OAUTH_ERROR_RESPONSE_BYTES
+                MAX_ERROR_RESPONSE_BYTES
                     + 512
             ]))
             .mount(&mock_server)
             .await;
 
         openshell_crypto::tls::ensure_default_provider();
-        let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
+        let mut response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();
         let status = response.status();
-        let body = read_bounded_oauth_error_body(response).await;
-        assert_eq!(body.len(), MAX_OAUTH_ERROR_RESPONSE_BYTES);
+        let body = read_bounded_error_body(&mut response).await;
+        assert_eq!(body.len(), MAX_ERROR_RESPONSE_BYTES);
 
         let failure = classify_oauth_token_error(status, &body, OAuthGrantKind::UserRefreshToken);
         assert_eq!(

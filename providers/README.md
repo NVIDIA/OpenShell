@@ -19,7 +19,7 @@ openshell provider profile import -f providers/github.yaml --global
 For gateway-minted GitHub App installation tokens, start with `github-app.yaml`.
 Configure its `github-app-installation` refresh with explicit repository IDs and
 permissions, and supply the private key through secret refresh material. See the
-[provider documentation](https://docs.nvidia.com/openshell/latest/providers/profiles.md).
+[provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#github-app-installation-tokens).
 
 Or import the whole directory:
 

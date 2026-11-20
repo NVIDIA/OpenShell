@@ -3,18 +3,13 @@
 
 //! GitHub App installation credentials. Signing material never leaves the gateway.
 
-use super::{
-    MintRequest, MintedCredential, RefreshFailure, current_time_ms, is_loopback_host,
-    required_material,
-};
+use super::{MintRequest, MintedCredential, RefreshFailure, current_time_ms, required_material};
 use reqwest::{StatusCode, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 use tonic::Status;
 
-const INSTALLATION_PATH: &str = "/app/installations/{installation_id}/access_tokens";
-const INSTALLATION_ID_PLACEHOLDER: &str = "{installation_id}";
 // GitHub may include metadata for up to 500 repositories in its response.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -89,29 +84,8 @@ pub(super) fn installation_url<S: std::hash::BuildHasher>(
         .ok()
         .filter(|id| *id > 0 && i64::try_from(*id).is_ok())
         .ok_or_else(|| Status::invalid_argument("installation_id must be a positive int64 ID"))?;
-    if !token_url.ends_with(INSTALLATION_PATH)
-        || token_url.matches(INSTALLATION_ID_PLACEHOLDER).count() != 1
-    {
-        return Err(Status::invalid_argument(format!(
-            "profile token_url must end with {INSTALLATION_PATH}"
-        )));
-    }
-    let url =
-        Url::parse(&token_url.replace(INSTALLATION_ID_PLACEHOLDER, &installation_id.to_string()))
-            .map_err(|_| Status::invalid_argument("profile token_url must be an absolute URL"))?;
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !(url.scheme() == "https"
-            || (url.scheme() == "http" && url.host_str().is_some_and(is_loopback_host)))
-    {
-        return Err(Status::invalid_argument(
-            "profile token_url requires HTTPS without userinfo, query, or fragment (loopback HTTP is allowed for tests)",
-        ));
-    }
-    Ok(url)
+    openshell_core::token_endpoint::github_app_installation_url(token_url, installation_id)
+        .map_err(|reason| Status::invalid_argument(format!("profile token_url {reason}")))
 }
 
 fn installation_parameters<S: std::hash::BuildHasher>(
@@ -198,8 +172,20 @@ pub(super) async fn mint(state: &MintRequest) -> Result<MintedCredential, Refres
         .await
         .map_err(transport_failure)?;
     if response.status() != StatusCode::CREATED {
-        // Do not retain upstream prose: it can contain echoed credentials.
-        return Err(classify_error(response.status(), response.headers()));
+        // GitHub can identify secondary throttling only in a 403's JSON message.
+        // Use that message for classification without including it in diagnostics.
+        let body = if response.status() == StatusCode::FORBIDDEN
+            && !response.headers().contains_key("retry-after")
+            && response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .is_none_or(|v| v != "0")
+        {
+            super::read_bounded_error_body(&mut response).await
+        } else {
+            Vec::new()
+        };
+        return Err(classify_error(response.status(), response.headers(), &body));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| {
@@ -302,12 +288,24 @@ fn invalid_response() -> RefreshFailure {
     )
 }
 
-fn classify_error(status: StatusCode, headers: &HeaderMap) -> RefreshFailure {
+fn classify_error(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> RefreshFailure {
+    #[derive(Deserialize)]
+    struct GitHubError {
+        message: String,
+    }
     let exhausted = headers
         .get("x-ratelimit-remaining")
         .is_some_and(|v| v == "0");
     let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
-        || (status == StatusCode::FORBIDDEN && (headers.contains_key("retry-after") || exhausted));
+        || (status == StatusCode::FORBIDDEN
+            && (headers.contains_key("retry-after")
+                || exhausted
+                || serde_json::from_slice::<GitHubError>(body).is_ok_and(|error| {
+                    error
+                        .message
+                        .to_ascii_lowercase()
+                        .contains("secondary rate limit")
+                })));
     if rate_limited || status.is_server_error() {
         let mut failure = RefreshFailure::retryable(
             Status::unavailable("GitHub token minting is temporarily unavailable or rate limited"),
@@ -365,6 +363,7 @@ fn classify_error(status: StatusCode, headers: &HeaderMap) -> RefreshFailure {
 
 #[cfg(test)]
 mod tests {
+    const INSTALLATION_PATH: &str = "/app/installations/{installation_id}/access_tokens";
     use super::super::tests::TEST_RSA_PRIVATE_KEY;
     use super::*;
     use openshell_core::proto::ProviderCredentialRefreshRecoveryAction as Recovery;
@@ -553,6 +552,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_app_retries_secondary_rate_limit_without_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "42")
+                    .set_body_json(serde_json::json!({
+                        "message": "You have exceeded a secondary rate limit. echoed-secret"
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let failure = mint(&state(&server.uri())).await.err().unwrap();
+        assert_eq!(failure.recovery_action, Recovery::Retry);
+        assert_eq!(
+            failure.retry_schedule,
+            super::super::RefreshRetrySchedule::Short
+        );
+        assert!(!failure.status.message().contains("echoed-secret"));
+    }
+
+    #[tokio::test]
     async fn github_app_bad_request_is_not_misreported_as_invalid_scope() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -697,19 +718,19 @@ mod tests {
     #[test]
     fn github_app_classifies_errors_without_provider_prose() {
         assert_eq!(
-            classify_error(StatusCode::UNPROCESSABLE_ENTITY, &HeaderMap::new()).failure_code,
+            classify_error(StatusCode::UNPROCESSABLE_ENTITY, &HeaderMap::new(), &[]).failure_code,
             "github_installation_scope_invalid"
         );
         for code in [400, 401, 403, 404, 422] {
             assert_eq!(
-                classify_error(StatusCode::from_u16(code).unwrap(), &HeaderMap::new())
+                classify_error(StatusCode::from_u16(code).unwrap(), &HeaderMap::new(), &[])
                     .recovery_action,
                 Recovery::FixConfiguration
             );
         }
         for code in [429, 500, 503] {
             assert_eq!(
-                classify_error(StatusCode::from_u16(code).unwrap(), &HeaderMap::new())
+                classify_error(StatusCode::from_u16(code).unwrap(), &HeaderMap::new(), &[])
                     .recovery_action,
                 Recovery::Retry
             );
@@ -718,17 +739,17 @@ mod tests {
         headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
         headers.insert("x-ratelimit-reset", "2000000000".parse().unwrap());
         assert_eq!(
-            classify_error(StatusCode::FORBIDDEN, &headers).retry_schedule,
+            classify_error(StatusCode::FORBIDDEN, &headers, &[]).retry_schedule,
             super::super::RefreshRetrySchedule::NotBefore(2_000_000_000_000)
         );
         headers.insert("x-ratelimit-remaining", "1".parse().unwrap());
         assert_eq!(
-            classify_error(StatusCode::TOO_MANY_REQUESTS, &headers).retry_schedule,
+            classify_error(StatusCode::TOO_MANY_REQUESTS, &headers, &[]).retry_schedule,
             super::super::RefreshRetrySchedule::Short
         );
         headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
         assert_eq!(
-            classify_error(StatusCode::FORBIDDEN, &headers).recovery_action,
+            classify_error(StatusCode::FORBIDDEN, &headers, &[]).recovery_action,
             Recovery::Retry
         );
     }

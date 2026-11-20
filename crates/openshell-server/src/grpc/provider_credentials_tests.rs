@@ -108,6 +108,83 @@ async fn github_app_export_withholds_preexisting_static_sibling() {
 }
 
 #[tokio::test]
+async fn github_app_delivery_caps_legacy_provider_expiry() {
+    use crate::grpc::provider::{
+        handle_configure_provider_refresh, resolve_provider_environment_with_credentials,
+        tests::github_app_refresh_fixture,
+    };
+    use wiremock::{Mock, ResponseTemplate, matchers::method};
+
+    let (state, server, provider, config) = github_app_refresh_fixture().await;
+    let key = "GITHUB_TOKEN";
+    let mut request = request(&[key]);
+    request.name.clone_from(&config.provider);
+    request.workspace_scope.clone_from(&config.workspace_scope);
+    handle_configure_provider_refresh(&state, crate::grpc::test_support::authed_request(config))
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "token": "minted-token",
+            "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let grant = state
+        .refresh
+        .rotate("default", provider.object_name(), key)
+        .await
+        .unwrap();
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(&state.store, "default")
+        .await
+        .unwrap();
+    for expiry in [
+        None,
+        Some(grant.expires_at_ms + 60_000),
+        Some(grant.expires_at_ms - 60_000),
+    ] {
+        state
+            .store
+            .update_message_cas::<Provider, _>(provider.object_id(), 0, |record| {
+                if let Some(ms) = expiry {
+                    record.credential_expiration_times.insert(
+                        key.into(),
+                        openshell_core::time::timestamp_from_millis(ms).unwrap(),
+                    );
+                } else {
+                    record.credential_expiration_times.remove(key);
+                }
+            })
+            .await
+            .unwrap();
+        let effective = expiry
+            .unwrap_or(grant.expires_at_ms)
+            .min(grant.expires_at_ms);
+        let values = handle(&state, authenticated(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            values.credentials[key].expiration_time,
+            openshell_core::time::timestamp_from_millis(effective).ok()
+        );
+        let environment = resolve_provider_environment_with_credentials(
+            &state.store,
+            &catalog,
+            "default",
+            std::slice::from_ref(&request.name),
+            &state.credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(environment.credential_expiration_times[key], effective);
+    }
+}
+
+#[tokio::test]
 async fn github_app_scope_reduction_withholds_token_and_respects_retry_after() {
     use crate::grpc::provider::{
         handle_configure_provider_refresh, resolve_provider_environment_with_credentials,

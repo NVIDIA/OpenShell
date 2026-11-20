@@ -146,7 +146,11 @@ async fn provider_snapshot_and_validation_use_injected_refresh_reads() {
         &refresh,
         &provider,
         &catalog,
-        &HashMap::from([("ACCESS_TOKEN".into(), "value".into())]),
+        &Provider {
+            credentials: HashMap::from([("ACCESS_TOKEN".into(), "value".into())]),
+            ..Default::default()
+        },
+        &[],
     )
     .await
     .unwrap_err();

@@ -77,19 +77,32 @@ pub(super) fn withhold_stale_github_app_outputs<'a>(
     refreshes: impl IntoIterator<Item = &'a StoredProviderCredentialRefreshState>,
 ) {
     for grant in refreshes {
-        if grant.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
-            && (grant.first_mint_provider_version == 0
-                || version < grant.first_mint_provider_version
-                || grant
-                    .metadata
-                    .as_ref()
-                    .is_some_and(|m| m.deletion_time.is_some()))
+        if grant.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32 {
+            continue;
+        }
+        if grant.first_mint_provider_version == 0
+            || version < grant.first_mint_provider_version
+            || grant
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.deletion_time.is_some())
         {
             provider.credentials.remove(&grant.credential_key);
             provider.credential_handles.remove(&grant.credential_key);
             provider
                 .credential_expiration_times
                 .remove(&grant.credential_key);
+        } else if grant.last_refresh_at_ms != 0 {
+            // Older gateways allowed a provider update to clear or extend this expiry.
+            let cap = openshell_core::time::timestamp_from_millis(grant.expires_at_ms)
+                .unwrap_or_default();
+            let expiry = provider
+                .credential_expiration_times
+                .entry(grant.credential_key.clone())
+                .or_insert(cap);
+            if (expiry.seconds, expiry.nanos) > (cap.seconds, cap.nanos) {
+                *expiry = cap;
+            }
         }
     }
 }
@@ -371,9 +384,13 @@ async fn reject_refresh_owned_credential_updates(
     refresh: &dyn CredentialRefresh,
     provider: &Provider,
     catalog: &EffectiveProviderProfileCatalog,
-    credential_updates: &HashMap<String, String>,
+    update: &Provider,
+    clear_expiries: &[String],
 ) -> Result<(), Status> {
-    if credential_updates.is_empty() {
+    if update.credentials.is_empty()
+        && update.credential_expiration_times.is_empty()
+        && clear_expiries.is_empty()
+    {
         return Ok(());
     }
 
@@ -387,19 +404,47 @@ async fn reject_refresh_owned_credential_updates(
             continue;
         }
 
-        if strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation
-            && let Some(profile) = &profile
-        {
-            validate_github_app_static_aliases(profile, &refresh_state.credential_key, |alias| {
-                credential_updates
-                    .get(alias)
-                    .is_some_and(|value| !value.is_empty())
-            })?;
+        if strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+            let key = &refresh_state.credential_key;
+            if refresh_state.first_mint_provider_version != 0 {
+                if clear_expiries.contains(key) {
+                    return Err(Status::failed_precondition(format!(
+                        "cannot clear the minted expiry for {key}"
+                    )));
+                }
+                if let Some(expiry) = update.credential_expiration_times.get(key) {
+                    // During publication the provider may already hold the new token
+                    // while the refresh state still describes the previous one.
+                    let cap = if refresh_state.status == "refresh_committing"
+                        || refresh_state.last_refresh_at_ms == 0
+                    {
+                        provider.credential_expiration_times.get(key).copied()
+                    } else {
+                        openshell_core::time::timestamp_from_millis(refresh_state.expires_at_ms)
+                            .ok()
+                    };
+                    if cap
+                        .is_none_or(|cap| (expiry.seconds, expiry.nanos) > (cap.seconds, cap.nanos))
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "expiry for {key} exceeds the minted token lifetime"
+                        )));
+                    }
+                }
+            }
+            if let Some(profile) = &profile {
+                validate_github_app_static_aliases(profile, key, |alias| {
+                    update
+                        .credentials
+                        .get(alias)
+                        .is_some_and(|value| !value.is_empty())
+                })?;
+            }
         }
         for key in std::iter::once(refresh_state.credential_key)
             .chain(refresh_state.additional_output_keys.into_values())
         {
-            if credential_updates.contains_key(&key) {
+            if update.credentials.contains_key(&key) {
                 refresh_owned_keys.insert(key);
             }
         }
@@ -466,8 +511,14 @@ async fn update_provider_record_validating(
         ));
     }
 
-    reject_refresh_owned_credential_updates(refresh, &existing, catalog, &provider.credentials)
-        .await?;
+    reject_refresh_owned_credential_updates(
+        refresh,
+        &existing,
+        catalog,
+        &provider,
+        clear_credential_expiration_keys,
+    )
+    .await?;
 
     let current_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
 
@@ -5688,13 +5739,10 @@ pub(super) async fn handle_configure_provider_refresh(
             .clone_from(&existing.retired_output_handles);
         if retain_expiry {
             state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
-        } else {
-            if let Some(metadata) = state_record.metadata.as_mut() {
-                metadata.annotations.remove(
-                    openshell_credential_issuer::refresh::engine::COMPLETED_MINT_ANNOTATION,
-                );
-            }
-            state_record.next_refresh_at_ms = 0;
+        } else if let Some(metadata) = state_record.metadata.as_mut() {
+            metadata
+                .annotations
+                .remove(openshell_credential_issuer::refresh::engine::COMPLETED_MINT_ANNOTATION);
         }
         state_record
             .pending_secret_deletions
@@ -5706,6 +5754,10 @@ pub(super) async fn handle_configure_provider_refresh(
                 handle.clone(),
             );
         }
+    }
+    if !retain_expiry {
+        // Workloads cannot use a previous installation token in the new epoch.
+        state_record.next_refresh_at_ms = 0;
     }
     crate::provider_refresh::set_refresh_expiration_presence(
         &mut state_record,
@@ -9434,6 +9486,96 @@ pub(super) mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn github_app_first_mint_is_due_despite_previous_token_expiry() {
+        let (state, server, provider, mut config) = github_app_refresh_fixture().await;
+        let future = crate::persistence::current_time_ms() + 3_600_000;
+        config.expiration_time = Some(openshell_core::time::timestamp_from_millis(future).unwrap());
+        handle_configure_provider_refresh(&state, authed_request(config))
+            .await
+            .unwrap();
+        let mut grant = crate::provider_refresh::get_refresh_state(
+            &state.store,
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(grant.next_refresh_at_ms, 0);
+
+        // An installation configured before upgrade may already have a future first mint.
+        grant.next_refresh_at_ms = future;
+        crate::provider_refresh::put_refresh_state(&state.store, &grant)
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        let changes = state.refresh.sweep().await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].completed_mint.is_some());
+    }
+
+    #[tokio::test]
+    async fn github_app_expiry_update_cannot_outlive_minted_token() {
+        let (state, server, provider, config) = github_app_refresh_fixture().await;
+        handle_configure_provider_refresh(&state, authed_request(config))
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        let key = "GITHUB_TOKEN";
+        let grant = state
+            .refresh
+            .rotate("default", provider.object_name(), key)
+            .await
+            .unwrap();
+        let update = |expires_at: Option<i64>| UpdateProviderRequest {
+            provider: Some(Provider {
+                metadata: Some(openshell_core::proto::ObjectMeta {
+                    name: provider.object_name().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            credential_expiration_times: expires_at
+                .into_iter()
+                .map(|ms| {
+                    (
+                        key.into(),
+                        openshell_core::time::timestamp_from_millis(ms).unwrap(),
+                    )
+                })
+                .collect(),
+            clear_credential_expiration_keys: if expires_at.is_none() {
+                vec![key.into()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        for expiry in [None, Some(grant.expires_at_ms + 1)] {
+            assert_eq!(
+                handle_update_provider(&state, authed_request(update(expiry)))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition
+            );
+        }
+        let shorter = grant.expires_at_ms - 60_000;
+        let updated = handle_update_provider(&state, authed_request(update(Some(shorter))))
+            .await
+            .unwrap()
+            .into_inner()
+            .provider
+            .unwrap();
+        assert_eq!(
+            updated.credential_expiration_times[key],
+            openshell_core::time::timestamp_from_millis(shorter).unwrap()
+        );
     }
 
     #[tokio::test]

@@ -253,7 +253,7 @@ When many providers share one OAuth client secret, store it once as a workspace 
 
 For GitHub App installations, check installed refresh help for
 `github-app-installation` and read the
-[provider profile documentation](https://docs.nvidia.com/openshell/latest/providers/profiles.md).
+[provider profile documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#github-app-installation-tokens).
 Use explicit repository IDs and permissions, keep the app private key in secret
 refresh material, and check refresh status before attaching the provider. Token
 permissions do not grant API writes or Git push through a read-only sandbox policy.

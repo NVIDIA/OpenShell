@@ -2435,19 +2435,34 @@ pub fn validate_profile_set(
             }
 
             if let Some(refresh) = credential.refresh.as_ref() {
-                if refresh.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation
-                    && (!refresh
-                        .token_url
-                        .ends_with("/app/installations/{installation_id}/access_tokens")
-                        || refresh.token_url.matches("{installation_id}").count() != 1
-                        || !refresh.scopes.is_empty())
-                {
-                    diagnostics.push(ProfileValidationDiagnostic::error(
-                        source,
-                        profile_id,
-                        "credentials.refresh",
-                        "github_app_installation requires a token_url ending in /app/installations/{installation_id}/access_tokens and uses permissions material instead of scopes",
-                    ));
+                if refresh.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+                    if credential.env_vars.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.env_vars",
+                            "github_app_installation requires at least one environment alias",
+                        ));
+                    }
+                    if let Err(reason) = openshell_core::token_endpoint::github_app_installation_url(
+                        &refresh.token_url,
+                        1,
+                    ) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.token_url",
+                            format!("token_url {reason}"),
+                        ));
+                    }
+                    if !refresh.scopes.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.scopes",
+                            "github_app_installation uses permissions material instead of scopes",
+                        ));
+                    }
                 }
                 if refresh.strategy == ProviderCredentialRefreshStrategy::Unspecified {
                     diagnostics.push(ProfileValidationDiagnostic::error(
@@ -6557,10 +6572,27 @@ binaries:
         let restored = ProviderTypeProfile::from_proto(&proto);
         let yaml = serde_yml::to_string(&restored).unwrap();
         assert!(yaml.contains("github_app_installation"));
-        let mut invalid = profile.clone();
-        invalid.credentials[0].refresh.as_mut().unwrap().token_url =
-            "https://api.github.com/token".into();
-        assert!(!validate_profile_set(&[("invalid.yaml".into(), invalid)]).is_empty());
+        for endpoint in [
+            "https://api.github.com/token",
+            "/app/installations/{installation_id}/access_tokens",
+            "http://github.example/app/installations/{installation_id}/access_tokens",
+        ] {
+            let mut invalid = profile.clone();
+            invalid.credentials[0].refresh.as_mut().unwrap().token_url = endpoint.into();
+            assert!(
+                validate_profile_set(&[("invalid.yaml".into(), invalid)])
+                    .iter()
+                    .any(|error| error.field == "credentials.refresh.token_url"),
+                "{endpoint}"
+            );
+        }
+        let mut missing_alias = profile.clone();
+        missing_alias.credentials[0].env_vars.clear();
+        assert!(
+            validate_profile_set(&[("invalid.yaml".into(), missing_alias)])
+                .iter()
+                .any(|error| error.field == "credentials.env_vars")
+        );
     }
 
     #[test]
