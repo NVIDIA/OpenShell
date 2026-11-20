@@ -2163,6 +2163,9 @@ pub struct ComputeDriverBuildContext<'a> {
     /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
     /// configured.
     supervisor_recovery_timeout_secs: Option<u32>,
+    /// Pool size limits from `[openshell.gateway.supervisor_pool]`, defaults
+    /// filled in.
+    supervisor_pool_limits: openshell_supervisor_control::PoolLimits,
 }
 
 impl ComputeDriverBuildContext<'_> {
@@ -2188,6 +2191,7 @@ impl ComputeDriverBuildContext<'_> {
                 if let Some(recovery_timeout_secs) = self.supervisor_recovery_timeout_secs {
                     supervision.set_recovery_timeout_secs(recovery_timeout_secs);
                 }
+                supervision.set_pool_limits(self.supervisor_pool_limits);
                 supervision
             })
             .clone()
@@ -2325,6 +2329,11 @@ async fn build_compute_runtime(
     let supervisor_pool = driver_startup
         .file
         .and_then(|file| file.openshell.gateway.supervisor_pool);
+    let supervisor_pool_limits = supervisor_pool
+        .map(|pool| pool.limits())
+        .transpose()
+        .map_err(|error| Error::config(format!("openshell.gateway.supervisor_pool: {error}")))?
+        .unwrap_or_default();
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let shared_supervision = OnceLock::new();
@@ -2342,6 +2351,7 @@ async fn build_compute_runtime(
                 app_endpoint_resolver: &app_endpoint_resolver,
                 supervisor_recovery_timeout_secs: supervisor_pool
                     .and_then(|pool| pool.recovery_timeout_secs),
+                supervisor_pool_limits,
             };
             let (instance, image_updates) = registration
                 .factory
@@ -3005,12 +3015,14 @@ mod tests {
     fn shared_supervision_is_always_a_pool_tuned_by_its_table() {
         let endpoint_overrides = std::collections::BTreeMap::new();
         let (_shutdown, shutdown_rx) = watch::channel(false);
-        for (configured, offered) in [
+        let tuned = openshell_supervisor_control::PoolLimits::new(64, 8).unwrap();
+        for (configured, offered, limits) in [
             (
                 None,
                 openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS,
+                openshell_supervisor_control::PoolLimits::default(),
             ),
-            (Some(75), 75),
+            (Some(75), 75, tuned),
         ] {
             let shared = std::sync::OnceLock::new();
             let context = super::ComputeDriverBuildContext {
@@ -3033,14 +3045,17 @@ mod tests {
                 shared_supervision: &shared,
                 app_endpoint_resolver: &std::sync::OnceLock::new(),
                 supervisor_recovery_timeout_secs: configured,
+                supervisor_pool_limits: limits,
             };
             // The driver asks for shared supervision as before; it is the
-            // pool, with the configured recovery deadline or the default.
+            // pool, with the configured recovery deadline and limits or the
+            // defaults.
             let supervision = context.shared_supervision();
             assert_eq!(
                 supervision.controller().pool_recovery_timeout_secs(),
                 offered
             );
+            assert_eq!(supervision.controller().pool_limits(), limits);
             assert_eq!(
                 context
                     .shared_supervision()

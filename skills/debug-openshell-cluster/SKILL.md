@@ -1374,9 +1374,23 @@ and enabling or disabling autoscaling on an existing release.
 
 With `supervisor_topology = "gateway"`, the gateway always coordinates the
 shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
-`supervisor.replicas` members (default 1, which has no failover). The chart
-renders only `[openshell.gateway.supervisor_pool] recovery_timeout_secs` (the
-driver's `shared_supervisor` table carries no pool settings), rolls one member
+`supervisor.replicas` members (default 1). The chart renders
+`[openshell.gateway.supervisor_pool]` `recovery_timeout_secs`,
+`max_instances_per_member` (Helm `supervisor.pool.maxInstancesPerMember`,
+1 to 1024, default 128, also passed to each member as
+`OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`), and `max_members_per_gateway`
+(`supervisor.pool.maxMembersPerGateway`, 1 or more, default 32); the driver's
+`shared_supervisor` table carries no pool settings. Rendering fails when
+`supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds the
+gateway replica count times `maxMembersPerGateway`. A create that finds every
+member at its cap, or the pool at gateway replicas × members × instances
+(never above 131072), fails with `FAILED_PRECONDITION` "sandbox capacity
+reached"; the gateway log warns "every supervisor is at its sandbox limit" or
+"supervisor pool is at its sandbox limit" to say which. Raise the cap or add
+members. Supervisor container
+resources come from `supervisor.resources` (unset by default; the chart
+recommends requests 250m and 768Mi with a 1.5Gi memory limit for 128
+sandboxes per supervisor). The chart rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control
 supervisor scheduling; top-level `affinity` applies only to the gateway), gives
 each member a 60-second grace period to leave,

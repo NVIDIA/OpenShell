@@ -220,6 +220,9 @@ pub fn spawn_membership_worker(
 
             match index.ring().await {
                 Ok((ring, members)) => {
+                    if let Some(controller) = state.compute.supervisor_host() {
+                        controller.set_gateway_replicas(ring.replica_count());
+                    }
                     let peers: HashMap<String, String> = members
                         .into_iter()
                         .map(|member| (member.replica_id, member.peer_endpoint))
