@@ -26,6 +26,8 @@
 
 # Reviewer routing registry and helper
 /REVIEWERS.md @ai-openshell/maintainers
+/tasks/scripts/check_commit_policy.py @ai-openshell/maintainers
+/tasks/scripts/check_commit_policy_test.py @ai-openshell/maintainers
 /tasks/scripts/check_review_readiness.py @ai-openshell/maintainers
 /tasks/scripts/check_review_readiness_test.py @ai-openshell/maintainers
 

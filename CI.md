@@ -600,6 +600,10 @@ operating-system CVEs remain the responsibility of the standalone scan.
 
 Org members and collaborators sign their commits cryptographically.
 
+The `Commit Policy` check enforces this on pull requests. It fails when a commit by an author with write or admin access is not GitHub-verified. External contributors and bots are exempt. To fix a failure, set up signing as described below, then re-sign the commits (for example `git rebase --exec 'git commit --amend --no-edit -S' <base>`) and push.
+
+The same check fails when a commit message, the PR title, or the PR body carries a `Co-authored-by:` trailer or a "Generated with" footer that names an AI agent, for every author. Remove the trailer or footer; see the Commits section of [AGENTS.md](AGENTS.md).
+
 DCO sign-off (`-s` / `Signed-off-by`) is a separate requirement and does not count as commit signing. Dependabot-authored dependency update PRs are allowlisted in DCO Assistant because the bot cannot sign commits.
 
 ### One-time setup with an SSH key

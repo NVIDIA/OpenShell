@@ -602,7 +602,7 @@ git commit --signoff --message "feat(sandbox): add new capability"
 DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
 
 - **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
-- **Cryptographic commit signing** applies to org members and collaborators only; see [CI.md](CI.md#commit-signing) for setup.
+- **Cryptographic commit signing** applies to org members and collaborators only, and the `Commit Policy` check enforces it. That check also rejects `Co-authored-by:` trailers and "Generated with" footers that name an AI agent. See [CI.md](CI.md#commit-signing) for setup and fixes.
 
 ### PR testing checklist
 
