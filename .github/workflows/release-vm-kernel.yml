@@ -258,8 +258,8 @@ jobs:
             ### Verify
 
             ```bash
-            gh release download vm-runtime -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
-            gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/OpenShell
+            gh release download vm-runtime -R ${{ github.repository }} -p vm-runtime-linux-x86_64.tar.zst
+            gh attestation verify vm-runtime-linux-x86_64.tar.zst -R ${{ github.repository }}
             ```
 
           files: |
