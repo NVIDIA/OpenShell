@@ -43,12 +43,12 @@ mkdir -p "${WORK}/pki/client" "${WORK}/jwt"
 e2e_write_podman_gateway_config \
   "${WORK}/podman.toml" "${ROOT}" "${WORK}/pki" "${WORK}/jwt" \
   test-gateway 0 "${WORK}/driver.sock" test-network 18181 \
-  workload:test 15 supervisor:test sandbox:test "${WORK}/spiffe.sock" \
+  workload:test 15 supervisor:test sandbox:test \
   "${WORK}/podman.sock" 0 ""
 e2e_write_podman_gateway_config \
   "${WORK}/podman-external.toml" "${ROOT}" "${WORK}/pki" "${WORK}/jwt" \
   test-gateway 1 "${WORK}/driver.sock" test-network 18181 \
-  workload:test 15 supervisor:test sandbox:test "${WORK}/spiffe.sock" \
+  workload:test 15 supervisor:test sandbox:test \
   "${WORK}/podman.sock" 0 ""
 
 printf '%s\n' \
@@ -65,7 +65,6 @@ printf '%s\n' \
   'assert driver["image_pull_policy"] == "if_not_present"' \
   'assert driver["supervisor_image"] == "supervisor:test"' \
   'assert driver["sandbox_runtime_image"] == "sandbox:test"' \
-  'assert driver["provider_spiffe_workload_api_socket"].endswith("/spiffe.sock")' \
   'assert driver["socket_path"].endswith("/podman.sock")' \
   'assert driver["resource_admission"] == {"enabled": False}' \
   'external_driver = external["openshell"]["drivers"]["podman"]' \

@@ -30,10 +30,9 @@ e2e_write_podman_gateway_config() {
   local stop_timeout_secs=${11}
   local supervisor_image=${12}
   local sandbox_runtime_image=${13}
-  local provider_spiffe_socket=${14}
-  local podman_socket=${15}
-  local oidc_mode=${16}
-  local oidc_issuer=${17}
+  local podman_socket=${14}
+  local oidc_mode=${15}
+  local oidc_issuer=${16}
   local configured_with_tls
 
   cp "${root}/deploy/rpm/gateway.toml.default" "${output}"
@@ -67,9 +66,6 @@ e2e_write_podman_gateway_config() {
       printf 'supervisor_image = %s\n' "$(e2e_podman_toml_string "${supervisor_image}")"
       printf 'sandbox_runtime_image = %s\n' "$(e2e_podman_toml_string "${sandbox_runtime_image}")"
       printf 'enable_bind_mounts = true\n'
-      if [ -n "${provider_spiffe_socket}" ]; then
-        printf 'provider_spiffe_workload_api_socket = %s\n' "$(e2e_podman_toml_string "${provider_spiffe_socket}")"
-      fi
       if [ -n "${podman_socket}" ]; then
         printf 'socket_path = %s\n' "$(e2e_podman_toml_string "${podman_socket}")"
       fi
@@ -81,18 +77,6 @@ e2e_write_podman_gateway_config() {
       e2e_write_gateway_mtls_auth_config
       if [ -n "${oidc_issuer}" ]; then
         e2e_write_gateway_oidc_config "${oidc_issuer}"
-      fi
-    fi
-    # Opt-in OTLP export so the otlp_relay e2e can bind a collector stub on
-    # the referenced port. Supervisors connect lazily, so the gateway may
-    # start before the stub exists.
-    if [ -n "${OPENSHELL_E2E_OTLP_ENDPOINT:-}" ]; then
-      printf '\n[openshell.gateway.otlp]\n'
-      printf 'endpoint = %s\n' "$(e2e_podman_toml_string "${OPENSHELL_E2E_OTLP_ENDPOINT}")"
-      # The agent trace relay is opt-in; OPENSHELL_E2E_OTLP_AGENT=0 runs the
-      # relay's inert case with trace export still on.
-      if [ "${OPENSHELL_E2E_OTLP_AGENT:-1}" != "0" ]; then
-        printf '\n[openshell.gateway.otlp.agent]\nenabled = true\n'
       fi
     fi
   } >>"${output}"

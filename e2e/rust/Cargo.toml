@@ -149,16 +149,6 @@ path = "tests/podman_resource_limits.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "provider_refresh_handles"
-path = "tests/provider_refresh_handles.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
-name = "provider_readiness"
-path = "tests/provider_readiness.rs"
-required-features = ["e2e-docker"]
-
-[[test]]
 name = "vm_gateway_start"
 path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
@@ -167,11 +157,6 @@ required-features = ["e2e-vm"]
 name = "vm_corporate_proxy"
 path = "tests/vm_corporate_proxy.rs"
 required-features = ["e2e-vm"]
-
-[[test]]
-name = "provider_token_exchange"
-path = "tests/provider_token_exchange.rs"
-required-features = ["e2e-podman"]
 
 [[test]]
 name = "kubernetes_ha_rebalancing"
@@ -228,16 +213,9 @@ name = "gpu"
 path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
-[[test]]
-name = "otlp_relay"
-path = "tests/otlp_relay.rs"
-required-features = ["e2e-local-container-driver"]
-
 [dependencies]
 openshell-core = { path = "../../crates/openshell-core", default-features = false, features = ["jwt"], optional = true }
 openshell-crypto = { path = "../../crates/openshell-crypto" }
-openshell-otel-test-support = { path = "../../crates/openshell-otel-test-support" }
-opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace"] }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
