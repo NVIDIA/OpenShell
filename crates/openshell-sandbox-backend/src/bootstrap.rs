@@ -52,7 +52,7 @@ pub struct BootstrapServerConfig {
 pub(crate) fn prepare(config: BootstrapServerConfig) -> Result<Exchange, String> {
     let verifier = SessionJwtVerifier::new(
         &config.config.gateway_id,
-        SessionTokenProfile::BoundaryBootstrap,
+        SessionTokenProfile::Bootstrap,
         [config.verification_key.clone()],
         Arc::new(SystemJwtClock),
     )
@@ -482,7 +482,7 @@ mod tests {
         let f = fixture();
         let expired = SessionJwtVerifier::new(
             "test",
-            SessionTokenProfile::BoundaryBootstrap,
+            SessionTokenProfile::Bootstrap,
             [f.server.verification_key.clone()],
             Arc::new(FutureClock),
         )

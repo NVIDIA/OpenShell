@@ -158,7 +158,7 @@ mod session {
     pub enum SessionTokenProfile {
         Gateway,
         Sandbox,
-        BoundaryBootstrap,
+        Bootstrap,
     }
 
     impl SessionTokenProfile {
@@ -167,7 +167,7 @@ mod session {
             match self {
                 Self::Gateway => GATEWAY_SESSION_JWT_TYPE,
                 Self::Sandbox => SANDBOX_SESSION_JWT_TYPE,
-                Self::BoundaryBootstrap => "openshell-boundary-bootstrap+jwt",
+                Self::Bootstrap => "openshell-boundary-bootstrap+jwt",
             }
         }
 
@@ -175,7 +175,7 @@ mod session {
             match self {
                 Self::Gateway => issuer,
                 Self::Sandbox => SANDBOX_SESSION_AUDIENCE,
-                Self::BoundaryBootstrap => "openshell-boundary-bootstrap",
+                Self::Bootstrap => "openshell-boundary-bootstrap",
             }
         }
     }
@@ -843,7 +843,7 @@ mod session {
             identity: &SandboxRuntimeIdentity,
         ) -> Result<MintedSessionToken, SessionJwtError> {
             self.mint(
-                SessionTokenProfile::BoundaryBootstrap,
+                SessionTokenProfile::Bootstrap,
                 identity,
                 Uuid::new_v4(),
                 self.clock.now_unix_seconds(),
@@ -1009,7 +1009,7 @@ mod session {
             token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionToken, SessionJwtError> {
-            let ttl = if profile == SessionTokenProfile::BoundaryBootstrap {
+            let ttl = if profile == SessionTokenProfile::Bootstrap {
                 Some(Duration::from_mins(15))
             } else {
                 self.ttl
@@ -1027,7 +1027,7 @@ mod session {
                 sandbox_id: identity.sandbox_id.clone(),
                 runtime_generation: identity.runtime_generation.clone(),
                 auth_epoch: identity.auth_epoch,
-                component: if profile == SessionTokenProfile::BoundaryBootstrap {
+                component: if profile == SessionTokenProfile::Bootstrap {
                     SessionComponent::OpenShellSandbox
                 } else {
                     SessionComponent::OpenShellSupervisor
@@ -1171,7 +1171,7 @@ mod session {
             if claims.aud != self.profile.audience(&self.issuer) {
                 return Err(SessionJwtError::WrongAudience);
             }
-            let component = if self.profile == SessionTokenProfile::BoundaryBootstrap {
+            let component = if self.profile == SessionTokenProfile::Bootstrap {
                 if claims.exp == 0 || claims.exp.saturating_sub(claims.iat) > 900 {
                     return Err(SessionJwtError::InvalidLifetime);
                 }
