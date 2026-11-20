@@ -34,6 +34,42 @@ let
     openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
     openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
   };
+  # The packaged installers' inputs, shared with the ones that also run a
+  # compute driver as an external service.
+  debInputs = {
+    openshell_deb = "../../artifacts/packages/openshell.deb";
+    openshell_e2e_python_image = e2ePythonImage;
+    openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
+    openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
+  };
+  rpmInputs = {
+    openshell_rpm = "../../artifacts/packages/rpm/openshell.rpm";
+    openshell_gateway_rpm = "../../artifacts/packages/rpm/openshell-gateway.rpm";
+    openshell_e2e_python_image = e2ePythonImage;
+    openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
+    openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
+  };
+  # A packaged installer with the compute driver for the machine's container
+  # runtime run as an external service, built from the same revision as the
+  # gateway. The openshell_external_driver role reads the driver's settings
+  # for that runtime, so an installer for a driver works on any machine with
+  # that driver's runtime, such as both rootful and rootless Podman.
+  externalDriverInstaller =
+    {
+      package,
+      playbook,
+      inputs,
+      driver,
+    }:
+    {
+      name = "${package}-external-${driver}-driver";
+      use_galaxy = false;
+      playbooks = [ playbook ];
+      inputs = inputs // {
+        openshell_external_driver_binary = "../../artifacts/external-drivers/${gnuTarget}/openshell-driver-${driver}";
+        openshell_external_driver_name = "external";
+      };
+    };
   fedoraPodman = podman: {
     machine = "fedora";
     driver = "podman";
@@ -202,30 +238,14 @@ let
         playbooks = [
           "ansible/playbooks/openshell-deb.yaml"
         ];
-        inputs = {
-          openshell_deb = "../../artifacts/packages/openshell.deb";
-          openshell_e2e_python_image = e2ePythonImage;
-          openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
-        };
+        inputs = debInputs;
       }
-      {
-        # The deb installer, with the Docker compute driver run as an external service,
-        # built from the same revision as the gateway.
-        name = "deb-external-docker-driver";
-        use_galaxy = false;
-        playbooks = [
-          "ansible/playbooks/openshell-deb.yaml"
-        ];
-        inputs = {
-          openshell_deb = "../../artifacts/packages/openshell.deb";
-          openshell_e2e_python_image = e2ePythonImage;
-          openshell_external_driver_binary = "../../artifacts/external-drivers/${gnuTarget}/openshell-driver-docker";
-          openshell_external_driver_name = "external";
-          openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
-        };
-      }
+      (externalDriverInstaller {
+        package = "deb";
+        driver = "docker";
+        playbook = "ansible/playbooks/openshell-deb.yaml";
+        inputs = debInputs;
+      })
       {
         # Installs the latest published release, as the baseline of an upgrade
         # test, and stages the candidate under /var/lib/openshell-qualification
@@ -247,14 +267,14 @@ let
         name = "rpm";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-rpm.yaml" ];
-        inputs = {
-          openshell_rpm = "../../artifacts/packages/rpm/openshell.rpm";
-          openshell_gateway_rpm = "../../artifacts/packages/rpm/openshell-gateway.rpm";
-          openshell_e2e_python_image = e2ePythonImage;
-          openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
-        };
+        inputs = rpmInputs;
       }
+      (externalDriverInstaller {
+        package = "rpm";
+        driver = "podman";
+        playbook = "ansible/playbooks/openshell-rpm.yaml";
+        inputs = rpmInputs;
+      })
     ];
 
     testsuites = [
