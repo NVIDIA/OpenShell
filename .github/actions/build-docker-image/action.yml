@@ -87,6 +87,9 @@ runs:
       if: inputs.push == 'true'
       shell: bash
       env:
+        # GitHub-hosted runners also ship podman, which the engine helper
+        # prefers; the SBOM check needs Docker's buildx imagetools.
+        CONTAINER_ENGINE: docker
         IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
       run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
 
