@@ -98,6 +98,10 @@ For native Windows MXC, supply the Windows command and absolute working
 directory through `--driver-config-json` and use `--detach`. The gateway
 administrator must enable caller driver configuration. Foreground attachment
 is rejected before provisioning; `--no-tty` alone does not request detachment.
+Use `sandbox exec <name> --no-tty -- <executable> [args...]` for an additional
+command. For shell builtins, pass a single command string after `cmd.exe /d /c`.
+Use `sandbox start <name>` to relaunch a stopped, completed, or failed-main-process sandbox with its
+policy-granted workspace intact.
 See [MXC configuration and limitations](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#mxc).
 
 Provider attachment is explicit. Name each provider with `--provider`; the

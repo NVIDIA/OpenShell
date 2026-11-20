@@ -2538,6 +2538,7 @@ pub(super) async fn handle_exec_sandbox(
     }
 
     require_ready_sandbox(&sandbox)?;
+    let command_str = exec_relay_command(&req, state.compute.configured_driver_name())?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -2552,8 +2553,6 @@ pub(super) async fn handle_exec_sandbox(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(&req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let stdin_payload = req.stdin;
     let execution_timeout = req
         .execution_timeout
@@ -3077,6 +3076,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
     }
 
     require_ready_sandbox(&sandbox)?;
+    let command_str = exec_relay_command(req, state.compute.configured_driver_name())?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
@@ -3088,8 +3088,6 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
     let no_login_shell = req.no_login_shell;
     let execution_timeout = req
@@ -3400,6 +3398,33 @@ fn exec_loop_result(exit_code: Option<i32>, close_seen: bool) -> Result<i32, Sta
     }
 }
 
+fn exec_relay_command(req: &ExecSandboxRequest, driver_name: &str) -> Result<String, Status> {
+    use openshell_core::ssh_exec::{ARGV_PREFIX, SshExecArgv};
+
+    if driver_name != "mxc" {
+        return build_remote_exec_command(req).map_err(|error| {
+            Status::invalid_argument(format!("command construction failed: {error}"))
+        });
+    }
+    if req.tty {
+        return Err(Status::failed_precondition(
+            "Windows MXC exec does not support a PTY. Use --no-tty.",
+        ));
+    }
+    let payload = serde_json::to_string(&SshExecArgv {
+        command: req.command.clone(),
+        environment: req.environment.clone(),
+        workdir: req.workdir.clone(),
+    })
+    .map_err(|_| Status::internal("encode MXC exec arguments"))?;
+    if ARGV_PREFIX.len() + payload.len() > MAX_COMMAND_STRING_LEN {
+        return Err(Status::invalid_argument(format!(
+            "assembled command exceeds {MAX_COMMAND_STRING_LEN} byte limit"
+        )));
+    }
+    Ok(format!("{ARGV_PREFIX}{payload}"))
+}
+
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
     let mut parts = Vec::new();
     let mut env_entries = req.environment.iter().collect::<Vec<_>>();
@@ -3462,6 +3487,12 @@ async fn stream_exec_over_relay(
         .await
         .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
+    let (exec_tx, coalescer) = if command.starts_with(openshell_core::ssh_exec::ARGV_PREFIX) {
+        let (exec_tx, task) = spawn_exec_output_coalescer(tx.clone());
+        (exec_tx, Some(task))
+    } else {
+        (tx.clone(), None)
+    };
     let exec = run_exec_with_russh(
         local_proxy_port,
         command,
@@ -3469,10 +3500,11 @@ async fn stream_exec_over_relay(
         request_tty,
         no_login_shell,
         (cols, rows),
-        tx.clone(),
+        exec_tx,
     );
 
-    let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
+    let exec_result =
+        wait_for_exec_relay(exec, &tx, execution_timeout, completion, coalescer).await;
     if matches!(exec_result, Ok(None)) {
         let _ = tx
             .send(Ok(ExecSandboxEvent {
@@ -3539,6 +3571,12 @@ async fn stream_interactive_exec_over_relay(
         .await
         .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
+    let (exec_tx, coalescer) = if command.starts_with(openshell_core::ssh_exec::ARGV_PREFIX) {
+        let (exec_tx, task) = spawn_exec_output_coalescer(tx.clone());
+        (exec_tx, Some(task))
+    } else {
+        (tx.clone(), None)
+    };
     let exec = run_interactive_exec_with_russh(
         local_proxy_port,
         command,
@@ -3547,10 +3585,11 @@ async fn stream_interactive_exec_over_relay(
         no_login_shell,
         cols,
         rows,
-        tx.clone(),
+        exec_tx,
     );
 
-    let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
+    let exec_result =
+        wait_for_exec_relay(exec, &tx, execution_timeout, completion, coalescer).await;
     if matches!(exec_result, Ok(None)) {
         let _ = tx
             .send(Ok(ExecSandboxEvent {
@@ -3586,6 +3625,135 @@ async fn stream_interactive_exec_over_relay(
 }
 
 /// `Ok(Some(code))` requires a real SSH `ExitStatus`, including nonzero codes.
+/// How long small exec output chunks are merged before being sent to the client.
+const EXEC_OUTPUT_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(5);
+/// Merged output is sent immediately once it reaches this size.
+const EXEC_OUTPUT_COALESCE_MAX: usize = 64 * 1024;
+
+/// Send any merged output as one event. Returns false when the client is gone.
+async fn flush_exec_output(
+    pending: &mut Option<(bool, Vec<u8>)>,
+    tx: &mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+) -> bool {
+    use openshell_core::proto::exec_sandbox_event::Payload;
+
+    let Some((is_stderr, data)) = pending.take() else {
+        return true;
+    };
+    let payload = if is_stderr {
+        Payload::Stderr(ExecSandboxStderr { data })
+    } else {
+        Payload::Stdout(ExecSandboxStdout { data })
+    };
+    tx.send(Ok(ExecSandboxEvent {
+        payload: Some(payload),
+    }))
+    .await
+    .is_ok()
+}
+
+/// Merge consecutive chunks of one stream; a stream switch or a full buffer flushes.
+async fn buffer_exec_output(
+    pending: &mut Option<(bool, Vec<u8>)>,
+    tx: &mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    is_stderr: bool,
+    data: &[u8],
+) -> bool {
+    match pending.as_mut() {
+        Some((kind, buffer)) if *kind == is_stderr => buffer.extend_from_slice(data),
+        _ => {
+            if !flush_exec_output(pending, tx).await {
+                return false;
+            }
+            *pending = Some((is_stderr, data.to_vec()));
+        }
+    }
+    if pending
+        .as_ref()
+        .is_some_and(|(_, buffer)| buffer.len() >= EXEC_OUTPUT_COALESCE_MAX)
+    {
+        return flush_exec_output(pending, tx).await;
+    }
+    true
+}
+
+/// Merge small output events before they reach the client. Only used for MXC
+/// (structured argv) execs, so other drivers keep their event boundaries.
+///
+/// Returns the sender the exec loop should write to and the task to await once
+/// the exec has finished, so merged output is delivered before the exit event.
+fn spawn_exec_output_coalescer(
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+) -> (
+    mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use openshell_core::proto::exec_sandbox_event::Payload;
+
+    let (inner_tx, mut inner_rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(64);
+    let task = tokio::spawn(async move {
+        let mut pending: Option<(bool, Vec<u8>)> = None;
+        loop {
+            let next = if pending.is_some() {
+                if let Ok(next) =
+                    tokio::time::timeout(EXEC_OUTPUT_COALESCE_WINDOW, inner_rx.recv()).await
+                {
+                    next
+                } else {
+                    if !flush_exec_output(&mut pending, &tx).await {
+                        return;
+                    }
+                    continue;
+                }
+            } else {
+                inner_rx.recv().await
+            };
+            let Some(item) = next else {
+                break;
+            };
+            let forwarded = match item {
+                Ok(ExecSandboxEvent {
+                    payload: Some(Payload::Stdout(output)),
+                }) => buffer_exec_output(&mut pending, &tx, false, &output.data).await,
+                Ok(ExecSandboxEvent {
+                    payload: Some(Payload::Stderr(output)),
+                }) => buffer_exec_output(&mut pending, &tx, true, &output.data).await,
+                other => flush_exec_output(&mut pending, &tx).await && tx.send(other).await.is_ok(),
+            };
+            if !forwarded {
+                return;
+            }
+        }
+        flush_exec_output(&mut pending, &tx).await;
+    });
+    (inner_tx, task)
+}
+
+async fn wait_for_exec_relay(
+    exec: impl Future<Output = Result<i32, Status>>,
+    response_tx: &mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    execution_timeout: Option<std::time::Duration>,
+    completion: Option<super::mutation_replay::Completion>,
+    coalescer: Option<tokio::task::JoinHandle<()>>,
+) -> Result<Option<i32>, Status> {
+    let wait_for_disconnect = coalescer.is_some();
+    let exec = async {
+        tokio::select! {
+            biased;
+            result = exec => result,
+            // MXC's coalescer can stay idle after the client has disconnected.
+            () = response_tx.closed(), if wait_for_disconnect => {
+                Err(Status::cancelled("exec response stream closed"))
+            }
+        }
+    };
+    let result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
+    if let Some(task) = coalescer {
+        let _ = task.await;
+    }
+    result
+}
+
 /// Synthetic gateway timeouts, lost status, and dropped futures leave the claim
 /// unresolved. Finalization precedes terminal delivery to the client.
 pub(super) async fn wait_for_exec_terminal(
@@ -3786,8 +3954,7 @@ async fn run_interactive_exec_with_russh(
                     }
                 }
                 ChannelMsg::ExitStatus { exit_status } => {
-                    let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
-                    exit_code = Some(converted);
+                    exit_code = Some(exit_status.cast_signed());
                 }
                 ChannelMsg::Close => {
                     close_seen = true;
@@ -4014,8 +4181,7 @@ async fn run_exec_with_russh(
                     .await;
             }
             ChannelMsg::ExitStatus { exit_status } => {
-                let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
-                exit_code = Some(converted);
+                exit_code = Some(exit_status.cast_signed());
             }
             ChannelMsg::Close => {
                 close_seen = true;
@@ -4311,6 +4477,60 @@ mod tests {
             "'def f():\n    return 1'"
         );
         assert_eq!(shell_escape("line1\r\nline2").unwrap(), "'line1\r\nline2'");
+    }
+
+    #[test]
+    fn mxc_exec_relay_preserves_argv_and_leaves_linux_shell_format_unchanged() {
+        use openshell_core::ssh_exec::{ARGV_PREFIX, SshExecArgv};
+
+        let req = ExecSandboxRequest {
+            command: vec![
+                r"C:\Program Files\tool.exe".into(),
+                "literal & value".into(),
+                String::new(),
+            ],
+            environment: HashMap::from([("NAME".into(), "two words".into())]),
+            workdir: r"C:\sandbox\work".into(),
+            ..Default::default()
+        };
+        let encoded = exec_relay_command(&req, "mxc").unwrap();
+        assert!(
+            !encoded.as_bytes().contains(&0),
+            "SSH transport forbids NUL"
+        );
+        let payload: SshExecArgv =
+            serde_json::from_str(encoded.strip_prefix(ARGV_PREFIX).unwrap()).unwrap();
+        assert_eq!(payload.command, req.command);
+        assert_eq!(payload.environment, req.environment);
+        assert_eq!(payload.workdir, req.workdir);
+        // Non-MXC drivers keep the historical POSIX shell string. Pin literals so
+        // this cannot pass by comparing a function with itself.
+        let linux = ExecSandboxRequest {
+            command: vec!["echo".into(), "a b".into()],
+            ..Default::default()
+        };
+        for driver in ["docker", "podman", "kubernetes"] {
+            assert_eq!(exec_relay_command(&linux, driver).unwrap(), "echo 'a b'");
+        }
+    }
+
+    #[test]
+    fn mxc_exec_relay_rejects_tty_and_oversized_commands() {
+        let tty = ExecSandboxRequest {
+            command: vec!["cmd.exe".into()],
+            tty: true,
+            ..Default::default()
+        };
+        let error = exec_relay_command(&tty, "mxc").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("--no-tty"));
+
+        let huge = ExecSandboxRequest {
+            command: vec!["x".repeat(MAX_COMMAND_STRING_LEN + 1)],
+            ..Default::default()
+        };
+        let error = exec_relay_command(&huge, "mxc").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     // ---- build_remote_exec_command ----

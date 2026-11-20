@@ -346,11 +346,12 @@ from `/dev/null` when a command needs no input.
 If streamed stdin exceeds the 4 MiB limit, the CLI reports an error and warns that the command may already have processed partial input. Cancellation does not undo that work.
 
 The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
-Large stdout and stderr streams are delivered before a successful exit. A slow
-reader backpressures the command. If output delivery fails, `exec` returns a
-failure instead of reporting success with incomplete output.
-If a background process keeps stdout or stderr open for more than 30 seconds
-after the command exits, `exec` reports an output delivery failure.
+Large stdout and stderr streams are delivered before a successful exit. If
+output delivery fails, the CLI reports a failure. On Linux, a slow reader slows
+the command, and background processes that hold the output pipes open for more
+than 30 seconds after the command exits cause an output delivery failure.
+See [Windows MXC exec](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#run-additional-commands-and-restart-a-sandbox)
+for the Windows output buffer behavior.
 
 A failed final gRPC status also makes the CLI report failure, even if the remote command reported exit code zero. The CLI does not automatically retry the execution.
 

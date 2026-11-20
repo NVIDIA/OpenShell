@@ -38,6 +38,7 @@ under development and is not a production-qualified security boundary:
   drivers stop sandboxes on a graceful gateway stop and recover them on restart;
   MXC does not provide that recovery. See
   [gateway exit and restart](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md#gateway-exit-and-restart).
+- Sandbox upload and download require POSIX file-transfer helpers and are unavailable.
 
 See the Windows branch's [MXC driver documentation](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md)
 for the current capabilities and enforcement limits, and its
@@ -116,6 +117,31 @@ Command-based sandbox creation requires administrator opt-in with
 `allow_driver_config = true`, a workload command and working directory, and
 `--detach`. Use a sandbox policy to grant the required filesystem and network
 access.
+
+## Run additional commands and restart a sandbox
+
+Run a native executable in a Ready ProcessContainer sandbox with
+`openshell sandbox exec <name> --no-tty -- <executable> [args...]`. Arguments
+are passed to the executable as supplied. For shell builtins, pass the command
+text as one argument to `cmd.exe /d /c`, for example:
+
+```shell
+openshell sandbox exec my-sandbox --no-tty -- cmd.exe /d /c "dir C:\Windows"
+```
+
+The command's standard output and error, and its exit status (including
+nonzero and crash-style codes), are returned. A missing or unlaunchable
+executable fails with an `openshell: <reason>` message and exit status 1.
+If the reader falls behind and the runtime discards unread output, the CLI
+reports an output delivery error and returns exit status 74.
+`sandbox exec` needs `--no-tty`; `sandbox connect`, `--tty`, and file
+upload/download are unavailable on MXC. Exec is supported for ProcessContainer
+sandboxes only; `isolation_session` sandboxes do not support it.
+
+Use `openshell sandbox start <name>` to relaunch a stopped sandbox, one whose
+main process completed, or one whose main process failed. The new runtime uses
+the original sandbox configuration and retains files in the policy-granted host
+workspace. Processes started by `sandbox exec` end when the runtime stops.
 
 ## Validate
 

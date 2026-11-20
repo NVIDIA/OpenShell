@@ -219,7 +219,8 @@ not required; driver-owned guest TLS fields are rejected.
 |---|---|
 | Filesystem and UI policy | Mapped to the MXC ProcessContainer fence |
 | Network policy and provider credentials | Standard host supervisor proxy; proxy-aware workloads only |
-| Exec, signals, retained output | Authenticated Sandbox Protocol; ConPTY resize is not yet supported |
+| Exec, signals, retained output | Gateway SSH relay to the in-process supervisor adapter, then the authenticated Sandbox Protocol. Exec requires `--no-tty`. |
+| Sandbox restart | Retire the old runtime and launch from the stored spec with fresh authentication. Policy-granted workspace files persist. |
 | Dynamic forwarding | Standard supervisor `ForwardTcp` path through sandbox loopback connect |
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer |
 | Gateway exit | Ends the sandbox processes, workloads included ([details](#gateway-exit-and-restart)) |
@@ -421,7 +422,16 @@ every recorded process to end and the gateway port to be bindable again (a
 replacement gateway must start on it). Only processes under the scenario's own
 gateway are tracked, so other sandboxes on the host are left alone. It relies on
 each sandbox generation's kill-on-close job object; no workload outlives the
-gateway. Select it with `-Scenario gateway-kill`.
+gateway. It also starts a long-running process with `sandbox exec` and requires
+that process to end with the rest. Select it with `-Scenario gateway-kill`.
+
+The default `exec-restart` scenario exercises `sandbox exec` and `sandbox start`
+on a real ProcessContainer sandbox. It checks literal arguments (spaces and shell
+metacharacters), the requested working directory and environment, exit statuses
+(7, 255, and a crash-style code), 60,000 lines of output without loss, and a
+clear spawn error for a missing executable. It then restarts the sandbox from
+`Completed` and from `Stopped` and requires a fresh main process each time with
+the workspace retained. Select it with `-Scenario exec-restart`.
 
 The default `gateway-restart` scenario covers a graceful gateway stop with
 persisted state. It runs the gateway on a SQLite file, creates a sandbox with a

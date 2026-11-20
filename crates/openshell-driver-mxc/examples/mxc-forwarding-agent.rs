@@ -9,6 +9,45 @@ use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
+    match arguments.get(1).map(String::as_str) {
+        // The MXC exec test uses this mode to exchange data with a real child
+        // process and check its arguments, output streams, and nonzero status.
+        Some("--exec-probe") => {
+            probe_exec_io(&arguments[2..])?;
+            std::process::exit(7); // arbitrary non-zero status
+        }
+        Some("--print-arg") if arguments.len() == 3 => {
+            println!("{}", arguments[2]);
+            return Ok(());
+        }
+        Some("--print-cwd") if arguments.len() == 2 => {
+            println!("{}", std::env::current_dir()?.display());
+            return Ok(());
+        }
+        Some("--print-env") if arguments.len() == 3 => {
+            // `<unset>` is not a valid value for the checks that use this, so it cannot
+            // be confused with a set variable.
+            println!(
+                "{}",
+                std::env::var(&arguments[2]).unwrap_or_else(|_| "<unset>".to_string())
+            );
+            return Ok(());
+        }
+        Some("--exit-on-file") if arguments.len() == 4 => {
+            let mut launches = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&arguments[2])?;
+            writeln!(launches, "launched")?;
+            drop(launches);
+            let exit_file = std::path::Path::new(&arguments[3]);
+            while !exit_file.try_exists()? {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     if !(arguments.len() == 3 || (matches!(arguments.len(), 4 | 5) && arguments[3] == "http")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -79,4 +118,20 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn probe_exec_io(arguments: &[String]) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(b"ready\n")?;
+    stdout.flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    writeln!(stdout, "argv: {}", serde_json::json!(arguments))?;
+    write!(stdout, "stdin: {}", serde_json::json!(input))?;
+    stdout.flush()?;
+
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(b"stderr line\nstderr tail")?;
+    stderr.flush()
 }
