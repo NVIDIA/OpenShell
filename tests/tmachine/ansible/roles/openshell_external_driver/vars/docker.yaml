@@ -6,3 +6,9 @@ openshell_external_driver_binary_name: openshell-driver-docker
 openshell_external_driver_socket: /run/openshell-driver-docker/compute.sock
 openshell_external_driver_supplementary_groups: docker
 openshell_external_driver_requires: docker.service
+openshell_external_driver_config_template: driver-docker.toml.j2
+openshell_external_driver_args:
+  - --config
+  - "/etc/openshell/driver-{{ openshell_external_driver_name }}.toml"
+  - --gateway-bind
+  - "{{ openshell_gateway_bind_address }}"

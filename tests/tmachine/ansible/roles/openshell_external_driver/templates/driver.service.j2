@@ -13,10 +13,13 @@ SupplementaryGroups={{ openshell_external_driver_supplementary_groups }}
 RuntimeDirectory=openshell-driver-{{ openshell_gateway_driver }}
 Environment=OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
 Environment=OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
+{% for entry in openshell_external_driver_environment | default([]) %}
+Environment={{ entry }}
+{% endfor %}
 ExecStart=/usr/local/bin/{{ openshell_external_driver_binary_name }} \
-  --bind-socket {{ openshell_external_driver_socket }} \
-  --config /etc/openshell/driver-{{ openshell_external_driver_name }}.toml \
-  --gateway-bind {{ openshell_gateway_bind_address }}
+  --bind-socket {{ openshell_external_driver_socket }}{% for arg in openshell_external_driver_args %} \
+  {{ arg }}{% endfor %}
+
 Restart=on-failure
 
 [Install]
