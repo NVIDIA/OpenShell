@@ -12,18 +12,16 @@
 
 use std::time::Duration;
 
-use host_server_support::{HttpRecorder, Request, Response, TEST_HOST, TcpServer};
+use host_server_support::{HttpRecorder, Request, Response, TEST_HOST, TcpServer, allow_host};
 use sandbox_clients_support::{self as clients, http, http_raw, scripts};
 use serde_json::Value;
 use testkit::policy::{self, Endpoint as _};
 use testkit::sdk::raw::proto;
 use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
 
-/// Files [`scripts::RELOAD_KEEP_ALIVE_CLIENT`] signals through.
-const RELOAD_READY: &str = "/tmp/proxy-reload-ready";
-const RELOAD_GO: &str = "/tmp/proxy-reload-go";
-const RELOAD_RESULT: &str = "/tmp/proxy-reload-result";
-const RELOAD_LOG: &str = "/tmp/proxy-reload-client.log";
+/// The directory [`scripts::RELOAD_KEEP_ALIVE_CLIENT`] signals through, and
+/// where its output goes to `log`.
+const RELOAD_DIR: &str = "/tmp/proxy-reload";
 
 /// The reply [`TcpServer::reply_when_idle`] gives a pipelined request, so the
 /// connection stays usable for the next one.
@@ -35,40 +33,36 @@ const PIPELINE_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 #[testkit::test]
 async fn policy_reload_denies_new_and_open_connections(cx: &mut Context) -> testkit::Result {
     let server = HttpRecorder::serve(|_| Response::text("ok").keep_alive()).await?;
-    let allowed = allow_server(server.port);
-    let sandbox = cx
-        .sandbox("reld")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(allowed.clone())
-        .create_ready()
-        .await?;
-    policy::set(&sandbox, &allowed).await?;
+    let mut allowed = policy::base();
+    allow_host(&mut allowed, "egress", server.port);
+    let sandbox = cx.python_sandbox("reld", allowed).create_ready().await?;
 
-    let port = server.port.to_string();
     sandbox
         .exec([
             "sh",
             "-c",
-            &format!("nohup python3 -c \"$1\" {TEST_HOST} {port} >{RELOAD_LOG} 2>&1 &"),
+            r#"mkdir -p "$2" && nohup python3 -c "$1" "$3" "$4" "$2" >"$2/log" 2>&1 &"#,
             "reload-client",
             scripts::RELOAD_KEEP_ALIVE_CLIENT,
+            RELOAD_DIR,
+            TEST_HOST,
+            &server.port.to_string(),
         ])
         .await?
         .success()
         .context("start the keep-alive client")?;
-    wait_for_file(&sandbox, RELOAD_READY).await?;
+    reload_file(&sandbox, "ready").await?;
     expect_statuses(&sandbox, server.port, |status| status == Some(200))
         .await
         .context("before the reload")?;
 
     policy::set(&sandbox, &policy::base()).await?;
     sandbox
-        .exec(["touch", RELOAD_GO])
+        .exec(["touch", &format!("{RELOAD_DIR}/go")])
         .await?
         .success()
         .context("release the keep-alive client")?;
-    let result: Value = serde_json::from_str(wait_for_file(&sandbox, RELOAD_RESULT).await?.trim())
+    let result: Value = serde_json::from_str(reload_file(&sandbox, "result").await?.trim())
         .context("parse the keep-alive client's result")?;
     testkit::ensure!(
         result["failed_closed"] == true,
@@ -87,14 +81,14 @@ async fn ambiguous_policy_update_is_rejected_and_active_policy_kept(
     cx: &mut Context,
 ) -> testkit::Result {
     let server = HttpRecorder::serve(|_| Response::text("ok").keep_alive()).await?;
-    let allowed = allow_server(server.port);
+    let mut allowed = policy::base();
+    allow_host(&mut allowed, "egress", server.port);
     let sandbox = cx
-        .sandbox("ambig")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(allowed.clone())
+        .python_sandbox("ambig", allowed.clone())
         .create_ready()
         .await?;
+    // Setting the same policy makes no revision but waits until the first
+    // is loaded, so its status can't change between the two listings below.
     policy::set(&sandbox, &allowed).await?;
     expect_statuses(&sandbox, server.port, |status| status == Some(200))
         .await
@@ -103,35 +97,9 @@ async fn ambiguous_policy_update_is_rejected_and_active_policy_kept(
     let connections = server.connections();
 
     let mut ambiguous = policy::base();
-    policy::allow(
-        &mut ambiguous,
-        "terminating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    );
-    policy::allow(
-        &mut ambiguous,
-        "passthrough",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .tls_skip();
-    let file = testkit::YamlFile::new(&policy::to_yaml(&ambiguous)?)?;
-    let output = cx
-        .cli([
-            "policy",
-            "set",
-            sandbox.name(),
-            "--policy",
-            file.path()?,
-            "--wait",
-            "--timeout",
-            "120",
-        ])
-        .await?
-        .failure()?;
+    allow_host(&mut ambiguous, "terminating", server.port);
+    allow_host(&mut ambiguous, "passthrough", server.port).tls_skip();
+    let output = policy::try_set(&sandbox, &ambiguous).await?.failure()?;
     testkit::ensure!(
         output.report_text().contains("ambiguity validation failed"),
         "the rejection doesn't explain the ambiguity:\n{}",
@@ -159,14 +127,8 @@ async fn ambiguous_policy_update_is_rejected_and_active_policy_kept(
 async fn tls_skip_relays_opaque_bytes(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::echo().await?;
     let mut policy = policy::base();
-    allow(&mut policy, server.port).tls_skip();
-    let sandbox = cx
-        .sandbox("tlskp")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy)
-        .create_ready()
-        .await?;
+    allow_host(&mut policy, "egress", server.port).tls_skip();
+    let sandbox = cx.python_sandbox("tlskp", policy).create_ready().await?;
     let mut payload = vec![0x00, 0xff, 0x13, 0x37, 0x80, 0x0a];
     payload.extend_from_slice(b"not-http-or-tls");
     payload.extend(0..64_u8);
@@ -184,13 +146,7 @@ async fn middleware_redacts_request_bodies(cx: &mut Context) -> testkit::Result 
     })
     .await?;
     let policy = middleware_policy(server.port, "fail_closed", "")?;
-    let sandbox = cx
-        .sandbox("redct")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy)
-        .create_ready()
-        .await?;
+    let sandbox = cx.python_sandbox("redct", policy).create_ready().await?;
     for request in ["first", "second"] {
         let reply = http(
             &sandbox,
@@ -220,13 +176,7 @@ async fn middleware_redacts_request_bodies(cx: &mut Context) -> testkit::Result 
 async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::echo().await?;
     let policy = middleware_policy(server.port, "fail_closed", "")?;
-    let sandbox = cx
-        .sandbox("fclos")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy)
-        .create_ready()
-        .await?;
+    let sandbox = cx.python_sandbox("fclos", policy).create_ready().await?;
     let mut payload = vec![0x00, 0xff, 0x13, 0x37];
     payload.extend_from_slice(b"not-http-or-tls");
     let reply = http_raw(&sandbox, TEST_HOST, server.port, &payload).await?;
@@ -249,13 +199,7 @@ async fn fail_closed_middleware_blocks_uninspectable_traffic(cx: &mut Context) -
 async fn fail_open_middleware_relays_uninspectable_traffic(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::echo().await?;
     let policy = middleware_policy(server.port, "fail_open", "        tls: skip\n")?;
-    let sandbox = cx
-        .sandbox("fopen")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy)
-        .create_ready()
-        .await?;
+    let sandbox = cx.python_sandbox("fopen", policy).create_ready().await?;
     let mut payload = vec![0x00, 0xff, 0x13, 0x37, 0x80];
     payload.extend_from_slice(b"middleware-bypass");
     expect_echo(&sandbox, server.port, &payload).await?;
@@ -275,10 +219,7 @@ async fn fail_open_middleware_relays_uninspectable_traffic(cx: &mut Context) -> 
 async fn pipelined_request_is_authorized_separately(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::reply_when_idle(PIPELINE_REPLY).await?;
     let sandbox = cx
-        .sandbox("pipe")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(rest_policy(server.port, "GET")?)
+        .python_sandbox("pipe", rest_policy(server.port, "GET")?)
         .create_ready()
         .await?;
     let target = format!("{TEST_HOST}:{}", server.port);
@@ -304,10 +245,7 @@ async fn pipelined_request_is_authorized_separately(cx: &mut Context) -> testkit
 async fn chunked_pipelined_request_is_authorized_separately(cx: &mut Context) -> testkit::Result {
     let server = TcpServer::reply_when_idle(PIPELINE_REPLY).await?;
     let sandbox = cx
-        .sandbox("chunk")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(rest_policy(server.port, "POST")?)
+        .python_sandbox("chunk", rest_policy(server.port, "POST")?)
         .create_ready()
         .await?;
     let target = format!("{TEST_HOST}:{}", server.port);
@@ -325,18 +263,6 @@ async fn chunked_pipelined_request_is_authorized_separately(cx: &mut Context) ->
         "expected only the allowed chunked request upstream; got:\n{received}"
     );
     Ok(())
-}
-
-/// [`policy::base`] with the image's Python allowed to reach `TEST_HOST` on
-/// `port`.
-fn allow_server(port: u16) -> proto::SandboxPolicy {
-    let mut policy = policy::base();
-    allow(&mut policy, port);
-    policy
-}
-
-fn allow(policy: &mut proto::SandboxPolicy, port: u16) -> &mut proto::NetworkEndpoint {
-    policy::allow(policy, "egress", TEST_HOST, port, PYTHON_BINARIES)
 }
 
 /// An endpoint on `port` with the `openshell/regex` redacting middleware,
@@ -442,17 +368,20 @@ async fn expect_echo(sandbox: &Sandbox, port: u16, payload: &[u8]) -> Result {
     Ok(())
 }
 
-/// The contents of `path` in the sandbox, once it exists. A timeout reports
-/// the keep-alive client's log.
-async fn wait_for_file(sandbox: &Sandbox, path: &str) -> Result<String> {
+/// The contents of `name` in [`RELOAD_DIR`], once it exists. A timeout
+/// reports the keep-alive client's log.
+async fn reload_file(sandbox: &Sandbox, name: &str) -> Result<String> {
     Ok(sandbox
         .poll_exec(
-            &format!("{path} to appear"),
+            &format!("{RELOAD_DIR}/{name} to appear"),
             Duration::from_secs(60),
             [
                 "sh",
                 "-c",
-                &format!("cat {path} || {{ cat {RELOAD_LOG}; exit 1; }}"),
+                r#"cat "$1/$2" || { cat "$1/log"; exit 1; }"#,
+                "reload-file",
+                RELOAD_DIR,
+                name,
             ],
             |output| output.exit_code == 0,
         )

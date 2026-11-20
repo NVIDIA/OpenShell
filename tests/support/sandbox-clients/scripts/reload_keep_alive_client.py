@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Sends a keep-alive GET to argv[1]:argv[2] and touches READY once it
-# succeeds. When GO appears, sends a second request on the same connection
-# and writes to RESULT whether it was refused.
+# Sends a keep-alive GET to argv[1]:argv[2] and creates `ready` in the
+# directory argv[3] once it succeeds. When `go` appears there, sends a second
+# request on the same connection and writes to `result` whether it was
+# refused.
 import json
 import os
 import socket
@@ -12,9 +13,7 @@ import time
 
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
-READY = "/tmp/proxy-reload-ready"
-GO = "/tmp/proxy-reload-go"
-RESULT = "/tmp/proxy-reload-result"
+READY, GO, RESULT = (os.path.join(sys.argv[3], name) for name in ("ready", "go", "result"))
 
 
 def read_response(sock):
