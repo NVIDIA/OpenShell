@@ -193,26 +193,45 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   tag-ghcr-dev:
-    name: Tag GHCR Images as Dev
+    name: Promote Dev Images to Quay
     needs: [build-images, release-dev]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    # Only jobs in this environment can trade their OIDC token for the Quay robot.
+    environment: release
     permissions:
-      packages: write
+      contents: read
+      id-token: write
+      packages: read
     steps:
-      - name: Log in to GHCR
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to the CI registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
-      - name: Tag images as dev
+      - name: Log in to Quay
+        uses: ai-openshell/workflows/quay-login@96e33d5551ba4e706203648eb90710c48466e543 # main
+        with:
+          robot: ai-openshell+openshell_release
+          clients: docker
+
+      # The SHA tag backs the 0.0.0-dev.<sha> chart, which pins appVersion to it.
+      - name: Promote images as dev
+        env:
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
+          CI_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/openshell"
           for component in gateway sandbox supervisor; do
-            echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as dev..."
+            echo "Promoting ${CI_REGISTRY}/${component}:${SOURCE_SHA} to quay.io/ai-openshell/${component}..."
             docker buildx imagetools create \
               --prefer-index=false \
-              -t "${REGISTRY}/${component}:dev" \
-              "${REGISTRY}/${component}:${{ github.sha }}"
+              -t "quay.io/ai-openshell/${component}:${SOURCE_SHA}" \
+              -t "quay.io/ai-openshell/${component}:dev" \
+              "${CI_REGISTRY}/${component}:${SOURCE_SHA}"
+            tasks/scripts/verify-image-sbom.sh "quay.io/ai-openshell/${component}:dev" --require-cargo
           done
 
   build-deb:

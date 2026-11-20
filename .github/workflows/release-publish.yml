@@ -188,17 +188,19 @@ jobs:
           if-no-files-found: error
 
   tag-ghcr-release:
-    name: Publish GHCR Images
+    name: Publish Quay Images
     needs: assemble
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    # Only jobs in this environment can trade their OIDC token for the Quay robot.
+    environment: release
     permissions:
       actions: read
       contents: read
-      packages: write
+      id-token: write
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ !inputs.is-prerelease }}
         with:
           persist-credentials: false
           ref: ${{ inputs.source-sha }}
@@ -214,8 +216,15 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - name: Log in to GHCR
+      - name: Log in to the CI registry
+        if: ${{ inputs.is-prerelease }}
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Log in to Quay
+        uses: ai-openshell/workflows/quay-login@96e33d5551ba4e706203648eb90710c48466e543 # main
+        with:
+          robot: ai-openshell+openshell_release
+          clients: docker
 
       - name: Publish stable image archives
         if: ${{ !inputs.is-prerelease }}
@@ -224,7 +233,7 @@ jobs:
         run: |
           set -euo pipefail
           for component in gateway sandbox supervisor; do
-            image="ghcr.io/nvidia/openshell/${component}:${VERSION}"
+            image="quay.io/ai-openshell/${component}:${VERSION}"
             # Never replace a published stable image; a rerun keeps the original.
             # Only a missing manifest means unpublished; any other lookup error
             # fails rather than risk overwriting.
@@ -268,21 +277,28 @@ jobs:
           VERSION: ${{ inputs.semver }}
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
+          REGISTRY="quay.io/ai-openshell"
+          # Prereleases promote the SHA-tagged build from the CI registry;
+          # stable images were already published to Quay above.
+          SOURCE_REGISTRY="${REGISTRY}"
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            SOURCE_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/openshell"
+          fi
           for component in gateway sandbox supervisor; do
             if [[ "${IS_PRERELEASE}" == "true" ]]; then
-              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
+              echo "Promoting ${SOURCE_REGISTRY}/${component}:${SOURCE_TAG} as ${REGISTRY}/${component}:${VERSION}..."
               docker buildx imagetools create \
                 --prefer-index=false \
                 -t "${REGISTRY}/${component}:${VERSION}" \
-                "${REGISTRY}/${component}:${SOURCE_TAG}"
+                "${SOURCE_REGISTRY}/${component}:${SOURCE_TAG}"
+              tasks/scripts/verify-image-sbom.sh "${REGISTRY}/${component}:${VERSION}" --require-cargo
             fi
             if [[ "${MAKE_LATEST}" == "true" ]]; then
-              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
+              echo "Tagging ${SOURCE_REGISTRY}/${component}:${SOURCE_TAG} as latest..."
               docker buildx imagetools create \
                 --prefer-index=false \
                 -t "${REGISTRY}/${component}:latest" \
-                "${REGISTRY}/${component}:${SOURCE_TAG}"
+                "${SOURCE_REGISTRY}/${component}:${SOURCE_TAG}"
             fi
           done
 
