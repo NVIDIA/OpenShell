@@ -99,6 +99,20 @@ pub const REASON_CREATE_TIMED_OUT: &str = "CreateTimedOut";
 /// stays transient: a slow registry can legitimately back off once.
 pub const IMAGE_PULL_BACKOFF_TERMINAL_AFTER_MS: i64 = 2 * 60 * 1000;
 
+/// How long a "not yet" printable status may persist before it becomes a
+/// terminal failure.
+///
+/// `ErrorUnschedulable` and `ErrorPvcNotFound` are not failures at create
+/// time: the launcher Pod is rejected while its workspace PVC binds
+/// (`pod has unbound immediate PersistentVolumeClaims`), and `KubeVirt`
+/// reports that single rejected scheduling attempt as `ErrorUnschedulable`
+/// for the seconds before the PVC binds and the VMI runs. Treating the first
+/// sighting as terminal failed every create on a cluster whose storage
+/// class binds late, even though the guest booted moments later. The status
+/// only means "stuck" once it has outlived this window — the same ten
+/// minutes the create deadline allows a gateway to finish a create.
+pub const NOT_YET_TERMINAL_AFTER_MS: i64 = 10 * 60 * 1000;
+
 /// Parse the Kubernetes RFC 3339 timestamp format to Unix milliseconds,
 /// through `k8s-openapi`'s `Time` (already a dependency — the same
 /// deserializer the API types use).
@@ -233,12 +247,57 @@ pub fn vmi_not_ready_since_ms(vmi: &DynamicObject) -> Option<i64> {
 /// Classify a terminal VM failure from the printable status and the paired
 /// VMI's phase. Returns a human-readable summary when the VM has failed.
 ///
+/// Printable statuses (per `KubeVirt` v1.9's `VirtualMachinePrintableStatus`)
+/// that mean "not yet", not "failed": the VM controller is still driving
+/// the VM towards a running VMI and will retry on its own. `Provisioning`,
+/// `Starting` and `WaitingForVolumeBinding` are explicitly in-progress;
+/// `ErrorUnschedulable` and `ErrorPvcNotFound` are the same situation seen
+/// after one rejected scheduling attempt (see
+/// [`NOT_YET_TERMINAL_AFTER_MS`]).
+pub fn not_yet_printable_status(printable_status: &str) -> bool {
+    matches!(
+        printable_status,
+        "Provisioning"
+            | "Starting"
+            | "WaitingForVolumeBinding"
+            | "ErrorUnschedulable"
+            | "ErrorPvcNotFound"
+    )
+}
+
+/// Map a "not yet" printable status that has outlived
+/// [`NOT_YET_TERMINAL_AFTER_MS`] to a terminal failure.
+///
+/// `not_ready_since_ms` is the moment the VM stopped making progress (the
+/// VMI's `Ready` transition, else the VM's creation). `None` keeps the state
+/// transient: timing fails open, isolation never does.
+pub fn stuck_not_yet_status(
+    printable_status: &str,
+    not_ready_since_ms: Option<i64>,
+    now_ms: i64,
+) -> Option<String> {
+    if !not_yet_printable_status(printable_status) {
+        return None;
+    }
+    let since = not_ready_since_ms?;
+    (now_ms - since > NOT_YET_TERMINAL_AFTER_MS).then(|| {
+        format!(
+            "printableStatus {printable_status} for more than {} minutes",
+            NOT_YET_TERMINAL_AFTER_MS / 60_000
+        )
+    })
+}
+
 /// Terminal printable statuses (per `KubeVirt` v1.9's
-/// `VirtualMachinePrintableStatus`): `CrashLoopBackOff`,
-/// `ErrorUnschedulable`, `ErrorPvcNotFound`, and `DataVolumeError` mean the
-/// VM cannot run and will not recover on its own.
+/// `VirtualMachinePrintableStatus`): `CrashLoopBackOff` means the guest keeps
+/// dying and `DataVolumeError` means the volume can never import. Both mean
+/// the VM cannot run and will not recover on its own.
 ///
 /// Deliberately **not** terminal:
+/// - `Provisioning`, `Starting`, `WaitingForVolumeBinding`,
+///   `ErrorUnschedulable` and `ErrorPvcNotFound` are "not yet" states; the
+///   caller fails them only once [`stuck_not_yet_status`] sees them outlive
+///   [`NOT_YET_TERMINAL_AFTER_MS`].
 /// - `Unknown` (the controller could not obtain the VM state) can appear
 ///   transiently during apiserver/communication hiccups; mapping it to
 ///   `Error` would flip a booting sandbox to `Error` on a blip.
@@ -255,7 +314,7 @@ pub fn terminal_vm_failure(
     vm_ready: bool,
 ) -> Option<String> {
     match printable_status {
-        "CrashLoopBackOff" | "ErrorUnschedulable" | "ErrorPvcNotFound" | "DataVolumeError" => {
+        "CrashLoopBackOff" | "DataVolumeError" => {
             return Some(format!("printableStatus {printable_status}"));
         }
         _ => {}
@@ -943,6 +1002,18 @@ pub fn sandbox_from_vm_object_with_runtime(
     ))
 }
 
+/// When the VM stopped making progress: the VMI's `Ready` transition when the
+/// VMI exists, else the VM's own creation time. Used to bound the "not yet"
+/// printable statuses ([`stuck_not_yet_status`]).
+fn not_ready_since_ms(obj: &DynamicObject, vmi_not_ready_since_ms: Option<i64>) -> Option<i64> {
+    vmi_not_ready_since_ms.or_else(|| {
+        obj.metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|time| time.0.as_millisecond())
+    })
+}
+
 /// Translate VM status into driver conditions:
 /// - `status.ready == true` becomes a backend `Ready=True` observation.
 ///   Without a connected supervisor session the gateway still reports
@@ -999,17 +1070,31 @@ fn vm_status_from_object(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
 
-    let terminal = terminal_vm_failure(printable, vmi_phase, ready).or_else(|| {
-        // L4: an image-pull backoff that has persisted past the threshold
-        // is terminal — the pull is effectively permanent, and the gateway
-        // would otherwise surface only the configuration gate's message
-        // until the CLI's provision timeout expires.
-        (printable == "ImagePullBackOff"
-            && vmi_not_ready_since_ms.is_some_and(|since| {
-                openshell_core::time::now_ms() - since > IMAGE_PULL_BACKOFF_TERMINAL_AFTER_MS
-            }))
-        .then(|| "guest image pull stuck in backoff (the image cannot be pulled)".to_string())
-    });
+    let terminal = terminal_vm_failure(printable, vmi_phase, ready)
+        .or_else(|| {
+            // L4: an image-pull backoff that has persisted past the threshold
+            // is terminal — the pull is effectively permanent, and the gateway
+            // would otherwise surface only the configuration gate's message
+            // until the CLI's provision timeout expires.
+            (printable == "ImagePullBackOff"
+                && vmi_not_ready_since_ms.is_some_and(|since| {
+                    openshell_core::time::now_ms() - since > IMAGE_PULL_BACKOFF_TERMINAL_AFTER_MS
+                }))
+            .then(|| "guest image pull stuck in backoff (the image cannot be pulled)".to_string())
+        })
+        .or_else(|| {
+            // "Not yet" statuses (a launcher rejected while its workspace PVC
+            // binds, a volume still binding, a VM still provisioning) stay
+            // provisioning until they outlive the window: an immediate failure
+            // turned every create on this cluster into `Error` while the guest
+            // was booting, because the first rejected scheduling attempt is
+            // reported as `ErrorUnschedulable`.
+            stuck_not_yet_status(
+                printable,
+                not_ready_since_ms(obj, vmi_not_ready_since_ms),
+                openshell_core::time::now_ms(),
+            )
+        });
 
     // A create whose Halted window outlived the deadline is a terminal
     // failure (M7): the gateway died mid-create, and a gateway restarted
@@ -1986,17 +2071,40 @@ mod kubevirt_review_tests {
         // A failed or completed VMI under a not-ready VM is terminal.
         assert!(terminal_vm_failure("Stopped", Some("Failed"), false).is_some());
         assert!(terminal_vm_failure("Stopped", Some("Succeeded"), false).is_some());
-        // KubeVirt's terminal printable statuses stand on their own
-        // (VirtualMachinePrintableStatus, KubeVirt v1.9).
-        for status in [
-            "CrashLoopBackOff",
-            "ErrorUnschedulable",
-            "ErrorPvcNotFound",
-            "DataVolumeError",
-        ] {
+        // KubeVirt's genuinely terminal printable statuses stand on their
+        // own (VirtualMachinePrintableStatus, KubeVirt v1.9): the guest
+        // keeps crashing, or the volume can never import.
+        for status in ["CrashLoopBackOff", "DataVolumeError"] {
             assert!(
                 terminal_vm_failure(status, None, false).is_some(),
                 "{status} must be terminal"
+            );
+        }
+        // "Not yet" statuses are NOT terminal on sight: the launcher's first
+        // scheduling attempt is rejected while the workspace PVC binds, and
+        // KubeVirt reports that as ErrorUnschedulable for the seconds before
+        // the VMI runs. They fail only via stuck_not_yet_status, on the
+        // timeout below.
+        for status in [
+            "Provisioning",
+            "Starting",
+            "WaitingForVolumeBinding",
+            "ErrorUnschedulable",
+            "ErrorPvcNotFound",
+        ] {
+            assert!(
+                not_yet_printable_status(status),
+                "{status} must classify as not-yet"
+            );
+            assert!(
+                terminal_vm_failure(status, None, false).is_none(),
+                "{status} must not be terminal on sight"
+            );
+        }
+        for status in ["CrashLoopBackOff", "DataVolumeError", "Running", "Stopped"] {
+            assert!(
+                !not_yet_printable_status(status),
+                "{status} must not classify as not-yet"
             );
         }
         // Image-pull problems are transient (kubelet retries) but visible:
@@ -2018,6 +2126,103 @@ mod kubevirt_review_tests {
         assert!(terminal_vm_failure("WaitingForVolumeBinding", None, false).is_none());
         // A Succeeded VMI under a ready VM is not a failure signal.
         assert!(terminal_vm_failure("Running", Some("Succeeded"), true).is_none());
+    }
+
+    #[test]
+    fn stuck_not_yet_status_fails_only_after_the_window() {
+        let now = openshell_core::time::now_ms();
+        for status in [
+            "Provisioning",
+            "Starting",
+            "WaitingForVolumeBinding",
+            "ErrorUnschedulable",
+            "ErrorPvcNotFound",
+        ] {
+            // Fresh: still provisioning, whatever the status.
+            assert!(
+                stuck_not_yet_status(status, Some(now - 1_000), now).is_none(),
+                "a fresh {status} must stay transient"
+            );
+            // Unknown start time: fail open (timing never isolates).
+            assert!(
+                stuck_not_yet_status(status, None, now).is_none(),
+                "{status} without a timestamp must stay transient"
+            );
+            // Past the window: terminal, and the message names the status.
+            let message =
+                stuck_not_yet_status(status, Some(now - NOT_YET_TERMINAL_AFTER_MS - 1), now)
+                    .expect("a stale not-yet status is terminal");
+            assert!(
+                message.contains(status),
+                "message {message} must name {status}"
+            );
+        }
+        // Exactly at the window is not yet late.
+        assert!(
+            stuck_not_yet_status(
+                "ErrorUnschedulable",
+                Some(now - NOT_YET_TERMINAL_AFTER_MS),
+                now
+            )
+            .is_none()
+        );
+        // Terminal and ordinary statuses are never "stuck not-yet".
+        for status in ["CrashLoopBackOff", "DataVolumeError", "Running", "Stopped"] {
+            assert!(
+                stuck_not_yet_status(status, Some(now - NOT_YET_TERMINAL_AFTER_MS - 1), now)
+                    .is_none(),
+                "{status} must not be handled by the not-yet timeout"
+            );
+        }
+    }
+
+    /// The bug this fix exists for: a launcher rejected while its workspace
+    /// PVC binds reports `printableStatus: ErrorUnschedulable` for a few
+    /// seconds. The snapshot must keep the sandbox provisioning, not latch a
+    /// terminal `VMFailed` the way it did before (every create on the IBM
+    /// cluster landed in `Error` with the VMI running seconds later).
+    #[test]
+    fn error_unschedulable_keeps_the_sandbox_provisioning() {
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
+        vm.data["status"] = serde_json::json!({
+            "ready": false,
+            "printableStatus": "ErrorUnschedulable",
+        });
+
+        let (_, sbx) = sandbox_from_vm_object_with_vmi("openshell-e2e-ns", vm.clone(), None)
+            .expect("converts");
+        let conditions = sbx.status.expect("status").conditions;
+        let ready = conditions
+            .iter()
+            .find(|condition| condition.r#type == "Ready")
+            .expect("Ready condition");
+        assert_eq!(ready.status, "False");
+        assert_eq!(
+            ready.reason, REASON_VM_NOT_READY,
+            "a fresh ErrorUnschedulable must stay transient: {conditions:?}"
+        );
+
+        // The same VM, created before the window: now it is a real failure.
+        vm.metadata.creation_timestamp =
+            Some(serde_json::from_value(serde_json::json!("2020-01-01T00:00:00Z")).expect("time"));
+        let (_, sbx) =
+            sandbox_from_vm_object_with_vmi("openshell-e2e-ns", vm, None).expect("converts");
+        let conditions = sbx.status.expect("status").conditions;
+        let ready = conditions
+            .iter()
+            .find(|condition| condition.r#type == "Ready")
+            .expect("Ready condition");
+        assert_eq!(
+            ready.reason, REASON_VM_FAILED,
+            "an ErrorUnschedulable that outlived the window is terminal: {conditions:?}"
+        );
+        assert!(
+            ready.message.contains("ErrorUnschedulable"),
+            "message must name the status: {}",
+            ready.message
+        );
     }
 
     #[test]
