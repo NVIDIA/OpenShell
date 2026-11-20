@@ -306,7 +306,6 @@ gator:blocked
   -> previous intended state blocker resolved
   -> stay blocked            blocker still present
   -> nudge responsible party blocker unchanged after 48 business hours
-  -> stop                    closed by vouch gate; wait for vouch and reopen
 
 gator:validated
   -> stop                    issue is already ready for work, no new PR or comments
@@ -317,7 +316,7 @@ gator:in-review
   -> gator:watch-pipeline    review feedback resolved
   -> nudge PR author         review feedback unanswered after 48 business hours
   -> gator:follow-up-needed  author action needed
-  -> gator:blocked           draft, vouch, DCO, merge conflict, or authority blocker
+  -> gator:blocked           draft, DCO, merge conflict, or authority blocker
 
 gator:watch-pipeline
   -> gator:approval-needed   required checks are green and maintainer approval is missing
@@ -428,7 +427,7 @@ Use 48 business hours as the default inactivity threshold for states that are wa
 State-specific monitoring:
 
 - `gator:follow-up-needed`: wait for submitter or maintainer clarification. If no substantive response arrives after 48 business hours, close as not planned or close the PR with a TTL-expired comment.
-- `gator:blocked`: re-check the blocker. If resolved, continue to the previous intended state. If still blocked after 48 business hours, nudge the responsible party unless the PR was auto-closed by the vouch system.
+- `gator:blocked`: re-check the blocker. If resolved, continue to the previous intended state. If still blocked after 48 business hours, nudge the responsible party.
 - `gator:validated`: for an issue-only item with no associated PR, stop; the issue is ready for work. If an associated PR exists or appears during a later invocation, validate the PR and move it to `gator:in-review`. If new information changes the scope, re-run validation.
 - `gator:in-review`: watch for author commits, trusted author responses, trusted maintainer comments, and unresolved gator findings. Ignore unacknowledged third-party comments. If feedback is addressed, move to E2E/test-label decision and then `gator:watch-pipeline`. If feedback is unanswered after 48 business hours, nudge the PR author. Continue watching after either action.
 - `gator:watch-pipeline`: watch checks until green, failed, or blocked. Move to `gator:approval-needed` when required checks are green, no review feedback remains, and maintainer approval is missing. Move directly to `gator:merge-ready` when required checks are green, no review feedback remains, and maintainer approval is present. Continue watching after either state transition because maintainer feedback can arrive later.
@@ -451,12 +450,9 @@ Before project-validity review, check blockers.
 Move to `gator:blocked` when any of these apply:
 
 - PR is draft and not ready for review
-- PR is blocked by the vouch system or was auto-closed for lack of vouch
 - DCO is missing or failing
 - PR has merge conflicts or `mergeStateStatus` indicates dirty/blocked for conflict reasons
 - An outside contributor's workflow runs await approval and the current user lacks maintainer authority
-
-For auto-closed vouch-gate PRs, do not treat the proposal as invalid. Comment only if useful, then stop and wait until the author is vouched and the PR is reopened.
 
 For blocked open PRs, post a concise gator comment that lists the blocker and the exact next human action. On later invocations, re-check the blocker and nudge the responsible party after 48 business hours if it remains unresolved.
 
