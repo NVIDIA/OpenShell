@@ -628,13 +628,9 @@ impl DockerComputeDriver {
                 .unwrap_or_default()
                 .iter()
                 .filter(|entry| {
-                    entry.split_once('=').is_some_and(|(name, _)| {
-                        matches!(
-                            name,
-                            openshell_core::sandbox_env::LOG_LEVEL
-                                | openshell_core::sandbox_env::TELEMETRY_ENABLED
-                        )
-                    })
+                    entry
+                        .split_once('=')
+                        .is_some_and(|(name, _)| name == openshell_core::sandbox_env::LOG_LEVEL)
                 })
                 .cloned()
                 .collect(),

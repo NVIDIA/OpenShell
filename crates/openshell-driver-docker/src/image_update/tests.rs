@@ -55,7 +55,6 @@ impl Fixture {
         ]);
         original_config.env = Some(vec![
             format!("{}=debug", openshell_core::sandbox_env::LOG_LEVEL),
-            format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED),
             "PATH=/original-image/path".into(),
         ]);
         source.host_config = Some(serde_json::from_value(serde_json::json!({

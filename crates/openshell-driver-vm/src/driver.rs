@@ -1475,10 +1475,6 @@ impl VmDriver {
             .env(
                 openshell_core::sandbox_env::LOG_LEVEL,
                 openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level),
-            )
-            .env(
-                openshell_core::sandbox_env::TELEMETRY_ENABLED,
-                openshell_core::telemetry::enabled_env_value(),
             );
         command.envs(supervisor_otlp_environment(&self.config));
         if let Some(server_name) = gateway_tls_server_name {
@@ -6752,10 +6748,6 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
         openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
     );
-    environment.insert(
-        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
-        openshell_core::telemetry::enabled_env_value().to_string(),
-    );
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs
@@ -8345,9 +8337,6 @@ mod tests {
         .expect("open test socket root");
         (dir, Arc::new(fd))
     }
-
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn vm_console_diagnostic_is_bounded_to_the_tail() {
@@ -11978,52 +11967,6 @@ mod tests {
                 openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
             ))),
             "GATEWAY_TLS_SERVER_NAME must be stripped from the guest environment"
-        );
-    }
-
-    #[test]
-    fn build_guest_environment_uses_deployment_telemetry_toggle() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        temp_env::with_vars(
-            [(
-                openshell_core::sandbox_env::TELEMETRY_ENABLED,
-                Some("false"),
-            )],
-            || {
-                let config = VmDriverConfig {
-                    grpc_endpoint: "http://127.0.0.1:8080".to_string(),
-                    ..Default::default()
-                };
-                let sandbox = Sandbox {
-                    id: "sandbox-123".to_string(),
-                    name: "sandbox-123".to_string(),
-                    spec: Some(SandboxSpec {
-                        environment: HashMap::from([(
-                            openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
-                            "true".to_string(),
-                        )]),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                };
-
-                let env = build_guest_environment(&sandbox, &config);
-                let telemetry_entries = env
-                    .iter()
-                    .filter(|entry| {
-                        entry.starts_with(&format!(
-                            "{}=",
-                            openshell_core::sandbox_env::TELEMETRY_ENABLED
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-
-                assert_eq!(telemetry_entries.len(), 1);
-                assert_eq!(
-                    telemetry_entries[0],
-                    &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
-                );
-            },
         );
     }
 

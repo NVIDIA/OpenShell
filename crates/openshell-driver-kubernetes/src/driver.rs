@@ -8346,11 +8346,6 @@ fn build_sandbox_env(
             upsert_env(&mut env, name, value);
         }
     }
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::TELEMETRY_ENABLED,
-        openshell_core::telemetry::enabled_env_value(),
-    );
     env
 }
 
@@ -9577,9 +9572,6 @@ mod tests {
         assert!(err.contains("proxy_ca_bundle"), "{err}");
         assert!(err.contains("Secret"), "{err}");
     }
-
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn kube_test_response(
         status: http::StatusCode,
@@ -12940,37 +12932,6 @@ mod tests {
                 .any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug")
         );
         assert!(cr["spec"].get("logLevel").is_none());
-    }
-
-    #[test]
-    fn telemetry_toggle_propagates_from_driver_env_to_sandbox_pod() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        temp_env::with_vars(
-            [(
-                openshell_core::sandbox_env::TELEMETRY_ENABLED,
-                Some("false"),
-            )],
-            || {
-                let spec = SandboxSpec {
-                    environment: std::collections::HashMap::from([(
-                        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
-                        "true".to_string(),
-                    )]),
-                    ..SandboxSpec::default()
-                };
-                let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
-                let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
-                    .as_array()
-                    .unwrap();
-                let telemetry_entries = env
-                    .iter()
-                    .filter(|entry| entry["name"] == openshell_core::sandbox_env::TELEMETRY_ENABLED)
-                    .collect::<Vec<_>>();
-
-                assert_eq!(telemetry_entries.len(), 1);
-                assert_eq!(telemetry_entries[0]["value"], serde_json::json!("false"));
-            },
-        );
     }
 
     #[test]

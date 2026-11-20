@@ -305,27 +305,6 @@ pub fn enabled() -> bool {
 }
 
 #[cfg(feature = "telemetry")]
-pub fn enabled_env_value() -> &'static str {
-    enabled_env_value_from(std::env::var("OPENSHELL_TELEMETRY_ENABLED").ok().as_deref())
-}
-
-/// Telemetry support is compiled out: report disabled so sandbox supervisors
-/// inherit the disabled state and skip activity collection.
-#[cfg(not(feature = "telemetry"))]
-pub fn enabled_env_value() -> &'static str {
-    "false"
-}
-
-#[cfg(feature = "telemetry")]
-fn enabled_env_value_from(value: Option<&str>) -> &'static str {
-    if telemetry_enabled_from(value) {
-        "true"
-    } else {
-        "false"
-    }
-}
-
-#[cfg(feature = "telemetry")]
 fn telemetry_enabled_from(value: Option<&str>) -> bool {
     let value = value.unwrap_or("true");
     !matches!(
@@ -628,14 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_enabled_env_value_is_normalized() {
-        assert_eq!(enabled_env_value_from(Some("false")), "false");
-        assert_eq!(enabled_env_value_from(Some("0")), "false");
-        assert_eq!(enabled_env_value_from(None), "true");
-        assert_eq!(enabled_env_value_from(Some("yes")), "true");
-    }
-
-    #[test]
     fn telemetry_endpoint_empty_disables_publish() {
         assert_eq!(telemetry_endpoint_from(Some("  ")), None);
         assert_eq!(
@@ -749,7 +720,6 @@ mod disabled_tests {
     #[test]
     fn telemetry_reports_disabled_when_compiled_out() {
         assert!(!enabled());
-        assert_eq!(enabled_env_value(), "false");
     }
 
     #[test]

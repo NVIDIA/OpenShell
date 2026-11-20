@@ -5623,11 +5623,6 @@ async fn spawn_docker_control_process(
             openshell_core::sandbox_env::LOG_LEVEL,
             openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level)
         ),
-        format!(
-            "{}={}",
-            openshell_core::sandbox_env::TELEMETRY_ENABLED,
-            openshell_core::telemetry::enabled_env_value()
-        ),
     ];
     environment.extend(image_environment);
     environment.extend(supervisor_otlp_environment(config));
@@ -6215,18 +6210,11 @@ fn build_boundary_environment(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
 ) -> Vec<String> {
-    vec![
-        format!(
-            "{}={}",
-            openshell_core::sandbox_env::LOG_LEVEL,
-            openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level)
-        ),
-        format!(
-            "{}={}",
-            openshell_core::sandbox_env::TELEMETRY_ENABLED,
-            openshell_core::telemetry::enabled_env_value()
-        ),
-    ]
+    vec![format!(
+        "{}={}",
+        openshell_core::sandbox_env::LOG_LEVEL,
+        openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level)
+    )]
 }
 
 fn docker_cdi_gpu_inventory(info: &SystemInfo) -> CdiGpuInventory {
