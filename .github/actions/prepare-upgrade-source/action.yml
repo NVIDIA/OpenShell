@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Prepare upgrade source
+description: >-
+  Download a published release's package and runtime images under
+  artifacts/upgrade, the baseline of the upgrade disruption. Run it in the job
+  that uses them, so a failure to download affects only that job.
+
+inputs:
+  tag:
+    description: Release tag to use as the baseline, such as v0.1.9
+    required: true
+  package:
+    description: Package type of the baseline; only deb is supported
+    required: false
+    default: deb
+  github-token:
+    description: Token that reads the release and pulls its images from GHCR
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The package doesn't embed the images; its gateway pins the release tag.
+    # They go in as tarballs so the guest needs no registry access.
+    - name: Download the released package
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SOURCE_TAG: ${{ inputs.tag }}
+        PACKAGE: ${{ inputs.package }}
+      run: |
+        set -euo pipefail
+        if [ -z "${SOURCE_TAG}" ]; then
+          echo "::error::no release tag to use as the upgrade baseline"
+          exit 1
+        fi
+        if [ "${PACKAGE}" != "deb" ]; then
+          echo "::error::unsupported upgrade source package type: ${PACKAGE}"
+          exit 1
+        fi
+        source_dir=artifacts/upgrade/deb/source
+        download_dir="${source_dir}/download"
+        gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" \
+          --pattern 'openshell_*_amd64.deb' \
+          --pattern openshell-checksums-sha256.txt \
+          --dir "$download_dir"
+        deb_path=$(find "$download_dir" -maxdepth 1 -type f -name 'openshell_*_amd64.deb' -print -quit)
+        if [[ -z "$deb_path" || ! -f "${download_dir}/openshell-checksums-sha256.txt" ]]; then
+          echo "::error::release ${SOURCE_TAG} did not contain the expected Debian package and checksums"
+          exit 1
+        fi
+        (
+          cd "$download_dir"
+          grep -F " $(basename "$deb_path")" openshell-checksums-sha256.txt | sha256sum --check --status
+        )
+        mv "$deb_path" "${source_dir}/openshell.deb"
+        rm -rf "$download_dir"
+
+    - name: Export the released runtime images
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SOURCE_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        image_tag="${SOURCE_TAG#v}"
+        mkdir -p artifacts/upgrade/source-images
+        for image in sandbox supervisor; do
+          docker pull "ghcr.io/nvidia/openshell/${image}:${image_tag}"
+          docker save --output "artifacts/upgrade/source-images/openshell-${image}-tmachine.tar" \
+            "ghcr.io/nvidia/openshell/${image}:${image_tag}"
+        done

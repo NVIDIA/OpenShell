@@ -47,7 +47,7 @@ defaults:
 jobs:
   compute-versions:
     name: Compute Versions
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     defaults:
       run:

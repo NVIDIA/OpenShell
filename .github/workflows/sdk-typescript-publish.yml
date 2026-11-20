@@ -44,7 +44,7 @@ permissions:
 jobs:
   publish:
     name: Publish TypeScript SDK
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
       run:

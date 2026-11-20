@@ -40,8 +40,7 @@ GitHub Actions runs four matrix cases under the existing `test:e2e` label:
 dedicated push/poll and shared graceful/abrupt takeover. These jobs use the
 reusable Kubernetes workflow, with kindnet replaced by pinned Calico for policy
 enforcement, and participate in `Core E2E result`. CI uploads the evidence even
-on failure. They still require the normal current-head `/ok to test <SHA>`
-approval mirror.
+on failure.
 
 ### Checking an already deployed release
 
