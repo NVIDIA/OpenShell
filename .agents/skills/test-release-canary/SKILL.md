@@ -97,8 +97,8 @@ Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${h
 
 `Release Dev` publishes two chart versions for every dev build (see the push steps in `.github/actions/release-helm-oci/action.yml`):
 
-- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
-- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
+- `oci://quay.io/ai-openshell/charts/openshell:0.0.0-dev` — floating, overwritten on every main push.
+- `oci://quay.io/ai-openshell/charts/openshell:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
 
 To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). The release-canary workflow itself does not currently expose `chart_version` / `image_tag` inputs.
 
@@ -111,7 +111,7 @@ kind create cluster --name release-canary-local
 
 bash e2e/support/install-agent-sandbox.sh
 
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell \
   --version 0.0.0-dev \
   --namespace openshell --create-namespace \
   --set server.disableTls=true \
@@ -147,7 +147,7 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 | `ubuntu-snap-system-docker` fails during the prover checks | The prover artifact is missing or packaged for the wrong architecture, `openshell.prover` is not exposed, missing the alias to `openshell-prover`, or not permitted to read the test policies, or its solver linkage is not runnable. | The `Install and check status` and `Check a policy boundary with the snap prover` steps, plus `snap info openshell` and `snap connections openshell`. |
 | `ubuntu-snap-docker-preflight` unexpectedly succeeds | The installer no longer fails before installing the OpenShell snap when Docker is absent or supplied by the Docker snap. | Inspect `install.log`, `docker-snap.log`, `snap list`, and snapd changes. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
-| `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
+| `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `quay.io/ai-openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |
 
 The `kubernetes` job's diagnostics step (only runs `if: failure()`) emits, in order: helm status, rendered manifest, `kubectl get all`, pod descriptions, pod logs (200 lines per container), port-forward log, gateway list, CLI version. Read it top-to-bottom — most failures fall out by the manifest or pod logs.

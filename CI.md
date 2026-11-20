@@ -454,18 +454,18 @@ Release rebuilds all stable artifacts with the stable version and publishes
 without rerunning qualification. These artifacts have different embedded versions
 from the qualified prerelease. Existing stable tags are never moved; a retry must
 resolve to the same qualified candidate. A retry rebuilds, then publishes only what
-is missing: it keeps published GHCR version tags, Helm charts, GitHub Release assets,
+is missing: it keeps published Quay version tags, Helm charts, GitHub Release assets,
 and npm versions. Snap uploads are not skipped.
 
 Stable image builds save multi-platform OCI archives as workflow artifacts without
-pushing to GHCR. Publication copies those archives, including their attestations,
-to the stable version tags and verifies their SBOMs before updating `latest`.
+pushing them. Publication copies those archives, including their attestations,
+to the stable version tags on Quay and verifies their SBOMs before updating `latest`.
 The qualified prerelease's commit-SHA image tags remain unchanged.
 
 Release is manually dispatched; pushing a stable tag does not trigger publication.
 Stable runs serialize across branches. A version older than the highest stable
 Git tag publishes versioned artifacts while preserving shared latest channels:
-GHCR `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
+Quay `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
 Each publisher rechecks the current remote stable tags immediately before
 updating its shared channel, including when a past publishing job is rerun.
 This protection applies to runs created with these workflow definitions.
@@ -517,9 +517,9 @@ gpg --output private-reports.tar.gz --decrypt codex-security-private.tar.gz.gpg
 ```
 
 Trivy accepts optional `images` and `charts`, one reference per line. Images can
-use tags or digests, such as `ghcr.io/nvidia/openshell/gateway:0.1.1-pre.1` or
-`ghcr.io/nvidia/openshell/gateway@sha256:<digest>`. Charts use versioned OCI
-references, such as `oci://ghcr.io/nvidia/openshell/helm-chart:0.1.1-pre.1`.
+use tags or digests, such as `quay.io/ai-openshell/gateway:0.1.1-pre.1` or
+`quay.io/ai-openshell/gateway@sha256:<digest>`. Charts use versioned OCI
+references, such as `oci://quay.io/ai-openshell/charts/openshell:0.1.1-pre.1`.
 Artifacts must already be published and accessible to the workflow. The caller
 selects artifacts matching the candidate; the workflow does not verify that
 association. Without artifact inputs, Trivy scans only the candidate's deployment
@@ -564,7 +564,7 @@ Run the scanner locally with:
 
 ```shell
 nix develop --command tasks/scripts/trivy-scan.sh config
-nix develop --command tasks/scripts/trivy-scan.sh images ghcr.io/nvidia/openshell/gateway:dev
+nix develop --command tasks/scripts/trivy-scan.sh images quay.io/ai-openshell/gateway:dev
 nix develop --command tasks/scripts/trivy-scan.sh gate
 nix develop --command tasks/scripts/trivy-scan.sh prepare-sarif
 ```
@@ -734,9 +734,11 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 
 Each step that publishes to an external registry, store, or site lives in its own workflow with both `workflow_call` and `workflow_dispatch`. Release calls it, and a maintainer can dispatch it to finish one missing publication for an existing release without rerunning Release. Dispatch inputs identify an already-published release, such as its tag and source commit; the workflow verifies them before publishing and should skip what is already published. Keep the manual trigger when changing or moving a publisher.
 
+CI builds push SHA-tagged images to the private CI registry, `ghcr.io/<owner>/openshell/<component>:<sha>`. Releases promote them to the public release registry: images to `quay.io/ai-openshell/{gateway,sandbox,supervisor}` and charts to `oci://quay.io/ai-openshell/charts/{openshell,openshell-workspace}`. Jobs that write to Quay run in the `release` environment and log in as the robot `ai-openshell+openshell_release` with the job's OIDC token through `ai-openshell/workflows/quay-login`; there is no stored registry secret. `ghcr.io/nvidia/openshell` is frozen and receives no new releases.
+
 | File | Role |
 |---|---|
-| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries and packages, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
+| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries and packages, promotes the images to `quay.io/ai-openshell/<component>` as `:dev` and `:<sha>`, and pushes the Helm chart as `oci://quay.io/ai-openshell/charts/openshell:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. Published artifacts are never overwritten: a rerun fills in what is missing, and a bad published artifact is fixed by releasing a new patch version. |
 | `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
