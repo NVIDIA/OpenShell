@@ -59,6 +59,7 @@ impl CredentialDriverService {
 struct VaultDriverSettings {
     address: Url,
     ca_bundle: Option<PathBuf>,
+    api_path_prefix: Option<String>,
     mount: String,
     kv_version: KvVersion,
     auth: VaultAuthSettings,
@@ -87,6 +88,7 @@ enum KvVersion {
 struct VaultDriverConfig {
     address: Option<String>,
     ca_bundle: Option<PathBuf>,
+    api_path_prefix: Option<String>,
     mount: Option<String>,
     kv_version: Option<String>,
     auth_method: Option<String>,
@@ -472,9 +474,17 @@ impl VaultCredentialDriver {
     }
 
     fn url_for_path(&self, path: &str) -> Result<Url, Status> {
+        // Enterprise Vault deployments may route API requests through an
+        // extra path prefix immediately after /v1/. The prefix belongs to
+        // the request URL only: logical secret paths and persisted handles
+        // never include it.
+        let api_path = self.settings.api_path_prefix.as_deref().map_or_else(
+            || format!("v1/{path}"),
+            |api_path_prefix| format!("v1/{api_path_prefix}/{path}"),
+        );
         self.settings
             .address
-            .join(&format!("v1/{path}"))
+            .join(&api_path)
             .map_err(|err| Status::internal(format!("failed to build Vault URL: {err}")))
     }
 }
@@ -587,6 +597,11 @@ impl VaultDriverSettings {
                 "[openshell.credential_drivers.vault] ca_bundle requires an https address",
             ));
         }
+        let api_path_prefix = config
+            .api_path_prefix
+            .as_deref()
+            .map(|value| path_config("api_path_prefix", value))
+            .transpose()?;
         let mount = config
             .mount
             .as_deref()
@@ -652,6 +667,7 @@ impl VaultDriverSettings {
         Ok(Self {
             address,
             ca_bundle: config.ca_bundle,
+            api_path_prefix,
             mount,
             kv_version,
             auth,
@@ -1160,6 +1176,153 @@ mod tests {
 
         assert!(matches!(settings.auth, VaultAuthSettings::TokenFile { .. }));
         assert_eq!(settings.kv_version, KvVersion::V2);
+    }
+
+    #[test]
+    fn settings_parse_api_path_prefix_with_kubernetes_auth() {
+        let settings = VaultDriverSettings::from_table(&table(&[
+            (
+                "address",
+                toml::Value::String("https://vault:8200".to_string()),
+            ),
+            (
+                "api_path_prefix",
+                toml::Value::String("business-unit".to_string()),
+            ),
+            ("auth_method", toml::Value::String("kubernetes".to_string())),
+            ("role", toml::Value::String("openshell-gateway".to_string())),
+        ]))
+        .unwrap();
+
+        assert_eq!(settings.api_path_prefix.as_deref(), Some("business-unit"));
+        assert!(matches!(
+            settings.auth,
+            VaultAuthSettings::Kubernetes { .. }
+        ));
+    }
+
+    #[test]
+    fn settings_parse_api_path_prefix_with_token_file_auth() {
+        let settings = VaultDriverSettings::from_table(&table(&[
+            (
+                "address",
+                toml::Value::String("https://vault:8200".to_string()),
+            ),
+            (
+                "api_path_prefix",
+                toml::Value::String("business-unit".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String("/run/secrets/vault-token".to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(settings.api_path_prefix.as_deref(), Some("business-unit"));
+        assert!(matches!(settings.auth, VaultAuthSettings::TokenFile { .. }));
+    }
+
+    #[test]
+    fn settings_api_path_prefix_defaults_to_none() {
+        let settings = VaultDriverSettings::from_table(&table(&[
+            (
+                "address",
+                toml::Value::String("https://vault:8200".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String("/run/secrets/vault-token".to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(settings.api_path_prefix, None);
+    }
+
+    #[test]
+    fn settings_reject_invalid_api_path_prefix() {
+        for api_path_prefix in [
+            "",
+            " ",
+            "/leading",
+            "trailing/",
+            "empty//segment",
+            "..",
+            "a/../b",
+            ".",
+            "two words",
+            "query?x=1",
+            "fragment#x",
+            "percent%20",
+        ] {
+            let err = VaultDriverSettings::from_table(&table(&[
+                (
+                    "address",
+                    toml::Value::String("https://vault:8200".to_string()),
+                ),
+                (
+                    "api_path_prefix",
+                    toml::Value::String(api_path_prefix.to_string()),
+                ),
+                ("auth_method", toml::Value::String("token_file".to_string())),
+                (
+                    "token_path",
+                    toml::Value::String("/run/secrets/vault-token".to_string()),
+                ),
+            ]))
+            .unwrap_err();
+
+            assert!(
+                err.to_string().contains("api_path_prefix"),
+                "{api_path_prefix:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_for_path_inserts_api_path_prefix_immediately_after_v1() {
+        let token = token_file("dev-token");
+        let mut config = table(&[
+            (
+                "address",
+                toml::Value::String("http://127.0.0.1:8200".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]);
+        let without_api_path_prefix = VaultCredentialDriver::from_config(&config).unwrap();
+        config.insert(
+            "api_path_prefix".to_string(),
+            toml::Value::String("business-unit".to_string()),
+        );
+        let with_api_path_prefix = VaultCredentialDriver::from_config(&config).unwrap();
+
+        for api_path in [
+            "auth/kubernetes/login",
+            "secret/data/providers/openai",
+            "secret/metadata/providers/openai",
+        ] {
+            assert_eq!(
+                without_api_path_prefix
+                    .url_for_path(api_path)
+                    .unwrap()
+                    .as_str(),
+                format!("http://127.0.0.1:8200/v1/{api_path}")
+            );
+            assert_eq!(
+                with_api_path_prefix
+                    .url_for_path(api_path)
+                    .unwrap()
+                    .as_str(),
+                format!("http://127.0.0.1:8200/v1/business-unit/{api_path}")
+            );
+        }
     }
 
     #[test]
@@ -1842,5 +2005,239 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn api_path_prefix_kubernetes_auth_kv2_secret() {
+        let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path(
+            "test-workspace",
+            "test-provider-id",
+            "github-prod",
+            "GITHUB_TOKEN",
+            "test-provider-id",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/business-unit/auth/kubernetes/login"))
+            .and(body_string_contains("openshell-gateway"))
+            .and(body_string_contains("jwt-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "auth": {
+                    "client_token": "bao-token"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/business-unit/secret/data/{logical_path}"
+            )))
+            .and(header("x-vault-token", "bao-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "data": {
+                        "value": "ghp-test"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+        let jwt_file = token_file("jwt-test\n");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            ("address", toml::Value::String(mock_server.uri())),
+            (
+                "api_path_prefix",
+                toml::Value::String("business-unit".to_string()),
+            ),
+            ("auth_method", toml::Value::String("kubernetes".to_string())),
+            ("role", toml::Value::String("openshell-gateway".to_string())),
+            (
+                "service_account_token_path",
+                toml::Value::String(jwt_file.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        let resolved = driver
+            .resolve_credentials(vec![ResolveCredentialRequest {
+                request_id: "credential-0".to_string(),
+                provider: "github-prod".to_string(),
+                credential_key: "GITHUB_TOKEN".to_string(),
+                handle: Some(handle(&format!("v1:{logical_path}"))),
+                workspace: "test-workspace".to_string(),
+                provider_id: "test-provider-id".to_string(),
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(resolved[0].value, "ghp-test");
+    }
+
+    #[tokio::test]
+    async fn api_path_prefix_token_file_kv2_handles_survive_restart() {
+        let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path(
+            "default",
+            "prov-123",
+            "nvidia-prod",
+            "NVIDIA_API_KEY",
+            "prov-123",
+        );
+        let data_path = format!("/v1/business-unit/secret/data/{logical_path}");
+        Mock::given(method("POST"))
+            .and(path(data_path.as_str()))
+            .and(header("x-vault-token", "dev-token"))
+            .and(body_string_contains("nvapi-test"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(data_path.as_str()))
+            .and(header("x-vault-token", "dev-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "data": {
+                        "value": "nvapi-test"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!(
+                "/v1/business-unit/secret/metadata/{logical_path}"
+            )))
+            .and(header("x-vault-token", "dev-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+        let token_file = token_file("dev-token\n");
+        let config = table(&[
+            ("address", toml::Value::String(mock_server.uri())),
+            (
+                "api_path_prefix",
+                toml::Value::String("business-unit".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token_file.path().display().to_string()),
+            ),
+        ]);
+        let driver = VaultCredentialDriver::from_config(&config).unwrap();
+
+        let stored = driver
+            .store_credential(StoreCredentialRequest {
+                provider: "nvidia-prod".to_string(),
+                credential_key: "NVIDIA_API_KEY".to_string(),
+                value: "nvapi-test".to_string(),
+                existing_handle: None,
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
+                object_id: "prov-123".to_string(),
+            })
+            .await
+            .unwrap();
+        // The prefix is a URL routing concern only: handles keep the logical
+        // path so they stay resolvable across restarts and config changes.
+        assert_eq!(stored.handle, format!("v1:{logical_path}"));
+
+        let restarted = VaultCredentialDriver::from_config(&config).unwrap();
+        let resolved = restarted
+            .resolve_credentials(vec![ResolveCredentialRequest {
+                request_id: "credential-0".to_string(),
+                provider: "nvidia-prod".to_string(),
+                credential_key: "NVIDIA_API_KEY".to_string(),
+                handle: Some(stored.clone()),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(resolved[0].value, "nvapi-test");
+
+        restarted
+            .delete_credential(DeleteCredentialRequest {
+                provider: "nvidia-prod".to_string(),
+                credential_key: "NVIDIA_API_KEY".to_string(),
+                handle: Some(stored),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_path_prefix_token_file_kv1_store_and_resolve() {
+        let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path(
+            "default",
+            "prov-123",
+            "nvidia-prod",
+            "NVIDIA_API_KEY",
+            "prov-123",
+        );
+        let api_path = format!("/v1/business-unit/secret/{logical_path}");
+        Mock::given(method("POST"))
+            .and(path(api_path.as_str()))
+            .and(header("x-vault-token", "dev-token"))
+            .and(body_string_contains("nvapi-test"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path.as_str()))
+            .and(header("x-vault-token", "dev-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "value": "nvapi-test"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+        let token_file = token_file("dev-token\n");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            ("address", toml::Value::String(mock_server.uri())),
+            (
+                "api_path_prefix",
+                toml::Value::String("business-unit".to_string()),
+            ),
+            ("kv_version", toml::Value::String("1".to_string())),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token_file.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        let stored = driver
+            .store_credential(StoreCredentialRequest {
+                provider: "nvidia-prod".to_string(),
+                credential_key: "NVIDIA_API_KEY".to_string(),
+                value: "nvapi-test".to_string(),
+                existing_handle: None,
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
+                object_id: "prov-123".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored.handle, format!("v1:{logical_path}"));
+
+        let resolved = driver
+            .resolve_credentials(vec![ResolveCredentialRequest {
+                request_id: "credential-0".to_string(),
+                provider: "nvidia-prod".to_string(),
+                credential_key: "NVIDIA_API_KEY".to_string(),
+                handle: Some(stored),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(resolved[0].value, "nvapi-test");
     }
 }

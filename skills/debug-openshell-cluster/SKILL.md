@@ -197,6 +197,11 @@ or the bundle does not contain the Vault server's issuer. A hostname mismatch
 means the HTTPS `address` host is absent from the server certificate SANs; keep
 verification enabled and issue a certificate for the service DNS name.
 
+`api_path_prefix` inserts an enterprise routing prefix immediately after `/v1/` in every
+Vault API URL, for example `/v1/business-unit/auth/kubernetes/login`. If the
+platform routes by path prefix and login or KV requests return 404, check that
+`api_path_prefix` matches the platform's prefix; omit it for standard Vault paths.
+
 For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
 
 ```bash
