@@ -25,7 +25,7 @@ Summary:        Safe, sandboxed runtimes for autonomous AI agents
 # Apache-2.0 SPDX headers or fall under the repository LICENSE. The unit file is
 # generated from this spec. Re-check when Cargo.lock changes.
 License:        Apache-2.0 AND BSD-3-Clause AND CC0-1.0 AND CDLA-Permissive-2.0 AND ISC AND MIT AND Unicode-3.0 AND Zlib
-URL:            https://github.com/NVIDIA/OpenShell
+URL:            https://github.com/ai-openshell/OpenShell
 Source0: openshell-%{openshell_version}.tar.gz
 Source1: openshell-%{openshell_version}-vendor.tar.xz
 
@@ -143,7 +143,7 @@ install -d %{buildroot}%{_userunitdir}
 cat > %{buildroot}%{_userunitdir}/%{name}-gateway.service << 'EOF'
 [Unit]
 Description=OpenShell Gateway (user)
-Documentation=https://github.com/NVIDIA/OpenShell
+Documentation=https://github.com/ai-openshell/OpenShell
 After=podman.socket
 Wants=podman.socket
 
