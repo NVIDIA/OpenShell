@@ -242,10 +242,14 @@ fi
             },
         )
         .await?;
+    let final_details = sandbox.get_json().await?;
     testkit::ensure!(
-        restarted["restart_policy"] == "on-failure",
-        "the restart policy after the restart is {}; expected \"on-failure\"",
-        restarted["restart_policy"]
+        final_details["phase"] == "Ready"
+            && final_details["restart_count"] == 1
+            && final_details["main_process_instance_id"] == restarted["main_process_instance_id"]
+            && final_details["restart_policy"] == "on-failure",
+        "expected the same Ready replacement after reading the workspace, with one restart and the on-failure policy; \
+         replacement: {restarted}; final state: {final_details}"
     );
     Ok(())
 }
