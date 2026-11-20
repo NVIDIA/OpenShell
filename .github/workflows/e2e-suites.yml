@@ -96,6 +96,7 @@ jobs:
             {"environment":"fedora-podman-rootful-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful-keycloak","installer":"deb","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful-oidc","installer":"deb","family":"features","package":"oidc-auth","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless","installer":"rpm","family":"features","package":"oci-image","gateway":"openshell","runner":"ubuntu-24.04"},
