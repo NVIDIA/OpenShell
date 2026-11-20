@@ -13,7 +13,9 @@ bind_socket = "/var/lib/openshell/run/compute-driver.sock"
 expected_peer_pid = 4242
 log_level = "info"
 gateway_name = "gateway-a"
+grpc_endpoint = "https://127.0.0.1:8080"
 tls_ca = "/etc/openshell/tls/ca.pem"
+upstream_proxy_ca_bundle = "/etc/openshell/proxy-ca.pem"
 
 [gateway.admission]
 allow_driver_config = true
@@ -44,10 +46,9 @@ key_file = "/etc/openshell/otlp/key.pem"
 [gateway.upstream_proxy]
 https_proxy = "http://proxy.example:3128"
 no_proxy = "localhost,127.0.0.1"
-auth_file = "/etc/openshell/proxy-auth"
-auth_allow_insecure = true
-connect_by_hostname = true
-ca_bundle = "/etc/openshell/proxy-ca.pem"
+proxy_auth_file = "/etc/openshell/proxy-auth"
+proxy_auth_allow_insecure = true
+proxy_connect_by_hostname = true
 
 [gateway.network_trust]
 path = "/var/lib/openshell/trust/bundle.pem"

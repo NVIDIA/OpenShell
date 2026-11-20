@@ -9,8 +9,7 @@
 
 use std::path::Path;
 
-use openshell_core::resource_admission::ResourceAdmissionConfig;
-use openshell_core::sandbox_env::{self, OtlpExport};
+use openshell_core::resource_admission::DriverAdmissionConfig;
 use openshell_core::{Error, NetworkSupervisorTrustBundle, Result, UpstreamProxyConfig};
 use openshell_driver_sdk as sdk;
 use openshell_server::config_file::OtlpConfig;
@@ -20,9 +19,11 @@ pub struct GatewayStartup<'a> {
     pub bind_socket: &'a Path,
     pub log_level: &'a str,
     pub gateway_name: &'a str,
+    /// Endpoint sandboxes use to reach the gateway, already resolved.
+    pub grpc_endpoint: &'a str,
+    /// The gateway's `guest_tls_ca`, for an `https://` `grpc_endpoint` only.
     pub tls_ca: Option<&'a Path>,
-    pub allow_driver_config: bool,
-    pub resource_admission: &'a ResourceAdmissionConfig,
+    pub admission: &'a DriverAdmissionConfig,
     pub otlp: Option<&'a OtlpConfig>,
     pub upstream_proxy: &'a UpstreamProxyConfig,
     pub proxy_ca_bundle: Option<&'a Path>,
@@ -60,41 +61,20 @@ impl GatewayStartup<'_> {
             expected_peer_pid: std::process::id(),
             log_level: self.log_level.to_string(),
             gateway_name: self.gateway_name.to_string(),
+            grpc_endpoint: self.grpc_endpoint.to_string(),
             tls_ca: self.tls_ca.map(Path::to_path_buf),
-            admission: sdk::Admission {
-                allow_driver_config: self.allow_driver_config,
-                resource_admission: sdk::ResourceAdmission {
-                    enabled: self.resource_admission.enabled,
-                    required_labels: self.resource_admission.required_labels.clone(),
-                },
-            },
+            upstream_proxy_ca_bundle: self.proxy_ca_bundle.map(Path::to_path_buf),
+            admission: self.admission.clone(),
             telemetry: sdk::Telemetry {
-                traces: supervisor_otlp.traces.map(export),
-                ocsf: supervisor_otlp.ocsf.map(export),
-                agent: supervisor_otlp.agent.map(export),
+                traces: supervisor_otlp.traces,
+                ocsf: supervisor_otlp.ocsf,
+                agent: supervisor_otlp.agent,
                 collector: self.otlp.and_then(collector_tls),
             },
-            upstream_proxy: sdk::UpstreamProxy {
-                https_proxy: self.upstream_proxy.https_proxy.clone(),
-                no_proxy: self.upstream_proxy.no_proxy.clone(),
-                auth_file: self.upstream_proxy.proxy_auth_file.clone(),
-                auth_allow_insecure: self.upstream_proxy.proxy_auth_allow_insecure == Some(true),
-                connect_by_hostname: self.upstream_proxy.proxy_connect_by_hostname == Some(true),
-                ca_bundle: self.proxy_ca_bundle.map(Path::to_path_buf),
-            },
+            upstream_proxy: self.upstream_proxy.clone(),
             network_trust,
         };
         Ok(sdk::StartupDocument::new(gateway, driver_config))
-    }
-}
-
-fn export(export: OtlpExport) -> sdk::OtlpExport {
-    sdk::OtlpExport {
-        endpoint: export.endpoint,
-        protocol: match export.protocol {
-            sandbox_env::OtlpProtocol::Grpc => sdk::OtlpProtocol::Grpc,
-            sandbox_env::OtlpProtocol::HttpProtobuf => sdk::OtlpProtocol::HttpProtobuf,
-        },
     }
 }
 
@@ -113,6 +93,8 @@ fn collector_tls(otlp: &OtlpConfig) -> Option<sdk::CollectorTls> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::resource_admission::ResourceAdmissionConfig;
+    use openshell_core::sandbox_env::OtlpProtocol;
     use openshell_server::config_file::{
         AgentOtlpConfig, OcsfOtlpConfig, OtlpCollectorConfig, OtlpTracesConfig,
     };
@@ -131,12 +113,9 @@ mod tests {
             std::fs::write(&path, pem).unwrap();
             path
         });
-        OtlpCollectorConfig::new(
-            "https://collector.example:4317",
-            sandbox_env::OtlpProtocol::Grpc,
-        )
-        .with_tls_files(Some(ca), Some(cert), Some(key))
-        .unwrap()
+        OtlpCollectorConfig::new("https://collector.example:4317", OtlpProtocol::Grpc)
+            .with_tls_files(Some(ca), Some(cert), Some(key))
+            .unwrap()
     }
 
     /// Every field the gateway can resolve is set, so a field added to the
@@ -154,23 +133,26 @@ mod tests {
             ocsf: Some(OcsfOtlpConfig {
                 collector: OtlpCollectorConfig::new(
                     "https://collector.example:4318",
-                    sandbox_env::OtlpProtocol::HttpProtobuf,
+                    OtlpProtocol::HttpProtobuf,
                 ),
                 schema_version: None,
             }),
             agent: Some(AgentOtlpConfig {
                 collector: OtlpCollectorConfig::new(
                     "https://collector.example:4319",
-                    sandbox_env::OtlpProtocol::Grpc,
+                    OtlpProtocol::Grpc,
                 ),
             }),
         };
-        let admission = ResourceAdmissionConfig {
-            enabled: true,
-            required_labels: BTreeMap::from([(
-                "openshell.ai/sandbox-attachable".to_string(),
-                "true".to_string(),
-            )]),
+        let admission = DriverAdmissionConfig {
+            allow_driver_config: true,
+            resource_admission: ResourceAdmissionConfig {
+                enabled: true,
+                required_labels: BTreeMap::from([(
+                    "openshell.ai/sandbox-attachable".to_string(),
+                    "true".to_string(),
+                )]),
+            },
         };
         let proxy = UpstreamProxyConfig {
             https_proxy: Some("http://proxy.example:3128".into()),
@@ -194,9 +176,9 @@ mod tests {
             bind_socket: Path::new("/var/lib/openshell/run/compute-driver.sock"),
             log_level: "info",
             gateway_name: "gateway-a",
+            grpc_endpoint: "https://127.0.0.1:8080",
             tls_ca: Some(Path::new("/etc/openshell/tls/ca.pem")),
-            allow_driver_config: true,
-            resource_admission: &admission,
+            admission: &admission,
             otlp: Some(&otlp),
             upstream_proxy: &proxy,
             proxy_ca_bundle: Some(Path::new("/etc/openshell/proxy-ca.pem")),
@@ -228,15 +210,15 @@ mod tests {
 
     #[test]
     fn an_unconfigured_gateway_omits_optional_settings() {
-        let admission = ResourceAdmissionConfig::default();
+        let admission = DriverAdmissionConfig::default();
         let proxy = UpstreamProxyConfig::default();
         let document = GatewayStartup {
             bind_socket: Path::new("/run/driver.sock"),
             log_level: "debug",
             gateway_name: "gateway",
+            grpc_endpoint: "http://127.0.0.1:8080",
             tls_ca: None,
-            allow_driver_config: false,
-            resource_admission: &admission,
+            admission: &admission,
             otlp: None,
             upstream_proxy: &proxy,
             proxy_ca_bundle: None,
@@ -263,15 +245,15 @@ mod tests {
             "sha256:abc",
             PathBuf::from("/var/lib/openshell/trust/bundle.pem"),
         );
-        let admission = ResourceAdmissionConfig::default();
+        let admission = DriverAdmissionConfig::default();
         let proxy = UpstreamProxyConfig::default();
         let text = GatewayStartup {
             bind_socket: Path::new("/run/driver.sock"),
             log_level: "info",
             gateway_name: "gateway",
+            grpc_endpoint: "http://127.0.0.1:8080",
             tls_ca: None,
-            allow_driver_config: false,
-            resource_admission: &admission,
+            admission: &admission,
             otlp: None,
             upstream_proxy: &proxy,
             proxy_ca_bundle: None,

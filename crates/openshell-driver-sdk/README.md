@@ -9,9 +9,10 @@ a fixed schema, and a `[driver_config]` table that is the operator's
 `driver_config`; the driver deserializes and validates it.
 
 This crate owns the document types, bounded parsing, and the schema version
-check. It defines its own types and depends on neither `openshell-core` nor the
-gateway, so operator configuration changes never change the contract and a
-driver in another repository can depend on it alone. Creating the file with
+check. Where `openshell-core` already defines a type the gateway and drivers
+share (OTLP exports, admission policy, upstream proxy settings), the document
+uses it directly, so there is one definition. Those types' serialized form is
+part of the contract, and changing it is a schema change. Creating the file with
 restrictive permissions and launching the driver belong to the gateway.
 
 ## Versioning
@@ -31,4 +32,6 @@ populated in it. Machine-checked breaking-change detection is not in place yet.
 - Network trust is passed as the staged artifact's path, digest, and
   certificate count. The certificate bytes do not cross the process boundary.
 - OTLP export headers are secrets and are not in the document.
+- `grpc_endpoint` is the endpoint sandboxes use to reach the gateway, resolved
+  by the gateway. `tls_ca` is set only when it is `https://`.
 - Proxy credentials are referenced by file path, not included.

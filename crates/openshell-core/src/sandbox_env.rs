@@ -109,7 +109,8 @@ impl From<OtlpProtocol> for openshell_otel::Protocol {
 }
 
 /// One OTLP collector that a supervisor exports to.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OtlpExport {
     pub endpoint: String,
     pub protocol: OtlpProtocol,

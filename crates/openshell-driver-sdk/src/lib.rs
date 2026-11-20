@@ -8,9 +8,10 @@
 //! [`GatewayContext`], and the operator's `driver_config` table, which the
 //! gateway does not interpret.
 //!
-//! This crate defines its own types and depends on neither `openshell-core`
-//! nor the gateway, so operator-facing configuration changes never change the
-//! contract and drivers in other repositories can use it on its own.
+//! Where `openshell-core` already defines a type the gateway and drivers share
+//! (OTLP exports, admission, upstream proxy), the document uses it directly, so
+//! there is one definition to keep in step. Those types' serialized form is
+//! part of the contract: changing it is a schema change.
 //!
 //! # Versioning
 //!
@@ -20,9 +21,11 @@
 //! before decoding the rest, so a mismatch reports both versions instead of an
 //! unrelated field error.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use openshell_core::UpstreamProxyConfig;
+use openshell_core::resource_admission::DriverAdmissionConfig;
+use openshell_core::sandbox_env::OtlpExport;
 use serde::{Deserialize, Serialize};
 
 /// Schema version this crate reads and writes.
@@ -125,33 +128,28 @@ pub struct GatewayContext {
     pub expected_peer_pid: u32,
     pub log_level: String,
     pub gateway_name: String,
-    /// CA certificate the gateway's TLS endpoints chain to.
+    /// Endpoint sandboxes use to reach the gateway. The gateway resolves it
+    /// from the operator's setting or its own listener, which the driver
+    /// cannot do.
+    pub grpc_endpoint: String,
+    /// CA certificate the supervisors use to authenticate the gateway. Set
+    /// only when `grpc_endpoint` is `https://`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<PathBuf>,
-    pub admission: Admission,
+    /// CA bundle trusted for the upstream proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy_ca_bundle: Option<PathBuf>,
+    /// Resource admission policy the driver must apply and acknowledge.
+    pub admission: DriverAdmissionConfig,
     #[serde(default, skip_serializing_if = "Telemetry::is_empty")]
     pub telemetry: Telemetry,
-    #[serde(default, skip_serializing_if = "UpstreamProxy::is_empty")]
-    pub upstream_proxy: UpstreamProxy,
+    /// Corporate forward proxy the driver reaches the network through.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub upstream_proxy: UpstreamProxyConfig,
     /// Staged network trust artifact. Only its location and identity cross the
     /// process boundary, never the certificate bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_trust: Option<NetworkTrust>,
-}
-
-/// Resource admission policy the driver must apply and acknowledge.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Admission {
-    pub allow_driver_config: bool,
-    pub resource_admission: ResourceAdmission,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceAdmission {
-    pub enabled: bool,
-    pub required_labels: BTreeMap<String, String>,
 }
 
 /// OTLP exports the driver and the supervisors it starts must use.
@@ -178,21 +176,6 @@ impl Telemetry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OtlpExport {
-    pub endpoint: String,
-    pub protocol: OtlpProtocol,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OtlpProtocol {
-    #[serde(rename = "grpc")]
-    Grpc,
-    #[serde(rename = "http/protobuf")]
-    HttpProtobuf,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorTls {
@@ -202,33 +185,6 @@ pub struct CollectorTls {
     pub cert_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_file: Option<PathBuf>,
-}
-
-/// Corporate forward proxy the driver reaches the network through.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpstreamProxy {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub https_proxy: Option<String>,
-    /// Comma-separated bypass list.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub no_proxy: Option<String>,
-    /// Path to a `user:pass` credential file, not the credential itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_file: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub auth_allow_insecure: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub connect_by_hostname: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca_bundle: Option<PathBuf>,
-}
-
-impl UpstreamProxy {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
 }
 
 /// Location and identity of the staged network trust bundle.
@@ -243,9 +199,8 @@ pub struct NetworkTrust {
     pub certificate_count: u32,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference.
-fn is_false(value: &bool) -> bool {
-    !*value
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 #[cfg(test)]
@@ -260,16 +215,12 @@ mod tests {
             expected_peer_pid: 1,
             log_level: "info".into(),
             gateway_name: "gateway".into(),
+            grpc_endpoint: "http://127.0.0.1:8080".into(),
             tls_ca: None,
-            admission: Admission {
-                allow_driver_config: false,
-                resource_admission: ResourceAdmission {
-                    enabled: false,
-                    required_labels: BTreeMap::new(),
-                },
-            },
+            upstream_proxy_ca_bundle: None,
+            admission: DriverAdmissionConfig::default(),
             telemetry: Telemetry::default(),
-            upstream_proxy: UpstreamProxy::default(),
+            upstream_proxy: UpstreamProxyConfig::default(),
             network_trust: None,
         }
     }
