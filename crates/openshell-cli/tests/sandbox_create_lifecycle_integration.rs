@@ -2892,6 +2892,34 @@ async fn service_expose_forwards_bearer_passthrough_mode() {
 }
 
 #[tokio::test]
+async fn create_upload_keeps_the_id_from_the_create_response() {
+    let server = run_server().await;
+    let state = &server.openshell.state;
+    // The name already points at a replacement when the first upload starts.
+    state.ssh_session_revocations.store(1, Ordering::SeqCst);
+    state
+        .replace_after_first_ssh_revoke
+        .store(true, Ordering::SeqCst);
+    let source = helpers::tempdir().unwrap();
+    let file = source.path().join("payload");
+    fs::write(&file, b"for the original sandbox").unwrap();
+    let output = run_cli_sandbox_create(
+        &server,
+        "upload-target",
+        &[
+            "--detach",
+            "--no-git-ignore",
+            "--upload",
+            file.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sandbox was replaced"));
+    assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn copy_retry_refuses_and_revokes_a_same_name_replacement() {
     let bin = helpers::tempdir().unwrap();
     let xdg = helpers::tempdir().unwrap();
@@ -2998,17 +3026,19 @@ async fn ssh_profile_credentials_follow_the_selected_endpoint() {
     let other_state = &other.openshell.state;
     other_state
         .ssh_session_failures_remaining
-        .store(1, Ordering::SeqCst);
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
-        .args(["ssh-proxy", "--server", &other.endpoint, "--name", "demo"])
-        .env("OPENSHELL_GATEWAY", "openshell")
-        .env("XDG_CONFIG_HOME", xdg.path())
-        .env("OPENSHELL_TELEMETRY_ENABLED", "false")
-        .output()
-        .await
-        .unwrap();
-    assert!(String::from_utf8_lossy(&output.stderr).contains("sandbox is not ready"));
-    assert_eq!(other_state.ssh_session_requests.load(Ordering::SeqCst), 1);
+        .store(2, Ordering::SeqCst);
+    for flag in ["--server", "--gateway-endpoint"] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+            .args(["ssh-proxy", flag, &other.endpoint, "--name", "demo"])
+            .env("OPENSHELL_GATEWAY", "openshell")
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .env("OPENSHELL_TELEMETRY_ENABLED", "false")
+            .output()
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stderr).contains("sandbox is not ready"));
+    }
+    assert_eq!(other_state.ssh_session_requests.load(Ordering::SeqCst), 2);
     assert_eq!(
         other_state
             .ssh_requests_with_cached_bearer

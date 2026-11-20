@@ -4344,6 +4344,11 @@ async fn run_async() -> Result<()> {
                     )
                 } else if gateway_name.is_some() {
                     (gateway_name, None)
+                } else if cli.gateway_endpoint.is_some() {
+                    (
+                        cli.gateway.filter(|_| explicit_gateway),
+                        cli.gateway_endpoint,
+                    )
                 } else {
                     (cli.gateway, cli.gateway_endpoint)
                 };

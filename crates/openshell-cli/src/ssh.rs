@@ -1429,17 +1429,21 @@ pub async fn sandbox_sync_up_files(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let source = UploadSource::FileList {
-        base_dir: base_dir.to_path_buf(),
-        files: files.to_vec(),
-        archive_prefix: file_list_archive_prefix(local_path),
-    };
-    upload_source(server, name, dest, source, tls, workspace)
-        .await
-        .map(|_| ())
+    sandbox_upload_planned(
+        crate::run::SandboxUploadPlan::GitAware {
+            base_dir: base_dir.to_owned(),
+            files: files.to_vec(),
+        },
+        server,
+        name,
+        None,
+        local_path,
+        dest,
+        tls,
+        workspace,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Push a local path (file or directory) into a sandbox using tar-over-SSH.
@@ -1456,6 +1460,19 @@ pub async fn sandbox_sync_up(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<String> {
+    upload_source(
+        server,
+        name,
+        sandbox_path,
+        path_upload_source(local_path)?,
+        tls,
+        workspace,
+        None,
+    )
+    .await
+}
+
+fn path_upload_source(local_path: &Path) -> Result<UploadSource> {
     let local_path_is_file_like = local_upload_path_is_file_like(local_path);
     let tar_name = if local_path_is_file_like {
         local_path
@@ -1470,11 +1487,36 @@ pub async fn sandbox_sync_up(
         directory_upload_prefix(local_path)
     };
 
-    let source = UploadSource::SinglePath {
-        local_path: local_path.to_path_buf(),
+    Ok(UploadSource::SinglePath {
+        local_path: local_path.to_owned(),
         tar_name,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sandbox_upload_planned(
+    plan: crate::run::SandboxUploadPlan,
+    server: &str,
+    name: &str,
+    expected_id: Option<&str>,
+    local_path: &Path,
+    dest: Option<&str>,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<Option<String>> {
+    use crate::run::SandboxUploadPlan;
+    let source = match plan {
+        SandboxUploadPlan::GitAware { files, .. } if files.is_empty() => return Ok(None),
+        SandboxUploadPlan::GitAware { base_dir, files } => UploadSource::FileList {
+            base_dir,
+            files,
+            archive_prefix: file_list_archive_prefix(local_path),
+        },
+        SandboxUploadPlan::Regular => path_upload_source(local_path)?,
     };
-    upload_source(server, name, sandbox_path, source, tls, workspace).await
+    let single_path = matches!(source, UploadSource::SinglePath { .. });
+    let uploaded = upload_source(server, name, dest, source, tls, workspace, expected_id).await?;
+    Ok(single_path.then_some(uploaded))
 }
 
 async fn upload_source(
@@ -1484,11 +1526,20 @@ async fn upload_source(
     source: UploadSource,
     tls: &TlsOptions,
     workspace: &str,
+    expected_id: Option<&str>,
 ) -> Result<String> {
     let selected = tokio::sync::OnceCell::new();
     let result = retry_sandbox_upload(|| async {
         let session = selected
-            .get_or_try_init(|| ssh_session_config(server, name, tls, workspace))
+            .get_or_try_init(|| async {
+                let selected = ssh_session_config(server, name, tls, workspace).await?;
+                if expected_id.is_some_and(|id| id != selected.target.id) {
+                    return Err(miette::miette!(
+                        "sandbox was replaced before uploading files"
+                    ));
+                }
+                Ok::<_, Report>(selected)
+            })
             .await?;
         ssh_tar_upload(session, dest, source.clone()).await
     })
