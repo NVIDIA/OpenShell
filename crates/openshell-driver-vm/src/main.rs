@@ -113,6 +113,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
     bootstrap_image: String,
 
+    #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_EXTRACTION_MAX_BYTES")]
+    bootstrap_extraction_max_bytes: Option<std::num::NonZeroU64>,
+
     #[arg(
         long,
         env = "OPENSHELL_VM_DRIVER_STATE_DIR",
@@ -336,6 +339,7 @@ async fn main() -> Result<()> {
         launcher_bin: None,
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
+        bootstrap_extraction_max_bytes: args.bootstrap_extraction_max_bytes,
         log_level: args.log_level.clone(),
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,

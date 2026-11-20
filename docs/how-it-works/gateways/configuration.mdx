@@ -2103,6 +2103,12 @@ grpc_endpoint    = "https://host.openshell.internal:17670"
 # configuration when both fields are empty; sandbox-requested images are never
 # bootstrap images.
 bootstrap_image  = "nvcr.io/nvidia/base/ubuntu:24.04"
+# On a registry bootstrap cache miss, this limit applies across all layers.
+# It caps both the total decoded tar bytes (including trailing data) and the
+# total logical bytes written while unpacking and merging files. Sparse holes
+# count at their logical size, and each copy into the merged rootfs counts.
+# Defaults to 10 GiB. Downloads and the final ext4 disk use additional space.
+# bootstrap_extraction_max_bytes = 10737418240
 krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048
