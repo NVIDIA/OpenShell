@@ -1685,8 +1685,8 @@ mod tests {
         GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
         GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig,
         PolicyDnsIpv6Egress, PolicyValidationFailureMode, ServiceHostnameFormat,
-        SupervisorIpv6EgressConfig, UpstreamProxyConfig,
-        default_sandbox_pids_limit, normalize_compute_driver_name,
+        SupervisorIpv6EgressConfig, UpstreamProxyConfig, default_sandbox_pids_limit,
+        normalize_compute_driver_name,
     };
     use std::time::Duration;
     use std::{net::SocketAddr, path::PathBuf};

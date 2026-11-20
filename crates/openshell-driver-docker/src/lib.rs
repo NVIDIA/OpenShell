@@ -61,8 +61,7 @@ use openshell_core::proto_struct::{
 };
 use openshell_core::{
     AppArmorProfile, Error, ImagePullPolicy, NetworkSupervisorTrustBundle, Result as CoreResult,
-    SupervisorIpv6EgressConfig,
-    UpstreamProxyConfig,
+    SupervisorIpv6EgressConfig, UpstreamProxyConfig,
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{

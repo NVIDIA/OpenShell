@@ -373,8 +373,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     Instant::now(),
                 )
                 .unwrap();
+            let endpoint_ids = mapping.endpoint_ids().cloned().collect::<Vec<_>>();
             assert_eq!(
-                mapping.pinned_addresses(),
+                mapping.pinned_addresses_for(&endpoint_ids).unwrap(),
                 ["2001:4860:4860::8888".parse::<IpAddr>().unwrap()]
             );
         }

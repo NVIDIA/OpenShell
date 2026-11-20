@@ -1195,6 +1195,7 @@ mod tests {
                 false,
                 false,
                 false,
+                &[],
                 None,
                 None,
                 owner(),
@@ -1491,6 +1492,7 @@ mod tests {
                 false,
                 false,
                 false,
+                &[],
                 None,
                 Some(("openshell-additional-ca-gateway-generation", digest)),
                 owner(),
@@ -1726,8 +1728,10 @@ mod tests {
             false,
             &args,
             None,
+            None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod");
         let command = pod.spec.as_ref().expect("Pod spec").containers[0]

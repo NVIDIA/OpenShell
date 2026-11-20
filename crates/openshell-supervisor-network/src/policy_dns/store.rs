@@ -868,11 +868,12 @@ mod tests {
         ipv6.contracts[0].pinned_addresses = vec!["2001:db8::8".parse().unwrap()];
         let record = store.publish(ipv6, 4, now).unwrap();
         assert!(record.synthetic_address.is_ipv6());
+        let lookup = store
+            .lookup(record.synthetic_address, 5432, 4, now)
+            .unwrap();
+        let endpoint_ids = lookup.endpoint_ids().cloned().collect::<Vec<_>>();
         assert_eq!(
-            store
-                .lookup(record.synthetic_address, 5432, 4, now)
-                .unwrap()
-                .pinned_addresses(),
+            lookup.pinned_addresses_for(&endpoint_ids).unwrap(),
             ["2001:db8::8".parse::<IpAddr>().unwrap()]
         );
         assert!(matches!(

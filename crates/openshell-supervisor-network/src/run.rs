@@ -576,7 +576,7 @@ pub async fn run_networking(
     #[cfg(not(target_os = "linux"))]
     let policy_dns_active = network_mediation_source.is_some();
     if policy_dns_active {
-        ocsf_emit!(ipv6_egress.event());
+        crate::telemetry::egress_emit!(ipv6_egress.event());
     }
 
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
@@ -813,5 +813,5 @@ async fn configure_nat64(configured: Vec<Nat64Prefix>) {
             }
         }
     };
-    ocsf_emit!(setup.event());
+    crate::telemetry::egress_emit!(setup.event());
 }

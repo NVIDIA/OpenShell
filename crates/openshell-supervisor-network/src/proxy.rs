@@ -9335,9 +9335,10 @@ network_policies:
             ResolvedPortContract, StoreConfig, SyntheticPools,
         };
 
-        let engine = OpaEngine::from_strings(
-            include_str!("../data/sandbox-policy.rego"),
-            r#"
+        let engine = Arc::new(
+            OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -9356,8 +9357,9 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+        );
         let pools = SyntheticPools::new(
             Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 1),
             "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::1".parse::<Ipv6Addr>().unwrap(),
@@ -9376,6 +9378,7 @@ process:
                     allocation_identity: [7; 32],
                     policy_generation: engine.current_generation(),
                     ttl: std::time::Duration::from_secs(30),
+                    eligible_ports: std::collections::BTreeSet::from([443]),
                     contracts: vec![ResolvedPortContract {
                         endpoint_id: PolicyEndpointId {
                             policy_name: "allowed".to_string(),
@@ -9403,6 +9406,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                process: None,
             }),
             destination: SocketAddr::new(record.synthetic_address, 443),
             socket: Some(
@@ -9419,12 +9423,13 @@ process:
 
         let accepted = preauthorize_transparent_open(
             pending,
-            Some(&store),
+            Some(&policy_dns_test_service(&store, &engine)),
             &engine,
             &BinaryIdentityCache::new(),
             None,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -9573,6 +9578,7 @@ process:
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         }
     }
 
@@ -9683,12 +9689,13 @@ process:
         let (pending, completion) = open(Ok(curl_identity()), SocketAddr::new(synthetic[0], 443));
         let accepted = preauthorize_transparent_open(
             pending,
-            Some(&runtime.store),
+            Some(&runtime.service),
             &engine,
             &BinaryIdentityCache::new(),
             None,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -9710,7 +9717,7 @@ process:
         let mut wget = curl_identity();
         wget.executable.path = PathBuf::from("/usr/bin/wget");
         assert_denied(
-            &runtime.store,
+            &runtime.service,
             &engine,
             open(Ok(wget), SocketAddr::new(synthetic[0], 443)),
             "unlisted binary",
@@ -9733,7 +9740,7 @@ process:
             (SocketAddr::new(synthetic[0], 8443), "wrong port"),
         ] {
             assert_denied(
-                &runtime.store,
+                &runtime.service,
                 &engine,
                 open(Ok(curl_identity()), destination),
                 case,
@@ -9742,7 +9749,7 @@ process:
         }
         // Without an attributable binary identity there is no grant either.
         assert_denied(
-            &runtime.store,
+            &runtime.service,
             &engine,
             open(
                 Err(ResolveError::Failed("unknown sender".into())),
@@ -9800,7 +9807,7 @@ process:
             )
             .unwrap();
         assert_denied(
-            &runtime.store,
+            &runtime.service,
             &engine,
             open(Ok(curl_identity()), SocketAddr::new(synthetic[0], 443)),
             "stale policy generation",
@@ -9809,7 +9816,7 @@ process:
     }
 
     async fn assert_denied(
-        store: &Arc<ResolvedEndpointStore>,
+        policy_dns: &Arc<PolicyDnsService>,
         engine: &OpaEngine,
         (pending, completion): (
             PendingTcpOpen,
@@ -9820,12 +9827,13 @@ process:
         assert!(
             preauthorize_transparent_open(
                 pending,
-                Some(store),
+                Some(policy_dns),
                 engine,
                 &BinaryIdentityCache::new(),
                 None,
                 None,
                 false,
+                None,
                 None,
             )
             .await
