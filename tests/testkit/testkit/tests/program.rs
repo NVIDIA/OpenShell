@@ -89,24 +89,7 @@ mod unix {
         std::fs::write(pid_file, helper.id().to_string()).expect("write pid");
     }
 
-    fn overlap(name: &str, peer: &str) {
-        let dir = PathBuf::from(std::env::var_os("FIXTURE_OVERLAP_DIR").expect("fixture dir"));
-        println!("{name}: stdout");
-        std::fs::write(dir.join(name), std::process::id().to_string()).expect("write pid");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !dir.join(peer).exists() {
-            assert!(
-                Instant::now() < deadline,
-                "{peer} did not start in parallel"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        eprintln!("{name}: stderr");
-    }
-
-    pub static FIXTURES: [Test; 9] = [
-        fixture("overlap_a", || Box::pin(async { overlap("a", "b") })),
-        fixture("overlap_b", || Box::pin(async { overlap("b", "a") })),
+    pub static FIXTURES: [Test; 7] = [
         fixture("passes", || {
             Box::pin(async {
                 println!("passes: stdout");
@@ -154,8 +137,7 @@ mod unix {
         },
     ];
 
-    pub static CHECKS: [Test; 15] = [
-        check("run_in_parallel", || Box::pin(async { run_in_parallel() })),
+    pub static CHECKS: [Test; 14] = [
         check("nextest_interface", || {
             Box::pin(async { nextest_interface() })
         }),
@@ -242,8 +224,7 @@ mod unix {
             stdout(&list),
             "fixture::fails: test\nfixture::hangs: test\nfixture::ignored: test\n\
              fixture::ignores_sigterm: test\nfixture::interrupts_after_exit: test\n\
-             fixture::leaves_a_helper: test\nfixture::overlap_a: test\n\
-             fixture::overlap_b: test\nfixture::passes: test\n"
+             fixture::leaves_a_helper: test\nfixture::passes: test\n"
         );
         let ignored = output(program(
             "fixtures",
@@ -300,8 +281,8 @@ mod unix {
             &["run", "passes", "fails", "ignored", "--junit", &junit_arg],
         ));
         assert_eq!(run.status.code(), Some(1));
-        // Both child streams are printed together on stderr.
-        assert!(stderr(&run).contains("passes: stdout"));
+        // Test output is passed through.
+        assert!(stdout(&run).contains("passes: stdout"));
         assert!(stderr(&run).contains("passes: stderr"));
         assert!(stderr(&run).contains("1 passed, 1 failed, 1 skipped"));
         assert!(stderr(&run).contains("FAIL fixture::fails: test failed"));
@@ -319,28 +300,6 @@ mod unix {
             "fixture failure",
         ] {
             assert!(xml.contains(expected), "missing {expected} in\n{xml}");
-        }
-    }
-
-    fn run_in_parallel() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut command = program("fixtures", &["run", "overlap_", "--test-threads", "2"]);
-        command.env("FIXTURE_OVERLAP_DIR", dir.path());
-        let run = output(command);
-        assert!(run.status.success());
-        assert_ne!(
-            read_pid(&dir.path().join("a")),
-            read_pid(&dir.path().join("b"))
-        );
-        let log = stderr(&run);
-        for name in ["a", "b"] {
-            let suffix = format!("] fixture::overlap_{name}\n");
-            let (_, block) = log.split_once(&suffix).expect("test header");
-            let end = format!("<== PASS fixture::overlap_{name}");
-            let (block, _) = block.split_once(&end).expect("test result");
-            assert!(block.contains(&format!("{name}: stdout")));
-            assert!(block.contains(&format!("{name}: stderr")));
-            assert!(!block.contains("==>"), "{block}");
         }
     }
 
@@ -510,7 +469,7 @@ mod unix {
         assert_eq!(run.status.code(), Some(2));
         assert!(stderr(&run).contains("<== PASS fixture::interrupts_after_exit"));
         assert!(stderr(&run).contains("interrupted; 1 later test did not run"));
-        assert!(!stderr(&run).contains("passes: stdout"));
+        assert!(!stdout(&run).contains("passes: stdout"));
         let xml = std::fs::read_to_string(path).expect("junit report");
         assert!(!xml.contains("fixture::passes"), "{xml}");
     }
@@ -601,7 +560,7 @@ mod unix {
         // A forced run refuses.
         let forced = with(&["run", "fails", "--include-ignored"]);
         assert_eq!(forced.status.code(), Some(1));
-        assert!(stderr(&forced).contains("remove the entry from OPENSHELL_TEST_UNSUPPORTED"));
+        assert!(stdout(&forced).contains("remove the entry from OPENSHELL_TEST_UNSUPPORTED"));
         assert!(!stderr(&forced).contains("fixture failure"));
         // Selecting only unsupported tests leaves nothing to run.
         let none = with(&["run", "fails"]);

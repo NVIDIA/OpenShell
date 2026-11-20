@@ -84,12 +84,39 @@ e2e_run_openshell_conformance() {
   # these for the gateway they started.
   echo "==> Running conformance suites against the ${gateway_label} gateway"
   "${program}" ready || return
-  local args=(--junit "${junit}")
   if [[ -n "${OPENSHELL_CONFORMANCE_TEST_THREADS:-}" ]]; then
-    args+=(--test-threads "${OPENSHELL_CONFORMANCE_TEST_THREADS}")
+    e2e_nextest_conformance "${program}" "${junit}"
+  else
+    "${program}" run --junit "${junit}"
   fi
-  "${program}" run "${args[@]}"
 }
+
+e2e_nextest_conformance() (
+  local program=$1 junit=$2
+  local work status=0
+  work="$(mktemp -d)" || return
+  trap 'rm -rf "${work}"' EXIT
+  "${program}" nextest-metadata "${work}" || return
+  cat > "${work}/nextest.toml" <<'EOF'
+[profile.openshell]
+slow-timeout = { period = "900s", terminate-after = 1, grace-period = "10s" }
+
+[profile.openshell.junit]
+path = "junit.xml"
+store-success-output = true
+EOF
+  cargo-nextest nextest run \
+    --cargo-metadata "${work}/cargo-metadata.json" \
+    --binaries-metadata "${work}/binaries-metadata.json" \
+    --config-file "${work}/nextest.toml" --profile openshell \
+    --test-threads "${OPENSHELL_CONFORMANCE_TEST_THREADS}" \
+    --no-tests fail --no-fail-fast --success-output immediate \
+    --failure-output immediate || status=$?
+  if [[ -f "${work}/target/nextest/openshell/junit.xml" ]]; then
+    mv "${work}/target/nextest/openshell/junit.xml" "${junit}" || return
+  fi
+  return "${status}"
+)
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   e2e_run_openshell_conformance

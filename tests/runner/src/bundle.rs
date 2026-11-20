@@ -76,7 +76,7 @@ struct Manifest {
 pub enum Kind {
     /// A nextest archive, run with `cargo-nextest`.
     Nextest,
-    /// A prebuilt testkit program (`list`, `ready` and `run`), run directly.
+    /// A prebuilt testkit program, run by nextest without a Cargo build.
     Program,
 }
 
@@ -93,7 +93,7 @@ impl Bundle {
     }
 }
 
-/// A bundle holding only `program`, a testkit program already built for the
+/// A bundle holding `program`, a testkit program already built for the
 /// guest target. `program` must be a static binary, as the guest's libc is
 /// not known.
 pub fn program(program: &Path) -> Result<Bundle> {
@@ -105,7 +105,20 @@ pub fn program(program: &Path) -> Result<Bundle> {
     let dir = tempfile::tempdir().context("create bundle directory")?;
     std::fs::copy(program, dir.path().join(PROGRAM_BINARY))
         .with_context(|| format!("copy {}", program.display()))?;
+    std::fs::write(dir.path().join(CONFIG), program_config())?;
     Ok(Bundle(dir, Kind::Program))
+}
+
+fn program_config() -> String {
+    format!(
+        r#"[profile.{PROFILE}]
+slow-timeout = {{ period = "900s", terminate-after = 1, grace-period = "{GRACE_PERIOD_SECS}s" }}
+
+[profile.{PROFILE}.junit]
+path = "junit.xml"
+store-success-output = true
+"#
+    )
 }
 
 /// The Rust target for guests. tmachine only boots guests of the host's
@@ -362,17 +375,18 @@ mod tests {
     }
 
     #[test]
-    fn program_bundle_holds_only_the_program() {
+    fn program_bundle_holds_the_program_and_nextest_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("openshell-conformance");
         std::fs::write(&path, b"binary").unwrap();
         let bundle = program(&path).unwrap();
         assert_eq!(bundle.kind(), Kind::Program);
-        let names: Vec<_> = std::fs::read_dir(bundle.path())
+        let mut names: Vec<_> = std::fs::read_dir(bundle.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(names, [PROGRAM_BINARY]);
+        names.sort();
+        assert_eq!(names, [CONFIG, PROGRAM_BINARY]);
         assert!(program(&dir.path().join("missing")).is_err());
     }
 

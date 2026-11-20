@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `run`: run the selected tests with bounded concurrency, each in a new process.
+//! `run`: run the selected tests one at a time, each in a new process.
 //!
 //! The program starts itself once per test as `<name> --exact --nocapture`,
 //! the same interface nextest uses, in a new process group. A test that runs
 //! past its timeout gets `SIGTERM`, a grace period, then `SIGKILL`. Output is
-//! buffered for each test and shown when it ends.
+//! shown as it comes and kept for the `JUnit` report.
 //!
 //! A test stopped this way does not run its cleanup: testkit tests do not
 //! handle `SIGTERM` yet, so sandboxes named `test-<run id>-*` can be left
@@ -14,12 +14,8 @@
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
-use std::io::{self, Write as _};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
-use std::sync::{Mutex, mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use super::capture::Capture;
@@ -32,7 +28,6 @@ const LIBTEST_FAILED: i32 = 101;
 
 pub struct Options {
     pub selection: Selection,
-    pub test_threads: NonZeroUsize,
     pub timeout: Duration,
     pub grace: Duration,
     pub junit: Option<PathBuf>,
@@ -101,9 +96,8 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
         return ExitCode::from(ERROR_EXIT);
     }
     let skipped = selected.len() - to_run;
-    let workers = options.test_threads.get().min(to_run);
     eprintln!(
-        "{program}: running {to_run} test{} (up to {workers} at once){}",
+        "{program}: running {to_run} test{} one at a time{}",
         plural(to_run),
         if skipped > 0 {
             format!(", skipping {skipped} ignored or unsupported")
@@ -115,54 +109,42 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
     let started = Instant::now();
     let selected_count = selected.len();
     let mut runs = Vec::with_capacity(selected_count);
-    let mut pending = Vec::with_capacity(to_run);
+    let mut position = 0;
     for (test, disposition) in selected {
-        let outcome = match disposition {
-            Disposition::Run => {
-                pending.push(test);
-                continue;
-            }
-            Disposition::Skip => Outcome::Skipped,
-            Disposition::Unsupported(issue) => Outcome::Unsupported(issue),
+        // A stop signal that arrives between tests still ends the run.
+        if process::stop_requested() {
+            break;
+        }
+        let skip = match disposition {
+            Disposition::Run => None,
+            Disposition::Skip => Some(Outcome::Skipped),
+            Disposition::Unsupported(issue) => Some(Outcome::Unsupported(issue)),
         };
-        runs.push(TestRun {
-            test,
-            outcome,
-            duration: None,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        });
+        if let Some(outcome) = skip {
+            runs.push(TestRun {
+                test,
+                outcome,
+                duration: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+            continue;
+        }
+        position += 1;
+        let name = test.name();
+        eprintln!("==> [{position}/{to_run}] {name}");
+        let run = run_one(exe, test, options);
+        let elapsed = run.duration.unwrap_or_default();
+        match run.outcome.message() {
+            None => eprintln!("<== {} {name} ({elapsed:.1?})", run.outcome.label()),
+            Some(message) => eprintln!(
+                "<== {} {name} ({elapsed:.1?}): {message}",
+                run.outcome.label()
+            ),
+        }
+        runs.push(run);
     }
 
-    let pending = Mutex::new(pending.into_iter());
-    thread::scope(|scope| {
-        let (send, recv) = mpsc::channel();
-        for _ in 0..workers {
-            let (pending, send) = (&pending, send.clone());
-            scope.spawn(move || {
-                loop {
-                    let test = {
-                        let mut pending = pending.lock().expect("test queue");
-                        if process::stop_requested() {
-                            break;
-                        }
-                        pending.next()
-                    };
-                    let Some(test) = test else { break };
-                    if send.send(run_one(exe, test, options)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(send);
-        for (index, run) in recv.into_iter().enumerate() {
-            print_run(&run, index + 1, to_run);
-            runs.push(run);
-        }
-    });
-
-    runs.sort_by_cached_key(|run| run.test.name());
     let not_run = selected_count - runs.len();
     let mut status = summarize(program, &runs, not_run, started.elapsed());
     if let Some(path) = &options.junit {
@@ -175,29 +157,6 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
         }
     }
     ExitCode::from(status)
-}
-
-fn print_run(run: &TestRun<'_>, position: usize, to_run: usize) {
-    let name = run.test.name();
-    // Use one stream so collectors cannot reorder stdout and stderr blocks.
-    let mut log = io::stderr().lock();
-    let _ = writeln!(log, "==> [{position}/{to_run}] {name}");
-    write_output(&mut log, &run.stdout);
-    write_output(&mut log, &run.stderr);
-    let elapsed = run.duration.unwrap_or_default();
-    let label = run.outcome.label();
-    match run.outcome.message() {
-        None => writeln!(log, "<== {label} {name} ({elapsed:.1?})"),
-        Some(message) => writeln!(log, "<== {label} {name} ({elapsed:.1?}): {message}"),
-    }
-    .ok();
-}
-
-fn write_output(mut stream: impl io::Write, bytes: &[u8]) {
-    let _ = stream.write_all(bytes);
-    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-        let _ = stream.write_all(b"\n");
-    }
 }
 
 fn run_one<'a>(exe: &Path, test: &'a Test, options: &Options) -> TestRun<'a> {
@@ -227,8 +186,14 @@ fn run_one<'a>(exe: &Path, test: &'a Test, options: &Options) -> TestRun<'a> {
             };
         }
     };
-    let stdout = child.stdout.take().map(Capture::start);
-    let stderr = child.stderr.take().map(Capture::start);
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stream| Capture::start(stream, std::io::stdout()));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stream| Capture::start(stream, std::io::stderr()));
     let ended = process::wait(&mut child, options.timeout, options.grace);
     let duration = started.elapsed();
     let outcome = match ended {

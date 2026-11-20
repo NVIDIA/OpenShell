@@ -68,8 +68,9 @@ Feature and driver suites are not part of it. The
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
 
-`run --test-threads 4` runs up to four tests at once on the same gateway.
-The default is one.
+`run` is serial. To run a prebuilt binary in parallel without Cargo or a
+checkout, use `nextest-metadata` and the [nextest command in the testkit
+README](../../testkit/README.md#test-programs).
 
 ### Marking a test unsupported in CI
 

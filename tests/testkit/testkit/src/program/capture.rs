@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Draining a test's output while keeping its tail for the console and report.
+//! Copying a test's output to the console while keeping it for the report.
 
 use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How much of each stream is kept. Keep the end, where failures are.
+/// How much of each stream is kept for the report. Output beyond this is
+/// still shown; the report keeps the end, where failures are.
 const KEPT_BYTES: usize = 4 << 20;
 
 /// How long to wait for a stream to close after the test's process group is
@@ -29,8 +30,11 @@ struct Kept {
 }
 
 impl Capture {
-    /// Drain `stream` on a thread so the test can keep writing.
-    pub fn start(mut stream: impl Read + Send + 'static) -> Self {
+    /// Copy `stream` to `console` on a thread, keeping a copy.
+    pub fn start(
+        mut stream: impl Read + Send + 'static,
+        mut console: impl Write + Send + 'static,
+    ) -> Self {
         let kept = Arc::new(Mutex::new(Kept::default()));
         let thread = std::thread::spawn({
             let kept = Arc::clone(&kept);
@@ -43,9 +47,11 @@ impl Capture {
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => return,
                     };
+                    let chunk = &buffer[..read];
+                    let _ = console.write_all(chunk).and_then(|()| console.flush());
                     kept.lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .push(&buffer[..read]);
+                        .push(chunk);
                 }
             }
         });
@@ -85,8 +91,8 @@ mod tests {
     use super::{Capture, KEPT_BYTES, Kept};
 
     #[test]
-    fn keeps_the_stream() {
-        let capture = Capture::start(&b"one\ntwo\n"[..]);
+    fn copies_and_keeps_the_stream() {
+        let capture = Capture::start(&b"one\ntwo\n"[..], std::io::sink());
         assert_eq!(capture.finish(), b"one\ntwo\n");
     }
 

@@ -14,8 +14,11 @@ manifest="${root}/tests/suites/conformance/Cargo.toml"
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
-cargo run --quiet --locked --manifest-path "${manifest}" --bin openshell-conformance -- list \
-    | awk '{print $1}' | sort > "${work}/program"
+messages="$(cargo build --locked --manifest-path "${manifest}" --bin openshell-conformance --message-format json)"
+program="$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' <<< "${messages}")"
+cp "${program}" "${work}/test-program"
+program="${work}/test-program"
+"${program}" list | awk '{print $1}' | sort > "${work}/program"
 # --run-ignored all: the program lists ignored tests too, so nextest must as well.
 cargo nextest list --locked --color never --run-ignored all --manifest-path "${manifest}" --message-format oneline \
     | awk '{print $2}' | sort > "${work}/nextest"
@@ -32,6 +35,18 @@ if [[ ! -s "${work}/program" ]]; then
     echo "error: openshell-conformance lists no tests" >&2
     exit 1
 fi
+# Check the same inventory from a renamed, prebuilt binary without a checkout
+# or Cargo on PATH. Metadata must retain the Cargo binary ID.
+"${program}" nextest-metadata "${work}/metadata"
+nextest="$(command -v cargo-nextest)"
+(
+    cd "${work}/metadata"
+    PATH=/usr/bin:/bin "${nextest}" nextest list --color never --run-ignored all \
+        --cargo-metadata cargo-metadata.json --binaries-metadata binaries-metadata.json \
+        --message-format oneline
+) > "${work}/prebuilt"
+grep -q '^conformance::bin/openshell-conformance ' "${work}/prebuilt"
+awk '{print $2}' "${work}/prebuilt" | sort | diff -u "${work}/program" -
 # unsupported.yaml must pass the program's own checks (known tests, https
 # issues, no duplicates) for every environment it names, and name only
 # environments that exist.
@@ -51,6 +66,6 @@ while IFS= read -r environment; do
         exit 1
     fi
     OPENSHELL_TEST_UNSUPPORTED="$("${root}/tasks/scripts/conformance-unsupported.sh" "${environment}")" \
-        cargo run --quiet --locked --manifest-path "${manifest}" --bin openshell-conformance -- list > /dev/null
+        "${program}" list > /dev/null
 done < <(yq -r '.[].environments[]' "${unsupported_file}" | sort -u)
 echo "openshell-conformance lists the same $(wc -l < "${work}/program" | tr -d ' ') tests as nextest"

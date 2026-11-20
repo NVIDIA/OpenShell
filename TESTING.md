@@ -256,9 +256,9 @@ prebuilt testkit program, such as a static `openshell-conformance` for the
 guest's architecture, instead of building the family's tests; it can't be
 combined with `--package`. With it, `--filter` (repeatable) takes parts of test
 names, as the program does, such as `--filter policy_advisor::`, rather than a
-nextest filterset. The runner runs the program's `ready`
-and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
-(the program's output) to the results directory. Branch E2E builds
+nextest filterset. The runner runs the program's `ready` command in the
+guest, then uses nextest to run the prebuilt binary. It writes `junit.xml`
+and `nextest.log` to the results directory. Branch E2E builds
 `openshell-conformance` once and passes it to every conformance row this way.
 With `--program`, `--test-threads N` runs up to N tests concurrently in the
 guest; the default is one.
@@ -519,9 +519,10 @@ feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURE
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
 features. The selector is handled by the runner; it is not a Cargo feature.
-Set `OPENSHELL_CONFORMANCE_TEST_THREADS` to run conformance tests concurrently
-in these wrappers; it defaults to one. Direct runs use
-`openshell-conformance run --test-threads N`.
+Set `OPENSHELL_CONFORMANCE_TEST_THREADS` to make these wrappers run the
+conformance program with nextest and the given number of workers. CI uses
+four. When unset, the wrappers use the serial `openshell-conformance run`
+command, which does not require nextest.
 
 ```shell
 OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
