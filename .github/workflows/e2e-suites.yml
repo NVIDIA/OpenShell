@@ -95,6 +95,8 @@ jobs:
           rows='[
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb-external-docker-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true},
+            {"environment":"fedora-podman-rootful","installer":"rpm-external-podman-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true},
+            {"environment":"fedora-podman-rootless","installer":"rpm-external-podman-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true},
             {"environment":"fedora-podman-rootful","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-k3s","installer":"k3s","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},

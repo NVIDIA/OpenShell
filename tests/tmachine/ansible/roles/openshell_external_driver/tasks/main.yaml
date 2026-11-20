@@ -14,7 +14,16 @@
 #   openshell_external_driver_name    the name to register it under; a built-in
 #                                     driver's name cannot be selected over a socket
 # The binary must be openshell-driver-<runtime> for the machine's container runtime
-# (openshell_gateway_driver), which selects the settings in vars/<runtime>.yaml.
+# (openshell_gateway_driver), which selects the settings in vars/<runtime>.yaml:
+#   openshell_external_driver_binary_name  the installed executable's name
+#   openshell_external_driver_socket       the compute socket the driver binds
+#   openshell_external_driver_args         the runtime's own command-line arguments,
+#                                          after the common --bind-socket
+#   openshell_external_driver_requires     the unit the service needs running first
+#   openshell_external_driver_config_template  optional, for a driver that reads a
+#                                          configuration file
+#   openshell_external_driver_environment  optional, extra Environment= entries
+#   openshell_external_driver_supplementary_groups  optional
 ---
 - name: Check the driver matches the container runtime
   ansible.builtin.assert:
@@ -59,9 +68,10 @@
     mode: "0755"
 
 - name: Write the external driver configuration
+  when: openshell_external_driver_config_template is defined
   become: true
   ansible.builtin.template:
-    src: "driver-{{ openshell_gateway_driver }}.toml.j2"
+    src: "{{ openshell_external_driver_config_template }}"
     dest: "/etc/openshell/driver-{{ openshell_external_driver_name }}.toml"
     mode: "0644"
 

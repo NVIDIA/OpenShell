@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The Podman driver takes its settings as arguments, not a configuration file.
+# It runs as the gateway's user: root for rootful Podman, and for rootless
+# Podman the unprivileged user whose Podman socket it talks to. The rootless
+# socket is a user unit, so the driver waits for that user's manager instead.
+---
+openshell_external_driver_binary_name: openshell-driver-podman
+openshell_external_driver_socket: /run/openshell-driver-podman/compute.sock
+openshell_external_driver_requires: >-
+  {{ ('user@' ~ openshell_gateway_uid ~ '.service')
+     if tmachine_container_runtime_is_rootless | bool else 'podman.socket' }}
+openshell_external_driver_environment: >-
+  {{ ['XDG_RUNTIME_DIR=/run/user/' ~ openshell_gateway_uid]
+     if tmachine_container_runtime_is_rootless | bool else [] }}
+openshell_external_driver_args:
+  - --podman-socket
+  - "{{ openshell_runtime_socket }}"
+  - --podman-tls-ca
+  - "{{ openshell_gateway_home }}/.local/state/openshell/tls/ca.crt"
+  - --gateway-port
+  - "17670"
+  - --network-name
+  - tmachine
