@@ -718,6 +718,7 @@ async fn run_single_session(
             supports_session_redirect: true,
             supports_config_push: true,
             supports_service_advertisements: config.app_installations.is_some(),
+            supports_workload_activity_requests: config.workload_activity.is_some(),
         })),
     })
     .await
@@ -832,6 +833,15 @@ async fn run_single_session(
                         peer_endpoint: r.peer_endpoint.clone(),
                         owner_replica_id: r.owner_replica_id.clone(),
                     });
+                }
+                if let Some(gateway_message::Payload::WorkloadActivityRequest(request)) = &msg.payload {
+                    // Answer before an idle stop so it sees current input and work.
+                    if let Some(activity) = &config.workload_activity {
+                        tx.send(crate::program_status::activity_reply(activity, &request.request_id))
+                            .await
+                            .map_err(|_| "outbound channel closed")?;
+                    }
+                    continue;
                 }
                 if let Some(gateway_message::Payload::ServiceRouteLease(lease)) = &msg.payload {
                     if let Some(source) = &config.app_installations {

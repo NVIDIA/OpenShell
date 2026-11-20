@@ -521,6 +521,9 @@ pub struct ActivitySummary {
     pub terminals: usize,
     /// Terminals with a current program report.
     pub reporting_terminals: usize,
+    /// Increments on every state transition, including one that is undone
+    /// within the same read, so each transition is a distinct value.
+    pub revision: u64,
 }
 
 /// Point-in-time activity including timestamps that change on every byte.
@@ -541,6 +544,27 @@ struct Inner {
     /// Latest client input to any workload terminal, kept after the terminal
     /// closes so a short session still counts as recent input.
     last_input: Option<Instant>,
+    revision: u64,
+}
+
+impl Inner {
+    fn dominant_state(&self) -> Option<ProgramState> {
+        self.terminals
+            .values()
+            .filter_map(|terminal| terminal.records.dominant())
+            .map(|(state, _, _)| state)
+            .max()
+    }
+
+    /// Record a transition when `before` differs from the current state.
+    fn note_transition(&mut self, before: Option<ProgramState>) -> Option<ProgramState> {
+        let after = self.dominant_state();
+        if after != before {
+            self.state_since = Instant::now();
+            self.revision += 1;
+        }
+        after
+    }
 }
 
 /// Program status across every workload terminal in one sandbox.
@@ -560,6 +584,7 @@ impl ProgramActivity {
                 terminals: BTreeMap::new(),
                 state_since: Instant::now(),
                 last_input: None,
+                revision: 0,
             }),
             changes,
         })
@@ -609,13 +634,17 @@ impl ProgramActivity {
 
     fn update<T>(&self, change: impl FnOnce(&mut Inner) -> T) -> T {
         let mut inner = self.inner.lock().expect("program activity lock poisoned");
-        let before = summarize(&inner);
+        let before = inner.dominant_state();
         let result = change(&mut inner);
-        let after = summarize(&inner);
-        if before.state != after.state {
-            inner.state_since = Instant::now();
-        }
-        drop(inner);
+        inner.note_transition(before);
+        self.publish(&inner);
+        result
+    }
+
+    /// Publish while holding the lock, so summaries leave in mutation order
+    /// and an older one never overwrites a newer one.
+    fn publish(&self, inner: &Inner) {
+        let after = summarize(inner);
         self.changes.send_if_modified(|current| {
             if *current == after {
                 false
@@ -624,15 +653,29 @@ impl ProgramActivity {
                 true
             }
         });
-        result
     }
 
-    fn with_terminal(&self, id: u64, change: impl FnOnce(&mut TerminalStatus)) {
-        self.update(|inner| {
-            if let Some(terminal) = inner.terminals.get_mut(&id) {
-                change(terminal);
+    /// Apply a terminal's output events in order, noting every transition so
+    /// the timer does not depend on how reads split the output.
+    fn apply_events(&self, id: u64, events: Vec<TerminalEvent>) {
+        let mut inner = self.inner.lock().expect("program activity lock poisoned");
+        let mut state = inner.dominant_state();
+        let Some(terminal) = inner.terminals.get_mut(&id) else {
+            return;
+        };
+        terminal.last_output = Instant::now();
+        for event in events {
+            let Some(terminal) = inner.terminals.get_mut(&id) else {
+                break;
+            };
+            match event {
+                TerminalEvent::Report(report) => terminal.records.apply(report),
+                TerminalEvent::Prompt => terminal.records.drop_running(),
+                TerminalEvent::Reset => terminal.records.apply(Report::Clear { id: None }),
             }
-        });
+            state = inner.note_transition(state);
+        }
+        self.publish(&inner);
     }
 
     fn touch_input(&self, id: u64) {
@@ -660,6 +703,7 @@ fn summarize(inner: &Inner) -> ActivitySummary {
             .values()
             .filter(|terminal| !terminal.records.records.is_empty())
             .count(),
+        revision: inner.revision,
     }
 }
 
@@ -685,18 +729,8 @@ impl TerminalTap {
                 Terminator::Bel => REPLY_BEL,
             });
         }
-        let events = scan.events;
-        self.activity.with_terminal(self.id, |terminal| {
-            terminal.last_output = Instant::now();
-            // Wire order matters: a prompt ends only the reports before it.
-            for event in events {
-                match event {
-                    TerminalEvent::Report(report) => terminal.records.apply(report),
-                    TerminalEvent::Prompt => terminal.records.drop_running(),
-                    TerminalEvent::Reset => terminal.records.apply(Report::Clear { id: None }),
-                }
-            }
-        });
+        // Wire order matters: a prompt ends only the reports before it.
+        self.activity.apply_events(self.id, scan.events);
         scan.forward
     }
 
@@ -851,6 +885,20 @@ pub fn activity_report(
         input_age: snapshot.last_input.and_then(proto_age),
         reporting_terminals: u32::try_from(snapshot.summary.reporting_terminals)
             .unwrap_or(u32::MAX),
+        request_id: String::new(),
+    }
+}
+
+/// The answer to a gateway's activity request: the current summary.
+#[must_use]
+pub fn activity_reply(
+    activity: &ProgramActivity,
+    request_id: &str,
+) -> openshell_core::proto::SupervisorMessage {
+    let mut report = activity_report(&activity.snapshot());
+    report.request_id = request_id.to_string();
+    openshell_core::proto::SupervisorMessage {
+        payload: Some(openshell_core::proto::supervisor_message::Payload::WorkloadActivity(report)),
     }
 }
 
@@ -1155,6 +1203,61 @@ mod tests {
             activity.snapshot().summary.state,
             Some(ProgramState::Blocked)
         );
+    }
+
+    #[tokio::test]
+    async fn a_turn_within_one_read_restarts_the_timer_and_notifies() {
+        let activity = ProgramActivity::new();
+        let mut tap = activity.register(|_| {});
+        tap.output(b"\x1b]7501;state=done\x07");
+        let mut changes = activity.subscribe();
+        changes.borrow_and_update();
+        let before = activity.snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tap.output(b"\x1b]7501;state=working\x07\x1b]7501;state=done\x07");
+        let after = activity.snapshot();
+        assert_eq!(after.summary.state, Some(ProgramState::Done));
+        assert!(
+            after.state_since > before.state_since,
+            "the new turn restarts the wait"
+        );
+        assert_eq!(after.summary.revision, before.summary.revision + 2);
+        assert!(changes.has_changed().unwrap(), "the reporter is told");
+    }
+
+    #[test]
+    fn concurrent_terminals_publish_every_transition_in_order() {
+        let activity = ProgramActivity::new();
+        let mut changes = activity.subscribe();
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let activity = Arc::clone(&activity);
+            threads.push(std::thread::spawn(move || {
+                let mut tap = activity.register(|_| {});
+                for _ in 0..200 {
+                    tap.output(b"\x1b]7501;state=working\x07");
+                    tap.output(b"\x1b]7501;state=done\x07");
+                }
+                std::mem::forget(tap);
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        // The last published summary is the final state, never an older one.
+        assert_eq!(*changes.borrow_and_update(), activity.snapshot().summary);
+    }
+
+    #[test]
+    fn activity_reply_carries_the_request_id() {
+        let activity = ProgramActivity::new();
+        let message = activity_reply(&activity, "req-1");
+        let Some(openshell_core::proto::supervisor_message::Payload::WorkloadActivity(report)) =
+            message.payload
+        else {
+            panic!("expected workload activity");
+        };
+        assert_eq!(report.request_id, "req-1");
     }
 
     #[test]

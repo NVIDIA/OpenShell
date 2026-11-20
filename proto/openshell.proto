@@ -3481,6 +3481,8 @@ message SupervisorWorkloadActivity {
   google.protobuf.Duration input_age = 5;
   // Workload terminals with a current program report.
   uint32 reporting_terminals = 6;
+  // Set when this summary answers a WorkloadActivityRequest.
+  string request_id = 7;
 }
 
 // Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
@@ -3494,7 +3496,16 @@ message GatewayMessage {
     SessionRedirect session_redirect = 6;
     ConfigUpdate config_update = 7;
     ServiceRouteLease service_route_lease = 8;
+    WorkloadActivityRequest workload_activity_request = 9;
   }
+}
+
+// Ask the supervisor for a current program status summary before an idle
+// stop. Sent only to supervisors that advertise
+// `supports_workload_activity_requests`. The reply is a
+// SupervisorWorkloadActivity carrying the same `request_id`.
+message WorkloadActivityRequest {
+  string request_id = 1;
 }
 
 // Supervisor identifies itself and the sandbox it manages.
@@ -3523,6 +3534,10 @@ message SupervisorHello {
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
   bool supports_service_advertisements = 8;
+  // The supervisor reports workload program status and answers
+  // WorkloadActivityRequest. Gateways idle-stop only sandboxes whose current
+  // supervisor confirms idleness this way.
+  bool supports_workload_activity_requests = 9;
 }
 
 // Gateway accepts the supervisor session.

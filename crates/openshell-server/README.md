@@ -178,15 +178,28 @@ with conflict retries, only when its state changes or input moves its time
 forward by a minute. It is fenced to the running main-process instance,
 survives driver snapshots, and is removed on every phase change.
 
-Every replica sweeps its own sessions every 30 seconds. A Ready sandbox whose
-program is idle, done, blocked, or in error is stopped once
+Every replica sweeps its own sessions every 30 seconds. A sandbox becomes a
+candidate when it is Ready, its program is idle, done, blocked, or in error, and
 `idle_stop_after_seconds` (gateway scope, then sandbox scope) plus a 15-second
-input report lag has elapsed since the later of the report's time and the
-main-process start. Under the lifecycle lock, the stop re-reads the live report
-and the setting. It records the `internal.openshell.ai/idle-stop` annotation
-with `IdleStopping`; that marker survives gateway recovery and settles the stop
-as `IdleStopped`. Any other lifecycle write removes it, and an explicit stop of
-an idle-stopped sandbox rewrites it as an ordinary stop.
+input report lag has elapsed. The lag runs from the later of the report's time
+and the main-process start.
+
+Under the lifecycle lock, admission checks four things before stopping:
+
+1. The shared owner record must still name the session.
+2. The setting is re-read.
+3. The supervisor must answer a `WorkloadActivityRequest` with a fresh report
+   within 5 seconds. Supervisors that do not advertise
+   `supports_workload_activity_requests` are never idle-stopped.
+4. The activity gate, which every live report update also takes, is held
+   through the final check and the `Stopping` write. A report received first
+   always counts.
+
+The stop records the `internal.openshell.ai/idle-stop` annotation with
+`IdleStopping`. That marker survives gateway recovery and settles the stop as
+`IdleStopped`. Any other lifecycle write removes it. An explicit stop, whether
+the idle stop is settled or still in flight on another replica, rewrites it as
+an ordinary stop.
 
 ## Static credential delivery
 

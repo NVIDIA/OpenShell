@@ -25,9 +25,16 @@ pub use openshell_core::metadata::IDLE_STOPPED_REASON;
 /// How often each replica looks for idle sandboxes among its sessions.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Longest delay before the supervisor reports new input: one check interval
-/// plus the minimum spacing of input reports. Idle stops wait this much past
-/// the timeout so a keystroke not yet reported still counts.
+/// plus the minimum spacing of input reports. The sweep waits this much past
+/// the timeout before asking the supervisor to confirm, which avoids
+/// confirmation requests that pushed input would have answered anyway.
 pub const INPUT_REPORT_LAG: Duration = Duration::from_secs(15);
+/// How long an idle stop waits for the supervisor to confirm. No answer, as
+/// from a replaced or dead session, cancels the stop.
+#[cfg(not(test))]
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_millis(200);
 /// Input progress smaller than this does not rewrite the displayed condition.
 pub const INPUT_WRITE_GRANULARITY: Duration = Duration::from_mins(1);
 /// Durable marker that the in-flight stop was started by the idle sweep. It
@@ -88,6 +95,9 @@ fn condition_message(report: &SupervisorWorkloadActivity, reason: &str) -> Strin
 pub struct LiveActivity {
     pub session_id: String,
     pub instance_id: String,
+    /// The session's supervisor answers activity requests, so it can confirm
+    /// idleness before a stop. Sessions that cannot are never idle-stopped.
+    pub confirms: bool,
     pub state: WorkloadProgramState,
     /// The later of the state change and the latest client input.
     pub since: SystemTime,
@@ -98,6 +108,7 @@ pub fn live_from_report(
     report: &SupervisorWorkloadActivity,
     session_id: &str,
     instance_id: &str,
+    confirms: bool,
     now: SystemTime,
 ) -> LiveActivity {
     let state_since = before(now, report.state_age.as_ref()).unwrap_or(now);
@@ -106,6 +117,7 @@ pub fn live_from_report(
     LiveActivity {
         session_id: session_id.to_string(),
         instance_id: instance_id.to_string(),
+        confirms,
         state: WorkloadProgramState::try_from(report.state)
             .unwrap_or(WorkloadProgramState::Unspecified),
         since,
@@ -283,6 +295,7 @@ mod tests {
             state_age: Some(proto_secs(state_age)),
             input_age: input_age.map(proto_secs),
             reporting_terminals: 1,
+            request_id: String::new(),
         }
     }
 
@@ -307,6 +320,7 @@ mod tests {
             &report(state, 0, input_age),
             "session-1",
             "instance-1",
+            true,
             at(received),
         )
     }
@@ -398,6 +412,7 @@ mod tests {
             &report(WorkloadProgramState::Blocked, 50, Some(5)),
             "session-1",
             "instance-1",
+            true,
             at(50),
         );
         assert_eq!(idle_since(&sandbox, &blocked), Some(at(45)));

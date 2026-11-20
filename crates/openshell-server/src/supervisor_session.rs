@@ -680,6 +680,24 @@ impl SupervisorSessionRegistry {
             .map(|session| session.config.is_some())
     }
 
+    /// Queue `message` on `session_id` if it is still the sandbox's current
+    /// session. Returns false when the session is gone or its queue is full.
+    pub fn send_if_current(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        message: GatewayMessage,
+    ) -> bool {
+        let tx = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+            .map(|session| session.tx.clone());
+        tx.is_some_and(|tx| tx.try_send(message).is_ok())
+    }
+
     pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {
         self.sessions
             .lock()
@@ -2238,6 +2256,7 @@ struct ConfigPushSetup {
 /// session task or drops with early cleanup.
 struct SessionSetup {
     advertises_services: bool,
+    confirms_activity: bool,
     state: Arc<ServerState>,
     sandbox_id: String,
     instance_id: String,
@@ -2257,6 +2276,7 @@ struct SessionSetup {
 async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     let SessionSetup {
         advertises_services,
+        confirms_activity,
         state,
         sandbox_id,
         instance_id,
@@ -2523,6 +2543,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         supports_session_redirect,
         pushes_config,
         advertises_services,
+        confirms_activity,
     };
     tokio::spawn(async move {
         let _session_lifetime = session_lifetime;
@@ -2660,6 +2681,7 @@ pub async fn handle_connect_supervisor(
     let setup = SessionSetup {
         advertises_services: state.config.supervisor_app_listener.enabled
             && hello.supports_service_advertisements,
+        confirms_activity: hello.supports_workload_activity_requests,
         state: Arc::clone(state),
         sandbox_id,
         instance_id: hello.instance_id,
@@ -2921,6 +2943,8 @@ fn queue_shutdown_redirect(
 }
 
 /// An accepted supervisor session, shared by the handlers for its messages.
+// Each bool is an independent capability the supervisor's hello negotiated.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct AcceptedSession {
     pub(crate) state: Arc<ServerState>,
     pub(crate) sandbox_id: String,
@@ -2935,6 +2959,9 @@ pub(crate) struct AcceptedSession {
     /// polling.
     pub(crate) pushes_config: bool,
     pub(crate) advertises_services: bool,
+    /// The supervisor answers `WorkloadActivityRequest`, so its sandbox can be
+    /// idle-stopped after it confirms.
+    pub(crate) confirms_activity: bool,
 }
 
 async fn run_session_loop(
@@ -3160,7 +3187,13 @@ async fn handle_supervisor_message(
         Some(supervisor_message::Payload::WorkloadActivity(report)) => {
             if let Err(error) = state
                 .compute
-                .record_workload_activity(sandbox_id, session_id, &session.instance_id, &report)
+                .record_workload_activity(
+                    sandbox_id,
+                    session_id,
+                    &session.instance_id,
+                    session.confirms_activity,
+                    &report,
+                )
                 .await
             {
                 debug!(sandbox_id = %sandbox_id, %error, "failed to record workload activity");
@@ -3385,6 +3418,7 @@ mod tests {
         let mut inbound = futures::stream::pending::<Result<SupervisorMessage, Status>>();
         let session = AcceptedSession {
             advertises_services: false,
+            confirms_activity: false,
             state: Arc::clone(&state),
             sandbox_id: "sb-no-peer".into(),
             session_id: "session-no-peer".into(),
@@ -5951,6 +5985,7 @@ mod tests {
         let mut inbound = futures::stream::iter([Ok(failure)]).chain(futures::stream::pending());
         let session = AcceptedSession {
             advertises_services: false,
+            confirms_activity: false,
             state: Arc::clone(&state),
             sandbox_id: "sb-replaced".into(),
             session_id: "session-a".into(),
@@ -6042,6 +6077,7 @@ mod tests {
         let mut inbound = futures::stream::iter([Ok(heartbeat)]).chain(futures::stream::pending());
         let session = AcceptedSession {
             advertises_services: false,
+            confirms_activity: false,
             state: Arc::clone(&state),
             sandbox_id: "sb-moved".into(),
             session_id: "session-replaced".into(),

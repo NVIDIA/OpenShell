@@ -23,7 +23,11 @@ A sandbox-wide summary takes the most active state across terminals
 (working, then blocked, error, done, idle) and the latest client input, which
 outlives the terminal that received it. Each gateway session receives the
 summary at start, on every change, and within 15 seconds of new input, including
-the last keystroke before typing stops. Ages are relative, so supervisor and gateway clocks need
+the last keystroke before typing stops. It also answers each
+`WorkloadActivityRequest` with the current summary, which the gateway requires
+before an idle stop. Every transition, including one undone within the same
+read, restarts the state timer and advances a revision. Summaries are published
+under the activity lock, so concurrent terminals never republish an older one. Ages are relative, so supervisor and gateway clocks need
 not agree.
 
 ## Bounded streaming uploads

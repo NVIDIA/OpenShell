@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, oneshot, watch};
 use tonic::transport::Channel;
 #[cfg(unix)]
 use tonic::transport::Endpoint;
@@ -971,6 +971,12 @@ pub struct ComputeRuntime {
     /// Latest program status per sandbox from this replica's supervisor
     /// sessions. Only these reports authorize an idle stop.
     live_activity: Arc<StdMutex<HashMap<String, idle_stop::LiveActivity>>>,
+    /// Serializes live report updates with the final idle check and the
+    /// `Stopping` write, so a report received before the write is never
+    /// overtaken by a stop decided from an older one.
+    activity_gate: Arc<Mutex<()>>,
+    /// Idle stops waiting for their supervisor to confirm, by request ID.
+    activity_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<()>>>>,
     sandbox_updates_enabled: bool,
     update_recovery_sweep: Arc<tokio::sync::Semaphore>,
     update_recovery_backoff: Arc<Mutex<HashMap<String, image_update::UpdateRecoveryBackoff>>>,
@@ -1095,6 +1101,8 @@ impl ComputeRuntime {
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
             live_activity: Arc::default(),
+            activity_gate: Arc::default(),
+            activity_requests: Arc::default(),
             sandbox_updates_enabled: false,
             update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
@@ -2185,6 +2193,7 @@ impl ComputeRuntime {
         }
 
         let mut attempt = 1;
+        let mut activity_gate = None;
         let (previous, transition) = loop {
             provisioning_operation::ensure_operation_settled(&current)?;
             match operation.admit(&current)? {
@@ -2235,14 +2244,63 @@ impl ComputeRuntime {
                 // Acquiring the lifecycle gate proves that no local worker
                 // still owns this transition. Retry the idempotent driver
                 // operation.
-                QuiesceAdmission::Retry => break (current.clone(), current),
+                QuiesceAdmission::Retry => {
+                    // An explicit stop replaces an idle stop still in flight on
+                    // another replica, so it cannot settle as `IdleStopped`.
+                    if operation == QuiesceOperation::Stop
+                        && cause == QuiesceCause::Requested
+                        && idle_stop::idle_stop_marked(&current)
+                    {
+                        let (reason, message) = operation.requested_condition(cause);
+                        match self
+                            .write_lifecycle_phase(
+                                &current,
+                                SandboxPhase::Stopping,
+                                reason,
+                                message,
+                            )
+                            .await
+                        {
+                            Ok(explicit) => {
+                                self.sandbox_index.update_from_sandbox(&explicit);
+                                self.sandbox_watch_bus.notify(&sandbox_id);
+                                current = explicit;
+                            }
+                            Err(crate::persistence::PersistenceError::Conflict { .. })
+                                if attempt < STOP_PHASE_CAS_RETRY_LIMIT =>
+                            {
+                                attempt += 1;
+                                current = self
+                                    .store
+                                    .get_message::<Sandbox>(&sandbox_id)
+                                    .await
+                                    .map_err(|e| {
+                                        Status::internal(format!("fetch sandbox failed: {e}"))
+                                    })?
+                                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(crate::grpc::persistence_error_to_status(
+                                    error,
+                                    "update sandbox lifecycle",
+                                ));
+                            }
+                        }
+                    }
+                    break (current.clone(), current);
+                }
                 QuiesceAdmission::Begin => {}
             }
-            // Re-check under the lifecycle lock with the current report and
-            // setting: input, a new turn, or a longer or disabled timeout since
-            // the sweep keeps the sandbox running.
-            if cause == QuiesceCause::Idle && self.idle_stop_due_now(&current).await.is_none() {
-                return Err(Status::aborted("sandbox is no longer idle"));
+            // Under the lifecycle lock, the supervisor confirms with a fresh
+            // report and the setting is re-read. The gate then stays held
+            // through the `Stopping` write so no report received meanwhile
+            // loses to it.
+            if cause == QuiesceCause::Idle {
+                match self.admit_idle_stop(&current).await {
+                    Some(gate) => activity_gate = Some(gate),
+                    None => return Err(Status::aborted("sandbox is no longer idle")),
+                }
             }
 
             let reclaimed_timeout = operation == QuiesceOperation::Stop
@@ -2301,6 +2359,7 @@ impl ComputeRuntime {
                 }
             }
         };
+        drop(activity_gate);
         drop(sandbox_guard);
 
         // Once the durable transition is committed, request cancellation must
@@ -5194,6 +5253,100 @@ impl ComputeRuntime {
         }
     }
 
+    /// Admit an idle stop of `sandbox`, holding the activity gate on success.
+    ///
+    /// The current session must still own the sandbox in the shared owner
+    /// record, the effective setting is re-read, and the supervisor must
+    /// confirm with a fresh report that the program is still waiting.
+    async fn admit_idle_stop(&self, sandbox: &Sandbox) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let live = self.current_live_activity(sandbox.object_id())?;
+        if !live.confirms {
+            return None;
+        }
+        // After an HA handoff a former owner can still see its old stream as
+        // current; the owner record names the session that really owns it.
+        let owner = SupervisorOwnerIndex::new(self.store.clone(), OWNER_TTL)
+            .read(sandbox.object_id())
+            .await
+            .ok()?;
+        if owner
+            .is_some_and(|owner| owner.is_fresh(OWNER_TTL) && owner.session_id != live.session_id)
+        {
+            return None;
+        }
+        self.idle_stop_due_now(sandbox).await?;
+        if !self
+            .confirm_activity(sandbox.object_id(), &live.session_id)
+            .await
+        {
+            return None;
+        }
+        let gate = Arc::clone(&self.activity_gate).lock_owned().await;
+        let live = self.current_live_activity(sandbox.object_id())?;
+        let timeout = self.idle_stop_timeout(sandbox).await?;
+        idle_stop::idle_stop_due(sandbox, &live, timeout, SystemTime::now())?;
+        Some(gate)
+    }
+
+    /// Ask the session's supervisor for a fresh report and wait for it.
+    async fn confirm_activity(&self, sandbox_id: &str, session_id: &str) -> bool {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.activity_requests
+            .lock()
+            .expect("activity request lock poisoned")
+            .insert(request_id.clone(), tx);
+        let sent = self.supervisor_sessions.send_if_current(
+            sandbox_id,
+            session_id,
+            openshell_core::proto::GatewayMessage {
+                payload: Some(
+                    openshell_core::proto::gateway_message::Payload::WorkloadActivityRequest(
+                        openshell_core::proto::WorkloadActivityRequest {
+                            request_id: request_id.clone(),
+                        },
+                    ),
+                ),
+            },
+        );
+        let answered = sent
+            && matches!(
+                tokio::time::timeout(idle_stop::CONFIRM_TIMEOUT, rx).await,
+                Ok(Ok(()))
+            );
+        self.activity_requests
+            .lock()
+            .expect("activity request lock poisoned")
+            .remove(&request_id);
+        answered
+    }
+
+    /// The effective idle timeout for `sandbox`, or `None` when disabled.
+    async fn idle_stop_timeout(&self, sandbox: &Sandbox) -> Option<Duration> {
+        let global = crate::grpc::policy::global_idle_stop_after_seconds(&self.store)
+            .await
+            .ok()?;
+        self.idle_stop_timeout_with_global(sandbox, global).await
+    }
+
+    /// [`Self::idle_stop_timeout`] with a gateway setting a sweep already
+    /// loaded for many sandboxes.
+    async fn idle_stop_timeout_with_global(
+        &self,
+        sandbox: &Sandbox,
+        global: Option<i64>,
+    ) -> Option<Duration> {
+        let setting = crate::grpc::policy::idle_stop_after_seconds(
+            &self.store,
+            global,
+            sandbox.object_workspace(),
+            sandbox.object_name(),
+        )
+        .await
+        .ok()?;
+        idle_stop::timeout_from_setting(setting)
+    }
+
     /// How long `sandbox` has waited past its idle timeout, if it is due now.
     async fn idle_stop_due_now(&self, sandbox: &Sandbox) -> Option<Duration> {
         let global = crate::grpc::policy::global_idle_stop_after_seconds(&self.store)
@@ -5211,15 +5364,7 @@ impl ComputeRuntime {
     ) -> Option<Duration> {
         let live = self.current_live_activity(sandbox.object_id())?;
         idle_stop::idle_since(sandbox, &live)?;
-        let setting = crate::grpc::policy::idle_stop_after_seconds(
-            &self.store,
-            global,
-            sandbox.object_workspace(),
-            sandbox.object_name(),
-        )
-        .await
-        .ok()?;
-        let timeout = idle_stop::timeout_from_setting(setting)?;
+        let timeout = self.idle_stop_timeout_with_global(sandbox, global).await?;
         idle_stop::idle_stop_due(sandbox, &live, timeout, SystemTime::now())
     }
 
@@ -5301,16 +5446,35 @@ impl ComputeRuntime {
         sandbox_id: &str,
         session_id: &str,
         instance_id: &str,
+        confirms: bool,
         report: &openshell_core::proto::SupervisorWorkloadActivity,
     ) -> Result<(), String> {
         let received = SystemTime::now();
-        self.live_activity
-            .lock()
-            .expect("live activity lock poisoned")
-            .insert(
-                sandbox_id.to_string(),
-                idle_stop::live_from_report(report, session_id, instance_id, received),
-            );
+        {
+            let _gate = self.activity_gate.lock().await;
+            self.live_activity
+                .lock()
+                .expect("live activity lock poisoned")
+                .insert(
+                    sandbox_id.to_string(),
+                    idle_stop::live_from_report(
+                        report,
+                        session_id,
+                        instance_id,
+                        confirms,
+                        received,
+                    ),
+                );
+        }
+        if !report.request_id.is_empty()
+            && let Some(waiter) = self
+                .activity_requests
+                .lock()
+                .expect("activity request lock poisoned")
+                .remove(&report.request_id)
+        {
+            let _ = waiter.send(());
+        }
         let _guard = self.lock_sandbox_local(sandbox_id).await;
         let mut attempt = 1;
         loop {
@@ -9150,6 +9314,8 @@ pub fn new_test_runtime_with_driver(
         image_preparation_timeout_seconds: 1800,
         provisioning_repair_window_ms: 300_000,
         live_activity: Arc::default(),
+        activity_gate: Arc::default(),
+        activity_requests: Arc::default(),
         sandbox_updates_enabled: false,
         update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
         update_recovery_backoff: Arc::default(),
@@ -10450,6 +10616,8 @@ mod tests {
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
             live_activity: Arc::default(),
+            activity_gate: Arc::default(),
+            activity_requests: Arc::default(),
             sandbox_updates_enabled: false,
             update_recovery_sweep: Arc::new(Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
@@ -22568,6 +22736,88 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap()
     }
 
+    async fn record(
+        runtime: &ComputeRuntime,
+        id: &str,
+        report: &openshell_core::proto::SupervisorWorkloadActivity,
+    ) {
+        runtime
+            .record_workload_activity(id, "session-1", "instance-1", true, report)
+            .await
+            .unwrap();
+    }
+
+    async fn record_done_an_hour_ago(runtime: &ComputeRuntime, id: &str) {
+        record(
+            runtime,
+            id,
+            &program_report(openshell_core::proto::WorkloadProgramState::Done, 3600),
+        )
+        .await;
+    }
+
+    async fn set_idle_timeout(runtime: &ComputeRuntime, name: &str, seconds: i64) {
+        crate::grpc::policy::put_int_setting_for_test(
+            &runtime.store,
+            Some(("default", name)),
+            openshell_core::settings::IDLE_STOP_AFTER_SECONDS_KEY,
+            seconds,
+        )
+        .await;
+    }
+
+    /// Register "session-1" with a supervisor that answers each activity
+    /// request with `answer`, as the real supervisor answers from its
+    /// current state.
+    fn register_confirming_session(
+        runtime: &ComputeRuntime,
+        id: &str,
+        answer: openshell_core::proto::SupervisorWorkloadActivity,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<openshell_core::proto::GatewayMessage>(8);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        runtime.supervisor_sessions.register(
+            id.to_string(),
+            "session-1".to_string(),
+            tx,
+            shutdown_tx,
+        );
+        let runtime = runtime.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let Some(
+                    openshell_core::proto::gateway_message::Payload::WorkloadActivityRequest(
+                        request,
+                    ),
+                ) = message.payload
+                {
+                    let mut reply = answer.clone();
+                    reply.request_id = request.request_id;
+                    let _ = runtime
+                        .record_workload_activity(&id, "session-1", "instance-1", true, &reply)
+                        .await;
+                }
+            }
+        });
+    }
+
+    async fn wait_for_phase(runtime: &ComputeRuntime, id: &str, phase: SandboxPhase) -> Sandbox {
+        let mut sandbox = stored_sandbox(runtime, id).await;
+        for _ in 0..200 {
+            if sandbox.phase() == phase as i32 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sandbox = stored_sandbox(runtime, id).await;
+        }
+        sandbox
+    }
+
+    fn still_idle() -> openshell_core::proto::SupervisorWorkloadActivity {
+        program_report(openshell_core::proto::WorkloadProgramState::Done, 3600)
+    }
+
     #[tokio::test]
     async fn workload_activity_is_recorded_for_the_running_instance_and_survives_snapshots() {
         use openshell_core::proto::WorkloadProgramState;
@@ -22577,15 +22827,12 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         runtime.store.put_message(&sandbox).await.unwrap();
         register_test_supervisor_session(&runtime, sandbox.object_id());
 
-        runtime
-            .record_workload_activity(
-                "sb-activity",
-                "session-1",
-                "instance-1",
-                &program_report(WorkloadProgramState::Done, 0),
-            )
-            .await
-            .unwrap();
+        record(
+            &runtime,
+            "sb-activity",
+            &program_report(WorkloadProgramState::Done, 0),
+        )
+        .await;
         let recorded = stored_sandbox(&runtime, "sb-activity").await;
         let program = idle_stop::program_condition(&recorded).unwrap();
         assert_eq!(program.reason, "Done");
@@ -22598,20 +22845,18 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 "sb-activity",
                 "session-1",
                 "instance-old",
+                true,
                 &program_report(WorkloadProgramState::Working, 0),
             )
             .await
             .unwrap();
         // An unchanged state is not rewritten.
-        runtime
-            .record_workload_activity(
-                "sb-activity",
-                "session-1",
-                "instance-1",
-                &program_report(WorkloadProgramState::Done, 0),
-            )
-            .await
-            .unwrap();
+        record(
+            &runtime,
+            "sb-activity",
+            &program_report(WorkloadProgramState::Done, 0),
+        )
+        .await;
         let unchanged = stored_sandbox(&runtime, "sb-activity").await;
         assert_eq!(sandbox_resource_version(&unchanged), version);
         assert_eq!(
@@ -22633,51 +22878,28 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     }
 
     #[tokio::test]
-    async fn idle_sweep_stops_waiting_sandboxes_and_start_clears_the_reason() {
+    async fn idle_sweep_stops_confirmed_waiting_sandboxes_and_start_clears_the_reason() {
         use openshell_core::proto::WorkloadProgramState;
         let driver = ControlledDriver::new();
         let runtime = Arc::new(test_runtime(driver.clone()).await);
         let idle = idle_ready_record("sb-idle", "sandbox-idle");
         let busy = idle_ready_record("sb-busy", "sandbox-busy");
         let unset = idle_ready_record("sb-unset", "sandbox-unset");
-        for sandbox in [&idle, &busy, &unset] {
-            runtime.store.put_message(sandbox).await.unwrap();
-            register_test_supervisor_session(&runtime, sandbox.object_id());
-        }
-        for (id, state) in [
-            ("sb-idle", WorkloadProgramState::Done),
-            ("sb-busy", WorkloadProgramState::Working),
-            ("sb-unset", WorkloadProgramState::Done),
+        for (sandbox, state) in [
+            (&idle, WorkloadProgramState::Done),
+            (&busy, WorkloadProgramState::Working),
+            (&unset, WorkloadProgramState::Done),
         ] {
-            runtime
-                .record_workload_activity(
-                    id,
-                    "session-1",
-                    "instance-1",
-                    &program_report(state, 3600),
-                )
-                .await
-                .unwrap();
+            runtime.store.put_message(sandbox).await.unwrap();
+            register_confirming_session(&runtime, sandbox.object_id(), program_report(state, 3600));
+            record(&runtime, sandbox.object_id(), &program_report(state, 3600)).await;
         }
         for name in ["sandbox-idle", "sandbox-busy"] {
-            crate::grpc::policy::put_int_setting_for_test(
-                &runtime.store,
-                Some(("default", name)),
-                openshell_core::settings::IDLE_STOP_AFTER_SECONDS_KEY,
-                60,
-            )
-            .await;
+            set_idle_timeout(&runtime, name, 60).await;
         }
 
         Arc::clone(&runtime).stop_idle_sandboxes().await.unwrap();
-        let mut stopped = stored_sandbox(&runtime, "sb-idle").await;
-        for _ in 0..200 {
-            if stopped.phase() == SandboxPhase::Stopped as i32 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            stopped = stored_sandbox(&runtime, "sb-idle").await;
-        }
+        let stopped = wait_for_phase(&runtime, "sb-idle", SandboxPhase::Stopped).await;
         assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
         assert!(
             stopped.idle_stopped(),
@@ -22720,22 +22942,26 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     }
 
     #[tokio::test]
-    async fn idle_stop_aborts_when_input_arrived_after_the_sweep_read() {
-        use openshell_core::proto::WorkloadProgramState;
+    async fn input_the_supervisor_confirms_at_admission_keeps_a_due_sandbox() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         let sandbox = idle_ready_record("sb-typed", "sandbox-typed");
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, sandbox.object_id());
-        runtime
-            .record_workload_activity(
-                "sb-typed",
-                "session-1",
-                "instance-1",
-                &program_report(WorkloadProgramState::Working, 0),
-            )
-            .await
-            .unwrap();
+        // Blocked for an hour by the last pushed report, but the user typed
+        // just now and the confirmation reports that input.
+        let mut typed = program_report(openshell_core::proto::WorkloadProgramState::Blocked, 3600);
+        typed.input_age = Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 0,
+        });
+        register_confirming_session(&runtime, "sb-typed", typed);
+        record(
+            &runtime,
+            "sb-typed",
+            &program_report(openshell_core::proto::WorkloadProgramState::Blocked, 3600),
+        )
+        .await;
+        set_idle_timeout(&runtime, "sandbox-typed", 60).await;
 
         let error = runtime
             .quiesce_sandbox(
@@ -22748,34 +22974,78 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap_err();
         assert_eq!(error.code(), Code::Aborted);
         assert_eq!(driver.stop_calls(), 0);
-        assert_eq!(
-            stored_sandbox(&runtime, "sb-typed").await.phase(),
-            SandboxPhase::Ready as i32
-        );
     }
 
-    async fn record_done_an_hour_ago(runtime: &ComputeRuntime, id: &str) {
-        runtime
-            .record_workload_activity(
-                id,
-                "session-1",
-                "instance-1",
-                &program_report(openshell_core::proto::WorkloadProgramState::Done, 3600),
+    #[tokio::test]
+    async fn a_turn_the_supervisor_confirms_at_admission_keeps_a_due_sandbox() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = idle_ready_record("sb-turn", "sandbox-turn");
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_confirming_session(
+            &runtime,
+            "sb-turn",
+            program_report(openshell_core::proto::WorkloadProgramState::Working, 0),
+        );
+        record_done_an_hour_ago(&runtime, "sb-turn").await;
+        set_idle_timeout(&runtime, "sandbox-turn", 60).await;
+        assert!(
+            runtime
+                .idle_stop_due_now(&stored_sandbox(&runtime, "sb-turn").await)
+                .await
+                .is_some(),
+            "the candidate is due from its last pushed report"
+        );
+
+        let error = runtime
+            .quiesce_sandbox(
+                QuiesceOperation::Stop,
+                QuiesceCause::Idle,
+                "default",
+                "sandbox-turn",
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.stop_calls(), 0);
     }
 
-    async fn wait_for_phase(runtime: &ComputeRuntime, id: &str, phase: SandboxPhase) -> Sandbox {
-        let mut sandbox = stored_sandbox(runtime, id).await;
-        for _ in 0..200 {
-            if sandbox.phase() == phase as i32 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            sandbox = stored_sandbox(runtime, id).await;
-        }
-        sandbox
+    #[tokio::test]
+    async fn sessions_that_do_not_confirm_are_never_stopped() {
+        let driver = ControlledDriver::new();
+        let runtime = Arc::new(test_runtime(driver.clone()).await);
+        let sandbox = idle_ready_record("sb-silent", "sandbox-silent");
+        runtime.store.put_message(&sandbox).await.unwrap();
+        // A stale stream after a handoff: registered, but nothing answers.
+        let (tx, _rx) = mpsc::channel(8);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        runtime.supervisor_sessions.register(
+            "sb-silent".to_string(),
+            "session-1".to_string(),
+            tx,
+            shutdown_tx,
+        );
+        record_done_an_hour_ago(&runtime, "sb-silent").await;
+        set_idle_timeout(&runtime, "sandbox-silent", 60).await;
+        let error = runtime
+            .quiesce_sandbox(
+                QuiesceOperation::Stop,
+                QuiesceCause::Idle,
+                "default",
+                "sandbox-silent",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+
+        // A supervisor that cannot answer requests is never idle-stopped.
+        runtime
+            .record_workload_activity("sb-silent", "session-1", "instance-1", false, &still_idle())
+            .await
+            .unwrap();
+        Arc::clone(&runtime).stop_idle_sandboxes().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(driver.stop_calls(), 0);
     }
 
     #[tokio::test]
@@ -22784,15 +23054,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let runtime = Arc::new(test_runtime(driver.clone()).await);
         let sandbox = idle_ready_record("sb-restored", "sandbox-restored");
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, "sb-restored");
+        register_confirming_session(&runtime, "sb-restored", still_idle());
         record_done_an_hour_ago(&runtime, "sb-restored").await;
-        crate::grpc::policy::put_int_setting_for_test(
-            &runtime.store,
-            Some(("default", "sandbox-restored")),
-            openshell_core::settings::IDLE_STOP_AFTER_SECONDS_KEY,
-            60,
-        )
-        .await;
+        set_idle_timeout(&runtime, "sandbox-restored", 60).await;
         // A gateway restart keeps the stored condition but no live report.
         runtime.live_activity.lock().unwrap().clear();
         assert!(
@@ -22823,17 +23087,16 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let runtime = test_runtime(driver.clone()).await;
         let sandbox = idle_ready_record("sb-disabled", "sandbox-disabled");
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, "sb-disabled");
+        register_confirming_session(&runtime, "sb-disabled", still_idle());
         record_done_an_hour_ago(&runtime, "sb-disabled").await;
-        for value in [60, 0] {
-            crate::grpc::policy::put_int_setting_for_test(
-                &runtime.store,
-                Some(("default", "sandbox-disabled")),
-                openshell_core::settings::IDLE_STOP_AFTER_SECONDS_KEY,
-                value,
-            )
-            .await;
-        }
+        set_idle_timeout(&runtime, "sandbox-disabled", 60).await;
+        assert!(
+            runtime
+                .idle_stop_due_now(&stored_sandbox(&runtime, "sb-disabled").await)
+                .await
+                .is_some()
+        );
+        set_idle_timeout(&runtime, "sandbox-disabled", 0).await;
         let error = runtime
             .quiesce_sandbox(
                 QuiesceOperation::Stop,
@@ -22853,15 +23116,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let runtime = Arc::new(test_runtime(driver.clone()).await);
         let sandbox = idle_ready_record("sb-explicit", "sandbox-explicit");
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, "sb-explicit");
+        register_confirming_session(&runtime, "sb-explicit", still_idle());
         record_done_an_hour_ago(&runtime, "sb-explicit").await;
-        crate::grpc::policy::put_int_setting_for_test(
-            &runtime.store,
-            Some(("default", "sandbox-explicit")),
-            openshell_core::settings::IDLE_STOP_AFTER_SECONDS_KEY,
-            60,
-        )
-        .await;
+        set_idle_timeout(&runtime, "sandbox-explicit", 60).await;
         Arc::clone(&runtime).stop_idle_sandboxes().await.unwrap();
         let idle_stopped = wait_for_phase(&runtime, "sb-explicit", SandboxPhase::Stopped).await;
         assert!(idle_stopped.idle_stopped());
@@ -22881,5 +23138,35 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             1,
             "the explicit stop needs no driver call"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_during_an_in_flight_idle_stop_settles_as_explicit() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        // Another replica's idle stop committed Stopping and is waiting on
+        // the driver; this replica has no worker for it.
+        let mut sandbox = idle_ready_record("sb-inflight", "sandbox-inflight");
+        apply_lifecycle_phase(
+            &mut sandbox,
+            SandboxPhase::Stopping,
+            idle_stop::IDLE_STOPPING_REASON,
+            "Sandbox stop requested after its program waited on the user past its idle timeout",
+            1800,
+            300_000,
+        );
+        assert!(idle_stop::idle_stop_marked(&sandbox));
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let stopped = runtime
+            .stop_sandbox("default", "sandbox-inflight")
+            .await
+            .unwrap();
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        assert!(
+            !stopped.idle_stopped(),
+            "the explicit stop wins over the idle one"
+        );
+        assert!(!idle_stop::idle_stop_marked(&stopped));
     }
 }

@@ -143,8 +143,24 @@ message SupervisorWorkloadActivity {
   google.protobuf.Duration state_age = 4;  // time in `state`
   google.protobuf.Duration input_age = 5;  // since last client input, if any
   uint32 reporting_terminals = 6;
+  string request_id = 7;                   // set when answering a request
+}
+
+message GatewayMessage {
+  oneof payload {
+    // ... existing variants 1-8 ...
+    WorkloadActivityRequest workload_activity_request = 9;
+  }
+}
+
+message WorkloadActivityRequest {
+  string request_id = 1;
 }
 ```
+
+`SupervisorHello.supports_workload_activity_requests` (field 9) advertises
+that the supervisor answers requests. As with every stream payload, the gateway
+sends requests only to supervisors that advertise it.
 
 Ages are relative so supervisor and gateway clocks need not agree. The
 supervisor sends the summary when each gateway session starts, on every change,
@@ -155,7 +171,10 @@ their program sent the support query.
 
 The supervisor applies reports, OSC 133 `A` prompts, and full resets (RIS) in
 output order, however reads split them. A prompt ends only the reports before
-it, and a reset clears the terminal's records as the spec requires.
+it, and a reset clears the terminal's records as the spec requires. Every
+transition restarts the state timer and advances a revision, including a
+`working` → `done` turn within one read. Summaries are published in mutation
+order, so concurrent terminals never hide a transition from the reporter.
 
 The replica holding the supervisor session keeps that session's latest report
 in memory. Only that live report authorizes an idle stop. The gateway also
@@ -188,7 +207,8 @@ A sandbox is idle when all of these hold:
   main-process instance, is `idle`, `done`, `blocked`, or `error`, so no
   terminal is `working`;
 - the later of that report's time and `main_process_started_time` is older
-  than the idle timeout plus a 15-second input report lag.
+  than the idle timeout plus a 15-second input report lag;
+- at admission, the supervisor confirms it with a fresh report.
 
 The timeout is a new runtime setting, `idle_stop_after_seconds`, set with
 `openshell settings set` at gateway or sandbox scope. As with every runtime
@@ -201,9 +221,22 @@ seconds and reads settings only for those already waiting. A gateway that
 restarts, or a session that moves to another replica, stops nothing until the
 new session reports, so a workload that resumed work during an outage is not
 stopped on a stale record. Each due sandbox goes through the existing stop path
-on its own task, with an idle cause. Under the lifecycle lock, the stop re-reads
-the live report and the setting. New input, a new turn, or a timeout that was
-disabled or extended since the sweep keeps the sandbox running.
+on its own task, with an idle cause.
+
+Under the lifecycle lock, admission does four things:
+
+1. Requires the shared owner record to still name the session, which covers a
+   former owner after an HA handoff.
+2. Re-reads the setting.
+3. Sends a `WorkloadActivityRequest` and waits up to 5 seconds for the reply. No
+   reply, as from a dead or replaced stream, cancels the stop.
+4. Holds an activity gate, which every live report update also takes, through
+   the final check and the `Stopping` write. A report the gateway received
+   before the write, such as `Working`, always counts.
+
+New input, a new turn, or a timeout that was disabled or extended keeps the
+sandbox running. Only input that arrives after the `Stopping` write is lost,
+which is inherent to stopping.
 
 The idle request writes the internal annotation `internal.openshell.ai/idle-stop`
 with the reason `IdleStopping`. The annotation survives gateway recovery and
@@ -211,8 +244,9 @@ driver snapshots that rewrite conditions. The Ready condition then settles as
 `IdleStopped` instead of `Stopped`, so users and the CLI can tell an idle stop
 from an explicit one. The gateway reapplies that reason when a driver snapshot
 of the stopped runtime rewrites it. Any other lifecycle write removes the
-annotation. An explicit `sandbox stop` of an idle-stopped sandbox rewrites it as
-an ordinary stop, so `sandbox connect` no longer starts it. The
+annotation. An explicit `sandbox stop` rewrites an idle stop as an ordinary
+stop, so `sandbox connect` no longer starts it. This holds whether the idle
+stop has settled or is still waiting on the driver on another replica. The
 gateway logs each idle stop with the sandbox, the program, and how long it
 waited.
 
@@ -228,6 +262,9 @@ sequenceDiagram
     S->>G: SupervisorWorkloadActivity(done, state_age)
     G->>G: record ProgramStatus condition
     Note over G: idle sweep: done for > idle_stop_after_seconds
+    G->>S: WorkloadActivityRequest
+    S->>G: SupervisorWorkloadActivity(done, request_id)
+    G->>G: final check and Stopping write under the activity gate
     G->>D: StopSandbox
     G->>G: phase Stopped, reason IdleStopped
 ```
