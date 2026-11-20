@@ -223,9 +223,7 @@ jobs:
           # variable on to the guest.
           OPENSHELL_TEST_UNSUPPORTED="$(tasks/scripts/suite-unsupported.sh "${ENVIRONMENT}/${INSTALLER}")"
           export OPENSHELL_TEST_UNSUPPORTED
-          # Nextest reports skips but not their issue URLs. The conformance
-          # program prints its own reasons.
-          if [[ -n "${OPENSHELL_TEST_UNSUPPORTED}" && ( "${FAMILY}" != "conformance" || "${PREBUILT}" != "true" ) ]]; then
+          if [[ -n "${OPENSHELL_TEST_UNSUPPORTED}" ]]; then
             printf 'Unsupported tests and issues for this environment:\n'
             printf '%s\n' "${OPENSHELL_TEST_UNSUPPORTED}" | tr ',' '\n'
           fi
