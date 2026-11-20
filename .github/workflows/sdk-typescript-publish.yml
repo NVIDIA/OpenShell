@@ -3,24 +3,11 @@
 
 name: Publish TypeScript SDK
 
+# Publishes the deprecated @nvidia/openshell-sdk stub, which re-exports
+# @ai-openshell/sdk. Run it by hand after ai-openshell/sdk-typescript publishes
+# the matching @ai-openshell/sdk release. That release needs the core tag
+# first, so the core Release workflow can't publish the stub.
 on:
-  workflow_call:
-    inputs:
-      release-tag:
-        required: true
-        type: string
-      source-ref:
-        description: Commit to publish the package from
-        required: true
-        type: string
-      npm-version:
-        required: true
-        type: string
-      make-latest:
-        description: Whether this release may update the npm latest dist-tag
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
     inputs:
       release-tag:
@@ -53,7 +40,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.source-ref || inputs.release-tag }}
+          ref: ${{ inputs.release-tag }}
 
       - uses: ./.github/actions/setup-nix
 
@@ -96,7 +83,7 @@ jobs:
           IFS=. read -r major minor _ <<<"${OPENSHELL_NPM_VERSION}"
           sdk_range="^${major}.${minor}.0"
           if [[ -z "$(npm view "@ai-openshell/sdk@${sdk_range}" version --registry=https://registry.npmjs.org/)" ]]; then
-            echo "::error title=@ai-openshell/sdk missing::No @ai-openshell/sdk version matches ${sdk_range} on npmjs.org. Release ai-openshell/sdk-typescript first, then rerun this workflow with workflow_dispatch."
+            echo "::error title=@ai-openshell/sdk missing::No @ai-openshell/sdk version matches ${sdk_range} on npmjs.org. Release ai-openshell/sdk-typescript first, then run this workflow again."
             exit 1
           fi
           npm pkg set version="${OPENSHELL_NPM_VERSION}"

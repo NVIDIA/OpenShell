@@ -16,7 +16,7 @@ Monitor GitHub Actions workflow runs using the `gh` CLI.
 
 ## SDK migration failures
 
-`TypeScript SDK Freeze` rejects additions and modifications under `sdk/typescript/` on PR mirrors, except the re-export stub's files. Move those changes to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no regenerated TypeScript bindings. Deletions are allowed for removal. The job skips merge groups, matching `Python SDK Freeze`.
+`TypeScript SDK Freeze` rejects additions and modifications under `sdk/typescript/` in pull requests, except the re-export stub's files. Move those changes to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no regenerated TypeScript bindings. Deletions are allowed for removal. The job skips merge groups, matching `Python SDK Freeze`.
 
 ## Quick Status Check
 
