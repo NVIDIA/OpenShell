@@ -1038,13 +1038,16 @@ openshell sandbox create \
   --detach \
   -- ./start-server.sh
 
-# Expose and manage an HTTP service through the gateway.
+# Expose and manage a named HTTP service.
 openshell service expose my-app 8080 web \
   --authorization-mode bearer-passthrough
 openshell service list my-app
 openshell service list my-app --output json
 openshell service get my-app web
 openshell service delete my-app web
+
+# Expose a service that listens for cleartext HTTP/2, such as native gRPC.
+openshell service expose my-app 50051 agent --backend-http-version 2
 ```
 
 Use `openshell service list --all-workspaces` for a Platform Admin view across
@@ -1054,6 +1057,8 @@ workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
 request and keeps the sandbox running. Add `--output json` for automation; the
 result contains a `service_urls` map whose empty key is the unnamed endpoint.
 Use `openshell service expose` after creation to add or update named endpoints.
+An HTTP/2 backend requires the supervisor application listener. Clients use the
+application URL with HTTP/2 over TLS.
 
 Exposed services strip `Authorization` by default. Select
 `bearer-passthrough` only when the application inside the sandbox authenticates
@@ -1062,9 +1067,10 @@ one non-empty Bearer credential and forwards that value unchanged. It rejects
 duplicate, malformed, or non-Bearer authorization before contacting the
 application. The application remains responsible for validating the token, and
 the raw token reaches the sandbox process, so never log it. Service routes
-bypass control-plane RPC authorization, but they still use the gateway's
-existing listener, domain routing, and TLS configuration, including any client
-certificate requirement. See the published
+bypass control-plane RPC authorization. Gateway service URLs use the gateway's
+listener and TLS configuration, including any client certificate requirement.
+The supervisor application listener uses application or ingress authentication.
+See the published
 [sandbox service documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for the complete security contract.
 

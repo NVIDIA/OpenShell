@@ -42,7 +42,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
-    SandboxRestartPolicy, SandboxTemplate, SshSession,
+    SandboxRestartPolicy, SandboxTemplate, ServiceBackendHttpVersion, SshSession,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
@@ -841,6 +841,7 @@ async fn handle_create_sandbox_inner(
                 exposure.target_port,
                 exposure.authorization_mode,
             )?,
+            ServiceBackendHttpVersion::Unspecified,
         )
         .await
         {

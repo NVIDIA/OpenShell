@@ -11,13 +11,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
-use http::{Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, Version, header};
+use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper::rt::Executor as _;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::grpc_client::SettingsPollResult;
-use openshell_core::proto::SandboxServiceRoute;
-use openshell_isolation_interface::contract::LoopbackTarget;
+use openshell_core::proto::{SandboxServiceRoute, ServiceBackendHttpVersion};
+use openshell_isolation_interface::contract::{BoundaryDuplexStream, LoopbackTarget};
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DispositionId,
     HttpActivityBuilder, HttpResponse, NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
@@ -33,6 +35,7 @@ use tokio_rustls::TlsAcceptor;
 const FRESHNESS: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HTTP2_STREAMS: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallRejection {
@@ -134,7 +137,7 @@ impl Config {
             .with_no_client_auth()
             .with_single_cert(certificates, key)
             .into_diagnostic()?;
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let socket = std::net::TcpListener::bind(self.address).into_diagnostic()?;
         socket.set_nonblocking(true).into_diagnostic()?;
         let listener = tokio::net::TcpListener::from_std(socket).into_diagnostic()?;
@@ -305,6 +308,7 @@ impl Routes {
                 || route.target_port == 0
                 || route.target_port > 65535
                 || !matches!(route.authorization_mode, 0..=2)
+                || ServiceBackendHttpVersion::try_from(route.backend_http_version).is_err()
                 || (!route.name.is_empty()
                     && (!openshell_core::app_listener::valid_dns_label(&route.name)
                         || route.name.contains("--")))
@@ -783,10 +787,19 @@ impl InstanceListener {
                             let service = hyper::service::service_fn(move |req| {
                                 proxy(req, sni.clone(), route.clone(), routes.clone(), connector.clone(), permit.clone(), token)
                             });
-                            let connection = hyper::server::conn::http1::Builder::new()
-                                .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
-                                .max_buf_size(65536).max_headers(64)
-                                .serve_connection(TokioIo::new(tls), service).with_upgrades();
+                            let connection = async {
+                                if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                                    hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                        .max_concurrent_streams(MAX_HTTP2_STREAMS)
+                                        .max_header_list_size(65536)
+                                        .serve_connection(TokioIo::new(tls), service).await
+                                } else {
+                                    hyper::server::conn::http1::Builder::new()
+                                        .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
+                                        .max_buf_size(65536).max_headers(64)
+                                        .serve_connection(TokioIo::new(tls), service).with_upgrades().await
+                                }
+                            };
                             tokio::select! {
                                 _ = connection => {},
                                 () = connection_routes.revoked(&connection_route, token) => {},
@@ -854,31 +867,33 @@ fn emit_denial(message: &str) {
     );
 }
 
-fn authority_matches<B>(req: &Request<B>, sni: &str) -> bool {
+fn request_authority<B>(req: &Request<B>, sni: &str) -> Option<header::HeaderValue> {
     let mut values = req.headers().get_all(header::HOST).iter();
-    let Some(value) = values.next() else {
-        return false;
+    let host = values
+        .next()
+        .map(header::HeaderValue::to_str)
+        .transpose()
+        .ok()?;
+    let uri_authority = req.uri().authority().map(http::uri::Authority::as_str);
+    let value = if req.version() == Version::HTTP_2 {
+        uri_authority?
+    } else {
+        host?
     };
-    if values.next().is_some() {
-        return false;
+    if values.next().is_some()
+        || host.is_some_and(|host| !host.eq_ignore_ascii_case(value))
+        || uri_authority.is_some_and(|uri| !uri.eq_ignore_ascii_case(value))
+        || value.contains('@')
+    {
+        return None;
     }
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    if value.contains('@') {
-        return false;
+    let authority = value.parse::<http::uri::Authority>().ok()?;
+    if !authority.host().eq_ignore_ascii_case(sni)
+        || (authority.port().is_some() && authority.port_u16().is_none())
+    {
+        return None;
     }
-    let Ok(authority) = value.parse::<http::uri::Authority>() else {
-        return false;
-    };
-    if authority.port().is_some() && authority.port_u16().is_none() {
-        return false;
-    }
-    authority.host().eq_ignore_ascii_case(sni)
-        && req
-            .uri()
-            .authority()
-            .is_none_or(|uri| uri.as_str().eq_ignore_ascii_case(value))
+    value.parse().ok()
 }
 
 fn gateway_header(name: &str) -> bool {
@@ -1004,20 +1019,31 @@ async fn proxy(
     if !routes.valid(&route, token) {
         return Ok(error(StatusCode::SERVICE_UNAVAILABLE));
     }
-    if !authority_matches(&req, &sni) {
+    let Some(authority) = request_authority(&req, &sni) else {
         return Ok(error(StatusCode::MISDIRECTED_REQUEST));
+    };
+    let downstream_http2 = req.version() == Version::HTTP_2;
+    let backend_http2 = route.backend_http_version == ServiceBackendHttpVersion::Http2 as i32;
+    if backend_http2 && !downstream_http2 {
+        return Ok(error(StatusCode::HTTP_VERSION_NOT_SUPPORTED));
     }
-    // Keep the public authority after validating it against SNI. The dial target
-    // is loopback, but rewriting Host would break application same-origin checks.
-    let authority = req.headers()[header::HOST].clone();
-    let websocket = req
+    if downstream_http2 && req.method() == Method::CONNECT {
+        return Ok(error(StatusCode::METHOD_NOT_ALLOWED));
+    }
+    let websocket = !downstream_http2
+        && req
+            .headers()
+            .get(header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let te_trailers = req
         .headers()
-        .get(header::UPGRADE)
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        .get(header::TE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"trailers"));
     if !sanitize_headers(req.headers_mut(), route.authorization_mode == 2, websocket) {
         return Ok(error(StatusCode::BAD_REQUEST));
     }
-    let downstream = websocket.then(|| hyper::upgrade::on(&mut req));
+    // Preserve the validated public authority for application same-origin checks.
+    req.headers_mut().insert(header::HOST, authority);
     let target = LoopbackTarget::new(
         "127.0.0.1".parse().expect("loopback"),
         u16::try_from(route.target_port).expect("validated route port"),
@@ -1027,6 +1053,14 @@ async fn proxy(
     else {
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
+    if backend_http2 {
+        if te_trailers {
+            req.headers_mut()
+                .insert(header::TE, header::HeaderValue::from_static("trailers"));
+        }
+        return Ok(proxy_http2(req, stream).await);
+    }
+    let downstream = websocket.then(|| hyper::upgrade::on(&mut req));
     let Ok((mut sender, connection)) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
     else {
@@ -1036,13 +1070,15 @@ async fn proxy(
         let _ = connection.with_upgrades().await;
     });
     let (mut parts, body) = req.into_parts();
+    if downstream_http2 {
+        parts.version = Version::HTTP_11;
+    }
     parts.uri = parts
         .uri
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .parse()
         .expect("valid path");
-    parts.headers.insert(header::HOST, authority);
     let response = sender.send_request(Request::from_parts(parts, body)).await;
     let Ok(mut response) = response else {
         upstream_task.abort();
@@ -1072,8 +1108,60 @@ async fn proxy(
     Ok(Response::from_parts(parts, Body::new(body)))
 }
 
+#[derive(Clone)]
+struct Http2RequestExecutor(watch::Receiver<()>);
+
+impl<F> hyper::rt::Executor<F> for Http2RequestExecutor
+where
+    F: Future + Send + 'static,
+{
+    fn execute(&self, future: F) {
+        let mut active = self.0.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = future => {},
+                _ = active.changed() => {},
+            }
+        });
+    }
+}
+
+async fn proxy_http2(req: Request<Incoming>, stream: BoundaryDuplexStream) -> Response<Body> {
+    let (active, receiver) = watch::channel(());
+    let executor = Http2RequestExecutor(receiver);
+    let handshake = hyper::client::conn::http2::handshake(executor.clone(), TokioIo::new(stream));
+    let Ok(Ok((mut sender, connection))) = tokio::time::timeout(CONNECT_TIMEOUT, handshake).await
+    else {
+        return error(StatusCode::BAD_GATEWAY);
+    };
+    executor.execute(connection);
+    let req = req.map(|body| {
+        body.map_frame(|mut frame| {
+            if let Some(trailers) = frame.trailers_mut() {
+                // Credentials are allowed only in the initial request headers.
+                sanitize_headers(trailers, false, false);
+            }
+            frame
+        })
+    });
+    let Ok(mut response) = sender.send_request(req).await else {
+        return error(StatusCode::BAD_GATEWAY);
+    };
+    strip_hop_headers(response.headers_mut(), false);
+    response.map(|body| {
+        Body::new(body.map_frame(move |frame| {
+            // Dropping the downstream body cancels this request's loopback connection,
+            // including any Hyper tasks still sending or receiving frames.
+            let _active = &active;
+            frame
+        }))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    mod http2;
+
     use super::*;
     use futures::{SinkExt as _, StreamExt as _};
     use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream};
@@ -1094,6 +1182,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         let mut config = installed(vec![route.clone()]);
         config.config_revision = 42;
@@ -1133,6 +1222,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         assert!(
@@ -1449,7 +1539,7 @@ mod tests {
     }
 
     struct Fixture {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         handle: Handle,
         address: SocketAddr,
         tls: Arc<rustls::ClientConfig>,
@@ -1495,6 +1585,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         let connector = Arc::new(Connector {
@@ -1502,7 +1593,7 @@ mod tests {
         });
         let handle = instance.start(rpc_test::loopback(connector.clone()));
         Fixture {
-            _directory: directory,
+            directory,
             handle,
             address,
             tls,
@@ -1857,6 +1948,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         for _ in 0..10 {

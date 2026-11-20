@@ -13,7 +13,8 @@ pub use openshell_core::app_listener::service_route_hash_label;
 use openshell_core::app_listener::service_route_label;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{
-    Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
+    Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceBackendHttpVersion, ServiceEndpoint,
+    TcpRelayTarget, relay_open,
 };
 use openshell_core::{ObjectId, ObjectWorkspace};
 use openshell_ocsf::{
@@ -633,7 +634,11 @@ async fn proxy_to_endpoint(
             return Err(err);
         }
     };
-    if !endpoint.domain || endpoint.target_port == 0 || endpoint.target_port > u32::from(u16::MAX) {
+    if !endpoint.domain
+        || endpoint.target_port == 0
+        || endpoint.target_port > u32::from(u16::MAX)
+        || endpoint.backend_http_version() == ServiceBackendHttpVersion::Http2
+    {
         let err = ServiceRouteError::endpoint_unavailable();
         emit_service_http_failure(
             &state,
@@ -1483,6 +1488,7 @@ mod tests {
             target_port: 8080,
             domain: true,
             authorization_mode: ServiceAuthorizationMode::Strip as i32,
+            backend_http_version: 0,
         }
     }
 
@@ -2374,6 +2380,7 @@ mod tests {
             target_port: 8080,
             domain: true,
             authorization_mode: ServiceAuthorizationMode::Strip as i32,
+            backend_http_version: 0,
         };
         store.put_message(&ep).await.unwrap();
 

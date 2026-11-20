@@ -12349,6 +12349,7 @@ mod tests {
             target_port: 8080,
             domain: true,
             authorization_mode: ServiceAuthorizationMode::Strip as i32,
+            backend_http_version: 0,
         }
     }
 

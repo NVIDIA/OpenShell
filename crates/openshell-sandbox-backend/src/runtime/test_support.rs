@@ -596,7 +596,8 @@ async fn relay_io(
         }
         writer.shutdown().await
     };
-    let read = async {
+    // End the response stream on EOF from the backend.
+    let read = async move {
         let mut b = vec![0; 16384];
         loop {
             let n = reader.read(&mut b).await?;

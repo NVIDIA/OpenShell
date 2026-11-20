@@ -65,9 +65,9 @@ use openshell_core::proto::{
     SandboxPolicy, SandboxResources, SandboxRestartPolicy, SandboxServiceExposure,
     SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
     SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    ServiceBackendHttpVersion, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
+    StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -4349,25 +4349,34 @@ async fn wait_for_lifecycle_phase(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn service_expose(
     server: &str,
     sandbox: &str,
     service: &str,
     target_port: u16,
     authorization_mode: ServiceAuthorizationMode,
+    backend_http_version: ServiceBackendHttpVersion,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let response = expose_service_endpoint(
-        server,
-        sandbox,
-        service,
-        target_port,
-        authorization_mode,
-        workspace,
-        tls,
-    )
-    .await?;
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .expose_service(ExposeServiceRequest {
+            request_id: String::new(),
+            sandbox: sandbox.to_string(),
+            name: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+            authorization_mode: authorization_mode as i32,
+            backend_http_version: backend_http_version as i32,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))?
+        .into_inner();
 
     if service.is_empty() {
         println!(
@@ -4392,33 +4401,6 @@ pub async fn service_expose(
         println!("  URL: {}", url.cyan());
     }
     Ok(())
-}
-
-async fn expose_service_endpoint(
-    server: &str,
-    sandbox: &str,
-    service: &str,
-    target_port: u16,
-    authorization_mode: ServiceAuthorizationMode,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<ServiceEndpointResponse> {
-    let mut client = grpc_client(server, tls).await?;
-    client
-        .expose_service(ExposeServiceRequest {
-            request_id: String::new(),
-            sandbox: sandbox.to_string(),
-            name: service.to_string(),
-            target_port: u32::from(target_port),
-            domain: true,
-            authorization_mode: authorization_mode as i32,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))
-        .map(tonic::Response::into_inner)
 }
 
 #[allow(clippy::too_many_arguments)] // user-facing CLI command

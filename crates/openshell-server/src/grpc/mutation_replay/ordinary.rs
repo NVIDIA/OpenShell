@@ -623,7 +623,9 @@ sandbox_scoped_mutation!(
         Ok(ServiceEndpointResponse {
             application_url,
             gateway_url: gateway_url.unwrap_or_else(|| url.clone()),
-            endpoint: Some(reference.restore(store).await?),
+            endpoint: Some(service::service_response_endpoint(
+                reference.restore(store).await?,
+            )),
             url,
         })
     }
