@@ -145,15 +145,20 @@ network_policies:
         None,
         None,
         None,
-        Some(ContractBinaryIdentity {
-            executable: ContractExecutableIdentity {
-                path: executable_path("/usr/bin/python3"),
-                digest: Some("00".repeat(32).parse().unwrap()),
+        Some(crate::run::ProxyListenerConfig {
+            bind_addr: ([127, 0, 0, 1], 0).into(),
+            authorization: None,
+            binary_identity: ContractBinaryIdentity {
+                executable: ContractExecutableIdentity {
+                    path: executable_path("/usr/bin/python3"),
+                    digest: Some("00".repeat(32).parse().unwrap()),
+                },
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
             },
-            ancestors: Vec::new(),
-            cmdline_paths: Vec::new(),
+            listener: None,
+            identity_resolver: None,
         }),
-        None,
         None,
     )
     .await
