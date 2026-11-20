@@ -5,8 +5,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GATOR_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$GATOR_DIR/bin"
+ROOT_DIR="$(cd "$GATOR_DIR/../../.." && pwd)"
 LEDGER="$SCRIPT_DIR/review-feedback-ledger"
 
 tmp="$(mktemp -d)"
@@ -406,14 +407,14 @@ rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
   "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-   abort unless manifest.fetch("payload_version") == 13
+   abort unless manifest.fetch("payload_version") == 14
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }
   abort unless resource.fetch("destination") ==
     "skills/gator-gate/references/review-findings-schema.md"
 ' "$GATOR_DIR/agent.yaml"
-rg -Fq 'manifest.fetch("resources", [])' "$GATOR_DIR/../run.sh"
+rg -Fq 'manifest.fetch("resources", [])' "$ROOT_DIR/scripts/agents/run.sh"
 rg -Fq 'Gator payload version: {{PAYLOAD_VERSION}}' \
     "$GATOR_DIR/prompts/gator.md"
 rg -q 'review-feedback-ledger NVIDIA OpenShell <pr-number>' \
@@ -428,7 +429,7 @@ rg -Fq 'private_security_review_required' "$GATOR_DIR/skills/gator-gate/SKILL.md
 rg -Fq 'Do not initiate external disclosure' "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -Fq 'not a generic private-security blocker' "$GATOR_DIR/prompts/gator.md"
 rg -Fq 'Security classification alone is not a private-triage gate' \
-    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+    "$ROOT_DIR/.claude/agents/principal-engineer-reviewer.md"
 rg -q '### Pragmatic review calibration' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'A new commit permits a delta review' \
@@ -440,9 +441,9 @@ rg -q 'available evidence demonstrates a Critical' \
 rg -q 'Keep reviews pragmatic and convergent' \
     "$GATOR_DIR/prompts/gator.md"
 rg -q '### Pragmatic review calibration' \
-    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+    "$ROOT_DIR/.claude/agents/principal-engineer-reviewer.md"
 rg -q 'Do not mine unchanged code for new findings' \
-    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+    "$ROOT_DIR/.claude/agents/principal-engineer-reviewer.md"
 rg -q 'three finding-bearing rounds' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'alone is not a process blocker' \
@@ -452,7 +453,7 @@ rg -q '`test_dispatch_required`' \
 rg -q 'Apply `test:windows` whenever a PR affects Windows support' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'require the `test:windows` label' \
-    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+    "$ROOT_DIR/.claude/agents/principal-engineer-reviewer.md"
 rg -q 'attacker_or_operator_prerequisite' \
     "$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"
 rg -Fq 'Write `Summary` as natural prose that can be read aloud' \

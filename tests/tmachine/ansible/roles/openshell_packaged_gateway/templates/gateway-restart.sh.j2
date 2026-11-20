@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Restarts the packaged gateway's user service as the user that runs it. The
+# openshell_packaged_gateway role renders this into
+# /var/lib/openshell-qualification/disruptions/gateway-restart for the runner's
+# `gateway-restart` disruption.
+set -euo pipefail
+
+sudo -n -u {{ openshell_gateway_user }} \
+  env HOME={{ openshell_gateway_home }} \
+  XDG_RUNTIME_DIR=/run/user/{{ openshell_gateway_uid }} \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ openshell_gateway_uid }}/bus \
+  systemctl --user restart openshell-gateway.service

@@ -32,8 +32,9 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 
 - A train has one base version, such as `v0.1.4`, fixed by its `-pre.1` tag. A
   patch train can't take breaking changes to Stable interfaces.
-- `Release Auto-Tag` runs on weekdays at 14:00 Europe/Zurich. If `main` has
-  commits since the latest `-pre.N`, it tags the next one and dispatches
+- `Release Auto-Tag` has no schedule while scheduled pre-releases are paused.
+  Dispatch it with `gh workflow run release-auto-tag.yml --ref main`. If `main`
+  has commits since the latest `-pre.N`, it tags the next one and dispatches
   `Pre-release` (`release-prerelease.yml`, about 45 minutes). It skips when the
   train has no `-pre.1` or the base version is already stable.
 - `Pre-release` builds, then publishes and qualifies in parallel, and writes a

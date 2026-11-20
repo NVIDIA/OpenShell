@@ -5,8 +5,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GATOR_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$GATOR_DIR/bin"
 RESOLVER="$SCRIPT_DIR/resolve-gator-review-threads"
 
 tmp="$(mktemp -d)"

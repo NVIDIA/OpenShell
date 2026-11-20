@@ -31,6 +31,18 @@ depends = [
   "test:label-issue",
 ]
 
+["test:gator"]
+description = "Test the Gator guarded tools and shared sandbox runtime"
+run = [
+  "for test in .agents/agents/gator/tests/*_test.sh; do bash \"$test\" || exit; done",
+  "bash scripts/agents/run_test.sh",
+  "bash scripts/agents/image_test.sh",
+  "bash scripts/agents/runtime/launch_test.sh",
+  "bash scripts/agents/runtime/supervisor_test.sh",
+  "bash scripts/agents/runtime/harnesses/codex/exec_test.sh",
+]
+hide = true
+
 ["test:merge-gateway-toml"]
 description = "Test the tmachine gateway TOML merge script"
 run = "uv run --no-project --with pytest pytest tests/tmachine/ansible/roles/openshell_gateway/files/merge_gateway_toml_test.py"
@@ -107,7 +119,10 @@ hide = true
 
 ["test:review-readiness"]
 description = "Test PR review readiness and reviewer reconciliation"
-run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
+run = [
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py",
+  "uv run --no-project python -m unittest discover -s tasks/scripts -p check_reviewer_collaborators_test.py",
+]
 hide = true
 
 ["test:accepted-work"]
