@@ -22,7 +22,8 @@
 //!
 //! The issuer must be reachable from the test process. The client must allow
 //! password grants. The `USER` and `USER_B` variables name plain users, and
-//! are read only by tests that sign in as them ([`User`]). A missing variable fails the test; it never skips it.
+//! are read only by tests that sign in as them ([`User`]). The tmachine
+//! `<base>-oidc` environment publishes them (`playbooks/oidc.yaml`). A missing variable fails the test; it never skips it.
 //! The fixture waits for the realm to answer, since Keycloak may still be
 //! starting when the tests begin.
 //!
