@@ -2255,8 +2255,10 @@ fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<Strin
         .map(|(key, value)| format!("    {key} {value}"))
         .collect::<Vec<_>>()
         .join("\n");
+    // The alias does not name the gateway. A connection the user shares would
+    // also serve the sandbox of the same name on another gateway, unchecked.
     Ok(format!(
-        "Host {host_alias}\n    User sandbox\n{options}\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
+        "Host {host_alias}\n    User sandbox\n{options}\n    ControlMaster no\n    ControlPath none\n    ControlPersist no\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
     ))
 }
 
@@ -2930,7 +2932,7 @@ mod tests {
     }
 
     /// `ssh` resolves the rendered block to the intended options, also when
-    /// the pin path needs quoting.
+    /// the pin path needs quoting and a later block enables connection sharing.
     #[cfg(unix)]
     #[test]
     fn rendered_ssh_config_makes_ssh_trust_only_the_pin() {
@@ -2942,7 +2944,15 @@ mod tests {
                 .to_string();
             let config = config_home.join("rendered_ssh_config");
             fs::create_dir_all(config_home).unwrap();
-            fs::write(&config, render_ssh_config("my-gw", "demo", "beta").unwrap()).unwrap();
+            let user_sharing = format!(
+                "Host *\n    ControlMaster auto\n    ControlPath \"{}/mux-%C\"\n    ControlPersist yes\n",
+                config_home.display()
+            );
+            fs::write(
+                &config,
+                render_ssh_config("my-gw", "demo", "beta").unwrap() + &user_sharing,
+            )
+            .unwrap();
 
             let output = Command::new("ssh")
                 .arg("-F")
@@ -2957,6 +2967,7 @@ mod tests {
                 Path::new(&known_hosts),
                 "openshell-demo.beta",
             );
+            assert_connection_sharing_disabled(&effective);
             let proxy_command = effective
                 .lines()
                 .find_map(|line| line.strip_prefix("proxycommand "))
