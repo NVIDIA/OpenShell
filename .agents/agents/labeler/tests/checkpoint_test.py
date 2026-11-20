@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from label_issue_checkpoint import (
+from checkpoint import (
     IncompleteMaterial,
     checkpoint_matches,
     collect_label_events,
@@ -603,12 +603,12 @@ class CheckpointTests(unittest.TestCase):
         )
 
     def test_actual_evidence_producer_satisfies_hydrated_child_contract(self):
-        from label_issue_evidence import (
+        from evidence import (
             expand_evidence,
             material_state,
             prepare_snapshot,
         )
-        from label_issue_evidence_test import API
+        from evidence_test import API
 
         for pull in [False, True]:
             with self.subTest(pull=pull), tempfile.TemporaryDirectory() as directory:
@@ -661,7 +661,7 @@ class CheckpointTests(unittest.TestCase):
                 )
 
     def test_producer_timeline_mapping_order_does_not_change_fingerprint(self):
-        from label_issue_evidence import _artifact
+        from evidence import _artifact
 
         state, reordered = material(), material()
         event = {

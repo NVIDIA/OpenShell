@@ -8,7 +8,7 @@ import sys
 import time
 import unittest
 
-from label_issue_github import GitHubClient, GitHubError, _run_bounded
+from github import GitHubClient, GitHubError, _run_bounded
 
 
 class Clock:

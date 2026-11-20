@@ -144,7 +144,7 @@ A PR represents accepted work when either:
 
 Use GitHub closing references such as `Closes #123` or `Fixes #123`.
 
-The definition of accepted work is encoded in `tasks/scripts/label_accepted_work.py` and should be directly imported where needed.
+The definition of accepted work is encoded in `.agents/agents/labeler/bin/acceptance.py` and should be directly imported where needed.
 
 Acceptance classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. Acceptance does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR as accepted work.
 
@@ -152,7 +152,7 @@ Acceptance classifies work, not implementation quality or approval to merge. Exi
 
 Labels drive notification streams as well as classification. Contributors use the GitHub app in Slack, and other integrations, to follow issues and PRs filtered by area or topic. Applying those labels can notify subscribers immediately, before they have chosen to follow the individual item.
 
-Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply the relevant classification labels using the [label-issue skill](.agents/skills/label-issue/SKILL.md) so subscribers can find the work.
+Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply the relevant classification labels using the [label-issue skill](.agents/agents/labeler/skills/label-issue/SKILL.md) so subscribers can find the work.
 
 Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
 
@@ -443,7 +443,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
-| `.agents/`      | Contributor skills and persona definitions    |
+| `.agents/`      | Contributor skills and [agents](.agents/agents/README.md) |
 
 ## RFCs
 

@@ -27,8 +27,8 @@ depends = [
   "test:cargo-lockfile-alignment",
   "test:review-readiness",
   "test:merge-gateway-toml",
-  "test:accepted-work",
-  "test:label-issue",
+  "test:stale-closure",
+  "test:labeling-agent",
 ]
 
 ["test:merge-gateway-toml"]
@@ -110,17 +110,16 @@ description = "Test PR review readiness and reviewer reconciliation"
 run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
 hide = true
 
-["test:accepted-work"]
-description = "Test the shared accepted-work library"
-run = "uv run --no-project python -m unittest discover -s tasks/scripts -p label_accepted_work_test.py"
+["test:stale-closure"]
+description = "Test stale closure provenance"
+env.PYTHONPATH = ".agents/agents/labeler/bin:tasks/scripts"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p stale_closure_test.py"
 hide = true
 
-["test:label-issue"]
-description = "Test issue labeling and stale closure provenance"
-run = [
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p 'label_issue*_test.py'",
-  "uv run --no-project python -m unittest discover -s tasks/scripts -p stale_closure_test.py",
-]
+["test:labeling-agent"]
+description = "Test the labeler offline"
+env.PYTHONPATH = ".agents/agents/labeler:.agents/agents/labeler/bin:tasks/scripts"
+run = "uv run --no-project python -m unittest discover -s .agents/agents/labeler/tests -p '*_test.py'"
 hide = true
 
 [e2e]

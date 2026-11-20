@@ -25,6 +25,6 @@ Follow [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifi
 4. For proposed configuration, CLI, SDK, or other UX changes, request notional examples of the suggested interaction if missing. Keep the issue framed entirely in terms of OpenShell.
 5. Reproduce or investigate enough to distinguish a confirmed bug, feasible feature, missing evidence, duplicate, already-fixed behavior, or expected behavior. State what was observed and what remains uncertain. Do not turn a failed reproduction attempt alone into a dismissal.
 6. Post a concise comment beginning with `> **📋 triage-agent**`. Explain the evidence, any exact missing information, and the next human decision. Keep this assessment judgment and comment in triage.
-7. Use [`/label-issue`](../label-issue/SKILL.md) to reconcile labels. Pass the assessment outcome and reviewed label subset through its assessment-only path. For accepted work, request classification when needed.
+7. Use [`/label-issue`](../../agents/labeler/skills/label-issue/SKILL.md) to reconcile labels. Pass the assessment outcome and reviewed label subset through its assessment-only path. For accepted work, request classification when needed.
 
 If substantial technical uncertainty remains, recommend `create-spike` with specific questions to answer. A direct user request can separately authorize planning or implementation through `build-from-issue`; it does not change the issue's recorded disposition.

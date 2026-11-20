@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from label_issue_evidence import (
+from evidence import (
     expand_evidence,
     material_state,
     preflight,
@@ -842,8 +842,8 @@ class EvidenceTests(unittest.TestCase):
         )
 
     def test_lifecycle_profiles_are_noise_but_actor_identity_is_substantive(self):
-        from label_issue_checkpoint import fingerprint
-        from label_issue_evidence import _artifact
+        from checkpoint import fingerprint
+        from evidence import _artifact
 
         self.api.item.update(
             state="closed",
@@ -902,7 +902,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("11", json.dumps(after))
 
     def test_actual_id_only_collections_do_not_substantiate_classification(self):
-        from label_issue_policy import validate_result
+        from policy import validate_result
 
         self.api = API(pull=True)
         self.api.collections["comments"] = [
@@ -942,9 +942,9 @@ class EvidenceTests(unittest.TestCase):
         }
 
     def test_omitted_body_requires_delivered_content_or_focused_slice(self):
-        from label_issue_policy import validate_result
+        from policy import validate_result
 
-        with mock.patch("label_issue_evidence.LIMIT", 65536):
+        with mock.patch("evidence.LIMIT", 65536):
             self.api.item["body"] = "Large issue content. " * 2800
             self.api.collections["comments"] = [
                 {"id": n, "body": "Other context", "user": {"login": "reader"}}
@@ -976,9 +976,9 @@ class EvidenceTests(unittest.TestCase):
             self.assertLessEqual(Path(snapshot["packet_path"]).stat().st_size, 65536)
 
     def test_same_digest_prior_delivery_survives_later_packet_eviction(self):
-        from label_issue_policy import validate_result
+        from policy import validate_result
 
-        with mock.patch("label_issue_evidence.LIMIT", 65536):
+        with mock.patch("evidence.LIMIT", 65536):
             self.api.item["body"] = "Large issue content. " * 2800
             snapshot = self.prepare()
             self.assertTrue(snapshot["evidence_index"]["body"]["inspected"])
@@ -998,7 +998,7 @@ class EvidenceTests(unittest.TestCase):
             )
 
     def test_source_change_invalidates_inspection_until_current_content_expanded(self):
-        from label_issue_policy import validate_result
+        from policy import validate_result
 
         self.api.collections["comments"] = [
             {"id": 7, "body": "Initial", "user": {"login": "reader"}}
@@ -1025,7 +1025,7 @@ class EvidenceTests(unittest.TestCase):
         )
 
     def test_read_flags_do_not_change_actual_material_fingerprint(self):
-        from label_issue_checkpoint import fingerprint
+        from checkpoint import fingerprint
 
         snapshot = self.prepare()
         before = material_state(snapshot)
@@ -1046,9 +1046,9 @@ class EvidenceTests(unittest.TestCase):
         )
 
     def test_preparation_does_not_mark_unread_human_comments_inspected(self):
-        from label_issue_policy import is_inspected_source
+        from policy import is_inspected_source
 
-        with mock.patch("label_issue_evidence.LIMIT", 65536):
+        with mock.patch("evidence.LIMIT", 65536):
             self.api.collections["comments"] = [
                 {"id": 7, "body": "a" * 40000, "user": {"login": "maintainer"}},
                 {"id": 8, "body": "b" * 40000, "user": {"login": "maintainer"}},
@@ -1069,7 +1069,7 @@ class EvidenceTests(unittest.TestCase):
     def test_authoritative_comment_preparation_batches_persistence_and_authority(self):
         from unittest import mock
 
-        import label_issue_evidence as module
+        import evidence as module
 
         self.api.item["user"] = {"login": "reader"}
         self.api.collections["comments"] = [
