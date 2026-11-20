@@ -29,6 +29,8 @@ use crate::settings::parse_bool_like;
 pub const REQUIRE_HOST_KEY_ENV: &str = "OPENSHELL_SSH_REQUIRE_HOST_KEY";
 const FINGERPRINT_PREFIX: &str = "SHA256:";
 const UNVERIFIED: &str = "unverified";
+/// The only host key type a gateway issues. A second type needs its name
+/// here, in `HostKeyAlgorithms`, and its own blob check in the gate.
 const HOST_KEY_ALGORITHM: &str = "ssh-ed25519";
 const PIN_HEADER: &str =
     "# Managed by OpenShell. Rewritten from the gateway-published fingerprint; do not edit.\n";

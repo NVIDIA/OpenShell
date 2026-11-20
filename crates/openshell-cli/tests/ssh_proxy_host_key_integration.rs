@@ -354,7 +354,7 @@ async fn proxy_warns_and_relays_for_a_caller_that_predates_host_key_verification
     );
 
     for (args, caller) in [
-        (old_client, "started by an OpenShell client that predates"),
+        (old_client, "started without --host-key and --known-hosts"),
         (
             old_name_mode(gateway),
             "SSH config entry for sandbox 'my-sb'",

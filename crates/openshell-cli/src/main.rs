@@ -4207,11 +4207,12 @@ async fn run_async() -> Result<()> {
                                 .and_then(|pin| HostKeyCheck::for_relay(expectation, pin))
                                 .map_err(|err| miette::miette!("{err}"))?,
                         ),
-                        // The `ssh` of such a client accepts any host key.
+                        // An older client starts the proxy this way, and its `ssh`
+                        // accepts any host key.
                         (None, None) => {
                             eprintln!(
-                                "openshell: warning: this SSH connection was started by an OpenShell client that predates host-key verification, so the SSH host key is NOT verified.\n\
-                                 Restart that client (the openshell command or openshell term)."
+                                "openshell: warning: ssh-proxy was started without --host-key and --known-hosts, so the SSH host key is NOT verified.\n\
+                                 If an OpenShell client that predates host-key verification started it, restart that client (the openshell command or openshell term)."
                             );
                             permit_unverified().map_err(|err| miette::miette!("{err}"))?;
                             None
