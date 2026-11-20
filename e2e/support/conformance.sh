@@ -84,7 +84,11 @@ e2e_run_openshell_conformance() {
   # these for the gateway they started.
   echo "==> Running conformance suites against the ${gateway_label} gateway"
   "${program}" ready || return
-  "${program}" run --junit "${junit}"
+  local args=(--junit "${junit}")
+  if [[ -n "${OPENSHELL_CONFORMANCE_TEST_THREADS:-}" ]]; then
+    args+=(--test-threads "${OPENSHELL_CONFORMANCE_TEST_THREADS}")
+  fi
+  "${program}" run "${args[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

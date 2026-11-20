@@ -139,6 +139,8 @@ pub struct Run<'a> {
     /// Narrowing the tests in the bundle: nextest filtersets (`-E`) for a
     /// nextest bundle, parts of test names for a program bundle.
     pub filters: &'a [String],
+    /// Concurrency override for a prebuilt program.
+    pub test_threads: Option<std::num::NonZeroUsize>,
     /// Where `junit.xml`, `nextest.log` and, after a failure, the guest's
     /// `diagnostics/` go.
     pub results: &'a Path,
@@ -405,6 +407,7 @@ async fn run_selected(
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
+    let test_threads = run.test_threads.map(|count| count.to_string());
     let mut tests = vec!["env"];
     tests.extend(env.iter().map(String::as_str));
     match kind {
@@ -436,10 +439,11 @@ async fn run_selected(
                 tests.extend(["-E", filter]);
             }
         }
-        // The program runs its tests one at a time, and writes the report
-        // where `collect_results` looks for it.
         Kind::Program => {
             tests.extend([program.as_str(), "run", "--junit", &junit]);
+            if let Some(count) = &test_threads {
+                tests.extend(["--test-threads", count]);
+            }
             // `run` takes name filters as arguments, after `--` so that one
             // starting with a dash isn't read as an option.
             if !filters.is_empty() {

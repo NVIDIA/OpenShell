@@ -203,6 +203,11 @@ re-locks a workspace from the root lockfile. Add new testkit workspaces to
 
 #### What a conformance test may assert
 
+Conformance tests must work concurrently on a shared gateway. Use
+`Context::name` (or testkit's sandbox builder) for gateway resource names,
+use test-unique selector values, and scope assertions and cleanup to
+resources the test owns. Do not change gateway-wide settings or routes.
+
 Conformance tests run on every compute driver, so they check the public
 contract and nothing a driver is free to change.
 
@@ -255,6 +260,8 @@ nextest filterset. The runner runs the program's `ready`
 and `run` commands in the guest and still writes `junit.xml` and `nextest.log`
 (the program's output) to the results directory. Branch E2E builds
 `openshell-conformance` once and passes it to every conformance row this way.
+With `--program`, `--test-threads N` runs up to N tests concurrently in the
+guest; the default is one.
 
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
@@ -512,6 +519,9 @@ feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURE
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
 features. The selector is handled by the runner; it is not a Cargo feature.
+Set `OPENSHELL_CONFORMANCE_TEST_THREADS` to run conformance tests concurrently
+in these wrappers; it defaults to one. Direct runs use
+`openshell-conformance run --test-threads N`.
 
 ```shell
 OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes

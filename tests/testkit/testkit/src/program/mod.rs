@@ -16,8 +16,9 @@
 //!
 //! - `list [FILTER]...` prints each test's name and description.
 //! - `ready [--timeout SECS]` waits for the gateway, as `testkit-ready` does.
-//! - `run [FILTER]...` runs tests one at a time, each in its own process with
-//!   a timeout, and can write a `JUnit` report. Unix only.
+//! - `run [FILTER]...` runs tests in separate processes with a timeout and
+//!   optional `JUnit` report. Use `--test-threads N` to run tests in parallel.
+//!   Unix only.
 //!
 //! Any other arguments are libtest's, so the program also works as a
 //! `harness = false` test target under `cargo test` and nextest: it answers
@@ -42,6 +43,7 @@ mod unsupported;
 pub(crate) use unsupported::Unsupported;
 
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -130,7 +132,7 @@ enum Command {
         #[arg(long, default_value = "60", value_name = "SECS", value_parser = seconds)]
         timeout: Duration,
     },
-    /// Run tests one at a time, each in its own process. Exits 1 if a test
+    /// Run tests, each in its own process. Exits 1 if a test
     /// failed and 2 if tests could not run.
     Run {
         /// Run tests whose name contains any of these (all if none).
@@ -138,6 +140,9 @@ enum Command {
         /// Run ignored tests too.
         #[arg(long)]
         include_ignored: bool,
+        /// Maximum number of tests to run at once.
+        #[arg(long, default_value = "1", value_name = "N")]
+        test_threads: NonZeroUsize,
         /// Stop a test that runs longer than this, in seconds. Longer than
         /// testkit's own step timeouts, so those report first.
         #[arg(long, default_value = "900", value_name = "SECS", value_parser = seconds)]
@@ -177,6 +182,7 @@ fn command(
         Command::Run {
             filters,
             include_ignored,
+            test_threads,
             timeout,
             grace,
             junit,
@@ -188,6 +194,7 @@ fn command(
                 include_ignored,
                 unsupported,
             },
+            test_threads,
             timeout,
             grace,
             junit,
@@ -200,6 +207,7 @@ fn run(
     program: &str,
     tests: &'static [Test],
     selection: Selection,
+    test_threads: NonZeroUsize,
     timeout: Duration,
     grace: Duration,
     junit: Option<PathBuf>,
@@ -213,6 +221,7 @@ fn run(
     };
     let options = supervisor::Options {
         selection,
+        test_threads,
         timeout,
         grace,
         junit,
@@ -226,6 +235,7 @@ fn run(
     program: &str,
     _tests: &'static [Test],
     _selection: Selection,
+    _test_threads: NonZeroUsize,
     _timeout: Duration,
     _grace: Duration,
     _junit: Option<PathBuf>,
@@ -379,6 +389,8 @@ mod tests {
             "smoke",
             "life",
             "--include-ignored",
+            "--test-threads",
+            "4",
             "--timeout",
             "1.5",
             "--junit",
@@ -388,6 +400,7 @@ mod tests {
         let Command::Run {
             filters,
             include_ignored,
+            test_threads,
             timeout,
             grace,
             junit,
@@ -397,6 +410,7 @@ mod tests {
         };
         assert_eq!(filters, ["smoke", "life"]);
         assert!(include_ignored);
+        assert_eq!(test_threads.get(), 4);
         assert_eq!(timeout, Duration::from_millis(1500));
         assert_eq!(grace, Duration::from_secs(10));
         assert_eq!(junit.unwrap().to_str(), Some("out/junit.xml"));
@@ -410,6 +424,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_limits() {
+        for bad in ["0", "-1", "1.5"] {
+            assert!(Cli::try_parse_from(["p", "run", "--test-threads", bad]).is_err());
+        }
         for bad in ["0", "-1", "soon", "inf", "NaN"] {
             assert!(
                 Cli::try_parse_from(["p", "run", "--timeout", bad]).is_err(),

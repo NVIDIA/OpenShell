@@ -93,12 +93,12 @@ jobs:
           # package runs every package in the workspace; each driver suite is a
           # workspace of its own.
           rows='[
-            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-docker-rootful","installer":"deb-external-docker-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true},
-            {"environment":"fedora-podman-rootful","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-k3s","installer":"k3s","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","test_threads":4},
+            {"environment":"ubuntu-docker-rootful","installer":"deb-external-docker-driver","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","external_driver":true,"test_threads":4},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","test_threads":4},
+            {"environment":"fedora-podman-rootless","installer":"rpm","family":"conformance","package":"conformance","gateway":"openshell","runner":"ubuntu-24.04","test_threads":4},
+            {"environment":"ubuntu-k3s","installer":"k3s","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04","test_threads":4},
+            {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"conformance","package":"conformance","gateway":"tmachine","runner":"ubuntu-24.04","test_threads":4},
             {"environment":"ubuntu-docker-rootful-cdi","installer":"deb","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-cdi","installer":"rpm","family":"features","package":"cdi","gateway":"openshell","runner":"ubuntu-24.04"},
@@ -252,6 +252,7 @@ jobs:
           PACKAGE: ${{ matrix.package }}
           GATEWAY: ${{ matrix.gateway }}
           DISRUPTION: ${{ matrix.disruption }}
+          TEST_THREADS: ${{ matrix.test_threads }}
         run: |
           # The tests this environment can't pass yet; the runner passes the
           # variable on to the guest.
@@ -270,6 +271,9 @@ jobs:
             chmod +x "${program}"
             "${program}" list > /dev/null
             selection=(--program "${program}")
+            if [ -n "${TEST_THREADS}" ]; then
+              selection+=(--test-threads "${TEST_THREADS}")
+            fi
           else
             if [ "${PREBUILT}" = "true" ]; then
               selection=(--bundle artifacts/prebuilt-bundle)

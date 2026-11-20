@@ -83,6 +83,8 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Run tests
+        env:
+          OPENSHELL_CONFORMANCE_TEST_THREADS: "4"
         run: ${{ matrix.cmd }}
 
       - name: Print AppArmor denials

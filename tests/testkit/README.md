@@ -229,21 +229,24 @@ program for the conformance suite; see
 |---|---|
 | `list [FILTER]...` | Prints each test's name and description. Ignored tests are included and marked. |
 | `ready [--timeout SECS]` | Waits for the gateway, like `testkit-ready` (default 60 seconds). Exits 2 if it is not ready in time. |
-| `run [FILTER]...` | Runs the tests one at a time, each in its own process. Unix only. |
+| `run [FILTER]...` | Runs each test in its own process. Unix only. |
 
 A filter selects tests whose name contains it. `run` also takes:
 
 - `--include-ignored`: runs ignored tests too, instead of reporting them as
   skipped.
+- `--test-threads N` (default 1): runs up to N tests at once.
 - `--timeout SECS` (default 900): a test that runs longer gets SIGTERM, then
   SIGKILL after `--grace SECS` (default 10).
 - `--junit PATH`: writes a JUnit report with one test suite per family.
 
 Each test runs in its own process group. When the test's process exits, `run`
 kills anything left in the group, such as CLI processes the test started.
-Interrupting `run` stops the current test the same way and runs no more
+It prints each completed test's output as one block on stderr, keeping up to
+the last 4 MiB of each stream for the console and JUnit.
+Interrupting `run` stops the active tests the same way and runs no more
 tests; a second interrupt skips the grace period. If `run` itself is killed
-with SIGKILL, the current test's process group keeps running. In a container
+with SIGKILL, active test process groups keep running. In a container
 where `run` is PID 1, start it under an init, for example with
 `docker run --init`.
 

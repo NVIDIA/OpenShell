@@ -68,6 +68,9 @@ Feature and driver suites are not part of it. The
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
 
+`run --test-threads 4` runs up to four tests at once on the same gateway.
+The default is one.
+
 ### Marking a test unsupported in CI
 
 When a test can't pass in one environment yet, for example because of a driver
@@ -91,6 +94,10 @@ fails there.
 Add a `#[testkit::test]` function to a suite, or for a new area, a new file in
 `src/` and a `mod` line for it in `src/lib.rs`. `openshell-conformance`
 includes every test in the crate.
+
+Tests must be safe to run concurrently on a shared gateway. Use test-unique
+names, selectors, and host fixtures; assert on test-owned resources, not
+gateway-wide counts. Do not change gateway-wide settings or routes.
 
 ## What a test may assert
 
