@@ -294,9 +294,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: cncf-ubuntu-26.04-8-32-x86
+          - runner: cncf-ubuntu-8-32-x86
             system: x86_64-linux
-          - runner: cncf-ubuntu-26.04-8-32-arm
+          - runner: cncf-ubuntu-8-32-arm
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -338,9 +338,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: cncf-ubuntu-26.04-8-32-x86
+          - runner: cncf-ubuntu-8-32-x86
             system: x86_64-linux
-          - runner: cncf-ubuntu-26.04-8-32-arm
+          - runner: cncf-ubuntu-8-32-arm
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -425,7 +425,7 @@ jobs:
     name: Rust PostgreSQL tests
     # Bare runner: the test script starts a disposable PostgreSQL container
     # with the host's Docker.
-    runs-on: cncf-ubuntu-26.04-8-32-x86
+    runs-on: cncf-ubuntu-8-32-x86
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -455,9 +455,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: cncf-ubuntu-26.04-8-32-x86
+          - runner: cncf-ubuntu-8-32-x86
             system: x86_64-linux
-          - runner: cncf-ubuntu-26.04-8-32-arm
+          - runner: cncf-ubuntu-8-32-arm
             system: aarch64-linux
           - runner: macos-15-xlarge
             system: aarch64-darwin
@@ -509,7 +509,7 @@ jobs:
 
   rust-feature-alias:
     name: Rust feature alias
-    runs-on: cncf-ubuntu-26.04-8-32-x86
+    runs-on: cncf-ubuntu-8-32-x86
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -532,7 +532,7 @@ jobs:
 
   rust-gateway-core-features:
     name: Rust gateway core features
-    runs-on: cncf-ubuntu-26.04-8-32-x86
+    runs-on: cncf-ubuntu-8-32-x86
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -557,7 +557,7 @@ jobs:
 
   rust-gateway-extended-features:
     name: Rust gateway extended features
-    runs-on: cncf-ubuntu-26.04-8-32-x86
+    runs-on: cncf-ubuntu-8-32-x86
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
