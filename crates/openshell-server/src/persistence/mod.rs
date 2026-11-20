@@ -3,9 +3,11 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod azure_workload_identity;
 mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;
+mod mutation_admission;
 pub mod mutation_lock;
 mod postgres;
 #[cfg(test)]
@@ -16,6 +18,7 @@ mod sqlite;
 pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
+pub use mutation_admission::ADMISSION_OBJECT_TYPE as MUTATION_ADMISSION_OBJECT_TYPE;
 
 use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
@@ -422,15 +425,29 @@ impl Store {
 
     /// Independent of the mutation locks: creation already holds its sandbox
     /// mutation guard when it provisions a supervisor's durable SSH identity.
+    ///
+    /// On `PostgreSQL` it takes the legacy
+    /// [`mutation_lock::SSH_IDENTITY_LOCK_KEY`] shared and then the sandbox's
+    /// [`mutation_lock::sandbox_ssh_identity_lock_key`] exclusively, in that
+    /// order on one data-pool connection. Steps for different sandboxes run at
+    /// once, and gateways from earlier releases, which hold the legacy key
+    /// exclusively, still exclude every one of them.
     pub(crate) async fn acquire_ssh_identity_mutation_guard(
         &self,
+        sandbox_id: &str,
     ) -> PersistenceResult<SshIdentityMutationGuard> {
         lock_order::check(lock_order::Lock::SshIdentity);
         match self {
             Self::Postgres(store) => Ok(SshIdentityMutationGuard {
                 _postgres: Some(
                     store
-                        .acquire_data_pool_lock(mutation_lock::SSH_IDENTITY_LOCK_KEY)
+                        .acquire_data_pool_locks(&[
+                            (mutation_lock::SSH_IDENTITY_LOCK_KEY, LockMode::Shared),
+                            (
+                                mutation_lock::sandbox_ssh_identity_lock_key(sandbox_id),
+                                LockMode::Exclusive,
+                            ),
+                        ])
                         .await?,
                 ),
                 _order: lock_order::hold(lock_order::Lock::SshIdentity),
@@ -459,7 +476,11 @@ impl Store {
         let key = i64::from_be_bytes(hash[..8].try_into().expect("eight digest bytes"));
         match self {
             Self::Postgres(store) => Ok(RefreshMutationGuard {
-                _postgres: Some(store.acquire_data_pool_lock(key).await?),
+                _postgres: Some(
+                    store
+                        .acquire_data_pool_locks(&[(key, LockMode::Exclusive)])
+                        .await?,
+                ),
             }),
             Self::Sqlite(_) => Ok(RefreshMutationGuard { _postgres: None }),
         }
@@ -501,20 +522,58 @@ impl Store {
         max_connections: Option<u32>,
         lock_max_connections: Option<u32>,
     ) -> CoreResult<PersistenceResult<Self>> {
+        Self::try_connect_with_database_auth(
+            url,
+            max_connections,
+            lock_max_connections,
+            openshell_core::config::DatabaseAuthMode::Default,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_connect_with_database_auth(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
+        auth: openshell_core::config::DatabaseAuthMode,
+    ) -> CoreResult<PersistenceResult<Self>> {
+        if auth == openshell_core::config::DatabaseAuthMode::AzureWorkloadIdentity
+            && !(url.starts_with("postgres://") || url.starts_with("postgresql://"))
+        {
+            return Err(CoreError::config(
+                "azure-workload-identity database authentication requires PostgreSQL",
+            ));
+        }
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             if let Some(configured) = max_connections
                 && configured < postgres::MIN_MAX_CONNECTIONS
             {
                 return Err(CoreError::config(format!(
                     "database_max_connections (--db-max-connections, OPENSHELL_DB_MAX_CONNECTIONS) \
-                     is {configured}, but PostgreSQL needs at least {}: the SSH identity lock \
-                     keeps one data connection while it queries the pool",
+                     is {configured}, but PostgreSQL needs at least {}: an SSH identity or \
+                     provider-refresh lock holder keeps one data connection for its lock and \
+                     queries the pool on another",
                     postgres::MIN_MAX_CONNECTIONS
                 )));
             }
             Ok(async {
-                let store =
-                    PostgresStore::connect(url, max_connections, lock_max_connections).await?;
+                let identity =
+                    if auth == openshell_core::config::DatabaseAuthMode::AzureWorkloadIdentity {
+                        Some(
+                            azure_workload_identity::AzureWorkloadIdentity::from_env()
+                                .map_err(|error| PersistenceError::Config(error.to_string()))?,
+                        )
+                    } else {
+                        None
+                    };
+                let store = PostgresStore::connect_with_identity(
+                    url,
+                    max_connections,
+                    lock_max_connections
+                        .unwrap_or(mutation_lock::MUTATION_LOCK_POOL_MAX_CONNECTIONS),
+                    identity,
+                )
+                .await?;
                 store.migrate().await?;
                 Ok(Self::Postgres(store))
             }
@@ -769,6 +828,61 @@ impl Store {
             labels,
             max_count
         ))
+    }
+
+    /// Insert a durable mutation admission unless its caller bucket already
+    /// holds `limit` admissions. Returns `Ok(None)` when the bucket is full.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.create_mutation_admission", otel.status_code = tracing::field::Empty, object.id = %id, workspace = %bucket, max_count = limit)
+    )]
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        store_dispatch_traced!(self.create_mutation_admission(id, name, bucket, payload, limit))
+    }
+
+    /// List completed mutation admissions last written at or before
+    /// `cutoff_ms`, oldest first, optionally for one bucket. Admissions are
+    /// rewritten only once, on completion, so `resource_version > 1` marks them
+    /// for every gateway version.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.list_completed_mutation_admissions", otel.status_code = tracing::field::Empty, limit = limit)
+    )]
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        bucket: Option<&str>,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<mutation_admission::CompletedAdmission>> {
+        store_dispatch_traced!(self.list_completed_mutation_admissions(bucket, cutoff_ms, limit))
+    }
+
+    /// Delete mutation admissions by id and mark their buckets for recount.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete_mutation_admissions", otel.status_code = tracing::field::Empty, object_count = ids.len())
+    )]
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        store_dispatch_traced!(self.delete_mutation_admissions(ids))
+    }
+
+    /// Backdate an object's last write to exercise expiry.
+    #[cfg(test)]
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        store_dispatch!(self.backdate(id, updated_at_ms))
     }
 
     /// Fetch an object by id.
@@ -1491,7 +1605,16 @@ pub fn current_time_ms() -> i64 {
 }
 
 fn map_db_error(error: &sqlx::Error) -> PersistenceError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
+    let unavailable = match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => error.get_ref().is_some_and(
+            <dyn std::error::Error + Send + Sync + 'static>::is::<
+                azure_workload_identity::CredentialUnavailable,
+            >,
+        ),
+        _ => false,
+    };
+    if unavailable {
         return PersistenceError::Unavailable(error.to_string());
     }
     if let sqlx::Error::Database(db) = error

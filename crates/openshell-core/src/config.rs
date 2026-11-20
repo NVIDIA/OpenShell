@@ -13,6 +13,35 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Database credential source. The default preserves URL/SQLite behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseAuthMode {
+    #[default]
+    Default,
+    AzureWorkloadIdentity,
+}
+
+impl fmt::Display for DatabaseAuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::AzureWorkloadIdentity => "azure-workload-identity",
+        })
+    }
+}
+
+impl FromStr for DatabaseAuthMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "azure-workload-identity" => Ok(Self::AzureWorkloadIdentity),
+            _ => Err("database authentication must be default or azure-workload-identity"),
+        }
+    }
+}
+
 // ── Public default constants ────────────────────────────────────────────
 //
 // Canonical source for default values used across multiple crates.
@@ -48,6 +77,19 @@ pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
 /// Default per-sandbox cap for each relay budget (SSH and service forwards).
 pub const DEFAULT_MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
+/// Default durable mutation admissions one caller identity can hold.
+pub const DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER: u32 = 1000;
+
+/// Accepted per-caller admission limits. The ceiling bounds the rows one caller
+/// can retain.
+pub const MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE: std::ops::RangeInclusive<u32> = 1..=1_000_000;
+
+/// Default replay window for successful durable mutation admissions.
+pub const DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS: u32 = 24 * 60 * 60;
+
+/// Accepted replay windows, from one minute to seven days.
+pub const MUTATION_REPLAY_WINDOW_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 60..=604_800;
 
 /// Gateway delivery path for supervisor configuration.
 ///
@@ -208,6 +250,91 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Gateway-owned SPIFFE Broker API issuance for Kubernetes sandbox identities.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpiffeBrokerConfig {
+    pub spiffe_id_prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    /// Connect to the gateway's node IP supplied through the Downward API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_local_port: Option<std::num::NonZeroU16>,
+    #[serde(default)]
+    pub server_spiffe_id: Option<String>,
+    #[serde(default)]
+    pub server_spiffe_id_prefix: Option<String>,
+    pub workload_api_socket_path: String,
+}
+
+impl SpiffeBrokerConfig {
+    /// Resolve the selected transport without making Kubernetes API calls.
+    /// Node-local mode requires the Pod's trusted Downward API node address.
+    pub fn endpoint_for_node(&self, node_ip: Option<&str>) -> Result<String, String> {
+        match (self.endpoint.is_empty(), self.node_local_port) {
+            (false, None) => Ok(self.endpoint.clone()),
+            (true, Some(port)) => {
+                let ip: std::net::IpAddr = node_ip
+                    .ok_or("spiffe_broker.node_local_port requires OPENSHELL_NODE_IP from status.hostIP")?
+                    .parse()
+                    .map_err(|_| "OPENSHELL_NODE_IP must be an IPv4 or IPv6 address")?;
+                Ok(format!("https://{}", SocketAddr::new(ip, port.get())))
+            }
+            _ => Err("spiffe_broker requires exactly one of endpoint and node_local_port".into()),
+        }
+    }
+
+    /// Validate the identity and authenticated transport before use.
+    pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
+        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
+            .sandbox_spiffe_id(gateway_id, "sandbox")?;
+        // Validate the mode independently of the startup environment. The
+        // adapter requires and resolves the actual node IP before serving.
+        let endpoint = self.endpoint_for_node(Some("127.0.0.1"))?;
+        let endpoint = url::Url::parse(&endpoint)
+            .map_err(|_| "spiffe_broker.endpoint must be an HTTPS endpoint")?;
+        let socket = std::path::Path::new(&self.workload_api_socket_path);
+        let valid_socket = socket.is_absolute()
+            && !self.workload_api_socket_path.ends_with('/')
+            && socket.file_name().is_some()
+            && socket
+                .parent()
+                .is_some_and(|parent| parent != std::path::Path::new("/"))
+            && self.workload_api_socket_path.trim() == self.workload_api_socket_path
+            && !self
+                .workload_api_socket_path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."));
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.path() != "/"
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !valid_socket
+        {
+            return Err(
+                "spiffe_broker requires an HTTPS endpoint and absolute Workload API socket path"
+                    .into(),
+            );
+        }
+        match (&self.server_spiffe_id, &self.server_spiffe_id_prefix) {
+            (Some(id), None) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(id)?;
+            }
+            (None, Some(prefix)) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(prefix)?;
+                if !prefix.trim_start_matches("spiffe://").contains('/') {
+                    return Err("spiffe_broker.server_spiffe_id_prefix requires an agent path, not a whole trust domain".into());
+                }
+            }
+            _ => return Err("spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix".into()),
+        }
+        Ok(())
+    }
+}
+
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -267,6 +394,9 @@ pub struct Config {
     /// Disabled by default; not a license to run mixed-version writers.
     pub enable_sandbox_updates: bool,
 
+    /// Workspace secret activation and reveal settings.
+    pub workspace_secrets: WorkspaceSecretsConfig,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -279,14 +409,22 @@ pub struct Config {
     /// sandbox identity is always carried by gateway-minted sandbox JWTs.
     pub mtls_auth: MtlsAuthConfig,
 
+    /// Optional details gateway mutation records capture.
+    pub audit: GatewayAuditConfig,
+
     /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
     /// loads the signing key from disk and accepts gateway-issued sandbox
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
     /// flow (issue #1354).
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
+    pub spiffe_broker: Option<SpiffeBrokerConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
+
+    /// Explicit database identity mode; independent of provider credentials.
+    pub database_auth: DatabaseAuthMode,
 
     /// Connection ceiling for the persistence pool.
     ///
@@ -344,6 +482,15 @@ pub struct Config {
     /// armed until Ready. Must be between 1 and 86400, inclusive.
     pub provisioning_repair_window_seconds: i64,
 
+    /// Durable mutation admissions one caller can hold across every replica
+    /// sharing the database. Replicas must use the same value. Must be within
+    /// [`MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE`].
+    pub mutation_admission_limit_per_caller: u32,
+
+    /// Seconds a successful mutation admission stays replayable. Must be within
+    /// [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
+    pub mutation_replay_window_seconds: u32,
+
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
     /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
@@ -368,6 +515,8 @@ pub struct Config {
 /// Part of the programmatically-built [`Config`]; never deserialized directly.
 #[derive(Debug, Clone)]
 pub struct ServiceRoutingConfig {
+    /// Publish gateway URLs and forward application requests through the gateway.
+    pub enabled: bool,
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
     pub base_domains: Vec<String>,
@@ -511,6 +660,18 @@ pub struct MetricsTlsConfig {
     pub require_client_auth: bool,
 }
 
+/// Workspace secret settings. Both default to off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSecretsConfig {
+    /// Operator activation for creating workspace secrets and referencing them
+    /// from provider refresh configuration. Enable only after every gateway
+    /// that can serve traffic supports workspace secrets.
+    pub enabled: bool,
+    /// Allow `RevealSecret` to return values to mTLS operators. Enable only
+    /// for a control-plane service that needs it.
+    pub reveal_enabled: bool,
+}
+
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
 ///
 /// When configured, the server validates `authorization: Bearer <JWT>`
@@ -570,6 +731,22 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+}
+
+/// `[openshell.gateway.audit]`: optional details gateway mutation records
+/// capture. Secrets are never captured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAuditConfig {
+    /// Record the values of gateway and sandbox settings that `UpdateConfig`
+    /// sets. Bytes values are never recorded.
+    #[serde(default)]
+    pub capture_setting_values: bool,
+    /// Record the command arguments of `ExecSandbox` and
+    /// `ExecSandboxInteractive` calls. Environment variables and standard
+    /// input are never recorded.
+    #[serde(default)]
+    pub capture_exec_command: bool,
 }
 
 /// mTLS user authentication for gateway users.
@@ -1057,11 +1234,15 @@ impl Config {
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
             enable_sandbox_updates: false,
+            workspace_secrets: WorkspaceSecretsConfig::default(),
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
+            audit: GatewayAuditConfig::default(),
             gateway_jwt: None,
+            spiffe_broker: None,
             database_url: String::new(),
+            database_auth: DatabaseAuthMode::default(),
             database_max_connections: None,
             database_lock_max_connections: None,
             compute_driver: None,
@@ -1073,6 +1254,8 @@ impl Config {
             max_service_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_seconds: 300,
+            mutation_admission_limit_per_caller: DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER,
+            mutation_replay_window_seconds: DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
@@ -1117,6 +1300,13 @@ impl Config {
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
+        self
+    }
+
+    /// Select database credentials independently of the connection URL.
+    #[must_use]
+    pub fn with_database_auth(mut self, mode: DatabaseAuthMode) -> Self {
+        self.database_auth = mode;
         self
     }
 
@@ -1287,6 +1477,13 @@ impl Config {
             .then_some(self.name.as_str())
     }
 
+    /// Enable gateway-mediated application routing independently of app listeners.
+    #[must_use]
+    pub const fn with_service_routing(mut self, enabled: bool) -> Self {
+        self.service_routing.enabled = enabled;
+        self
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1306,6 +1503,7 @@ impl Config {
 impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
             service_hostname_format: ServiceHostnameFormat::default(),
@@ -2032,5 +2230,79 @@ mod tests {
             runtime_image_default(None, "compiled:default".to_string()),
             "compiled:default"
         );
+    }
+    #[test]
+    fn broker_configuration_rejects_ambiguous_transport() {
+        let mut config = super::SpiffeBrokerConfig {
+            spiffe_id_prefix: "spiffe://example.org/openshell".into(),
+            endpoint: "https://spire-broker.spire.svc:8443".into(),
+            node_local_port: None,
+            server_spiffe_id: Some("spiffe://example.org/spire/agent/node".into()),
+            server_spiffe_id_prefix: None,
+            workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock".into(),
+        };
+        config.validate("gw").unwrap();
+        let mut local = config.clone();
+        local.endpoint.clear();
+        local.node_local_port = std::num::NonZeroU16::new(8443);
+        local.validate("gw").unwrap();
+        assert_eq!(
+            local.endpoint_for_node(Some("10.20.0.2")).unwrap(),
+            "https://10.20.0.2:8443"
+        );
+        assert_eq!(
+            local.endpoint_for_node(Some("2001:db8::2")).unwrap(),
+            "https://[2001:db8::2]:8443"
+        );
+        for address in [
+            None,
+            Some(""),
+            Some("agent.example.org"),
+            Some("10.20.0.2:8443"),
+        ] {
+            assert!(local.endpoint_for_node(address).is_err());
+        }
+        local.endpoint.clone_from(&config.endpoint);
+        assert!(local.validate("gw").is_err());
+        local.endpoint.clear();
+        local.node_local_port = None;
+        assert!(local.validate("gw").is_err());
+        let encoded = serde_json::to_value(&config).unwrap();
+        for port in [0, 65536] {
+            let mut invalid = encoded.clone();
+            invalid["node_local_port"] = port.into();
+            assert!(serde_json::from_value::<super::SpiffeBrokerConfig>(invalid).is_err());
+        }
+        config.server_spiffe_id = None;
+        config.server_spiffe_id_prefix =
+            Some("spiffe://example.org/spire/agent/k8s_psat/cluster".into());
+        config.validate("gw").unwrap();
+        config.server_spiffe_id_prefix = Some("spiffe://example.org".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id = Some("spiffe://example.org/spire/agent/node".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id_prefix = None;
+        for endpoint in [
+            "http://broker:8443",
+            "https://user:password@broker",
+            "https://broker/path",
+            "https://broker/?query",
+            "https://broker/#fragment",
+        ] {
+            config.endpoint = endpoint.into();
+            assert!(config.validate("gw").is_err());
+        }
+        config.endpoint = "https://broker:8443".into();
+        for socket in [
+            "tcp:broker:1234",
+            "/",
+            "/agent.sock",
+            "/run/../agent.sock",
+            "/run/spire/",
+            " /run/spire/agent.sock",
+        ] {
+            config.workload_api_socket_path = socket.into();
+            assert!(config.validate("gw").is_err(), "{socket}");
+        }
     }
 }

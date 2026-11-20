@@ -9,6 +9,10 @@ permissions:
   contents: read
   packages: read
 
+concurrency:
+  group: release-dev
+  cancel-in-progress: false
+
 defaults:
   run:
     shell: bash
@@ -19,7 +23,7 @@ jobs:
   # ---------------------------------------------------------------------------
   compute-versions:
     name: Compute Versions
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     container:
       image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
@@ -145,6 +149,23 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: conformance
+      cancel-in-progress: false
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  continuity-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-suites.yml
+    with:
+      family: continuity
+      upgrade-source: true
+      cancel-in-progress: false
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
@@ -159,6 +180,7 @@ jobs:
     uses: ./.github/workflows/e2e-suites.yml
     with:
       family: features
+      cancel-in-progress: false
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
     secrets:
@@ -174,7 +196,7 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       checkout-ref: ${{ github.sha }}
-      runner: linux-arm64-cpu8
+      runner: ubuntu-24.04-arm
 
   vm-e2e:
     needs: [build-binaries-linux, build-binaries-macos, build-vm-driver-linux, build-vm-driver-macos]
@@ -189,7 +211,7 @@ jobs:
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
     needs: [build-images, release-dev]
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       packages: write
@@ -256,13 +278,14 @@ jobs:
       - compute-versions
       - package-binaries
       - conformance-integration
+      - continuity-integration
       - feature-specific-integration
       - docker-e2e
       - vm-e2e
       - build-deb
       - build-rpm
       - build-snap
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write

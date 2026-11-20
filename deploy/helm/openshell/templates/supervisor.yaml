@@ -12,8 +12,9 @@
 {{- $app := include "openshell.appListenerConfig" . | fromYaml }}
 {{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml }}
 {{- $appPort := get $app "port" | default 8443 }}
+{{- $listenHost := include "openshell.listenHost" .Values.supervisor.listenAddress }}
 {{- if get $app "enabled" }}
-{{- $_ := required "supervisor app listener requires domain" (get $app "domain") }}
+{{- $_ := required "supervisor app listener requires base_url" (get $app "base_url") }}
 {{- $_ := required "supervisor app listener requires tls_secret_name" (get $appDeployment "tls_secret_name") }}
 {{- if or (lt (int $appPort) 1024) (gt (int $appPort) 65535) (eq (int $appPort) 5501) (eq (int $appPort) (int (get $shared "runtime_port"))) }}
 {{- fail "supervisor app listener port must be in 1024..65535 and distinct from runtime and health ports" }}
@@ -88,11 +89,11 @@ spec:
             - --gateway-endpoint
             - {{ $endpoint | quote }}
             - --address
-            - 0.0.0.0:5501
+            - {{ printf "%s:5501" $listenHost | quote }}
             - --token-file
             - /etc/openshell/supervisor-token/token
             - --runtime-listen
-            - 0.0.0.0:{{ get $shared "runtime_port" }}
+            - {{ printf "%s:%v" $listenHost (get $shared "runtime_port") | quote }}
             - --session-root
             - /run/openshell/sessions
           env:
@@ -100,9 +101,9 @@ spec:
             - name: OPENSHELL_APP_LISTENER_ENABLED
               value: "true"
             - name: OPENSHELL_APP_LISTEN_ADDRESS
-              value: {{ printf "0.0.0.0:%v" $appPort | quote }}
-            - name: OPENSHELL_APP_SERVICE_DOMAIN
-              value: {{ get $app "domain" | quote }}
+              value: {{ printf "%s:%v" $listenHost $appPort | quote }}
+            - name: OPENSHELL_APP_BASE_URL
+              value: {{ get $app "base_url" | quote }}
             - name: OPENSHELL_APP_TLS_CERT
               value: /etc/openshell/app-tls/tls.crt
             - name: OPENSHELL_APP_TLS_KEY

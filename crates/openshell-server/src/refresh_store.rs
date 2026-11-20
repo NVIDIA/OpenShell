@@ -5,11 +5,12 @@
 use crate::persistence::{ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition};
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredRefreshMaterialDeletion,
+    StoredRefreshMaterialDeletion, StoredWorkspaceSecret,
 };
 use async_trait::async_trait;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::RefreshMaterialDeletion;
+use openshell_credential_issuer::refresh::secret_refs::WorkspaceSecretMaterial;
 use openshell_credential_issuer::refresh::{
     RefreshLease, RefreshState, RefreshStateStore, refresh_state_name,
 };
@@ -116,6 +117,16 @@ pub async fn list_all_refresh_states(
 ) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
     store
         .collect_messages(ObjectListQuery::AllWorkspaces)
+        .await
+        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
+}
+
+pub async fn list_refresh_states_in_workspace(
+    store: &Store,
+    workspace: &str,
+) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
+    store
+        .collect_messages(ObjectListQuery::Workspace(workspace))
         .await
         .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
 }
@@ -270,6 +281,37 @@ impl RefreshStateStore for ServerRefreshStore {
             .await
             .map(|guard| -> Box<dyn RefreshLease> { Box::new(guard) })
             .map_err(|_| Status::unavailable("credential refresh coordination unavailable"))
+    }
+    async fn get_workspace_secret(
+        &self,
+        workspace: &str,
+        secret_id: &str,
+    ) -> Result<Option<WorkspaceSecretMaterial>, Status> {
+        let stored = self
+            .0
+            .get_message::<StoredWorkspaceSecret>(secret_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch workspace secret failed: {e}")))?;
+        Ok(stored
+            .filter(|stored| {
+                stored.object_workspace() == workspace
+                    && stored.create_pending_since.is_none()
+                    && stored
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_time.is_none())
+            })
+            .and_then(|stored| {
+                stored.value_handle.map(|handle| WorkspaceSecretMaterial {
+                    handle,
+                    // A reveal-only secret allows no endpoint, so a mint
+                    // carrying it fails closed. Configure refuses to bind one.
+                    allowed_endpoints: stored
+                        .refresh_use
+                        .map(|refresh_use| refresh_use.allowed_endpoints)
+                        .unwrap_or_default(),
+                })
+            }))
     }
 }
 

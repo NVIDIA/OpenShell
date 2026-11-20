@@ -14,6 +14,7 @@ use rand::Rng;
 
 use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup, Key};
 use crate::cli::{Cli, CliOutput};
+use crate::cli_child::CliChild;
 use crate::cli_sandbox::CliSandboxBuilder;
 use crate::error::{Error, Result, ResultExt};
 use crate::output::Outcome;
@@ -79,6 +80,81 @@ impl Context {
         self.handles.cli.run_with_env(None, env, args).await
     }
 
+    /// Start the CLI with `args` and keep it running, with stdin, stdout,
+    /// and stderr piped to the test. See [`CliChild`].
+    pub fn cli_spawn<I, S>(&self, args: I) -> Result<CliChild>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.spawn(args)
+    }
+
+    /// Like [`Context::cli_spawn`], with `stdin` as the CLI's stdin, such
+    /// as [`std::process::Stdio::null`], a file, or a pseudo-terminal.
+    pub fn cli_spawn_with_stdin<I, S>(
+        &self,
+        args: I,
+        stdin: impl Into<std::process::Stdio>,
+    ) -> Result<CliChild>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.handles.cli.spawn_with_stdin(args, stdin)
+    }
+
+    /// The entry called `name` in a paginated `--output json` listing from
+    /// `list` (e.g. `["sandbox", "template", "list", "--all-workspaces"]`),
+    /// where `collection` is the JSON key holding the entries. Follows every
+    /// page. A listing without that key is an error, so a "not listed" check
+    /// cannot pass on a malformed listing.
+    pub async fn cli_find_listed(
+        &self,
+        list: &[&str],
+        collection: &str,
+        name: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        const PAGE_SIZE: &str = "1000";
+        /// More pages than any test gateway should have; stops a repeated
+        /// token from looping forever.
+        const MAX_PAGES: usize = 1000;
+
+        let mut token = String::new();
+        for _ in 0..MAX_PAGES {
+            let mut args = list.to_vec();
+            args.extend([
+                "--page-size",
+                PAGE_SIZE,
+                "--page-token",
+                &token,
+                "--output",
+                "json",
+            ]);
+            let page: serde_json::Value = self.cli(args).await?.success()?.json()?;
+            let Some(entries) = page[collection].as_array() else {
+                return Err(Error::msg(format!(
+                    "`{}` output has no '{collection}' array",
+                    list.join(" ")
+                )));
+            };
+            if let Some(entry) = entries.iter().find(|entry| entry["name"] == name) {
+                return Ok(Some(entry.clone()));
+            }
+            token = page["next_page_token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if token.is_empty() {
+                return Ok(None);
+            }
+        }
+        Err(Error::msg(format!(
+            "`{}` did not finish within {MAX_PAGES} pages",
+            list.join(" ")
+        )))
+    }
+
     /// The CLI that [`Context::cli`] runs, for code that can't borrow the
     /// context, such as a cleanup hook.
     pub fn cli_handle(&self) -> Cli {
@@ -101,12 +177,18 @@ impl Context {
     }
 
     /// Start describing a sandbox named `cx.name(suffix)`.
+    ///
+    /// # Panics
+    ///
+    /// If the name is longer than the gateway allows; see
+    /// [`MAX_SANDBOX_NAME_LEN`].
+    #[track_caller]
     pub fn sandbox(&self, suffix: &str) -> SandboxBuilder {
         SandboxBuilder {
             handles: self.handles.clone(),
             policy: None,
             spec: SandboxSpec {
-                name: Some(self.name(suffix)),
+                name: Some(self.sandbox_name(suffix)),
                 ..SandboxSpec::default()
             },
         }
@@ -116,8 +198,20 @@ impl Context {
     /// `openshell` CLI creates. Use it for what only `sandbox create`
     /// offers, such as a `--policy` file or `--no-keep`; prefer
     /// [`Context::sandbox`] otherwise.
+    ///
+    /// # Panics
+    ///
+    /// As [`Context::sandbox`].
+    #[track_caller]
     pub fn cli_sandbox(&self, suffix: &str) -> CliSandboxBuilder {
-        CliSandboxBuilder::new(self.handles.clone(), self.name(suffix))
+        CliSandboxBuilder::new(self.handles.clone(), self.sandbox_name(suffix))
+    }
+
+    #[track_caller]
+    fn sandbox_name(&self, suffix: &str) -> String {
+        let name = self.name(suffix);
+        check_sandbox_name(&name);
+        name
     }
 
     /// Track a sandbox the test is about to create through the CLI, so cleanup
@@ -127,7 +221,13 @@ impl Context {
     /// Cleanup deletes the sandbox and waits until it is gone, at the point
     /// in the cleanup order where it was first tracked. Tracking a sandbox
     /// again, for example by adopting it, doesn't move it.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is longer than [`MAX_SANDBOX_NAME_LEN`].
+    #[track_caller]
     pub fn track(&self, name: &str) {
+        check_sandbox_name(name);
         self.handles.track(name);
     }
 
@@ -321,6 +421,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Attach these providers to the sandbox.
+    pub fn providers<I, S>(mut self, providers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.spec.providers = providers.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Create the sandbox with this policy instead of the gateway's default.
     pub fn policy(mut self, policy: proto::SandboxPolicy) -> Self {
         self.policy = Some(policy);
@@ -466,6 +576,19 @@ impl ExecOutput {
         Ok(self)
     }
 
+    /// The last line of stdout that parses as JSON, such as the result a
+    /// client script prints after its other output.
+    pub fn last_json(&self) -> Result<serde_json::Value> {
+        last_json_line(&self.stdout).ok_or_else(|| {
+            Error::msg(format!(
+                "{} printed no JSON line; stdout: {}; stderr: {}",
+                self.description,
+                self.stdout.trim(),
+                self.stderr.trim()
+            ))
+        })
+    }
+
     fn outcome(&self) -> Outcome<'_> {
         Outcome {
             what: &self.description,
@@ -474,6 +597,26 @@ impl ExecOutput {
             stderr: &self.stderr,
         }
     }
+}
+
+/// Only objects and arrays count, so a line that happens to parse, such as
+/// a number, isn't taken for the result.
+fn last_json_line(stdout: &str) -> Option<serde_json::Value> {
+    stdout.lines().rev().find_map(|line| {
+        serde_json::from_str(line.trim())
+            .ok()
+            .filter(|value: &serde_json::Value| value.is_object() || value.is_array())
+    })
+}
+
+/// A script's first line that isn't blank or a license header, which names
+/// it in reports instead of its full text.
+fn script_summary(script: &str) -> &str {
+    script
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("# SPDX-"))
+        .unwrap_or_default()
 }
 
 impl Sandbox {
@@ -649,6 +792,49 @@ impl Sandbox {
         })
     }
 
+    /// Run `script` with `python3 -c` and `args`, as in a sandbox from
+    /// [`crate::python_image`]. Fails unless it exits 0. Read a JSON result
+    /// with [`ExecOutput::last_json`].
+    pub async fn run_python(&self, script: &str, args: &[&str]) -> Result<ExecOutput> {
+        let mut command = vec!["python3", "-c", script];
+        command.extend_from_slice(args);
+        let mut output = self.exec(command).await?;
+        output.description = format!(
+            "python3 script {:?} with {args:?} in sandbox {}",
+            script_summary(script),
+            self.name
+        );
+        let missing_python =
+            output.exit_code == 127 || output.stderr.contains("python3: not found");
+        output.success().map_err(|error| {
+            if missing_python {
+                error.context("the sandbox has no python3; create it from testkit::python_image()")
+            } else {
+                error
+            }
+        })
+    }
+
+    /// The sandbox's policy revisions, from `policy list --output json`.
+    pub async fn policy_revisions(&self) -> Result<serde_json::Value> {
+        self.handles
+            .cli
+            .run(["policy", "list", &self.name, "--output", "json"])
+            .await?
+            .success()?
+            .json()
+    }
+
+    /// The sandbox's active policy, from `policy get --full --output json`.
+    pub async fn active_policy(&self) -> Result<serde_json::Value> {
+        self.handles
+            .cli
+            .run(["policy", "get", &self.name, "--full", "--output", "json"])
+            .await?
+            .success()?
+            .json()
+    }
+
     /// Run `command` every 250 ms until `ready` accepts its output, and return
     /// that output. An exec error fails at once; a timeout reports the last
     /// output.
@@ -782,6 +968,22 @@ impl Context {
             crate::gateway::Gateway::from_endpoint(ENDPOINT.to_string(), "default".to_string());
         Self::new(&client, "default", Cli::from_env(&gateway))
     }
+}
+
+/// The longest sandbox name the gateway accepts, the server's
+/// `MAX_ROUTABLE_NAME_LEN` in `crates/openshell-server/src/grpc/mod.rs`. With
+/// `test-<run-id>-`, a sandbox suffix can have at most 5 characters.
+pub const MAX_SANDBOX_NAME_LEN: usize = 19;
+
+/// Panic, at the test's call, on a sandbox name the gateway would reject, so
+/// the test fails with this message instead of the gateway's.
+#[track_caller]
+fn check_sandbox_name(name: &str) {
+    assert!(
+        name.len() <= MAX_SANDBOX_NAME_LEN,
+        "sandbox name {name:?} has {} characters; the gateway allows {MAX_SANDBOX_NAME_LEN}, so a suffix after `test-<run-id>-` can have at most 5",
+        name.len()
+    );
 }
 
 /// Short, lowercase, and DNS-label safe, so names work on every driver.

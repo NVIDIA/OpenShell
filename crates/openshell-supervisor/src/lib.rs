@@ -937,8 +937,8 @@ pub struct SandboxInstanceConfig {
     pub attach_request_timeout: Duration,
     /// Parent of the startup span.
     pub trace_context: Option<RegistrationTraceContext>,
-    /// SPIFFE Workload API socket for provider token grants; absent fails closed.
-    pub provider_workload_api_socket: Option<std::path::PathBuf>,
+    /// How this instance obtains provider access tokens.
+    pub provider_identity: openshell_supervisor_network::run::ProviderIdentitySource,
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
     /// Gateway-granted authority to replace the generation's current owner.
     /// The instance then adopts the running workload instead of starting it.
@@ -1112,7 +1112,7 @@ pub async fn run_sandbox_instance(
         main_exit_marker,
         attach_request_timeout,
         trace_context,
-        provider_workload_api_socket,
+        provider_identity,
         proxy_tls,
         takeover,
         supervisor_recovery_timeout_secs,
@@ -1476,7 +1476,7 @@ pub async fn run_sandbox_instance(
                 sandbox_id: sandbox_id.clone(),
                 sandbox_name: sandbox_name_for_agg.clone(),
                 gateway: gateway.clone(),
-                provider_workload_api_socket,
+                provider_identity,
                 denial_log,
                 proxy_tls,
             },
@@ -4793,7 +4793,7 @@ mod tests {
             main_exit_marker: None,
             attach_request_timeout: Duration::from_mins(5),
             trace_context: None,
-            provider_workload_api_socket: None,
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
             takeover: None,
             supervisor_recovery_timeout_secs: None,

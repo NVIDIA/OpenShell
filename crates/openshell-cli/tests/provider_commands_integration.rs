@@ -7,33 +7,32 @@ use helpers::TempDir;
 use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
-    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant,
-    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
-    ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt, ProviderProfile,
-    ProviderProfileCredential, ProviderProfileDiscovery, ProviderReadinessObservation,
-    ProviderReadinessReason, ProviderReadinessState, ProviderReadinessStatus, ProviderResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, WorkspaceSelector,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    ExecSandboxRequest, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxProviderStatusRequest,
+    GetSandboxProviderStatusResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
+    ProviderCredentialRefresh, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+    ProviderCredentialTokenGrant, ProviderCredentialTokenGrantSubjectToken,
+    ProviderCredentialTokenGrantType, ProviderDesiredIdentity, ProviderMutationKind,
+    ProviderMutationReceipt, ProviderProfile, ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderReadinessObservation, ProviderReadinessReason, ProviderReadinessState,
+    ProviderReadinessStatus, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
+    SandboxStreamEvent, ServiceStatus, SettingValue, UpdateProviderRequest, WatchSandboxRequest,
+    WorkspaceSelector,
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
 use openshell_core::{ObjectId, ObjectName};
+use openshell_server::test_support::grpc::open_shell_server::{OpenShell, OpenShellServer};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -127,6 +126,7 @@ enum ProviderRefreshRequestLog {
         credential_key: String,
         material: HashMap<String, String>,
         secret_material_keys: Vec<String>,
+        material_secrets: HashMap<String, String>,
         expires_at_ms: Option<i64>,
     },
     Rotate {
@@ -235,34 +235,6 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
-    async fn peer_notify_config_update(
-        &self,
-        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
-    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_report_provider_readiness(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_report_endpoint_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_get_sandbox_provider_status(
-        &self,
-        _request: tonic::Request<GetSandboxProviderStatusRequest>,
-    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
     async fn report_endpoint_status(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
@@ -270,34 +242,6 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(
             openshell_core::proto::ReportEndpointStatusResponse {},
         ))
-    }
-
-    async fn begin_rootfs_tar_staging(
-        &self,
-        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
-    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn report_main_process_exit(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn finalize_main_process_exit(
-        &self,
-        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
-    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn get_current_user(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
-    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
     }
 
     async fn health(
@@ -310,46 +254,11 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
-    async fn get_gateway_info(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
-    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
     async fn create_sandbox(
         &self,
         _request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Ok(Response::new(SandboxResponse::default()))
-    }
-
-    async fn stop_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn start_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn suspend_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn resume_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
     }
 
     async fn get_sandbox(
@@ -363,6 +272,8 @@ impl OpenShell for TestOpenShell {
         let name = request.name;
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("sb-{name}"),
@@ -388,8 +299,6 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
-
-    unimplemented_sandbox_template_rpcs!();
 
     async fn list_sandbox_providers(
         &self,
@@ -687,15 +596,6 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
-    async fn report_provider_readiness(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
-        Err(Status::unimplemented(
-            "provider installation reports are not exercised by this mock",
-        ))
-    }
-
     async fn create_ssh_session(
         &self,
         _request: tonic::Request<CreateSshSessionRequest>,
@@ -712,39 +612,11 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    async fn get_service(
-        &self,
-        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
-    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn list_services(
-        &self,
-        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn delete_service(
-        &self,
-        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
         Ok(Response::new(RevokeSshSessionResponse::default()))
-    }
-
-    async fn exchange_provider_subject_token(
-        &self,
-        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
     }
 
     async fn create_provider(
@@ -797,13 +669,6 @@ impl OpenShell for TestOpenShell {
             provider: Some(provider),
             ..Default::default()
         }))
-    }
-
-    async fn get_provider_credentials(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
-        Err(Status::unimplemented("not used by this mock"))
     }
 
     async fn get_provider(
@@ -1242,6 +1107,7 @@ impl OpenShell for TestOpenShell {
                 credential_key: request.credential_key.clone(),
                 material: request.material.clone(),
                 secret_material_keys: request.secret_material_keys.clone(),
+                material_secrets: request.material_secrets.clone(),
                 expires_at_ms: request
                     .expiration_time
                     .as_ref()
@@ -1274,6 +1140,7 @@ impl OpenShell for TestOpenShell {
             failure_code: String::new(),
             provider_error_subtype: String::new(),
             last_error_time: None,
+            material_secrets: HashMap::new(),
         };
         drop(providers);
         self.state
@@ -1417,254 +1284,24 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    type WatchSandboxStream =
-        tokio_stream::wrappers::ReceiverStream<Result<SandboxStreamEvent, Status>>;
-    type ExecSandboxStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
-    type ConnectSupervisorStream =
-        tokio_stream::wrappers::ReceiverStream<Result<GatewayMessage, Status>>;
-
     async fn watch_sandbox(
         &self,
         _request: tonic::Request<WatchSandboxRequest>,
-    ) -> Result<Response<Self::WatchSandboxStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<SandboxStreamEvent>>, Status> {
         let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
     }
 
     async fn exec_sandbox(
         &self,
         _request: tonic::Request<ExecSandboxRequest>,
-    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<ExecSandboxEvent>>, Status> {
         let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
-    }
-
-    type ExecSandboxInteractiveStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
-    async fn exec_sandbox_interactive(
-        &self,
-        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
-    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn update_config(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_sandbox_policies(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_sandbox_configuration(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_logs(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxLogsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn push_sandbox_logs(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PushSandboxLogsRequest>>,
-    ) -> Result<Response<openshell_core::proto::PushSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn submit_policy_analysis(
-        &self,
-        _request: tonic::Request<openshell_core::proto::SubmitPolicyAnalysisRequest>,
-    ) -> Result<Response<openshell_core::proto::SubmitPolicyAnalysisResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_policy(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftPolicyResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn reject_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RejectDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::RejectDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_all_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveAllDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveAllDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn edit_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::EditDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::EditDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn undo_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UndoDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::UndoDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn clear_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ClearDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ClearDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_history(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn issue_sandbox_token(
-        &self,
-        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn refresh_sandbox_token(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn connect_supervisor(
-        &self,
-        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
-    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type RelayStreamStream =
-        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
-
-    async fn relay_stream(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<Response<Self::RelayStreamStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type PeerRelayStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::PeerRelayFrame, Status>,
-    >;
-
-    async fn peer_relay(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PeerRelayFrame>>,
-    ) -> Result<Response<Self::PeerRelayStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::TcpForwardFrame, Status>,
-    >;
-
-    async fn forward_tcp(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
-    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn create_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_workspaces(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn delete_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn add_workspace_member(
-        &self,
-        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
-    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn remove_workspace_member(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
-    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_workspace_members(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
-    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
     }
 }
 
@@ -3905,6 +3542,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
             secret_material_env: &[],
             secret_material_keys: &["client_secret".to_string()],
             credential_expires_at_ms: Some(1_767_225_600_000),
+            material_secrets: &[],
         },
         "default",
         &ts.tls,
@@ -3948,6 +3586,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 material: HashMap::from([("tenant_id".to_string(), "tenant".to_string())]),
                 secret_material_keys: vec!["client_secret".to_string()],
+                material_secrets: HashMap::new(),
                 expires_at_ms: Some(1_767_225_600_000),
             },
             ProviderRefreshRequestLog::Status {
@@ -4001,6 +3640,7 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
                     ],
                     secret_material_keys: &[],
                     credential_expires_at_ms: None,
+                    material_secrets: &[],
                 },
                 "default",
                 &ts.tls,
@@ -4022,11 +3662,94 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
                         ("private_key".to_string(), "pem-from-env".to_string()),
                     ]),
                     secret_material_keys: vec!["private_key".to_string()],
+                    material_secrets: HashMap::new(),
                     expires_at_ms: None,
                 }]
             );
         })
         .await;
+}
+
+#[tokio::test]
+async fn provider_refresh_configure_sends_workspace_secret_references_as_secret_keys() {
+    let ts = run_server().await;
+    install_test_profile(&ts, "custom-chat", "GOOGLE_CHAT_ACCESS_TOKEN").await;
+    run::provider_create(
+        &ts.endpoint,
+        "alice-mcp",
+        "custom-chat",
+        false,
+        &["GOOGLE_CHAT_ACCESS_TOKEN=pending".to_string()],
+        false,
+        &[],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "alice-mcp",
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
+            strategy: "oauth2_client_credentials",
+            material: &["client_id=client-id".to_string()],
+            secret_material_env: &[],
+            secret_material_keys: &[],
+            credential_expires_at_ms: None,
+            material_secrets: &["client_secret=acme-oauth-client".to_string()],
+        },
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh configure");
+
+    let requests = ts.state.refresh_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![ProviderRefreshRequestLog::Configure {
+            provider: "alice-mcp".to_string(),
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN".to_string(),
+            material: HashMap::from([("client_id".to_string(), "client-id".to_string())]),
+            // Listed so gateways that predate workspace secrets reject the
+            // request rather than ignore the reference.
+            secret_material_keys: vec!["client_secret".to_string()],
+            material_secrets: HashMap::from([(
+                "client_secret".to_string(),
+                "acme-oauth-client".to_string()
+            )]),
+            expires_at_ms: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn provider_refresh_configure_rejects_key_supplied_inline_and_by_secret() {
+    let ts = run_server().await;
+    let err = run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "alice-mcp",
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
+            strategy: "oauth2_client_credentials",
+            material: &["client_secret=inline".to_string()],
+            secret_material_env: &[],
+            secret_material_keys: &[],
+            credential_expires_at_ms: None,
+            material_secrets: &["client_secret=acme-oauth-client".to_string()],
+        },
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("a key cannot come from both inline material and a secret");
+    assert!(
+        err.to_string()
+            .contains("duplicate material key 'client_secret'")
+    );
+    assert!(ts.state.refresh_requests.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -4045,6 +3768,7 @@ async fn provider_refresh_configure_rejects_key_supplied_via_both_material_and_e
                     secret_material_env: &["private_key=OPENSHELL_ITEST_SME_DUP_KEY".to_string()],
                     secret_material_keys: &[],
                     credential_expires_at_ms: None,
+                    material_secrets: &[],
                 },
                 "default",
                 &ts.tls,
@@ -4076,6 +3800,7 @@ async fn provider_refresh_configure_fails_closed_when_secret_material_env_is_uns
             secret_material_env: &["private_key=OPENSHELL_ITEST_SME_DEFINITELY_UNSET".to_string()],
             secret_material_keys: &[],
             credential_expires_at_ms: None,
+            material_secrets: &[],
         },
         "default",
         &ts.tls,

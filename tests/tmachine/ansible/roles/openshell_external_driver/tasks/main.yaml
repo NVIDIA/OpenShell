@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Run a compute driver as an external service for the packaged gateway.
+#
+# The gateway does not start or supervise an external driver, so this installs
+# the driver binary and a system service for it, waits for its socket, and
+# points the gateway at it through /etc/openshell-test/gateway-overrides.toml
+# (applied by merge-settings.yaml). The driver runs as the gateway's user, which
+# the driver requires of its peer.
+#
+# Inputs:
+#   openshell_external_driver_binary  the driver binary for the guest
+#   openshell_external_driver_name    the name to register it under; a built-in
+#                                     driver's name cannot be selected over a socket
+# The binary must be openshell-driver-<runtime> for the machine's container runtime
+# (openshell_gateway_driver), which selects the settings in vars/<runtime>.yaml.
+---
+- name: Check the driver matches the container runtime
+  ansible.builtin.assert:
+    that: openshell_external_driver_binary | basename == 'openshell-driver-' ~ openshell_gateway_driver
+    fail_msg: >-
+      {{ openshell_external_driver_binary | basename }} does not run on this
+      machine's {{ openshell_gateway_driver }} container runtime
+
+- name: Load external driver settings
+  ansible.builtin.include_vars:
+    file: "{{ openshell_gateway_driver }}.yaml"
+
+- name: Install the external driver binary
+  become: true
+  ansible.builtin.copy:
+    src: "{{ openshell_external_driver_binary }}"
+    dest: "/usr/local/bin/{{ openshell_external_driver_binary_name }}"
+    mode: "0755"
+
+# The packaged gateway serves TLS from certificates it generates when it starts,
+# which is after this driver. The driver needs the CA, to give to sandboxes, so
+# generate them first, as the gateway's service does.
+- name: Generate the gateway certificates the driver trusts
+  become: true
+  become_user: "{{ openshell_gateway_user }}"
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openshell-gateway
+      - generate-certs
+      - --output-dir
+      - "{{ openshell_gateway_home }}/.local/state/openshell/tls"
+      - --server-san
+      - host.openshell.internal
+  environment:
+    HOME: "{{ openshell_gateway_home }}"
+
+- name: Create the external driver configuration directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/openshell
+    state: directory
+    mode: "0755"
+
+- name: Write the external driver configuration
+  become: true
+  ansible.builtin.template:
+    src: "driver-{{ openshell_gateway_driver }}.toml.j2"
+    dest: "/etc/openshell/driver-{{ openshell_external_driver_name }}.toml"
+    mode: "0644"
+
+- name: Install the external driver service
+  become: true
+  ansible.builtin.template:
+    src: driver.service.j2
+    dest: "/etc/systemd/system/openshell-driver-{{ openshell_external_driver_name }}.service"
+    mode: "0644"
+
+- name: Start the external driver service
+  become: true
+  ansible.builtin.systemd_service:
+    name: "openshell-driver-{{ openshell_external_driver_name }}.service"
+    daemon_reload: true
+    enabled: true
+    state: started
+
+- name: Wait for the external driver socket
+  block:
+    - name: Wait for the socket
+      ansible.builtin.wait_for:
+        path: "{{ openshell_external_driver_socket }}"
+        timeout: 30
+  rescue:
+    - name: Read the external driver logs
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - -u
+          - "openshell-driver-{{ openshell_external_driver_name }}.service"
+          - --no-pager
+          - -n
+          - "60"
+      register: openshell_external_driver_logs
+      changed_when: false
+
+    - name: Show the external driver logs
+      ansible.builtin.debug:
+        var: openshell_external_driver_logs.stdout_lines
+
+    - name: Report external driver startup failure
+      ansible.builtin.fail:
+        msg: The external driver socket did not appear
+
+- name: Create the environment settings directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/openshell-test
+    state: directory
+    mode: "0755"
+
+- name: Point the gateway at the external driver
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/openshell-test/gateway-overrides.toml
+    mode: "0644"
+    content: |
+      [openshell.drivers.{{ openshell_external_driver_name }}]
+      socket_path = "{{ openshell_external_driver_socket }}"

@@ -9,7 +9,8 @@ Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 {{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
 {{- if not (get $oidcRuntimeConfig "issuer") -}}{{- $oidcRuntimeConfig = .Values.server.oidc | default dict -}}{{- end -}}
 {{- $kubernetesRuntimeConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
-{{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
+{{- $broker := get $gatewayConfig "openshell.gateway.spiffe_broker" | default dict -}}
+{{- $spiffeSocketPath := get $broker "workload_api_socket_path" | default (get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path") -}}
 {{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
 {{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
 {{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
@@ -66,6 +67,12 @@ spec:
         - {{ .Values.server.dbUrl | quote }}
         {{- end }}
       env:
+        {{- if hasKey $broker "node_local_port" }}
+        - name: OPENSHELL_NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        {{- end }}
         - name: OPENSHELL_REPLICA_ID
           valueFrom:
             fieldRef:

@@ -421,6 +421,18 @@ service OpenShell {
     };
   }
 
+  // Copy each workspace secret referenced by one credential's refresh
+  // configuration into provider-owned refresh material and remove the
+  // references. Other material, including a rotated refresh token, is kept.
+  rpc InlineProviderRefreshSecrets(InlineProviderRefreshSecretsRequest)
+      returns (InlineProviderRefreshSecretsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
+
   // Delete gateway-owned refresh configuration for one provider credential.
   rpc DeleteProviderRefresh(DeleteProviderRefreshRequest)
       returns (DeleteProviderRefreshResponse) {
@@ -448,6 +460,60 @@ service OpenShell {
       scope: "provider:write"
       workspace_role: "admin"
     };
+  }
+
+  // Create a workspace secret. Secrets are credential minting material only:
+  // OpenShell never injects them into sandboxes, and Get and List never
+  // return their values.
+  rpc CreateSecret(CreateSecretRequest) returns (SecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Fetch workspace secret metadata by name. The value is never returned.
+  rpc GetSecret(GetSecretRequest) returns (SecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:read"
+      workspace_role: "user"
+    };
+  }
+
+  // List workspace secret metadata. Values are never returned.
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Replace a workspace secret's value, description, or labels.
+  rpc UpdateSecret(UpdateSecretRequest) returns (SecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Delete a workspace secret by name.
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "secret:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Return a workspace secret's plaintext value to a control-plane caller.
+  // Disabled unless the gateway sets enable_secret_reveal. Only directly
+  // authenticated mTLS operators may call this method. Every call is audited.
+  rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "operator" };
   }
 
   // Get sandbox settings by id (called by users, and by supervisors at startup
@@ -555,6 +621,13 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
+  }
+
+  // Obtain the final provider token for the authenticated sandbox session.
+  // SPIFFE assertions and intermediate credentials remain in the gateway.
+  rpc GetSandboxProviderAccessToken(GetSandboxProviderAccessTokenRequest)
+      returns (GetSandboxProviderAccessTokenResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
   }
 
   // Fetch recent sandbox logs (one-shot).
@@ -856,6 +929,28 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+}
+
+// Application ingress consumers discover routes independently of sandbox management.
+service ServiceDiscovery {
+  // Read installed, unexpired application routes in one explicit workspace.
+  rpc GetServiceRouteSnapshot(GetServiceRouteSnapshotRequest) returns (GetServiceRouteSnapshotResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Full replacement views; reauthorize during the bounded watch lifetime.
+  rpc WatchServiceRoutes(WatchServiceRoutesRequest) returns (stream WatchServiceRoutesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
 }
 
 // Optional sandbox mutations are separate from OpenShell so existing generated
@@ -1587,7 +1682,13 @@ message SandboxResponse {
   Sandbox sandbox = 1;
   // Service URLs created by CreateSandbox, keyed by service name. The empty
   // key identifies the unnamed service. Other sandbox RPCs return an empty map.
+  // Idempotent retries preserve all originally returned addresses.
   map<string, string> service_urls = 2;
+  // Configured application origins for the same services. These are
+  // authoritative public addresses, not installation or health evidence.
+  map<string, string> application_service_urls = 3;
+  // Gateway-routed alternatives, independent of application ingress.
+  map<string, string> gateway_service_urls = 4;
 }
 
 // List sandboxes response.
@@ -1970,10 +2071,16 @@ message ServiceEndpoint {
   ServiceAuthorizationMode authorization_mode = 7;
 }
 
-// Response containing a service endpoint and, when available, its local URL.
+// Service addresses. A configured address does not establish readiness.
 message ServiceEndpointResponse {
   ServiceEndpoint endpoint = 1;
+  // Preferred address: application_url when configured, otherwise gateway_url.
+  // Idempotent retries preserve all originally returned addresses.
   string url = 2;
+  // Authoritative configured public application address. Preserve its port.
+  string application_url = 3;
+  // Gateway-routed alternative; existing gateway routing remains available.
+  string gateway_url = 4;
 }
 
 // Revoke SSH session request.
@@ -2539,6 +2646,8 @@ message ProviderCredentialRefreshStatus {
   // values are not persisted or returned.
   string provider_error_subtype = 12;
   google.protobuf.Timestamp last_error_time = 113;
+  // Material key to the name of the workspace secret that supplies it.
+  map<string, string> material_secrets = 14;
 }
 
 // Provider profile local discovery declaration.
@@ -2568,13 +2677,19 @@ message ConfigureProviderRefreshRequest {
   ProviderCredentialRefreshStrategy strategy = 3;
   map<string, string> material = 4 [(openshell.options.v1.secret) = true];
   // Additional material names the caller requests be stored as secrets. Every
-  // name must be present in material. The server also classifies secrets from
-  // the authoritative provider profile and refresh strategy.
+  // name must be present in material or material_secrets. The server also
+  // classifies secrets from the authoritative provider profile and refresh
+  // strategy.
   repeated string secret_material_keys = 5;
   google.protobuf.Timestamp expiration_time = 106;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 8;
+  // Secret material supplied by a workspace secret in the same workspace: each
+  // key is a material key and each value names a Secret. Every key must also be
+  // listed in secret_material_keys, so gateways that predate workspace secrets
+  // reject the request instead of ignoring this field.
+  map<string, string> material_secrets = 9;
 }
 
 message ConfigureProviderRefreshResponse {
@@ -2592,6 +2707,20 @@ message RotateProviderCredentialRequest {
 }
 
 message RotateProviderCredentialResponse {
+  ProviderCredentialRefreshStatus status = 1;
+}
+
+message InlineProviderRefreshSecretsRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string provider = 2;
+  string credential_key = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
+}
+
+message InlineProviderRefreshSecretsResponse {
   ProviderCredentialRefreshStatus status = 1;
 }
 
@@ -2756,6 +2885,122 @@ message DeleteProviderProfileResponse {
   DeletionOutcome outcome = 2;
 }
 
+// A workspace-scoped, non-injectable value. OpenShell never injects a secret
+// into sandboxes and never returns its value from Get or List. A secret with
+// refresh_use may also supply provider refresh material, such as an OAuth
+// client secret shared by many providers; one without it is reveal-only.
+message Secret {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string description = 2;
+  // Present only when the value may be used as provider refresh material.
+  // Fixed at creation.
+  SecretRefreshUse refresh_use = 3;
+  // Last time the value was written.
+  google.protobuf.Timestamp value_update_time = 4;
+}
+
+// How a secret may be used as provider refresh material.
+message SecretRefreshUse {
+  // Token endpoints the value may be sent to during refresh. Required and
+  // non-empty: absolute https URLs, or http URLs for loopback hosts, compared
+  // exactly after normalization.
+  repeated string allowed_endpoints = 1;
+}
+
+message CreateSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  string description = 3;
+  // Required and non-empty.
+  string value = 4 [(openshell.options.v1.secret) = true];
+  // Set to allow provider refresh to use the value. Omit for a reveal-only
+  // secret. Cannot be changed after creation.
+  SecretRefreshUse refresh_use = 5;
+  map<string, string> labels = 6;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 7;
+}
+
+message GetSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+}
+
+message ListSecretsRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // The maximum number of secrets to return. Zero uses 100. Values above 1000
+  // are coerced to 1000; negative values are invalid.
+  int32 page_size = 2;
+  // Token from a previous ListSecrets response. All other request parameters
+  // except page_size must match the request that produced it.
+  string page_token = 3;
+  // Optional label selector in key=value comma-separated form.
+  string label_selector = 4;
+}
+
+// Presence selects replacement, including an explicitly empty map.
+message SecretLabels {
+  map<string, string> labels = 1;
+}
+
+message UpdateSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  // Absent leaves the value unchanged. Present must be non-empty.
+  optional string value = 3 [(openshell.options.v1.secret) = true];
+  // Absent leaves the description unchanged.
+  optional string description = 4;
+  // Absent leaves labels unchanged. Present replaces the full set.
+  SecretLabels labels = 5;
+  // Rejects the update unless it matches the current resource version.
+  optional uint64 expected_resource_version = 6;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 7;
+}
+
+message DeleteSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  // Succeed with ALREADY_ABSENT if the target is missing. Authorization and
+  // parent-workspace checks still apply.
+  bool allow_missing = 3;
+  // Optional nonzero UUID. Same ID and payload replay success for 24 hours.
+  string request_id = 4;
+}
+
+message SecretResponse {
+  Secret secret = 1;
+}
+
+message ListSecretsResponse {
+  repeated Secret secrets = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
+}
+
+message DeleteSecretResponse {
+  DeletionOutcome outcome = 1;
+}
+
+message RevealSecretRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+}
+
+message RevealSecretResponse {
+  string value = 1 [(openshell.options.v1.secret) = true];
+  // Last time the value was written.
+  google.protobuf.Timestamp value_update_time = 2;
+}
+
 // Get sandbox provider environment request.
 message GetSandboxProviderEnvironmentRequest {
   // The sandbox ID.
@@ -2873,6 +3118,21 @@ message ProviderEnvironmentSnapshot {
   ProviderReadinessReason readiness_reason = 6;
   // Complete desired set of non-secret managed files, keyed by absolute path.
   map<string, string> files = 7;
+}
+
+// Supervisor-only request. Sandbox/workspace are derived from the verified
+// session JWT. No caller-selected identity, endpoint, audience, or scope.
+message GetSandboxProviderAccessTokenRequest {
+  // Opaque endpoint-bound credential key issued in the gateway's provider
+  // configuration. Echo the configured key without supervisor-local revision
+  // or installation decorations. Callers must not construct or parse it.
+  string credential_key = 1;
+}
+
+message GetSandboxProviderAccessTokenResponse {
+  string access_token = 1 [(openshell.options.v1.secret) = true];
+  google.protobuf.Duration expires_after = 2;
+  string token_type = 3;
 }
 
 message ExchangeProviderSubjectTokenRequest {
@@ -4244,4 +4504,48 @@ message SupervisorServiceAdvertisement {
   repeated openshell.sandbox.v1.SandboxServiceRoute routes = 4;
   // Domain actually installed by the process listener, not the gateway URL.
   string service_domain = 5;
+}
+
+// One explicit active workspace is required. Omitted and all-workspaces
+// selectors are rejected; discovery-only machine grants are separate work.
+message GetServiceRouteSnapshotRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+}
+message GetServiceRouteSnapshotResponse {
+  ServiceRouteSnapshot snapshot = 1;
+}
+// Same workspace authorization as GetServiceRouteSnapshot. A watch sends an
+// initial replacement and later replacements, including lease-only renewal.
+// Clients reconnect/relist when the bounded stream ends and expire cached
+// routes during discovery errors; errors are not empty replacements.
+message WatchServiceRoutesRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+}
+message WatchServiceRoutesResponse {
+  ServiceRouteSnapshot snapshot = 1;
+}
+message ServiceRouteSnapshot {
+  repeated DiscoveredServiceRoute routes = 1;
+  // Opaque equality token for this complete view, including lease expiries.
+  // No ordering across replicas or server restarts is implied.
+  string revision = 2;
+}
+// Trusted supervisor TLS endpoint. Preserve DiscoveredServiceRoute.hostname
+// as SNI and HTTP authority; this endpoint never addresses a workload port.
+message ServiceRouteEndpoint {
+  string host = 1;
+  uint32 port = 2;
+}
+// Accepted installation evidence, not application health or ingress readiness.
+message DiscoveredServiceRoute {
+  string workspace = 1;
+  string sandbox = 2;
+  // Canonical service name; empty identifies the existing unnamed service.
+  string name = 3;
+  string hostname = 4;
+  ServiceRouteEndpoint endpoint = 5;
+  // Changes on owner/backend/declaration replacement, but not lease renewal.
+  string installation_version = 6;
+  uint64 declaration_revision = 7;
+  google.protobuf.Timestamp expires_at = 8;
 }

@@ -126,6 +126,29 @@ Restart affected gateways and supervisors to apply changes. Existing admission
 deadlines stay unchanged. After a timeout, wait for cleanup before starting the
 sandbox again. CLI wait and image-preparation timeouts are separate settings.
 
+## Request ID capacity
+
+Clients that send a `request_id` get a durable admission for each mutation, such
+as sandbox create, start, exec, or delete. A successful admission keeps its slot
+until its replay window ends, and an unresolved one keeps it until an operator
+reconciles it. The gateway deletes expired admissions in the background about
+once a minute, and immediately for a caller that reaches the limit. Admissions are counted per caller identity across every replica
+that shares the database. When a caller's admissions reach the limit, the gateway
+rejects new requests with `RESOURCE_EXHAUSTED`. Requests without a `request_id`
+do not use this capacity.
+
+| Setting | Default | Allowed values |
+|---|---|---|
+| `mutation_admission_limit_per_caller` | `1000` | `1` through `1000000` |
+| `mutation_replay_window_seconds` | `86400` (24 hours) | `60` through `604800` (7 days) |
+
+Set both under `[openshell.gateway]`, using the same values on every replica.
+Size the limit for the most request-ID mutations one caller makes within the
+replay window. For example, creating and deleting 400 sandboxes takes 800. A
+shorter window frees capacity sooner, but a client that retries after the window
+ends can run the mutation again. For replay behavior, refer to
+[API Errors](/sdk/api-errors).
+
 ## Additional Destination CAs
 
 Use the global supervisor network table to trust private certificate authorities
@@ -282,6 +305,11 @@ log_level             = "info"
 # Activate only after retiring incompatible gateways and outstanding driver work.
 enable_sandbox_updates = false
 
+# Activate only after every gateway that can serve traffic supports workspace secrets.
+enable_workspace_secrets = false
+# Let mTLS operators read workspace secret values.
+enable_secret_reveal = false
+
 # Connection ceiling for the gateway's database pool. Omit to use the backend
 # default: 10 for Postgres, 5 for on-disk SQLite.
 database_max_connections = 10
@@ -311,6 +339,12 @@ image_preparation_timeout_seconds = 1800
 # Admission repair window in seconds; existing deadlines are preserved.
 provisioning_repair_window_seconds = 300
 
+# Request-ID admissions one caller identity can hold, 1 through 1000000, and the
+# seconds a successful request ID stays replayable, 60 through 604800. Every
+# replica sharing the database must use the same values.
+mutation_admission_limit_per_caller = 1000
+mutation_replay_window_seconds = 86400
+
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
 policy_validation_failure_mode = "fail_closed"
@@ -324,6 +358,8 @@ config_delivery_mode = "poll"
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
 # service URLs under that domain.
 server_sans                  = ["openshell", "*.dev.openshell.localhost"]
+# Publish gateway service URLs and forward application traffic through the gateway.
+enable_gateway_service_routing      = true
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
 # Hostname format for exposed sandbox services. "hashed" makes service URLs
@@ -405,6 +441,10 @@ allow_unauthenticated_users = false
 [openshell.gateway.mtls_auth]
 enabled = false
 operator_enabled = false # Opt-in: trusted OU=operator grants gateway-wide administration.
+
+[openshell.gateway.audit]
+capture_setting_values = false # Opt-in: record setting values in mutation records.
+capture_exec_command = false # Opt-in: record exec command arguments in mutation records.
 
 # OTLP export. Omit this table entirely to disable it.
 [openshell.gateway.otlp]
@@ -576,6 +616,49 @@ and `https://<workspace>--<sandbox>.<base-domain>/` for the unnamed endpoint.
 The base domain is the first wildcard DNS SAN in `server_sans`; gateways
 without SANs use the built-in `openshell.localhost`.
 
+The core runtime defaults `enable_gateway_service_routing` to `true`; Docker, Podman,
+and VM gateway behavior is unchanged. The Kubernetes Helm chart defaults it to
+`false`. Set it to `false` to stop publishing
+gateway service URLs and reject gateway-mediated application HTTP requests and
+WebSocket upgrades with `404`. Control-plane APIs, service declarations, direct
+supervisor listeners, and discovery remain available. The setting also accepts
+`--enable-gateway-service-routing=false` or `OPENSHELL_ENABLE_GATEWAY_SERVICE_ROUTING=false`,
+with CLI > environment > TOML > default precedence. In Helm, configure the
+canonical gateway table:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    enable_gateway_service_routing: false
+```
+
+For Kubernetes service ingress directly through supervisors, set
+`[openshell.supervisor.app_listener].enabled = true` and configure the
+[supervisor application listener](#supervisor-application-listener). Pair it with
+an ingress solution, such as a TLS-passthrough proxy or a compatible Kubernetes
+ingress/Gateway API integration, that consumes discovery and routes each
+advertised hostname to the current owning supervisor's app-listener IP and port.
+Preserve the application hostname as Host and TLS SNI. Enabling the listener
+alone does not provision DNS or external ingress routes; the chart does not
+enable either the listener or the ingress integration automatically.
+
+If both routing modes are disabled, startup logs warn that sandbox service
+routing is disabled. Gateway-mediated forwarding does not require the app
+listener.
+
+When upgrading a Helm installation that uses gateway service URLs, explicitly
+set `enable_gateway_service_routing: true` in the canonical table above before the
+upgrade. Missing saved values receive the chart's `false` default; explicit
+`true` values remain enabled. This changes application forwarding only, not
+control-plane API access or the service-authentication default.
+
+With gateway routing disabled, `gateway_url` is empty and `gateway_service_urls`
+is empty. A configured application origin supplies the preferred URL; without
+one, preferred URLs are empty. Idempotent retries preserve all recorded URL fields together. Use service
+Get/List operations to obtain current addresses. Service declarations can still
+be created without either routing path; the CLI explains when no public URL is
+configured.
+
 `service_hostname_format` selects the hostname format for exposed sandbox
 services when multiple gateways share one service base domain behind a single
 ingress and wildcard certificate. Identically named workspaces, sandboxes, and
@@ -607,7 +690,8 @@ unique per gateway, so exact-host ingress rules can route it unambiguously.
 The gateway still accepts requests for legacy composite hostnames while
 hashed format is configured.
 
-Service URLs are recomputed from the current configuration, not persisted.
+Service Get/List URLs are computed from the current configuration. Idempotent
+mutation receipts retain the URLs originally returned.
 Changing the installation name, the hostname format, or both changes every
 hash URL issued before the change; previously issued URLs stop resolving
 until callers request a fresh URL.
@@ -652,6 +736,118 @@ an image update is pending or retained sandboxes require the private image
 revision protocol. SQLite supports one gateway process only; activation attests
 that the previous process has stopped, not that sharing a SQLite file enables HA.
 
+## Workspace Secrets
+
+`[openshell.gateway] enable_workspace_secrets` defaults to `false`. It gates
+creating [workspace secrets](/how-it-works/providers/overview#shared-secret-material)
+and referencing them from provider refresh configuration. Reading, updating,
+and deleting existing secrets do not need it, and neither does
+`provider refresh inline-secrets`. The equivalent gateway process flag and
+environment variable are `--enable-workspace-secrets true` and
+`OPENSHELL_ENABLE_WORKSPACE_SECRETS=true`.
+
+Upgrade every gateway before activation. Gateways that predate workspace
+secrets reject requests that reference one, but they can delete a workspace
+that holds secrets. With PostgreSQL, a request is refused while any live
+gateway membership record lacks workspace-secret support. As with sandbox
+updates, that check is not proof that older gateways have stopped; setting the
+flag attests that they are retired.
+
+Before rolling back to a release without workspace secrets:
+
+1. Set `enable_workspace_secrets = false`.
+2. For each row of `openshell provider refresh status` with a value in the
+   `MATERIAL_SECRETS` column, run `openshell provider refresh inline-secrets`
+   for that provider and credential key. Retry it if a mint is in progress.
+3. Run `openshell secret list` in each workspace and find every secret another
+   service reads directly through `RevealSecret`. These include all secrets
+   whose `REFRESH ENDPOINTS` column shows `reveal-only`, and any
+   refresh-enabled secret that a control-plane service also reveals. Provider
+   refresh status does not show them, and their readers do not block deletion.
+   Move each value that is still needed to storage the target release
+   supports, and confirm its readers no longer use `RevealSecret`.
+4. Delete every workspace secret.
+5. Remove `enable_workspace_secrets` and `enable_secret_reveal` from the gateway
+   configuration, including any Helm `gatewayConfig` values, and remove the
+   `--enable-workspace-secrets` and `--enable-secret-reveal` process flags and
+   their environment variables. Older gateways reject unknown configuration
+   keys even when they are set to `false`, so do this before starting the
+   older release.
+
+After the downgrade, the older gateway mints copied values without the
+allowed-endpoint and redirect checks. It still sends them only to the token
+endpoint fixed when refresh was configured, but it follows redirects from that
+endpoint.
+
+`[openshell.gateway] enable_secret_reveal` defaults to `false`. When `true`,
+the `RevealSecret` RPC returns secret values to operators authenticated with
+an operator mTLS certificate, which requires `mtls_auth.operator_enabled`. No
+user identity can call it, whatever its roles or scopes, and the CLI has no
+reveal command. Every reveal is audited.
+Enable it only for a control-plane service that performs its own OAuth
+authorization-code exchange. The equivalent flag and environment variable are
+`--enable-secret-reveal true` and `OPENSHELL_ENABLE_SECRET_REVEAL=true`.
+
+## Azure PostgreSQL workload identity
+
+Set `database_auth = "azure-workload-identity"` under `[openshell.gateway]` to
+use an AKS projected ServiceAccount token for Azure Database for PostgreSQL.
+The equivalent flag is `--db-auth azure-workload-identity`; the environment
+variable is `OPENSHELL_DB_AUTH`. The default, `default`, preserves SQLite and
+password-based PostgreSQL authentication.
+
+Use a password-free database URL with an explicit mapped PostgreSQL role and
+`sslmode=verify-full`. Configure the PostgreSQL Entra principal for the gateway
+managed identity's object ID and grant it ownership of the OpenShell database
+so it can run migrations. Also grant `USAGE` and `CREATE` on its `public`
+schema; Azure PostgreSQL can retain separate schema ownership after you change
+the database owner. Run this as the Entra administrator connected to the
+OpenShell database, replacing the role name if needed:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO openshell_gateway;
+```
+
+Connect directly to PostgreSQL. Session advisory locks require session affinity
+and cannot use transaction pooling.
+
+For Helm, set the following values and create `openshell-db` with a `uri` key
+containing `postgresql://openshell_gateway@SERVER.postgres.database.azure.com/openshell?sslmode=verify-full`:
+
+```yaml
+workload:
+  kind: deployment
+replicaCount: 2
+serviceAccount:
+  name: openshell
+  annotations:
+    azure.workload.identity/client-id: MANAGED_IDENTITY_CLIENT_ID
+podLabels:
+  azure.workload.identity/use: "true"
+server:
+  externalDbSecret: openshell-db
+gatewayConfig:
+  "openshell.gateway":
+    database_auth: azure-workload-identity
+```
+
+Enable AKS OIDC and workload identity, then federate only the gateway
+ServiceAccount subject with audience `api://AzureADTokenExchange`. The AKS
+webhook supplies `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+`AZURE_FEDERATED_TOKEN_FILE`. Only the public Azure authority is supported.
+Sandbox ServiceAccounts do not need this federation or database credentials.
+
+The gateway caches access tokens until near their reported expiry and rereads
+the projected token file on refresh. Both data and advisory-lock pools obtain
+valid credentials before opening connections. Healthy sessions remain usable
+through token expiry or an Entra outage. Requests can wait for a busy healthy
+session to return, even if token refresh fails or stalls. New physical
+connections still require a valid token; acquisitions fail within the pool
+deadline if neither credential acquisition nor session reuse succeeds. The gateway does not fall back to a
+password, node identity, or Azure CLI credentials. Check the gateway identity,
+federated subject, projected volume, and Entra connectivity when refresh fails;
+never print token files or token responses while diagnosing authentication.
+
 ## Database Pool
 
 `[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving. On Postgres, a caller that gets no connection within 5 seconds fails instead of waiting for the database to answer, usually with a retryable `UNAVAILABLE` error whose reason is `DATABASE_UNAVAILABLE`.
@@ -664,7 +860,7 @@ Omit the key to use the backend default, which is unchanged from earlier release
 | SQLite (on disk) | 5 |
 | SQLite (in memory) | 1, always. The database lives inside its single connection, so a configured value is ignored and the gateway logs that it was. |
 
-The equivalent flag and environment variable are `--db-max-connections` and `OPENSHELL_DB_MAX_CONNECTIONS`, and Helm deployments set the key under `gatewayConfig.openshell.gateway`. Values below `1` are rejected at startup: a zero-sized pool would block every acquisition rather than degrade. Postgres needs at least `2`, because the SSH identity lock keeps one data connection while it queries the pool, so the gateway rejects `1` there too.
+The equivalent flag and environment variable are `--db-max-connections` and `OPENSHELL_DB_MAX_CONNECTIONS`, and Helm deployments set the key under `gatewayConfig.openshell.gateway`. Values below `1` are rejected at startup: a zero-sized pool would block every acquisition rather than degrade. Postgres needs at least `2`, so the gateway rejects `1` there too: an SSH identity or provider-refresh lock holder keeps one data connection for its lock and queries the pool on another, and the gateway caps those holders at half of `database_max_connections` per replica.
 
 On Postgres, the gateway holds its mutation advisory locks on a separate lock pool, one connection per guarded mutation while it runs or waits. `[openshell.gateway] database_lock_max_connections` sets that pool's ceiling, `4` by default, so it bounds how many guarded mutations a replica runs or waits on in Postgres at once. When every lock connection is in use, further guarded mutations queue for one, and fail with `MUTATION_LOCK_TIMEOUT` only if none frees up before their 10-second lock wait runs out. The equivalent flag and environment variable are `--db-lock-max-connections` and `OPENSHELL_DB_LOCK_MAX_CONNECTIONS`, and Helm deployments set the key under `gatewayConfig.openshell.gateway`. Values below `1` are rejected at startup. SQLite has no lock pool, so the gateway ignores the key there and logs that it did.
 
@@ -708,9 +904,26 @@ Metrics include `openshell_ocsf_log_queued_total`, `openshell_ocsf_log_written_t
 
 Allow enough retention and disk space for shipper outages. Graceful shutdown allows five seconds for draining; outstanding OS writes remain uncertain if they outlast that budget. Flush does not mean fsync. The file is a best-effort collection boundary, not durable acceptance, a replay protocol, or proof of a complete audit history. See [OCSF JSON export](/observability/ocsf-json-export) for the separate sandbox-local output.
 
+## Gateway Mutation Records
+
+`[openshell.gateway.audit]` adds optional details to [gateway mutation records](/observability/ocsf-json-export#gateway-mutation-records).
+
+```toml
+[openshell.gateway.audit]
+capture_setting_values = true
+capture_exec_command = true
+```
+
+| Field | Default | Behavior |
+|---|---|---|
+| `capture_setting_values` | `false` | Record the value an `UpdateConfig` call sets for a registered setting. |
+| `capture_exec_command` | `false` | Record the first 32 arguments of each exec command. Arguments can contain secrets the caller passes, such as an `Authorization` header. |
+
+Unknown fields are rejected. Restart the gateway after changing this configuration.
+
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector. [OTLP Collectors](/observability/overview#otlp-collectors) shows where each signal goes.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the default collector for each signal and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. OTLP metrics are off until `[openshell.gateway.otlp.metrics]` sets `enabled = true`, OCSF log export is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each signal can use its own collector. [OTLP Collectors](/observability/overview#otlp-collectors) shows where each signal goes.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
@@ -727,9 +940,9 @@ protocol = "http/protobuf"
 
 Each enabled signal needs an endpoint, either in its own table or from `endpoint`. A table without its own `endpoint` uses the whole `[openshell.gateway.otlp]` collector, including its `protocol`, headers, and TLS files. A table with its own `endpoint` takes nothing else from `[openshell.gateway.otlp]`, so configured settings for one collector, such as its credentials, never reach another, and setting any of them in a table without an `endpoint` is a configuration error. Endpoints must be valid URIs without a query string: exporters send no query parameters, so an endpoint with one is a configuration error, and a collector that needs parameters must take them as headers. If an endpoint is malformed, the gateway logs the configuration error and continues with all OTLP export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
 
-`protocol` selects the transport to a collector: `grpc`, the default, or `http/protobuf`. With `http/protobuf`, the endpoint is a base URL and each signal is posted to its path under it, `/v1/traces` or `/v1/logs`, as with `OTEL_EXPORTER_OTLP_ENDPOINT`. HTTP/JSON is not supported. Point a `grpc` endpoint at a collector's gRPC receiver, conventionally port `4317`, and an `http/protobuf` endpoint at its HTTP receiver, conventionally port `4318`. A URI alone cannot distinguish the two, so a mismatched endpoint is accepted at startup and then fails on export. Sandbox supervisors and standalone compute drivers must come from the same release as the gateway to use `http/protobuf`: an older supervisor exports over gRPC, and an older driver rejects the protocol setting.
+`protocol` selects the transport to a collector: `grpc`, the default, or `http/protobuf`. With `http/protobuf`, the endpoint is a base URL and each signal is posted to its path under it, `/v1/traces`, `/v1/logs`, or `/v1/metrics`, as with `OTEL_EXPORTER_OTLP_ENDPOINT`. HTTP/JSON is not supported. Point a `grpc` endpoint at a collector's gRPC receiver, conventionally port `4317`, and an `http/protobuf` endpoint at its HTTP receiver, conventionally port `4318`. A URI alone cannot distinguish the two, so a mismatched endpoint is accepted at startup and then fails on export. Sandbox supervisors and standalone compute drivers must come from the same release as the gateway to use `http/protobuf`: an older supervisor exports over gRPC, and an older driver rejects the protocol setting.
 
-`headers` sets request headers sent with every export to a collector, as gRPC metadata or HTTP headers, such as an authorization token or a backend's routing header. Each name must be a valid HTTP header name set once, ignoring case; names the exporters set themselves, such as `content-type`, `host`, and `grpc-*`, and binary gRPC names ending in `-bin` are rejected. Each value must be non-empty printable ASCII; spaces are allowed. The gateway's trace and OCSF exporters also read `OTEL_EXPORTER_OTLP_TRACES_HEADERS` or `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, or else `OTEL_EXPORTER_OTLP_HEADERS`, and a header set there replaces a configured header of the same name. In-process compute drivers and the VM driver send the gateway's trace headers, including those from the environment, with their own spans. A standalone compute driver sends only the headers in its own `OTEL_EXPORTER_OTLP_*HEADERS` variables. Supervisors send their trace collector's `headers` with their own spans, and the gateway's OCSF headers, including those from the environment, with their OCSF records. Trace headers from the gateway's environment do not reach supervisors, so set `headers` or `headers_file` on the trace collector when supervisor spans need them. The agent trace relay sends only its collector's `headers`, never ones from the environment, so its credentials can only be set with `headers` or `headers_file`. A changed header takes effect when the gateway restarts, and reaches a running sandbox only after that sandbox restarts.
+`headers` sets request headers sent with every export to a collector, as gRPC metadata or HTTP headers, such as an authorization token or a backend's routing header. Each name must be a valid HTTP header name set once, ignoring case; names the exporters set themselves, such as `content-type`, `host`, and `grpc-*`, and binary gRPC names ending in `-bin` are rejected. Each value must be non-empty printable ASCII; spaces are allowed. The gateway's exporters also read their signal's `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, or `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, or else `OTEL_EXPORTER_OTLP_HEADERS`, and a header set there replaces a configured header of the same name. In-process compute drivers and the VM driver send the gateway's trace headers, including those from the environment, with their own spans. A standalone compute driver sends only the headers in its own `OTEL_EXPORTER_OTLP_*HEADERS` variables. Supervisors send their trace collector's `headers` with their own spans, and the gateway's OCSF headers, including those from the environment, with their OCSF records. Trace headers from the gateway's environment do not reach supervisors, so set `headers` or `headers_file` on the trace collector when supervisor spans need them. The agent trace relay sends only its collector's `headers`, never ones from the environment, so its credentials can only be set with `headers` or `headers_file`. A changed header takes effect when the gateway restarts, and reaches a running sandbox only after that sandbox restarts.
 
 Put credentials in `headers_file` rather than `headers`. It reads a collector's headers from a file instead, such as a mounted Kubernetes Secret, so credentials stay out of the configuration file. The file holds one `name=value` header per line. Blank lines are skipped, and whitespace around each name and value is trimmed. The headers are validated like `headers`, the file must be UTF-8 and at most 64 KiB, and setting both `headers` and `headers_file` in one table is a configuration error. A relative path uses the gateway's working directory. The gateway reads the file at startup and fails to start if it is missing or invalid, so a changed file takes effect as a changed header does.
 
@@ -836,6 +1049,32 @@ automatically.
 
 In-process compute drivers read their backend-specific settings from `[openshell.drivers.<name>]`. An external driver's gateway table supplies only its `socket_path`; configure the external driver process itself through that binary's flags or environment variables. A driver that advertises `supports_sandbox_authentication` may authenticate an opaque bootstrap credential through the compute-driver protocol. It must return the same non-empty runtime identity from sandbox creation and credential authentication. Start requests include the previously recorded opaque identity so the driver can preserve the stable resource while rotating generation-specific compute. For `IssueSandboxToken`, the gateway verifies the sandbox exists and the driver/runtime identity matches the durable provisioning record before returning a generation-bound session JWT. The in-process Kubernetes driver reads `service_account_name`, `workspace_mode`, and namespace discovery from `[openshell.drivers.kubernetes]`; an external Kubernetes driver receives the equivalent values through its own CLI or environment contract.
 
+### OTLP Metrics
+
+Set `enabled = true` in `[openshell.gateway.otlp.metrics]` to push gateway
+metrics over OTLP. It defaults to `false` and uses the table's collector
+settings, or inherits the shared endpoint, protocol, headers, and TLS settings
+from `[openshell.gateway.otlp]` when its own `endpoint` is omitted. This works
+even when `[openshell.gateway.otlp.traces]` selects a different collector.
+
+```toml
+[openshell.gateway.otlp.metrics]
+enabled = true
+# endpoint = "https://metrics-collector:4317" # optional override
+```
+
+Metric export works with or without the Prometheus listener. Metric names and
+labels are preserved: for example, `openshell_server_grpc_requests_total`
+keeps that name, and `openshell_server_grpc_request_duration_seconds` is one
+OTLP histogram with that name, not separate `_bucket`, `_sum`, or `_count`
+metric names. Prometheus summary quantiles are not exported. Metrics carry the
+gateway's trace resource attributes and a `service.instance.id` that distinguishes
+gateway processes. Set it through `OTEL_RESOURCE_ATTRIBUTES` to override the
+generated process identity. Supervisors and workloads do not export metrics
+through this setting.
+
+For Helm, set `gatewayConfig."openshell.gateway.otlp.metrics".enabled: true`.
+
 ### OCSF Log Export
 
 Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and protocol and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector [headers](#otlp-export) that the gateway uses for OCSF export, so a collector that requires authentication accepts their records too. The gateway delivers headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
@@ -903,6 +1142,8 @@ The gateway honors these variables:
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | Set to `gzip` to compress exports of every signal. `zstd` is not supported. |
 | `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Exporter transport tuning for spans only. These override the general variables. |
 | `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_COMPRESSION`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Exporter transport tuning for OCSF log records only. These override the general variables. |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Interval between gateway metric exports in milliseconds. Defaults to `60000`. |
+| `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, `OTEL_EXPORTER_OTLP_METRICS_COMPRESSION`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Metric exporter transport tuning. These override the general variables. |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | Replace the system trust roots for `https://` endpoints without a `ca_file`. They affect the gateway and the compute drivers it runs, not supervisors. |
 
 For Helm deployments, set these variables with `server.extraEnv`. Read credentials from a Secret so they stay out of the values file:
@@ -924,13 +1165,12 @@ These variables have no effect. Only `[openshell.gateway.otlp]` decides which si
 
 | Variable | Reason |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Enablement has one source, `[openshell.gateway.otlp]`, so an environment variable cannot silently turn export on or redirect it. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Enablement has one source, `[openshell.gateway.otlp]`, so an environment variable cannot silently turn export on or redirect it. |
 | `OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER` | `[openshell.gateway.otlp]` decides which signals are exported. To disable export, omit it. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | `protocol` in each table selects the transport, and supervisors follow the same setting. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`, `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | `protocol` in each table selects the transport, and supervisors follow the same setting. |
 | `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`, and their per-signal forms | The endpoint scheme selects TLS, and `ca_file`, `cert_file`, and `key_file` in each table set its trust and client certificate, so supervisors follow the same setting. |
 | `OTEL_PROPAGATORS` | The gateway always propagates W3C Trace Context. |
 | `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | OCSF log export uses its own queue and batching, described in [OCSF Log Export](#ocsf-log-export). |
-| `OTEL_EXPORTER_OTLP_METRICS_*`, `OTEL_METRIC_EXPORT_INTERVAL` | The gateway serves metrics for Prometheus scraping and does not export them over OTLP. |
 
 To sample 10% of traces:
 
@@ -1284,6 +1524,8 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
+On IPv6 clusters, set the Helm values `gateway.listenAddress` and `supervisor.listenAddress` to `::`.
+
 ```toml
 [openshell]
 version = 2
@@ -1442,13 +1684,85 @@ In managed workspace mode, the Kubernetes driver copies each explicitly named
 namespace on sandbox creation. Shared and operator modes require the Secret to
 already exist in the sandbox namespace.
 
-For token-exchange provider profiles, the gateway also needs access to its own
+For dedicated-supervisor token-exchange profiles, the gateway also needs access to its own
 SPIFFE Workload API socket. In Helm deployments, set
 `server.providerTokenGrants.spiffe.enabled=true`; the chart mounts the socket
 into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
+
+### Sandbox identity through the SPIFFE Broker API
+
+For shared-supervisor Kubernetes sandboxes, the gateway can obtain sandbox
+JWT-SVIDs through SPIRE's experimental Broker API. This uses the gateway's own
+X.509-SVID over mTLS.
+
+```toml
+[openshell.gateway.spiffe_broker]
+spiffe_id_prefix = "spiffe://example.org/openshell"
+node_local_port = 8443
+server_spiffe_id_prefix = "spiffe://example.org/spire/agent/k8s_psat/cluster"
+workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+```
+
+`node_local_port` connects directly to the SPIRE agent on the gateway Pod's
+node. Helm injects `OPENSHELL_NODE_IP` from the Downward API's `status.hostIP`;
+the gateway formats the IPv4 or IPv6 endpoint at startup without Kubernetes API
+calls or additional RBAC. A missing or invalid node IP prevents startup. The
+agent must expose its mTLS Broker listener on that node address through host
+networking or a host port. Broker traffic does not traverse a Kubernetes Service.
+The gateway does not fall back to a remote agent when its local agent is unavailable.
+
+Configure exactly one transport: `node_local_port`, or an explicit HTTPS
+`endpoint` for a fixed address or Service. Outside Helm, node-local deployments
+must supply `OPENSHELL_NODE_IP` themselves. Both modes retain the same mTLS,
+SPIFFE peer verification, broker allowlist, and Kubernetes authorization checks.
+
+Gateway session JWTs with a positive TTL are required.
+When enabling the broker on a gateway that omitted `gateway_jwt.ttl_secs`, set
+a positive value and restart existing sandboxes to issue expiring sessions;
+existing non-expiring sessions cannot request brokered tokens.
+The gateway fetches fresh X.509 credentials and trust bundles for each token
+acquisition, so Workload API rotation does not require a gateway restart.
+The same `workload_api_socket_path` supplies the gateway's JWT-SVID for
+`token_exchange`; no separate socket environment variable is needed. Omit
+the driver's `provider_spiffe_workload_api_socket_path` for shared supervisors.
+
+The operator must enable SPIRE's Broker endpoint, authorize the gateway SPIFFE
+ID for `KubernetesObjectReference` over TCP, and configure the Kubernetes
+attestor with `access_policy = "enforced"`. Give the agent permission to look
+up Sandbox resources and create SubjectAccessReviews. UID-only references
+require cluster-wide Sandbox `get`/`list` permission for the agents, even
+though SPIRE requests metadata-only responses. Grant the gateway's
+SPIFFE ID the `impersonate-via-spire` verb on Sandbox resources only in its
+permitted namespaces.
+
+Register each sandbox's stable SPIFFE ID against its attested Sandbox resource
+UID. The gateway supplies the UID from its persisted compute-runtime identity;
+workload Pod replacement does not change it. Registrations must reach every
+eligible agent. In node-local mode this includes every node where a gateway
+replica may run, so gateway rescheduling does not require re-registration.
+Use a SPIRE node alias as the
+registration parent to cover agents attested with the intended cluster,
+namespace, and ServiceAccount selectors, including newly added nodes. The
+alias does not change the agents' certificate identities.
+
+Set exactly one peer policy. `server_spiffe_id_prefix` accepts descendants of
+the configured SPIFFE path in the same trust domain. The example accepts all
+node IDs in one attested cluster and rejects sibling cluster paths. For an
+endpoint serving one fixed identity, use `server_spiffe_id` instead. Certificate
+chain verification and the requirement for exactly one URI SAN apply to both
+modes. Do not use a trust-domain-wide peer policy. The installed SPIRE version and operator
+must support the experimental API; this configuration alone does not enable it.
+
+If grants fail after rescheduling or adding nodes, check that the eligible
+agents match the peer prefix and node alias, and that Sandbox registrations
+have reached each agent. Identity or configuration rejections require fixing
+registration, trust, or authorization; connection failures can be retried.
+Provider-token requests use a separate instance of the configured gRPC rate
+budget. Authenticated work is also capped at four concurrent requests per
+sandbox and 64 per gateway, including when token caching is disabled.
 
 ### MXC
 
@@ -1504,6 +1818,9 @@ default_image      = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
+# Opt in newly created /sandbox workspaces to driver-owned persistent storage.
+# Does not migrate existing workspaces. Updates also need enable_sandbox_updates.
+persist_workspace = false
 # host (default) or bridge networking for the supervisor.
 # Operator-owned; sandbox driver config cannot override this choice.
 supervisor_network_mode = "host"
@@ -1544,6 +1861,16 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 ```
 
 Use `sandbox_label` for Docker configurations.
+
+`persist_workspace` defaults to `false`. When enabled, newly created workspaces
+using the default `/sandbox` directory receive a driver-owned local volume.
+Stop/start retains its data; deleting the sandbox removes the owned volume.
+Custom working directories and image-declared volumes overlapping `/sandbox`
+are rejected. Existing writable-layer workspaces remain unchanged. The driver
+advertises image-only updates for persistent workspaces; the gateway also
+requires `enable_sandbox_updates` before accepting them. See
+[stopped sandbox image updates](/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
+for the supported image layout and update sequence.
 
 `supervisor_network_mode` accepts `host` (the default), `bridge`, or `auto`.
 `auto` also selects host; the driver does not infer a mode from the workload runtime.
@@ -1950,14 +2277,26 @@ ingress remains available independently.
 [openshell.supervisor.app_listener]
 enabled = true
 port = 9443
-domain = "services.example.com"
+base_url = "https://services.example.com"
 
 [openshell.drivers.kubernetes.sandbox_runtime.app_listener]
 tls_secret_name = "openshell-app-tls"
 ```
 
-The listener defaults to disabled, with port `8443` and no domain. Port, domain,
-or driver options alone do not enable it. Use an unprivileged port distinct from
+`base_url = "https://<domain>"` replaces `domain`. Remove the old key when
+updating an existing app-listener configuration.
+
+Upgrade the gateway, compute driver, and supervisors together. Existing dedicated
+sandbox Pods retain their old supervisor image until replaced. Recreate them
+with the matching supervisor image before relying on discovery or application
+ingress; plan for service interruption during replacement. Older supervisors
+cannot acknowledge the new hostname declarations. New supervisors require the
+driver to supply `OPENSHELL_APP_BASE_URL` and cannot start an enabled listener
+with only the older `OPENSHELL_APP_SERVICE_DOMAIN` variable.
+
+The listener defaults to disabled, with port `8443` and no base URL. Port,
+`base_url`, or driver options alone do not enable it. An enabled listener requires
+`base_url`; its hostname supplies the service domain. Use an unprivileged port distinct from
 the supervisor runtime and health ports. The common `port` controls both the
 listener and its Kubernetes endpoint.
 
@@ -1965,6 +2304,10 @@ With the listener enabled, supervisors cap configuration polling delays at five
 seconds so healthy routes retain their 30-second freshness lease. Failed polls
 do not renew the lease; expiry closes affected application connections. Disabling
 the listener preserves the configured polling interval.
+
+If services disappear from discovery after a configuration change, check
+supervisor OCSF events named `App listener service routes rejected` for the
+rejection reason and configuration revision.
 
 On Kubernetes, provide a TLS Secret with `tls.crt` and `tls.key` matching
 `*.services.example.com` in each supervisor namespace, and allow your ingress
@@ -1981,9 +2324,25 @@ Expose services with the existing commands. For direct listener testing, an
 unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 `default--demo.services.example.com`; a service named `web` uses
 `default--demo--web.services.example.com`. Configure DNS or your ingress to reach
-the owning supervisor while preserving that hostname. Automatic discovery and
-application URL publication are separate work; current CLI URLs still identify
-the existing gateway path.
+the owning supervisor while preserving that hostname.
+
+Both ingress paths use `[openshell.gateway].service_hostname_format`; the app
+listener has no separate naming mode. Keeping the same installation name and
+public HTTPS domain/port preserves the URL when switching between gateway and
+app-listener ingress.
+
+With `[openshell.gateway].service_hostname_format = "hashed"`, application URLs
+and discovery use the same 16-character label as gateway-mediated URLs. The
+label includes the gateway installation name, workspace, sandbox, and service;
+application and gateway origins may still have different domains and ports.
+Use a unique gateway `name` among installations sharing an application domain.
+Supervisors install the gateway-declared hostname and retain readable aliases
+for migration. Proxies and controllers consume discovery hostnames as returned.
+Upgrade gateways and supervisors together before enabling hashed application
+hostnames; older supervisors cannot serve the new hashed routes.
+
+The discovery API supplies accepted supervisor endpoints. Configure `base_url`
+to publish the application origin; otherwise CLI URLs retain the gateway path.
 
 Enabled supervisors report installed service routes through their authenticated
 gateway sessions. The gateway accepts only current configuration and ownership,
@@ -2004,3 +2363,58 @@ application streams even if configuration continues renewing. Under a partition,
 allow for pool membership failure detection before the last serving lease expires.
 Storage errors prevent lease renewal. Discovery expiry and serving expiry are
 separate from external ingress readiness.
+
+Both discovery RPCs require `supervisor_app_listener.enabled = true`. When the
+listener is disabled, they return `FAILED_PRECONDITION` without collecting routes
+or starting a watch.
+
+Discovery clients use the separate `openshell.v1.ServiceDiscovery` gRPC service.
+Call `GetServiceRouteSnapshot` or `WatchServiceRoutes` with
+one explicit workspace selector, `sandbox:read`, and workspace user access. Each
+response replaces the workspace route view and includes the hostname, supervisor
+TLS endpoint, installation version, and expiry. Preserve the hostname as TLS SNI
+and HTTP authority when routing directly to the endpoint. Remove absent routes
+and expire cached entries even during discovery errors. An API error does not
+mean the workspace has no routes. Watches end after one minute; reconnect and
+relist when they end. Discovery-only machine credentials are separate work.
+
+Discovery limits apply per gateway process: 1,000 installation records, 4,096
+routes, and 4 MiB per snapshot, with a ten-second collection timeout. Up to four
+collections and 16 unary requests run concurrently. Collections wait for a free
+slot within the ten-second timeout; unary requests are limited
+to four per principal and eight per workspace. Watches are limited to 32 total,
+four per principal, and 16 per workspace. Capacity and size limits return
+`RESOURCE_EXHAUSTED`; storage failures, configuration changes during collection,
+and timeouts return `UNAVAILABLE`; corrupt
+records return `INTERNAL`. Disabling the app listener returns `FAILED_PRECONDITION`.
+
+Consumers share a one-second collection cache, bounded to 16 workspaces. Cache reuse adds at most one refresh interval to collection freshness;
+cached routes never outlive their advertised expiry. Collections publish the
+latest accepted renewal for an unchanged, revalidated installation; the gateway
+does not create a new lease when serving discovery. Watches recheck bearer
+credentials and workspace access every second and terminate if either is lost.
+OIDC token revocation follows the configured verifier's semantics; offline JWT
+verification cannot detect issuer-side revocation before token expiry.
+
+Set `base_url` to the external HTTPS base origin under which service records
+are created. The service hostname is `<service-label>.<base-url-hostname>`. The
+base URL must have a DNS hostname and cannot contain credentials, a path, query,
+or fragment. A nondefault public port is supported, for example
+`https://services.example.com:10443`. This port is independent of the internal
+listener `port` and the gateway API address. Set `enabled = true` to activate
+the listener; configuring `base_url` alone does not enable routing or create DNS,
+certificates, or ingress.
+
+When configured, service responses return the application address as `url` and
+`application_url`, with `gateway_url` available as a separate alternative.
+Create-time exposure returns corresponding preferred, application, and gateway
+URL maps. CLI and SDK callers preserve the application origin, including its
+port, when the gateway is reached through a port-forward. With the listener
+disabled, the existing gateway URL behavior remains. Idempotent retries preserve
+all originally returned URL fields together. Use service Get/List operations for
+current addresses after a configuration change. A configured URL does not mean
+that a supervisor installed the route or ingress is ready.
+
+Upgrade the CLI alongside the gateway when enabling `base_url`. Older CLI
+versions can replace the public application port with the gateway connection's
+port.

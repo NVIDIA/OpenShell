@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: ""
+      external-drivers:
+        description: Include the external compute drivers (openshell-driver-<runtime> artifacts) built by this run, for the installers that run a driver as a service
+        required: false
+        type: boolean
+        default: false
     outputs:
       source_sha:
         description: Source revision of the candidate artifacts
@@ -89,6 +94,16 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
 
+      - name: Download external compute driver artifacts
+        if: inputs['external-drivers']
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: openshell-driver-*-x86_64-unknown-linux-gnu
+          merge-multiple: true
+          path: artifacts/external-drivers/x86_64-unknown-linux-gnu
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
+
       - name: Download Debian package artifact
         if: inputs['deb-artifact-name'] != ''
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -136,8 +151,10 @@ jobs:
           mv "${gateway_rpms[0]}" artifacts/packages/rpm/openshell-gateway.rpm
           rm -rf "$download_dir"
 
-      - name: Log in to GHCR
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+      - uses: ./.github/actions/load-e2e-images
+        with:
+          platform-arch: amd64
+          run-id: ${{ inputs['artifact-run-id'] }}
 
       - name: Export OpenShell images
         env:
@@ -145,15 +162,12 @@ jobs:
         run: |
           mkdir -p artifacts/images
 
-          docker pull "ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG}"
           docker tag "ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG}" openshell/gateway:tmachine
           docker save --output artifacts/images/openshell-gateway-tmachine.tar openshell/gateway:tmachine
 
-          docker pull "ghcr.io/nvidia/openshell/sandbox:${IMAGE_TAG}"
           docker tag "ghcr.io/nvidia/openshell/sandbox:${IMAGE_TAG}" openshell/sandbox:tmachine
           docker save --output artifacts/images/openshell-sandbox-tmachine.tar openshell/sandbox:tmachine
 
-          docker pull "ghcr.io/nvidia/openshell/supervisor:${IMAGE_TAG}"
           docker tag "ghcr.io/nvidia/openshell/supervisor:${IMAGE_TAG}" openshell/supervisor:tmachine
           docker save --output artifacts/images/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
 

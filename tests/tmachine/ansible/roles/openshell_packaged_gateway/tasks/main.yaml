@@ -21,6 +21,14 @@
     name: openshell_gateway
     tasks_from: "{{ openshell_gateway_driver }}.yaml"
 
+# With an external driver, the gateway selects it by name and reaches it over
+# its socket. It starts after the images load, which it needs, and before the
+# gateway, which connects to it at startup.
+- name: Run the compute driver as an external service
+  ansible.builtin.include_role:
+    name: openshell_external_driver
+  when: openshell_external_driver_binary is defined
+
 - name: Create packaged gateway environment directory
   become: true
   ansible.builtin.file:
@@ -32,8 +40,10 @@
 
 # Exercise the package-owned service's environment-file mechanism without
 # generating operator-owned gateway TOML. Preflight and startup must resolve
-# the same candidate runtime images.
+# the same candidate runtime images. A released source keeps the package's own
+# defaults, which pin the release's image tags.
 - name: Configure candidate runtime images for qualification
+  when: not (openshell_packaged_gateway_released_source | default(false) | bool)
   become: true
   ansible.builtin.copy:
     dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.env"
@@ -41,7 +51,7 @@
     group: "{{ openshell_gateway_user }}"
     mode: "0600"
     content: |
-      OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}
+      OPENSHELL_COMPUTE_DRIVER={{ openshell_external_driver_name | default(openshell_gateway_driver) }}
       OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
       OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
 
@@ -86,6 +96,26 @@
     host: 127.0.0.1
     port: 17670
     timeout: 60
+
+# The runner's continuity disruptions run the executables staged here. How to
+# restart the gateway depends on who runs it, which this role knows.
+- name: Create disruptions directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/openshell-qualification/disruptions
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Stage the gateway-restart disruption
+  become: true
+  ansible.builtin.template:
+    src: gateway-restart.sh.j2
+    dest: /var/lib/openshell-qualification/disruptions/gateway-restart
+    owner: root
+    group: root
+    mode: "0755"
 
 # The rootful Podman gateway uses root's image store and packaged user service.
 # Copy only client credentials so the test runner can register that gateway

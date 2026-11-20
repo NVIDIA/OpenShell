@@ -31,17 +31,27 @@ pub const PROFILE: &str = "openshell";
 /// The readiness check every bundle carries, at the bundle root.
 pub const READY_BINARY: &str = "testkit-ready";
 
-/// Nextest flags a test as slow after the period and terminates it after
-/// `terminate-after` periods, so a hung test fails after two minutes instead
-/// of holding the lane until the job times out.
-const NEXTEST_CONFIG: &str = r#"# Written by the OpenShell test runner.
+/// Nextest flags a test as slow after this period and terminates it after
+/// [`SLOW_TERMINATE_AFTER`] periods, so a hung test fails after two minutes
+/// instead of holding the lane until the job times out.
+const SLOW_PERIOD_SECS: u64 = 30;
+const SLOW_TERMINATE_AFTER: u64 = 4;
+/// How long a terminated test has between SIGTERM and SIGKILL.
+const GRACE_PERIOD_SECS: u64 = 10;
+
+/// The nextest configuration written into a nextest bundle.
+fn nextest_config() -> String {
+    format!(
+        r#"# Written by the OpenShell test runner.
 [profile.openshell]
 fail-fast = false
-slow-timeout = { period = "30s", terminate-after = 4 }
+slow-timeout = {{ period = "{SLOW_PERIOD_SECS}s", terminate-after = {SLOW_TERMINATE_AFTER}, grace-period = "{GRACE_PERIOD_SECS}s" }}
 
 [profile.openshell.junit]
 path = "junit.xml"
-"#;
+"#
+    )
+}
 
 /// The prebuilt program's name in a program bundle.
 pub const PROGRAM_BINARY: &str = "test-program";
@@ -204,7 +214,7 @@ pub fn build(root: &Path, family: &str, packages: &[String], out: &Path) -> Resu
     run(&mut command).with_context(|| format!("build the {} test archive", workspace.display()))?;
 
     copy_manifests(&workspace, out)?;
-    std::fs::write(out.join(CONFIG), NEXTEST_CONFIG)?;
+    std::fs::write(out.join(CONFIG), nextest_config())?;
     std::fs::copy(&ready, out.join(READY_BINARY))
         .with_context(|| format!("copy {}", ready.display()))?;
     let manifest = Manifest {
@@ -342,6 +352,14 @@ fn run(command: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nextest_profile_stops_a_hung_test_after_two_minutes() {
+        let config = nextest_config();
+        assert!(config.contains(
+            r#"slow-timeout = { period = "30s", terminate-after = 4, grace-period = "10s" }"#
+        ));
+    }
 
     #[test]
     fn program_bundle_holds_only_the_program() {

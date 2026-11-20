@@ -208,6 +208,9 @@ pub struct DriverTracingConfig<'a> {
     pub gateway_name: Option<&'a str>,
     pub service_version: &'static str,
     pub log_level: &'a str,
+    /// Whether console logs on stdout carry ANSI escapes. Callers pass
+    /// `openshell_core::color::stdout_ansi()` so collected logs stay plain.
+    pub ansi: bool,
 }
 
 impl Drop for DriverTracingHandle {
@@ -251,7 +254,7 @@ pub fn install_driver_tracing(
         .with(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config.log_level)),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(config.ansi))
         .with(provider.as_ref().map(|provider| descriptor.layer(provider)))
         .init();
 
@@ -326,6 +329,7 @@ mod tests {
             gateway_name: None,
             service_version: "1.2.3",
             log_level: "info",
+            ansi: false,
         };
 
         let transport = config(Some(&ca), None).transport().unwrap();

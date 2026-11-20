@@ -1743,8 +1743,10 @@ impl ComputeRuntime {
             metadata.resource_version = result.resource_version;
         }
         // The parent now owns any staged key, including if this request is
-        // cancelled. Keep the creation guard until its public identity and
-        // protected launch bundle have been committed.
+        // cancelled. Release the creation guard before the SSH identity step:
+        // its per-sandbox lock fences a concurrent delete on its own, and a
+        // guard held across it would cap concurrent creates at the lock pool.
+        drop(mutation_guard);
         let prepared = async {
             if let Some(encoded) = runtime_inputs.launch_authentication {
                 let authentication = serde_json::from_slice(&encoded)
@@ -1764,7 +1766,6 @@ impl ComputeRuntime {
             }
         }
         .await;
-        drop(mutation_guard);
         let launch_authentication = match prepared {
             Ok(authentication) => authentication,
             Err(status) => {
@@ -5595,6 +5596,7 @@ impl ComputeRuntime {
                 }
             }
             Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
+                info!(sandbox_id = %deleted.sandbox_id, "Compute driver reported sandbox deleted");
                 self.apply_deleted(&deleted.sandbox_id).await?;
             }
             Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
@@ -6314,24 +6316,43 @@ impl ComputeRuntime {
     }
 
     async fn apply_deleted_locked(&self, sandbox_id: &str) -> Result<(), String> {
-        let sandbox = self
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(sandbox) = sandbox.as_ref() {
+        // This event is the only signal that removes the record after a
+        // driver-confirmed delete; the orphan sweep waits out its grace
+        // period. Other replicas keep writing the record until it is gone,
+        // e.g. the endpoint-status reset when the supervisor session ends, so
+        // retry the removal against a fresh snapshot after such a write.
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            let Some(sandbox) = self
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                let _ = self
+                    .store
+                    .delete(Sandbox::object_type(), sandbox_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.cleanup_removed_sandbox_state(sandbox_id);
+                return Ok(());
+            };
             // Timeout cleanup can emit Deleted before an explicit stop exposes
             // Stopped for repair. A delayed (or repeated) event must retain that
             // recovery record too; explicit deletion still transitions to Deleting.
             if self
-                .pending_driver_operation_blocks_cleanup(sandbox)
+                .pending_driver_operation_blocks_cleanup(&sandbox)
                 .await?
-                || (provisioning_deadline::timed_out(sandbox)
+                || (provisioning_deadline::timed_out(&sandbox)
                     && matches!(
                         SandboxPhase::try_from(sandbox.phase()),
                         Ok(SandboxPhase::Error | SandboxPhase::Stopped)
                     ))
             {
+                info!(
+                    sandbox_id,
+                    phase = ?SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown),
+                    "Retaining sandbox record after driver deletion for pending recovery"
+                );
                 return Ok(());
             }
             // The watcher told us this sandbox's compute resource is gone, so
@@ -6343,21 +6364,27 @@ impl ComputeRuntime {
             if self
                 .remove_sandbox_record_if_version_locked(
                     sandbox_id,
-                    sandbox_resource_version(sandbox),
+                    sandbox_resource_version(&sandbox),
                 )
                 .await?
             {
                 self.spawn_driver_sandbox_cleanup(sandbox.object_id(), sandbox.object_name());
+                return Ok(());
             }
-            return Ok(());
+            if attempt < DELETE_PHASE_CAS_RETRY_LIMIT {
+                info!(
+                    sandbox_id,
+                    attempt,
+                    expected_resource_version = sandbox_resource_version(&sandbox),
+                    "Sandbox removal after driver deletion did not complete; retrying"
+                );
+                tokio::task::yield_now().await;
+            }
         }
-
-        let _ = self
-            .store
-            .delete(Sandbox::object_type(), sandbox_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.cleanup_removed_sandbox_state(sandbox_id);
+        warn!(
+            sandbox_id,
+            "Sandbox removal after driver deletion did not complete; leaving it to reconciliation"
+        );
         Ok(())
     }
 
@@ -6633,6 +6660,26 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.remove(sandbox_id);
     }
 
+    /// Whether a sweep observes a `Starting` sandbox with an active start.
+    ///
+    /// `StartSandbox` holds the gate for the whole driver call, during which
+    /// the workload can still show its previous exit. The sweep skips the
+    /// sandbox instead of waiting, and the next tick or watch event
+    /// reports the settled state. The gate is probed, never retained, so
+    /// Deleted watches can still dispatch cleanup.
+    ///
+    /// The gate is local to this replica. A start owned by another replica is
+    /// visible through its durable driver-operation claim.
+    fn sweep_start_in_progress(&self, record: &ObjectRecord) -> Result<bool, String> {
+        let sandbox = decode_sandbox_record(record)?;
+        Ok(sandbox.phase() == SandboxPhase::Starting as i32
+            && (provisioning_deadline::driver_operation_pending(&sandbox)
+                || self
+                    .lifecycle_gates
+                    .try_lock_for(sandbox.object_id())
+                    .is_none()))
+    }
+
     async fn reconcile_snapshot_sandbox(
         &self,
         snapshot: DriverSandbox,
@@ -6673,6 +6720,7 @@ impl ComputeRuntime {
         };
         if existing.resource_version != expected_resource_version
             || existing.updated_at_ms > sweep_started_at_ms
+            || self.sweep_start_in_progress(&existing)?
         {
             return Ok(());
         }
@@ -6808,6 +6856,7 @@ impl ComputeRuntime {
             sandbox_id = %sandbox_id,
             sandbox_name = %sandbox_name,
             age_secs = age_ms / 1000,
+            phase = ?phase,
             "Removing sandbox from store after it disappeared from the compute driver snapshot"
         );
         // The driver's own snapshot never reported this sandbox, so no
@@ -10339,6 +10388,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn create_releases_its_mutation_guard_before_the_ssh_identity_step() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("test-runtime");
+        let mut runtime = test_runtime(driver.clone()).await;
+        let credentials = configure_test_ssh_credentials(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-guard-release",
+            "guard-release",
+            SandboxPhase::Provisioning,
+        );
+        let (entered, release) = credentials.gate_next_store();
+        let creating = {
+            let runtime = runtime.clone();
+            let sandbox = sandbox.clone();
+            tokio::spawn(async move {
+                runtime
+                    .create_sandbox_authenticated(
+                        sandbox.clone(),
+                        None,
+                        Some(test_launch_authentication(&sandbox)),
+                        false,
+                    )
+                    .await
+            })
+        };
+        entered.await.unwrap();
+
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.mutation_guard(MutationScope::sandbox("default", sandbox.object_id())),
+        )
+        .await
+        .expect("the SSH identity step must not hold the sandbox mutation guard")
+        .unwrap();
+        drop(guard);
+
+        release.send(()).unwrap();
+        let created = creating.await.unwrap().unwrap();
+        assert!(!created.host_key_fingerprint.is_empty());
         assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -14312,6 +14404,129 @@ mod tests {
         );
     }
 
+    // Regression for #5258. The reconcile sweep polls the driver without
+    // waiting for a start, and a restarting workload still shows its previous
+    // exit until the driver starts it. The sweep skips a sandbox whose start
+    // holds the lifecycle gate; the settled state is reported afterwards.
+    // Another replica cannot see that gate, so it relies on the start's
+    // durable driver-operation claim.
+    #[tokio::test]
+    async fn reconcile_sweep_skips_a_sandbox_while_its_start_is_in_progress() {
+        for other_replica in [false, true] {
+            let driver = ControlledDriver::new();
+            driver.block_start();
+            let sandbox = sandbox_record(
+                "sb-start-reconcile",
+                "sandbox-start-reconcile",
+                SandboxPhase::Stopped,
+            );
+            let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            polled.status = Some(make_driver_status(make_driver_condition(
+                "ContainerExited",
+                "Container exited with code 0",
+            )));
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let start_runtime = runtime.clone();
+            let sandbox_name = sandbox.object_name().to_string();
+            let start =
+                tokio::spawn(
+                    async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+                .await
+                .expect("start did not reach the driver");
+
+            let mut observer = runtime.clone();
+            if other_replica {
+                // Replicas share the store but not lifecycle gates.
+                observer.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+            }
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                observer.reconcile_snapshot_sandbox(polled.clone(), i64::MAX),
+            )
+            .await
+            .expect("reconciliation must not wait for the start")
+            .unwrap();
+            let phase_during_start = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .phase();
+            assert_eq!(
+                phase_during_start,
+                SandboxPhase::Starting as i32,
+                "other_replica={other_replica}"
+            );
+
+            driver.release_start();
+            start.await.unwrap().unwrap();
+
+            // Once the start settles, a genuine exit of the restarted
+            // workload still surfaces through the sweep.
+            observer
+                .reconcile_snapshot_sandbox(polled, i64::MAX)
+                .await
+                .unwrap();
+            let settled = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !provisioning_deadline::driver_operation_pending(&settled),
+                "other_replica={other_replica}"
+            );
+            assert_eq!(
+                settled.phase(),
+                SandboxPhase::Error as i32,
+                "other_replica={other_replica}"
+            );
+        }
+    }
+
+    // A start writes `Starting` before it records its driver-operation claim.
+    // In between, only the local lifecycle gate defers this replica's sweep.
+    #[tokio::test]
+    async fn reconcile_sweep_skips_a_starting_sandbox_whose_gate_is_held_before_its_claim() {
+        let driver = ControlledDriver::new();
+        let sandbox = sandbox_record(
+            "sb-start-gate",
+            "sandbox-start-gate",
+            SandboxPhase::Starting,
+        );
+        let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        polled.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "Container exited with code 0",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+        runtime
+            .reconcile_snapshot_sandbox(polled, i64::MAX)
+            .await
+            .unwrap();
+        drop(gate);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!provisioning_deadline::driver_operation_pending(&stored));
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
     #[tokio::test]
     async fn live_container_exit_during_start_still_transitions_to_error() {
         for reason in [
@@ -16381,6 +16596,49 @@ mod tests {
         stop_watch_loop(shutdown_tx, watch_handle).await;
     }
 
+    // The sweep's start probe must not hold the lifecycle gate across the
+    // driver poll, or a Deleted watch for a `Starting` sandbox could not
+    // dispatch driver cleanup.
+    #[tokio::test]
+    async fn deleted_watch_during_sweep_poll_of_starting_sandbox_dispatches_cleanup() {
+        let driver = ControlledDriver::new();
+        driver.block_get();
+        driver.set_get_outcome(ControlledGetOutcome::Missing);
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-a", "sandbox-a", SandboxPhase::Starting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let (shutdown_tx, watch_handle) = start_watch_loop(&runtime, &driver).await;
+        let mut deleted_rx = runtime.sandbox_watch_bus.subscribe("sb-a");
+        let reconcile_runtime = runtime.clone();
+        let snapshot = ready_driver_sandbox("sb-a", "sandbox-a");
+        let reconcile = tokio::spawn(async move {
+            reconcile_runtime
+                .reconcile_snapshot_sandbox(snapshot, i64::MAX)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
+            .await
+            .expect("reconciliation did not reach the driver lookup");
+
+        driver.send_event(deleted_watch_event("sb-a"));
+        tokio::time::timeout(Duration::from_secs(1), deleted_rx.recv())
+            .await
+            .expect("watch event was blocked by reconciliation lookup")
+            .expect("sandbox watch bus closed before notification");
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("the sweep must not suppress deletion-watch driver cleanup");
+        driver.release_get();
+        tokio::time::timeout(Duration::from_secs(1), reconcile)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.delete_calls(), 1);
+        stop_watch_loop(shutdown_tx, watch_handle).await;
+    }
+
     #[tokio::test]
     async fn non_deleting_container_exit_still_transitions_to_error() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
@@ -17272,6 +17530,70 @@ mod tests {
         assert!(stored.spec.as_ref().is_some_and(|spec| {
             openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
         }));
+    }
+
+    /// Another replica can write a deleting sandbox while the watch deletion
+    /// removes it, e.g. when the supervisor session ends. The removal must
+    /// retry, not wait for the orphan grace period.
+    #[tokio::test]
+    async fn watch_deletion_retries_after_concurrent_replica_write() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect conflict injector");
+        sqlx::query("CREATE TABLE injected_conflicts (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create conflict marker table");
+        // Another replica writes the sandbox between the removal's version
+        // check and its delete, once.
+        sqlx::query(
+            "CREATE TRIGGER inject_replica_write \
+             AFTER DELETE ON objects \
+             WHEN OLD.object_type = 'sandbox_settings' \
+               AND NOT EXISTS (SELECT 1 FROM injected_conflicts) \
+             BEGIN \
+               INSERT INTO injected_conflicts (id) VALUES (OLD.id); \
+               UPDATE objects SET resource_version = resource_version + 1 \
+                 WHERE object_type = 'sandbox' AND id = 'sb-race'; \
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install conflict trigger");
+
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = store;
+        let sandbox = sandbox_record("sb-race", "race", SandboxPhase::Deleting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        runtime.apply_deleted("sb-race").await.unwrap();
+
+        let injected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM injected_conflicts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(injected, 1, "the removal must hit the injected write");
+        pool.close().await;
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-race")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.delete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successful retry must reclaim driver-owned resources");
     }
 
     /// Driver watch events arrive on a background stream, so the store writes

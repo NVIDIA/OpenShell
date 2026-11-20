@@ -180,6 +180,11 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
+To run Python in a testkit sandbox, use `Sandbox::run_python` with a sandbox
+from `testkit::python_image()`, not the Python SDK's `exec_python` described
+under Python E2E. [Writing a sandbox client](tests/testkit/README.md#writing-a-sandbox-client)
+covers scripts that probe the network from inside a sandbox.
+
 The conformance crate also builds `openshell-conformance`, a program that
 runs the conformance suite against a gateway without cargo or nextest
 (`openshell-conformance list`, `ready`, `run`). It covers only the
@@ -305,11 +310,11 @@ service.
   setup playbook starts the service (with a restart policy, since setup is
   cached as a disk) and writes the variables as `KEY=VALUE` lines to
   `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
-  through the environment's setup `inputs`, and add them to the tmachine disk
-  cache key in `e2e-suites.yml`. The runner rejects names without the
-  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
-  values never appear in a runner command. Values are taken literally, without
-  quoting.
+  through the environment's setup `inputs`; they are part of the setup layer's
+  hash, which CI's disk cache keys on too. The runner rejects names without
+  the `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest,
+  so values never appear in a runner command. Values are taken literally,
+  without quoting.
 - **Fixture.** Put the service's fixture in a support crate under
   `tests/support/<service>`, named `<service>-support`, so any suite can
   depend on it, or reuse the existing one. It defines the variable names as constants and a
@@ -344,6 +349,41 @@ expects. Any environment that creates matching devices and sets the variable
 can run the suite. The expectations characterize the sandbox's behavior today,
 not a specification, and the `echo-socket` check needs `perl` in the workload
 image, which the default image has.
+
+### Continuity suites (`tests/suites/continuity/`)
+
+A continuity scenario checks that state created before a disruption survives it.
+Each scenario is a module with a `seed` test and a `verify` test that share a
+run id through `CONTINUITY_RUN_ID` and derive resource names from it
+(`scenario::name`). `seed` creates state through the CLI, so testkit's cleanup
+leaves it in place. `verify` adopts it and checks it, then does something new.
+
+`openshell-test-runner run --disruption <name>` runs the `seed` tests, applies the
+disruption in the guest, waits for the gateway, and runs the `verify` tests.
+Scenarios run under every disruption. The installer provides each disruption as an
+executable in `/var/lib/openshell-qualification/disruptions/<name>`, because how to
+restart or upgrade OpenShell depends on how it is installed. The runner stops
+before seeding if the installer doesn't provide the one you ask for.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family continuity --disruption gateway-restart
+```
+
+The `upgrade` disruption installs the candidate over a released package. Use the
+`deb-upgrade-source` installer, which installs the latest release as the baseline.
+The candidate is this checkout's `nix run .#build-artifacts` output, which CI also
+builds. CI downloads the baseline; locally, put the release's Debian package at
+`artifacts/upgrade/deb/source/openshell.deb` and its sandbox and supervisor images,
+saved with `docker save`, at
+`artifacts/upgrade/source-images/openshell-{sandbox,supervisor}-tmachine.tar`.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb-upgrade-source \
+  --family continuity --disruption upgrade
+```
 
 ### Python E2E (`e2e/python/`)
 
@@ -650,6 +690,12 @@ rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
 
+The `connect-ssh-supervision` feature suite
+(`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
+supervises its `ssh` process: it reconnects after losing the SSH transport and
+forwards a SIGTERM to `ssh`. The tests find those processes in `/proc`, so they
+need a Linux test host. CI runs them on Docker rootful.
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell
@@ -823,6 +869,7 @@ Available task variants:
 | `e2e:kubernetes:shared-supervisor` | One-member shared supervisor pool for the gateway's sandboxes (gateway TLS through the port-forward) |
 | `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool behind two gateway replicas on PostgreSQL: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted; crashes and restarts gateways and checks each sandbox's session stays on its supervisor's gateway |
 | `e2e:kubernetes:shared-supervisor-scaling` | One-member shared supervisor pool: scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
+| `e2e:kubernetes:tracing` | Deploys a Jaeger collector, exports gateway traces to it, and fails unless Jaeger receives gateway and Kubernetes compute-driver spans for a new sandbox. The only Kubernetes lane that exports traces |
 
 Kubernetes e2e environment variables:
 
@@ -832,6 +879,8 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
 | `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
 | `OPENSHELL_E2E_KUBE_CHART`, `OPENSHELL_E2E_KUBECONFIG` | Set by the harness for tests that upgrade the release, such as the supervisor pool scaling test: the chart it installed, and the kubeconfig passed as `--kubeconfig` to kubectl and helm. Set them yourself when running such a test directly against an existing release |
+| `OPENSHELL_E2E_KUBE_CONFORMANCE` | `0` skips the conformance suites that otherwise run before the lane's Rust tests |
+| `OPENSHELL_E2E_KUBE_JAEGER` | `1` deploys a Jaeger collector, points gateway OTLP export at it, and sets `OPENSHELL_E2E_JAEGER_QUERY_URL` to its query API. Unset, the gateway exports no traces |
 | `OPENSHELL_E2E_KUBE_TLS` | `1` reaches the gateway over mTLS through the port-forward; pair it with an overlay that keeps gateway TLS on, such as `ci/values-tls-port-forward.yaml` |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |

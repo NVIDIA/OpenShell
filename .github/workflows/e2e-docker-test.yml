@@ -12,7 +12,7 @@ on:
       runner:
         required: false
         type: string
-        default: linux-amd64-cpu8
+        default: ubuntu-24.04
       checkout-ref:
         required: false
         type: string
@@ -25,10 +25,6 @@ on:
         required: false
         type: boolean
         default: false
-      external-driver-binary:
-        required: false
-        type: string
-        default: ""
       suite-matrix:
         required: false
         type: string
@@ -57,7 +53,7 @@ jobs:
       options: --privileged
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
-        - /home/runner/_work:/home/runner/_work
+        - /home/runner/work:/home/runner/work
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
@@ -78,10 +74,9 @@ jobs:
         with:
           artifact-name: ${{ inputs.gateway-artifact }}
 
-      - if: inputs.external-driver-binary != ''
-        uses: ./.github/actions/setup-e2e-driver
+      - uses: ./.github/actions/load-e2e-images
         with:
-          binary: ${{ inputs.external-driver-binary }}
+          images: sandbox supervisor
 
       - name: Check out MCP conformance tests
         if: matrix.mcp

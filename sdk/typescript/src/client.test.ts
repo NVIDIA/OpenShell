@@ -20,6 +20,7 @@ import {
   POLICY_SOURCE_NAMES,
   Pushable,
   SandboxClient,
+  type SandboxRef,
   SandboxTemplateClient,
   SCOPE_NAMES,
   ServiceAuthorizationMode,
@@ -700,6 +701,20 @@ describe('watchLogs', () => {
 });
 
 describe('create', () => {
+  it('accepts the existing SandboxRef shape without explicit access-path maps', () => {
+    const ref: SandboxRef = {
+      id: 'sb-id',
+      name: 'sb',
+      workspace: 'default',
+      phase: 'ready',
+      labels: {},
+      resourceVersion: '1',
+      serviceUrls: {},
+      restartCount: 0,
+    };
+    expect(ref.serviceUrls).toEqual({});
+  });
+
   it('sends create-time service exposures', async () => {
     let created: {
       serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
@@ -709,6 +724,8 @@ describe('create', () => {
         created = req;
         return {
           ...readySandbox('sb', 'sb-id'),
+          applicationServiceUrls: { '': 'https://sb.example.test/', metrics: 'https://metrics.sb.example.test/' },
+          gatewayServiceUrls: { '': 'https://sb.gateway.test:8080/' },
           serviceUrls: {
             '': 'https://sb.example.test/',
             metrics: 'https://metrics.sb.example.test/',
@@ -743,6 +760,8 @@ describe('create', () => {
         authorizationMode: ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH,
       },
     ]);
+    expect(result.applicationServiceUrls).toEqual(result.serviceUrls);
+    expect(result.gatewayServiceUrls?.['']).toBe('https://sb.gateway.test:8080/');
     expect(result.serviceUrls).toEqual({
       '': 'https://sb.example.test/',
       metrics: 'https://metrics.sb.example.test/',

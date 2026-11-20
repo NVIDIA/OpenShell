@@ -2,23 +2,30 @@
 
 The `conformance` crate holds the testkit suites for sandbox behavior that every
 compute driver must provide. The family is this one crate, its own workspace.
-It is a library: each module in `src/` is one suite, and `cargo test` and
-nextest run the tests as the library's unit tests. The crate also builds the
-`openshell-conformance` program, which runs the same tests.
+It is a library of suites, one module each in `src/`, and the
+`openshell-conformance` program that runs them. The program is the crate's test
+target (`harness = false`), so `openshell-conformance run`,
+`cargo test --bin openshell-conformance` and
+`cargo nextest run --bin openshell-conformance` all run the same code.
 
 | Suite | Covers |
 |---|---|
 | `smoke` | Create a sandbox, run `echo` in it, delete it |
 | `lifecycle` | SDK: long-running and run-to-completion sandboxes, prompt delete when the workload is slow to handle TERM, the default command, restart of a stopped sandbox, deleting a stopped sandbox, exec past the startup recovery deadline, the final phase when the main command exits, the main command's environment, `--no-keep` cleanup |
-| `cli` | The same lifecycle through the `openshell` CLI: status, create, get, list, exec, stop, start, delete |
+| `cli` | The same lifecycle through the `openshell` CLI: status, create, get, list, exec, stop, start, delete; attached `sandbox create -- <command>` streams the main process and reports its exit code; `--no-keep` deletes the sandbox afterwards |
+| `exec-cli` | `sandbox exec` through the CLI: complete large output, piped stdin up to the 4 MiB limit, early exit, a forced TTY, unreadable stdin |
+| `attach` | `sandbox connect` to the main process: one input owner, read-only viewers, history replay on reconnect, stop and start while attached, a main exit of 255 |
+| `ssh` | The SSH host key: the same in get, list, and `ssh`; kept across stop and start; new for a recreated sandbox |
 | `persistent-workspace` | Files in `/sandbox` survive stop and start |
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
 | `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |
+| `create-upload` | `sandbox create --upload`: directory basename and nested files, multiple uploads, a single file |
 | `credential-gating` | Provider credentials: admission of credentialed endpoints, REST body placeholders and rewriting, WebSocket binary frames, live policy binding |
 | `image` | A sandbox runs the default image or the one it is created from |
 | `labels` | Labels are stored and select sandboxes in `sandbox list` |
 | `templates` | A sandbox created from a template uses its workload; duplicate, deleted and missing templates return the right errors |
 | `settings` | Sandbox-scoped settings |
+| `workspaces` | Workspace create, get, list and delete; a template is scoped to its workspace; a workspace holding a resource goes Terminating, rejects creates and deletes once empty |
 | `process` | Core dumps are disabled for sandbox processes |
 | `filesystem-policy` | Landlock: a hard requirement accepts added device paths; a replaced policy path rejects the next launch |
 
@@ -31,7 +38,8 @@ tests, so a test environment needs it installed
 environments). `credential-gating`, ported from NVIDIA/OpenShell#5264, starts
 servers (`tests/support/host-server`) on the machine that runs the tests and
 reaches them from sandboxes created from `testkit::python_image()` through
-`host.openshell.internal`.
+`host.openshell.internal`. `ssh` runs `ssh` and `ssh-keygen` there and needs a named
+gateway, which `sandbox ssh-config` writes into its `ProxyCommand`.
 
 ## Running it
 
@@ -59,6 +67,24 @@ Feature and driver suites are not part of it. The
 [testkit README](../../testkit/README.md#test-programs) describes the commands
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
+
+### Marking a test unsupported in CI
+
+When a test can't pass in one environment yet, for example because of a driver
+bug, keep the test and mark it unsupported there:
+
+1. File an issue for the bug.
+2. Add an entry to [`unsupported.yaml`](unsupported.yaml): the test, the issue,
+   and the environments it fails in, each a tmachine row
+   (`<environment>/<installer>`, such as `ubuntu-k3s/k3s-ha`) or a host lane
+   (`docker`, `podman`, `kubernetes` or `vm`).
+3. Delete the entry in the PR that fixes the bug.
+
+CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`; the
+[testkit README](../../testkit/README.md#unsupported-tests) describes what the
+program does with it. Branch Checks runs the program with each environment's
+entries, so an unknown test, a bad issue URL or an unknown environment name
+fails there.
 
 ## Adding a test
 

@@ -53,6 +53,7 @@ let
       driver = "docker";
       use_galaxy = true;
       playbooks = [
+        "ansible/playbooks/disable-unattended-upgrades.yaml"
         "ansible/playbooks/nextest.yaml"
         "ansible/playbooks/test-tools.yaml"
         "ansible/playbooks/docker.yaml"
@@ -62,6 +63,7 @@ let
       machine = "ubuntu";
       use_galaxy = false;
       playbooks = [
+        "ansible/playbooks/disable-unattended-upgrades.yaml"
         "ansible/playbooks/nextest.yaml"
         "ansible/playbooks/test-tools.yaml"
         "ansible/playbooks/k3s.yaml"
@@ -205,6 +207,40 @@ let
           openshell_e2e_python_image = e2ePythonImage;
           openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
           openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
+        # The deb installer, with the Docker compute driver run as an external service,
+        # built from the same revision as the gateway.
+        name = "deb-external-docker-driver";
+        use_galaxy = false;
+        playbooks = [
+          "ansible/playbooks/openshell-deb.yaml"
+        ];
+        inputs = {
+          openshell_deb = "../../artifacts/packages/openshell.deb";
+          openshell_e2e_python_image = e2ePythonImage;
+          openshell_external_driver_binary = "../../artifacts/external-drivers/${gnuTarget}/openshell-driver-docker";
+          openshell_external_driver_name = "external";
+          openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
+        # Installs the latest published release, as the baseline of an upgrade
+        # test, and stages the candidate under /var/lib/openshell-qualification
+        # for the `upgrade` disruption to install.
+        name = "deb-upgrade-source";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-deb-upgrade-source.yaml" ];
+        inputs = {
+          openshell_deb = "../../artifacts/upgrade/deb/source/openshell.deb";
+          openshell_supervisor_image = "../../artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../../artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar";
+          openshell_e2e_python_image = e2ePythonImage;
+          openshell_candidate_deb = "../../artifacts/packages/openshell.deb";
+          openshell_candidate_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_candidate_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
         };
       }
       {

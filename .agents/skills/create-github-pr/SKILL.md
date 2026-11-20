@@ -28,14 +28,15 @@ gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
 ```
 
 Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
-`state:accepted`; keep the issue link and note the missing label. Everyone else
+`state:accepted`; keep the issue link. Do not add access or acceptance evidence
+to the PR description. Everyone else
 must link at least one target-repository issue and have `state:accepted` on each.
 Otherwise, preserve local work and report which issue needs acceptance. A direct
-request, roadmap placement, other labels, or vouch status does not bypass this gate.
+request, roadmap placement, or other labels do not bypass this gate.
 
 When acting for another author, verify their permissions. Resolve failed lookups
 before proceeding; retry sandbox network failures outside the sandbox before
-reporting an authentication problem. Vouch requirements still apply separately.
+reporting an authentication problem.
 
 ### Check Config Documentation
 
@@ -144,7 +145,7 @@ Closes #123
 - Return 400 instead of 500"
 ```
 
-If the work needs multiple PRs, create a separate closable issue for each PR. A higher-level tracking issue may link the component issues, but no PR should close that tracking issue until all its work is complete. Follow `SECURITY.md` for vulnerability disclosure. First-time external contributors must be vouched before their PRs are accepted; the vouch check may close unvouched PRs. Check the current vouch process before opening a PR for an external contributor.
+If the work needs multiple PRs, create a separate closable issue for each PR. A higher-level tracking issue may link the component issues, but no PR should close that tracking issue until all its work is complete. Follow `SECURITY.md` for vulnerability disclosure.
 
 ### Create as Draft
 

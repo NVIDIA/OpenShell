@@ -103,7 +103,9 @@ No additional profile flag is required. Header credentials resolve only in the
 declared header, query credentials only in the declared parameter, and path
 credentials only in the `{credential}` slot of their path template. Header names
 are case-insensitive. An `Authorization` binding accepts Bearer, token, and Basic
-authentication.
+authentication. For Basic authentication, the client base64-encodes
+`user:<placeholder>` in an `Authorization: Basic` header; the proxy decodes it,
+resolves the placeholder, and re-encodes the header.
 
 The credential's `auth_style` selects its placement. Fields for other styles are
 ignored, so a bearer credential with unused `query_param` or `path_template`
@@ -580,6 +582,13 @@ Gateway-managed refresh strategies use these material keys:
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
 
+The two OAuth2 strategies also accept these optional material keys:
+
+| Key | Behavior |
+|---|---|
+| `token_endpoint_auth_method` | `none`, `client_secret_post`, or `client_secret_basic`. The default is `client_secret_post` when `client_secret` is set, otherwise `none`. `client_secret_basic` sends the credentials in an HTTP `Authorization` header and omits them from the request body. |
+| `resource` | An absolute URI without a fragment, sent as the OAuth `resource` indicator ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)). |
+
 ### Additional Outputs
 
 Most refresh strategies mint a single credential. `aws_sts_assume_role` mints three. A refresh declares the extra credentials it co-mints with `additional_outputs`, mapping each strategy-defined output id to a sibling credential whose `env_vars` receive the value:
@@ -696,15 +705,17 @@ Token grant fields:
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
 | `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
-| `cache_ttl` | No | Protobuf-duration cache override, such as `300s` or `0.500s`. Omission uses the token response expiry; `0s` disables caching. The legacy `cache_ttl_seconds` input remains accepted. |
+| `cache_ttl` | No | Protobuf-duration cache override, such as `300s`. Omission uses the token response expiry; `0s` disables caching. Shared supervisor grants require a positive override to be at least `1s` and cap it at the issuer and identity expiries. The legacy `cache_ttl_seconds` input remains accepted. |
 | `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
 | `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
 
-Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. `token_exchange` also requires the gateway to have its own Workload API socket so it can present a gateway JWT-SVID during the intermediate exchange. They apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
+Dedicated supervisors use a local SPIFFE Workload API socket for the exchanges above. Shared supervisors use the gateway's [SPIFFE Broker API integration](/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api): the gateway obtains the stable sandbox JWT-SVID and performs both exchanges, then returns only the final access token. The intermediate audience is the stable sandbox SPIFFE ID. Only the gateway mounts the Workload API socket, including for its own JWT-SVID in `token_exchange`.
 
-The gateway only brokers an intermediate token for a sandbox principal, and only when the requested provider is attached to that sandbox. It verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain against the gateway's own JWT-SVID, then uses the verified supervisor SVID subject as the intermediate-token audience.
+Token grants apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
+
+The gateway authorizes the sandbox session and provider attachment on every request. In the dedicated path it also verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain. In the shared path it resolves the configured credential itself and rechecks authorization before returning even a cached token.
 
 ### Token Grant Failures
 

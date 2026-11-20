@@ -26,6 +26,11 @@ runs:
       with:
         github-token: ${{ github.token }}
         summarize: false
+        # One failed HTTP/2 connection fails every NAR multiplexed on it, and
+        # Nix fails completed NARs it then resumes at EOF with HTTP 416
+        # (NixOS/nix#16722). Separate HTTP/1.1 connections limit the damage.
+        extra-conf: |
+          http2 = false
 
     - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
       with:

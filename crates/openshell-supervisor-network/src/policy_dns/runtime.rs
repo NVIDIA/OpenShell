@@ -87,7 +87,7 @@ impl PolicyDnsRuntimeConfig {
 }
 
 pub(crate) struct PolicyDnsRuntime {
-    pub(crate) store: Arc<ResolvedEndpointStore>,
+    pub(crate) service: Arc<PolicyDnsService>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -112,6 +112,7 @@ impl PolicyDnsRuntime {
             store.clone(),
             trusted_host_gateway,
         ));
+        let dns_service = service.clone();
         let task = tokio::spawn(async move {
             if engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
@@ -127,7 +128,7 @@ impl PolicyDnsRuntime {
                 };
                 let source = source.clone();
                 accepts.push(accept_mediated_dns(source).boxed());
-                let service = service.clone();
+                let service = dns_service.clone();
                 tokio::spawn(async move {
                     let timing = query.timing.clone();
                     let response = match query.transport {
@@ -161,7 +162,7 @@ impl PolicyDnsRuntime {
                 });
             }
         });
-        let expiry_store = store.clone();
+        let expiry_store = store;
         let expiry_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -178,7 +179,7 @@ impl PolicyDnsRuntime {
                 .build()
         );
         Ok(Self {
-            store,
+            service,
             tasks: vec![task, expiry_task],
         })
     }
@@ -238,6 +239,7 @@ impl PolicyDnsRuntime {
         });
 
         let mut tcp_engine_ready = engine_ready;
+        let tcp_service = service.clone();
         let tcp_task = tokio::spawn(async move {
             if tcp_engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
@@ -247,7 +249,7 @@ impl PolicyDnsRuntime {
                     break;
                 };
                 set_tcp_nodelay_best_effort(&stream);
-                let service = service.clone();
+                let service = tcp_service.clone();
                 tokio::spawn(async move {
                     // DNS-over-TCP connections may carry multiple sequential
                     // length-prefixed messages. libc commonly reuses one
@@ -275,7 +277,7 @@ impl PolicyDnsRuntime {
                 });
             }
         });
-        let expiry_store = store.clone();
+        let expiry_store = store;
         let expiry_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -293,7 +295,7 @@ impl PolicyDnsRuntime {
                 .build()
         );
         Ok(Self {
-            store,
+            service,
             tasks: vec![udp_task, tcp_task, expiry_task],
         })
     }

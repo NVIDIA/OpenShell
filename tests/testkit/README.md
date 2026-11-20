@@ -63,18 +63,29 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 
 `Context` currently provides:
 
-- `cx.sandbox(suffix)` to build a sandbox with a run-unique name, then
+- `cx.sandbox(suffix)` to build a sandbox with a run-unique name
+  (`test-<run-id>-<suffix>`), then
   `create()` it or `create_ready()` to also wait for Ready. Set its image
-  with `image(..)` and its policy with `policy(..)`. The returned
+  with `image(..)`, its policy with `policy(..)` and its providers with
+  `providers(..)`. A long-running sandbox is
+  `.command(["sleep", "infinity"])`; add `.image(testkit::python_image())`
+  when a test runs Python clients in it. The returned
   `Sandbox` can wait for ready or finished, stop, start, exec or
   `poll_exec` until the output matches, read its config and draft policy, set
-  a setting, read `sandbox get` JSON with `get_json()`, and delete. Its
-  `expect_listed`, `expect_absent` and `wait_absent` check list and get.
-  Exec output has `success()`, `failure()` and `expect_stdout()`.
+  a setting, read `sandbox get` JSON with `get_json()`, read its policy
+  revisions and active policy with `policy_revisions()` and
+  `active_policy()`, and delete. Its `expect_listed`, `expect_absent` and
+  `wait_absent` check list and get. `run_python(script, args)` runs a script
+  with `python3 -c` and fails unless it exits 0. Exec output has `success()`,
+  `failure()`, `expect_stdout()`, and `last_json()` for the last JSON object
+  or array line of stdout, such as a client script's result.
 - `cx.cli_sandbox(suffix)` for a sandbox only `openshell sandbox create`
   can make, such as one with `policy_yaml(...)` or `--no-keep`. `create()`
   detaches and returns the `Sandbox`, `create_ready()` also waits for Ready,
   and `run()` returns the attached CLI output.
+- Sandbox names are limited to `testkit::MAX_SANDBOX_NAME_LEN` (19)
+  characters, so a sandbox suffix can have at most 5. `cx.sandbox`,
+  `cx.cli_sandbox` and `cx.track` panic on a longer name.
 - `cx.track(name)` to register a sandbox created some other way, such as
   through the CLI, for cleanup. Call it before the
   create, so a create that fails after the gateway accepted it is still cleaned
@@ -92,7 +103,17 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   the same `success()`, `failure()` and `expect_stdout()` as exec output,
   plus `json()`, and `report_text()` for matching a wrapped error report.
   `cx.cli_handle()` returns that CLI for code that can't borrow `cx`, such as
-  a cleanup hook.
+  a cleanup hook. `cx.cli_find_listed(list, collection, name)` finds an entry
+  in a paginated `--output json` listing, following every page; a listing
+  without `collection` is an error.
+- `cx.cli_spawn([...])` to start the CLI and keep it running, for commands
+  that stream or read input, such as `sandbox connect`. The `CliChild` it
+  returns writes stdin, reads stdout and stderr line by line or all at once,
+  sends signals, and waits for the exit code. `cx.cli_spawn_with_stdin` takes
+  another stdin, such as a file or a pseudo-terminal.
+- `Cli::apply_env` to point another program at the same gateway, such as `ssh`
+  with the `ProxyCommand` from `sandbox ssh-config`. `Cli::gateway` says which
+  gateway that is.
 - `cx.on_cleanup(name, hook)` to remove something when the test ends.
 - `testkit::policy` for sandbox policies: `policy::base()` reads
   `testkit/src/base-policy.yaml`, which allows no network access, and
@@ -100,7 +121,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   (binaries apply to every endpoint under `name`) that `policy::Endpoint`
   configures (`.rest(Access::Full)`, `.credential_binding(provider)`, ...).
   Pass the result to `cx.sandbox(..).policy(policy)`, or `policy::to_yaml`
-  for the CLI.
+  for the CLI. `policy::binaries_yaml(binaries)` writes a `binaries:` list
+  into policy YAML a test writes by hand.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
 - `cx.import_profile(profile)` to import a provider profile and return its
   `id`, and `cx.create_provider(name, type, credentials)` to create a
@@ -108,12 +130,38 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   credentials)` does both.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
+- In `tests/support`: `host-server` starts servers on the machine that runs
+  the tests, which sandboxes reach as `host_server_support::TEST_HOST`, and
+  `sandbox-clients` runs clients in a sandbox: `connect`, `http` and
+  `http_raw` return typed results, and `scripts` holds client scripts for
+  `run_python`.
 - `?` and `.context(..)` on I/O, JSON, YAML, SDK and gRPC results, which
   convert into `testkit::Error`.
 - `error.grpc_code()` for the gRPC status code (`testkit::GrpcCode`) of a
   request the gateway refused, such as a sandbox create.
 - `poll_until` for waiting on other state, and `with_deadline(what, timeout,
   future)` for a step that must finish sooner than its own timeout.
+
+## Writing a sandbox client
+
+A test that checks what a sandbox can reach runs its client inside the
+sandbox, because the sandbox policy applies only to processes there. A client
+script:
+
+- uses only Python's standard library, and runs with `sandbox.run_python(script,
+  args)` in a sandbox from `testkit::python_image()`;
+- takes its input as arguments;
+- prints its result as one JSON line, which the test reads with
+  `output.last_json()`. A refused connection or a failed read is a result,
+  not a crash: the script exits non-zero only on a bug;
+- leaves parsing and assertions to Rust.
+
+A script only one test uses can stay beside that test, as a `const` or an
+`include_str!`. Move it to `tests/support/sandbox-clients/scripts/`, with a
+constant in its `scripts` module, once a second test or suite needs it, so no
+suite reads another workspace's files. If its result has a fixed shape, add a
+typed probe there too, like `connect` and `http`. `sandbox-clients` holds
+network clients; put file-system or system-call probes in a sibling crate.
 
 ## Running against a gateway
 
@@ -207,7 +255,7 @@ A test that is stopped does not clean up: sandboxes it created stay on the
 gateway. Run against a gateway you can throw away, or delete them by hand.
 
 Without a subcommand, the program takes libtest's arguments instead. A
-`[[test]]` target with `harness = false` therefore also runs under `cargo test`
+test target with `harness = false` therefore also runs under `cargo test`
 and nextest. In that mode tests run in one process, one at a time unless
 `--test-threads` says otherwise.
 
@@ -216,6 +264,32 @@ name, as in nextest. Its family, which groups tests in the JUnit report, is
 the first directory under the last `suites` directory in the crate's path:
 `conformance` for `tests/suites/conformance`, `features` for
 `tests/suites/features/<name>`.
+
+### Unsupported tests
+
+An environment that cannot pass a test yet lists it in
+`OPENSHELL_TEST_UNSUPPORTED`, instead of putting `#[ignore]` on the test, which
+turns it off everywhere. The value is `<test>=<issue>` entries separated by
+commas and/or whitespace, so an issue URL can't contain either:
+
+```shell
+OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVIDIA/OpenShell/issues/1234"
+```
+
+`<test>` is the crate name (`_` for `-`), then the name libtest shows. The
+program reads the variable under every interface, so `openshell-conformance
+run`, `cargo test` and nextest agree: the test is ignored, so each shows SKIP,
+and `list` marks it `[unsupported: <issue>]`. `run` prints the entries to stderr
+and lists them in its summary and JUnit report; under `cargo test` and nextest
+the program stays quiet, so whatever starts them should print the entries.
+
+A program applies only the entries for crates it links, so one value can serve
+several programs, and a misspelled crate name is ignored. A bad entry for a
+crate it links exits 2 before anything is listed or run (nextest exits 104,
+because its listing fails). Forcing an unsupported test to run
+(`--include-ignored`, `--ignored`, nextest's `--run-ignored`) fails it with
+`unsupported: <issue>; remove the entry from OPENSHELL_TEST_UNSUPPORTED to run
+it`.
 
 ## Checks
 

@@ -138,6 +138,19 @@ impl ActivityId {
         }
     }
 
+    /// Returns a human-readable label for API Activity context.
+    #[must_use]
+    pub fn api_label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Open => "Create",
+            Self::Close => "Read",
+            Self::Reset => "Update",
+            Self::Fail => "Delete",
+            _ => "Other",
+        }
+    }
+
     /// Returns a human-readable label for Process Activity context.
     #[must_use]
     pub fn process_label(self) -> &'static str {

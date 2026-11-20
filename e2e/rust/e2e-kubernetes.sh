@@ -74,6 +74,10 @@ is_operator_workspace_mode() {
 }
 
 run_conformance() {
+  if [ "${OPENSHELL_E2E_KUBE_CONFORMANCE:-1}" = "0" ]; then
+    echo "note: skipping conformance suites (OPENSHELL_E2E_KUBE_CONFORMANCE=0)."
+    return 0
+  fi
   if is_operator_workspace_mode; then
     echo "note: skipping conformance suites in Kubernetes operator workspace mode; default workspace is not operator-allowlisted (see #2971)."
     return 0

@@ -123,6 +123,10 @@ JSON output for scripting:
 gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId, status: .status, branch: .headBranch, url: .url}'
 ```
 
+## E2E and dev release concurrency
+
+`Release Dev` finishes its active run and replaces pending runs when new commits arrive. Other callers retain E2E cancellation. Inspect job annotations for cancellation reasons.
+
 ## View Job Logs
 
 For Branch Checks `Reviewer Roster` failures, the log lists non-collaborators in

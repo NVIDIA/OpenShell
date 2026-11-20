@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Keep a deny span active during OCSF emission.
+//! Emit egress audit records in their owning trace context.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use openshell_ocsf::{ActionId, HttpActivityEvent, OcsfEvent};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Emit one egress event, entering an INFO deny span if it is denied HTTP Activity.
 macro_rules! egress_emit {
@@ -38,8 +39,17 @@ fn as_http(event: &OcsfEvent) -> Option<&HttpActivityEvent> {
 /// a span. The span describes the denied HTTP record, or the first HTTP record
 /// when only a companion finding is denied. A saved `parent` keeps the span in
 /// the connect trace after authorization exits.
+///
+/// An inspected request already owns an all-outcome span. Its ambient request
+/// scope suppresses denial-only spans even for legacy emitters and when tracing
+/// is disabled, filtered, or unsampled.
 #[allow(clippy::disallowed_macros)]
 pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option<&tracing::Span>) {
+    if crate::l7::correlation::is_inspected_request() {
+        let request_span = crate::l7::correlation::current_request_span();
+        emit_inspected_decision(events, request_span.as_ref());
+        return;
+    }
     let events: Vec<_> = events.into_iter().collect();
     let span = if events.iter().any(is_denied) {
         events
@@ -58,6 +68,27 @@ pub fn emit_decision(events: impl IntoIterator<Item = OcsfEvent>, parent: Option
     };
     if let Some(span) = span {
         span.in_scope(emit);
+    } else {
+        emit();
+    }
+}
+
+/// Inspected requests own an all-outcome span, so their records never create a
+/// denial-only span, including when that request span is disabled or unsampled.
+#[allow(clippy::disallowed_macros)]
+pub fn emit_inspected_decision(
+    events: impl IntoIterator<Item = OcsfEvent>,
+    parent: Option<&tracing::Span>,
+) {
+    let emit = || {
+        for event in events {
+            openshell_ocsf::ocsf_emit!(event);
+        }
+    };
+    let context = parent.map_or_else(opentelemetry::Context::new, OpenTelemetrySpanExt::context);
+    let _context = context.attach();
+    if let Some(parent) = parent {
+        parent.in_scope(emit);
     } else {
         emit();
     }

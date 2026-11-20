@@ -121,6 +121,58 @@ class PredicateTests(unittest.TestCase):
 
 
 class GitHubAdapterTests(unittest.TestCase):
+    def test_structured_evidence_for_accepted_authorities(self):
+        from label_accepted_work import evaluate_pr_accepted_work
+
+        for author, permission, expected in (
+            ("MAINTAINER", None, {"basis": "maintainer"}),
+            (
+                "contributor",
+                "admin",
+                {"basis": "repository_permission", "permission": "admin"},
+            ),
+        ):
+            with self.subTest(author=author):
+                api = mock.Mock(return_value={"permission": permission})
+                result = evaluate_pr_accepted_work(
+                    REPO, {**PR, "user": {"login": author}}, {"maintainer"}, api=api
+                )
+                self.assertEqual(result, expected)
+
+    def test_structured_evidence_names_qualifying_issue_and_relationship(self):
+        from label_accepted_work import evaluate_pr_accepted_work
+
+        api = mock.Mock(
+            side_effect=[
+                {"permission": "read"},
+                connection(42),
+                issue(author="other", assignees=("contributor",)),
+                [{"name": ACCEPTED_LABEL}],
+            ]
+        )
+        self.assertEqual(
+            evaluate_pr_accepted_work(REPO, PR, {"maintainer"}, api=api),
+            {"basis": "accepted_issue", "issue": 42, "relationship": "assignee"},
+        )
+
+    def test_structured_evidence_for_issue_author_and_unaccepted_work(self):
+        from label_accepted_work import evaluate_pr_accepted_work
+
+        api = mock.Mock(
+            side_effect=[
+                {"permission": "read"},
+                connection(42),
+                issue(),
+                [{"name": ACCEPTED_LABEL}],
+            ]
+        )
+        self.assertEqual(
+            evaluate_pr_accepted_work(REPO, PR, {"maintainer"}, api=api),
+            {"basis": "accepted_issue", "issue": 42, "relationship": "author"},
+        )
+        api = mock.Mock(side_effect=[{"permission": "read"}, connection()])
+        self.assertIsNone(evaluate_pr_accepted_work(REPO, PR, {"maintainer"}, api=api))
+
     def check(self, responses, *, pull=None, maintainers=None):
         api = mock.Mock(side_effect=responses)
         result = check_pr_accepted_work(
