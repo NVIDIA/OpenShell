@@ -12,20 +12,14 @@
 //! policy that lets [`testkit::PYTHON_BINARIES`] reach the target:
 //!
 //! ```ignore
-//! use host_server_support::{HttpRecorder, TEST_HOST};
+//! use host_server_support::{HttpRecorder, TEST_HOST, allow_host};
 //! use sandbox_clients_support::{Request, http};
-//! use testkit::{PYTHON_BINARIES, policy};
+//! use testkit::policy;
 //!
 //! let server = HttpRecorder::start("hello").await?;
 //! let mut allowed = policy::base();
-//! policy::allow(&mut allowed, "server", TEST_HOST, server.port, PYTHON_BINARIES);
-//! let sandbox = cx
-//!     .sandbox("probe")
-//!     .image(testkit::python_image())
-//!     .command(["sleep", "infinity"])
-//!     .policy(allowed)
-//!     .create_ready()
-//!     .await?;
+//! allow_host(&mut allowed, "server", server.port);
+//! let sandbox = cx.python_sandbox("probe", allowed).create_ready().await?;
 //! let reply = http(&sandbox, TEST_HOST, server.port, &Request::get("/")).await?;
 //! testkit::ensure!(reply.status() == Some(200), "{reply:?}");
 //! ```
@@ -76,18 +70,6 @@ pub mod scripts {
     /// reload, signalling through files in `/tmp`.
     pub const RELOAD_KEEP_ALIVE_CLIENT: &str =
         include_str!("../scripts/reload_keep_alive_client.py");
-
-    /// Sends GraphQL queries, mutations and persisted queries with urllib and
-    /// raw sockets, and prints each status and JSON `error` code.
-    pub const GRAPHQL_CLIENT: &str = include_str!("../scripts/graphql_client.py");
-
-    /// Sends JSON-RPC calls, batches and invalid JSON with urllib and raw
-    /// sockets, and prints each status and JSON `error` code.
-    pub const JSONRPC_CLIENT: &str = include_str!("../scripts/jsonrpc_client.py");
-
-    /// Sends an unlisted JSON-RPC method and a response frame, and prints each
-    /// status and JSON `error` code.
-    pub const JSONRPC_AUDIT_CLIENT: &str = include_str!("../scripts/jsonrpc_audit_client.py");
 
     /// Runs an MCP client for each protocol revision it's given, and prints
     /// `MCP_OK version=<version>` after each passes.
