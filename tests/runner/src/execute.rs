@@ -405,25 +405,30 @@ async fn run_selected(
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
-    let mut tests = vec!["env"];
-    tests.extend(env.iter().map(String::as_str));
+    let export = test_env::export_script(test_env::ENV_DIR);
+    let mut args: Vec<&str> = vec![
+        "--archive-file",
+        &archive,
+        "--workspace-remap",
+        guest,
+        "--extract-to",
+        &extract,
+        "--extract-overwrite",
+        "--config-file",
+        &config,
+        "--profile",
+        PROFILE,
+    ];
+    for filter in filters {
+        args.extend(["-E", filter]);
+    }
+    let env_args = std::iter::once("env").chain(env.iter().map(String::as_str));
+    let mut tests: Vec<_> = env_args.clone().collect();
     match kind {
         Kind::Nextest => {
+            tests.extend(["cargo-nextest", "nextest", "run"]);
+            tests.extend(&args);
             tests.extend([
-                "cargo-nextest",
-                "nextest",
-                "run",
-                "--archive-file",
-                &archive,
-                "--workspace-remap",
-                guest,
-                "--extract-to",
-                &extract,
-                "--extract-overwrite",
-                "--config-file",
-                &config,
-                "--profile",
-                PROFILE,
                 "--no-capture",
                 // Tests share one gateway and the guest has 4 GiB; run them
                 // serially whatever --no-capture implies.
@@ -432,9 +437,6 @@ async fn run_selected(
                 "--no-tests",
                 "fail",
             ]);
-            for filter in filters {
-                tests.extend(["-E", filter]);
-            }
         }
         // The program runs its tests one at a time, and writes the report
         // where `collect_results` looks for it.
@@ -454,13 +456,34 @@ async fn run_selected(
     // can be credentials, never appear in the command (or its errors).
     let log = format!("{guest}/{NEXTEST_LOG}");
     let redirect = if append { ">>" } else { ">" };
-    let script = format!(
-        r#"exec {redirect}"$0" 2>&1; {}; exec "$@""#,
-        test_env::export_script(test_env::ENV_DIR)
-    );
+    let script = format!(r#"exec {redirect}"$0" 2>&1; {export}; exec "$@""#);
     let mut command = vec!["sh", "-c", &script, &log];
     command.extend(tests);
     let output = session.exec_timeout(&command, RUN_TIMEOUT).await?;
+    if kind == Kind::Nextest
+        && output.status.code() == Some(NEXTEST_NO_TESTS_RUN)
+        && env
+            .iter()
+            .any(|entry| entry.starts_with("OPENSHELL_TEST_UNSUPPORTED="))
+    {
+        // Nothing ran. Ask nextest whether the same filters match ignored
+        // tests, so a mistyped filter still fails.
+        let script = format!(r#"{export}; exec "$@""#);
+        let mut list = vec!["sh", "-c", &script, "list-tests"];
+        list.extend(env_args);
+        list.extend(["cargo-nextest", "nextest", "list"]);
+        list.extend(args);
+        list.extend(["--run-ignored", "only", "--message-format", "oneline"]);
+        let ignored = checked(
+            "list selected ignored tests",
+            session.exec_timeout(&list, RUN_TIMEOUT).await?,
+        )?;
+        if !ignored.trim().is_empty() {
+            let ignored = ignored.trim_end();
+            eprintln!("==> all selected tests are ignored:\n{ignored}");
+            return Ok(Status::Passed);
+        }
+    }
     let log = run.results.join(NEXTEST_LOG);
     Ok(match kind {
         Kind::Nextest => Status::of_nextest(output.status, &log),

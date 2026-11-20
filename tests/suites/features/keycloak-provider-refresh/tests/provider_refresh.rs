@@ -11,6 +11,10 @@ use std::io::Write as _;
 use keycloak_support::KeycloakContext;
 use testkit::{CliOutput, Context, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const CREDENTIAL_KEY: &str = "KEYCLOAK_ACCESS_TOKEN";
 
 /// A provider refreshes a valid Keycloak grant. Once Keycloak revokes the

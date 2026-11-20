@@ -24,6 +24,10 @@ use sandbox_clients_support::{Request, http};
 use testkit::policy;
 use testkit::{Context, PYTHON_BINARIES};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// Requests reach a server by an IP literal endpoint with `allowed_ips` for
 /// that address, and another by an IP literal endpoint without it.
 #[testkit::test]

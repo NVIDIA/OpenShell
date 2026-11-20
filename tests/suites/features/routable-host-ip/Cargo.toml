@@ -11,6 +11,11 @@ license = "Apache-2.0"
 repository = "https://github.com/ai-openshell/openshell"
 publish = false
 
+[[test]]
+name = "routable-host-ip"
+path = "tests/routable_host_ip.rs"
+harness = false
+
 [dependencies]
 host-server-support = { path = "../../../support/host-server" }
 sandbox-clients-support = { path = "../../../support/sandbox-clients" }

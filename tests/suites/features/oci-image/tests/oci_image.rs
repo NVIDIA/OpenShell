@@ -13,6 +13,10 @@
 use container_engine_support::{Engine, Image};
 use testkit::{Context, Error, Result, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// Sandbox condition reason for an image `WORKDIR` the sandbox identity
 /// cannot use.
 const WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFailed";
