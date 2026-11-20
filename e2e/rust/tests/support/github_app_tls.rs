@@ -13,7 +13,7 @@ pub struct SupervisorTrust {
     config_path: PathBuf,
     original: String,
     // Drop the image only after restoring the gateway configuration.
-    _image: ImageGuard,
+    image: ImageGuard,
 }
 
 impl SupervisorTrust {
@@ -50,16 +50,16 @@ impl SupervisorTrust {
         let guard = Self {
             config_path,
             original,
-            _image: image,
+            image,
         };
         std::fs::write(&guard.config_path, updated).map_err(|e| e.to_string())?;
-        restart().await?;
+        restart(Some(guard.image.tag())).await?;
         Ok(guard)
     }
 
     pub async fn restore(self) -> Result<(), String> {
         std::fs::write(&self.config_path, &self.original).map_err(|e| e.to_string())?;
-        restart().await?;
+        restart(None).await?;
         Ok(())
     }
 }
@@ -77,9 +77,12 @@ impl Drop for SupervisorTrust {
     }
 }
 
-async fn restart() -> Result<(), String> {
-    let gateway = ManagedGateway::from_env()?
+async fn restart(supervisor_image: Option<&str>) -> Result<(), String> {
+    let mut gateway = ManagedGateway::from_env()?
         .ok_or_else(|| "GitHub HTTPS fixture requires a harness-managed gateway".to_string())?;
+    if let Some(image) = supervisor_image {
+        gateway.set_supervisor_image(image);
+    }
     gateway.stop()?;
     gateway.start()?;
     wait_for_healthy(Duration::from_mins(2)).await
