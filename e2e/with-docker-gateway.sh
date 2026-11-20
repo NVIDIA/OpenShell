@@ -84,13 +84,13 @@ github_actions_host_docker_tmpdir() {
   # exist on the host, but the gateway also validates those same paths inside
   # the job container before handing them to Docker. This must be a real mount
   # rather than a symlink because the Docker driver canonicalizes file paths.
-  if [ -d /home/runner/_work/_temp ]; then
-    printf '%s\n' /home/runner/_work/_temp
+  if [ -d /home/runner/work/_temp ]; then
+    printf '%s\n' /home/runner/work/_temp
     return 0
   fi
 
-  echo "ERROR: GitHub Actions Docker e2e requires /home/runner/_work mounted inside the job container." >&2
-  echo "       Mount /home/runner/_work:/home/runner/_work so Docker bind paths resolve on both sides." >&2
+  echo "ERROR: GitHub Actions Docker e2e requires /home/runner/work mounted inside the job container." >&2
+  echo "       Mount /home/runner/work:/home/runner/work so Docker bind paths resolve on both sides." >&2
   return 2
 }
 
@@ -359,7 +359,7 @@ resolve_docker_supervisor_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/ai-openshell/openshell}"
     printf '%s/supervisor:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
@@ -388,7 +388,7 @@ resolve_docker_sandbox_runtime_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/ai-openshell/openshell}"
     printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi

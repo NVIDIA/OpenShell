@@ -411,10 +411,13 @@ topologySpreadConstraints: []
 gatewayConfig:
   openshell:
     version: 2
-  # openshell.gateway.spiffe_broker enables gateway-owned sandbox JWT-SVID
-  # acquisition over mTLS. Configure node_local_port or endpoint, an exact or
-  # cluster-scoped peer identity, the Workload API socket, and the stable sandbox
-  # SPIFFE ID prefix. SPIRE must authorize the gateway and attest its Sandbox references.
+  openshell.gateway:
+    # openshell.gateway.spiffe_broker enables gateway-owned sandbox JWT-SVID
+    # acquisition over mTLS. Configure node_local_port or endpoint, an exact or
+    # cluster-scoped peer identity, the Workload API socket, and the stable sandbox
+    # SPIFFE ID prefix. SPIRE must authorize the gateway and attest its Sandbox references.
+    # -- Opt in to gateway-mediated sandbox service URLs and forwarding. Disabled for Kubernetes; configure application-listener ingress or explicitly enable this path.
+    enable_gateway_service_routing: false
 
 # Server configuration
 server:

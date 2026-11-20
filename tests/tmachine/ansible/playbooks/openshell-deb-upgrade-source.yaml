@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Install a released Debian package as the baseline of an upgrade test. The
+# released package keeps its own runtime image tags and defaults.
+- name: Install released OpenShell Debian package
+  ansible.builtin.import_playbook: openshell-deb.yaml
+  vars:
+    openshell_packaged_gateway_released_source: true
+
+# Stage the candidate, and the `upgrade` disruption that installs it. How a
+# candidate is installed depends on the package type, so the installer that
+# knows it provides the step. The runner runs it from the disruptions directory.
+- name: Stage the OpenShell upgrade candidate
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Create candidate and disruptions directories
+      become: true
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /var/lib/openshell-qualification/candidate
+        - /var/lib/openshell-qualification/disruptions
+
+    - name: Copy candidate package, runtime images and upgrade disruption
+      become: true
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode | default('0644') }}"
+      loop:
+        - { dest: /var/lib/openshell-qualification/candidate/openshell.deb, src: "{{ openshell_candidate_deb }}" }
+        - { dest: /var/lib/openshell-qualification/candidate/sandbox.tar, src: "{{ openshell_candidate_sandbox_image }}" }
+        - { dest: /var/lib/openshell-qualification/candidate/supervisor.tar, src: "{{ openshell_candidate_supervisor_image }}" }
+        - { dest: /var/lib/openshell-qualification/disruptions/upgrade, src: "{{ playbook_dir }}/upgrade/deb.sh", mode: "0755" }

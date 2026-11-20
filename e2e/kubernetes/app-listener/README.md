@@ -31,16 +31,16 @@ differs from the repository's mise environment.
 `OPENSHELL_E2E_APP_DELIVERY` accepts `push` (default) or `poll`;
 `OPENSHELL_E2E_APP_TAKEOVER` accepts `graceful` (default) or `abrupt` for shared
 supervisors. Dedicated runs include gateway-outage expiry. Every run also
-disables the listener and verifies absent app sockets/TLS mounts/Services and
-continued gateway application ingress. Logs, events, and resource summaries
+disables the listener, explicitly enables gateway routing for the fallback
+check, and verifies absent app sockets/TLS mounts/Services and continued gateway
+application ingress. Logs, events, and resource summaries
 are written under `results/app-listener/`, without TLS private keys or Secrets.
 
 GitHub Actions runs four matrix cases under the existing `test:e2e` label:
 dedicated push/poll and shared graceful/abrupt takeover. These jobs use the
 reusable Kubernetes workflow, with kindnet replaced by pinned Calico for policy
 enforcement, and participate in `Core E2E result`. CI uploads the evidence even
-on failure. They still require the normal current-head `/ok to test <SHA>`
-approval mirror.
+on failure.
 
 ### Checking an already deployed release
 

@@ -1472,6 +1472,7 @@ mod tests {
     /// registered root is already stopped while the scan has not returned.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "races on 4-vCPU CI runners; see issue #5811"]
     fn terminal_group_signal_precedes_the_first_descendant_collect() {
         use std::io::BufRead as _;
         use std::os::unix::process::CommandExt as _;

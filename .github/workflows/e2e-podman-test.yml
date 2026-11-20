@@ -46,9 +46,9 @@ jobs:
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
-      OPENSHELL_SANDBOX_RUNTIME_IMAGE: ${{ format('ghcr.io/nvidia/openshell/sandbox:{0}', inputs.image-tag) }}
-      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+      OPENSHELL_REGISTRY: ghcr.io/ai-openshell/openshell
+      OPENSHELL_SANDBOX_RUNTIME_IMAGE: ${{ format('ghcr.io/ai-openshell/openshell/sandbox:{0}', inputs.image-tag) }}
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/ai-openshell/openshell/supervisor:{0}', inputs.image-tag) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,6 +73,11 @@ jobs:
           podman-major: ${{ matrix.podman_major }}
           podman-package-version: ${{ matrix.podman_package_version }}
           conmon-package-version: ${{ matrix.conmon_package_version }}
+
+      - uses: ./.github/actions/load-e2e-images
+        with:
+          images: sandbox supervisor
+          engine: podman
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
