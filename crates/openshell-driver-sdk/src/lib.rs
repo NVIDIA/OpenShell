@@ -21,6 +21,8 @@
 //! before decoding the rest, so a mismatch reports both versions instead of an
 //! unrelated field error.
 
+#[cfg(feature = "clap")]
+pub mod cli;
 pub mod network_trust;
 
 use std::path::PathBuf;
@@ -105,6 +107,27 @@ impl StartupDocument {
             .map_err(|error: toml::de::Error| DocumentError::Invalid(error.to_string()))
     }
 
+    /// Read and parse the document at `path`, reading no more than
+    /// [`MAX_DOCUMENT_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message that names the file for read failures, an oversized
+    /// document, a schema version this driver does not accept, or invalid
+    /// content.
+    pub fn read(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::Read as _;
+
+        let mut text = String::new();
+        std::fs::File::open(path)
+            .and_then(|file| {
+                file.take(MAX_DOCUMENT_BYTES as u64 + 1)
+                    .read_to_string(&mut text)
+            })
+            .map_err(|error| format!("read startup document {}: {error}", path.display()))?;
+        Self::parse(&text).map_err(|error| format!("startup document {}: {error}", path.display()))
+    }
+
     /// Render the document as TOML.
     ///
     /// # Errors
@@ -164,6 +187,38 @@ impl Telemetry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The exports a driver passes to the supervisors it starts.
+    #[must_use]
+    pub fn supervisor_otlp(&self) -> openshell_core::sandbox_env::SupervisorOtlp {
+        openshell_core::sandbox_env::SupervisorOtlp {
+            traces: self.traces.clone(),
+            ocsf: self.ocsf.clone(),
+            agent: self.agent.clone(),
+        }
+    }
+
+    /// Set a driver's OTLP command-line settings from the document.
+    #[cfg(feature = "clap")]
+    pub fn apply_to(&self, args: &mut openshell_core::sandbox_env::SupervisorOtlpArgs) {
+        if let Some(export) = &self.traces {
+            args.endpoint = Some(export.endpoint.clone());
+            args.protocol = export.protocol;
+        }
+        if let Some(export) = &self.ocsf {
+            args.ocsf_endpoint = Some(export.endpoint.clone());
+            args.ocsf_protocol = export.protocol;
+        }
+        if let Some(export) = &self.agent {
+            args.agent_endpoint = Some(export.endpoint.clone());
+            args.agent_protocol = export.protocol;
+        }
+        if let Some(collector) = &self.collector {
+            args.ca_file.clone_from(&collector.ca_file);
+            args.cert_file.clone_from(&collector.cert_file);
+            args.key_file.clone_from(&collector.key_file);
+        }
     }
 }
 
@@ -299,6 +354,13 @@ mod tests {
             StartupDocument::parse(&text),
             Err(DocumentError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn a_missing_file_names_the_path() {
+        let error =
+            StartupDocument::read(std::path::Path::new("/nonexistent/startup.toml")).unwrap_err();
+        assert!(error.contains("/nonexistent/startup.toml"), "{error}");
     }
 
     #[test]

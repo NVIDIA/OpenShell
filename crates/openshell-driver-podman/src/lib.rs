@@ -9,6 +9,7 @@ pub mod grpc;
 mod isolation;
 pub mod otel_tracing;
 mod socket_discovery;
+pub mod startup_config;
 #[cfg(test)]
 pub(crate) mod test_utils;
 pub(crate) mod watcher;

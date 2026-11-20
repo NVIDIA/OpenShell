@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -13,12 +13,19 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
 use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS};
+use openshell_driver_podman::startup_config::config_from_document;
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
+use openshell_driver_sdk::StartupDocument;
 
 #[derive(Parser)]
 #[command(name = "openshell-driver-podman")]
 #[command(version = VERSION)]
 struct Args {
+    /// Gateway startup document (TOML). A driver started with it takes all of
+    /// its settings from the document and accepts no other flag.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
     #[arg(
         long,
@@ -203,9 +210,42 @@ struct Args {
     enable_bind_mounts: bool,
 }
 
+/// Parse the command line. With `--config` the document supplies everything
+/// the gateway used to pass as flags, so any other flag is an error.
+fn parse_args() -> std::result::Result<(Args, Option<StartupDocument>), String> {
+    let command = Args::command();
+    let matches = command
+        .clone()
+        .try_get_matches_from(std::env::args_os())
+        .unwrap_or_else(|error| error.exit());
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let Some(path) = args.config.clone() else {
+        return Ok((args, None));
+    };
+    if let Some(flag) = openshell_driver_sdk::cli::first_flag_besides(&command, &matches, "config")
+    {
+        return Err(format!(
+            "--{flag} cannot be combined with --config; the startup document supplies it"
+        ));
+    }
+    let document = StartupDocument::read(&path)?;
+    apply_gateway_context(&mut args, &document);
+    Ok((args, Some(document)))
+}
+
+/// Set the values the driver needs before it builds its configuration:
+/// tracing, the listening socket, and the gateway's identity.
+fn apply_gateway_context(args: &mut Args, document: &StartupDocument) {
+    let gateway = &document.gateway;
+    args.bind_socket = Some(gateway.bind_socket.clone());
+    args.log_level.clone_from(&gateway.log_level);
+    args.gateway_name = Some(gateway.gateway_name.clone());
+    gateway.telemetry.apply_to(&mut args.otlp);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let (args, document) = parse_args().map_err(|err| miette::miette!("{err}"))?;
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_podman::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
@@ -222,55 +262,61 @@ async fn main() -> Result<()> {
     );
     args.otlp.warn_deprecated();
 
-    let supervisor_otlp = args.otlp.supervisor_otlp();
-    // External drivers have no gateway-local staged artifact. Do not accept
-    // a path or silently emulate destination-CA delivery outside the gateway.
-    let driver = PodmanComputeDriver::new(
-        PodmanComputeConfig {
-            allow_driver_config: args.admission_config_json.allow_driver_config,
-            resource_admission: args.admission_config_json.resource_admission.clone(),
-            socket_path: args.podman_socket,
-            default_image: args.sandbox_image.unwrap_or_default(),
-            image_pull_policy: args.sandbox_image_pull_policy,
-            grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-            supervisor_otlp,
-            supervisor_gateway_name: args.gateway_name.clone(),
-            gateway_port: args.gateway_port,
-            host_gateway_ip: args
-                .host_gateway_ip
-                .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
-            ssh_socket_path: args.sandbox_ssh_socket_path,
-            network_name: args.network_name,
-            stop_timeout_secs: args.stop_timeout,
-            sandbox_runtime_image: args
-                .sandbox_runtime_image
-                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
-            supervisor_image: args
-                .supervisor_image
-                .unwrap_or_else(openshell_core::config::default_supervisor_image),
-            guest_tls_ca: args.podman_tls_ca,
-            guest_tls_cert: args.podman_tls_cert,
-            guest_tls_key: args.podman_tls_key,
-            provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
-            app_armor_profile: args.app_armor_profile,
-            sandbox_pids_limit: args.sandbox_pids_limit,
-            health_check_interval_secs: args.health_check_interval_secs,
-            https_proxy: args.sandbox_https_proxy,
-            no_proxy: args.sandbox_no_proxy,
-            proxy_auth_file: args.sandbox_proxy_auth_file,
-            proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
-            proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
-            proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
-            additional_ca_bundle: args.sandbox_additional_ca_bundle,
-            userns: args.userns,
-            uidmap: args.uidmap,
-            gidmap: args.gidmap,
-            enable_bind_mounts: args.enable_bind_mounts,
-        },
-        None,
-    )
-    .await
-    .into_diagnostic()?;
+    let (config, network_trust) = if let Some(document) = document.as_ref() {
+        config_from_document(document).map_err(|err| miette::miette!("{err}"))?
+    } else {
+        let supervisor_otlp = args.otlp.supervisor_otlp();
+        // Without a startup document there is no gateway-local staged
+        // artifact. Do not accept a path or silently emulate
+        // destination-CA delivery outside the gateway.
+        (
+            PodmanComputeConfig {
+                allow_driver_config: args.admission_config_json.allow_driver_config,
+                resource_admission: args.admission_config_json.resource_admission.clone(),
+                socket_path: args.podman_socket,
+                default_image: args.sandbox_image.unwrap_or_default(),
+                image_pull_policy: args.sandbox_image_pull_policy,
+                grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+                supervisor_otlp,
+                supervisor_gateway_name: args.gateway_name.clone(),
+                gateway_port: args.gateway_port,
+                host_gateway_ip: args
+                    .host_gateway_ip
+                    .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
+                ssh_socket_path: args.sandbox_ssh_socket_path,
+                network_name: args.network_name,
+                stop_timeout_secs: args.stop_timeout,
+                sandbox_runtime_image: args
+                    .sandbox_runtime_image
+                    .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
+                supervisor_image: args
+                    .supervisor_image
+                    .unwrap_or_else(openshell_core::config::default_supervisor_image),
+                guest_tls_ca: args.podman_tls_ca,
+                guest_tls_cert: args.podman_tls_cert,
+                guest_tls_key: args.podman_tls_key,
+                provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
+                app_armor_profile: args.app_armor_profile,
+                sandbox_pids_limit: args.sandbox_pids_limit,
+                health_check_interval_secs: args.health_check_interval_secs,
+                https_proxy: args.sandbox_https_proxy,
+                no_proxy: args.sandbox_no_proxy,
+                proxy_auth_file: args.sandbox_proxy_auth_file,
+                proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
+                proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+                proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+                additional_ca_bundle: args.sandbox_additional_ca_bundle,
+                userns: args.userns,
+                uidmap: args.uidmap,
+                gidmap: args.gidmap,
+                enable_bind_mounts: args.enable_bind_mounts,
+            },
+            None,
+        )
+    };
+    let driver = PodmanComputeDriver::new(config, network_trust)
+        .await
+        .into_diagnostic()?;
 
     let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
     if let Some(socket_path) = args.bind_socket {

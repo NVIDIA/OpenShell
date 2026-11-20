@@ -9,7 +9,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_driver_sdk::StartupDocument;
-use openshell_driver_vm::startup_config::{VmComputeConfig, read_startup_document};
+use openshell_driver_vm::startup_config::VmComputeConfig;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -504,7 +504,7 @@ where
                 "--{flag} cannot be combined with --config; the startup document supplies it"
             )));
         }
-        let document = read_startup_document(&path).map_err(ArgsError::Config)?;
+        let document = StartupDocument::read(&path).map_err(ArgsError::Config)?;
         apply_startup_document(&mut args, &document).map_err(ArgsError::Config)?;
     }
     Ok(args)
@@ -536,24 +536,7 @@ fn apply_startup_document(
     args.gateway_name = Some(gateway.gateway_name.clone());
     args.guest_tls_ca.clone_from(&gateway.tls_ca);
 
-    let telemetry = &gateway.telemetry;
-    if let Some(export) = &telemetry.traces {
-        args.otlp.endpoint = Some(export.endpoint.clone());
-        args.otlp.protocol = export.protocol;
-    }
-    if let Some(export) = &telemetry.ocsf {
-        args.otlp.ocsf_endpoint = Some(export.endpoint.clone());
-        args.otlp.ocsf_protocol = export.protocol;
-    }
-    if let Some(export) = &telemetry.agent {
-        args.otlp.agent_endpoint = Some(export.endpoint.clone());
-        args.otlp.agent_protocol = export.protocol;
-    }
-    if let Some(collector) = &telemetry.collector {
-        args.otlp.ca_file.clone_from(&collector.ca_file);
-        args.otlp.cert_file.clone_from(&collector.cert_file);
-        args.otlp.key_file.clone_from(&collector.key_file);
-    }
+    gateway.telemetry.apply_to(&mut args.otlp);
 
     if let Some(trust) = &gateway.network_trust {
         args.additional_ca_bundle = Some(trust.path.clone());

@@ -55,7 +55,7 @@ url = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-openshell-driver-sdk = { path = "../openshell-driver-sdk" }
+openshell-driver-sdk = { path = "../openshell-driver-sdk", features = ["clap"] }
 oci-client = { version = "0.16", optional = true }
 libc = "0.2"
 rustix = { workspace = true, features = ["fs"] }

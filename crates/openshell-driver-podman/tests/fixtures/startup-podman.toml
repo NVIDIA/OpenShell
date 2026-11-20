@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Startup document the gateway writes for the Podman driver. The gateway's
+# conversion test and the driver's configuration test both read this file.
+
+schema_version = 1
+
+[gateway]
+bind_socket = "/var/lib/openshell/podman-driver/run/compute-driver.sock"
+expected_peer_pid = 4242
+log_level = "debug"
+gateway_name = "gateway-a"
+gateway_port = 8080
+
+[gateway.telemetry.traces]
+endpoint = "https://collector.example:4317"
+protocol = "grpc"
+
+[gateway.network_trust]
+path = "/var/lib/openshell/trust/bundle.pem"
+digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+certificate_count = 3
+
+[driver_config]
+allow_driver_config = true
+default_image = "openshell/sandbox:default"
+network_name = "openshell-test"
+stop_timeout_secs = 20
+enable_bind_mounts = true

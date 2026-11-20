@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+clap = { workspace = true, optional = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
@@ -20,6 +21,10 @@ toml = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+## Helpers for drivers that parse their command line with clap.
+clap = ["dep:clap", "openshell-core/clap"]
 
 [lints]
 workspace = true

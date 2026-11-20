@@ -8,11 +8,10 @@
 //! passed through unchanged; [`VmComputeConfig`] is what the driver accepts in
 //! it, and the driver validates it at startup.
 
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use openshell_core::{Error, Result, UpstreamProxyConfig};
-use openshell_driver_sdk::{MAX_DOCUMENT_BYTES, StartupDocument};
+use openshell_driver_sdk::StartupDocument;
 
 /// The VM driver's own configuration: the operator's `[openshell.drivers.vm]`
 /// table, which the gateway passes through as the startup document's
@@ -233,24 +232,6 @@ pub fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
     Ok(())
 }
 
-/// Read and parse a startup document, reading no more than the size limit.
-///
-/// # Errors
-///
-/// Returns a message that names the file for read failures, an oversized
-/// document, a schema version this driver does not accept, or invalid content.
-pub fn read_startup_document(path: &Path) -> std::result::Result<StartupDocument, String> {
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .and_then(|file| {
-            file.take(MAX_DOCUMENT_BYTES as u64 + 1)
-                .read_to_string(&mut text)
-        })
-        .map_err(|error| format!("read startup document {}: {error}", path.display()))?;
-    StartupDocument::parse(&text)
-        .map_err(|error| format!("startup document {}: {error}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,12 +263,6 @@ mod tests {
             document.driver_config = toml::from_str(&format!("{key} = '/x'")).unwrap();
             assert!(VmComputeConfig::from_document(&document).is_err(), "{key}");
         }
-    }
-
-    #[test]
-    fn a_missing_file_names_the_path() {
-        let error = read_startup_document(Path::new("/nonexistent/startup.toml")).unwrap_err();
-        assert!(error.contains("/nonexistent/startup.toml"), "{error}");
     }
 
     #[test]
