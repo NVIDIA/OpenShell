@@ -619,4 +619,4 @@ Only mark a checklist item as complete after you have run and verified it, not a
 
 ## CI
 
-How PR CI runs, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e` and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
