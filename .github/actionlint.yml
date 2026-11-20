@@ -5,6 +5,8 @@ self-hosted-runner:
   labels:
     - ubuntu-26.04
     - windows-arm64
+    - cncf-ubuntu-26.04-8-32-x86
+    - cncf-ubuntu-26.04-8-32-arm
 
 paths:
   .github/workflows/windows-msvc.yml:

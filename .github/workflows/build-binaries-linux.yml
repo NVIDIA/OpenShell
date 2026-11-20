@@ -37,9 +37,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - triple: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: &build_steps
@@ -69,9 +69,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - triple: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: *build_steps
@@ -85,9 +85,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - triple: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: *build_steps
@@ -103,19 +103,19 @@ jobs:
           - package: openshell-sandbox
             binary: openshell-sandbox
             triple: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - package: openshell-sandbox
             binary: openshell-sandbox
             triple: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
           - package: openshell-supervisor
             binary: openshell-supervisor
             triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - package: openshell-supervisor
             binary: openshell-supervisor
             triple: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: *build_steps
@@ -130,9 +130,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - triple: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: *build_steps

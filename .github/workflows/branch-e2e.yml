@@ -151,9 +151,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - triple: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -187,9 +187,9 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - triple: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: cncf-ubuntu-26.04-8-32-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -240,7 +240,7 @@ jobs:
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       contents: read
-    runs-on: ubuntu-24.04
+    runs-on: cncf-ubuntu-26.04-8-32-x86
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -296,15 +296,15 @@ jobs:
           - package: openshell-driver-docker
             binary: openshell-driver-docker
             triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - package: openshell-driver-podman
             binary: openshell-driver-podman
             triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
           - package: openshell-driver-kubernetes
             binary: openshell-driver-kubernetes
             triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: cncf-ubuntu-26.04-8-32-x86
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
