@@ -843,6 +843,7 @@ network_policies:
             endpoint: EndpointDecision::default(),
             binary: Some(std::path::PathBuf::from("/usr/bin/curl")),
             binary_pid: None,
+            process: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         };
@@ -1019,8 +1020,14 @@ network_policies:
             .reload(POLICY_REGO, CURL_EXAMPLE_AND_OTHER_POLICY)
             .unwrap();
 
-        assert!(!generation_guard.is_stale(), "approving another host must not close this relay");
-        assert_eq!(generation_guard.captured_generation(), engine.current_generation());
+        assert!(
+            !generation_guard.is_stale(),
+            "approving another host must not close this relay"
+        );
+        assert_eq!(
+            generation_guard.captured_generation(),
+            engine.current_generation()
+        );
     }
 
     /// Approving an endpoint for another host leaves an inspected (L7)
@@ -1194,7 +1201,11 @@ network_policies:
             !guard.is_stale(),
             "a connection that never carried credentials cannot hold a stale one"
         );
-        let uses = request.provider_credentials.as_ref().unwrap().credential_uses();
+        let uses = request
+            .provider_credentials
+            .as_ref()
+            .unwrap()
+            .credential_uses();
         assert!(uses.expect("http_context tracks credential use").is_empty());
     }
 
@@ -1211,7 +1222,10 @@ network_policies:
         inject_static_credential(&request, "API_TOKEN");
         change_provider_credentials(&engine, &credentials, 2, &[("API_TOKEN", "a2")]);
 
-        assert!(guard.is_stale(), "the upstream session may hold the old credential");
+        assert!(
+            guard.is_stale(),
+            "the upstream session may hold the old credential"
+        );
     }
 
     /// Rotating another provider's credential, or attaching a new
@@ -1232,12 +1246,19 @@ network_policies:
             2,
             &[("API_TOKEN", "a"), ("OTHER_TOKEN", "b2")],
         );
-        assert!(!guard.is_stale(), "OTHER_TOKEN was never sent on this connection");
+        assert!(
+            !guard.is_stale(),
+            "OTHER_TOKEN was never sent on this connection"
+        );
         change_provider_credentials(
             &engine,
             &credentials,
             3,
-            &[("API_TOKEN", "a"), ("OTHER_TOKEN", "b2"), ("NEW_TOKEN", "c")],
+            &[
+                ("API_TOKEN", "a"),
+                ("OTHER_TOKEN", "b2"),
+                ("NEW_TOKEN", "c"),
+            ],
         );
         assert!(!guard.is_stale());
     }
@@ -1823,7 +1844,9 @@ network_policies:
             .reload(POLICY_REGO, CURL_EXAMPLE_REST_NARROWED_POLICY)
             .unwrap();
         assert!(evaluator.is_stale());
-        engine.reload(POLICY_REGO, CURL_EXAMPLE_REST_POLICY).unwrap();
+        engine
+            .reload(POLICY_REGO, CURL_EXAMPLE_REST_POLICY)
+            .unwrap();
 
         assert!(evaluator.is_stale());
     }
@@ -2174,7 +2197,10 @@ network_policies:
 
         let outcome = mcp_status_across_reload(None, Some(upcoming)).await;
 
-        assert!(outcome.second_forwarded, "nothing changed for the running tunnel");
+        assert!(
+            outcome.second_forwarded,
+            "nothing changed for the running tunnel"
+        );
         assert_eq!(outcome.second_reported, None);
     }
 
@@ -2387,7 +2413,10 @@ network_policies:
             2,
             &[("API_TOKEN", "a"), ("OTHER_TOKEN", "b2")],
         );
-        assert_ne!(credentials.snapshot().child_env["API_TOKEN"], old_placeholder);
+        assert_ne!(
+            credentials.snapshot().child_env["API_TOKEN"],
+            old_placeholder
+        );
         let decision = authorized_decision(&engine);
         let request = connection_context(&decision, &credentials);
         let guard = http_relay_guard(&engine, &decision, &request);
