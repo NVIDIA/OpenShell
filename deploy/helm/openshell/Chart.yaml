@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 apiVersion: v2
-# Chart name determines the OCI image name: ghcr.io/nvidia/openshell/helm-chart:<version>
-name: helm-chart
+# Chart name determines the OCI artifact name: quay.io/ai-openshell/charts/openshell:<version>
+name: openshell
 description: runtime environment for autonomous agents
 type: application
 # version and appVersion are patched to the release semver by CI before helm package.

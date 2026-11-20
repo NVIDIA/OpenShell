@@ -9,7 +9,7 @@
 #
 # Generate the cluster-scoped objects for the cluster-admin step from the same
 # release values, then apply them as cluster-admin:
-#   helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+#   helm template openshell oci://quay.io/ai-openshell/charts/openshell \
 #     --version <version> --namespace openshell -f my-values.yaml \
 #     --set rbac.create=true \
 #     --set rbac.clusterScoped.create=true \

@@ -7,7 +7,7 @@ Edit README.md.gotmpl and values.yaml, then run `mise run helm:docs`.
 
 > **Experimental** - the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
 
-This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to GHCR at `oci://ghcr.io/nvidia/openshell/helm-chart`.
+This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to Quay at `oci://quay.io/ai-openshell/charts/openshell`.
 
 By default, this chart also creates the namespace-scoped resources needed by
 sandboxes. For a shared-gateway deployment, install it with
@@ -52,7 +52,7 @@ A cluster-admin applies the cluster-scoped objects once per gateway
 ServiceAccount, rendered from the same values the release uses:
 
 ```shell
-helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm template openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   --namespace openshell -f my-values.yaml \
   --set rbac.create=true \
   --set rbac.clusterScoped.create=true \
@@ -66,7 +66,7 @@ objects omitted, using [`ci/values-namespace-admin.yaml`](ci/values-namespace-ad
 or the equivalent `--set`:
 
 ```shell
-helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm upgrade --install openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   --namespace openshell -f my-values.yaml \
   --set rbac.clusterScoped.create=false
 ```
@@ -99,7 +99,7 @@ With `rbac.create=false` the cluster-admin applies the namespaced RBAC too,
 adding it to the same render:
 
 ```shell
-helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm template openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   --namespace openshell -f my-values.yaml \
   --set rbac.create=true \
   --set rbac.clusterScoped.create=true \
@@ -167,7 +167,7 @@ where Helm cannot discover cluster APIs.
 ## Install on Kubernetes
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version>
+helm install openshell oci://quay.io/ai-openshell/charts/openshell --version <version>
 ```
 
 ## Install on OpenShift
@@ -179,7 +179,7 @@ See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/
 oc create ns openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell --version <version> -n openshell \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -365,7 +365,7 @@ recreate the StatefulSet so its template matches:
 kubectl -n openshell patch pvc openshell-data-openshell-0 \
   -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
 kubectl -n openshell delete statefulset openshell --cascade=orphan
-helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <installed-version> \
+helm upgrade openshell oci://quay.io/ai-openshell/charts/openshell --version <installed-version> \
   --reuse-values -n openshell --set server.dataStorageSize=20Gi
 ```
 
@@ -390,7 +390,7 @@ kubectl create secret generic my-pg-credentials -n openshell \
 Then install the chart pointing at that Secret:
 
 ```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+helm install openshell oci://quay.io/ai-openshell/charts/openshell --version <version> \
   -n openshell \
   --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
