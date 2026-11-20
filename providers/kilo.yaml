@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/kilo.yaml
+#   openshell provider profile import -f providers/kilo.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   Kilo CLI.
+# Reference layout:  Kilo at /usr/local/bin/kilo, as in
+#                    ghcr.io/kilo-org/kilocode and its OpenShell variant
+#                    ghcr.io/kilo-org/kilocode:latest-openshell. Add curl or an
+#                    SDK interpreter if the workload calls the API another way.
+# Credential scope:  KILO_API_KEY, sent as a bearer token. OpenShell resolves it
+#                    only for the endpoints below. Kilo also sends it to
+#                    ingest.kilosessions.ai for cloud session upload and to
+#                    events.kiloapps.io for its presence service, which this
+#                    profile leaves blocked. The Kilo Gateway serves many
+#                    upstream models with one key, and this profile cannot
+#                    restrict which of them Kilo uses.
+# Endpoint access:   api.kilo.ai for account lookups, ai-gateway.kilo.ai for
+#                    inference and the gateway's model list, us.i.posthog.com
+#                    for the CLI's telemetry, all read-write and L7 enforced.
+#                    Kilo sends it with PostHog's own project key, never with
+#                    KILO_API_KEY, so allowing it exposes no credential. Drop
+#                    it if your policy forbids that traffic. models.dev stays
+#                    blocked: Kilo falls back to the model catalog bundled in
+#                    its binary.
+# Smoke test:        openshell sandbox create --provider <name> \
+#                      --from ghcr.io/kilo-org/kilocode:latest-openshell -- \
+#                      kilo run --model kilo/nvidia/nemotron-3.5-lightning:free 'reply with OK'
+#
+# The -openshell image keeps Kilo's own sandbox off. Kilo's sandbox uses
+# bubblewrap, which cannot create its namespaces inside an OpenShell sandbox,
+# so when a project's kilo.jsonc turns it on, every tool call fails and
+# `kilo run` can still exit 0. The image sets {"sandbox": {"enabled": false}}
+# in /etc/kilo/kilo.json, which Kilo loads after project configuration, so a
+# project cannot override it. It also sets KILO_DISABLE_MODELS_FETCH=1,
+# KILO_DISABLE_SESSION_INGEST=1 and KILO_DISABLE_PRESENCE=1, which stop Kilo
+# from trying the blocked hosts above. OpenShell still confines Kilo and every
+# tool it runs.
+#
+# The image's environment reaches the sandbox's main command only, so start
+# Kilo as that command, as the smoke test does. A process started with
+# `openshell sandbox exec` does not get those variables. Pass them with --env
+# on `openshell sandbox create` instead, which reaches every process.
+#
+# With another image, add the same /etc/kilo/kilo.json and variables yourself.
+# KILO_TELEMETRY_LEVEL=off stops Kilo's telemetry.
+
+id: kilo
+display_name: Kilo
+description: Kilo CLI with the Kilo Gateway
+category: agent
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Kilo Gateway API key used by the Kilo CLI
+    env_vars: [KILO_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.kilo.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: ai-gateway.kilo.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: us.i.posthog.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/kilo]
