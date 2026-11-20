@@ -273,7 +273,7 @@ turns it off everywhere. The value is `<test>=<issue>` entries separated by
 commas and/or whitespace, so an issue URL can't contain either:
 
 ```shell
-OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/NVIDIA/OpenShell/issues/1234"
+OPENSHELL_TEST_UNSUPPORTED="conformance::cli::stop_start=https://github.com/ai-openshell/OpenShell/issues/1234"
 ```
 
 `<test>` is the crate name (`_` for `-`), then the name libtest shows. The
