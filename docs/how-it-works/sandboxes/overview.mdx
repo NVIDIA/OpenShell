@@ -1022,6 +1022,30 @@ If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause
 
 For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
+### Stop Idle Sandboxes
+
+The gateway can stop a sandbox whose agent is waiting for you. Agents that
+report their state with the OSC 7501 program status protocol, such as Claude
+Code and Codex, tell the supervisor when a turn is working, done, or blocked
+on a prompt. Set `idle_stop_after_seconds` to stop a sandbox after its
+agent has waited that long with no terminal input:
+
+```shell
+openshell settings set my-sandbox --key idle_stop_after_seconds --value 1800
+openshell settings set --global --key idle_stop_after_seconds --value 3600
+```
+
+A global value overrides per-sandbox values. Zero or unset disables idle stop.
+A sandbox keeps running while its agent reports `working`, and a sandbox whose
+programs never report status is never stopped. `openshell sandbox get` shows the
+latest report as the `ProgramStatus` condition.
+
+An idle stop moves the sandbox to `Stopped` with the reason `IdleStopped`.
+`openshell sandbox connect` starts such a sandbox before connecting. Process
+memory is not retained: the canonical command starts fresh, so resume the
+agent's conversation with its own option, such as `claude --continue`. Workspace
+files persist as they do for any stop.
+
 ### Update the Image of a Stopped Sandbox
 
 Use `openshell.v1.SandboxUpdates/UpdateSandbox` to change a stopped sandbox's

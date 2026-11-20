@@ -410,6 +410,8 @@ struct ChannelState {
     main_input_pending: bool,
     main_detach_prefix_pending: bool,
     main_output_task: Option<tokio::task::AbortHandle>,
+    /// Records client input for a PTY session's program status.
+    input_marker: Option<crate::program_status::InputMarker>,
 }
 
 enum InputSender {
@@ -977,6 +979,9 @@ impl russh::server::Handler for SshHandler {
             return Ok(());
         };
         if !state.main_attached {
+            if let Some(marker) = &state.input_marker {
+                marker.mark();
+            }
             // Russh replenishes receive credit before this callback. Waiting
             // for space here would block signals, close, and output credit on
             // the same SSH connection. Reject overflow before copying input.
@@ -1022,6 +1027,12 @@ impl russh::server::Handler for SshHandler {
             state.input_sender = Some(InputSender::Main(input));
             state.main_input_pending = false;
             session.extended_data(channel, 1, b"openshell: input enabled\r\n".to_vec())?;
+        }
+        if !forward.is_empty()
+            && state.main_input_owner.is_some()
+            && let Some(main_session) = self.main_session.as_ref()
+        {
+            main_session.mark_input();
         }
         let error = (!forward.is_empty())
             .then(|| state.input_sender.as_ref()?.send(forward).err())
@@ -1362,6 +1373,10 @@ impl SshHandler {
             .exec(spec)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let activity = self
+            .main_session
+            .as_ref()
+            .map(|main_session| main_session.program_activity().clone());
         let state = self
             .channels
             .get_mut(&channel)
@@ -1395,6 +1410,19 @@ impl SshHandler {
             .input_task
             .as_ref()
             .map(input::InputTask::abort_handle);
+        // Interactive PTY programs may report their status over OSC 7501.
+        let tap = match (&activity, &state.terminal, &state.input_sender) {
+            (Some(activity), Some(_), Some(InputSender::Process(sender))) => {
+                let reply = sender.reply_handle();
+                Some(activity.register(move |bytes| {
+                    let _ = reply.send(bytes);
+                }))
+            }
+            _ => None,
+        };
+        state.input_marker = tap
+            .as_ref()
+            .map(crate::program_status::TerminalTap::input_marker);
 
         // Upload stdout carries only credit, so extraction output uses stderr.
         let stdout_extended = finisher.is_some();
@@ -1402,6 +1430,14 @@ impl SshHandler {
         let stdout_handle = handle.clone();
         let stdout_task = tokio::spawn(async move {
             let mut buffer = [0_u8; 4096];
+            if let Some(mut tap) = tap {
+                while let Some(data) =
+                    crate::program_status::read_observed(&mut stdout, &mut buffer, &mut tap).await
+                {
+                    let _ = stdout_handle.data(channel, data).await;
+                }
+                return;
+            }
             loop {
                 match stdout.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,

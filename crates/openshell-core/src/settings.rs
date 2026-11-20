@@ -106,6 +106,17 @@ pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 /// fail-closes on unknown persisted values for defense in depth.
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
+/// Seconds a sandbox's terminal program may wait on the user before it stops.
+///
+/// Only programs that report OSC 7501 program status, such as Claude Code, can
+/// be judged idle. Unset, zero, or negative disables idle stop; values above
+/// [`MAX_IDLE_STOP_AFTER_SECONDS`] are capped. Gateway scope wins over sandbox
+/// scope.
+pub const IDLE_STOP_AFTER_SECONDS_KEY: &str = "idle_stop_after_seconds";
+
+/// Longest effective idle stop timeout: 30 days.
+pub const MAX_IDLE_STOP_AFTER_SECONDS: i64 = 30 * 24 * 60 * 60;
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // When true the supervisor emits OCSF-JSON records to stderr and writes
     // JSONL to `/var/log/openshell-ocsf*.jsonl` when file logging is available.
@@ -135,6 +146,12 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         key: PROPOSAL_APPROVAL_MODE_KEY,
         kind: SettingValueKind::String,
         allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
+    },
+    // Idle stop timeout. See IDLE_STOP_AFTER_SECONDS_KEY. Unset disables it.
+    RegisteredSetting {
+        key: IDLE_STOP_AFTER_SECONDS_KEY,
+        kind: SettingValueKind::Int,
+        allowed_string_values: None,
     },
 ];
 
@@ -170,6 +187,13 @@ mod tests {
         PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, REGISTERED_SETTINGS,
         RegisteredSetting, SettingValueKind, parse_bool_like, registered_keys_csv, setting_for_key,
     };
+
+    #[test]
+    fn idle_stop_after_seconds_is_an_int_setting() {
+        let setting = setting_for_key(super::IDLE_STOP_AFTER_SECONDS_KEY)
+            .expect("idle_stop_after_seconds should be registered");
+        assert_eq!(setting.kind, SettingValueKind::Int);
+    }
 
     #[test]
     fn setting_for_key_returns_none_for_unknown() {

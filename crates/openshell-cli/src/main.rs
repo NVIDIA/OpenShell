@@ -1842,6 +1842,7 @@ enum SandboxCommands {
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
+    /// A sandbox the gateway stopped while idle is started first.
     /// Press Ctrl-D or Ctrl-P Ctrl-Q to disconnect without terminating the main process.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
@@ -3800,6 +3801,8 @@ async fn run_async() -> Result<()> {
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::start_if_idle_stopped(endpoint, &name, &cli.workspace, &tls)
+                                .await?;
                             if let Some(editor) = editor.map(Into::into) {
                                 run::sandbox_connect_editor(
                                     endpoint,

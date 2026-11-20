@@ -15,6 +15,7 @@ mod credential_gating;
 mod exec_cli;
 mod file_transfer;
 mod filesystem_policy;
+mod idle_stop;
 mod image;
 mod labels;
 mod lifecycle;

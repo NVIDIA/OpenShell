@@ -167,6 +167,23 @@ A provisioning timeout can be repaired by Stop after its original driver work
 settles and cleanup completes. Stop exposes Stopped without discarding the timeout
 diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
 
+## Idle stop
+
+Supervisor `SupervisorWorkloadActivity` reports become the `ProgramStatus`
+condition, in gateway time. The condition is written only when its state
+changes or terminal input moves its time forward by a minute, is fenced to the
+running main-process instance, survives driver snapshots, and is removed on
+every phase change.
+
+The restart loop, which runs only on the reconciler-lease holder, sweeps every
+30 seconds. A Ready sandbox whose program is idle, done, blocked, or in error
+is stopped once `idle_stop_after_seconds` (gateway scope, then sandbox scope)
+has elapsed since the later of that condition's time and the main-process
+start. The stop re-checks idleness under the lifecycle lock and records the
+`internal.openshell.ai/idle-stop` annotation with `IdleStopping`. That marker
+survives gateway recovery and settles the stop as `IdleStopped`. The next
+lifecycle transition removes it.
+
 ## Static credential delivery
 
 Existing polling and configuration-push environments keep their original wire

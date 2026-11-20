@@ -4,6 +4,7 @@
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
 pub mod driver_config;
+mod idle_stop;
 mod image_update;
 pub mod lease;
 mod mutation_guard;
@@ -59,7 +60,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, Notify, watch};
@@ -389,6 +390,15 @@ enum QuiesceOperation {
     Suspend,
 }
 
+/// Who asked for a quiesce operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuiesceCause {
+    /// A client request or gateway recovery.
+    Requested,
+    /// The idle sweep found the sandbox's program waiting past `timeout`.
+    Idle { timeout: Duration },
+}
+
 /// What an explicit quiesce request does with the current durable phase.
 enum QuiesceAdmission {
     /// The requested state is already durable.
@@ -421,15 +431,25 @@ impl QuiesceOperation {
         }
     }
 
-    const fn requested_condition(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Stop => ("Stopping", "Sandbox stop requested"),
-            Self::Suspend => ("Suspending", "Sandbox suspend requested"),
+    const fn requested_condition(self, cause: QuiesceCause) -> (&'static str, &'static str) {
+        match (self, cause) {
+            (Self::Stop, QuiesceCause::Idle { .. }) => (
+                idle_stop::IDLE_STOPPING_REASON,
+                "Sandbox stop requested after its program waited on the user past its idle timeout",
+            ),
+            (Self::Stop, QuiesceCause::Requested) => ("Stopping", "Sandbox stop requested"),
+            (Self::Suspend, _) => ("Suspending", "Sandbox suspend requested"),
         }
     }
 
-    const fn settled_condition(self) -> (&'static str, &'static str) {
+    /// The settled condition for `sandbox`, whose durable marker records
+    /// whether the idle sweep started the stop.
+    fn settled_condition(self, sandbox: &Sandbox) -> (&'static str, &'static str) {
         match self {
+            Self::Stop if idle_stop::idle_stop_marked(sandbox) => (
+                idle_stop::IDLE_STOPPED_REASON,
+                idle_stop::IDLE_STOPPED_MESSAGE,
+            ),
             Self::Stop => ("Stopped", "Sandbox compute is stopped"),
             Self::Suspend => (
                 "Suspended",
@@ -2079,8 +2099,13 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
-        self.quiesce_sandbox(QuiesceOperation::Stop, workspace, name)
-            .await
+        self.quiesce_sandbox(
+            QuiesceOperation::Stop,
+            QuiesceCause::Requested,
+            workspace,
+            name,
+        )
+        .await
     }
 
     /// Whether the configured compute driver retains sandbox memory state
@@ -2106,13 +2131,19 @@ impl ComputeRuntime {
         name: &str,
     ) -> Result<Sandbox, Status> {
         self.require_suspend_resume()?;
-        self.quiesce_sandbox(QuiesceOperation::Suspend, workspace, name)
-            .await
+        self.quiesce_sandbox(
+            QuiesceOperation::Suspend,
+            QuiesceCause::Requested,
+            workspace,
+            name,
+        )
+        .await
     }
 
     async fn quiesce_sandbox(
         &self,
         operation: QuiesceOperation,
+        cause: QuiesceCause,
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
@@ -2155,6 +2186,13 @@ impl ComputeRuntime {
                 QuiesceAdmission::Retry => break (current.clone(), current),
                 QuiesceAdmission::Begin => {}
             }
+            // Re-check under the lifecycle lock: input or a new turn since the
+            // sweep read the record keeps the sandbox running.
+            if let QuiesceCause::Idle { timeout } = cause
+                && idle_stop::idle_stop_due(&current, timeout, SystemTime::now()).is_none()
+            {
+                return Err(Status::aborted("sandbox is no longer idle"));
+            }
 
             let reclaimed_timeout = operation == QuiesceOperation::Stop
                 && current.phase() == SandboxPhase::Error as i32
@@ -2166,7 +2204,7 @@ impl ComputeRuntime {
                     "Timed-out compute has been reclaimed; sandbox stopped for repair",
                 )
             } else {
-                let (reason, message) = operation.requested_condition();
+                let (reason, message) = operation.requested_condition(cause);
                 (operation.in_flight_phase(), reason, message)
             };
             match self
@@ -3227,7 +3265,7 @@ impl ComputeRuntime {
                     operation.verb()
                 )));
             }
-            let (reason, message) = operation.settled_condition();
+            let (reason, message) = operation.settled_condition(&latest);
             match self
                 .write_lifecycle_phase(&latest, operation.settled_phase(), reason, message)
                 .await
@@ -5007,9 +5045,17 @@ impl ComputeRuntime {
     }
 
     async fn restart_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
+        // The idle sweep shares the restart loop's reconciler ownership.
+        let mut next_idle_sweep = tokio::time::Instant::now();
         loop {
             if let Err(err) = self.restart_due_sandboxes().await {
                 warn!(error = %err, "Sandbox restart sweep failed");
+            }
+            if tokio::time::Instant::now() >= next_idle_sweep {
+                next_idle_sweep = tokio::time::Instant::now() + idle_stop::SWEEP_INTERVAL;
+                if let Err(err) = Arc::clone(&self).stop_idle_sandboxes().await {
+                    warn!(error = %err, "Sandbox idle sweep failed");
+                }
             }
             tokio::select! {
                 () = tokio::time::sleep(RESTART_SCAN_INTERVAL) => {}
@@ -5061,6 +5107,147 @@ impl ComputeRuntime {
             }
             offset += u32::try_from(page_len).expect("restart scan page length is capped at 1000");
         }
+        Ok(())
+    }
+
+    /// Start an idle stop for every sandbox whose program has waited on the
+    /// user past its timeout. Each stop runs on its own task so a slow driver
+    /// does not delay restarts.
+    async fn stop_idle_sandboxes(self: Arc<Self>) -> Result<(), String> {
+        let now = SystemTime::now();
+        let global = crate::grpc::policy::global_idle_stop_after_seconds(&self.store)
+            .await
+            .map_err(|status| status.message().to_string())?;
+        let mut offset = 0;
+        loop {
+            let records = self
+                .store
+                .list_by_type(Sandbox::object_type(), 1000, offset)
+                .await
+                .map_err(|err| err.to_string())?;
+            let page_len = records.len();
+            for record in records {
+                let Ok(sandbox) = Sandbox::decode(record.payload.as_slice()) else {
+                    continue;
+                };
+                // Settings are read only for sandboxes already waiting.
+                if idle_stop::idle_since(&sandbox).is_none() {
+                    continue;
+                }
+                let setting = match crate::grpc::policy::idle_stop_after_seconds(
+                    &self.store,
+                    global,
+                    sandbox.object_workspace(),
+                    sandbox.object_name(),
+                )
+                .await
+                {
+                    Ok(setting) => setting,
+                    Err(status) => {
+                        debug!(sandbox_id = %sandbox.object_id(), error = %status.message(), "Failed to read idle stop setting");
+                        continue;
+                    }
+                };
+                let Some(timeout) = idle_stop::timeout_from_setting(setting) else {
+                    continue;
+                };
+                let Some(idle) = idle_stop::idle_stop_due(&sandbox, timeout, now) else {
+                    continue;
+                };
+                let runtime = Arc::clone(&self);
+                tokio::spawn(async move {
+                    let workspace = sandbox.object_workspace().to_string();
+                    let name = sandbox.object_name().to_string();
+                    let program = idle_stop::program_condition(&sandbox)
+                        .map(|condition| condition.message.clone())
+                        .unwrap_or_default();
+                    match runtime
+                        .quiesce_sandbox(
+                            QuiesceOperation::Stop,
+                            QuiesceCause::Idle { timeout },
+                            &workspace,
+                            &name,
+                        )
+                        .await
+                    {
+                        Ok(_) => info!(
+                            sandbox_id = %sandbox.object_id(),
+                            sandbox_name = %name,
+                            program = %program,
+                            idle_seconds = idle.as_secs(),
+                            "Stopped idle sandbox"
+                        ),
+                        Err(status) if status.code() == Code::Aborted => debug!(
+                            sandbox_id = %sandbox.object_id(),
+                            reason = %status.message(),
+                            "Skipped idle stop"
+                        ),
+                        Err(status) => warn!(
+                            sandbox_id = %sandbox.object_id(),
+                            sandbox_name = %name,
+                            error = %status.message(),
+                            "Idle sandbox stop failed"
+                        ),
+                    }
+                });
+            }
+            if page_len < 1000 {
+                break;
+            }
+            offset += u32::try_from(page_len).expect("idle scan page length is capped at 1000");
+        }
+        Ok(())
+    }
+
+    /// Record the program status a supervisor session reported as the
+    /// `ProgramStatus` condition. Writes only on state changes or coarse input
+    /// progress, and only for the running main-process instance.
+    pub async fn record_workload_activity(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+        report: &openshell_core::proto::SupervisorWorkloadActivity,
+    ) -> Result<(), String> {
+        let received = SystemTime::now();
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
+        let Some(existing) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let Some(status) = existing.status.as_ref() else {
+            return Ok(());
+        };
+        if status.phase != SandboxPhase::Ready as i32
+            || (!status.main_process_instance_id.is_empty()
+                && status.main_process_instance_id != instance_id)
+        {
+            return Ok(());
+        }
+        let next = idle_stop::condition_from_report(report, received);
+        let next = match idle_stop::merge_condition(idle_stop::program_condition(&existing), next) {
+            idle_stop::ConditionWrite::Keep => return Ok(()),
+            idle_stop::ConditionWrite::Set(condition) => Some(condition),
+            idle_stop::ConditionWrite::Remove => None,
+        };
+        let expected_resource_version = sandbox_resource_version(&existing);
+        let sandbox = self
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+                if let Some(status) = sandbox.status.as_mut() {
+                    status.conditions.retain(|condition| {
+                        condition.r#type != openshell_core::metadata::PROGRAM_STATUS_CONDITION
+                    });
+                    status.conditions.extend(next.clone());
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        self.sandbox_index.update_from_sandbox(&sandbox);
+        self.sandbox_watch_bus.notify(sandbox_id);
         Ok(())
     }
 
@@ -7872,6 +8059,18 @@ fn apply_driver_snapshot(
             .clone_from(&current_status.configuration_admission);
         status.configuration_activated = current_status.configuration_activated;
         status.provisioning.clone_from(&current_status.provisioning);
+        // Program status is gateway-owned and describes the running program,
+        // which a phase change ends.
+        if old_phase == phase
+            && let Some(program) = current_status.conditions.iter().find(|condition| {
+                condition.r#type == openshell_core::metadata::PROGRAM_STATUS_CONDITION
+            })
+        {
+            status.conditions.retain(|condition| {
+                condition.r#type != openshell_core::metadata::PROGRAM_STATUS_CONDITION
+            });
+            status.conditions.push(program.clone());
+        }
     }
     if old_phase != phase {
         info!(
@@ -7902,6 +8101,11 @@ fn apply_driver_snapshot(
         }
     }
 
+    // A snapshot of the stopped runtime reports why its container exited; an
+    // idle stop keeps its own reason so a connect can start the sandbox.
+    if phase == SandboxPhase::Stopped && idle_stop::idle_stop_marked(sandbox) {
+        upsert_ready_condition(&mut status, idle_stop::idle_stopped_condition());
+    }
     if let Some(metadata) = sandbox.metadata.as_mut() {
         metadata.name.clone_from(sandbox_name);
     }
@@ -8325,6 +8529,16 @@ fn apply_lifecycle_phase(
     // intent. A resuming start records a new one after this write.
     if let Some(metadata) = sandbox.metadata.as_mut() {
         metadata.annotations.remove(RESUME_INTENT_ANNOTATION);
+        // The idle marker lives from the idle stop request until the next
+        // lifecycle transition after the stop settles.
+        if reason == idle_stop::IDLE_STOPPING_REASON {
+            metadata.annotations.insert(
+                idle_stop::IDLE_STOP_ANNOTATION.to_string(),
+                "true".to_string(),
+            );
+        } else if phase != SandboxPhase::Stopped {
+            metadata.annotations.remove(idle_stop::IDLE_STOP_ANNOTATION);
+        }
     }
     // Explicit quiesce and start requests cancel any gateway-managed
     // automatic restart.
@@ -22197,5 +22411,217 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap();
         assert_eq!(starting.object_id(), "sb-ttl");
         assert_eq!(starting.phase(), i32::from(SandboxPhase::Starting));
+    }
+
+    fn program_report(
+        state: openshell_core::proto::WorkloadProgramState,
+        state_age_secs: i64,
+    ) -> openshell_core::proto::SupervisorWorkloadActivity {
+        openshell_core::proto::SupervisorWorkloadActivity {
+            state: state.into(),
+            app: "claude-code".into(),
+            state_age: Some(prost_types::Duration {
+                seconds: state_age_secs,
+                nanos: 0,
+            }),
+            reporting_terminals: 1,
+            ..Default::default()
+        }
+    }
+
+    fn idle_ready_record(id: &str, name: &str) -> Sandbox {
+        let mut sandbox = sandbox_record(id, name, SandboxPhase::Ready);
+        let status = sandbox.status.as_mut().unwrap();
+        status.main_process_instance_id = "instance-1".into();
+        status.configuration_activated = Some(true);
+        sandbox
+    }
+
+    async fn stored_sandbox(runtime: &ComputeRuntime, id: &str) -> Sandbox {
+        runtime
+            .store
+            .get_message::<Sandbox>(id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workload_activity_is_recorded_for_the_running_instance_and_survives_snapshots() {
+        use openshell_core::proto::WorkloadProgramState;
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = idle_ready_record("sb-activity", "sandbox-activity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        runtime
+            .record_workload_activity(
+                "sb-activity",
+                "instance-1",
+                &program_report(WorkloadProgramState::Done, 0),
+            )
+            .await
+            .unwrap();
+        let recorded = stored_sandbox(&runtime, "sb-activity").await;
+        let program = idle_stop::program_condition(&recorded).unwrap();
+        assert_eq!(program.reason, "Done");
+        assert_eq!(program.message, "claude-code is done");
+        let version = sandbox_resource_version(&recorded);
+
+        // A stale supervisor instance cannot change the record.
+        runtime
+            .record_workload_activity(
+                "sb-activity",
+                "instance-old",
+                &program_report(WorkloadProgramState::Working, 0),
+            )
+            .await
+            .unwrap();
+        // An unchanged state is not rewritten.
+        runtime
+            .record_workload_activity(
+                "sb-activity",
+                "instance-1",
+                &program_report(WorkloadProgramState::Done, 0),
+            )
+            .await
+            .unwrap();
+        let unchanged = stored_sandbox(&runtime, "sb-activity").await;
+        assert_eq!(sandbox_resource_version(&unchanged), version);
+        assert_eq!(
+            idle_stop::program_condition(&unchanged).unwrap().reason,
+            "Done"
+        );
+
+        // Driver snapshots rebuild conditions but keep the program status.
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox("sb-activity", "sandbox-activity"))
+            .await
+            .unwrap();
+        let observed = stored_sandbox(&runtime, "sb-activity").await;
+        assert_eq!(observed.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(
+            idle_stop::program_condition(&observed).unwrap().reason,
+            "Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_sweep_stops_waiting_sandboxes_and_start_clears_the_reason() {
+        use openshell_core::proto::WorkloadProgramState;
+        let driver = ControlledDriver::new();
+        let runtime = Arc::new(test_runtime(driver.clone()).await);
+        let idle = idle_ready_record("sb-idle", "sandbox-idle");
+        let busy = idle_ready_record("sb-busy", "sandbox-busy");
+        let unset = idle_ready_record("sb-unset", "sandbox-unset");
+        for sandbox in [&idle, &busy, &unset] {
+            runtime.store.put_message(sandbox).await.unwrap();
+            register_test_supervisor_session(&runtime, sandbox.object_id());
+        }
+        for (id, state) in [
+            ("sb-idle", WorkloadProgramState::Done),
+            ("sb-busy", WorkloadProgramState::Working),
+            ("sb-unset", WorkloadProgramState::Done),
+        ] {
+            runtime
+                .record_workload_activity(id, "instance-1", &program_report(state, 3600))
+                .await
+                .unwrap();
+        }
+        for name in ["sandbox-idle", "sandbox-busy"] {
+            crate::grpc::policy::put_int_setting_for_test(
+                &runtime.store,
+                Some(("default", name)),
+                openshell_core::settings::IDLE_STOP_AFTER_SECONDS_KEY,
+                60,
+            )
+            .await;
+        }
+
+        Arc::clone(&runtime).stop_idle_sandboxes().await.unwrap();
+        let mut stopped = stored_sandbox(&runtime, "sb-idle").await;
+        for _ in 0..200 {
+            if stopped.phase() == SandboxPhase::Stopped as i32 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stopped = stored_sandbox(&runtime, "sb-idle").await;
+        }
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        assert!(
+            stopped.idle_stopped(),
+            "idle stop settles with its own reason"
+        );
+        assert!(idle_stop::program_condition(&stopped).is_none());
+        assert_eq!(
+            driver.stop_calls(),
+            1,
+            "only the waiting sandbox with a timeout stops"
+        );
+        for id in ["sb-busy", "sb-unset"] {
+            assert_eq!(
+                stored_sandbox(&runtime, id).await.phase(),
+                SandboxPhase::Ready as i32
+            );
+        }
+
+        // A snapshot of the exited container keeps the idle reason.
+        let mut exited = ready_driver_sandbox("sb-idle", "sandbox-idle");
+        let condition = &mut exited.status.as_mut().unwrap().conditions[0];
+        condition.status = "False".to_string();
+        condition.reason = openshell_core::driver_utils::CONDITION_EXITED.to_string();
+        runtime.apply_sandbox_update(exited).await.unwrap();
+        let observed = stored_sandbox(&runtime, "sb-idle").await;
+        assert_eq!(observed.phase(), SandboxPhase::Stopped as i32);
+        assert!(
+            observed.idle_stopped(),
+            "driver snapshots keep the idle reason"
+        );
+
+        // A start clears the idle reason along with the durable marker.
+        let starting = runtime
+            .start_sandbox("default", "sandbox-idle")
+            .await
+            .unwrap();
+        assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+        assert!(!starting.idle_stopped());
+        assert!(!idle_stop::idle_stop_marked(&starting));
+    }
+
+    #[tokio::test]
+    async fn idle_stop_aborts_when_input_arrived_after_the_sweep_read() {
+        use openshell_core::proto::WorkloadProgramState;
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = idle_ready_record("sb-typed", "sandbox-typed");
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+        runtime
+            .record_workload_activity(
+                "sb-typed",
+                "instance-1",
+                &program_report(WorkloadProgramState::Working, 0),
+            )
+            .await
+            .unwrap();
+
+        let error = runtime
+            .quiesce_sandbox(
+                QuiesceOperation::Stop,
+                QuiesceCause::Idle {
+                    timeout: Duration::from_mins(1),
+                },
+                "default",
+                "sandbox-typed",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            stored_sandbox(&runtime, "sb-typed").await.phase(),
+            SandboxPhase::Ready as i32
+        );
     }
 }

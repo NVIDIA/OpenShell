@@ -136,6 +136,8 @@ pub struct SessionRuntimeContext {
     /// Peer endpoint of the gateway replica serving this supervisor's shared
     /// host. When set, sessions dial it instead of the configured address.
     pub gateway_home: Option<watch::Receiver<Option<String>>>,
+    /// Program status from workload terminals, reported to every session.
+    pub workload_activity: Option<Arc<crate::program_status::ProgramActivity>>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -432,6 +434,7 @@ pub fn spawn_with_readiness(
         config_apply_tx: runtime.config_apply_tx,
         config_push_updates: runtime.config_push_updates,
         gateway_home: runtime.gateway_home,
+        workload_activity: runtime.workload_activity,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -453,6 +456,7 @@ struct SessionConfig {
     /// reconnect to a gateway that does not push resumes polling.
     config_push_updates: watch::Sender<bool>,
     gateway_home: Option<watch::Receiver<Option<String>>>,
+    workload_activity: Option<Arc<crate::program_status::ProgramActivity>>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -792,6 +796,12 @@ async fn run_single_session(
     if let (Some(apply_tx), Some(bootstrap)) = (config_apply_tx, bootstrap) {
         spawn_config_apply(apply_tx.clone(), bootstrap, tx.clone(), &config.sandbox_id);
     }
+
+    // Each session starts with a full report; the task ends with the session.
+    let _activity_reporter = config
+        .workload_activity
+        .as_ref()
+        .map(|activity| crate::program_status::spawn_activity_reporter(activity, tx.clone()));
 
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));

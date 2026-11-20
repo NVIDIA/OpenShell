@@ -4,7 +4,7 @@
 //! Bounded stdin delivery without blocking the shared SSH session callback.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use openshell_isolation_interface::contract::BoundaryInput;
 use tokio::io::AsyncWriteExt;
@@ -54,9 +54,9 @@ pub(super) enum SendError {
     Closed,
 }
 
-impl InputSender {
-    pub(super) fn send(&self, bytes: &[u8]) -> Result<(), SendError> {
-        let mut buffer = self.0.buffer.lock().map_err(|_| SendError::Closed)?;
+impl Shared {
+    fn send(&self, bytes: &[u8]) -> Result<(), SendError> {
+        let mut buffer = self.buffer.lock().map_err(|_| SendError::Closed)?;
         if buffer.closed {
             return Err(SendError::Closed);
         }
@@ -65,8 +65,28 @@ impl InputSender {
         }
         buffer.bytes.extend(bytes);
         drop(buffer);
-        self.0.ready.notify_one();
+        self.ready.notify_one();
         Ok(())
+    }
+}
+
+impl InputSender {
+    pub(super) fn send(&self, bytes: &[u8]) -> Result<(), SendError> {
+        self.0.send(bytes)
+    }
+
+    /// A sender for supervisor-generated replies. It does not keep stdin open:
+    /// EOF still follows the client's sender.
+    pub(super) fn reply_handle(&self) -> ReplyHandle {
+        ReplyHandle(Arc::downgrade(&self.0))
+    }
+}
+
+pub(super) struct ReplyHandle(Weak<Shared>);
+
+impl ReplyHandle {
+    pub(super) fn send(&self, bytes: &[u8]) -> Result<(), SendError> {
+        self.0.upgrade().ok_or(SendError::Closed)?.send(bytes)
     }
 }
 

@@ -3157,6 +3157,15 @@ async fn handle_supervisor_message(
                 return false;
             }
         }
+        Some(supervisor_message::Payload::WorkloadActivity(report)) => {
+            if let Err(error) = state
+                .compute
+                .record_workload_activity(sandbox_id, &session.instance_id, &report)
+                .await
+            {
+                debug!(sandbox_id = %sandbox_id, %error, "failed to record workload activity");
+            }
+        }
         _ => {
             warn!(
                 sandbox_id = %sandbox_id,

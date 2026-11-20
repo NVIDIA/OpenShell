@@ -84,13 +84,44 @@ impl ObjectWorkspace for Sandbox {
     }
 }
 
+/// Ready condition reason of a sandbox stopped because its terminal program
+/// waited on the user longer than the sandbox's idle timeout.
+pub const IDLE_STOPPED_REASON: &str = "IdleStopped";
+
+/// Condition type for the program status workload terminals declare via OSC 7501.
+///
+/// Its reason is the state (`Idle`, `Working`, `Done`, `Blocked`, or `Error`),
+/// and its transition time is when the program began that state or a client
+/// last typed into a workload terminal, whichever is later.
+pub const PROGRAM_STATUS_CONDITION: &str = "ProgramStatus";
+
 impl Sandbox {
+    /// Whether the gateway stopped this sandbox for idleness, so connecting
+    /// may start it again.
+    pub fn idle_stopped(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| {
+            status.phase == crate::proto::SandboxPhase::Stopped as i32
+                && status
+                    .conditions
+                    .iter()
+                    .any(|c| c.r#type == "Ready" && c.reason == IDLE_STOPPED_REASON)
+        })
+    }
+
     pub fn phase(&self) -> i32 {
         self.status.as_ref().map_or(0, |s| s.phase)
     }
 
+    /// Set the lifecycle phase. A phase change ends the program whose status
+    /// was reported, so its condition is removed with it.
     pub fn set_phase(&mut self, phase: i32) {
-        self.status.get_or_insert_with(SandboxStatus::default).phase = phase;
+        let status = self.status.get_or_insert_with(SandboxStatus::default);
+        if status.phase != phase {
+            status
+                .conditions
+                .retain(|condition| condition.r#type != PROGRAM_STATUS_CONDITION);
+        }
+        status.phase = phase;
     }
 
     pub fn current_policy_version(&self) -> u32 {
