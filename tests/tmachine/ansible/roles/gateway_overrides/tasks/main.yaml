@@ -30,11 +30,12 @@
       - >-
         gateway_overrides_state == 'absent' or
         (gateway_overrides_content is defined and
-         gateway_overrides_content | trim | length > 0)
+         gateway_overrides_content | trim is match('\\['))
     fail_msg: >-
       gateway_overrides needs gateway_overrides_name (lowercase letters,
       digits and dashes), gateway_overrides_state present or absent, and
-      non-empty gateway_overrides_content unless the state is absent
+      gateway_overrides_content that starts with a table header, such as
+      `[openshell.gateway]`, unless the state is absent
 
 - name: Create the test configuration directory
   become: true
