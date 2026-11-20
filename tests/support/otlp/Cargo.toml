@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "otlp-support"
+description = "OTLP collector fixture for test suites whose gateway exports to a collector the test runs"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+[dependencies]
+openshell-otel-test-support = { path = "../../../crates/openshell-otel-test-support" }
+openshell-testkit = { path = "../../testkit/testkit" }

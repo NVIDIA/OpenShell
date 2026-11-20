@@ -23,6 +23,8 @@ never skips it. Add a row when you add a variable.
 | `OPENSHELL_TEST_KEYCLOAK_CLIENT_ID` | `<base>-keycloak` | `keycloak-support` | A client in that realm that allows password grants. |
 | `OPENSHELL_TEST_KEYCLOAK_USERNAME` | `<base>-keycloak` | `keycloak-support` | The realm user that tests sign in as. |
 | `OPENSHELL_TEST_KEYCLOAK_PASSWORD` | `<base>-keycloak` | `keycloak-support` | That user's password. |
+| `OPENSHELL_TEST_OTLP_LISTEN` | `<podman base>-otlp` (`playbooks/otlp.yaml`) | `otlp-support` | The address the test's OTLP/gRPC collector listens on, such as `0.0.0.0:4317`. |
+| `OPENSHELL_TEST_OTLP_ENDPOINT` | `<podman base>-otlp` | `otlp-support` | The collector endpoint in the gateway's `[openshell.gateway.otlp]`, which also enables the agent trace relay. Tests check that sandboxes never see it. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which configures the gateway's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the gateway trusts. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | The additional-CA environment | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |
