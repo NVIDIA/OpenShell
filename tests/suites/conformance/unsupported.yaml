@@ -17,4 +17,8 @@
 # the bug. A test can appear more than once with different issues, but not twice
 # for one environment. Branch Checks runs the program with each environment's
 # entries to validate this file; see tests/suites/conformance/README.md.
-[]
+# The VM driver can't recover the preserved overlay disk on restart.
+- test: conformance::lifecycle::on_failure_policy_restarts_main_and_keeps_workspace
+  issue: https://github.com/NVIDIA/OpenShell/issues/5507
+  environments:
+    - vm

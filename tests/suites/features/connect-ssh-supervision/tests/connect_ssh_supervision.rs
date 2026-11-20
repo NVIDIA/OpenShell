@@ -12,8 +12,6 @@
 //! CI runs them on Docker only. Through a Kubernetes port-forward, the
 //! reconnect can attach read-only while the old SSH session still owns input
 //! (#4445).
-//!
-//! Ported from `e2e/rust/tests/sandbox_lifecycle.rs`.
 
 use std::time::Duration;
 
