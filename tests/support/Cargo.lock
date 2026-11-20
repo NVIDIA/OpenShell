@@ -3741,6 +3741,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "spiffe-support"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures-util",
+ "hex",
+ "jsonwebtoken",
+ "openshell-crypto",
+ "openshell-testkit",
+ "prost",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tower",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

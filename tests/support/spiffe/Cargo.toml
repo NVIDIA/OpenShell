@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "spiffe-support"
+description = "SPIFFE Workload API fixtures for test suites whose gateway and supervisors use Workload APIs the test runs"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+futures-util = "0.3"
+hex = "0.4"
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
+openshell-crypto = { path = "../../../crates/openshell-crypto" }
+openshell-testkit = { path = "../../testkit/testkit" }
+prost = "0.14"
+serde_json = "1"
+tokio = { version = "1.43", features = ["net", "rt", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server"] }
+tonic-prost = "0.14"
+tower = "0.5"

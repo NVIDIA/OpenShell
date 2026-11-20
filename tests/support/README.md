@@ -25,6 +25,8 @@ never skips it. Add a row when you add a variable.
 | `OPENSHELL_TEST_KEYCLOAK_PASSWORD` | `<base>-keycloak` | `keycloak-support` | That user's password. |
 | `OPENSHELL_TEST_OTLP_LISTEN` | `<podman base>-otlp` (`playbooks/otlp.yaml`) | `otlp-support` | The address the test's OTLP/gRPC collector listens on, such as `0.0.0.0:4317`. |
 | `OPENSHELL_TEST_OTLP_ENDPOINT` | `<podman base>-otlp` | `otlp-support` | The collector endpoint in the gateway's `[openshell.gateway.otlp]`, which also enables the agent trace relay. Tests check that sandboxes never see it. |
+| `OPENSHELL_TEST_SPIFFE_GATEWAY_LISTEN` | `<podman base>-spiffe` (`playbooks/spiffe.yaml`) | `spiffe-support` | The Unix socket the test's gateway Workload API listens on. The gateway's `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET` names it. |
+| `OPENSHELL_TEST_SPIFFE_SUPERVISOR_LISTEN` | `<podman base>-spiffe` | `spiffe-support` | The TCP address the test's supervisor Workload API listens on, such as `0.0.0.0:17690`. The driver's `provider_spiffe_workload_api_socket` reaches it as `tcp:127.0.0.1:<port>`. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_CERT` | The additional-CA environment, which configures the gateway's `additional_ca_bundle` (added by #5729) | `host-server-support` (`TestCa::from_env`) | The path of the CA certificate, in PEM, that the gateway trusts. |
 | `OPENSHELL_TEST_ADDITIONAL_CA_KEY` | The additional-CA environment | `host-server-support` (`TestCa::from_env`) | The path of that CA's private key, in PEM, readable by the test user. Tests sign server certificates with it. |
 | `OPENSHELL_TEST_BASE_IMAGE` | Optional; you, for example to use a mirror | `testkit::base_image()` | The default sandbox image. Unset, it is `nvcr.io/nvidia/base/ubuntu:24.04`. |
