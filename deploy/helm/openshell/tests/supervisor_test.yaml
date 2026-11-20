@@ -79,7 +79,7 @@ tests:
         documentIndex: 0
       - equal:
           path: spec.replicas
-          value: 2
+          value: 1
         documentIndex: 0
       - equal:
           path: spec.template.metadata.labels["app.kubernetes.io/name"]
@@ -322,7 +322,7 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
-  - it: runs two replicas as a high-availability pool by default
+  - it: runs one replica as a high-availability pool by default
     template: templates/supervisor.yaml
     set:
       gatewayConfig:
@@ -346,7 +346,7 @@ tests:
         template: templates/supervisor-pdb.yaml
       - equal:
           path: spec.replicas
-          value: 2
+          value: 1
         documentIndex: 0
       - notExists:
           path: spec.template.spec.containers[0].resources
