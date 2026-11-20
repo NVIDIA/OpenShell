@@ -3071,6 +3071,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "provider-rotation"
+version = "0.0.0"
+dependencies = [
+ "host-server-support",
+ "openshell-testkit",
+ "rand 0.9.4",
+ "serde_json",
+]
+
+[[package]]
 name = "provider-token-exchange"
 version = "0.0.0"
 dependencies = [
