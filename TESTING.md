@@ -337,6 +337,15 @@ nix run .#openshell-test-runner -- run \
   --family features --package keycloak-provider-refresh
 ```
 
+The `oidc-auth` suite runs in `ubuntu-docker-rootful-oidc`, which adds a gateway
+that trusts the Keycloak realm and gives testkit an operator client certificate:
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful-oidc --installer deb \
+  --family features --package oidc-auth
+```
+
 A suite that needs setup beyond a container engine runs in a feature
 environment, named `<base>-<feature>`, such as `ubuntu-docker-rootful-keycloak`
 or `ubuntu-docker-rootful-cdi`. `features` in `tests/tmachine/config.nix` lists
