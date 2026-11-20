@@ -4726,7 +4726,6 @@ name = "workloads"
 version = "0.0.0"
 dependencies = [
  "openshell-testkit",
- "tempfile",
 ]
 
 [[package]]

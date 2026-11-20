@@ -22,6 +22,5 @@ test = false
 
 [dependencies]
 openshell-testkit = { path = "../../testkit/testkit" }
-tempfile = "3"
 
 [workspace]

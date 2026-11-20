@@ -944,8 +944,6 @@ Use `test:e2e` for Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, w
 
 Add `test:e2e-kubernetes` for gateway high availability or Kubernetes Secrets and Vault credential driver storage. It runs only the HA and credential-driver suites, so apply it alongside `test:e2e` when other Kubernetes coverage is also needed.
 
-Add `test:e2e-workloads` for changes to the workloads suite (`tests/suites/workloads`) or its tmachine environments. It runs only that suite, so apply it alongside `test:e2e` when other coverage is also needed.
-
 Apply `test:windows` whenever a PR affects Windows support. This includes Windows or MSVC CI and `mise` tasks, Windows lock-file platform entries, the MXC driver, and `cfg(windows)` implementations or tests in otherwise cross-platform crates. Apply it alongside any applicable E2E label; it is not a substitute for runtime coverage.
 
 After applying a `test:*` label, read the bot comment that is posted by the E2E Label Help workflow and follow its instructions.
