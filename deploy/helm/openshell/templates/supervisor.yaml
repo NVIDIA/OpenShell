@@ -96,6 +96,14 @@ spec:
             - {{ printf "%s:%v" $listenHost (get $shared "runtime_port") | quote }}
             - --session-root
             - /run/openshell/sessions
+            {{- with get $kubernetes "policy_dns_ipv6_egress" }}
+            - --policy-dns-ipv6-egress
+            - {{ . | quote }}
+            {{- end }}
+            {{- range get $kubernetes "nat64_prefixes" | default list }}
+            - --nat64-prefix
+            - {{ . | quote }}
+            {{- end }}
           env:
             {{- if get $app "enabled" }}
             - name: OPENSHELL_APP_LISTENER_ENABLED

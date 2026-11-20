@@ -1546,6 +1546,8 @@ The Kubernetes, Docker, Podman, and MicroVM driver tables accept two keys that t
 - `policy_dns_ipv6_egress` sets how mediated policy DNS answers AAAA queries: `auto` (default), `enabled`, or `disabled`. `auto` answers AAAA only when the supervisor network namespace has an IPv6 default route and no IPv4 default route. `disabled` answers AAAA with an empty response so dual-stack clients fall back to IPv4.
 - `nat64_prefixes` lists the NAT64 prefixes of the sandbox network as RFC 6052 CIDRs (`/32`, `/40`, `/48`, `/56`, `/64`, or `/96`). The supervisor applies the IPv4 SSRF rules to the IPv4 address embedded in any destination inside these prefixes. It always recognizes the well-known prefix `64:ff9b::/96` and also discovers the network prefix through `ipv4only.arpa` (RFC 7050), so set this key when the network uses a prefix that discovery cannot find.
 
+With `supervisor_topology = "gateway"`, the Helm chart passes the Kubernetes keys to the shared supervisors.
+
 The gateway rejects an unknown mode or a malformed prefix at startup.
 
 ```toml

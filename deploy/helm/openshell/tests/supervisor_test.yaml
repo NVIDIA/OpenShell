@@ -46,6 +46,35 @@ tests:
           path: spec.template.spec.containers[0].args[8]
           value: "[::]:5500"
         documentIndex: 0
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --policy-dns-ipv6-egress
+        documentIndex: 0
+  - it: passes the driver policy DNS IPv6 settings to the supervisor pool
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          policy_dns_ipv6_egress: enabled
+          nat64_prefixes: ["2001:db8:64::/96"]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args[11]
+          value: --policy-dns-ipv6-egress
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].args[12]
+          value: enabled
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].args[13]
+          value: --nat64-prefix
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].args[14]
+          value: 2001:db8:64::/96
+        documentIndex: 0
   - it: deploys the supervisor pool without Kubernetes identity in the gateway namespace
     template: templates/supervisor.yaml
     set:
