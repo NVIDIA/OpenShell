@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "otlp-relay"
+description = "Features suite: the supervisor's agent trace relay, with and without a collector"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+openshell-testkit = { path = "../../../testkit/testkit" }
+otlp-support = { path = "../../../support/otlp" }
