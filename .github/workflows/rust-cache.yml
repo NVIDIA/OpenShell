@@ -34,7 +34,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest-8-cores
+          - runner: ubuntu-24.04
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -70,7 +70,7 @@ jobs:
   # Restored by build-e2e-bundles in branch-e2e.yml.
   e2e-bundles:
     name: E2E suite bundles cache (x86_64-unknown-linux-musl)
-    runs-on: ubuntu-latest-8-cores
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
