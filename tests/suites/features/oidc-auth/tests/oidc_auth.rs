@@ -835,6 +835,7 @@ fn provider_request(workspace: &str, name: &str, profile: &str) -> proto::Create
                 ..Default::default()
             }),
             r#type: profile.to_string(),
+            profile_workspace: workspace.to_string(),
             credentials: [(CREDENTIAL_ENV.to_string(), CREDENTIAL_VALUE.to_string())].into(),
             ..Default::default()
         }),
