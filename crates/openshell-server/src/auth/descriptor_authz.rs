@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use openshell_ocsf::ActivityId;
 use prost_reflect::{DescriptorPool, Value};
 
 use super::method_authz::{AuthMode, Role};
@@ -36,6 +37,8 @@ const SCOPE_ONLY_METHODS: &[&str] = &["/openshell.v1.OpenShell/GetGatewayConfig"
 pub struct DescriptorAuthEntry {
     pub auth_mode: AuthMode,
     pub scope: Option<String>,
+    /// The API Activity recorded for each call, when the method is audited.
+    pub audit: Option<ActivityId>,
     pub workspace_role: Option<String>,
     pub global_role: Option<String>,
 }
@@ -117,6 +120,7 @@ impl DescriptorAuthTable {
                 let workspace_role_str = string_field(auth_msg, "workspace_role");
                 let global_role_str = string_field(auth_msg, "global_role");
                 let scope_str = string_field(auth_msg, "scope");
+                let audit_str = string_field(auth_msg, "audit");
 
                 let auth_mode = match auth_mode_str.as_str() {
                     "unauthenticated" => AuthMode::Unauthenticated,
@@ -143,11 +147,14 @@ impl DescriptorAuthTable {
                     scope.as_deref(),
                 )?;
 
+                let audit = audit_activity(&path, scope.as_deref(), &audit_str)?;
+
                 entries.insert(
                     path,
                     DescriptorAuthEntry {
                         auth_mode,
                         scope,
+                        audit,
                         workspace_role,
                         global_role,
                     },
@@ -220,6 +227,35 @@ fn validate_entry(
     }
 
     Ok(())
+}
+
+/// The audit activity a method declares. A write-scoped method must declare
+/// one; `read` marks a read the gateway audits because it returns secrets.
+fn audit_activity(
+    path: &str,
+    scope: Option<&str>,
+    audit: &str,
+) -> Result<Option<ActivityId>, String> {
+    let activity = match audit {
+        "" => None,
+        "create" => Some(ActivityId::Open),
+        "update" => Some(ActivityId::Reset),
+        "delete" => Some(ActivityId::Fail),
+        "other" => Some(ActivityId::Other),
+        "read" => Some(ActivityId::Close),
+        other => {
+            return Err(format!(
+                "method {path}: unknown audit '{other}' (expected one of create, update, delete, other, read)"
+            ));
+        }
+    };
+    let writes = scope.is_some_and(|scope| scope.ends_with(":write"));
+    if writes && matches!(audit, "" | "read") {
+        return Err(format!(
+            "method {path}: write-scoped method must declare audit create, update, delete, or other"
+        ));
+    }
+    Ok(activity)
 }
 
 fn string_field(msg: &prost_reflect::DynamicMessage, name: &str) -> String {
@@ -321,6 +357,21 @@ mod tests {
             err,
             "method /openshell.v1.OpenShell/FutureRpc: bearer method declares no role and no scope"
         );
+    }
+
+    #[test]
+    fn write_scoped_rpc_must_declare_audit() {
+        let err = audit_activity(FUTURE_RPC, Some("sandbox:write"), "")
+            .expect_err("write-scoped RPC without audit must be rejected");
+        assert!(err.contains("must declare audit"));
+        assert!(audit_activity(FUTURE_RPC, Some("sandbox:write"), "read").is_err());
+        assert!(audit_activity(FUTURE_RPC, Some("sandbox:write"), "create").is_ok());
+        assert_eq!(
+            audit_activity(FUTURE_RPC, Some("sandbox:read"), "").unwrap(),
+            None
+        );
+        assert!(audit_activity(FUTURE_RPC, None, "read").unwrap().is_some());
+        assert!(audit_activity(FUTURE_RPC, None, "bogus").is_err());
     }
 
     #[test]
