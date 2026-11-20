@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use testkit::{Poll, Result, ResultExt as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 
-use crate::{MAX_REQUEST, READ_TIMEOUT, WAIT_INTERVAL, WAIT_TIMEOUT, bind, find};
+use crate::{MAX_REQUEST, READ_TIMEOUT, Server, WAIT_INTERVAL, WAIT_TIMEOUT, find};
 
 /// How long a [`TcpServer::reply_when_idle`] connection waits for more bytes
 /// before it answers.
@@ -21,8 +19,7 @@ const IDLE: Duration = Duration::from_millis(200);
 pub struct TcpServer {
     pub port: u16,
     received: Arc<Mutex<Vec<u8>>>,
-    connections: Arc<AtomicUsize>,
-    task: JoinHandle<()>,
+    server: Server,
 }
 
 #[derive(Clone)]
@@ -45,22 +42,15 @@ impl TcpServer {
     }
 
     async fn start(mode: Mode) -> Result<Self> {
-        let (listener, port) = bind().await?;
         let received = Arc::new(Mutex::new(Vec::new()));
-        let connections = Arc::new(AtomicUsize::new(0));
         let task_received = Arc::clone(&received);
-        let task_connections = Arc::clone(&connections);
-        let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                task_connections.fetch_add(1, Ordering::AcqRel);
-                tokio::spawn(serve(stream, mode.clone(), Arc::clone(&task_received)));
-            }
-        });
+        let server =
+            Server::start(move |stream| serve(stream, mode.clone(), Arc::clone(&task_received)))
+                .await?;
         Ok(Self {
-            port,
+            port: server.port,
             received,
-            connections,
-            task,
+            server,
         })
     }
 
@@ -74,7 +64,7 @@ impl TcpServer {
 
     /// The number of connections the server has accepted.
     pub fn connections(&self) -> usize {
-        self.connections.load(Ordering::Acquire)
+        self.server.connections()
     }
 
     /// The bytes the server has read, once they contain `needle`.
@@ -127,12 +117,6 @@ pub async fn exchange(port: u16, request: &[u8]) -> Result<Vec<u8>> {
         })?
         .context(format!("read from 127.0.0.1:{port}"))?;
     Ok(reply)
-}
-
-impl Drop for TcpServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 async fn serve(mut stream: TcpStream, mode: Mode, received: Arc<Mutex<Vec<u8>>>) {

@@ -68,9 +68,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   `create()` it or `create_ready()` to also wait for Ready. Set its image
   with `image(..)`, its policy with `policy(..)`, its providers with
   `providers(..)`, and the template's driver-keyed `driver_config(json)`. A
-  long-running sandbox is `.command(["sleep", "infinity"])`; add
-  `.image(testkit::python_image())` when a test runs Python clients in it. The
-  returned
+  long-running sandbox is `.command(["sleep", "infinity"])`.
+  `cx.python_sandbox(suffix, policy)` builds one from
+  `testkit::python_image()` with `policy`, for tests that run Python clients
+  in it. The returned
   `Sandbox` can wait for ready or finished, stop, start, exec or
   `poll_exec` until the output matches, read its config and draft policy, set
   a setting, read `sandbox get` JSON with `get_json()`, read its policy
@@ -128,7 +129,8 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   into policy YAML a test writes by hand. `policy::base_with(yaml)` adds YAML
   sections, such as L7 rules, to the base policy. `policy::from_yaml` reads a
   policy file, and `policy::set(&sandbox, &policy)` replaces a running
-  sandbox's policy and waits until it is loaded.
+  sandbox's policy and waits until it is loaded. `policy::try_set` returns
+  the CLI output instead, for a policy the gateway should reject.
   `testkit::PYTHON_BINARIES` names `python3` in `python_image()` images.
 - `cx.import_profile(profile)` to import a provider profile and return its
   `id`, and `cx.create_provider(name, type, credentials)` to create a
@@ -137,8 +139,9 @@ fails. A killed test process skips cleanup, so names are unique to the run.
 - `testkit::YamlFile` for YAML a CLI command reads from a file.
 - `cx.client()` for SDK calls testkit does not wrap.
 - In `tests/support`: `host-server` starts servers on the machine that runs
-  the tests, which sandboxes reach as `host_server_support::TEST_HOST`, and
-  `sandbox-clients` runs clients in a sandbox: `connect`, `http` and
+  the tests, which sandboxes reach as `host_server_support::TEST_HOST`
+  (`host_server_support::allow_host(&mut policy, name, port)` lets
+  `PYTHON_BINARIES` reach one), and `sandbox-clients` runs clients in a sandbox: `connect`, `http` and
   `http_raw` return typed results, and `scripts` holds client scripts for
   `run_python`.
 - `?` and `.context(..)` on I/O, JSON, YAML, SDK and gRPC results, which

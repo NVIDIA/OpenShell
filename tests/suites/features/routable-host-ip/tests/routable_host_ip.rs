@@ -19,7 +19,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
-use host_server_support::{HttpRecorder, TEST_HOST};
+use host_server_support::{HttpRecorder, TEST_HOST, allow_host};
 use sandbox_clients_support::{Request, http};
 use testkit::policy;
 use testkit::{Context, PYTHON_BINARIES};
@@ -31,18 +31,9 @@ async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Resul
     let explicit = HttpRecorder::start("explicit").await?;
     let implicit = HttpRecorder::start("implicit").await?;
     let mut name_policy = policy::base();
-    policy::allow(
-        &mut name_policy,
-        "by_name",
-        TEST_HOST,
-        explicit.port,
-        PYTHON_BINARIES,
-    );
+    allow_host(&mut name_policy, "by_name", explicit.port);
     let sandbox = cx
-        .sandbox("hstip")
-        .policy(name_policy)
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
+        .python_sandbox("hstip", name_policy)
         .create_ready()
         .await?;
     let reply = http(

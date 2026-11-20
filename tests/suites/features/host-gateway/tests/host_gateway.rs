@@ -9,10 +9,10 @@
 //! Python test image ([`testkit::python_image`]) that requests a page from that
 //! server through the name.
 
-use host_server_support::{HttpRecorder, TEST_HOST};
+use host_server_support::{HttpRecorder, TEST_HOST, allow_host};
 use testkit::policy;
 use testkit::sdk::raw::proto;
-use testkit::{Context, PYTHON_BINARIES, ResultExt as _};
+use testkit::{Context, ResultExt as _};
 
 /// The image's Python, which needs nothing beyond its standard library. The
 /// policy allows [`PYTHON_BINARIES`], the real paths behind `python3` in
@@ -76,6 +76,6 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
 /// name is what makes it reachable, not an `allowed_ips` range.
 fn policy(port: u16) -> proto::SandboxPolicy {
     let mut policy = policy::base();
-    policy::allow(&mut policy, "host_server", TEST_HOST, port, PYTHON_BINARIES);
+    allow_host(&mut policy, "host_server", port);
     policy
 }

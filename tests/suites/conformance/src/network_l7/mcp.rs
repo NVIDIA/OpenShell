@@ -16,6 +16,9 @@ use host_server_support::{HttpRecorder, Request, Response, TEST_HOST};
 use sandbox_clients_support::scripts::MCP_CLIENT;
 use serde_json::{Value, json};
 use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, policy};
+
+/// The sessionless MCP revision, which needs no initialization and carries
+/// request metadata in headers and `_meta`.
 const SESSIONLESS: &str = "2026-07-28";
 
 /// The sessionless revision: discovery, an allowed and a denied tool, and a
@@ -49,52 +52,47 @@ async fn run_profile(cx: &Context, suffix: &str, versions: &[&str]) -> Result {
     let server =
         HttpRecorder::serve(move |request| fixture(request, &supported, &received)).await?;
 
-    let legacy_rules = if versions.iter().any(|version| *version != SESSIONLESS) {
-        "          - allow:\n              method: initialize\n          - allow:\n              method: notifications/initialized\n"
-    } else {
-        ""
-    };
-    let versions_json = serde_json::to_string(versions).context("encode the MCP revisions")?;
-    let policy = policy::base_with(&format!(
-        r"network_policies:
-  mcp:
-    name: mcp
-    endpoints:
-      - host: {TEST_HOST}
-        port: {port}
-        path: /mcp
-        protocol: mcp
-        enforcement: enforce
-        mcp:
-          versions: {versions_json}
-          max_body_bytes: 65536
-        rules:
-{legacy_rules}          - allow:
-              method: server/discover
-          - allow:
-              method: tools/call
-              tool: read_status
-          - allow:
-              method: subscriptions/listen
-        deny_rules:
-          - method: tools/call
-            tool: read_details
-    binaries: {binaries}
-",
-        port = server.port,
-        binaries = policy::binaries_yaml(PYTHON_BINARIES),
-    ))?;
-    let sandbox = cx
-        .sandbox(suffix)
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy)
-        .create_ready()
-        .await?;
+    let mut rules = Vec::new();
+    if versions.iter().any(|version| *version != SESSIONLESS) {
+        rules.push(json!({"allow": {"method": "initialize"}}));
+        rules.push(json!({"allow": {"method": "notifications/initialized"}}));
+    }
+    rules.extend([
+        json!({"allow": {"method": "server/discover"}}),
+        json!({"allow": {"method": "tools/call", "tool": "read_status"}}),
+        json!({"allow": {"method": "subscriptions/listen"}}),
+    ]);
+    let binaries: Vec<Value> = PYTHON_BINARIES
+        .iter()
+        .map(|path| json!({"path": path}))
+        .collect();
+    let rule = json!({
+        "mcp": {
+            "name": "mcp",
+            "endpoints": [{
+                "host": TEST_HOST,
+                "port": server.port,
+                "path": "/mcp",
+                "protocol": "mcp",
+                "enforcement": "enforce",
+                "mcp": {"versions": versions, "max_body_bytes": 65536},
+                "rules": rules,
+                "deny_rules": [{"method": "tools/call", "tool": "read_details"}],
+            }],
+            "binaries": binaries,
+        }
+    });
+    // JSON is YAML, so the rule can follow the base policy's YAML.
+    let policy = policy::base_with(&format!("network_policies: {rule}\n"))?;
+    let sandbox = cx.python_sandbox(suffix, policy).create_ready().await?;
     let output = sandbox
         .run_python(
             MCP_CLIENT,
-            &[TEST_HOST, &server.port.to_string(), &versions_json],
+            &[
+                TEST_HOST,
+                &server.port.to_string(),
+                &json!(versions).to_string(),
+            ],
         )
         .await
         .context(format!("MCP revisions {versions:?}"))?;
@@ -131,12 +129,11 @@ fn fixture(request: &Request, supported: &[String], received: &Mutex<Vec<Value>>
         received.push(json!([version, method, params.get("name")]));
         received.clone()
     };
-    let Some(version) = version.filter(|version| supported.contains(version)) else {
+    let Some(version) =
+        version.filter(|version| request.path() == "/mcp" && supported.contains(version))
+    else {
         return bad_request("request revision did not reach the fixture intact");
     };
-    if request.path() != "/mcp" {
-        return bad_request("request revision did not reach the fixture intact");
-    }
     let sessionless = version == SESSIONLESS;
     if sessionless {
         let meta = &params["_meta"];

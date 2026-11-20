@@ -5,8 +5,11 @@
 //! traffic it leaves alone, and listening sockets whose lifetime it must not
 //! extend.
 //!
-//! Ported from the `bypass_detection`, `listener_lifetime`, and `no_proxy`
-//! e2e tests, and the destination denials in `proxy_egress_pipeline`.
+//! Ported from the e2e tests this change removes from `e2e/rust/tests/`:
+//! `bypass_detection.rs`, `listener_lifetime.rs`, `no_proxy.rs` (its
+//! `sandbox_reaches_localhost_without_proxy_environment` is
+//! [`localhost_is_reachable_without_proxy_environment`]), and the
+//! destination denials in `proxy_egress_pipeline.rs`.
 
 use std::time::Duration;
 
@@ -22,10 +25,7 @@ const EACCES: i32 = 13;
 #[testkit::test]
 async fn direct_connect_bypass_is_denied_promptly(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("bypas")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy::base())
+        .python_sandbox("bypas", policy::base())
         .create_ready()
         .await?;
     let probe = connect(&sandbox, "198.51.100.1", 80).await?;
@@ -63,13 +63,7 @@ async fn reserved_destinations_fail_with_eacces_even_when_allowed(
 "#,
         binaries = policy::binaries_yaml(PYTHON_BINARIES),
     ))?;
-    let sandbox = cx
-        .sandbox("deny")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy)
-        .create_ready()
-        .await?;
+    let sandbox = cx.python_sandbox("deny", policy).create_ready().await?;
     for (destination, host, port) in [
         ("metadata", "169.254.169.254", 80),
         ("control_plane", "203.0.113.10", 6443),
@@ -89,10 +83,7 @@ async fn reserved_destinations_fail_with_eacces_even_when_allowed(
 #[testkit::test]
 async fn localhost_is_reachable_without_proxy_environment(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("local")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy::base())
+        .python_sandbox("local", policy::base())
         .create_ready()
         .await?;
     let result = sandbox
@@ -112,10 +103,7 @@ async fn localhost_is_reachable_without_proxy_environment(cx: &mut Context) -> t
 #[testkit::test]
 async fn closed_or_exited_listener_releases_its_port(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("lsten")
-        .image(testkit::python_image())
-        .command(["sleep", "infinity"])
-        .policy(policy::base())
+        .python_sandbox("lsten", policy::base())
         .create_ready()
         .await?;
     let inode = sandbox

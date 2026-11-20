@@ -23,10 +23,14 @@ mod http;
 mod tcp;
 mod websocket;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use testkit::{Result, ResultExt as _};
-use tokio::net::TcpListener;
+use testkit::sdk::raw::proto;
+use testkit::{PYTHON_BINARIES, Result, ResultExt as _, policy};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 pub use http::{HttpRecorder, Request, Response};
 pub use tcp::{TcpServer, exchange};
@@ -34,6 +38,16 @@ pub use websocket::{TEXT_REPLY, WebSocketRecorder};
 
 /// The name a sandbox reaches these servers by.
 pub const TEST_HOST: &str = "host.openshell.internal";
+
+/// Let [`PYTHON_BINARIES`] reach a server on the test host at `port` under
+/// the network policy `name`; see [`policy::allow`].
+pub fn allow_host<'a>(
+    policy: &'a mut proto::SandboxPolicy,
+    name: &str,
+    port: u16,
+) -> &'a mut proto::NetworkEndpoint {
+    policy::allow(policy, name, TEST_HOST, port, PYTHON_BINARIES)
+}
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_INTERVAL: Duration = Duration::from_millis(100);
@@ -49,6 +63,47 @@ async fn bind() -> Result<(TcpListener, u16)> {
         .context("read the host server's address")?
         .port();
     Ok((listener, port))
+}
+
+/// An accept loop on a new port that hands each connection to its own task,
+/// counts the connections, and stops when dropped.
+struct Server {
+    port: u16,
+    connections: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl Server {
+    async fn start<F, Fut>(serve: F) -> Result<Self>
+    where
+        F: Fn(TcpStream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (listener, port) = bind().await?;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let task_connections = Arc::clone(&connections);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                task_connections.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(serve(stream));
+            }
+        });
+        Ok(Self {
+            port,
+            connections,
+            task,
+        })
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// A port that nothing on the test host listened on when this returned.

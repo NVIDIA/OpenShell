@@ -3,15 +3,13 @@
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use testkit::{Poll, Result};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 
-use crate::{MAX_REQUEST, READ_TIMEOUT, WAIT_INTERVAL, WAIT_TIMEOUT, bind, find, header};
+use crate::{MAX_REQUEST, READ_TIMEOUT, Server, WAIT_INTERVAL, WAIT_TIMEOUT, find, header};
 
 /// A request an [`HttpRecorder`] read. A chunked body arrives decoded.
 #[derive(Clone, Debug)]
@@ -157,8 +155,7 @@ type Handler = dyn Fn(&Request) -> Response + Send + Sync;
 pub struct HttpRecorder {
     pub port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
-    connections: Arc<AtomicUsize>,
-    task: JoinHandle<()>,
+    server: Server,
 }
 
 impl HttpRecorder {
@@ -172,27 +169,17 @@ impl HttpRecorder {
     pub async fn serve(
         handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
     ) -> Result<Self> {
-        let (listener, port) = bind().await?;
         let handler: Arc<Handler> = Arc::new(handler);
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let connections = Arc::new(AtomicUsize::new(0));
         let task_requests = Arc::clone(&requests);
-        let task_connections = Arc::clone(&connections);
-        let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                task_connections.fetch_add(1, Ordering::AcqRel);
-                tokio::spawn(respond(
-                    stream,
-                    Arc::clone(&handler),
-                    Arc::clone(&task_requests),
-                ));
-            }
-        });
+        let server = Server::start(move |stream| {
+            respond(stream, Arc::clone(&handler), Arc::clone(&task_requests))
+        })
+        .await?;
         Ok(Self {
-            port,
+            port: server.port,
             requests,
-            connections,
-            task,
+            server,
         })
     }
 
@@ -206,7 +193,7 @@ impl HttpRecorder {
 
     /// The number of connections the server has accepted.
     pub fn connections(&self) -> usize {
-        self.connections.load(Ordering::Acquire)
+        self.server.connections()
     }
 
     /// The requests the server has read, once there are at least `count`.
@@ -228,12 +215,6 @@ impl HttpRecorder {
             },
         )
         .await
-    }
-}
-
-impl Drop for HttpRecorder {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 

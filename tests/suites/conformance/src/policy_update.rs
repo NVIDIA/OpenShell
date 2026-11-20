@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use testkit::policy;
 use testkit::sdk::raw::proto;
 use testkit::{Context, Result, Sandbox};
@@ -32,10 +32,7 @@ const LOAD_TIMEOUT: Duration = Duration::from_mins(2);
 #[testkit::test]
 async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("pset")
-        .image(testkit::python_image())
-        .policy(policy::base())
-        .command(["sleep", "infinity"])
+        .python_sandbox("pset", policy::base())
         .create_ready()
         .await?;
     let initial = settled(&sandbox).await?;
@@ -96,16 +93,12 @@ async fn policy_set_versions_and_ignores_repeats(cx: &mut Context) -> testkit::R
 #[testkit::test]
 async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
-        .sandbox("pscop")
-        .image(testkit::python_image())
-        .policy(scoped_policy()?)
-        .command(["sleep", "infinity"])
+        .python_sandbox("pscop", scoped_policy()?)
         .create_ready()
         .await?;
     let before = settled(&sandbox).await?;
-    let rules_before = &before["policy"]["network_policies"];
     testkit::ensure!(
-        rules_before.is_object(),
+        before["policy"]["network_policies"].is_object(),
         "policy get has no network policies: {before}"
     );
 
@@ -143,63 +136,49 @@ async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> t
         }
     }
 
-    update(
-        cx,
-        &sandbox,
-        "--add-allow",
-        "api.example.com:443,8443:POST:/admin",
-    )
-    .await?;
-    let allowed = policy_get(&sandbox).await?;
-    testkit::ensure!(
-        version(&allowed)? > version(&before)? && allowed["hash"] != before["hash"],
-        "the allow didn't make a new revision: before {before}, after {allowed}"
-    );
-    let rules = &allowed["policy"]["network_policies"];
-    testkit::ensure!(
-        rules["sibling"] == rules_before["sibling"],
-        "the allow changed the sibling rule: {}",
-        rules["sibling"]
-    );
-    testkit::ensure!(
-        rules["internal_api"]["endpoints"][1] == rules_before["internal_api"]["endpoints"][1],
-        "the allow changed the other endpoint: {}",
-        rules["internal_api"]["endpoints"][1]
-    );
-    testkit::ensure!(
-        has_rule(&rules["internal_api"]["endpoints"][0]["rules"], |rule| {
-            rule["allow"]["method"] == "POST" && rule["allow"]["path"] == "/admin"
-        }),
-        "the endpoint has no POST /admin allow rule: {}",
-        rules["internal_api"]["endpoints"][0]
-    );
-
-    update(
-        cx,
-        &sandbox,
-        "--add-deny",
-        "api.example.com:443,8443:POST:/admin/private",
-    )
-    .await?;
-    let denied = policy_get(&sandbox).await?;
-    testkit::ensure!(
-        version(&denied)? > version(&allowed)?,
-        "the deny didn't make a new revision: before {allowed}, after {denied}"
-    );
-    let rules = &denied["policy"]["network_policies"];
-    testkit::ensure!(
-        rules["sibling"] == rules_before["sibling"],
-        "the deny changed the sibling rule: {}",
-        rules["sibling"]
-    );
-    testkit::ensure!(
-        has_rule(
-            &rules["internal_api"]["endpoints"][0]["deny_rules"],
-            |rule| { rule["method"] == "POST" && rule["path"] == "/admin/private" }
+    // An allow, then a deny, each changing only the selected endpoint. A
+    // deny rule has `method` and `path` where an allow rule nests them in
+    // `allow`.
+    let mut previous = before.clone();
+    for (flag, target, list, prefix, path) in [
+        (
+            "--add-allow",
+            "api.example.com:443,8443:POST:/admin",
+            "rules",
+            "/allow",
+            "/admin",
         ),
-        "the endpoint has no POST /admin/private deny rule: {}",
-        rules["internal_api"]["endpoints"][0]
-    );
+        (
+            "--add-deny",
+            "api.example.com:443,8443:POST:/admin/private",
+            "deny_rules",
+            "",
+            "/admin/private",
+        ),
+    ] {
+        update(cx, &sandbox, flag, target).await?;
+        let updated = policy_get(&sandbox).await?;
+        testkit::ensure!(
+            version(&updated)? > version(&previous)? && updated["hash"] != previous["hash"],
+            "{flag} {target} didn't make a new revision: before {previous}, after {updated}"
+        );
+        testkit::ensure!(
+            unselected(&updated) == unselected(&before),
+            "{flag} {target} changed another endpoint: {}",
+            updated["policy"]["network_policies"]
+        );
+        let endpoint = &updated["policy"]["network_policies"]["internal_api"]["endpoints"][0];
+        testkit::ensure!(
+            endpoint[list]
+                .as_array()
+                .is_some_and(|rules| rules.iter().any(|rule| {
+                    rule.pointer(&format!("{prefix}/method")) == Some(&json!("POST"))
+                        && rule.pointer(&format!("{prefix}/path")) == Some(&json!(path))
+                })),
+            "{flag} {target} added no matching rule: {endpoint}"
+        );
+        previous = updated;
+    }
     Ok(())
 }
 
@@ -346,8 +325,12 @@ fn version(policy: &Value) -> Result<u64> {
         .ok_or_else(|| testkit::Error::msg(format!("policy get has no version: {policy}")))
 }
 
-fn has_rule(rules: &Value, matches: impl Fn(&Value) -> bool) -> bool {
+/// The network rules of `policy` without the endpoint
+/// [`policy_update_changes_only_the_selected_endpoint`] updates.
+fn unselected(policy: &Value) -> Value {
+    let mut rules = policy["policy"]["network_policies"].clone();
+    if let Some(endpoint) = rules.pointer_mut("/internal_api/endpoints/0") {
+        endpoint.take();
+    }
     rules
-        .as_array()
-        .is_some_and(|rules| rules.iter().any(matches))
 }

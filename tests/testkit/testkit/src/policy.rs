@@ -14,6 +14,7 @@
 
 use openshell_sdk::raw::proto;
 
+use crate::cli::CliOutput;
 use crate::context::Sandbox;
 use crate::error::{Error, Result, ResultExt as _};
 use crate::yaml_file::YamlFile;
@@ -108,6 +109,16 @@ pub fn base_with(yaml: &str) -> Result<proto::SandboxPolicy> {
 /// Replace `sandbox`'s policy with `policy` through `policy set --wait`, and
 /// wait up to two minutes until the sandbox has loaded it.
 pub async fn set(sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result {
+    try_set(sandbox, policy)
+        .await?
+        .success()
+        .context(format!("set the policy of sandbox {}", sandbox.name()))?;
+    Ok(())
+}
+
+/// Run [`set`]'s `policy set` command and return its output, whether or not
+/// it succeeded, for a test that expects the gateway to reject `policy`.
+pub async fn try_set(sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result<CliOutput> {
     let file = YamlFile::new(&to_yaml(policy)?)?;
     sandbox
         .handles()
@@ -122,10 +133,7 @@ pub async fn set(sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result {
             "--timeout",
             "120",
         ])
-        .await?
-        .success()
-        .context(format!("set the policy of sandbox {}", sandbox.name()))?;
-    Ok(())
+        .await
 }
 
 /// Settings for an endpoint from [`allow`], named as in policy YAML.

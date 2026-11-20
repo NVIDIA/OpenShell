@@ -7,10 +7,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use testkit::{Poll, Result};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 
 use crate::http::read_request;
-use crate::{MAX_REQUEST, READ_TIMEOUT, WAIT_INTERVAL, WAIT_TIMEOUT, bind, header};
+use crate::{MAX_REQUEST, READ_TIMEOUT, Server, WAIT_INTERVAL, WAIT_TIMEOUT, header};
 
 /// A WebSocket server that completes the handshake, then reads frames until
 /// the connection closes. It records whether any was a binary frame, records
@@ -18,7 +17,7 @@ use crate::{MAX_REQUEST, READ_TIMEOUT, WAIT_INTERVAL, WAIT_TIMEOUT, bind, header
 pub struct WebSocketRecorder {
     pub port: u16,
     state: Arc<WebSocketState>,
-    task: JoinHandle<()>,
+    _server: Server,
 }
 
 /// The text frame a [`WebSocketRecorder`] sends after each text frame.
@@ -34,15 +33,15 @@ struct WebSocketState {
 
 impl WebSocketRecorder {
     pub async fn start() -> Result<Self> {
-        let (listener, port) = bind().await?;
         let state = Arc::new(WebSocketState::default());
         let task_state = Arc::clone(&state);
-        let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(accept_websocket(stream, Arc::clone(&task_state)));
-            }
-        });
-        Ok(Self { port, state, task })
+        let server =
+            Server::start(move |stream| accept_websocket(stream, Arc::clone(&task_state))).await?;
+        Ok(Self {
+            port: server.port,
+            state,
+            _server: server,
+        })
     }
 
     /// Wait until a client completed the handshake.
@@ -94,12 +93,6 @@ impl WebSocketRecorder {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-}
-
-impl Drop for WebSocketRecorder {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 

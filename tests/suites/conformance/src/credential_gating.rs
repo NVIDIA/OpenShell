@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use host_server_support::{
-    HttpRecorder, Request, Response, TEST_HOST, TEXT_REPLY, WebSocketRecorder,
+    HttpRecorder, Request, Response, TEST_HOST, TEXT_REPLY, WebSocketRecorder, allow_host,
 };
 use sandbox_clients_support::{self as clients, http, scripts};
 use serde_json::json;
@@ -44,15 +44,9 @@ async fn profile_rest_endpoint_keeps_body_placeholder(cx: &mut Context) -> testk
     let provider = install_gating_provider(cx, Some((server.port, websocket.port))).await?;
 
     let mut policy = policy::base();
-    policy::allow(
-        &mut policy,
-        "credential_gating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .rest(Access::Full)
-    .request_body_credential_rewrite(false);
+    allow_host(&mut policy, "credential_gating", server.port)
+        .rest(Access::Full)
+        .request_body_credential_rewrite(false);
     let sandbox = create_sandbox(cx, "rest", policy, &[&provider]).await?;
     post_token_body(&sandbox, server.port).await?;
     expect_placeholder_body(&server).await
@@ -92,44 +86,25 @@ async fn policy_binding_requires_inspection_or_opt_in(cx: &mut Context) -> testk
     let provider = install_gating_provider(cx, None).await?;
 
     let mut l4 = policy::base();
-    policy::allow(
-        &mut l4,
-        "credential_gating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .credential_binding(&provider);
+    allow_host(&mut l4, "credential_gating", server.port).credential_binding(&provider);
     // The wording checks follow the #5264 tests.
     let error = expect_rejected(cx, "l4", l4, &provider).await?;
     testkit::ensure!(error.contains("credentialed endpoint"), "{error}");
     testkit::ensure!(error.contains("L4-only"), "{error}");
 
     let mut tls_skip = policy::base();
-    policy::allow(
-        &mut tls_skip,
-        "credential_gating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .rest(Access::Full)
-    .tls_skip()
-    .credential_binding(&provider);
+    allow_host(&mut tls_skip, "credential_gating", server.port)
+        .rest(Access::Full)
+        .tls_skip()
+        .credential_binding(&provider);
     let error = expect_rejected(cx, "tls", tls_skip, &provider).await?;
     testkit::ensure!(error.contains("credentialed endpoint"), "{error}");
     testkit::ensure!(error.contains("tls:") && error.contains("skip"), "{error}");
 
     let mut opt_in = policy::base();
-    policy::allow(
-        &mut opt_in,
-        "credential_gating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .allow_uninspected_credentials()
-    .credential_binding(&provider);
+    allow_host(&mut opt_in, "credential_gating", server.port)
+        .allow_uninspected_credentials()
+        .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "optin", opt_in, &[&provider]).await?;
     sandbox.exec(["true"]).await?.success()?;
     Ok(())
@@ -145,16 +120,10 @@ async fn policy_binding_rest_body_keeps_placeholder_without_rewrite(
     let provider = install_gating_provider(cx, None).await?;
 
     let mut policy = policy::base();
-    policy::allow(
-        &mut policy,
-        "credential_gating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .rest(Access::Full)
-    .request_body_credential_rewrite(false)
-    .credential_binding(&provider);
+    allow_host(&mut policy, "credential_gating", server.port)
+        .rest(Access::Full)
+        .request_body_credential_rewrite(false)
+        .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "body", policy, &[&provider]).await?;
     post_token_body(&sandbox, server.port).await?;
     expect_placeholder_body(&server).await
@@ -170,16 +139,10 @@ async fn policy_binding_rest_body_rewrite_sends_secret_upstream(
     let provider = install_gating_provider(cx, None).await?;
 
     let mut policy = policy::base();
-    policy::allow(
-        &mut policy,
-        "credential_gating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .rest(Access::Full)
-    .request_body_credential_rewrite(true)
-    .credential_binding(&provider);
+    allow_host(&mut policy, "credential_gating", server.port)
+        .rest(Access::Full)
+        .request_body_credential_rewrite(true)
+        .credential_binding(&provider);
     let sandbox = create_sandbox(cx, "rw", policy, &[&provider]).await?;
     post_token_body(&sandbox, server.port).await?;
     let request = one_request(&server).await?;
@@ -200,15 +163,9 @@ async fn policy_binding_updates_provider_environment_live(cx: &mut Context) -> t
 
     let policy_binding = |bind: bool| {
         let mut policy = policy::base();
-        let endpoint = policy::allow(
-            &mut policy,
-            "credential_gating",
-            TEST_HOST,
-            server.port,
-            PYTHON_BINARIES,
-        )
-        .rest(Access::Full)
-        .request_body_credential_rewrite(false);
+        let endpoint = allow_host(&mut policy, "credential_gating", server.port)
+            .rest(Access::Full)
+            .request_body_credential_rewrite(false);
         if bind {
             endpoint.credential_binding(&provider);
         }
@@ -357,11 +314,8 @@ async fn profile_endpoints_bind_static_credentials(cx: &mut Context) -> testkit:
         endpoint(server_b.port),
     ))?;
     let sandbox = cx
-        .sandbox("bind")
-        .image(testkit::python_image())
-        .policy(policy)
+        .python_sandbox("bind", policy)
         .providers([provider_a, provider_b])
-        .command(["sleep", "infinity"])
         .create_ready()
         .await?;
     let output = sandbox
@@ -407,14 +361,7 @@ async fn send_binary_frame(
     providers: &[&str],
 ) -> Result<bool> {
     let mut policy = policy::base();
-    policy::allow(
-        &mut policy,
-        "credential_gating",
-        TEST_HOST,
-        server.port,
-        PYTHON_BINARIES,
-    )
-    .websocket(Access::ReadWrite);
+    allow_host(&mut policy, "credential_gating", server.port).websocket(Access::ReadWrite);
     let sandbox = create_sandbox(cx, suffix, policy, providers).await?;
     sandbox
         .run_python(
@@ -529,11 +476,8 @@ fn sandbox_with(
     policy: proto::SandboxPolicy,
     providers: &[&str],
 ) -> testkit::SandboxBuilder {
-    cx.sandbox(suffix)
-        .policy(policy)
-        .image(testkit::python_image())
+    cx.python_sandbox(suffix, policy)
         .providers(providers.iter().copied())
-        .command(["sleep", "infinity"])
 }
 
 /// Create a long-running sandbox from the Python image with `policy` and

@@ -198,6 +198,21 @@ impl Context {
         }
     }
 
+    /// Start describing a sandbox named `cx.name(suffix)` from
+    /// [`python_image`](crate::python_image) that idles under `policy`, for
+    /// tests that run Python clients in it with [`Sandbox::exec`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Context::sandbox`].
+    #[track_caller]
+    pub fn python_sandbox(&self, suffix: &str, policy: proto::SandboxPolicy) -> SandboxBuilder {
+        self.sandbox(suffix)
+            .image(crate::python_image())
+            .command(["sleep", "infinity"])
+            .policy(policy)
+    }
+
     /// Start describing a sandbox named `cx.name(suffix)` that the
     /// `openshell` CLI creates. Use it for what only `sandbox create`
     /// offers, such as a `--policy` file or `--no-keep`; prefer
