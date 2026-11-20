@@ -306,7 +306,7 @@ A gateway serves exactly the profiles you imported. OpenShell ships no profiles 
 
 The OpenShell repository ships example profiles for GitHub, PyPI, and the major
 inference and agent providers in
-[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers). They are
+[`providers/`](https://github.com/ai-openshell/OpenShell/tree/main/providers). They are
 reviewable starting points, not platform defaults.
 
 Read a file's header before importing it. Each one names the client binaries it
@@ -317,8 +317,8 @@ profile's `binaries` and `endpoints` match your image and workload, import it
 directly from the repository:
 
 ```shell
-openshell profile lint --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml --global
+openshell profile lint --url https://raw.githubusercontent.com/ai-openshell/OpenShell/main/providers/github.yaml
+openshell profile import --url https://raw.githubusercontent.com/ai-openshell/OpenShell/main/providers/github.yaml --global
 ```
 
 `--url` accepts one HTTP or HTTPS `.yaml`, `.yml`, or `.json` profile. It cannot

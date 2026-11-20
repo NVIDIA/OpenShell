@@ -404,7 +404,7 @@ The bounded exporter queue does not cap span generation. Collector-side sampling
 reduces stored traces, not the supervisor's span-generation cost. The gateway's
 `OTEL_TRACES_SAMPLER` setting does not configure supervisor sampling; operator
 control is tracked in
-[#5362](https://github.com/NVIDIA/OpenShell/issues/5362).
+[#5362](https://github.com/ai-openshell/OpenShell/issues/5362).
 
 Leave supervisor trace export disabled if your deployment requires a
 denial-only volume bound. OCSF records and request receipts still work without it.

@@ -181,7 +181,7 @@ git worktree remove --force "$wt"
    to the release notes rather than repeating them:
 
    ```text
-   :white_check_mark: :ship: OpenShell vX.Y.Z is out: https://github.com/NVIDIA/OpenShell/releases/tag/vX.Y.Z
+   :white_check_mark: :ship: OpenShell vX.Y.Z is out: https://github.com/ai-openshell/OpenShell/releases/tag/vX.Y.Z
 
    It shipped from vX.Y.Z-pre.N (<commit>). I'll be starting the <next version>-pre.* jobs shortly for next week.
 

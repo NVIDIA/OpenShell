@@ -91,7 +91,7 @@ gh run view <run-id> --log-failed
 
 When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published dev artifacts* (`0.0.0-dev` chart, `:dev` images, and the `dev` GitHub release). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
 
-Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
+Note `install.sh` is pulled from `raw.githubusercontent.com/ai-openshell/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
 
 ## Testing artifacts from a specific SHA
 
