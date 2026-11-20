@@ -22,7 +22,7 @@ jobs:
   macos:
     name: macOS Homebrew
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: macos-15
+    runs-on: macos-latest-xlarge
     timeout-minutes: 20
     steps:
       - name: Ensure VM driver

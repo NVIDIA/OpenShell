@@ -32,7 +32,7 @@ jobs:
         include:
           - arch: aarch64
             triple: aarch64-apple-darwin
-    runs-on: macos-15
+    runs-on: macos-15-xlarge
     timeout-minutes: 60
     defaults:
       run:

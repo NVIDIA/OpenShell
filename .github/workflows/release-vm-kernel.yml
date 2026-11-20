@@ -126,7 +126,7 @@ jobs:
   build-runtime-macos-arm64:
     name: Build Runtime (macOS ARM64)
     needs: [build-runtime-linux-arm64]
-    runs-on: macos-15
+    runs-on: macos-latest-xlarge
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: ""

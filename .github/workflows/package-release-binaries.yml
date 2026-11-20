@@ -112,7 +112,7 @@ jobs:
             runner: ubuntu-24.04-arm
             package: prover-binary-linux-arm64
           - triple: aarch64-apple-darwin
-            runner: macos-15
+            runner: macos-15-xlarge
             package: prover-binary-macos
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
