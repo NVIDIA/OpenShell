@@ -1,9 +1,6 @@
 # No wildcard rule. The maintainer-approval workflow checks maintainer reviews.
 # Explicit ownership below protects the review and CI machinery.
 
-## Vouch list — maintainers only (bot commits bypass, but manual edits need review)
-.github/VOUCHED.td @NVIDIA/openshell-codeowners
-
 ## Merge enforcement — these paths decide who can merge, so they notify the full
 # list of maintainers to raise scrutiny on changes here.
 #

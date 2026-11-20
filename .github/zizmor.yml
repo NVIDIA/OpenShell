@@ -13,4 +13,3 @@ rules:
       - release-canary.yml:3
       - required-ci-gates.yml:3
       - review-readiness.yml:6
-      - vouch-check.yml:3

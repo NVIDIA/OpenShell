@@ -653,11 +653,10 @@ Flow:
 Prerequisites:
 
 - DCO sign-off (`git commit -s`) on every commit. Manual admission does not require cryptographic commit signing.
-- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
 
 Flow:
 
-1. Open the PR. The vouch check confirms first-time external contributors are vouched (otherwise their PRs are auto-closed).
+1. Open the PR.
 2. If copy-pr-bot does not mirror it automatically, a maintainer with Write access or greater reviews the diff and comments `/ok to test <SHA>` with the latest commit SHA. Fork location alone does not determine whether a PR is mirrored automatically.
 3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to automatically admitted PRs: `Required CI Gates` verifies the mirror and required push workflows, and maintainers apply the E2E label when the extra suites are needed.
 4. When the PR is ready to merge, maintainers add it to the merge queue so the queued integration state is tested before it reaches `main`.
