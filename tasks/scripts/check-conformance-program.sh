@@ -13,30 +13,9 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 suites="${root}/tests/suites"
 conformance="${suites}/conformance/Cargo.toml"
-manifests=("${conformance}" "${suites}/features/Cargo.toml" "${suites}"/drivers/*/Cargo.toml)
+manifests=("${suites}/features/Cargo.toml" "${suites}"/drivers/*/Cargo.toml)
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
-unset OPENSHELL_TEST_UNSUPPORTED
-
-cargo run --quiet --locked --manifest-path "${conformance}" --bin openshell-conformance -- list \
-    | awk '{print $1}' | sort > "${work}/program"
-# --run-ignored all: the program lists ignored tests too, so nextest must as well.
-cargo nextest list --locked --color never --run-ignored all --manifest-path "${conformance}" --message-format oneline \
-    | awk '{print $2}' | sort > "${work}/nextest"
-
-if [[ ! -s "${work}/nextest" ]]; then
-    echo "error: could not read test names from nextest's list; has its oneline format changed?" >&2
-    exit 1
-fi
-if ! diff -u "${work}/nextest" "${work}/program"; then
-    echo "error: openshell-conformance list differs from nextest's list (-nextest +program)" >&2
-    exit 1
-fi
-if [[ ! -s "${work}/program" ]]; then
-    echo "error: openshell-conformance lists no tests" >&2
-    exit 1
-fi
-echo "openshell-conformance lists the same $(wc -l < "${work}/program" | tr -d ' ') tests as nextest"
 
 # Cargo metadata includes auto-discovered integration targets, but not their
 # harness settings. Check the manifest for the explicit opt-out.
@@ -47,18 +26,16 @@ for manifest in "${manifests[@]}"; do
     cargo metadata --locked --no-deps --format-version 1 --manifest-path "${manifest}" \
         | yq -p=json -r '.packages[] | select(.dependencies[] | .name == "openshell-testkit")
             | .manifest_path as $manifest | .targets[]
-            | select(.test and (.kind[0] == "test" or .kind[0] == "bin"))
-            | [$manifest, .kind[0], .name] | @tsv' > "${work}/targets"
-    while IFS=$'\t' read -r package kind target; do
-        harnessless="$(target_name="${target}" target_kind="${kind}" yq -p=toml -o=yaml -r \
-            '.[strenv(target_kind)][] | select(.name == strenv(target_name) and .harness == false) | .name' "${package}")"
+            | select(.test and .kind[0] == "test")
+            | [$manifest, .name] | @tsv' > "${work}/targets"
+    while IFS=$'\t' read -r package target; do
+        harnessless="$(target_name="${target}" yq -p=toml -o=yaml -r \
+            '.test[] | select(.name == strenv(target_name) and .harness == false) | .name' "${package}")"
         if [[ -z "${harnessless}" ]]; then
-            echo "error: ${package}: ${target} needs an explicit [[${kind}]] with harness = false" >&2
+            echo "error: ${package}: ${target} needs an explicit [[test]] with harness = false" >&2
             exit 1
         fi
-        if [[ "${kind}" == test ]]; then
-            printf '%s\n' "${target//-/_}" >> "${work}/crates"
-        fi
+        printf '%s\n' "${target//-/_}" >> "${work}/crates"
     done < "${work}/targets"
 done
 duplicates="$(sort "${work}/crates" | uniq -d)"
@@ -106,6 +83,19 @@ if [[ -n "${bad_issues}" ]]; then
     exit 1
 fi
 unsupported="$(yq -r 'unique_by(.test) | .[] | .test + "=" + .issue' "${unsupported_file}" | paste -sd, -)"
+# Include ignored tests so unsupported entries do not change the parity check.
+OPENSHELL_TEST_UNSUPPORTED="${unsupported}" \
+    cargo nextest list --locked --color never --run-ignored all --manifest-path "${conformance}" --message-format oneline \
+    | awk '{print $2}' | sort > "${work}/nextest"
+OPENSHELL_TEST_UNSUPPORTED="" \
+    cargo run --quiet --locked --manifest-path "${conformance}" --bin openshell-conformance -- list \
+    | awk '{print $1}' | sort > "${work}/program"
+if [[ ! -s "${work}/nextest" ]] || ! diff -u "${work}/nextest" "${work}/program"; then
+    echo "error: openshell-conformance and nextest must list the same nonempty set of tests" >&2
+    exit 1
+fi
+echo "openshell-conformance lists the same $(wc -l < "${work}/program" | tr -d ' ') tests as nextest"
+
 if [[ -n "${unsupported}" ]]; then
     for manifest in "${manifests[@]}"; do
         OPENSHELL_TEST_UNSUPPORTED="${unsupported}" \
