@@ -6,8 +6,8 @@ use std::process::Command;
 #[test]
 fn startup_logs_go_to_stderr_not_stdout() {
     let output = Command::new(env!("CARGO_BIN_EXE_openshell-sandbox"))
-        .arg("--bootstrap")
-        .arg("/does/not/exist/openshell-boundary.json")
+        .arg("--join-file")
+        .arg("/does/not/exist/openshell-join.json")
         .env("OPENSHELL_LOG_LEVEL", "info")
         .env_remove("RUST_LOG")
         .output()
@@ -27,7 +27,7 @@ fn startup_logs_go_to_stderr_not_stdout() {
     );
     assert!(
         stderr.contains("capability-free sandbox probe")
-            || stderr.contains("read boundary config")
+            || stderr.contains("open runtime launch credentials")
             || stderr.contains("openshell-sandbox requires Linux"),
         "expected startup qualification or bootstrap error on stderr, got: {stderr}"
     );

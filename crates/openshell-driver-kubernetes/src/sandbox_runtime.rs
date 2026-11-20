@@ -33,8 +33,6 @@ pub const SANDBOX_SECRET_COMPONENT: &str = "sandbox-bootstrap";
 pub const SUPERVISOR_SECRET_COMPONENT: &str = "supervisor-bootstrap";
 pub const IMAGE_PULL_SECRET_COMPONENT: &str = "image-pull";
 pub const BACKEND_DESCRIPTOR_KEY: &str = "runtime-descriptor.json";
-pub const BOUNDARY_CERTIFICATE_KEY: &str = "tls.crt";
-pub const BOUNDARY_PRIVATE_KEY: &str = "tls.key";
 pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
@@ -47,6 +45,7 @@ pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
 /// JSON sandbox instance registration of a generation on the shared supervisor.
 pub const SHARED_INSTANCE_KEY: &str = "instance.json";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
+#[cfg(test)]
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 #[cfg(test)]
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
@@ -248,31 +247,6 @@ pub fn boundary_service(
         }),
         ..Default::default()
     }
-}
-
-/// Independent bootstrap resources preserve existing Sandbox Protocol Services
-/// and policies across gateway upgrades and connection direction changes.
-#[must_use]
-pub fn boundary_bootstrap_resources(
-    namespace: &str,
-    names: &SandboxRuntimeNames,
-    sandbox_id: &str,
-    owner: OwnerReference,
-) -> (Service, NetworkPolicy) {
-    let port = openshell_sandbox_backend::bootstrap::PORT;
-    let name = format!("os-bootstrap-{}", sandbox_id.to_ascii_lowercase());
-    let mut service = boundary_service(
-        namespace,
-        names,
-        sandbox_id,
-        port,
-        KubernetesControlConnection::RuntimeInitiated,
-        owner.clone(),
-    );
-    service.metadata.name = Some(name.clone());
-    let mut policy = control_policy(namespace, names, sandbox_id, port, owner);
-    policy.metadata.name = Some(name);
-    (service, policy)
 }
 
 /// A runtime-initiated supervisor becomes Ready only after the runtime has
@@ -674,8 +648,6 @@ pub fn sandbox_bootstrap_secret(
     namespace: &str,
     names: &SandboxRuntimeNames,
     sandbox_id: &str,
-    boundary_certificate: Vec<u8>,
-    boundary_private_key: Vec<u8>,
     owner: OwnerReference,
 ) -> Secret {
     Secret {
@@ -686,16 +658,7 @@ pub fn sandbox_bootstrap_secret(
             labels: Some(common_labels(sandbox_id, SANDBOX_SECRET_COMPONENT)),
             ..Default::default()
         },
-        data: Some(BTreeMap::from([
-            (
-                BOUNDARY_CERTIFICATE_KEY.to_string(),
-                ByteString(boundary_certificate),
-            ),
-            (
-                BOUNDARY_PRIVATE_KEY.to_string(),
-                ByteString(boundary_private_key),
-            ),
-        ])),
+        data: Some(BTreeMap::new()),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
         ..Default::default()
@@ -1587,8 +1550,7 @@ mod tests {
     #[test]
     fn bootstrap_secrets_are_immutable_and_split_by_trust_domain() {
         let names = SandboxRuntimeNames::new("pair");
-        let sandbox =
-            sandbox_bootstrap_secret("sandbox", &names, "pair", Vec::new(), Vec::new(), owner());
+        let sandbox = sandbox_bootstrap_secret("sandbox", &names, "pair", owner());
         assert_eq!(
             sandbox.metadata.labels.as_ref().unwrap()["openshell.ai/component"],
             SANDBOX_SECRET_COMPONENT
@@ -1599,13 +1561,7 @@ mod tests {
             .unwrap()
             .into_keys()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            sandbox_keys,
-            std::collections::BTreeSet::from([
-                BOUNDARY_CERTIFICATE_KEY.to_string(),
-                BOUNDARY_PRIVATE_KEY.to_string(),
-            ])
-        );
+        assert_eq!(sandbox_keys, std::collections::BTreeSet::new());
 
         let supervisor = supervisor_bootstrap_secret(
             "sandbox",

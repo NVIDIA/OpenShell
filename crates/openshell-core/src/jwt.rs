@@ -144,7 +144,7 @@ mod session {
         }
     }
 
-    /// Component authorized by a supervisor session or boundary bootstrap token.
+    /// Component authorized by a supervisor session or Join token.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum SessionComponent {
         #[serde(rename = "openshell-supervisor")]
@@ -158,7 +158,8 @@ mod session {
     pub enum SessionTokenProfile {
         Gateway,
         Sandbox,
-        Bootstrap,
+        Join,
+        Runtime,
     }
 
     impl SessionTokenProfile {
@@ -167,7 +168,8 @@ mod session {
             match self {
                 Self::Gateway => GATEWAY_SESSION_JWT_TYPE,
                 Self::Sandbox => SANDBOX_SESSION_JWT_TYPE,
-                Self::Bootstrap => "openshell-boundary-bootstrap+jwt",
+                Self::Join => "openshell-join+jwt",
+                Self::Runtime => "openshell-runtime-session+jwt",
             }
         }
 
@@ -175,7 +177,8 @@ mod session {
             match self {
                 Self::Gateway => issuer,
                 Self::Sandbox => SANDBOX_SESSION_AUDIENCE,
-                Self::Bootstrap => "openshell-boundary-bootstrap",
+                Self::Join => "openshell-join",
+                Self::Runtime => "openshell-runtime-session",
             }
         }
     }
@@ -816,7 +819,7 @@ mod session {
         }
     }
 
-    /// Issuer shared by session, supervisor, and boundary bootstrap token profiles.
+    /// Issuer shared by session, supervisor, and Join token profiles.
     pub struct SessionJwtIssuer {
         encoding_key: EncodingKey,
         key_id: String,
@@ -837,13 +840,26 @@ mod session {
     }
 
     impl SessionJwtIssuer {
-        /// Mint a bootstrap-only capability with a bounded 15-minute lifetime.
-        pub fn mint_boundary_bootstrap(
+        /// Mint a Join capability with a bounded 15-minute lifetime.
+        pub fn mint_join_token(
             &self,
             identity: &SandboxRuntimeIdentity,
         ) -> Result<MintedSessionToken, SessionJwtError> {
             self.mint(
-                SessionTokenProfile::Bootstrap,
+                SessionTokenProfile::Join,
+                identity,
+                Uuid::new_v4(),
+                self.clock.now_unix_seconds(),
+            )
+        }
+
+        /// Mint a renewable runtime-to-supervisor control credential.
+        pub fn mint_runtime_session(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            self.mint(
+                SessionTokenProfile::Runtime,
                 identity,
                 Uuid::new_v4(),
                 self.clock.now_unix_seconds(),
@@ -1009,8 +1025,10 @@ mod session {
             token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionToken, SessionJwtError> {
-            let ttl = if profile == SessionTokenProfile::Bootstrap {
+            let ttl = if profile == SessionTokenProfile::Join {
                 Some(Duration::from_mins(15))
+            } else if profile == SessionTokenProfile::Runtime {
+                Some(MAX_SESSION_TOKEN_TTL)
             } else {
                 self.ttl
             };
@@ -1027,7 +1045,10 @@ mod session {
                 sandbox_id: identity.sandbox_id.clone(),
                 runtime_generation: identity.runtime_generation.clone(),
                 auth_epoch: identity.auth_epoch,
-                component: if profile == SessionTokenProfile::Bootstrap {
+                component: if matches!(
+                    profile,
+                    SessionTokenProfile::Join | SessionTokenProfile::Runtime
+                ) {
                     SessionComponent::OpenShellSandbox
                 } else {
                     SessionComponent::OpenShellSupervisor
@@ -1054,7 +1075,7 @@ mod session {
         pub public_key_pem: Vec<u8>,
     }
 
-    /// Strict verifier for gateway sessions, Sandbox Protocol sessions, and boundary bootstrap.
+    /// Strict verifier for gateway sessions, Sandbox Protocol sessions, and Join.
     pub struct SessionJwtVerifier {
         keys: BTreeMap<String, DecodingKey>,
         issuer: String,
@@ -1171,13 +1192,19 @@ mod session {
             if claims.aud != self.profile.audience(&self.issuer) {
                 return Err(SessionJwtError::WrongAudience);
             }
-            let component = if self.profile == SessionTokenProfile::Bootstrap {
-                if claims.exp == 0 || claims.exp.saturating_sub(claims.iat) > 900 {
-                    return Err(SessionJwtError::InvalidLifetime);
+            let component = match self.profile {
+                SessionTokenProfile::Join | SessionTokenProfile::Runtime => {
+                    let maximum = if self.profile == SessionTokenProfile::Join {
+                        900
+                    } else {
+                        3600
+                    };
+                    if claims.exp == 0 || claims.exp.saturating_sub(claims.iat) > maximum {
+                        return Err(SessionJwtError::InvalidLifetime);
+                    }
+                    SessionComponent::OpenShellSandbox
                 }
-                SessionComponent::OpenShellSandbox
-            } else {
-                SessionComponent::OpenShellSupervisor
+                _ => SessionComponent::OpenShellSupervisor,
             };
             if claims.component != component {
                 return Err(SessionJwtError::InvalidRuntimeIdentity);

@@ -40,7 +40,7 @@ The driver creates two containers for each sandbox:
 
 Both containers are non-root, request no capabilities, and set
 no-new-privileges. A shared named volume carries the authenticated Unix socket
-and sandbox bootstrap material. A second supervisor-only volume carries the
+and a consumable Join token envelope. A second supervisor-only volume carries the
 supervisor JWT and gateway client credentials and is never mounted into the
 workload.
 
@@ -116,7 +116,7 @@ LSM decisions remain authoritative.
 | `network_mode = host` on the supervisor | Lets the trusted supervisor reach the gateway's primary loopback listener and originate approved upstream connections. |
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Omit `sandbox_pids_limit` to use OpenShell's default. Explicit zero is invalid. |
-| Private named volumes | Separate volumes carry sandbox bootstrap keys, the runtime-initiated Unix socket, and supervisor-only credentials. The supervisor mounts bootstrap keys read-only and only the socket volume writable. |
+| Private named volumes | Separate volumes carry the consumable Join token, the runtime-initiated Unix socket, and supervisor-only credentials. The supervisor mounts bootstrap keys read-only and only the socket volume writable. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
 
@@ -233,6 +233,6 @@ The supervisor owns these security-critical variables:
 - `OPENSHELL_MAIN_PROCESS_SPEC`
 - `OPENSHELL_TLS_CA` when HTTPS is enabled
 
-Template and sandbox environment is encoded in the protected bootstrap and
-exposed only to workload children. Workload input cannot override
+Template and sandbox environment arrives over the joined control connection
+and is exposed only to workload children. Workload input cannot override
 security-critical supervisor variables.

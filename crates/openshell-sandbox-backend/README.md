@@ -26,6 +26,28 @@ negotiator checks major versions and each peer's required capabilities. The
 built-in runtime does not advertise `openshell.sandbox.suspend-resume` and
 returns `UNIMPLEMENTED` for those optional RPCs.
 
+## Joining the supervisor
+
+All first-party drivers provision a supervisor address and Join token. The
+versioned token bundles the supervisor CA digest, optional shared-supervisor
+route, and a 15-minute JWT restricted to joining one sandbox generation. The
+runtime pins the presented CA before sending its bearer. Normal certificate,
+server-name, and handshake-signature verification still apply.
+
+The initial exchange uses the existing control listener. After durable
+single-use redemption at the gateway, the supervisor returns configuration and
+a runtime-only reconnect JWT. The same TLS stream immediately carries HTTP/2
+and the Sandbox Protocol. TLS client/server roles are independent of gRPC
+roles: the sandbox dials as TLS client and serves Sandbox Protocol requests.
+Reconnects validate locally and renew their one-hour credential. Unused spares
+refresh every 30 minutes; active control connections are retained.
+
+Drivers retain launch state in their existing private recovery storage.
+Docker, Podman, and VM stage only a consumable Join token envelope at launch;
+Kubernetes uses Secret-backed environment variables. Workload configuration and
+TLS private keys stay with the supervisor. A lost response after redemption
+requires a fresh generation, rather than permitting a second redemption.
+
 ## Suspend and resume
 
 The supervisor's `Describe` metadata lists `openshell.sandbox.suspend-resume`

@@ -163,6 +163,13 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
+    async fn redeem_join_token(
+        &self,
+        _request: Request<openshell_core::proto::RedeemJoinTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RedeemJoinTokenResponse>, Status> {
+        Err(Status::unimplemented("unused by this test"))
+    }
+
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*

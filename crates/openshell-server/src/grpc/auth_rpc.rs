@@ -522,6 +522,88 @@ async fn ensure_sandbox_exists(
         .ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
+pub async fn handle_redeem_join_token(
+    state: &ServerState,
+    request: Request<openshell_core::proto::RedeemJoinTokenRequest>,
+) -> Result<Response<openshell_core::proto::RedeemJoinTokenResponse>, Status> {
+    use crate::auth::sandbox_session::PersistedSandboxIdentity;
+    const REDEEMED: &str = "internal.openshell.ai/redeemed-join-generation";
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .ok_or_else(|| Status::unauthenticated("missing supervisor principal"))?;
+    let Principal::Sandbox(principal) = principal else {
+        return Err(Status::permission_denied(
+            "Join token requires its supervisor",
+        ));
+    };
+    if !matches!(principal.source, SandboxIdentitySource::BootstrapJwt { .. }) {
+        return Err(Status::permission_denied(
+            "Join token requires a gateway session",
+        ));
+    }
+    let generation = &request.get_ref().generation;
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&principal.sandbox_id)
+        .await
+        .map_err(|_| Status::internal("read Join token identity"))?
+        .ok_or_else(|| Status::not_found("sandbox no longer exists"))?;
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::unauthenticated("sandbox identity is missing"))?;
+    let identity = PersistedSandboxIdentity::read(&metadata.annotations)
+        .map_err(|_| Status::unauthenticated("invalid runtime identity"))?;
+    let bearer = crate::auth::authenticator::bearer_credential(request.metadata().as_ref())
+        .ok_or_else(|| Status::unauthenticated("missing supervisor bearer"))?;
+    let verified = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| Status::unavailable("sandbox sessions are unavailable"))?
+        .verify_gateway_token(bearer)
+        .map_err(|_| Status::unauthenticated("invalid supervisor bearer"))?;
+    let current_bearer = verified.token_id == identity.gateway_token_id;
+    if verified.runtime_generation != identity.runtime_generation || !current_bearer {
+        return Err(Status::unauthenticated("supervisor session changed"));
+    }
+    if principal.auth_epoch() != Some(identity.auth_epoch) {
+        return Err(Status::unauthenticated("supervisor ownership changed"));
+    }
+    if !matches!(
+        openshell_core::proto::SandboxPhase::try_from(sandbox.phase()),
+        Ok(openshell_core::proto::SandboxPhase::Provisioning
+            | openshell_core::proto::SandboxPhase::Starting
+            | openshell_core::proto::SandboxPhase::Ready)
+    ) {
+        return Err(Status::failed_precondition("sandbox is not starting"));
+    }
+    if identity.runtime_generation.as_str() != generation {
+        return Err(Status::unauthenticated("Join token generation is stale"));
+    }
+    if metadata.annotations.get(REDEEMED) == Some(generation) {
+        return Err(Status::unauthenticated("Join token was already redeemed"));
+    }
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(
+            &principal.sandbox_id,
+            metadata.resource_version,
+            |sandbox| {
+                if let Some(metadata) = sandbox.metadata.as_mut() {
+                    metadata
+                        .annotations
+                        .insert(REDEEMED.into(), generation.clone());
+                }
+            },
+        )
+        .await
+        .map_err(|_| Status::aborted("runtime changed during bootstrap redemption"))?;
+    Ok(Response::new(
+        openshell_core::proto::RedeemJoinTokenResponse {},
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

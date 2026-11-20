@@ -22,7 +22,7 @@ use crate::boundary_protocol::{
 /// Further sockets are closed immediately rather than queued.
 const MAX_PENDING_HANDSHAKES: usize = 8;
 /// Upper bound on the time an unauthenticated peer may occupy a slot.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Authenticated connections not yet claimed by a client. The runtime keeps
 /// one spare open, so a small bound only absorbs reconnect races.
 const MAX_QUEUED_CONNECTIONS: usize = 2;
@@ -71,19 +71,24 @@ impl RuntimeInitiatedListener {
                 ));
             }
         };
-        Self::start(listener, &descriptor.tls)
+        Self::start_authenticated(
+            listener,
+            &descriptor.tls,
+            crate::bootstrap::lookup(descriptor.session_id),
+        )
     }
 
-    fn start(
+    fn start_authenticated(
         listener: Listener,
         tls: &SandboxTlsClientConfig,
+        bootstrap: Option<std::sync::Arc<crate::bootstrap::Exchange>>,
     ) -> Result<std::sync::Arc<Self>, BackendError> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             BackendError::Unavailable("runtime-initiated listener requires a Tokio runtime".into())
         })?;
         let (sender, spares) = mpsc::channel(MAX_QUEUED_CONNECTIONS);
         let accept_task = runtime
-            .spawn(accept_loop(listener, tls.clone(), sender))
+            .spawn(accept_loop(listener, tls.clone(), bootstrap, sender))
             .abort_handle();
         tracing::info!("Runtime-initiated Sandbox Protocol listener ready");
         Ok(std::sync::Arc::new(Self {
@@ -135,6 +140,7 @@ fn bind_tcp(address: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
 async fn accept_loop(
     listener: Listener,
     tls: SandboxTlsClientConfig,
+    bootstrap: Option<std::sync::Arc<crate::bootstrap::Exchange>>,
     spares: mpsc::Sender<BoundaryDuplexStream>,
 ) {
     let pending = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
@@ -157,12 +163,19 @@ async fn accept_loop(
                     continue;
                 };
                 let tls = tls.clone();
+                let bootstrap = bootstrap.clone();
                 let spares = spares.clone();
                 handshakes.spawn(async move {
                     let _permit = permit;
                     let authenticated = tokio::time::timeout(
                         HANDSHAKE_TIMEOUT,
-                        crate::runtime::authenticate_boundary_stream(&tls, stream),
+                        async move {
+                            if let Some(bootstrap) = bootstrap {
+                                bootstrap.authenticate(stream).await.map_err(BackendError::Denied)
+                            } else {
+                                crate::runtime::authenticate_boundary_stream(&tls, stream).await
+                            }
+                        },
                     )
                     .await;
                     match authenticated {

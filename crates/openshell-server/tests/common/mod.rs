@@ -52,6 +52,13 @@ pub struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn redeem_join_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RedeemJoinTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RedeemJoinTokenResponse>, Status> {
+        Err(Status::unimplemented("unused by this test"))
+    }
+
     async fn peer_notify_config_update(
         &self,
         _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,

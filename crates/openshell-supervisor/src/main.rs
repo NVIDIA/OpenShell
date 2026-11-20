@@ -539,27 +539,43 @@ fn main() -> Result<()> {
 
     let exit_code = runtime.block_on(async move {
         openshell_crypto::tls::ensure_default_provider();
-        let _bootstrap_server = match std::env::var("OPENSHELL_BOUNDARY_BOOTSTRAP_SERVER_FILE") {
-            Ok(path) => {
-                if args.mode == SupervisorMode::Shared
-                    || args.role != SupervisorRole::IsolationBackend
-                {
-                    return Err(miette::miette!(
-                        "boundary bootstrap requires a dedicated isolation-backend supervisor"
-                    ));
+        let _runtime_launch =
+            match std::env::var(openshell_sandbox_backend::bootstrap::SERVER_ENV) {
+                Ok(path) => {
+                    if args.mode == SupervisorMode::Shared
+                        || args.role != SupervisorRole::IsolationBackend
+                    {
+                        return Err(miette::miette!(
+                            "runtime launch requires a dedicated isolation-backend supervisor"
+                        ));
+                    }
+                    let config: openshell_sandbox_backend::bootstrap::JoinServerConfig =
+                        serde_json::from_slice(&std::fs::read(path).into_diagnostic()?)
+                            .map_err(|_| miette::miette!("decode runtime launch material"))?;
+                    let credentials = isolation_inputs
+                        .as_ref()
+                        .map(|(_, _, _, _, credentials)| credentials.clone())
+                        .ok_or_else(|| {
+                            miette::miette!("runtime launch requires gateway credentials")
+                        })?;
+                    let endpoint = args.openshell_endpoint.as_ref().ok_or_else(|| {
+                        miette::miette!("runtime launch requires a gateway endpoint")
+                    })?;
+                    let redemption = Arc::new(openshell_supervisor::JoinTokenRedemption {
+                        gateway: openshell_core::grpc_client::GatewayEndpoint::new(
+                            endpoint.as_str(),
+                            credentials,
+                        ),
+                        generation: config.config.generation.clone(),
+                    });
+                    Some(
+                        openshell_sandbox_backend::bootstrap::register(config, redemption)
+                            .map_err(|error| miette::miette!(error))?,
+                    )
                 }
-                let bytes = std::fs::read(path).into_diagnostic()?;
-                let config = serde_json::from_slice(&bytes)
-                    .map_err(|_| miette::miette!("decode supervisor bootstrap server input"))?;
-                Some(
-                    openshell_sandbox_backend::bootstrap::serve(config)
-                        .await
-                        .map_err(|error| miette::miette!(error))?,
-                )
-            }
-            Err(std::env::VarError::NotPresent) => None,
-            Err(_) => return Err(miette::miette!("invalid boundary bootstrap server path")),
-        };
+                Err(std::env::VarError::NotPresent) => None,
+                Err(_) => return Err(miette::miette!("invalid runtime launch path")),
+            };
         let log_push_state = if let (Some(sandbox_id), Some(endpoint), Some(credentials)) = (
             &args.sandbox_id,
             &args.openshell_endpoint,

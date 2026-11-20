@@ -790,6 +790,13 @@ service OpenShell {
     };
   }
 
+  // Atomically consume the calling runtime generation's Join token.
+  // Only its authenticated supervisor may redeem it; no workspace selector is
+  // needed because the gateway derives the sandbox from that principal.
+  rpc RedeemJoinToken(RedeemJoinTokenRequest) returns (RedeemJoinTokenResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
+  }
+
   // ---------------------------------------------------------------------------
   // Workspace management RPCs
   // ---------------------------------------------------------------------------
@@ -4245,3 +4252,9 @@ message SupervisorServiceAdvertisement {
   // Domain actually installed by the process listener, not the gateway URL.
   string service_domain = 5;
 }
+
+// Authenticated supervisor-only redemption of its sandbox's launch generation.
+message RedeemJoinTokenRequest {
+  string generation = 1;
+}
+message RedeemJoinTokenResponse {}

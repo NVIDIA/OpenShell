@@ -63,7 +63,7 @@ use openshell_core::{
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
+    GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
     SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
 use opentelemetry::trace::TraceContextExt as _;
@@ -113,7 +113,7 @@ const SUPERVISOR_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 const SUPERVISOR_UID: u32 = 65_534;
 const SUPERVISOR_GID: u32 = 65_534;
 const BOUNDARY_MOUNT_PATH: &str = "/.openshell/channel";
-const BOUNDARY_CONFIG_MOUNT_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
+const BOOTSTRAP_CREDENTIALS_MOUNT_PATH: &str = "/.openshell/channel/sandbox/join-token.json";
 const BOUNDARY_CONTROL_MOUNT_PATH: &str = "/.openshell/channel/control";
 const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/control/supervisor/control.sock";
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
@@ -135,9 +135,7 @@ const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
 const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const MAIN_PROCESS_SPEC_FILE: &str = "main-process.json";
 const WORKSPACE_ROOT_FILE: &str = "workspace-root";
-const BOUNDARY_CONFIG_FILE: &str = "boundary-bootstrap.json";
-const BOUNDARY_CERTIFICATE_FILE: &str = "boundary-server.crt";
-const BOUNDARY_PRIVATE_KEY_FILE: &str = "boundary-server.key";
+const RUNTIME_LAUNCH_FILE: &str = openshell_sandbox_backend::bootstrap::SERVER_FILE;
 const SUPERVISOR_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 const START_GENERATION_FILE: &str = "start-generation";
 const HOST_OPEN_SHELL_INTERNAL: &str = "host.openshell.internal";
@@ -1867,7 +1865,7 @@ impl DockerComputeDriver {
                 cleanup_runtime_volumes().await;
                 cleanup_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
-                    "BoundaryConfigWriteFailed",
+                    "JoinTokenProvisionFailed",
                     status.message(),
                 ));
             }
@@ -2591,34 +2589,15 @@ impl DockerComputeDriver {
                 "Docker sandbox runtime descriptor is missing; refusing to start the workload without its supervisor",
             ));
         };
-        let boundary_config = tokio::fs::read(
-            docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?
-                .join(BOUNDARY_CONFIG_FILE),
+        let directory = docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?;
+        let launch: openshell_sandbox_backend::bootstrap::Launch = serde_json::from_slice(
+            &tokio::fs::read(directory.join(RUNTIME_LAUNCH_FILE))
+                .await
+                .map_err(|error| Status::internal(format!("read Docker launch record: {error}")))?,
         )
-        .await
-        .map_err(|error| {
-            Status::failed_precondition(format!(
-                "read Docker sandbox bootstrap for restart: {error}"
-            ))
-        })?;
-        let boundary_directory =
-            docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?;
-        let boundary_certificate =
-            tokio::fs::read(boundary_directory.join(BOUNDARY_CERTIFICATE_FILE))
-                .await
-                .map_err(|error| {
-                    Status::failed_precondition(format!(
-                        "read Docker sandbox channel certificate for restart: {error}"
-                    ))
-                })?;
-        let boundary_private_key =
-            tokio::fs::read(boundary_directory.join(BOUNDARY_PRIVATE_KEY_FILE))
-                .await
-                .map_err(|error| {
-                    Status::failed_precondition(format!(
-                        "read Docker sandbox channel private key for restart: {error}"
-                    ))
-                })?;
+        .map_err(|_| Status::internal("decode Docker launch record"))?;
+        let boundary_config = serde_json::to_vec(&launch.credentials)
+            .map_err(|_| Status::internal("encode Docker launch credentials"))?;
         let workspace_root = tokio::fs::read_to_string(
             docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?
                 .join(WORKSPACE_ROOT_FILE),
@@ -2635,10 +2614,6 @@ impl DockerComputeDriver {
             &self.config,
             &runtime_descriptor.workload_identity,
             &boundary_config,
-            DockerSandboxTls {
-                certificate: &boundary_certificate,
-                private_key: &boundary_private_key,
-            },
             &workspace_root,
         )
         .await?;
@@ -4526,16 +4501,9 @@ fn append_docker_archive_file(
         .map_err(|error| Status::internal(format!("build Docker sandbox archive: {error}")))
 }
 
-#[derive(Clone, Copy)]
-struct DockerSandboxTls<'a> {
-    certificate: &'a [u8],
-    private_key: &'a [u8],
-}
-
 fn docker_sandbox_bundle_archive(
     sandbox_binary: &[u8],
     boundary_config: &[u8],
-    boundary_tls: DockerSandboxTls<'_>,
     identity: &ResolvedWorkloadIdentity,
     workspace_root: &str,
 ) -> Result<Vec<u8>, Status> {
@@ -4566,31 +4534,12 @@ fn docker_sandbox_bundle_archive(
     )?;
     append_docker_archive_file(
         &mut archive,
-        ".openshell/channel/sandbox/bootstrap.json",
+        ".openshell/channel/sandbox/join-token.json",
         0o600,
         identity.uid,
         identity.gid,
         boundary_config,
     )?;
-    for (path, contents) in [
-        (
-            ".openshell/channel/sandbox/server.crt",
-            boundary_tls.certificate,
-        ),
-        (
-            ".openshell/channel/sandbox/server.key",
-            boundary_tls.private_key,
-        ),
-    ] {
-        append_docker_archive_file(
-            &mut archive,
-            path,
-            0o600,
-            identity.uid,
-            identity.gid,
-            contents,
-        )?;
-    }
     if workspace_root == driver_mounts::DEFAULT_WORKSPACE_ROOT {
         // The default workspace is driver-managed. Create it before the
         // capability-free sandbox starts because that process deliberately
@@ -4614,13 +4563,11 @@ async fn stage_docker_sandbox_bundle(
     config: &DockerDriverRuntimeConfig,
     identity: &ResolvedWorkloadIdentity,
     boundary_config: &[u8],
-    boundary_tls: DockerSandboxTls<'_>,
     workspace_root: &str,
 ) -> Result<(), Status> {
     let archive = docker_sandbox_bundle_archive(
         config.sandbox_binary.as_slice(),
         boundary_config,
-        boundary_tls,
         identity,
         workspace_root,
     )?;
@@ -4738,31 +4685,26 @@ async fn prepare_docker_boundary_files(
     }
     .provision()
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    let boundary_config = provisioning
-        .boundary_config
-        .encode()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    write_docker_boundary_file(&directory.join(BOUNDARY_CONFIG_FILE), &boundary_config).await?;
+    let launch = openshell_sandbox_backend::bootstrap::Launch::provision(
+        provisioning.boundary_config,
+        format!("unix:{BOUNDARY_SOCKET_MOUNT_PATH}"),
+        String::new(),
+    )
+    .map_err(Status::internal)?;
     write_docker_boundary_file(
-        &directory.join(BOUNDARY_CERTIFICATE_FILE),
-        tls.certificate_chain_pem.as_bytes(),
+        &directory.join(RUNTIME_LAUNCH_FILE),
+        &serde_json::to_vec(&launch)
+            .map_err(|_| Status::internal("encode Docker launch record"))?,
     )
     .await?;
-    write_docker_boundary_file(
-        &directory.join(BOUNDARY_PRIVATE_KEY_FILE),
-        tls.private_key_pem.as_bytes(),
-    )
-    .await?;
+    let boundary_config = serde_json::to_vec(&launch.credentials)
+        .map_err(|_| Status::internal("encode Docker launch credentials"))?;
     stage_docker_sandbox_bundle(
         docker,
         container_id,
         config,
         workload_identity,
         &boundary_config,
-        DockerSandboxTls {
-            certificate: tls.certificate_chain_pem.as_bytes(),
-            private_key: tls.private_key_pem.as_bytes(),
-        },
         &workspace_root,
     )
     .await?;
@@ -4817,7 +4759,22 @@ async fn docker_supervisor_bundle_archive(
             "Docker supervisor requires launch authentication",
         ));
     }
+    let launch: openshell_sandbox_backend::bootstrap::Launch = serde_json::from_slice(
+        &tokio::fs::read(directory.join(RUNTIME_LAUNCH_FILE))
+            .await
+            .map_err(|error| Status::internal(format!("read Docker launch record: {error}")))?,
+    )
+    .map_err(|_| Status::internal("decode Docker launch record"))?;
     let mut archive = tar::Builder::new(Vec::new());
+    append_docker_archive_file(
+        &mut archive,
+        openshell_sandbox_backend::bootstrap::SERVER_FILE,
+        0o600,
+        SUPERVISOR_UID,
+        SUPERVISOR_GID,
+        &serde_json::to_vec(&launch.server)
+            .map_err(|_| Status::internal("encode Docker supervisor launch"))?,
+    )?;
     append_docker_archive_file(
         &mut archive,
         "runtime-descriptor.json",
@@ -4911,8 +4868,8 @@ async fn refresh_docker_boundary_authentication(
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let mut boundary_config = serde_json::from_slice::<BoundaryConfig>(
-        &tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+    let launch = serde_json::from_slice::<openshell_sandbox_backend::bootstrap::Launch>(
+        &tokio::fs::read(directory.join(RUNTIME_LAUNCH_FILE))
             .await
             .map_err(|error| {
                 Status::failed_precondition(format!(
@@ -4925,6 +4882,7 @@ async fn refresh_docker_boundary_authentication(
             "decode Docker sandbox bootstrap for authentication rotation: {error}"
         ))
     })?;
+    let mut boundary_config = launch.server.config;
     let Some(mut runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await?
     else {
         return Err(Status::failed_precondition(
@@ -4957,27 +4915,22 @@ async fn refresh_docker_boundary_authentication(
         server_name: tls.server_name,
         trust_anchor_pem: tls.trust_anchor_pem,
     };
-    let encoded_boundary_config = boundary_config
-        .encode()
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let launch = openshell_sandbox_backend::bootstrap::Launch::provision(
+        boundary_config,
+        format!("unix:{BOUNDARY_SOCKET_MOUNT_PATH}"),
+        String::new(),
+    )
+    .map_err(Status::internal)?;
+    let encoded_boundary_config =
+        serde_json::to_vec(&launch).map_err(|_| Status::internal("encode Docker launch record"))?;
     let descriptor = runtime_descriptor
         .backend_descriptor()
         .map_err(|error| Status::internal(error.to_string()))?;
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
     write_docker_boundary_file(
-        &directory.join(BOUNDARY_CONFIG_FILE),
+        &directory.join(RUNTIME_LAUNCH_FILE),
         &encoded_boundary_config,
-    )
-    .await?;
-    write_docker_boundary_file(
-        &directory.join(BOUNDARY_CERTIFICATE_FILE),
-        tls.certificate_chain_pem.as_bytes(),
-    )
-    .await?;
-    write_docker_boundary_file(
-        &directory.join(BOUNDARY_PRIVATE_KEY_FILE),
-        tls.private_key_pem.as_bytes(),
     )
     .await?;
     write_docker_boundary_file(
@@ -5340,11 +5293,12 @@ async fn docker_workload_image_environment(
     sandbox: &DriverSandbox,
     directory: &Path,
 ) -> Result<Vec<String>, Status> {
-    let bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+    let bytes = tokio::fs::read(directory.join(RUNTIME_LAUNCH_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker image launch identity: {error}")))?;
-    let bootstrap: BoundaryConfig = serde_json::from_slice(&bytes)
+    let launch: openshell_sandbox_backend::bootstrap::Launch = serde_json::from_slice(&bytes)
         .map_err(|_| Status::internal("decode Docker image launch identity"))?;
+    let bootstrap = launch.server.config;
     let mut environment = Vec::new();
     if let Some(image) = sandbox_image(sandbox) {
         environment.push(format!(
@@ -5458,6 +5412,12 @@ async fn spawn_docker_control_process(
             openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
         ));
     }
+    environment.push(format!(
+        "{}={}/{}",
+        openshell_sandbox_backend::bootstrap::SERVER_ENV,
+        SUPERVISOR_STATE_MOUNT_PATH,
+        openshell_sandbox_backend::bootstrap::SERVER_FILE
+    ));
     let supervisor_archive = docker_supervisor_bundle_archive(sandbox, config).await?;
     stage_docker_supervisor_bundle(docker, sandbox, config, supervisor_archive).await?;
     let labels = HashMap::from([
@@ -6284,8 +6244,8 @@ fn build_container_create_body_for_image(
         entrypoint: Some(vec![SANDBOX_BINARY_PATH.to_string()]),
         // The image cannot append inherited arguments or select either role.
         cmd: Some(vec![
-            "--bootstrap".to_string(),
-            BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
+            "--join-file".to_string(),
+            BOOTSTRAP_CREDENTIALS_MOUNT_PATH.to_string(),
         ]),
         labels: Some(labels),
         host_config: Some(HostConfig {

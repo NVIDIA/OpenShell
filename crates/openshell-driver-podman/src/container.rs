@@ -1635,7 +1635,7 @@ pub fn build_isolation_specs(
         .filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
         .collect();
     workload.command = vec![
-        "--bootstrap".into(),
+        "--join-file".into(),
         crate::isolation::BOOTSTRAP_PATH.into(),
     ];
     workload.user.clone_from(&user);
@@ -1734,6 +1734,10 @@ pub fn build_isolation_specs(
     if let Some(network_trust) = input.network_trust {
         supervisor.mounts.push(network_trust_mount(network_trust)?);
     }
+    supervisor.env.insert(
+        openshell_sandbox_backend::bootstrap::SERVER_ENV.into(),
+        crate::isolation::RUNTIME_LAUNCH_PATH.into(),
+    );
     supervisor.env.insert(
         openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
         openshell_sandbox_backend::BACKEND_NAME.into(),
@@ -2122,7 +2126,7 @@ mod tests {
         assert!(specs.workload.cap_add.is_empty());
         assert_eq!(
             specs.workload.command,
-            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
+            vec!["--join-file", crate::isolation::BOOTSTRAP_PATH]
         );
         assert_eq!(specs.supervisor.user, "1000:1001");
         assert_eq!(
@@ -2198,7 +2202,7 @@ mod tests {
         assert!(default_specs.workload.cap_add.is_empty());
         assert_eq!(
             default_specs.workload.command,
-            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
+            vec!["--join-file", crate::isolation::BOOTSTRAP_PATH]
         );
         let workload_json = serde_json::to_string(&specs.workload).unwrap();
         assert!(workload_json.contains("\"apparmor_profile\":\"openshell-sandbox\""));

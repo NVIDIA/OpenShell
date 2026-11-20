@@ -1432,12 +1432,12 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 boundary_port = 5500
 ```
 
-Kubernetes sandboxes fetch boundary configuration from their supervisor using a
-short-lived bootstrap token. No bootstrap setting is required. Dedicated
-supervisors use port 5502; `boundary_port` must differ from 5502. Shared
-supervisors use their configured runtime listener. Deploy matching gateway,
-supervisor, and sandbox images together; new and restarted generations use
-token bootstrap.
+New and restarted sandboxes use a short-lived Join token to receive configuration
+from their supervisor over the existing control connection. No bootstrap setting
+or additional port is required. The token includes the supervisor trust digest;
+the sandbox receives no TLS private key or workload configuration file. Deploy
+matching gateway, supervisor, and sandbox images together. Recreate local
+sandboxes created with the earlier file-based runtime contract.
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
 releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress

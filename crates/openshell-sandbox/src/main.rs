@@ -30,10 +30,6 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
 #[cfg(target_os = "linux")]
-const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 2] = ["tls.crt", "tls.key"];
-#[cfg(target_os = "linux")]
-const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
-#[cfg(target_os = "linux")]
 const SANDBOX_RUNTIME_ROOT: &str = "/.openshell/runtime";
 #[cfg(target_os = "linux")]
 const SANDBOX_STATE_ROOT: &str = "/.openshell/state";
@@ -55,17 +51,13 @@ const LINUX_SIGNAL_LIMIT: i32 = 65;
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell in-workload isolation boundary")]
 struct BoundaryArgs {
-    /// Protected one-use bootstrap configuration staged by the driver.
-    #[arg(
-        long,
-        required_unless_present = "bootstrap_remote",
-        conflicts_with = "bootstrap_remote"
-    )]
-    bootstrap: Option<std::path::PathBuf>,
+    /// Protected Join token envelope, consumed before workload execution.
+    #[arg(long, required_unless_present = "join", conflicts_with = "join")]
+    join_file: Option<std::path::PathBuf>,
 
-    /// Fetch configuration from the supervisor using protected bootstrap environment inputs.
+    /// Join the supervisor using `OPENSHELL_JOIN_TOKEN` and `OPENSHELL_SUPERVISOR_ADDRESS`.
     #[arg(long)]
-    bootstrap_remote: bool,
+    join: bool,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
@@ -1545,14 +1537,10 @@ fn copy_self(dest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stage the immutable Kubernetes bootstrap Secret into private writable
-/// memory-backed volumes. The projected Secret remains mounted only in this
-/// trusted init container; the long-lived sandbox consumes and unlinks the
-/// staged configuration before it starts workload code.
+/// Stage the trusted Kubernetes runtime binary into its private memory volume.
 #[cfg(target_os = "linux")]
 fn stage_kubernetes_bootstrap() -> Result<()> {
     stage_kubernetes_bootstrap_at(
-        Path::new(BOOTSTRAP_INPUT_ROOT),
         Path::new(SANDBOX_RUNTIME_ROOT),
         Path::new(SANDBOX_STATE_ROOT),
     )
@@ -1574,9 +1562,8 @@ fn run_kubernetes_bootstrap() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) -> Result<()> {
+fn stage_kubernetes_bootstrap_at(runtime: &Path, state: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
-    use std::os::unix::fs::PermissionsExt as _;
 
     let uid = nix::unistd::geteuid().as_raw();
     let gid = nix::unistd::getegid().as_raw();
@@ -1603,15 +1590,6 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     copy_regular_file(&executable, &runtime_tmp, 0o500)?;
     fs::rename(&runtime_tmp, &runtime_final).into_diagnostic()?;
 
-    let bundle_tmp = state.join(format!(".bootstrap.{nonce}"));
-    let bundle_final = state.join("bootstrap");
-    fs::create_dir(&bundle_tmp).into_diagnostic()?;
-    fs::set_permissions(&bundle_tmp, fs::Permissions::from_mode(0o700)).into_diagnostic()?;
-    for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
-        copy_projected_secret_file(source, name, &bundle_tmp.join(name), 0o600)?;
-    }
-    fs::rename(&bundle_tmp, &bundle_final).into_diagnostic()?;
-
     // Flush the two directory entries before the init container exits. Both
     // targets are tmpfs in production, but keeping the staging operation
     // durable also makes the helper safe in local conformance tests.
@@ -1628,24 +1606,6 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
         .sync_all()
         .into_diagnostic()?;
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn copy_projected_secret_file(
-    source_root: &Path,
-    name: &str,
-    destination: &Path,
-    mode: u32,
-) -> Result<()> {
-    let canonical_root = std::fs::canonicalize(source_root).into_diagnostic()?;
-    let canonical_source = std::fs::canonicalize(source_root.join(name)).into_diagnostic()?;
-    if !canonical_source.starts_with(&canonical_root) {
-        return Err(miette::miette!(
-            "projected bootstrap input escapes its mounted Secret: {}",
-            source_root.join(name).display()
-        ));
-    }
-    copy_regular_file(&canonical_source, destination, mode)
 }
 
 #[cfg(target_os = "linux")]
@@ -1868,7 +1828,7 @@ fn main() -> Result<()> {
     let args = BoundaryArgs::parse();
     #[cfg(target_os = "linux")]
     {
-        run_boundary_source(args.bootstrap.as_deref(), &args.log_level)
+        run_boundary_source(args.join_file.as_deref(), &args.log_level)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1951,48 +1911,6 @@ mod tests {
             },
             0
         );
-    }
-
-    #[test]
-    fn kubernetes_bootstrap_stages_private_memory_bundle() {
-        if nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() == 0 {
-            return;
-        }
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("input");
-        let runtime = root.path().join("runtime");
-        let state = root.path().join("state");
-        std::fs::create_dir(&source).unwrap();
-        let revision = source.join("..2026_09_04_00_00_00");
-        std::fs::create_dir(&revision).unwrap();
-        for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
-            std::fs::write(revision.join(name), format!("contents-{name}")).unwrap();
-            std::os::unix::fs::symlink(format!("..data/{name}"), source.join(name)).unwrap();
-        }
-        std::os::unix::fs::symlink(revision.file_name().unwrap(), source.join("..data")).unwrap();
-
-        stage_kubernetes_bootstrap_at(&source, &runtime, &state).unwrap();
-
-        assert!(runtime.join("openshell-sandbox").is_file());
-        assert_eq!(
-            std::fs::metadata(runtime.join("openshell-sandbox"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o500
-        );
-        for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
-            let staged = state.join("bootstrap").join(name);
-            assert_eq!(
-                std::fs::read(&staged).unwrap(),
-                std::fs::read(source.join(name)).unwrap()
-            );
-            assert_eq!(
-                std::fs::metadata(staged).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
     }
 
     #[test]

@@ -109,7 +109,7 @@ pub struct SandboxInstanceRegistration {
     pub runtime_descriptor: SandboxRuntimeDescriptor,
     /// Launch-pinned bootstrap served through this instance's routed listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bootstrap: Option<openshell_sandbox_backend::bootstrap::BootstrapServerConfig>,
+    pub bootstrap: Option<openshell_sandbox_backend::bootstrap::JoinServerConfig>,
     /// Gateway-issued credentials for exactly this generation.
     pub auth: openshell_core::jwt::SupervisorAuthBundle,
     /// Encoded `MainProcessConfig` for the canonical process.

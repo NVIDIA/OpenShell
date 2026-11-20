@@ -766,9 +766,23 @@ impl SharedHost {
         let failure = |error: miette::Report| ControlError::Unavailable(error.to_string());
         let bootstrap = registration
             .bootstrap
-            .map(|config| self.router.register_bootstrap(&registration.route, config))
-            .transpose()
-            .map_err(|error| ControlError::Invalid(error.to_string()))?;
+            .map(|config| {
+                let credentials =
+                    openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(
+                        &registration.auth,
+                    )
+                    .map_err(failure)?;
+                let redemption = Arc::new(crate::JoinTokenRedemption {
+                    gateway: openshell_core::grpc_client::GatewayEndpoint::new(
+                        self.gateway_endpoint.as_str(),
+                        credentials,
+                    ),
+                    generation: config.config.generation.clone(),
+                });
+                openshell_sandbox_backend::bootstrap::register(config, redemption)
+                    .map_err(ControlError::Invalid)
+            })
+            .transpose()?;
         let main_process =
             openshell_core::sandbox_env::MainProcessConfig::decode(&registration.main_process_spec)
                 .map_err(ControlError::Invalid)?;

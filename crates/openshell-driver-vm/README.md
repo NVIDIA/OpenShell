@@ -47,7 +47,7 @@ flowchart LR
     client -->|"CreateSandbox / Watch"| gateway
 ```
 
-The supervisor owns gateway credentials, admitted policy, provider resolution, middleware, the network proxy, and relay registration. The sandbox receives no gateway JWT. Each VM generation receives distinct sandbox and supervisor channel keys; the guest consumes and unlinks its private bootstrap files before launching the workload.
+The supervisor owns gateway credentials, admitted policy, provider resolution, middleware, the network proxy, and relay registration. The sandbox receives no gateway JWT. Each VM generation receives a Join token envelope, which the guest consumes and unlinks before launching the workload. Configuration and a reconnect credential arrive over the existing vsock control connection; the guest receives no TLS private key.
 
 VM-specific RFC 0012 code under `src/isolation/` only chooses the vsock transport and binds immutable VM generation and image claims into the protected guest config and host descriptor. Lifecycle, authentication, process control, binary identity, forwarding, and streaming come from `openshell-isolation-interface` and `openshell-sandbox`.
 

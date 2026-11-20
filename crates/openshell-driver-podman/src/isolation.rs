@@ -22,8 +22,9 @@ use serde::{Deserialize, Serialize};
 pub const LABEL_ROLE: &str = "openshell.ai/isolation-role";
 pub const WORKLOAD_FILTER: &str = "openshell.ai/isolation-role=sandbox";
 pub const CHANNEL_ROOT: &str = "/.openshell/channel";
-pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
+pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/join-token.json";
 pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
+pub const RUNTIME_LAUNCH_PATH: &str = "/.openshell/supervisor/runtime-launch.json";
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
 pub const CONTROL_ROOT: &str = "/.openshell/channel/control";
@@ -218,6 +219,11 @@ pub fn bootstrap_archives(
         child_env,
         launch_authentication,
     } = input;
+    if !runtime_initiated {
+        return Err(invalid(
+            "recreate this sandbox to use runtime-initiated bootstrap",
+        ));
+    }
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id).map_err(invalid)?;
@@ -310,6 +316,12 @@ pub fn bootstrap_archives(
         workload_identity: identity.clone(),
         provisioning_evidence,
     };
+    let (credentials, server) = openshell_sandbox_backend::bootstrap::provision(
+        config,
+        format!("unix:{RUNTIME_INITIATED_SOCKET}"),
+        String::new(),
+    )
+    .map_err(invalid)?;
     // Libpod resolves the requested upload destination once for a stopped
     // container. Archive entries must be relative to the selected named volume,
     // not rootfs paths that the volume would shadow on container start.
@@ -317,11 +329,9 @@ pub fn bootstrap_archives(
     channel.directory(".", 0o755, false)?;
     channel.directory("sandbox", 0o711, true)?;
     channel.file(
-        "sandbox/bootstrap.json",
-        &serde_json::to_vec(&config).map_err(invalid)?,
+        "sandbox/join-token.json",
+        &serde_json::to_vec(&credentials).map_err(invalid)?,
     )?;
-    channel.file("sandbox/server.crt", tls.certificate_chain_pem.as_bytes())?;
-    channel.file("sandbox/server.key", tls.private_key_pem.as_bytes())?;
     let channel = channel.finish()?;
     let mut workspace = Archive::new(identity);
     workspace.directory(".", 0o700, true)?;
@@ -335,6 +345,10 @@ pub fn bootstrap_archives(
     supervisor.file(
         AUTH_BUNDLE_PATH,
         &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
+    )?;
+    supervisor.file(
+        RUNTIME_LAUNCH_PATH,
+        &serde_json::to_vec(&server).map_err(invalid)?,
     )?;
     let restart_metadata = RestartMetadata {
         runtime_initiated,
@@ -554,7 +568,7 @@ mod tests {
         let authentication = authentication();
         let child_env = HashMap::from([("PATH".to_string(), "/agent/bin".to_string())]);
         let archives = bootstrap_archives(BootstrapArchivesInput {
-            runtime_initiated: false,
+            runtime_initiated: true,
             sandbox_id: "sandbox",
             container_id: "container",
             generation: "generation-1",
@@ -576,20 +590,22 @@ mod tests {
         assert_eq!(root.header().gid().unwrap(), u64::from(identity.gid));
         assert_eq!(root.header().mode().unwrap(), 0o700);
         assert!(entries.next().is_none());
-        assert_eq!(workload.len(), 3);
-        assert_eq!(supervisor.len(), 3);
+        assert_eq!(workload.len(), 1);
+        assert_eq!(supervisor.len(), 4);
         assert!(workload.keys().all(|path| path.starts_with("sandbox")));
         assert!(
             supervisor
                 .keys()
                 .all(|path| path.starts_with(".openshell/supervisor"))
         );
-        let config: BoundaryConfig = serde_json::from_slice(
-            workload
-                .get(&PathBuf::from("sandbox/bootstrap.json"))
-                .unwrap(),
-        )
-        .unwrap();
+        let launch: openshell_sandbox_backend::bootstrap::JoinServerConfig =
+            serde_json::from_slice(
+                supervisor
+                    .get(&PathBuf::from(RUNTIME_LAUNCH_PATH.trim_start_matches('/')))
+                    .unwrap(),
+            )
+            .unwrap();
+        let config = launch.config;
         let runtime_descriptor: SandboxRuntimeDescriptor = serde_json::from_slice(
             supervisor
                 .get(&PathBuf::from(

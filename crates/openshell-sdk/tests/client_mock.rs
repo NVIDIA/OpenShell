@@ -245,6 +245,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn redeem_join_token(
+        &self,
+        _request: tonic::Request<proto::RedeemJoinTokenRequest>,
+    ) -> Result<Response<proto::RedeemJoinTokenResponse>, Status> {
+        Err(Status::unimplemented("unused by this test"))
+    }
+
     async fn peer_notify_config_update(
         &self,
         _request: tonic::Request<proto::PeerNotifyConfigUpdateRequest>,

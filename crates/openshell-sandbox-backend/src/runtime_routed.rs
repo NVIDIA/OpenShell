@@ -62,7 +62,7 @@ const MAX_PENDING_HANDSHAKES: usize = 64;
 /// listener for every other sandbox instance.
 const MAX_PENDING_HANDSHAKES_PER_ROUTE: usize = 4;
 /// Bound on reading the preface and completing TLS for one socket.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Authenticated connections queued for a sandbox instance but not yet claimed.
 const MAX_QUEUED_CONNECTIONS: usize = 2;
 
@@ -223,6 +223,7 @@ struct Route {
     /// Distinguishes a re-registered handle from the registration it replaced.
     id: u64,
     tls: SandboxTlsClientConfig,
+    bootstrap: Option<Arc<crate::bootstrap::Exchange>>,
     spares: mpsc::Sender<BoundaryDuplexStream>,
     pending: Arc<Semaphore>,
 }
@@ -231,7 +232,6 @@ struct Route {
 struct Routes {
     next_id: u64,
     by_handle: HashMap<String, Route>,
-    bootstraps: HashMap<String, Arc<crate::bootstrap::Exchange>>,
     /// This listener's address, as the route directory names it.
     own_address: Option<SocketAddr>,
     /// Runtime listener of the pool member that hosts each route.
@@ -240,11 +240,11 @@ struct Routes {
 
 /// Where a routing preface's handle leads.
 enum Destination {
-    Bootstrap(Arc<crate::bootstrap::Exchange>, Option<SocketAddr>),
     /// A sandbox instance registered on this listener, which the directory
     /// names as `own`.
     Local {
         tls: SandboxTlsClientConfig,
+        bootstrap: Option<Arc<crate::bootstrap::Exchange>>,
         spares: mpsc::Sender<BoundaryDuplexStream>,
         pending: Arc<Semaphore>,
         own: Option<SocketAddr>,
@@ -264,24 +264,13 @@ impl Routes {
         let owner = self
             .owners
             .get(handle)
-            .or_else(|| {
-                handle
-                    .strip_prefix("boot-")
-                    .and_then(|route| self.owners.get(route))
-            })
             .copied()
             .filter(|owner| Some(*owner) != self.own_address);
-        if let Some(bootstrap) = self.bootstraps.get(handle) {
-            return if follows_redirects && let Some(owner) = owner {
-                Destination::Owner(owner)
-            } else {
-                Destination::Bootstrap(bootstrap.clone(), self.own_address)
-            };
-        }
         match (self.by_handle.get(handle), owner) {
             (Some(_), Some(owner)) if follows_redirects => Destination::Owner(owner),
             (Some(route), _) => Destination::Local {
                 tls: route.tls.clone(),
+                bootstrap: route.bootstrap.clone(),
                 spares: route.spares.clone(),
                 pending: route.pending.clone(),
                 own: self.own_address,
@@ -349,7 +338,7 @@ impl RuntimeRouter {
         validate_route_handle(handle)?;
         crate::runtime::validate_client_tls(tls)?;
         let mut routes = lock(&self.routes);
-        if routes.by_handle.contains_key(handle) || routes.bootstraps.contains_key(handle) {
+        if routes.by_handle.contains_key(handle) {
             return Err(BackendError::Denied(
                 "runtime route handle is already registered".to_string(),
             ));
@@ -362,6 +351,7 @@ impl RuntimeRouter {
             Route {
                 id,
                 tls: tls.clone(),
+                bootstrap: crate::bootstrap::lookup_tls(tls),
                 spares: sender,
                 pending: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES_PER_ROUTE)),
             },
@@ -374,30 +364,6 @@ impl RuntimeRouter {
             spares: tokio::sync::Mutex::new(spares),
             connected: AtomicBool::new(false),
         }))
-    }
-
-    /// Register a launch-pinned bootstrap exchange on the existing listener.
-    pub fn register_bootstrap(
-        self: &Arc<Self>,
-        handle: &str,
-        config: crate::bootstrap::BootstrapServerConfig,
-    ) -> Result<BootstrapRegistration, BackendError> {
-        let handle = format!("boot-{handle}");
-        validate_route_handle(&handle)?;
-        let exchange =
-            Arc::new(crate::bootstrap::prepare(config).map_err(BackendError::Descriptor)?);
-        let mut routes = lock(&self.routes);
-        if routes.bootstraps.contains_key(&handle) || routes.by_handle.contains_key(&handle) {
-            return Err(BackendError::Denied(
-                "bootstrap route is already registered".into(),
-            ));
-        }
-        routes.bootstraps.insert(handle.clone(), exchange.clone());
-        Ok(BootstrapRegistration {
-            router: Arc::downgrade(self),
-            handle,
-            exchange,
-        })
     }
 
     /// Replace the route directory of a supervisor pool: the runtime listener
@@ -416,27 +382,6 @@ impl RuntimeRouter {
 impl Drop for RuntimeRouter {
     fn drop(&mut self) {
         self.accept_task.abort();
-    }
-}
-
-/// Removes the launch's bootstrap route when its hosted instance leaves.
-pub struct BootstrapRegistration {
-    router: std::sync::Weak<RuntimeRouter>,
-    handle: String,
-    exchange: Arc<crate::bootstrap::Exchange>,
-}
-impl Drop for BootstrapRegistration {
-    fn drop(&mut self) {
-        if let Some(router) = self.router.upgrade() {
-            let mut routes = lock(&router.routes);
-            if routes
-                .bootstraps
-                .get(&self.handle)
-                .is_some_and(|entry| Arc::ptr_eq(entry, &self.exchange))
-            {
-                routes.bootstraps.remove(&self.handle);
-            }
-        }
     }
 }
 
@@ -579,25 +524,14 @@ async fn route_connection(
     // The handle only selects which pinned identity to expect, or which pool
     // member to name.
     let destination = lock(routes).destination(&handle, negotiated);
-    let (tls, spares, route_pending, own) = match destination {
+    let (tls, bootstrap, spares, route_pending, own) = match destination {
         Destination::Local {
             tls,
+            bootstrap,
             spares,
             pending,
             own,
-        } => (tls, spares, pending, own),
-        Destination::Bootstrap(exchange, own) => {
-            if !negotiated {
-                return Err("bootstrap requires route negotiation".into());
-            }
-            send_reply(
-                &mut stream,
-                deadline,
-                &address_reply(ROUTE_REPLY_ACCEPT, own)?,
-            )
-            .await?;
-            return exchange.exchange(stream).await;
-        }
+        } => (tls, bootstrap, spares, pending, own),
         Destination::Owner(owner) if negotiated => {
             send_reply(&mut stream, deadline, &redirect_reply(owner)?).await?;
             tracing::debug!(%owner, "redirected routed runtime connection to the route's owner");
@@ -623,10 +557,16 @@ async fn route_connection(
         .await?;
     }
     let stream: BoundaryDuplexStream = Box::new(stream);
-    let authenticated = tokio::time::timeout_at(
-        deadline,
-        crate::runtime::authenticate_boundary_stream(&tls, stream),
-    )
+    let authenticated = tokio::time::timeout_at(deadline, async move {
+        if let Some(bootstrap) = bootstrap {
+            bootstrap
+                .authenticate(stream)
+                .await
+                .map_err(BackendError::Denied)
+        } else {
+            crate::runtime::authenticate_boundary_stream(&tls, stream).await
+        }
+    })
     .await
     .map_err(|_| "runtime TLS handshake timed out".to_string())?
     .map_err(|error| error.to_string())?;

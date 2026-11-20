@@ -19,6 +19,7 @@ openshell-core = { path = "../openshell-core", default-features = false, feature
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 async-trait = "0.1"
 bytes = { workspace = true }
+base64 = { workspace = true }
 hyper-util = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }

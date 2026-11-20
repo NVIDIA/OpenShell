@@ -32,6 +32,7 @@ PODMAN_CI_TESTS=(
   host_gateway_alias
   live_policy_update
   local_driver_token_restart
+  join_token
   no_proxy
   ocsf_jsonl_conformance
   otlp_relay

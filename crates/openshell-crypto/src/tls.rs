@@ -130,3 +130,83 @@ pub fn server_builder_with_protocol_versions(
     try_server_builder_with_protocol_versions(versions)
         .expect("selected TLS provider must support the requested protocol versions")
 }
+
+/// Verify a server chain against the SHA-256 digest of its presented root CA.
+///
+/// The caller must obtain the digest through a trusted launch channel. The
+/// server supplies its root as the last certificate; normal `WebPKI` name,
+/// validity, chain, and TLS handshake signature checks still apply.
+#[must_use]
+pub fn pinned_ca_verifier(digest: [u8; 32]) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+    Arc::new(PinnedCaVerifier { digest })
+}
+
+#[derive(Debug)]
+struct PinnedCaVerifier {
+    digest: [u8; 32],
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCaVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let (root, chain) = intermediates
+            .split_last()
+            .ok_or(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))?;
+        let actual = crate::sha256(root.as_ref())
+            .map_err(|_| rustls::Error::General("hash pinned TLS root".into()))?;
+        if actual != self.digest {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root.clone())?;
+        rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            configuration_provider(),
+        )
+        .build()
+        .map_err(|_| rustls::Error::General("configure pinned TLS root".into()))?
+        .verify_server_cert(end_entity, chain, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            signature,
+            &signature_verification_algorithms(),
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            signature,
+            &signature_verification_algorithms(),
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        signature_verification_algorithms().supported_schemes()
+    }
+}

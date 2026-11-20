@@ -3069,6 +3069,12 @@ mod tests {
                 ),
                 format!(
                     "PUT {}",
+                    api_path(
+                        "/libpod/containers/ctr-1/archive?path=%2F.openshell%2Fchannel%2Fcontrol"
+                    )
+                ),
+                format!(
+                    "PUT {}",
                     api_path("/libpod/containers/openshell-supervisor-sandbox-1/archive?path=%2F")
                 ),
             ]
@@ -4470,7 +4476,7 @@ mod tests {
         )
         .unwrap();
         let bundle = serde_json::to_vec(&crate::isolation::RestartMetadata {
-            runtime_initiated: false,
+            runtime_initiated: true,
             generation: "generation-1".to_string(),
             workload_identity: identity,
             child_env: HashMap::new(),
@@ -4491,6 +4497,7 @@ mod tests {
             ),
             StubResponse::new(StatusCode::OK, archive.into_inner().unwrap()),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
+            StubResponse::new(StatusCode::OK, ""), // runtime control volume
             StubResponse::new(StatusCode::OK, ""), // refreshed supervisor auth and runtime descriptor
             fence_response(),
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
@@ -4669,13 +4676,7 @@ mod tests {
     }
 
     fn channel_archive_members() -> &'static [&'static str] {
-        &[
-            ".",
-            "sandbox",
-            "sandbox/bootstrap.json",
-            "sandbox/server.crt",
-            "sandbox/server.key",
-        ]
+        &[".", "sandbox", "sandbox/join-token.json"]
     }
 
     #[tokio::test]

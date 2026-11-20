@@ -125,6 +125,8 @@ mod linux {
     const RUNTIME_DIAL_BACKOFF_MIN: Duration = Duration::from_millis(100);
     const RUNTIME_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(2);
     /// A spare that dies this quickly without being claimed counts as a failure.
+    // Refresh unused spares well before their one-hour reconnect token expires.
+    const RUNTIME_SPARE_REFRESH: Duration = Duration::from_mins(30);
     const RUNTIME_SPARE_MIN_LIFETIME: Duration = Duration::from_secs(1);
     /// How long a retired connection may take to shut down gracefully before
     /// its transport is dropped.
@@ -257,32 +259,40 @@ mod linux {
         config_path: Option<&Path>,
         qualification: crate::RuntimeQualification,
     ) -> Result<(), String> {
+        use openshell_sandbox_backend::bootstrap;
         install_boundary_signal_handlers()?;
         make_boundary_nondumpable()?;
         disable_core_dumps()?;
-        let config: BoundaryConfig = if let Some(path) = config_path {
-            let bytes = std::fs::read(path)
-                .map_err(|error| format!("read boundary config {}: {error}", path.display()))?;
-            serde_json::from_slice(&bytes).map_err(|_| "decode boundary config".to_string())?
+        let credentials = if let Some(path) = config_path {
+            use std::io::Read as _;
+            let mut bytes = Vec::new();
+            File::open(path)
+                .map_err(|_| "open runtime launch credentials")?
+                .take(16385)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "read runtime launch credentials")?;
+            if bytes.len() > 16384 {
+                return Err("runtime launch credentials exceed limit".into());
+            }
+            let credentials: bootstrap::Credentials =
+                serde_json::from_slice(&bytes).map_err(|_| "decode runtime launch credentials")?;
+            std::fs::remove_file(path)
+                .map_err(|error| format!("consume runtime launch credentials: {error}"))?;
+            credentials
         } else {
-            use openshell_sandbox_backend::bootstrap;
             let input = |name| std::env::var(name).map_err(|_| format!("missing {name}"));
-            let address = input(bootstrap::ADDRESS_ENV)?
-                .parse()
-                .map_err(|_| "invalid bootstrap address")?;
+            bootstrap::Credentials {
+                address: input(bootstrap::ADDRESS_ENV)?,
+                join_token: input(bootstrap::TOKEN_ENV)?,
+            }
+        };
+        let bootstrap = bootstrap::Client::new(credentials)?;
+        let (config, connection) = {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|error| format!("create bootstrap runtime: {error}"))?;
-            runtime.block_on(bootstrap::fetch(
-                address,
-                input(bootstrap::SERVER_NAME_ENV)?,
-                &input(bootstrap::CA_ENV)?,
-                &input(bootstrap::TOKEN_ENV)?,
-                Some(input(bootstrap::ROUTE_ENV)?)
-                    .filter(|route| !route.is_empty())
-                    .as_deref(),
-            ))?
+                .map_err(|error| format!("create runtime bootstrap: {error}"))?;
+            runtime.block_on(bootstrap.bootstrap())?
         };
         validate_config(&config)?;
         validate_runtime_resource_claims(&config)?;
@@ -290,10 +300,6 @@ mod linux {
             &config.workload_identity,
             allows_runtime_supplementary_groups(&config),
         )?;
-        if let Some(path) = config_path {
-            std::fs::remove_file(path)
-                .map_err(|error| format!("consume boundary config {}: {error}", path.display()))?;
-        }
         crate::process::install_boundary_user_environment(config.child_env.clone())?;
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
@@ -325,13 +331,16 @@ mod linux {
             .enable_all()
             .build()
             .map_err(|error| format!("create boundary process runtime: {error}"))?;
-        let runtime = Arc::new(BoundaryRuntime::new(
+        let mut runtime = BoundaryRuntime::new(
             config.clone(),
             process_runtime.handle().clone(),
             network_broker,
             launcher,
             qualification,
-        )?);
+        )?;
+        runtime.bootstrap = Some(bootstrap);
+        runtime.initial_control = Mutex::new(Some(connection));
+        let runtime = Arc::new(runtime);
         serve_then_stop(process_runtime, &config.listener, runtime)
     }
 
@@ -753,22 +762,56 @@ mod linux {
     }
 
     /// Runtime-initiated control: dial the supervisor instead of listening.
-    /// TLS server and gRPC server roles are the same as for a listener.
+    /// The joined sandbox is the TLS client and the gRPC server.
     fn serve_runtime_initiated(
         config: &BoundaryListenerConfig,
         tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
         runtime: Arc<BoundaryRuntime>,
     ) -> Result<(), String> {
-        let server_config = Arc::new(
-            load_tls_server_config(tls)
-                .map_err(|error| format!("load boundary TLS identity: {error}"))?,
-        );
+        let server_config = if runtime.bootstrap.is_some() {
+            None
+        } else {
+            Some(Arc::new(load_tls_server_config(tls).map_err(|error| {
+                format!("load boundary TLS identity: {error}")
+            })?))
+        };
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let initial_control = lock(&runtime.initial_control).take();
+        if let Some(connection) = initial_control {
+            let member = connection.member;
+            let client = runtime
+                .bootstrap
+                .as_ref()
+                .ok_or("missing runtime bootstrap client")?;
+            let stream = runtime
+                .process_runtime
+                .block_on(connection.attach(client))?;
+            let established = ControlStream::Tls {
+                stream,
+                runtime: runtime.process_runtime.clone(),
+            };
+            let runtime = runtime.clone();
+            let active_connections = active_connections.clone();
+            runtime.process_runtime.clone().spawn(async move {
+                if let Err(error) = serve_authenticated_connection(
+                    established,
+                    runtime,
+                    active_connections,
+                    None,
+                    member,
+                )
+                .await
+                {
+                    tracing::debug!(%error, "Initial runtime control connection ended");
+                }
+            });
+        }
         tracing::info!(?config, "Boundary control dialer ready");
         let dialer = runtime.process_runtime.spawn(run_runtime_initiated_control(
             config.clone(),
             server_config,
             runtime.clone(),
-            Arc::new(AtomicUsize::new(0)),
+            active_connections,
         ));
         loop {
             if let Some(result) = take_termination(&runtime) {
@@ -791,7 +834,7 @@ mod linux {
     /// describes.
     async fn run_runtime_initiated_control(
         config: BoundaryListenerConfig,
-        server_config: Arc<rustls::ServerConfig>,
+        server_config: Option<Arc<rustls::ServerConfig>>,
         runtime: Arc<BoundaryRuntime>,
         active_connections: Arc<AtomicUsize>,
     ) {
@@ -825,13 +868,9 @@ mod linux {
                             "supervisor dial timed out",
                         ))
                     }) {
-                    Ok(stream) => ControlStream::PendingTls {
-                        stream,
-                        server_config: server_config.clone(),
-                    }
-                    .establish_async(&runtime.process_runtime)
-                    .await
-                    .map_err(|error| format!("authenticate boundary transport: {error}")),
+                    Ok(stream) => authenticate_runtime_stream(stream, &server_config, &runtime)
+                        .await
+                        .map_err(|error| format!("authenticate boundary transport: {error}")),
                     Err(error) => Err(format!("dial supervisor: {error}")),
                 };
             let healthy = match established {
@@ -877,7 +916,9 @@ mod linux {
         let now = tokio::time::Instant::now();
         if now >= *warn_at.get_or_insert(now + RUNTIME_DIAL_WARNING_INTERVAL) {
             *warn_at = Some(now + RUNTIME_DIAL_WARNING_INTERVAL);
-            tracing::warn!(%error, "Runtime-initiated control cannot reach the supervisor; retrying");
+            tracing::warn!(
+                "Runtime-initiated control cannot reach the supervisor; retrying: {error}"
+            );
         } else {
             tracing::debug!(%error, "Runtime-initiated control dial failed; retrying");
         }
@@ -1022,7 +1063,7 @@ mod linux {
     /// routing.
     async fn run_routed_runtime_control(
         pool: SupervisorRoute,
-        server_config: Arc<rustls::ServerConfig>,
+        server_config: Option<Arc<rustls::ServerConfig>>,
         runtime: Arc<BoundaryRuntime>,
         active_connections: Arc<AtomicUsize>,
         discovery_interval: Duration,
@@ -1108,7 +1149,7 @@ mod linux {
     async fn discover_route_owner(
         pool: &SupervisorRoute,
         spares: &mut RouteSpares,
-        server_config: &Arc<rustls::ServerConfig>,
+        server_config: &Option<Arc<rustls::ServerConfig>>,
         runtime: &Arc<BoundaryRuntime>,
         active_connections: &Arc<AtomicUsize>,
     ) {
@@ -1144,19 +1185,52 @@ mod linux {
         }
     }
 
+    async fn authenticate_runtime_stream(
+        stream: PlainControlStream,
+        server_config: &Option<Arc<rustls::ServerConfig>>,
+        runtime: &Arc<BoundaryRuntime>,
+    ) -> io::Result<ControlStream> {
+        if let Some(client) = &runtime.bootstrap {
+            let raw = {
+                let _guard = runtime.process_runtime.enter();
+                stream.into_tokio()?
+            };
+            let (stream, config) = client.authenticate(raw).await.map_err(io::Error::other)?;
+            if config.is_some() {
+                return Err(io::Error::other(
+                    "session reconnect returned bootstrap configuration",
+                ));
+            }
+            Ok(ControlStream::Tls {
+                stream,
+                runtime: runtime.process_runtime.clone(),
+            })
+        } else {
+            ControlStream::PendingTls {
+                stream,
+                server_config: server_config
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing control TLS identity"))?
+                    .clone(),
+            }
+            .establish_async(&runtime.process_runtime)
+            .await
+        }
+    }
+
     /// Complete the runtime's TLS handshake with a reached supervisor and
     /// serve the connection until the supervisor uses it or it closes.
     async fn start_route_spare(
         dialed: DialedMember,
-        server_config: &Arc<rustls::ServerConfig>,
+        server_config: &Option<Arc<rustls::ServerConfig>>,
         runtime: &Arc<BoundaryRuntime>,
         active_connections: &Arc<AtomicUsize>,
     ) -> io::Result<RouteSpare> {
-        let stream = ControlStream::PendingTls {
-            stream: PlainControlStream::Tcp(dialed.stream.into_std()?),
-            server_config: server_config.clone(),
-        }
-        .establish_async(&runtime.process_runtime)
+        let stream = authenticate_runtime_stream(
+            PlainControlStream::Tcp(dialed.stream.into_std()?),
+            server_config,
+            runtime,
+        )
         .await?;
         let (claimed_tx, claimed) = tokio::sync::oneshot::channel();
         let served = serve_authenticated_connection(
@@ -1355,6 +1429,7 @@ mod linux {
     struct ClaimOnFirstRead {
         inner: openshell_isolation_interface::contract::BoundaryDuplexStream,
         claimed: Option<tokio::sync::oneshot::Sender<()>>,
+        refresh: Pin<Box<tokio::time::Sleep>>,
     }
 
     impl tokio::io::AsyncRead for ClaimOnFirstRead {
@@ -1363,6 +1438,12 @@ mod linux {
             context: &mut Context<'_>,
             buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
+            if self.claimed.is_some() && self.refresh.as_mut().poll(context).is_ready() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "refresh unused runtime spare",
+                )));
+            }
             let before = buffer.filled().len();
             let result = Pin::new(&mut self.inner).poll_read(context, buffer);
             if matches!(result, Poll::Ready(Ok(())))
@@ -1437,6 +1518,7 @@ mod linux {
             Some(claimed) => Box::new(ClaimOnFirstRead {
                 inner: stream,
                 claimed: Some(claimed),
+                refresh: Box::pin(tokio::time::sleep(RUNTIME_SPARE_REFRESH)),
             }),
             None => stream,
         };
@@ -2530,6 +2612,8 @@ mod linux {
     type OwnershipGuard<'a> = tokio::sync::RwLockReadGuard<'a, ()>;
 
     struct BoundaryRuntime {
+        bootstrap: Option<Arc<openshell_sandbox_backend::bootstrap::Client>>,
+        initial_control: Mutex<Option<openshell_sandbox_backend::bootstrap::Detached>>,
         config: BoundaryConfig,
         routing_handle: String,
         authenticator: SandboxProtocolAuthenticator,
@@ -2867,6 +2951,8 @@ mod linux {
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
             let filesystem_flush = FilesystemFlush::for_listener(&config.listener);
             Ok(Self {
+                bootstrap: None,
+                initial_control: Mutex::new(None),
                 authenticator: SandboxProtocolAuthenticator::new(
                     verifier,
                     sandbox_id,
@@ -5231,11 +5317,7 @@ mod linux {
             server_config: Arc<rustls::ServerConfig>,
         },
         Tls {
-            stream: Box<
-                tokio_rustls::server::TlsStream<
-                    openshell_isolation_interface::contract::BoundaryDuplexStream,
-                >,
-            >,
+            stream: openshell_isolation_interface::contract::BoundaryDuplexStream,
             runtime: tokio::runtime::Handle,
         },
         Grpc {
@@ -7387,7 +7469,7 @@ mod linux {
                         addresses: vec![service_address],
                         route: route.clone(),
                     },
-                    server_config,
+                    Some(server_config),
                     boundary,
                     Arc::new(AtomicUsize::new(0)),
                     Duration::from_millis(100),
@@ -7480,7 +7562,7 @@ mod linux {
                     addresses: vec![service_address],
                     route: route.clone(),
                 },
-                server_config,
+                Some(server_config),
                 boundary.clone(),
                 Arc::new(AtomicUsize::new(0)),
                 Duration::from_millis(200),

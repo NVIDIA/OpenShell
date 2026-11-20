@@ -9,7 +9,7 @@ REST API over a Unix socket. Each sandbox has two independent containers:
 
 New containers dial the supervisor over a separate private Unix socket volume
 at `/.openshell/channel/control/control.sock`; workload networking remains
-`none`. The supervisor's bootstrap-key mount stays read-only. Restart metadata
+`none`. The supervisor's launch-envelope mount stays read-only. Restart metadata
 records the direction, with missing metadata retaining the legacy runtime
 listener. Deploy matching supervisor and sandbox runtime binaries for new
 containers.
@@ -72,7 +72,8 @@ DNS remains supervisor-mediated; general UDP is unsupported. The driver sets
 namespace so the sandbox's loopback DNS relay can bind port 53 without a
 capability. No nftables or nested network namespace setup runs in the sandbox.
 
-The channel contains the sandbox bootstrap and sandbox-side TLS identity only.
+The channel contains only a consumable Join token envelope. The sandbox receives
+configuration over the existing Unix control connection and holds no TLS private key.
 Supervisor private keys and the runtime descriptor stay in the supervisor's private filesystem.
 Landlock denies agent access to the top-level `/.openshell` control hierarchy.
 The driver verifies Podman's reported `network=none` fence before launch and
@@ -127,8 +128,7 @@ creation removes only containers created by that attempt, then cleans up
 driver-owned volumes and secrets.
 
 Stop retains both containers, workspace, channel, and secrets. Start restores
-the consumed sandbox bootstrap from a copy in the supervisor's private
-filesystem, verifies the fence, and starts the same pair. A failed supervisor
+a fresh Join token envelope, verifies the fence, and starts the same pair. A failed supervisor
 start stops the workload. Delete removes the companion first, then the workload,
 channel, workspace, and driver-owned secrets. User-owned volumes are retained.
 Delete keeps a channel, control, or workspace volume whose

@@ -7774,3 +7774,27 @@ network_policies:
 
 #[cfg(test)]
 mod legacy_startup_regression_tests;
+
+/// Durable redemption shared by dedicated and pooled runtime control listeners.
+pub struct JoinTokenRedemption {
+    pub gateway: openshell_core::grpc_client::GatewayEndpoint,
+    pub generation: String,
+}
+impl openshell_sandbox_backend::bootstrap::Redemption for JoinTokenRedemption {
+    fn redeem(&self) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let channel = openshell_core::grpc_client::connect_channel_pub(&self.gateway)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut client =
+                openshell_core::proto::open_shell_client::OpenShellClient::new(channel);
+            client
+                .redeem_join_token(openshell_core::proto::RedeemJoinTokenRequest {
+                    generation: self.generation.clone(),
+                })
+                .await
+                .map_err(|status| status.message().to_string())?;
+            Ok(())
+        })
+    }
+}

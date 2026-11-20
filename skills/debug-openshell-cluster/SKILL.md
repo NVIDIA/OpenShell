@@ -1193,7 +1193,7 @@ Pod before releasing either Pod. The supervisor Pod runs
 same resolved non-root identity, request no capabilities, drop `ALL`, disable
 privilege escalation, and use `RuntimeDefault` seccomp. The supervisor and
 sandbox talk over per-sandbox TLS with server-certificate verification plus
-bootstrap-token client authentication; the supervisor owns gateway policy,
+Join token client authentication; the supervisor owns gateway policy,
 provider credentials, DNS, and mediated upstream connections.
 
 Each sandbox records which side opens that connection in the Sandbox annotation
@@ -1236,16 +1236,16 @@ Do not edit the annotation, Service selector, or `os-control-<id>` policy:
 reconciliation suspends a sandbox whose Service or control policy no longer
 matches its recorded mode.
 
-New and restarted sandbox generations fetch boundary bootstrap using a
-short-lived JWT over pinned TLS. Dedicated supervisors use port 5502: check
-`os-bootstrap-<id>` Service and NetworkPolicy for connectivity between the
-paired Pods. Shared supervisors use their existing routed runtime listener;
-check instance assignment and the pool's route directory. The workload Secret
-has `bootstrap-token` and trust inputs instead of `boundary.json`; inspect key
-names only, never print token values. A bootstrap timeout occurs before normal
-Sandbox Protocol admission. Deploy matching gateway, supervisor, and sandbox
-images together. Dedicated supervisor inputs remain in its private Secret;
-shared inputs travel with instance assignments. Boundary TLS files remain staged.
+New and restarted generations join their supervisor on the existing control
+listener using `OPENSHELL_JOIN_TOKEN` and `OPENSHELL_SUPERVISOR_ADDRESS` from
+the workload Secret. Check `os-supervisor-<id>` and `os-control-<id>` for a
+dedicated supervisor, or the existing runtime route and instance assignment
+for shared supervisors. The Secret contains `join-token` and
+`supervisor-address`; inspect key names only. No `boundary.json`, sandbox TLS
+private key, or separate bootstrap endpoint is needed. The Join token includes
+the server trust digest. Redemption is single-use across supervisor restart
+and failover; a response lost after redemption requires a fresh generation.
+Deploy matching gateway, supervisor, and sandbox images together.
 
 The supervisor loads its startup configuration through the polling RPCs and
 opens `ConnectSupervisor` once the workload runs. When the gateway runs with

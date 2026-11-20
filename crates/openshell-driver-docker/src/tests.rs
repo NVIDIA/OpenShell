@@ -125,8 +125,16 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
     .provision()
     .unwrap();
     fs::write(
-        directory.join(BOUNDARY_CONFIG_FILE),
-        provisioned.boundary_config.encode().unwrap(),
+        directory.join(RUNTIME_LAUNCH_FILE),
+        serde_json::to_vec(
+            &openshell_sandbox_backend::bootstrap::Launch::provision(
+                provisioned.boundary_config.clone(),
+                format!("unix:{BOUNDARY_SOCKET_MOUNT_PATH}"),
+                String::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
     )
     .unwrap();
     fs::write(
@@ -147,8 +155,9 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
         .await
         .unwrap();
 
-    let bootstrap: BoundaryConfig =
-        serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    let launch: openshell_sandbox_backend::bootstrap::Launch =
+        serde_json::from_slice(&fs::read(directory.join(RUNTIME_LAUNCH_FILE)).unwrap()).unwrap();
+    let bootstrap = launch.server.config;
     // A restart keeps the original image identity even if the mutable
     // template reference now names another image in the registry.
     let sandbox = test_sandbox();
@@ -1658,8 +1667,8 @@ fn container_creation_uses_inspected_immutable_image() {
         body.cmd.as_deref(),
         Some(
             &[
-                "--bootstrap".to_string(),
-                BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
+                "--join-file".to_string(),
+                BOOTSTRAP_CREDENTIALS_MOUNT_PATH.to_string(),
             ][..]
         )
     );
@@ -1736,10 +1745,6 @@ fn sandbox_bundle_prepares_only_the_driver_managed_workspace() {
     let default_archive = docker_sandbox_bundle_archive(
         b"sandbox-binary",
         b"{}",
-        DockerSandboxTls {
-            certificate: b"server-cert",
-            private_key: b"server-key",
-        },
         &identity,
         driver_mounts::DEFAULT_WORKSPACE_ROOT,
     )
@@ -1762,17 +1767,9 @@ fn sandbox_bundle_prepares_only_the_driver_managed_workspace() {
         u64::from(identity.gid)
     );
 
-    let image_archive = docker_sandbox_bundle_archive(
-        b"sandbox-binary",
-        b"{}",
-        DockerSandboxTls {
-            certificate: b"server-cert",
-            private_key: b"server-key",
-        },
-        &identity,
-        "/workspace/project",
-    )
-    .unwrap();
+    let image_archive =
+        docker_sandbox_bundle_archive(b"sandbox-binary", b"{}", &identity, "/workspace/project")
+            .unwrap();
     let mut archive = tar::Archive::new(image_archive.as_slice());
     assert!(
         archive
@@ -1784,15 +1781,11 @@ fn sandbox_bundle_prepares_only_the_driver_managed_workspace() {
 }
 
 #[test]
-fn sandbox_bundle_stages_private_tls_server_material() {
+fn sandbox_bundle_stages_only_private_launch_credentials() {
     let identity = test_workload_identity();
     let archive = docker_sandbox_bundle_archive(
         b"sandbox-binary",
         b"{}",
-        DockerSandboxTls {
-            certificate: b"server-cert",
-            private_key: b"server-key",
-        },
         &identity,
         driver_mounts::DEFAULT_WORKSPACE_ROOT,
     )
@@ -1814,10 +1807,8 @@ fn sandbox_bundle_stages_private_tls_server_material() {
             ))
         })
         .collect::<HashMap<_, _>>();
-    for path in [
-        ".openshell/channel/sandbox/server.crt",
-        ".openshell/channel/sandbox/server.key",
-    ] {
+    {
+        let path = ".openshell/channel/sandbox/join-token.json";
         assert_eq!(
             entries.get(Path::new(path)),
             Some(&(0o600, u64::from(identity.uid), u64::from(identity.gid)))
@@ -2633,8 +2624,8 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     assert_eq!(
         create_body.cmd,
         Some(vec![
-            "--bootstrap".to_string(),
-            BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
+            "--join-file".to_string(),
+            BOOTSTRAP_CREDENTIALS_MOUNT_PATH.to_string(),
         ])
     );
     assert!(

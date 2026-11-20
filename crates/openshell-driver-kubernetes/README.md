@@ -165,9 +165,10 @@ Service. It preserves unknown annotations, so the mode marker is accepted only
 for its recorded generation. Do not replace an individual generation's
 supervisor or runtime binary with one that cannot read its descriptor.
 
-Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
-container stages the sandbox bootstrap into memory, and the sandbox removes it
-before starting untrusted code. The other Secret is mounted only by the
+Each sandbox generation uses two immutable Secrets. A trusted init container
+stages only the runtime binary. The sandbox receives a Join token and supervisor
+address through Secret-backed environment variables, which never reach workload
+children. The other Secret is mounted only by the
 supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
 corporate proxy CA bundle, which the gateway reads from its own filesystem so
 the anchor stays in the gateway's trust domain rather than the sandbox
@@ -180,34 +181,25 @@ container again from gateway config, so a sandbox created by an older gateway
 starts with the current sandbox runtime image. The shared network fence
 remains for the lifetime of the namespace.
 
-### Boundary bootstrap
+### Join tokens
 
-Every new Kubernetes sandbox generation receives a 15-minute bootstrap JWT,
-supervisor address, pinned TLS trust, and the boundary certificate/key through
-its workload Secret. It contains no `boundary.json`. The sandbox fetches its
-configuration into memory before normal admission. Stop/start creates fresh
-credentials and Secret references. Deploy matching gateway, supervisor, and
-sandbox images together.
+Every new or restarted generation receives a 15-minute Join token containing
+its supervisor trust digest, route, and generation-bound bearer. The sandbox
+verifies the supervisor's TLS certificate chain against that digest before
+sending the bearer. It receives configuration and a reconnect credential over
+the existing runtime-initiated control connection, then uses that same TLS
+stream for the Sandbox Protocol. No separate bootstrap port, Service, or
+NetworkPolicy is created. The sandbox receives no TLS private key or workload
+configuration file. Deploy matching gateway, supervisor, and sandbox images.
 
-Dedicated supervisors serve bootstrap on port 5502 through the per-sandbox
-`os-bootstrap-<id>` Service and NetworkPolicy, independently of the Sandbox
-Protocol connection direction. Shared supervisors serve each instance through
-its existing routed runtime listener, including pool-owner redirects. Their
-bootstrap input travels in the gateway's instance assignment. Dedicated
-supervisors receive it through their existing private Secret.
+The supervisor atomically redeems the generation at the gateway before
+releasing configuration. Reuse remains rejected across supervisor restart and
+pool failover. If the response is lost after redemption, start a fresh sandbox
+generation. Reconnects use a runtime-only JWT, scoped to this generation and
+renewed on connection; they do not redeem the Join token again.
 
-Bootstrap reuses the session JWT implementation with a separate audience,
-token type, and sandbox component. The trusted driver issues the token with an
-ephemeral per-launch key. The supervisor checks the registered token ID,
-sandbox, generation, and epoch. A response lost before acknowledgment can be
-fetched again. Acknowledgment retires that launch's exchange in memory; a
-supervisor restart or reassignment resets retirement while the token is valid.
-Fetch retries are bounded to two minutes and never fall back to a file.
-Boundary TLS files remain staged. Existing running generations retain their
-launch inputs; their next start uses token bootstrap.
-
-The standard `mise run e2e:kubernetes` suite checks creation, workload
-environment isolation, absence of the boundary config file, and stop/start.
+The common `join_token` E2E test checks creation, configuration-file absence,
+workload environment, and stop/start parity for all first-party drivers.
 
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals

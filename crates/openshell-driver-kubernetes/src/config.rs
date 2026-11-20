@@ -146,16 +146,11 @@ pub struct KubernetesAppListenerConfig {
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.app_listener.common.validate()?;
-        if self.boundary_port == openshell_sandbox_backend::bootstrap::PORT {
-            return Err("boundary_port conflicts with bootstrap port 5502".into());
-        }
         if self.app_listener.common.enabled {
             if !is_dns_subdomain(&self.app_listener.tls_secret_name) {
                 return Err("sandbox_runtime.app_listener.tls_secret_name is required when the app listener is enabled".into());
             }
-            if [self.boundary_port, 5501].contains(&self.app_listener.common.port)
-                || self.app_listener.common.port == openshell_sandbox_backend::bootstrap::PORT
-            {
+            if [self.boundary_port, 5501].contains(&self.app_listener.common.port) {
                 return Err("supervisor.app_listener.port conflicts with a supervisor runtime or health port".into());
             }
         }

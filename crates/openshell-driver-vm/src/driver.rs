@@ -76,9 +76,8 @@ use openshell_core::{
     NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
 };
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
-    SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
-    generate_sandbox_tls_material,
+    BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
+    SandboxTlsServerConfig, SandboxTransport, generate_sandbox_tls_material,
 };
 use openshell_vfio::SysfsRoot;
 use opentelemetry::trace::TraceContextExt as _;
@@ -1424,6 +1423,10 @@ impl VmDriver {
             .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
         let mut command = Command::new(&supervisor_binary);
         isolate_host_control_environment(&mut command);
+        command.env(
+            openshell_sandbox_backend::bootstrap::SERVER_ENV,
+            state_dir.join(openshell_sandbox_backend::bootstrap::SERVER_FILE),
+        );
         command
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -2124,13 +2127,30 @@ impl VmDriver {
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let guest_boundary_config_path =
             guest_boundary_config_path(&provisioning.boundary_config.generation);
-        inject_guest_boundary_bundle(
-            &overlay_disk,
-            &guest_boundary_config_path,
-            &provisioning.boundary_config,
-            &channel_tls,
+        let bootstrap_port = match &provisioning.boundary_config.listener {
+            BoundaryListener::RuntimeInitiatedVsock { host_port, .. } => *host_port,
+            _ => {
+                return Err(Status::internal(
+                    "VM bootstrap requires a runtime-initiated vsock transport",
+                ));
+            }
+        };
+        let (credentials, server) = openshell_sandbox_backend::bootstrap::provision(
+            provisioning.boundary_config,
+            format!("vsock:{bootstrap_port}"),
+            String::new(),
         )
-        .map_err(|error| Status::internal(format!("inject VM boundary configuration: {error}")))?;
+        .map_err(Status::internal)?;
+        write_private_file(
+            &state_dir.join(openshell_sandbox_backend::bootstrap::SERVER_FILE),
+            serde_json::to_vec(&server).map_err(|error| Status::internal(error.to_string()))?,
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+        inject_guest_boundary_bundle(&overlay_disk, &guest_boundary_config_path, &credentials)
+            .map_err(|error| {
+                Status::internal(format!("inject VM boundary configuration: {error}"))
+            })?;
         write_private_file(
             &state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
             boundary_generation.as_bytes().to_vec(),
@@ -7422,6 +7442,7 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
     for path in [
         state_dir.join(HOST_AUTH_BUNDLE_FILE),
         state_dir.join(HOST_RUNTIME_DESCRIPTOR_FILE),
+        state_dir.join(openshell_sandbox_backend::bootstrap::SERVER_FILE),
         generation_path,
     ] {
         match tokio::fs::remove_file(&path).await {
@@ -7603,34 +7624,12 @@ fn prepare_sandbox_overlay_image(
 fn inject_guest_boundary_bundle(
     overlay_disk: &Path,
     guest_path: &str,
-    config: &BoundaryConfig,
-    material: &SandboxTlsMaterial,
+    credentials: &openshell_sandbox_backend::bootstrap::Credentials,
 ) -> Result<(), String> {
-    let tls = match &config.listener {
-        BoundaryListener::Unix { tls, .. }
-        | BoundaryListener::TlsTcp { tls, .. }
-        | BoundaryListener::Vsock { tls, .. }
-        | BoundaryListener::RuntimeInitiatedTlsTcp { tls, .. }
-        | BoundaryListener::RuntimeInitiatedUnix { tls, .. }
-        | BoundaryListener::RuntimeInitiatedVsock { tls, .. } => tls.clone(),
-    };
-    let encoded_config = config
-        .encode()
-        .map_err(|error| format!("encode VM boundary configuration: {error}"))?;
-    let config_path = overlay_upper_path(guest_path);
-    write_rootfs_image_file(overlay_disk, &config_path, &encoded_config)?;
-    set_rootfs_image_file_mode(overlay_disk, &config_path, 0o600)?;
-    for (guest_path, contents) in [
-        (
-            tls.certificate_chain_path,
-            material.certificate_chain_pem.as_bytes(),
-        ),
-        (tls.private_key_path, material.private_key_pem.as_bytes()),
-    ] {
-        let path = overlay_upper_path(guest_path.to_string_lossy().as_ref());
-        write_rootfs_image_file(overlay_disk, &path, contents)?;
-        set_rootfs_image_file_mode(overlay_disk, &path, 0o600)?;
-    }
+    let encoded = serde_json::to_vec(credentials).map_err(|error| error.to_string())?;
+    let path = overlay_upper_path(guest_path);
+    write_rootfs_image_file(overlay_disk, &path, &encoded)?;
+    set_rootfs_image_file_mode(overlay_disk, &path, 0o600)?;
     Ok(())
 }
 
@@ -7646,7 +7645,7 @@ fn inject_guest_mount_manifest(
 }
 
 fn guest_boundary_config_path(generation: &str) -> String {
-    format!("{GUEST_BOUNDARY_CONFIG_DIR}/bootstrap-{generation}.json")
+    format!("{GUEST_BOUNDARY_CONFIG_DIR}/join-token-{generation}.json")
 }
 
 fn guest_boundary_tls_paths(generation: &str) -> SandboxTlsServerConfig {
