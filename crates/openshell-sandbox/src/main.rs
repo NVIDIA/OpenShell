@@ -56,8 +56,16 @@ const LINUX_SIGNAL_LIMIT: i32 = 65;
 #[command(about = "OpenShell in-workload isolation boundary")]
 struct BoundaryArgs {
     /// Protected one-use bootstrap configuration staged by the driver.
+    #[arg(
+        long,
+        required_unless_present = "bootstrap_remote",
+        conflicts_with = "bootstrap_remote"
+    )]
+    bootstrap: Option<std::path::PathBuf>,
+
+    /// Fetch configuration from the supervisor using protected bootstrap environment inputs.
     #[arg(long)]
-    bootstrap: std::path::PathBuf,
+    bootstrap_remote: bool,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
@@ -1600,6 +1608,9 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     fs::create_dir(&bundle_tmp).into_diagnostic()?;
     fs::set_permissions(&bundle_tmp, fs::Permissions::from_mode(0o700)).into_diagnostic()?;
     for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
+        if name == "boundary.json" && source.join("bootstrap-token").exists() {
+            continue;
+        }
         copy_projected_secret_file(source, name, &bundle_tmp.join(name), 0o600)?;
     }
     fs::rename(&bundle_tmp, &bundle_final).into_diagnostic()?;
@@ -1789,6 +1800,11 @@ fn seed_kubernetes_workspace() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+    run_boundary_source(Some(bootstrap), log_level)
+}
+
+#[cfg(target_os = "linux")]
+fn run_boundary_source(bootstrap: Option<&Path>, log_level: &str) -> Result<()> {
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
@@ -1801,7 +1817,10 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
         )
         .try_init();
     let (qualification, _) = qualify_runtime()?;
-    openshell_sandbox::run(bootstrap, qualification)
+    bootstrap.map_or_else(
+        || openshell_sandbox::run_remote(qualification),
+        |path| openshell_sandbox::run(path, qualification),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1850,7 +1869,14 @@ fn main() -> Result<()> {
     }
 
     let args = BoundaryArgs::parse();
-    run_boundary(&args.bootstrap, &args.log_level)
+    #[cfg(target_os = "linux")]
+    {
+        run_boundary_source(args.bootstrap.as_deref(), &args.log_level)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(miette::miette!("openshell-sandbox requires Linux"))
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1928,6 +1954,26 @@ mod tests {
             },
             0
         );
+    }
+
+    #[test]
+    fn kubernetes_wire_bootstrap_stages_tls_without_config_or_token_files() {
+        if nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("input");
+        let runtime = root.path().join("runtime");
+        let state = root.path().join("state");
+        std::fs::create_dir(&source).unwrap();
+        for name in ["bootstrap-token", "tls.crt", "tls.key"] {
+            std::fs::write(source.join(name), b"protected-input").unwrap();
+        }
+        stage_kubernetes_bootstrap_at(&source, &runtime, &state).unwrap();
+        assert!(!state.join("bootstrap/boundary.json").exists());
+        assert!(!state.join("bootstrap/bootstrap-token").exists());
+        assert!(state.join("bootstrap/tls.crt").is_file());
+        assert!(state.join("bootstrap/tls.key").is_file());
     }
 
     #[test]

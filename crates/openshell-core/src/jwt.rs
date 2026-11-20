@@ -144,11 +144,13 @@ mod session {
         }
     }
 
-    /// The only component authorized by either sandbox-session token profile.
+    /// Component authorized by a supervisor session or boundary bootstrap token.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum SessionComponent {
         #[serde(rename = "openshell-supervisor")]
         OpenShellSupervisor,
+        #[serde(rename = "openshell-sandbox")]
+        OpenShellSandbox,
     }
 
     /// Exact token profile. The profile chooses both the JOSE `typ` and JWT `aud`.
@@ -156,6 +158,7 @@ mod session {
     pub enum SessionTokenProfile {
         Gateway,
         Sandbox,
+        BoundaryBootstrap,
     }
 
     impl SessionTokenProfile {
@@ -164,6 +167,7 @@ mod session {
             match self {
                 Self::Gateway => GATEWAY_SESSION_JWT_TYPE,
                 Self::Sandbox => SANDBOX_SESSION_JWT_TYPE,
+                Self::BoundaryBootstrap => "openshell-boundary-bootstrap+jwt",
             }
         }
 
@@ -171,6 +175,7 @@ mod session {
             match self {
                 Self::Gateway => issuer,
                 Self::Sandbox => SANDBOX_SESSION_AUDIENCE,
+                Self::BoundaryBootstrap => "openshell-boundary-bootstrap",
             }
         }
     }
@@ -811,7 +816,7 @@ mod session {
         }
     }
 
-    /// Gateway-side issuer shared by both token profiles.
+    /// Issuer shared by session, supervisor, and boundary bootstrap token profiles.
     pub struct SessionJwtIssuer {
         encoding_key: EncodingKey,
         key_id: String,
@@ -832,6 +837,19 @@ mod session {
     }
 
     impl SessionJwtIssuer {
+        /// Mint a bootstrap-only capability with a bounded 15-minute lifetime.
+        pub fn mint_boundary_bootstrap(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            self.mint(
+                SessionTokenProfile::BoundaryBootstrap,
+                identity,
+                Uuid::new_v4(),
+                self.clock.now_unix_seconds(),
+            )
+        }
+
         pub fn from_ed25519_pem(
             signing_key_pem: &[u8],
             key_id: impl Into<String>,
@@ -991,7 +1009,12 @@ mod session {
             token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionToken, SessionJwtError> {
-            let expires_at = self.ttl.map_or(0, |ttl| {
+            let ttl = if profile == SessionTokenProfile::BoundaryBootstrap {
+                Some(Duration::from_mins(15))
+            } else {
+                self.ttl
+            };
+            let expires_at = ttl.map_or(0, |ttl| {
                 issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
             });
             let claims = SessionClaims {
@@ -1004,7 +1027,11 @@ mod session {
                 sandbox_id: identity.sandbox_id.clone(),
                 runtime_generation: identity.runtime_generation.clone(),
                 auth_epoch: identity.auth_epoch,
-                component: SessionComponent::OpenShellSupervisor,
+                component: if profile == SessionTokenProfile::BoundaryBootstrap {
+                    SessionComponent::OpenShellSandbox
+                } else {
+                    SessionComponent::OpenShellSupervisor
+                },
             };
             let mut header = Header::new(Algorithm::EdDSA);
             header.kid = Some(self.key_id.clone());
@@ -1027,7 +1054,7 @@ mod session {
         pub public_key_pem: Vec<u8>,
     }
 
-    /// Strict verifier used by either the gateway or the Sandbox Protocol.
+    /// Strict verifier for gateway sessions, Sandbox Protocol sessions, and boundary bootstrap.
     pub struct SessionJwtVerifier {
         keys: BTreeMap<String, DecodingKey>,
         issuer: String,
@@ -1143,6 +1170,17 @@ mod session {
             }
             if claims.aud != self.profile.audience(&self.issuer) {
                 return Err(SessionJwtError::WrongAudience);
+            }
+            let component = if self.profile == SessionTokenProfile::BoundaryBootstrap {
+                if claims.exp == 0 || claims.exp.saturating_sub(claims.iat) > 900 {
+                    return Err(SessionJwtError::InvalidLifetime);
+                }
+                SessionComponent::OpenShellSandbox
+            } else {
+                SessionComponent::OpenShellSupervisor
+            };
+            if claims.component != component {
+                return Err(SessionJwtError::InvalidRuntimeIdentity);
             }
             if claims.sub != format!("{SANDBOX_SUBJECT_PREFIX}{}", claims.sandbox_id) {
                 return Err(SessionJwtError::SubjectMismatch);

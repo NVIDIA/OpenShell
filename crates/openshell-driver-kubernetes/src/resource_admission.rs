@@ -143,6 +143,17 @@ fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, 
                 return Err(deny());
             }
             for env in container["env"].as_array().into_iter().flatten() {
+                // Only driver-authored bootstrap inputs from this generation's
+                // private Secret may cross into the trusted boundary process.
+                // Its launcher strips the reserved namespace from workload env.
+                if field == "containers" && container["name"] == "agent"
+                    && container["command"] == serde_json::json!(["/.openshell/runtime/openshell-sandbox", "--bootstrap-remote"])
+                    && openshell_sandbox_backend::bootstrap::ENV_KEYS.iter().any(|(name, key)| {
+                        *env == serde_json::json!({"name": name, "valueFrom": {"secretKeyRef": {"name": private_secret, "key": key}}})
+                    })
+                {
+                    continue;
+                }
                 if !env["valueFrom"]["secretKeyRef"].is_null()
                     || !env["valueFrom"]["configMapKeyRef"].is_null()
                 {
@@ -273,6 +284,22 @@ pub fn check_record(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_environment_is_limited_to_the_boundarys_private_secret() {
+        use super::*;
+        let entry = serde_json::json!({"name": "OPENSHELL_BOUNDARY_BOOTSTRAP_TOKEN",
+            "valueFrom": {"secretKeyRef": {"name": "private-generation", "key": "bootstrap-token"}}});
+        let mut spec = serde_json::json!({"automountServiceAccountToken": false,
+            "containers": [{"name": "agent", "command": ["/.openshell/runtime/openshell-sandbox", "--bootstrap-remote"], "env": [entry]}]});
+        assert!(inventory(&spec, "private-generation").unwrap().is_empty());
+        assert!(inventory(&spec, "other-generation").is_err());
+        spec["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["key"] = "tls.key".into();
+        assert!(inventory(&spec, "private-generation").is_err());
+        spec["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["key"] =
+            "bootstrap-token".into();
+        spec["containers"][0]["name"] = "sidecar".into();
+        assert!(inventory(&spec, "private-generation").is_err());
+    }
     use super::*;
 
     #[tokio::test]

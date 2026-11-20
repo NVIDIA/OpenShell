@@ -674,6 +674,14 @@ for dependencies still declared in `Chart.yaml`.
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |
 
+## Token bootstrap prototype
+
+`mise run e2e:kubernetes:bootstrap` creates an isolated deployment with
+`ci/values-bootstrap-wire.yaml` and dedicated supervisors. It verifies creation
+without `boundary.json`, token exclusion from the workload environment, and
+fresh Secret references after stop/start. All three images must come from the
+branch under test. The default file bootstrap and shared topology are unchanged.
+
 ## Sandbox update regression lane
 
 Run `mise run e2e:kubernetes:updates` for the testkit update suite against both

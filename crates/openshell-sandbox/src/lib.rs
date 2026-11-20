@@ -84,5 +84,11 @@ pub fn run(
         .map_err(|error| miette::miette!(error))
 }
 
+/// Fetch the protected configuration from the supervisor before admission.
+#[cfg(target_os = "linux")]
+pub fn run_remote(qualification: RuntimeQualification) -> miette::Result<()> {
+    boundary_server::run_remote_boundary(qualification).map_err(|error| miette::miette!(error))
+}
+
 #[cfg(target_os = "linux")]
 mod native_api;

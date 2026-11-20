@@ -539,6 +539,27 @@ fn main() -> Result<()> {
 
     let exit_code = runtime.block_on(async move {
         openshell_crypto::tls::ensure_default_provider();
+        let _bootstrap_server = match std::env::var("OPENSHELL_BOUNDARY_BOOTSTRAP_SERVER_FILE") {
+            Ok(path) => {
+                if args.mode == SupervisorMode::Shared
+                    || args.role != SupervisorRole::IsolationBackend
+                {
+                    return Err(miette::miette!(
+                        "boundary bootstrap requires a dedicated isolation-backend supervisor"
+                    ));
+                }
+                let bytes = std::fs::read(path).into_diagnostic()?;
+                let config = serde_json::from_slice(&bytes)
+                    .map_err(|_| miette::miette!("decode supervisor bootstrap server input"))?;
+                Some(
+                    openshell_sandbox_backend::bootstrap::serve(config)
+                        .await
+                        .map_err(|error| miette::miette!(error))?,
+                )
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err(miette::miette!("invalid boundary bootstrap server path")),
+        };
         let log_push_state = if let (Some(sandbox_id), Some(endpoint), Some(credentials)) = (
             &args.sandbox_id,
             &args.openshell_endpoint,

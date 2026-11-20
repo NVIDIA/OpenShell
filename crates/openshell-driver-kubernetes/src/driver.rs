@@ -2657,6 +2657,7 @@ impl KubernetesComputeDriver {
             sandbox_gid: resolved_group_id,
             boundary_port: self.config.sandbox_runtime.boundary_port,
             sandbox_secret_name: &proxy_names.sandbox_secret,
+            bootstrap_over_wire: self.config.sandbox_runtime.bootstrap_over_wire,
         };
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
@@ -2827,12 +2828,16 @@ impl KubernetesComputeDriver {
         owner: OwnerReference,
     ) -> Result<VerifiedControlPolicy, KubernetesDriverError> {
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        let expected = control_policy(
+        let mut expected = control_policy(
             namespace,
             names,
             sandbox_id,
             self.config.sandbox_runtime.boundary_port,
             owner,
+        );
+        configure_bootstrap_policy(
+            &mut expected,
+            self.config.sandbox_runtime.bootstrap_over_wire,
         );
         create_or_validate_sandbox_runtime_fence(&policies, &expected).await?;
         // Bind the coordinates of the object that was actually validated.
@@ -2950,12 +2955,16 @@ impl KubernetesComputeDriver {
                     ))
                 })?;
         // Ownership is not part of enforcement; compare the spec and labels.
-        let expected = control_policy(
+        let mut expected = control_policy(
             namespace,
             &names,
             sandbox_id,
             self.config.sandbox_runtime.boundary_port,
             OwnerReference::default(),
+        );
+        configure_bootstrap_policy(
+            &mut expected,
+            self.config.sandbox_runtime.bootstrap_over_wire,
         );
         validate_sandbox_runtime_fence(&stored, &expected)?;
         if !sandbox_runtime_policy_generation_matches(
@@ -3449,7 +3458,7 @@ impl KubernetesComputeDriver {
         owner: OwnerReference,
     ) -> Result<(), KubernetesDriverError> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let expected = boundary_service(
+        let mut expected = boundary_service(
             namespace,
             names,
             sandbox_id,
@@ -3457,6 +3466,23 @@ impl KubernetesComputeDriver {
             mode,
             owner,
         );
+        if self.config.sandbox_runtime.bootstrap_over_wire
+            && mode == KubernetesControlConnection::RuntimeInitiated
+        {
+            expected
+                .spec
+                .as_mut()
+                .unwrap()
+                .ports
+                .as_mut()
+                .unwrap()
+                .push(k8s_openapi::api::core::v1::ServicePort {
+                    name: Some("bootstrap".into()),
+                    port: i32::from(openshell_sandbox_backend::bootstrap::PORT),
+                    protocol: Some("TCP".into()),
+                    ..Default::default()
+                });
+        }
         let service = match services.create(&PostParams::default(), &expected).await {
             Ok(service) => service,
             Err(kube::Error::Api(error)) if error.code == 409 => services
@@ -3471,6 +3497,22 @@ impl KubernetesComputeDriver {
                 names.control_service(mode),
                 mode.as_str(),
             )));
+        }
+        if self.config.sandbox_runtime.bootstrap_over_wire
+            && mode == KubernetesControlConnection::RuntimeInitiated
+            && !service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.ports.as_ref())
+                .is_some_and(|ports| {
+                    ports.iter().any(|port| {
+                        port.port == i32::from(openshell_sandbox_backend::bootstrap::PORT)
+                    })
+                })
+        {
+            return Err(KubernetesDriverError::Precondition(
+                "wire bootstrap requires a fresh deployment with the bootstrap Service port".into(),
+            ));
         }
         Ok(())
     }
@@ -3540,7 +3582,7 @@ impl KubernetesComputeDriver {
             .ensure_network_additional_ca_config_map(namespace)
             .await?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let pod = crate::sandbox_runtime::with_runtime_class(
+        let mut pod = crate::sandbox_runtime::with_runtime_class(
             crate::app_listener::configure_supervisor_pod(
                 supervisor_pod(
                     namespace,
@@ -3585,6 +3627,19 @@ impl KubernetesComputeDriver {
             ),
             &self.config.supervisor_runtime_class_name,
         );
+        if self.config.sandbox_runtime.bootstrap_over_wire {
+            pod.spec.as_mut().unwrap().containers[0]
+                .env
+                .get_or_insert_default()
+                .push(k8s_openapi::api::core::v1::EnvVar {
+                    name: "OPENSHELL_BOUNDARY_BOOTSTRAP_SERVER_FILE".into(),
+                    value: Some(format!(
+                        "/.openshell/supervisor/{}",
+                        openshell_sandbox_backend::bootstrap::SERVER_FILE
+                    )),
+                    ..Default::default()
+                });
+        }
         pods.create(&PostParams::default(), &pod)
             .await
             .map_err(KubernetesDriverError::from_kube)?
@@ -3949,7 +4004,7 @@ impl KubernetesComputeDriver {
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
         let instance_owner = workload_owner.clone();
-        let sandbox_secret = sandbox_bootstrap_secret(
+        let mut sandbox_secret = sandbox_bootstrap_secret(
             namespace,
             names,
             sandbox_id,
@@ -3961,6 +4016,25 @@ impl KubernetesComputeDriver {
             tls.private_key_pem.into_bytes(),
             workload_owner.clone(),
         );
+        let bootstrap_server = if self.config.sandbox_runtime.bootstrap_over_wire {
+            let GenerationLaunchTarget::Dedicated {
+                service_ip,
+                control_policy: Some(_),
+                ..
+            } = &target
+            else {
+                return Err(KubernetesDriverError::Precondition(
+                    "wire bootstrap requires runtime-initiated dedicated supervision".into(),
+                ));
+            };
+            Some(prepare_wire_bootstrap(
+                &mut sandbox_secret,
+                provisioned.boundary_config,
+                *service_ip,
+            )?)
+        } else {
+            None
+        };
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
         secrets
             .create(&PostParams::default(), &sandbox_secret)
@@ -3973,7 +4047,7 @@ impl KubernetesComputeDriver {
                     .backend_descriptor()
                     .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
                 let supervisor_owner = runtime_pod_owner(&names.supervisor_pod, pod_uid);
-                let supervisor_secret = supervisor_bootstrap_secret(
+                let mut supervisor_secret = supervisor_bootstrap_secret(
                     namespace,
                     names,
                     sandbox_id,
@@ -3989,6 +4063,12 @@ impl KubernetesComputeDriver {
                     staged.client_tls,
                     supervisor_owner.clone(),
                 );
+                if let Some(server) = bootstrap_server {
+                    supervisor_secret.data.as_mut().unwrap().insert(
+                        openshell_sandbox_backend::bootstrap::SERVER_FILE.into(),
+                        k8s_openapi::ByteString(server),
+                    );
+                }
                 secrets
                     .create(&PostParams::default(), &supervisor_secret)
                     .await
@@ -4539,6 +4619,8 @@ impl KubernetesComputeDriver {
                         &init_containers,
                         &image_pull_secrets,
                     );
+                    running_patch["spec"]["podTemplate"]["spec"]["containers"] = object.data["spec"]["podTemplate"]["spec"]["containers"].clone();
+                    configure_bootstrap_container(&mut running_patch["spec"]["podTemplate"]["spec"]["containers"], self.config.sandbox_runtime.bootstrap_over_wire, &names.sandbox_secret);
                     running_patch
                 },
             )
@@ -7394,6 +7476,140 @@ const SANDBOX_PROXY_CA_VOLUME_NAME: &str = "openshell-run";
 const SANDBOX_PROXY_CA_MOUNT_PATH: &str = "/run";
 const SANDBOX_BOOTSTRAP_SCHEDULING_GATE: &str = "openshell.ai/bootstrap";
 
+fn configure_bootstrap_policy(policy: &mut NetworkPolicy, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let port = NetworkPolicyPort {
+        port: Some(IntOrString::Int(i32::from(
+            openshell_sandbox_backend::bootstrap::PORT,
+        ))),
+        protocol: Some("TCP".into()),
+        ..Default::default()
+    };
+    let spec = policy.spec.as_mut().unwrap();
+    for rule in spec.ingress.iter_mut().flatten() {
+        rule.ports.get_or_insert_default().push(port.clone());
+    }
+    for rule in spec.egress.iter_mut().flatten() {
+        rule.ports.get_or_insert_default().push(port.clone());
+    }
+}
+
+fn configure_bootstrap_container(containers: &mut serde_json::Value, enabled: bool, secret: &str) {
+    use openshell_sandbox_backend::bootstrap;
+    let Some(containers) = containers.as_array_mut() else {
+        return;
+    };
+    let Some(agent) = containers
+        .iter_mut()
+        .find(|container| container["name"] == "agent")
+    else {
+        return;
+    };
+    agent["command"] = if enabled {
+        serde_json::json!([
+            format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+            "--bootstrap-remote"
+        ])
+    } else {
+        serde_json::json!([
+            format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+            "--bootstrap",
+            BOUNDARY_CONFIG_PATH
+        ])
+    };
+    let env = agent
+        .as_object_mut()
+        .unwrap()
+        .entry("env")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .unwrap();
+    let inputs = bootstrap::ENV_KEYS;
+    env.retain(|entry| !inputs.iter().any(|(name, _)| entry["name"] == *name));
+    if enabled {
+        for (name, key) in inputs {
+            env.push(serde_json::json!({"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": key}}}));
+        }
+    }
+}
+
+fn prepare_wire_bootstrap(
+    secret: &mut Secret,
+    config: openshell_sandbox_backend::boundary_protocol::BoundaryConfig,
+    supervisor_ip: std::net::IpAddr,
+) -> Result<Vec<u8>, KubernetesDriverError> {
+    use openshell_core::jwt::{
+        SandboxId, SandboxRuntimeIdentity, SessionJwtIssuer, SessionVerificationKey, SystemJwtClock,
+    };
+    use openshell_sandbox_backend::bootstrap::{BootstrapServerConfig, PORT};
+    let prepare = || -> Result<_, String> {
+        let data = secret
+            .data
+            .as_mut()
+            .ok_or("missing bootstrap Secret data")?;
+        data.remove(crate::sandbox_runtime::BOUNDARY_CONFIG_KEY);
+        let tls =
+            generate_sandbox_tls_material(config.session_id).map_err(|error| error.to_string())?;
+        let key =
+            openshell_crypto::pki::generate_jwt_keypair().map_err(|error| error.to_string())?;
+        let key_id = "boundary-bootstrap";
+        let issuer = SessionJwtIssuer::from_ed25519_pem(
+            key.serialize_pem()
+                .map_err(|error| error.to_string())?
+                .as_bytes(),
+            key_id,
+            &config.gateway_id,
+            None,
+            Arc::new(SystemJwtClock),
+        )
+        .map_err(|error| error.to_string())?;
+        let token = issuer
+            .mint_boundary_bootstrap(&SandboxRuntimeIdentity {
+                sandbox_id: SandboxId::parse(config.boundary_id.clone())
+                    .map_err(|error| error.to_string())?,
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    config.generation.clone(),
+                )
+                .map_err(|error| error.to_string())?,
+                auth_epoch: config.auth_epoch,
+            })
+            .map_err(|error| error.to_string())?;
+        for (name, value) in [
+            ("bootstrap-token", token.token.expose_secret().to_string()),
+            (
+                "bootstrap-address",
+                std::net::SocketAddr::new(supervisor_ip, PORT).to_string(),
+            ),
+            ("bootstrap-ca", tls.trust_anchor_pem),
+            ("bootstrap-server-name", tls.server_name),
+        ] {
+            data.insert(name.into(), k8s_openapi::ByteString(value.into_bytes()));
+        }
+        serde_json::to_vec(&BootstrapServerConfig {
+            listen: std::net::SocketAddr::new(
+                if supervisor_ip.is_ipv6() {
+                    std::net::Ipv6Addr::UNSPECIFIED.into()
+                } else {
+                    std::net::Ipv4Addr::UNSPECIFIED.into()
+                },
+                PORT,
+            ),
+            config,
+            verification_key: SessionVerificationKey {
+                key_id: key_id.into(),
+                public_key_pem: key.public_key_pem().into_bytes(),
+            },
+            token_id: token.token_id.to_string(),
+            certificate_pem: tls.certificate_chain_pem,
+            private_key_pem: tls.private_key_pem,
+        })
+        .map_err(|_| "encode supervisor bootstrap input".to_string())
+    };
+    prepare().map_err(KubernetesDriverError::Message)
+}
+
 fn sandbox_bootstrap_secret_name(spec: &serde_json::Value) -> Option<&str> {
     spec["volumes"]
         .as_array()?
@@ -7820,6 +8036,7 @@ fn default_workspace_volume_claim_templates(
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
+    bootstrap_over_wire: bool,
     default_image: &'a str,
     image_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     image_pull_secrets: &'a [String],
@@ -7859,6 +8076,7 @@ impl Default for SandboxPodParams<'_> {
             sandbox_gid: DEFAULT_SANDBOX_UID,
             boundary_port: 5500,
             sandbox_secret_name: "os-sandbox-test-generation",
+            bootstrap_over_wire: false,
         }
     }
 }
@@ -8165,6 +8383,11 @@ fn sandbox_template_to_k8s_with_validated_config(
     let mut result = serde_json::Value::Object(template_value);
 
     apply_supervisor_sandbox_runtime_boundary(&mut result, params);
+    configure_bootstrap_container(
+        &mut result["spec"]["containers"],
+        params.bootstrap_over_wire,
+        params.sandbox_secret_name,
+    );
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling. Skipped when the user
@@ -9137,6 +9360,79 @@ fn spawn_namespace_file_watcher(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn kubernetes_bootstrap_secret_can_fetch_the_registered_configuration() {
+        use super::*;
+        use openshell_core::jwt::{CredentialEpoch, SessionRotation};
+        use openshell_sandbox_backend::bootstrap;
+        use openshell_sandbox_backend::boundary_protocol::{BoundaryConfig, BoundaryListener};
+        let config = BoundaryConfig {
+            boundary_id: "bootstrap-test".into(), generation: "generation-1".into(),
+            session_id: openshell_core::SandboxSessionId::new(),
+            session_rotation: SessionRotation::new(1).unwrap(), auth_epoch: CredentialEpoch::new(1).unwrap(),
+            gateway_id: "test".into(), verification_keys: vec![],
+            listener: BoundaryListener::Unix { socket_path: "/unused".into(), tls: SandboxTlsServerConfig {
+                certificate_chain_path: BOUNDARY_CERTIFICATE_PATH.into(), private_key_path: BOUNDARY_PRIVATE_KEY_PATH.into(),
+            } },
+            workload_identity: ResolvedWorkloadIdentity::new(1000, 1000, vec![], "test".into(), "test".into()).unwrap(),
+            provisioning_evidence: openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence("generation-1", b"test").unwrap(),
+            resource_claims: BTreeMap::new(), resource_claim_files: BTreeMap::new(),
+            child_env: [("PRIVATE_VALUE".into(), "boundary-only".into())].into(),
+        };
+        let mut secret = sandbox_bootstrap_secret(
+            "test",
+            &SandboxRuntimeNames::new("bootstrap-test"),
+            "bootstrap-test",
+            config.encode().unwrap(),
+            b"boundary-certificate".to_vec(),
+            b"boundary-key".to_vec(),
+            runtime_pod_owner("test", "test-uid"),
+        );
+        let bytes =
+            prepare_wire_bootstrap(&mut secret, config, "127.0.0.1".parse().unwrap()).unwrap();
+        let data = secret.data.as_ref().unwrap();
+        assert!(!data.contains_key("boundary.json"));
+        assert_eq!(data.len(), 6); // Token, address, trust, server name, and existing TLS pair.
+        assert_eq!(data["bootstrap-address"].0, b"127.0.0.1:5502");
+        let mut server_config: bootstrap::BootstrapServerConfig =
+            serde_json::from_slice(&bytes).unwrap();
+        server_config.listen = "127.0.0.1:0".parse().unwrap();
+        let server = bootstrap::serve(server_config).await.unwrap();
+        let input = |key: &str| std::str::from_utf8(&data[key].0).unwrap();
+        let received = bootstrap::fetch(
+            server.address,
+            input("bootstrap-server-name").into(),
+            input("bootstrap-ca"),
+            input("bootstrap-token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.boundary_id, "bootstrap-test");
+        assert_eq!(received.generation, "generation-1");
+        assert_eq!(received.child_env["PRIVATE_VALUE"], "boundary-only");
+    }
+
+    #[test]
+    fn wire_bootstrap_container_rotates_secret_references_without_embedding_tokens() {
+        use super::*;
+        // Container rendering must reference Secret keys and never embed a token.
+        let mut containers = serde_json::json!([{"name": "agent", "env": [{"name": "USER_VALUE", "value": "kept"}]}]);
+        configure_bootstrap_container(&mut containers, true, "generation-secret");
+        assert_eq!(containers[0]["command"][1], "--bootstrap-remote");
+        let env = containers[0]["env"].as_array().unwrap();
+        assert_eq!(env.len(), 5);
+        assert!(env[1..].iter().all(|entry| entry.get("value").is_none()
+            && entry["valueFrom"]["secretKeyRef"]["name"] == "generation-secret"));
+        configure_bootstrap_container(&mut containers, true, "next-secret");
+        assert_eq!(containers[0]["env"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            containers[0]["env"][1]["valueFrom"]["secretKeyRef"]["name"],
+            "next-secret"
+        );
+        configure_bootstrap_container(&mut containers, false, "unused");
+        assert_eq!(containers[0]["command"][1], "--bootstrap");
+        assert_eq!(containers[0]["env"].as_array().unwrap().len(), 1);
+    }
     use super::*;
 
     /// Serve Pod GETs over one reusable HTTP/1 connection per client,

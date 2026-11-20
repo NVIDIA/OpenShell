@@ -180,6 +180,32 @@ container again from gateway config, so a sandbox created by an older gateway
 starts with the current sandbox runtime image. The shared network fence
 remains for the lifetime of the namespace.
 
+### Token bootstrap prototype
+
+Set `sandbox_runtime.bootstrap_over_wire = true` in a fresh test deployment with
+dedicated supervisors and matching gateway, supervisor, and sandbox images.
+The workload Secret contains a 15-minute bootstrap JWT, supervisor address,
+pinned TLS trust, and the existing boundary certificate/key. It contains no
+`boundary.json`. The sandbox fetches its configuration into memory over TLS on
+port 5502 before normal admission. The per-sandbox Service and control policy
+admit that port only between the paired Pods. The supervisor receives the
+configuration through its existing Secret and starts bootstrap before waiting
+for the sandbox. Stop/start creates fresh credentials and Secret references.
+
+This prototype reuses the session JWT implementation with a separate audience,
+token type, and sandbox component. The trusted driver issues the token with an
+ephemeral per-launch key; gateway-key issuance is deferred. The supervisor
+checks the registered token ID, sandbox, generation, and epoch. A response lost
+before acknowledgment can be fetched again. Acknowledgment closes the listener;
+that retirement is in memory and resets if the supervisor restarts while the
+token is still valid. Fetch retries are bounded to two minutes. Failed fetches
+never fall back to a configuration file.
+
+Shared supervisors, live migration between bootstrap modes, durable redemption,
+and removal of the remaining TLS files are outside this prototype. Run
+`mise run e2e:kubernetes:bootstrap` for creation, workload environment isolation,
+absence of the boundary config file, and stop/start validation.
+
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals
 must not create permissive policies, create Pods, read bootstrap Secrets, or
