@@ -730,22 +730,28 @@ async fn user_can_resolve_provider_profile_for_sandbox(cx: &mut Context) -> Resu
 /// operator, which the tests' setup and cleanup need.
 async fn setup(cx: &mut Context) -> Result<KeycloakContext<'_>> {
     let kc = KeycloakContext::new(cx).await?;
-    let operator = kc.cli_handle().gateway().connect().await?;
-    match operator
+    let me = kc
+        .cli_handle()
+        .gateway()
+        .connect()
+        .await?
         .raw_grpc_fresh()
         .await?
         .get_current_user(proto::GetCurrentUserRequest {})
         .await
-    {
-        Err(status) if status.code() == GrpcCode::PermissionDenied => Ok(kc),
-        Err(status) => Err(Error::from(status).context("check testkit connects as an operator")),
-        Ok(user) => Err(Error::msg(format!(
-            "testkit's client certificate signs in as user {:?} ({}), not as an operator; \
-             the <base>-oidc environment makes it an operator's (roles/oidc_gateway)",
-            user.get_ref().subject,
-            user.get_ref().identity_provider
-        ))),
-    }
+        .context("check testkit connects as an operator")?
+        .into_inner();
+    // The gateway gives an operator certificate's identity the `operator`
+    // role; any other certificate signs in as an ordinary user.
+    testkit::ensure!(
+        me.identity_provider == "mtls" && me.roles.iter().any(|role| role == "operator"),
+        "testkit's client certificate signs in as {:?} ({}, roles {:?}), not as an operator; \
+         the <base>-oidc environment makes it an operator's (roles/oidc_gateway)",
+        me.subject,
+        me.identity_provider,
+        me.roles
+    );
+    Ok(kc)
 }
 
 async fn raw(session: &Session) -> Result<AuthedGrpcClient> {
