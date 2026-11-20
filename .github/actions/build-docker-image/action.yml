@@ -28,8 +28,6 @@ runs:
   using: composite
   steps:
     - uses: ./.github/actions/setup-buildx
-      with:
-        buildkitd-config: /etc/buildkit/buildkitd.toml
 
     - name: Log in to GHCR
       if: inputs.push == 'true'
@@ -76,7 +74,7 @@ runs:
           --platform linux/amd64,linux/arm64 \
           --file deploy/docker/Dockerfile.${COMPONENT} \
           --target ${COMPONENT} \
-          --tag ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG} \
+          --tag ghcr.io/ai-openshell/openshell/${COMPONENT}:${IMAGE_TAG} \
           --cache-from type=gha,scope=${COMPONENT} \
           --cache-to type=gha,mode=max,scope=${COMPONENT} \
           --provenance=mode=min \
@@ -85,11 +83,31 @@ runs:
           --output "type=oci,dest=artifacts/images/${COMPONENT}.tar,oci-mediatypes=true,oci-artifact=true" \
           .
 
+    # E2E jobs load these instead of pulling from a registry, so fork pull
+    # requests, which cannot push, still run E2E. skopeo ships on the
+    # GitHub-hosted Ubuntu images.
+    - name: Export per-platform Docker archives
+      shell: bash
+      env:
+        COMPONENT: ${{ inputs.component }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+      run: |
+        set -euo pipefail
+        install -d e2e-images
+        for arch in amd64 arm64; do
+          skopeo --insecure-policy copy --override-os linux --override-arch "${arch}" \
+            "oci-archive:artifacts/images/${COMPONENT}.tar" \
+            "docker-archive:e2e-images/${COMPONENT}-linux-${arch}.tar:ghcr.io/ai-openshell/openshell/${COMPONENT}:${IMAGE_TAG}"
+        done
+
     - name: Verify SBOM attestation
       if: inputs.push == 'true'
       shell: bash
       env:
-        IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
+        # GitHub-hosted runners also ship podman, which the engine helper
+        # prefers; the SBOM check needs Docker's buildx imagetools.
+        CONTAINER_ENGINE: docker
+        IMAGE_REF: ghcr.io/ai-openshell/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
       run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
 
     - name: Upload ${{ inputs.component }} image
@@ -97,6 +115,24 @@ runs:
       with:
         name: image-${{ inputs.component }}
         path: artifacts
+        compression-level: 0
+        retention-days: 5
+        if-no-files-found: error
+
+    - name: Upload ${{ inputs.component }} amd64 E2E archive
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: e2e-image-${{ inputs.component }}-linux-amd64
+        path: e2e-images/${{ inputs.component }}-linux-amd64.tar
+        compression-level: 0
+        retention-days: 5
+        if-no-files-found: error
+
+    - name: Upload ${{ inputs.component }} arm64 E2E archive
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: e2e-image-${{ inputs.component }}-linux-arm64
+        path: e2e-images/${{ inputs.component }}-linux-arm64.tar
         compression-level: 0
         retention-days: 5
         if-no-files-found: error

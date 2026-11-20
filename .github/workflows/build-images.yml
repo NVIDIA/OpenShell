@@ -30,7 +30,7 @@ jobs:
       COMPONENT: gateway
       BINARY: openshell-gateway
       TARGET_SUFFIX: unknown-linux-gnu
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps: &build_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,7 +52,7 @@ jobs:
       COMPONENT: sandbox
       BINARY: openshell-sandbox
       TARGET_SUFFIX: unknown-linux-musl
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps: *build_steps
 
@@ -61,6 +61,6 @@ jobs:
       COMPONENT: supervisor
       BINARY: openshell-supervisor
       TARGET_SUFFIX: unknown-linux-gnu
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps: *build_steps

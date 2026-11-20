@@ -24,7 +24,7 @@ jobs:
     name: OpenShell / Maintainer Approval
     # Merge-group checks do not need to repeat the PR approval evaluation.
     if: >-
-      github.repository_owner == 'NVIDIA' &&
+      github.event.repository.fork == false &&
       github.event_name != 'merge_group' &&
       github.event.pull_request.state == 'open'
     runs-on: ubuntu-latest

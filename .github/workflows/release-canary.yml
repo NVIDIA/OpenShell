@@ -94,7 +94,7 @@ jobs:
   fedora:
     name: Fedora RPM
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       FEDORA_CANARY_CONTAINER: openshell-fedora-canary-${{ github.run_id }}-${{ github.run_attempt }}

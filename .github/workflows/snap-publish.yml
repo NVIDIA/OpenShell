@@ -60,9 +60,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
           - arch: arm64
-            runner: linux-arm64-cpu8
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     environment: ${{ inputs.github-environment || inputs.upload-channel }}
