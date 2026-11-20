@@ -21,6 +21,8 @@
 //! before decoding the rest, so a mismatch reports both versions instead of an
 //! unrelated field error.
 
+pub mod network_trust;
+
 use std::path::PathBuf;
 
 use openshell_core::sandbox_env::OtlpExport;

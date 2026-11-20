@@ -27,7 +27,6 @@ use crate::rootfs::{
     validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
@@ -44,6 +43,7 @@ use oci_client::manifest::{
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
+use openshell_core::NetworkSupervisorTrustBundle;
 use openshell_core::UpstreamProxyConfig;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
@@ -71,9 +71,6 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
-};
-use openshell_core::{
-    NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
 };
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
@@ -687,53 +684,16 @@ fn initialize_additional_ca_snapshot(config: &mut VmDriverConfig) -> Result<(), 
     ) {
         (None, None, None) => None,
         (Some(path), Some(expected_digest), Some(expected_certificate_count)) => {
-            if path.as_os_str().is_empty() {
-                return Err("additional CA artifact path must not be empty".to_string());
-            }
-            if expected_certificate_count == 0 {
-                return Err("additional CA certificate count must be greater than zero".to_string());
-            }
-            let expected_digest = normalized_additional_ca_digest(expected_digest)?;
-            let pem = read_gateway_additional_ca_artifact(path)?;
-            // Deterministic destination-trust generation label, not an
-            // authenticity proof: the equality check below only detects
-            // staged-artifact drift; trust comes from the gateway's
-            // normalization and TLS verification. Classified as a non-security
-            // identity hash in openshell-crypto/README.md.
-            let actual_digest = format!("sha256:{:x}", Sha256::digest(&pem));
-            if actual_digest != expected_digest {
-                return Err(format!(
-                    "additional CA artifact '{}' does not match expected digest {}",
-                    path.display(),
-                    expected_digest
-                ));
-            }
-            let actual_certificate_count = normalized_additional_ca_certificate_count(&pem)
-                .map_err(|error| {
-                    format!(
-                        "additional CA artifact '{}' is not a normalized certificate bundle: {error}",
-                        path.display()
-                    )
-                })?;
-            if actual_certificate_count != expected_certificate_count {
-                return Err(format!(
-                    "additional CA artifact '{}' has certificate count {}, expected {}",
-                    path.display(),
-                    actual_certificate_count,
-                    expected_certificate_count
-                ));
-            }
+            // The bundle's artifact path records provenance only. Never call
+            // `verify_artifact` on this retained value: all later launches
+            // must use these captured immutable bytes rather than rereading
+            // the mutable gateway-host source path.
             Some(VmNetworkSupervisorTrustSnapshot {
-                // The bundle's artifact path records provenance only. Never
-                // call `verify_artifact` on this retained value: all later
-                // launches must use these captured immutable bytes rather
-                // than rereading the mutable gateway-host source path.
-                bundle: NetworkSupervisorTrustBundle::new(
-                    pem,
-                    actual_certificate_count,
+                bundle: openshell_driver_sdk::network_trust::load_staged_bundle(
+                    path,
                     expected_digest,
-                    path.clone(),
-                ),
+                    expected_certificate_count,
+                )?,
             })
         }
         _ => {
@@ -752,159 +712,6 @@ fn initialize_additional_ca_snapshot(config: &mut VmDriverConfig) -> Result<(), 
     config.additional_ca_certificate_count = None;
     config.additional_ca_snapshot = snapshot;
     Ok(())
-}
-
-/// Require the generation form emitted by gateway normalization.
-fn normalized_additional_ca_digest(digest: &str) -> Result<String, String> {
-    let Some(hex) = digest.strip_prefix("sha256:") else {
-        return Err("additional CA digest must use the sha256: prefix".to_string());
-    };
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("additional CA digest must be a SHA-256 digest".to_string());
-    }
-    if hex.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        return Err("additional CA digest must use normalized lowercase hexadecimal".to_string());
-    }
-    Ok(format!("sha256:{hex}"))
-}
-
-/// Read a normalized gateway artifact once without following symlinks.
-fn read_gateway_additional_ca_artifact(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "inspect additional CA artifact '{}': {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(format!(
-            "additional CA artifact '{}' is not a regular file",
-            path.display()
-        ));
-    }
-    validate_gateway_additional_ca_artifact_metadata(path, &metadata)?;
-
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        // The pre-open metadata check gives portable diagnostics, while these
-        // flags ensure an attacker cannot replace it with a symlink, FIFO, or
-        // blocking special file before the actual one-time read.
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| format!("open additional CA artifact '{}': {error}", path.display()))?;
-    let opened_metadata = file.metadata().map_err(|error| {
-        format!(
-            "inspect additional CA artifact '{}': {error}",
-            path.display()
-        )
-    })?;
-    if !opened_metadata.file_type().is_file() {
-        return Err(format!(
-            "additional CA artifact '{}' is not a regular file",
-            path.display()
-        ));
-    }
-    validate_gateway_additional_ca_artifact_metadata(path, &opened_metadata)?;
-
-    let capacity = usize::try_from(opened_metadata.len()).map_err(|_| {
-        format!(
-            "additional CA artifact '{}' exceeds the {}-byte limit",
-            path.display(),
-            MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES
-        )
-    })?;
-    let mut pem = Vec::with_capacity(capacity);
-    Read::by_ref(&mut file)
-        .take((MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES + 1) as u64)
-        .read_to_end(&mut pem)
-        .map_err(|error| format!("read additional CA artifact '{}': {error}", path.display()))?;
-    if pem.len() > MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES {
-        return Err(format!(
-            "additional CA artifact '{}' exceeds the {}-byte limit",
-            path.display(),
-            MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES
-        ));
-    }
-    Ok(pem)
-}
-
-fn validate_gateway_additional_ca_artifact_metadata(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), String> {
-    if metadata.len() > MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES as u64 {
-        return Err(format!(
-            "additional CA artifact '{}' exceeds the {}-byte limit",
-            path.display(),
-            MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES
-        ));
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o7777 != 0o444 {
-        return Err(format!(
-            "additional CA artifact '{}' does not have the required read-only permissions",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Verify that the bytes are exactly the canonical PEM representation emitted
-/// by the gateway's destination-trust normalization boundary, and return its
-/// number of certificate blocks.
-fn normalized_additional_ca_certificate_count(pem: &[u8]) -> Result<usize, &'static str> {
-    let text = std::str::from_utf8(pem).map_err(|_| "bundle is not UTF-8 PEM text")?;
-    let mut remainder = text;
-    let mut normalized = Vec::with_capacity(pem.len());
-    let mut certificate_count = 0_usize;
-
-    while !remainder.is_empty() {
-        let Some(after_begin) = remainder.strip_prefix("-----BEGIN CERTIFICATE-----\n") else {
-            return Err("bundle contains material outside canonical certificate blocks");
-        };
-        remainder = after_begin;
-        let mut encoded = String::new();
-        loop {
-            let Some(newline) = remainder.find('\n') else {
-                return Err("certificate block is missing its terminating newline");
-            };
-            let line = &remainder[..newline];
-            remainder = &remainder[newline + 1..];
-            if line == "-----END CERTIFICATE-----" {
-                break;
-            }
-            if line.is_empty() || line.len() > 64 {
-                return Err("certificate block has a non-canonical base64 line");
-            }
-            encoded.push_str(line);
-        }
-        let decoded = BASE64_STANDARD
-            .decode(encoded.as_bytes())
-            .map_err(|_| "certificate block contains invalid base64")?;
-        if decoded.is_empty() {
-            return Err("certificate block is empty");
-        }
-        normalized.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
-        let canonical = BASE64_STANDARD.encode(decoded);
-        for line in canonical.as_bytes().chunks(64) {
-            normalized.extend_from_slice(line);
-            normalized.push(b'\n');
-        }
-        normalized.extend_from_slice(b"-----END CERTIFICATE-----\n");
-        certificate_count += 1;
-    }
-
-    if certificate_count == 0 {
-        return Err("bundle contains no certificate blocks");
-    }
-    if normalized != pem {
-        return Err("bundle is not canonical normalized PEM");
-    }
-    Ok(certificate_count)
 }
 
 /// Write or remove the host-only per-sandbox trust artifact.
@@ -8311,6 +8118,7 @@ fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::gpu::allocate_vsock_cid;
+    use openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
