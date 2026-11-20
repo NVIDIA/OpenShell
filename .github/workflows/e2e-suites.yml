@@ -255,8 +255,12 @@ jobs:
         run: |
           # The tests this environment can't pass yet; the runner passes the
           # variable on to the guest.
-          OPENSHELL_TEST_UNSUPPORTED="$(tasks/scripts/conformance-unsupported.sh "${ENVIRONMENT}/${INSTALLER}")"
+          OPENSHELL_TEST_UNSUPPORTED="$(tasks/scripts/suite-unsupported.sh "${ENVIRONMENT}/${INSTALLER}")"
           export OPENSHELL_TEST_UNSUPPORTED
+          if [[ -n "${OPENSHELL_TEST_UNSUPPORTED}" ]]; then
+            printf 'Unsupported tests and issues for this environment:\n'
+            printf '%s\n' "${OPENSHELL_TEST_UNSUPPORTED}" | tr ',' '\n'
+          fi
           # Retry dependency preparation, then run the suites once. Without
           # prebuilt tests, the runner builds the suites for the guest, so it
           # needs no prepared archives.

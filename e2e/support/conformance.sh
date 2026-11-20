@@ -72,10 +72,10 @@ e2e_run_openshell_conformance() {
   junit="${OPENSHELL_CONFORMANCE_JUNIT:-${root}/results/conformance-$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]').xml}"
   mkdir -p "$(dirname "${junit}")" || return
 
-  # The tests this lane can't pass yet, from tests/suites/conformance/unsupported.yaml.
+  # The tests this lane can't pass yet, from tests/suites/unsupported.yaml.
   # A caller that sets OPENSHELL_TEST_UNSUPPORTED keeps its value.
   if [[ -z "${OPENSHELL_TEST_UNSUPPORTED:-}" ]]; then
-    OPENSHELL_TEST_UNSUPPORTED="$("${root}/tasks/scripts/conformance-unsupported.sh" "$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]')")" || return
+    OPENSHELL_TEST_UNSUPPORTED="$("${root}/tasks/scripts/suite-unsupported.sh" "$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]')")" || return
     export OPENSHELL_TEST_UNSUPPORTED
   fi
 

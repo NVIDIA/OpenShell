@@ -283,7 +283,9 @@ suite, with a name that says what the suite tests.
 1. Add a crate under `tests/suites/features/<name>` that depends on
    `openshell-testkit`, and add it to `members` in
    `tests/suites/features/Cargo.toml`.
-2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions and use
+   [testkit's harness](tests/testkit/README.md#unsupported-tests) so the suite
+   can skip unsupported tests per environment.
 3. Re-lock the workspace: `cargo metadata --manifest-path
    tests/suites/features/Cargo.toml`, then
    `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`. `cargo fmt`

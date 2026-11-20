@@ -19,6 +19,10 @@ use std::time::Duration;
 
 use testkit::Context;
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// How long an attachment may take to show output or recover.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);

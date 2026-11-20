@@ -12,6 +12,10 @@ use std::sync::LazyLock;
 use testkit::sdk::raw::{AuthedGrpcClient, AuthedSandboxUpdatesClient, proto};
 use testkit::{Context, Sandbox};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 // Multi-platform release manifests; no test-local tags or cluster image loads.
 const ORIGINAL_IMAGE_DEFAULT: &str = "mirror.gcr.io/library/alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507";
 const UPDATED_IMAGE_DEFAULT: &str = "mirror.gcr.io/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8";
