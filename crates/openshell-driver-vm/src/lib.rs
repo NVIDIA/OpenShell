@@ -37,6 +37,7 @@ mod rootfs;
 #[cfg(feature = "compute-driver")]
 mod runtime;
 
+#[cfg(feature = "compute-driver")]
 pub mod startup_config;
 
 #[cfg(feature = "compute-driver")]

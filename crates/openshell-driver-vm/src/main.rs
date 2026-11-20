@@ -9,7 +9,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_driver_sdk::StartupDocument;
-use openshell_driver_vm::startup_config::{VmDriverFileConfig, read_startup_document};
+use openshell_driver_vm::startup_config::{VmComputeConfig, read_startup_document};
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -564,66 +564,59 @@ fn apply_startup_document(
         );
     }
 
-    let config = VmDriverFileConfig::from_document(document)?;
-    if config.allow_driver_config.is_some() || config.resource_admission.is_some() {
-        args.admission_config_json = openshell_core::resource_admission::DriverAdmissionConfig {
-            allow_driver_config: config.allow_driver_config.unwrap_or_default(),
-            resource_admission: config.resource_admission.unwrap_or_default(),
+    let mut config = VmComputeConfig::from_document(document)?;
+    if config.state_dir.as_os_str().is_empty() {
+        config.state_dir = VmComputeConfig::default_state_dir();
+    }
+    // The gateway's own listener is the default endpoint for sandboxes. It has
+    // a gateway CA exactly when it serves TLS.
+    if config.grpc_endpoint.trim().is_empty() {
+        let scheme = if gateway.tls_ca.is_some() {
+            "https"
+        } else {
+            "http"
         };
+        config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", gateway.gateway_port);
     }
-    if let Some(value) = config.grpc_endpoint {
-        args.grpc_endpoint = Some(value);
+    config
+        .validate_configuration()
+        .map_err(|error| error.to_string())?;
+    // The CA authenticates the gateway for an https endpoint only.
+    if !config.grpc_endpoint.starts_with("https://") {
+        args.guest_tls_ca = None;
     }
-    args.upstream_proxy = config.https_proxy.or_else(|| args.upstream_proxy.take());
-    args.upstream_no_proxy = config.no_proxy.or_else(|| args.upstream_no_proxy.take());
-    args.upstream_proxy_auth_file = config
-        .proxy_auth_file
-        .or_else(|| args.upstream_proxy_auth_file.take());
-    if let Some(value) = config.proxy_auth_allow_insecure {
-        args.upstream_proxy_auth_allow_insecure = value;
+
+    args.admission_config_json = openshell_core::resource_admission::DriverAdmissionConfig {
+        allow_driver_config: config.allow_driver_config,
+        resource_admission: config.resource_admission.clone(),
+    };
+    args.grpc_endpoint = Some(config.grpc_endpoint);
+    let proxy = config.upstream_proxy;
+    args.upstream_proxy = proxy.https_proxy;
+    args.upstream_no_proxy = proxy.no_proxy;
+    args.upstream_proxy_auth_file = proxy.proxy_auth_file;
+    args.upstream_proxy_auth_allow_insecure = proxy.proxy_auth_allow_insecure == Some(true);
+    args.upstream_proxy_connect_by_hostname = proxy.proxy_connect_by_hostname == Some(true);
+    args.upstream_proxy_ca_bundle = config.proxy_ca_bundle;
+    args.state_dir = config.state_dir;
+    if !config.default_image.trim().is_empty() {
+        args.default_image = config.default_image;
     }
-    if let Some(value) = config.proxy_connect_by_hostname {
-        args.upstream_proxy_connect_by_hostname = value;
+    if !config.bootstrap_image.trim().is_empty() {
+        args.bootstrap_image = config.bootstrap_image;
     }
-    args.upstream_proxy_ca_bundle = config
-        .proxy_ca_bundle
-        .or_else(|| args.upstream_proxy_ca_bundle.take());
-    if let Some(value) = config.state_dir {
-        args.state_dir = value;
-    }
-    if let Some(value) = config.default_image {
-        args.default_image = value;
-    }
-    if let Some(value) = config.bootstrap_image {
-        args.bootstrap_image = value;
-    }
-    if let Some(value) = config.krun_log_level {
-        args.krun_log_level = value;
-    }
-    if let Some(value) = config.vcpus {
-        args.vcpus = value;
-    }
-    if let Some(value) = config.mem_mib {
-        args.mem_mib = value;
-    }
-    if let Some(value) = config.overlay_disk_mib {
-        args.overlay_disk_mib = value;
-    }
-    args.sandbox_uid = config.sandbox_uid.or(args.sandbox_uid);
-    args.sandbox_gid = config.sandbox_gid.or(args.sandbox_gid);
-    args.rootfs_tar_staging_dir = config
-        .rootfs_tar_staging_dir
-        .or_else(|| args.rootfs_tar_staging_dir.take());
-    args.rootfs_tar_max_bytes = config.rootfs_tar_max_bytes.or(args.rootfs_tar_max_bytes);
-    if let Some(value) = config.enable_bind_mounts {
-        args.enable_bind_mounts = value;
-    }
-    args.provider_spiffe_workload_api_tcp_endpoint = config
-        .provider_spiffe_workload_api_tcp_endpoint
-        .or_else(|| args.provider_spiffe_workload_api_tcp_endpoint.take());
-    if let Some(value) = config.provider_spiffe_allow_guest_tcp {
-        args.provider_spiffe_allow_guest_tcp = value;
-    }
+    args.krun_log_level = config.krun_log_level;
+    args.vcpus = config.vcpus;
+    args.mem_mib = config.mem_mib;
+    args.overlay_disk_mib = config.overlay_disk_mib;
+    args.sandbox_uid = config.sandbox_uid;
+    args.sandbox_gid = config.sandbox_gid;
+    args.rootfs_tar_staging_dir = config.rootfs_tar_staging_dir;
+    args.rootfs_tar_max_bytes = config.rootfs_tar_max_bytes;
+    args.enable_bind_mounts = config.enable_bind_mounts;
+    args.provider_spiffe_workload_api_tcp_endpoint =
+        config.provider_spiffe_workload_api_tcp_endpoint;
+    args.provider_spiffe_allow_guest_tcp = config.provider_spiffe_allow_guest_tcp;
     Ok(())
 }
 
