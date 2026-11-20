@@ -141,13 +141,9 @@ Workspace secrets are optional. Existing provider-owned refresh material remains
 
 ## GitHub workflow approval
 
-Test labels select CI suites; `/ok to test` comments are no longer used. External
-contributor runs need native GitHub Actions approval. Authorize workflow approval
-explicitly in the launch assignment; it does not authorize PR approval or merge.
-Gator uses `approve-gator-workflow --operator-authorized PR_NUMBER RUN_ID`, which
-checks the current PR head and run association. PRs changing `.github/` require
-manual workflow inspection and approval. Reruns and dispatch are separately
-authorized actions.
+Test labels select CI suites. Gator can approve current-head workflow runs only
+with explicit launch authorization. PRs changing `.github/` require manual
+approval. PR approval, merging, reruns, and dispatch require separate authorization.
 
 ## Tests
 
