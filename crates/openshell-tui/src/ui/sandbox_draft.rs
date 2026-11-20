@@ -1179,6 +1179,49 @@ mod tests {
     }
 
     #[test]
+    fn approval_detail_explains_l4_request_scope() {
+        for (protocol, summary, unfiltered) in [
+            ("", "alias.test:80 [L4]", true),
+            ("tcp", "alias.test:80 [tcp]", true),
+            ("rest", "alias.test:80 [L7 rest, allow GET /orders]", false),
+        ] {
+            let mut endpoint = NetworkEndpoint {
+                host: "alias.test".into(),
+                port: 80,
+                protocol: protocol.into(),
+                ..Default::default()
+            };
+            if unfiltered {
+                endpoint.tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
+            }
+            if protocol != "tcp" {
+                endpoint.path = "/orders/**".into();
+                endpoint.rules.push(openshell_core::proto::L7Rule {
+                    allow: Some(L7Allow {
+                        method: "GET".into(),
+                        path: "/orders".into(),
+                        ..Default::default()
+                    }),
+                });
+            }
+            assert_eq!(format_endpoint_summary(&endpoint), summary);
+            let chunk = PolicyChunk {
+                proposed_rule: Some(openshell_core::proto::NetworkPolicyRule {
+                    endpoints: vec![endpoint],
+                    ..Default::default()
+                }),
+                ..make_chunk("pending", "")
+            };
+            let (screen, _) = render(&chunk, 80, 24, 0);
+            assert!(screen.contains(summary));
+            assert_eq!(screen.contains("no HTTP method/path filter"), unfiltered);
+            assert_eq!(screen.contains("Allow: GET /orders"), !unfiltered);
+            assert_eq!(screen.contains("Path scope: /orders/**"), !unfiltered);
+            assert_eq!(screen.contains("TLS: skip"), unfiltered);
+        }
+    }
+
+    #[test]
     fn long_guidance_head_and_tail_are_both_reachable() {
         let chunk = PolicyChunk {
             status: "rejected".to_string(),

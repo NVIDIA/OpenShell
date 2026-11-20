@@ -8768,9 +8768,30 @@ mod tests {
         let l4 = NetworkEndpoint {
             host: "host.example.test".to_string(),
             port: 443,
+            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "GET".into(),
+                    path: "/orders".into(),
+                    ..Default::default()
+                }),
+            }],
             ..Default::default()
         };
-        assert_eq!(format_endpoint(&l4), "host.example.test:443 [L4]");
+        assert_eq!(
+            format_endpoint(&l4),
+            "host.example.test:443 [L4, no HTTP method/path filter]"
+        );
+        let tcp = NetworkEndpoint {
+            protocol: "tcp".to_string(),
+            access: 0,
+            rules: vec![],
+            ..l4
+        };
+        assert_eq!(
+            format_endpoint(&tcp),
+            "host.example.test:443 [tcp, no HTTP method/path filter]"
+        );
 
         let l7_readonly = NetworkEndpoint {
             host: "host.example.test".to_string(),
