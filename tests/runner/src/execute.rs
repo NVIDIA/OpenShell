@@ -409,6 +409,10 @@ async fn run_selected(
     tests.extend(env.iter().map(String::as_str));
     match kind {
         Kind::Nextest => {
+            // Unsupported entries may leave no tests to run.
+            let skip_ok = env
+                .iter()
+                .any(|entry| entry.starts_with("OPENSHELL_TEST_UNSUPPORTED="));
             tests.extend([
                 "cargo-nextest",
                 "nextest",
@@ -430,16 +434,7 @@ async fn run_selected(
                 "--test-threads",
                 "1",
                 "--no-tests",
-                // Skipping every selected test runs none, which nextest
-                // otherwise treats as a failure.
-                if env
-                    .iter()
-                    .any(|entry| entry.starts_with("OPENSHELL_TEST_UNSUPPORTED="))
-                {
-                    "pass"
-                } else {
-                    "fail"
-                },
+                if skip_ok { "pass" } else { "fail" },
             ]);
             for filter in filters {
                 tests.extend(["-E", filter]);
