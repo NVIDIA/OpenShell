@@ -665,7 +665,9 @@ The `service-exposure` feature suite (`tests/suites/features/service-exposure`)
 exposes a service in a sandbox and checks how the gateway forwards the client's
 `Authorization` header. The test sends requests to the gateway's endpoint with
 the service URL's host as the Host header, so the test machine doesn't resolve
-service hosts. CI runs it on the same environments as `host-gateway`.
+service hosts. CI runs it on Docker rootful and Podman rootful and rootless. The
+Helm chart turns gateway service routing off, so the K3s installers have no
+service URLs.
 
 Run the VM-backed Rust CLI e2e suite:
 
