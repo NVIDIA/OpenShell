@@ -4,7 +4,7 @@ authors:
 state: accepted
 links:
   - https://github.com/NVIDIA/OpenShell/issues/1062
-  - https://github.com/NVIDIA/OpenShell/blob/main/architecture/policy-advisor.md
+  - https://github.com/ai-openshell/openshell/blob/df38d1f66f05dac6a3995844ab96c68c80595265/architecture/policy-advisor.md
 ---
 
 # RFC 0002 - Agent-Driven Policy Management
@@ -153,8 +153,8 @@ Current implementation points:
   TUI review and approval surface for network rules.
 - `crates/openshell-cli/src/run.rs`
   `openshell rule get|approve|reject|approve-all|history`.
-- `architecture/policy-advisor.md`
-  Current sandbox-side recommendation design.
+- [Original Policy Advisor design](https://github.com/ai-openshell/openshell/blob/df38d1f66f05dac6a3995844ab96c68c80595265/architecture/policy-advisor.md)
+  Sandbox-side recommendation design referenced by this RFC.
 
 Important capabilities that already exist and should be preserved:
 
