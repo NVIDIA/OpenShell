@@ -42,6 +42,7 @@ endpoints:
       - allow: { method: POST, path: "/repos/{NVIDIA,ai-openshell}/{openshell,OpenShell-ghsa-*}/pulls/*/reviews" }
       - allow: { method: POST, path: "/repos/{NVIDIA,ai-openshell}/{openshell,OpenShell-ghsa-*}/pulls/*/reviews/*/comments" }
       - allow: { method: POST, path: "/repos/{NVIDIA,ai-openshell}/{openshell,OpenShell-ghsa-*}/statuses/*" }
+      - allow: { method: POST, path: "/repos/ai-openshell/openshell/actions/runs/*/approve" }
   - host: api.github.com
     port: 443
     path: /graphql

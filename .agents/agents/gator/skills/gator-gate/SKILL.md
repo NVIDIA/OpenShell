@@ -11,7 +11,7 @@ This skill is a gating workflow. It can start from any issue or PR state, inspec
 
 ## Skill Location
 
-Codex and other agent harnesses should load this skill from the repository path `.agents/agents/gator/skills/gator-gate/SKILL.md`. After this branch is merged, the canonical GitHub location is <https://github.com/ai-openshell/openshell/blob/main/.agents/agents/gator/skills/gator-gate/SKILL.md>.
+Load this skill from `.agents/agents/gator/skills/gator-gate/SKILL.md`, or its [canonical GitHub location](https://github.com/ai-openshell/openshell/blob/main/.agents/agents/gator/skills/gator-gate/SKILL.md).
 
 ## Prerequisites
 
@@ -38,7 +38,7 @@ If the `principal-engineer-reviewer` sub-agent fails before producing usable rev
 
 - Do not push commits to a contributor's PR branch by default.
 - You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
-- Do not approve workflow runs for an outside contributor's PR unless the current GitHub user has maintainer authority.
+- Do not approve workflow runs unless the operator explicitly authorized workflow approval and the current GitHub user has repository write, maintain, or admin permission. Workflow approval is not PR approval; never approve or merge a PR without separate operator authorization.
 - Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
 - Surface security-related findings introduced or newly exposed by an unmerged
   PR in that PR's normal review, using the same evidence, severity, and blocker
@@ -51,7 +51,7 @@ If the `principal-engineer-reviewer` sub-agent fails before producing usable rev
 
 Maintainer authority means one of:
 
-- User is in the ai-openshell `maintainers` team
+- User is in the `ai-openshell/maintainers` team
 - User is a CODEOWNER listed in `.github/CODEOWNERS`
 - Repository permission is `admin`, `maintain`, or `write` for maintainer-only actions such as approving workflow runs
 
@@ -735,7 +735,7 @@ and validate the feedback ledger. If its review mode is `already_reviewed`, do
 not run the reviewer. If its mode is `critical_only`, follow the review-budget
 rules above. Also check whether gator has already posted for the
 current PR head SHA. Search existing issue comments and PR reviews for the gator
-marker and either `Head SHA: <sha>`, `Head SHA: `<sha>``, or the current
+marker and either `Head SHA: <sha>`, ``Head SHA: `<sha>` ``, or the current
 `headRefOid` anywhere in the body. Gator may post at most one marked public
 disposition for a given head SHA. A state-specific TTL nudge is separately
 rate-limited and is not a disposition.
@@ -941,6 +941,24 @@ Apply `test:windows` whenever a PR affects Windows support. This includes Window
 
 Applying `test:e2e`, `test:e2e-kubernetes`, `test:e2e:continuity`, or `test:windows` starts the matching workflow. For a PR from an outside contributor, each run waits until a maintainer approves it in the Actions tab. If runs are awaiting approval and you lack maintainer authority, or the operator did not authorize approving them, move to `gator:blocked` with reason `test_dispatch_required` and state that a maintainer must approve the pending runs.
 
+`/ok to test` comments and copy-pr mirror checks are obsolete. With explicit
+operator authorization, approve a pending run using:
+
+```bash
+approve-gator-workflow --operator-authorized <pr-number> <run-id>
+```
+
+The helper checks repository write permission, the PR's current head, the run's
+PR association, pending approval state, and a recognized PR workflow. It refuses
+PRs changing `.github/` (including renamed files); those require a maintainer's
+manual inspection and approval in GitHub. Do not bypass a refusal with a raw API
+call. Before approval, also inspect changes to scripts and local actions used by
+the workflow; approval executes contributor-controlled code. Recheck each run
+separately after a new head. Reruns and workflow dispatch require separate
+operator authorization; workflow approval never grants PR approval or merge
+authority. Do not approve private-advisory workflows through this public-repo
+helper.
+
 Do not treat a test label as proof that testing started. Confirm that every required workflow has a check or run for the current head in `queued`, `in_progress`, or `completed` state before applying `gator:watch-pipeline`. Do not claim that CI monitoring is active until it does.
 
 ## Step 10: Pipeline Watch Loop
@@ -992,7 +1010,7 @@ When resuming an item already in `gator:approval-needed`, first check whether ma
 - The most recent maintainer comment or review
 - The most recent gator maintainer-nudge comment
 
-If more than 48 business hours have elapsed, post a single nudge comment tagging `@ai-openshell/maintainers` and any relevant CODEOWNERS. For PRs, derive relevant CODEOWNERS from `.github/CODEOWNERS` and the changed files; because OpenShell has broad ownership, include the broad owner set when no more specific owner exists.
+If more than 48 business hours have elapsed, post a single nudge comment tagging `@ai-openshell/maintainers` and any relevant CODEOWNERS. For PRs, derive relevant CODEOWNERS from `.github/CODEOWNERS` and the changed files; include the maintainer team when no specific owner exists.
 
 Do not post repeated nudges more often than once per 48 business hours. If the PR is no longer green, has new review feedback, or has changed materially, move it back to `gator:in-review` instead of nudging.
 
