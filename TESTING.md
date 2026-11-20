@@ -111,7 +111,7 @@ report `SKIP` when the executor or backend is absent; E2E returns nonzero
 when required runtime coverage is missing. Report passed, failed, and
 skipped/ignored executions separately, including why any probe gated coverage.
 Passing E2E does not qualify the [known Windows enforcement gaps](WINDOWS.md#runtime-and-current-limits).
-See the [Windows test task definitions](https://github.com/NVIDIA/OpenShell/blob/windows/tasks/windows.toml)
+See the [Windows test task definitions](https://github.com/ai-openshell/openshell/blob/windows/tasks/windows.toml)
 for boundary, loopback, network, and audit suites.
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
@@ -218,7 +218,7 @@ contract and nothing a driver is free to change.
 - The only way to skip a test is `#[ignore = "<issue link>"]`, for a broken or
   flaky test.
 
-Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
+Adapted from the handover notes in ai-openshell/openshell#4629 by Evan Lezar.
 
 ### Running suites in a tmachine environment (`tests/runner/`)
 
@@ -708,7 +708,7 @@ mise run e2e:kubernetes:credential-drivers
 
 The `e2e-kubernetes` nextest profile temporarily excludes only
 `canonical_main_connect_recovers_its_ssh_transport` while
-[#4445](https://github.com/NVIDIA/OpenShell/issues/4445) investigates delayed SSH
+[#4445](https://github.com/ai-openshell/openshell/issues/4445) investigates delayed SSH
 input-owner release through port-forwarding. The test remains available to other
 driver profiles; the remaining Kubernetes tests stay enabled.
 
@@ -747,7 +747,7 @@ failure or interrupt.
 
 Sandbox pods use the namespace-assigned UID/GID and run under `restricted-v2`
 without a privileged SCC grant to `openshell-sandbox`. Earlier versions required
-that grant for in-container isolation setup. [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
+that grant for in-container isolation setup. [RFC 0012](https://github.com/ai-openshell/openshell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
 explains the isolation backend separation behind the capability-free runtime.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
@@ -755,7 +755,7 @@ on the sandbox-side `host.openshell.internal` alias reaching the machine running
 the tests, which is unreachable from pods on a remote cluster, so they fail.
 The conformance suite's `credential_gating` tests need the alias to reach that
 machine too, and the feature selection doesn't skip them, so they fail on a
-remote cluster. [#5409](https://github.com/NVIDIA/OpenShell/issues/5409)
+remote cluster. [#5409](https://github.com/ai-openshell/openshell/issues/5409)
 tracks handling that.
 Left enabled, the `host_gateway_alias` suite fails because
 `host.openshell.internal` does not resolve inside the pod, so the gateway

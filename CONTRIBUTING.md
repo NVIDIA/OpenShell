@@ -24,7 +24,7 @@ Pull requests from authors without write access must link an issue labeled `stat
 
 ### Finding Work
 
-Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
+Issues labeled [`good first issue`](https://github.com/ai-openshell/openshell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
 An open issue is not necessarily accepted or ready for implementation. Inspect the repository’s current `state:*` labels and ask a maintainer when its status is unclear. A direct user request authorizes an agent to perform the requested phase without changing the issue’s disposition.
 
@@ -50,7 +50,7 @@ The project includes optional [agent skills](#agent-skills) for using OpenShell 
 
 ### When NOT to Open an Issue
 
-- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions).
+- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/ai-openshell/openshell/discussions).
 - Security vulnerabilities — follow [SECURITY.md](SECURITY.md) instead.
 
 ## Before You Submit a Change
@@ -75,7 +75,7 @@ OpenShell keeps skills for using the product separate from skills for developing
 
 ### Skills for Using OpenShell
 
-Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add ai-openshell/openshell`.
 
 | Skill | Purpose |
 | --- | --- |
@@ -149,7 +149,7 @@ Apply `area:` and `topic:` classification labels only after the issue or PR meet
 
 Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
 
-Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/NVIDIA/OpenShell/issues/5261). Until that policy changes, defer classification labels until acceptance.
+Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/ai-openshell/openshell/issues/5261). Until that policy changes, defer classification labels until acceptance.
 
 ### Label Discovery
 
@@ -167,7 +167,7 @@ When recording a triage outcome, replace the previous assessment state rather th
 
 ## Prerequisites
 
-Native Windows development uses the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Native Windows development uses the [`windows` branch](https://github.com/ai-openshell/openshell/tree/windows).
 Follow [Native Windows support](WINDOWS.md) for checkout, MSVC prerequisites,
 runtime requirements, and limitations. Target Windows implementation PRs at
 `windows`. Shared documentation can merge into `main`, but Windows-specific
@@ -312,7 +312,7 @@ mise run --skip-tools windows:build:x64
 
 For ARM64, use `windows:build:arm64` with ARM64 MSVC components and host-native
 LLVM. Keep the matching `libz3.dll` staged by the build beside the executables.
-See [Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+See [Windows validation](https://github.com/ai-openshell/openshell/blob/windows/TESTING.md#native-windows-validation)
 for native tests and MXC E2E requirements. Docker is not required for the native
 Windows build or MXC runtime.
 

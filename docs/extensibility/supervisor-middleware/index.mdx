@@ -18,7 +18,7 @@ A network policy decides whether an agent can call an API. Use middleware when y
 - Remove sensitive content from HTTP responses before the agent receives them.
 - Check outgoing WebSocket text messages during a session.
 
-The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) shows a complete middleware service that performs checks like these.
+The [content guard example](https://github.com/ai-openshell/openshell/tree/main/examples/supervisor-middleware-content-guard) shows a complete middleware service that performs checks like these.
 
 ## How Middleware Processes Traffic
 
@@ -72,7 +72,7 @@ Attach built-in middleware, register your own service, choose failure behavior, 
 
 ## Build Your Middleware Service
 
-A middleware service is a gRPC server that implements the services in [`proto/supervisor_middleware.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/supervisor_middleware.proto). The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) is a complete service you can start from.
+A middleware service is a gRPC server that implements the services in [`proto/supervisor_middleware.proto`](https://github.com/ai-openshell/openshell/blob/main/proto/supervisor_middleware.proto). The [content guard example](https://github.com/ai-openshell/openshell/tree/main/examples/supervisor-middleware-content-guard) is a complete service you can start from.
 
 <Warning>
 

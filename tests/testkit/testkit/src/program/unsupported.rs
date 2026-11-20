@@ -99,7 +99,7 @@ mod tests {
     use crate::registry::Test;
     use crate::registry::tests::test;
 
-    const ISSUE: &str = "https://github.com/NVIDIA/OpenShell/issues/1";
+    const ISSUE: &str = "https://github.com/ai-openshell/openshell/issues/1";
 
     const TESTS: &[Test] = &[
         test("suite::cli", "stop", false),

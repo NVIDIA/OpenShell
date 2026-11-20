@@ -2,7 +2,7 @@
 
 This supplement defines the build targets for the release system described by
 RFC 0014. The targets follow the structure of the
-[proposed support matrix](https://github.com/NVIDIA/OpenShell/blob/d575cf85f8c520774cc3e307ec1bcdabf57cd682/docs/reference/support-matrix.mdx)
+[proposed support matrix](https://github.com/ai-openshell/openshell/blob/d575cf85f8c520774cc3e307ec1bcdabf57cd682/docs/reference/support-matrix.mdx)
 and describe the intended final state.
 
 These tables enumerate build and capability targets. They do not imply that

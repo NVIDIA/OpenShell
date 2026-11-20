@@ -7054,7 +7054,12 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
 
         // Reference discovery (GET) is allowed.
-        let refs = l7_input("github.com", 443, "GET", "/NVIDIA/OpenShell.git/info/refs");
+        let refs = l7_input(
+            "github.com",
+            443,
+            "GET",
+            "/ai-openshell/openshell.git/info/refs",
+        );
         assert!(eval_l7(&engine, &refs), "GET info/refs should be allowed");
 
         // Clone/fetch (POST git-upload-pack) is allowed.
@@ -7062,7 +7067,7 @@ network_policies:
             "github.com",
             443,
             "POST",
-            "/NVIDIA/OpenShell.git/git-upload-pack",
+            "/ai-openshell/openshell.git/git-upload-pack",
         );
         assert!(
             eval_l7(&engine, &upload_pack),
@@ -7074,7 +7079,7 @@ network_policies:
             "github.com",
             443,
             "POST",
-            "/NVIDIA/OpenShell.git/git-receive-pack",
+            "/ai-openshell/openshell.git/git-receive-pack",
         );
         assert!(
             !eval_l7(&engine, &receive_pack),

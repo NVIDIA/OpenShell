@@ -3,14 +3,14 @@ authors:
   - "@elezar"
 state: implemented
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1492
-  - https://github.com/NVIDIA/OpenShell/pull/1589
-  - https://github.com/NVIDIA/OpenShell/pull/1744
-  - https://github.com/NVIDIA/OpenShell/pull/1785
-  - https://github.com/NVIDIA/OpenShell/pull/1815
-  - https://github.com/NVIDIA/OpenShell/pull/1861
-  - https://github.com/NVIDIA/OpenShell/pull/2086
-  - https://github.com/NVIDIA/OpenShell/pull/2092
+  - https://github.com/ai-openshell/openshell/issues/1492
+  - https://github.com/ai-openshell/openshell/pull/1589
+  - https://github.com/ai-openshell/openshell/pull/1744
+  - https://github.com/ai-openshell/openshell/pull/1785
+  - https://github.com/ai-openshell/openshell/pull/1815
+  - https://github.com/ai-openshell/openshell/pull/1861
+  - https://github.com/ai-openshell/openshell/pull/2086
+  - https://github.com/ai-openshell/openshell/pull/2092
 ---
 
 # RFC 0006 - Driver Config Passthrough

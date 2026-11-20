@@ -1,6 +1,6 @@
 # Native Windows support
 
-The [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows) is the
+The [`windows` branch](https://github.com/ai-openshell/openshell/tree/windows) is the
 development and release branch for native Windows OpenShell. The Windows
 implementation stays on that branch. This guide and other shared documentation
 can also appear on `main`; their presence there does not move the Windows
@@ -30,9 +30,9 @@ under development and is not a production-qualified security boundary:
   command workloads with `--detach`.
 - Gateway restart recovery for live MXC generations is not supported.
 
-See the Windows branch's [MXC driver documentation](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md)
+See the Windows branch's [MXC driver documentation](https://github.com/ai-openshell/openshell/blob/windows/crates/openshell-driver-mxc/README.md)
 for the current capabilities and enforcement limits, and its
-[boundary library documentation](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-mxc-boundary/README.md)
+[boundary library documentation](https://github.com/ai-openshell/openshell/blob/windows/crates/openshell-mxc-boundary/README.md)
 for the runtime architecture. Passing build or E2E checks does not establish
 the missing security guarantees.
 
@@ -41,7 +41,7 @@ the missing security guarantees.
 Use a separate checkout so an existing `main` checkout can remain in place:
 
 ```powershell
-git clone --branch windows https://github.com/NVIDIA/OpenShell.git OpenShell-windows
+git clone --branch windows https://github.com/ai-openshell/openshell.git OpenShell-windows
 Set-Location OpenShell-windows
 mise trust
 ```
@@ -57,7 +57,7 @@ are not the native Windows distribution path.
 Use Windows with rustup, mise, Visual Studio C++ Build Tools, a Windows SDK,
 and host-compatible LLVM/libclang. Install the MSVC components for each target
 you build, including ARM64 tools and Spectre-mitigated libraries for ARM64.
-The [Windows build skill](https://github.com/NVIDIA/OpenShell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md)
+The [Windows build skill](https://github.com/ai-openshell/openshell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md)
 lists the full prerequisites and environment overrides.
 
 Run the build matching your target:
@@ -94,8 +94,8 @@ and configure its absolute path.
 `probes.baseContainerSupportsIngressHostLoopbackAllow` must be `true`.
 A Windows version number alone does not establish runtime compatibility.
 Configure `compute_driver = "mxc"` and use the matching
-[Windows gateway configuration](https://github.com/NVIDIA/OpenShell/blob/windows/docs/how-it-works/gateways/configuration.mdx#configure-mxc)
-and [example gateway TOML](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/examples/mxc-gateway.toml).
+[Windows gateway configuration](https://github.com/ai-openshell/openshell/blob/windows/docs/how-it-works/gateways/configuration.mdx#configure-mxc)
+and [example gateway TOML](https://github.com/ai-openshell/openshell/blob/windows/crates/openshell-driver-mxc/examples/mxc-gateway.toml).
 Command-based sandbox creation requires administrator opt-in with
 `allow_driver_config = true`, a workload command and working directory, and
 `--detach`. Use a sandbox policy to grant the required filesystem and network
@@ -103,11 +103,11 @@ access.
 
 ## Validate
 
-Follow [native Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+Follow [native Windows validation](https://github.com/ai-openshell/openshell/blob/windows/TESTING.md#native-windows-validation)
 for native x64 or ARM64 lint, build, unit tests, and real MXC tests. Cross-building
 ARM64 on x64 does not run native ARM64 tests. Real MXC tests and E2E require a
 capable host; record probe-gated skips separately from passes.
 
-The [Windows CI guidance](https://github.com/NVIDIA/OpenShell/blob/windows/CI.md#windows-validation)
+The [Windows CI guidance](https://github.com/ai-openshell/openshell/blob/windows/CI.md#windows-validation)
 describes opt-in PR checks and branch builds. A successful compilation or an
 advisory CI run is not a Windows release qualification result.

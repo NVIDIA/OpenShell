@@ -5312,7 +5312,7 @@ mod tests {
     fn deny_response_body_is_agent_readable_and_redacted() {
         let req = L7Request {
             action: "PUT".to_string(),
-            target: "/repos/NVIDIA/OpenShell/contents/README.md?access_token=secret-token"
+            target: "/repos/ai-openshell/openshell/contents/README.md?access_token=secret-token"
                 .to_string(),
             query_params: HashMap::new(),
             raw_header: Vec::new(),
@@ -5323,7 +5323,7 @@ mod tests {
             &req,
             "github-readonly",
             "no matching L7 allow rule",
-            Some("/repos/NVIDIA/OpenShell/contents/README.md"),
+            Some("/repos/ai-openshell/openshell/contents/README.md"),
             Some(DenyResponseContext {
                 host: Some("api.github.com"),
                 port: Some(443),
@@ -5341,17 +5341,20 @@ mod tests {
         assert_eq!(body["host"], "api.github.com");
         assert_eq!(body["port"], 443);
         assert_eq!(body["binary"], "/usr/bin/gh");
-        assert_eq!(body["path"], "/repos/NVIDIA/OpenShell/contents/README.md");
+        assert_eq!(
+            body["path"],
+            "/repos/ai-openshell/openshell/contents/README.md"
+        );
         assert_eq!(
             body["rule"],
-            "PUT /repos/NVIDIA/OpenShell/contents/README.md"
+            "PUT /repos/ai-openshell/openshell/contents/README.md"
         );
         assert_eq!(body["rule_missing"]["type"], "rest_allow");
         assert_eq!(body["rule_missing"]["layer"], "l7");
         assert_eq!(body["rule_missing"]["method"], "PUT");
         assert_eq!(
             body["rule_missing"]["path"],
-            "/repos/NVIDIA/OpenShell/contents/README.md"
+            "/repos/ai-openshell/openshell/contents/README.md"
         );
         assert_eq!(body["rule_missing"]["host"], "api.github.com");
         assert_eq!(body["rule_missing"]["port"], 443);

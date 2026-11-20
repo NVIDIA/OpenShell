@@ -6,7 +6,7 @@ The agent-root entry point is `.agents/agents/gator/run.sh`.
 
 ## Prerequisites
 
-- `gh` is authenticated on the host and has access to `NVIDIA/OpenShell`.
+- `gh` is authenticated on the host and has access to `ai-openshell/openshell`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
 - For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
 - A Docker, Podman, or Kubernetes gateway is available. Local builds require

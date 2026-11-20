@@ -1,9 +1,9 @@
 # openshell-driver-mxc
 
 Native Windows implementation and releases are maintained on the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+[`windows` branch](https://github.com/ai-openshell/openshell/tree/windows).
 For current setup, capabilities, and limitations, use the
-[Windows driver README](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md)
+[Windows driver README](https://github.com/ai-openshell/openshell/blob/windows/crates/openshell-driver-mxc/README.md)
 and [Windows guide](../../WINDOWS.md). The implementation notes below describe
 the older source snapshot on `main`, not the current Windows release branch.
 In particular, current Windows uses a separate host supervisor and Windows

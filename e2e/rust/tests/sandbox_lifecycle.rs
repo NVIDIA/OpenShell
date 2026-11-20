@@ -44,7 +44,7 @@ async fn sandbox_details(name: &str) -> String {
 }
 
 // The conformance suite has no counterpart for this test: on the VM driver the
-// replacement never starts (https://github.com/NVIDIA/OpenShell/issues/5507),
+// replacement never starts (https://github.com/ai-openshell/openshell/issues/5507),
 // and the legacy lanes that run this file are Docker and Kubernetes.
 #[tokio::test]
 #[serial(sandbox_lifecycle)]

@@ -79,12 +79,12 @@ visible; do not disable the job or add a broad Buf ignore rule.
 ### Windows validation
 
 Native Windows implementation and releases use the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows), independently
+[`windows` branch](https://github.com/ai-openshell/openshell/tree/windows), independently
 of the `main` release train described in this document. Shared documentation on
 `main` must retain that branch placement. See [WINDOWS.md](WINDOWS.md) for the
 native MSVC build and MXC runtime requirements.
 
-The [Windows MSVC workflow on `windows`](https://github.com/NVIDIA/OpenShell/blob/windows/.github/workflows/windows-msvc.yml)
+The [Windows MSVC workflow on `windows`](https://github.com/ai-openshell/openshell/blob/windows/.github/workflows/windows-msvc.yml)
 runs native x64 and ARM64 lanes. Windows PR checks are opt-in: adding
 `test:windows` starts them, and later commits to the PR run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
@@ -93,7 +93,7 @@ release binary builds. Those jobs use `continue-on-error: true`, so inspect
 their individual results rather than treating a green workflow as qualification.
 The jobs do not upload or publish the binaries. Native Windows packages are
 not supplied through the `main` installer or release train. Real MXC runtime qualification requires a
-capable host and the [Windows runtime tests](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation).
+capable host and the [Windows runtime tests](https://github.com/ai-openshell/openshell/blob/windows/TESTING.md#native-windows-validation).
 
 ### Advisory compatibility review
 

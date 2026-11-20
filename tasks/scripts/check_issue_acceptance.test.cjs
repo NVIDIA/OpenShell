@@ -38,8 +38,8 @@ async function check({
       return { repository: { pullRequest: { closingIssuesReferences: {
         nodes: issues.map(issue => ({
           number: issue.number,
-          url: `https://github.com/${issue.owner || 'NVIDIA'}/OpenShell/issues/${issue.number}`,
-          repository: { name: 'OpenShell', owner: { login: issue.owner || 'NVIDIA' } },
+          url: `https://github.com/${issue.owner || 'ai-openshell'}/openshell/issues/${issue.number}`,
+          repository: { name: 'openshell', owner: { login: issue.owner || 'ai-openshell' } },
         })),
         pageInfo: { hasNextPage: false, endCursor: null },
       } } } };
@@ -52,7 +52,7 @@ async function check({
   await checkIssueAcceptance({
     github,
     context: {
-      repo: { owner: 'NVIDIA', repo: 'OpenShell' },
+      repo: { owner: 'ai-openshell', repo: 'openshell' },
       payload: { pull_request: { number } },
       actor, sha: 'base-commit', serverUrl: 'https://github.com', runId: 42,
     },
@@ -109,7 +109,7 @@ test('accepted issues in the target repository pass', async () => {
 test('accepted issues in another repository cannot bypass the gate', async () => {
   const failures = await check({ issues: [{ number: 1, owner: 'contributor', labels: [{ name: 'state:accepted' }] }] });
   assert.equal(failures.length, 1);
-  assert.match(failures[0], /Acceptance must be recorded in NVIDIA\/OpenShell/);
+  assert.match(failures[0], /Acceptance must be recorded in ai-openshell\/openshell/);
 });
 
 test('a non-collaborator still needs an accepted issue', async () => {

@@ -65,7 +65,7 @@ Use `gh api user` as the health check. It works with provider-scoped tokens and 
 
 ```bash
 gh api user --jq '.login'
-gh api repos/NVIDIA/OpenShell --jq '{full_name,default_branch}'
+gh api repos/ai-openshell/openshell --jq '{full_name,default_branch}'
 ```
 
 If this fails, refresh host `gh` auth before launching. Do not rely on `gh auth status` alone inside provider-backed sandboxes.

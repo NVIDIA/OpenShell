@@ -7,7 +7,7 @@
   "homepage": "https://github.com/ai-openshell/sdk-typescript",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NVIDIA/OpenShell.git",
+    "url": "git+https://github.com/ai-openshell/openshell.git",
     "directory": "sdk/typescript"
   },
   "publishConfig": {
