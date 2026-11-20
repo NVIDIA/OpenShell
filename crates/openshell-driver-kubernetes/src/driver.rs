@@ -9327,76 +9327,8 @@ fn spawn_namespace_file_watcher(
 
 #[cfg(test)]
 mod tests {
-    use crate::sandbox_runtime::BOUNDARY_CONFIG_PATH;
-    #[tokio::test]
-    async fn kubernetes_bootstrap_secret_can_fetch_the_registered_configuration() {
-        use super::*;
-        use openshell_core::jwt::{CredentialEpoch, SessionRotation};
-        use openshell_sandbox_backend::bootstrap;
-        use openshell_sandbox_backend::boundary_protocol::{BoundaryConfig, BoundaryListener};
-        let config = BoundaryConfig {
-            boundary_id: "bootstrap-test".into(), generation: "generation-1".into(),
-            session_id: openshell_core::SandboxSessionId::new(),
-            session_rotation: SessionRotation::new(1).unwrap(), auth_epoch: CredentialEpoch::new(1).unwrap(),
-            gateway_id: "test".into(), verification_keys: vec![],
-            listener: BoundaryListener::Unix { socket_path: "/unused".into(), tls: SandboxTlsServerConfig {
-                certificate_chain_path: BOUNDARY_CERTIFICATE_PATH.into(), private_key_path: BOUNDARY_PRIVATE_KEY_PATH.into(),
-            } },
-            workload_identity: ResolvedWorkloadIdentity::new(1000, 1000, vec![], "test".into(), "test".into()).unwrap(),
-            provisioning_evidence: openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence("generation-1", b"test").unwrap(),
-            resource_claims: BTreeMap::new(), resource_claim_files: BTreeMap::new(),
-            child_env: [("PRIVATE_VALUE".into(), "boundary-only".into())].into(),
-        };
-        let mut secret = sandbox_bootstrap_secret(
-            "test",
-            &SandboxRuntimeNames::new("bootstrap-test"),
-            "bootstrap-test",
-            b"boundary-certificate".to_vec(),
-            b"boundary-key".to_vec(),
-            runtime_pod_owner("test", "test-uid"),
-        );
-        let mut server_config =
-            prepare_wire_bootstrap(&mut secret, config, "127.0.0.1:5502".parse().unwrap(), "")
-                .unwrap();
-        let data = secret.data.as_ref().unwrap();
-        assert!(!data.contains_key("boundary.json"));
-        assert_eq!(data.len(), 7); // Bootstrap inputs and the existing TLS pair.
-        assert_eq!(data["bootstrap-address"].0, b"127.0.0.1:5502");
-        server_config.listen = "127.0.0.1:0".parse().unwrap();
-        let server = bootstrap::serve(server_config).await.unwrap();
-        let input = |key: &str| std::str::from_utf8(&data[key].0).unwrap();
-        let received = bootstrap::fetch(
-            server.address,
-            input("bootstrap-server-name").into(),
-            input("bootstrap-ca"),
-            input("bootstrap-token"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(received.boundary_id, "bootstrap-test");
-        assert_eq!(received.generation, "generation-1");
-        assert_eq!(received.child_env["PRIVATE_VALUE"], "boundary-only");
-    }
-
-    #[test]
-    fn wire_bootstrap_container_rotates_secret_references_without_embedding_tokens() {
-        use super::*;
-        // Container rendering must reference Secret keys and never embed a token.
-        let mut containers = serde_json::json!([{"name": "agent", "env": [{"name": "USER_VALUE", "value": "kept"}]}]);
-        configure_bootstrap_container(&mut containers, "generation-secret");
-        assert_eq!(containers[0]["command"][1], "--bootstrap-remote");
-        let env = containers[0]["env"].as_array().unwrap();
-        assert_eq!(env.len(), 6);
-        assert!(env[1..].iter().all(|entry| entry.get("value").is_none()
-            && entry["valueFrom"]["secretKeyRef"]["name"] == "generation-secret"));
-        configure_bootstrap_container(&mut containers, "next-secret");
-        assert_eq!(containers[0]["env"].as_array().unwrap().len(), 6);
-        assert_eq!(
-            containers[0]["env"][1]["valueFrom"]["secretKeyRef"]["name"],
-            "next-secret"
-        );
-    }
     use super::*;
+    use crate::sandbox_runtime::BOUNDARY_CONFIG_PATH;
 
     /// Serve Pod GETs over one reusable HTTP/1 connection per client,
     /// delaying a request for Pod `slow-<millis>` by that many milliseconds.

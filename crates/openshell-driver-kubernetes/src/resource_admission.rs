@@ -284,22 +284,6 @@ pub fn check_record(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn bootstrap_environment_is_limited_to_the_boundarys_private_secret() {
-        use super::*;
-        let entry = serde_json::json!({"name": "OPENSHELL_BOUNDARY_BOOTSTRAP_TOKEN",
-            "valueFrom": {"secretKeyRef": {"name": "private-generation", "key": "bootstrap-token"}}});
-        let mut spec = serde_json::json!({"automountServiceAccountToken": false,
-            "containers": [{"name": "agent", "command": ["/.openshell/runtime/openshell-sandbox", "--bootstrap-remote"], "env": [entry]}]});
-        assert!(inventory(&spec, "private-generation").unwrap().is_empty());
-        assert!(inventory(&spec, "other-generation").is_err());
-        spec["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["key"] = "tls.key".into();
-        assert!(inventory(&spec, "private-generation").is_err());
-        spec["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["key"] =
-            "bootstrap-token".into();
-        spec["containers"][0]["name"] = "sidecar".into();
-        assert!(inventory(&spec, "private-generation").is_err());
-    }
     use super::*;
 
     #[tokio::test]

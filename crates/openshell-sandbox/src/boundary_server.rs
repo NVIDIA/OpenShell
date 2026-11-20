@@ -274,7 +274,7 @@ mod linux {
                 .enable_all()
                 .build()
                 .map_err(|error| format!("create bootstrap runtime: {error}"))?;
-            runtime.block_on(bootstrap::fetch_routed(
+            runtime.block_on(bootstrap::fetch(
                 address,
                 input(bootstrap::SERVER_NAME_ENV)?,
                 &input(bootstrap::CA_ENV)?,

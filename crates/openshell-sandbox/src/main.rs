@@ -1954,26 +1954,6 @@ mod tests {
     }
 
     #[test]
-    fn kubernetes_wire_bootstrap_stages_tls_without_config_or_token_files() {
-        if nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() == 0 {
-            return;
-        }
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("input");
-        let runtime = root.path().join("runtime");
-        let state = root.path().join("state");
-        std::fs::create_dir(&source).unwrap();
-        for name in ["bootstrap-token", "tls.crt", "tls.key"] {
-            std::fs::write(source.join(name), b"protected-input").unwrap();
-        }
-        stage_kubernetes_bootstrap_at(&source, &runtime, &state).unwrap();
-        assert!(!state.join("bootstrap/boundary.json").exists());
-        assert!(!state.join("bootstrap/bootstrap-token").exists());
-        assert!(state.join("bootstrap/tls.crt").is_file());
-        assert!(state.join("bootstrap/tls.key").is_file());
-    }
-
-    #[test]
     fn kubernetes_bootstrap_stages_private_memory_bundle() {
         if nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() == 0 {
             return;

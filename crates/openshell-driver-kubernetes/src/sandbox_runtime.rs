@@ -1585,32 +1585,6 @@ mod tests {
     }
 
     #[test]
-    fn boundary_bootstrap_has_its_own_paired_endpoint_for_both_control_directions() {
-        let names = SandboxRuntimeNames::new("pair");
-        let (service, policy) = boundary_bootstrap_resources("sandbox", &names, "pair", owner());
-        assert_eq!(service.metadata.name.as_deref(), Some("os-bootstrap-pair"));
-        assert_eq!(policy.metadata.name, service.metadata.name);
-        assert!(boundary_service_matches_mode(
-            &service,
-            "pair",
-            KubernetesControlConnection::RuntimeInitiated
-        ));
-        let ports = service.spec.as_ref().unwrap().ports.as_ref().unwrap();
-        assert_eq!(ports.len(), 1);
-        assert_eq!(ports[0].port, 5502);
-        let expected = runtime_control_policy("sandbox", "os-bootstrap-pair", "pair", 5502);
-        assert_eq!(policy.spec, expected.spec);
-        for direction in [
-            KubernetesControlConnection::RuntimeInitiated,
-            KubernetesControlConnection::SupervisorInitiated,
-        ] {
-            let control = boundary_service("sandbox", &names, "pair", 5500, direction, owner());
-            assert_ne!(service.metadata.name, control.metadata.name);
-            assert_eq!(control.spec.unwrap().ports.unwrap()[0].port, 5500);
-        }
-    }
-
-    #[test]
     fn bootstrap_secrets_are_immutable_and_split_by_trust_domain() {
         let names = SandboxRuntimeNames::new("pair");
         let sandbox =

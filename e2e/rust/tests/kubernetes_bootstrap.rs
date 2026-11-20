@@ -71,21 +71,42 @@ async fn workload_secret(name: &str) -> String {
 
 #[tokio::test]
 async fn token_bootstrap_starts_and_restarts_without_a_boundary_config_file() {
-    let mut sandbox = SandboxGuard::create(&[])
+    let mut sandbox = SandboxGuard::create(&["--env", "BOOTSTRAP_PARITY_VALUE=preserved"])
         .await
         .expect("create token-bootstrapped sandbox");
     let first_secret = workload_secret(&sandbox.name).await;
     let check = [
         "sh",
         "-c",
-        "test ! -e /.openshell/state/bootstrap/boundary.json && test -z \"${OPENSHELL_BOUNDARY_BOOTSTRAP_TOKEN+x}\" && echo bootstrap-ok",
+        r#"set -eu
+        test ! -e /.openshell/state/bootstrap/boundary.json
+        test ! -e /.openshell/state/bootstrap/bootstrap-token
+        if env | cut -d= -f1 | grep -q '^OPENSHELL_BOUNDARY_BOOTSTRAP_'; then exit 1; fi
+        test "$BOOTSTRAP_PARITY_VALUE" = preserved
+        test "$PWD" = /sandbox
+        test "$1" = bootstrap-argument
+        echo bootstrap-ok"#,
+        "bootstrap-check",
+        "bootstrap-argument",
     ];
     assert!(sandbox.exec(&check).await.unwrap().contains("bootstrap-ok"));
+    sandbox
+        .exec(&["sh", "-c", "printf preserved > /sandbox/bootstrap-parity"])
+        .await
+        .unwrap();
     for operation in ["stop", "start"] {
         let (output, code) = run_cli(&["sandbox", operation, &sandbox.name]).await;
         assert_eq!(code, 0, "{operation}: {output}");
     }
     assert_ne!(first_secret, workload_secret(&sandbox.name).await);
     assert!(sandbox.exec(&check).await.unwrap().contains("bootstrap-ok"));
+    assert_eq!(
+        sandbox
+            .exec(&["cat", "/sandbox/bootstrap-parity"])
+            .await
+            .unwrap()
+            .trim(),
+        "preserved"
+    );
     sandbox.cleanup().await;
 }
