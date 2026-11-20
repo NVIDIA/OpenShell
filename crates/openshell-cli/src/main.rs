@@ -4347,16 +4347,10 @@ async fn run_async() -> Result<()> {
                 } else {
                     (cli.gateway, cli.gateway_endpoint)
                 };
-                let endpoint = match (profile, endpoint) {
-                    (None, Some(endpoint)) => endpoint,
-                    (profile, endpoint) => {
-                        let ctx = resolve_gateway(&profile, &endpoint)?;
-                        tls = tls.with_gateway_name(&ctx.name);
-                        apply_auth(&mut tls, &ctx.name)?;
-                        ctx.endpoint
-                    }
-                };
-                run::sandbox_ssh_proxy_by_name(&endpoint, &name, &tls, &cli.workspace).await?;
+                let ctx = resolve_gateway(&profile, &endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
+                run::sandbox_ssh_proxy_by_name(&ctx.endpoint, &name, &tls, &cli.workspace).await?;
             }
         }
 

@@ -2947,7 +2947,7 @@ async fn copy_retry_refuses_and_revokes_a_same_name_replacement() {
 async fn ssh_profile_credentials_follow_the_selected_endpoint() {
     let server = run_server().await;
     let xdg = helpers::tempdir().unwrap();
-    prepare_cli_xdg(&server, &xdg);
+    prepare_cli_xdg(&server, &xdg, "openshell");
     write_oidc_test_credentials(&server, &xdg, "https://unused.invalid", 4_102_444_800);
     let state = &server.openshell.state;
     state
@@ -2980,6 +2980,40 @@ async fn ssh_profile_credentials_follow_the_selected_endpoint() {
     assert_eq!(
         state.ssh_requests_with_cached_bearer.load(Ordering::SeqCst),
         3
+    );
+
+    // --server selects B's mTLS identity even if the shell exports profile A.
+    let other = run_server().await;
+    prepare_cli_xdg(&other, &xdg, "other");
+    fs::write(
+        xdg.path().join("openshell/gateways/other/metadata.json"),
+        serde_json::to_vec(&openshell_bootstrap::GatewayMetadata {
+            name: "other".into(),
+            gateway_endpoint: other.endpoint.clone(),
+            ..openshell_bootstrap::GatewayMetadata::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let other_state = &other.openshell.state;
+    other_state
+        .ssh_session_failures_remaining
+        .store(1, Ordering::SeqCst);
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+        .args(["ssh-proxy", "--server", &other.endpoint, "--name", "demo"])
+        .env("OPENSHELL_GATEWAY", "openshell")
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .env("OPENSHELL_TELEMETRY_ENABLED", "false")
+        .output()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sandbox is not ready"));
+    assert_eq!(other_state.ssh_session_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        other_state
+            .ssh_requests_with_cached_bearer
+            .load(Ordering::SeqCst),
+        0
     );
 }
 
@@ -3206,8 +3240,12 @@ async fn sandbox_create_env_rejects_invalid_key_name() {
     );
 }
 
-fn prepare_cli_xdg(server: &TestServer, xdg_dir: &TempDir) {
-    let tls_dir = xdg_dir.path().join("openshell/gateways/openshell/mtls");
+fn prepare_cli_xdg(server: &TestServer, xdg_dir: &TempDir, profile: &str) {
+    let tls_dir = xdg_dir
+        .path()
+        .join("openshell/gateways")
+        .join(profile)
+        .join("mtls");
     fs::create_dir_all(&tls_dir).unwrap();
     for filename in ["ca.crt", "tls.crt", "tls.key"] {
         fs::copy(server.dir.path().join(filename), tls_dir.join(filename)).unwrap();
@@ -3262,7 +3300,7 @@ async fn run_cli_sandbox_create(
     extra_args: &[&str],
 ) -> std::process::Output {
     let xdg_dir = helpers::tempdir().unwrap();
-    prepare_cli_xdg(server, &xdg_dir);
+    prepare_cli_xdg(server, &xdg_dir, "openshell");
     run_cli_sandbox_create_with_xdg(server, &xdg_dir, name, extra_args).await
 }
 
@@ -3391,7 +3429,7 @@ async fn run_cli_sandbox_create_with_env(
     environment: &[(&str, &str)],
 ) -> std::process::Output {
     let xdg_dir = helpers::tempdir().unwrap();
-    prepare_cli_xdg(server, &xdg_dir);
+    prepare_cli_xdg(server, &xdg_dir, "openshell");
     run_cli_sandbox_create_with_xdg_and_env(server, &xdg_dir, name, extra_args, environment).await
 }
 
@@ -3558,7 +3596,7 @@ async fn sandbox_create_fails_before_mutation_when_expired_oidc_refresh_is_rejec
     let server = run_server().await;
     let issuer = run_rejected_oidc_refresh_server().await;
     let xdg_dir = helpers::tempdir().unwrap();
-    prepare_cli_xdg(&server, &xdg_dir);
+    prepare_cli_xdg(&server, &xdg_dir, "openshell");
 
     write_oidc_test_credentials(&server, &xdg_dir, &issuer, 0);
 
@@ -3594,7 +3632,7 @@ async fn sandbox_create_continues_with_unexpired_cached_token_when_refresh_fails
     let server = run_server().await;
     let issuer = run_rejected_oidc_refresh_server().await;
     let xdg_dir = helpers::tempdir().unwrap();
-    prepare_cli_xdg(&server, &xdg_dir);
+    prepare_cli_xdg(&server, &xdg_dir, "openshell");
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

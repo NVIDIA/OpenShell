@@ -57,7 +57,7 @@ pub struct RelayGrant {
 pub struct PreparedProxy {
     command: String,
     cancel: oneshot::Sender<()>,
-    cleanup: tokio::task::JoinHandle<()>,
+    cleanup: tokio::task::JoinHandle<bool>,
 }
 
 impl SshTarget {
@@ -139,7 +139,9 @@ impl SshTarget {
                 peer.write_u32(u32::try_from(payload.len()).map_err(std::io::Error::other)?)
                     .await?;
                 peer.write_all(&payload).await?;
-                peer.read_u8().await?;
+                if peer.read_u8().await? != 1 {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
                 Ok::<_, std::io::Error>(peer)
             };
             // Keep the peer until the issuing client has attempted revocation.
@@ -150,6 +152,9 @@ impl SshTarget {
             revoke.await;
             if let Some(mut peer) = peer {
                 let _ = peer.write_u8(1).await;
+                true
+            } else {
+                false
             }
         });
         Ok(PreparedProxy {
@@ -179,10 +184,21 @@ impl PreparedProxy {
     }
 
     pub async fn run<T>(self, operation: impl Future<Output = Result<T>>) -> Result<T> {
+        self.run_with_admission(operation)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Report whether the proxy actually opened `ForwardTcp`. Elapsed SSH
+    /// startup time alone cannot distinguish a slow rejection from a session.
+    pub async fn run_with_admission<T>(
+        self,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<(T, bool)> {
         let result = operation.await;
         drop(self.cancel);
-        self.cleanup.await.into_diagnostic()?;
-        result
+        let admitted = self.cleanup.await.into_diagnostic()?;
+        Ok((result?, admitted))
     }
 }
 

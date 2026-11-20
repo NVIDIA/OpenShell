@@ -24,6 +24,23 @@ struct Gateway {
 
 #[tonic::async_trait]
 impl OpenShell for Gateway {
+    async fn get_sandbox(
+        &self,
+        _: Request<proto::GetSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        let metadata = proto::datamodel::v1::ObjectMeta {
+            id: "id-repro".into(),
+            ..proto::datamodel::v1::ObjectMeta::default()
+        };
+        Ok(Response::new(proto::SandboxResponse {
+            sandbox: Some(proto::Sandbox {
+                metadata: Some(metadata),
+                ..proto::Sandbox::default()
+            }),
+            ..proto::SandboxResponse::default()
+        }))
+    }
+
     async fn create_ssh_session(
         &self,
         _: Request<proto::CreateSshSessionRequest>,

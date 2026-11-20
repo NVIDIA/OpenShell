@@ -120,22 +120,7 @@ async fn ssh_session_config(
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
-    // Resolve the sandbox and retain its ID for local lifecycle tracking.
-    let response = client
-        .get_sandbox(with_owner_hint(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-        }))
-        .await
-        .into_diagnostic()?;
-    let replica = owner_replica(&response);
-    let sandbox = response
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
-
+    let (sandbox, replica) = lookup_ssh_sandbox(&mut client, name, workspace).await?;
     let gateway_name = tls
         .gateway_name()
         .ok_or_else(|| miette::miette!("gateway name is required to build SSH proxy command"))?;
@@ -468,6 +453,7 @@ async fn sandbox_connect_supervised(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
+    let mut selected_id = None;
     let mut recovery_deadline = None;
     let mut retry_delay = CONNECT_RETRY_INITIAL_DELAY;
     let mut cancellation = ConnectCancellation::new()?;
@@ -482,6 +468,11 @@ async fn sandbox_connect_supervised(
             recovery_deadline,
             async {
                 let session = ssh_session_config(server, name, tls, workspace).await?;
+                if selected_id.get_or_insert_with(|| session.target.id.clone())
+                    != &session.target.id
+                {
+                    return Err(miette::miette!("sandbox was replaced before reconnecting"));
+                }
                 Ok((session.prepare().await?, session.main_terminal))
             },
         )))
@@ -518,14 +509,17 @@ async fn sandbox_connect_supervised(
         };
 
         let command = main_attach_command(&proxy, main_terminal);
-        let (exit_code, attached_for) = proxy
-            .run(async {
+        let ((exit_code, attached_for), admitted) = proxy
+            .run_with_admission(async {
                 let started = Instant::now();
                 let code = run_main_attach_supervised(command, &mut cancellation).await?;
                 Ok((code, started.elapsed()))
             })
             .await?;
         let recovery_active = recovery_deadline.is_some();
+        if !admitted && !recovery_active {
+            return Ok(exit_code);
+        }
         let main_has_terminal_result = if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
             match cancellation
                 .wait(canonical_main_has_terminal_result(
@@ -914,6 +908,14 @@ fn foreground_forward_started_message(name: &str, spec: &ForwardSpec) -> String 
     )
 }
 
+/// Exit status returned by a sandbox command run through OpenSSH.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("ssh exited with status {code}")]
+pub struct SshCommandExit {
+    pub code: i32,
+}
+
+/// Execute a sandbox command and return a `SshCommandExit` on a nonzero exit.
 pub async fn sandbox_exec(
     server: &str,
     name: &str,
@@ -952,8 +954,10 @@ pub async fn sandbox_exec(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    proxy.run(wait_for_ssh(ssh)).await?;
-
+    let code = proxy.run(wait_for_ssh(ssh)).await?;
+    if code != 0 {
+        return Err(Report::new(SshCommandExit { code }));
+    }
     Ok(())
 }
 
@@ -1910,21 +1914,27 @@ async fn sandbox_sync_down_directory(
     stream_sandbox_tar(session, tar_cmd, dest_path).await
 }
 
-async fn ssh_owner(
+async fn lookup_ssh_sandbox(
     client: &mut GrpcClient,
     name: &str,
     workspace: &str,
-) -> Option<AsciiMetadataValue> {
-    client
+) -> Result<(openshell_core::proto::Sandbox, Option<AsciiMetadataValue>)> {
+    let response = client
         .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
+                (workspace).to_string(),
             )),
         }))
         .await
-        .ok()
-        .and_then(|response| owner_replica(&response))
+        .into_diagnostic()?;
+    let replica = owner_replica(&response);
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    Ok((sandbox, replica))
 }
 
 /// Mint the token inside the proxy so neither SSH nor its other children inherit it.
@@ -1935,7 +1945,7 @@ pub async fn sandbox_ssh_proxy_by_name(
     workspace: &str,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let replica = ssh_owner(&mut client, name, workspace).await;
+    let (sandbox, replica) = lookup_ssh_sandbox(&mut client, name, workspace).await?;
     let mut cancellation = ConnectCancellation::new()?;
     let session = cancellation
         .wait(client.create_ssh_session(CreateSshSessionRequest {
@@ -1949,14 +1959,14 @@ pub async fn sandbox_ssh_proxy_by_name(
         .into_diagnostic()?
         .into_inner();
     let opened = cancellation
-        .wait(open_ssh_relay(
-            server,
-            name,
-            tls,
-            workspace,
-            &session,
-            replica.as_ref(),
-        ))
+        .wait(async {
+            if sandbox.object_id() != session.sandbox_id {
+                return Err(miette::miette!(
+                    "sandbox was replaced before opening the SSH relay"
+                ));
+            }
+            open_ssh_relay(server, name, tls, workspace, &session, replica.as_ref()).await
+        })
         .await;
     // ForwardTcp authenticates its first frame. Revoke even on a failed open,
     // before a long-lived forward or a killed SSH process can strand the grant.
@@ -2126,7 +2136,10 @@ async fn open_ssh_relay(
     let mut client = grpc_client(&gateway_url, tls).await?;
     let owner = match replica {
         Some(owner) => Some(owner.clone()),
-        None => ssh_owner(&mut client, name, workspace).await,
+        None => lookup_ssh_sandbox(&mut client, name, workspace)
+            .await
+            .ok()
+            .and_then(|(_, owner)| owner),
     };
     let init = TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
