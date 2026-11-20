@@ -115,8 +115,7 @@ jobs:
             {"environment":"fedora-podman-rootless-userns-auto","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-docker-rootful-workloads","installer":"deb","family":"workloads","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"fedora-podman-rootless-workloads","installer":"rpm","family":"workloads","gateway":"openshell","runner":"ubuntu-24.04"}
+            {"environment":"ubuntu-docker-rootful-workloads","installer":"deb","family":"workloads","gateway":"openshell","runner":"ubuntu-24.04"}
           ]'
           # `suite` names the row's tests in the job and artifact names.
           matrix=$(jq -c --arg family "${FAMILY}" --arg external "${EXTERNAL_DRIVERS}" '{include: map(

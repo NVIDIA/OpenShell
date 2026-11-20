@@ -23,6 +23,7 @@ jobs:
       should_run: ${{ steps.gate.outputs.should_run }}
       run_integration: ${{ steps.labels.outputs.run_core_e2e }}
       run_core_e2e: ${{ steps.labels.outputs.run_core_e2e }}
+      run_workloads_e2e: ${{ steps.labels.outputs.run_workloads_e2e }}
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
       run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
@@ -47,12 +48,14 @@ jobs:
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              run_workloads_e2e="$(jq -r 'index("test:e2e:workloads") != null' <<< "$LABELS_JSON")"
               ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
+              run_workloads_e2e=true
               ;;
           esac
           if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
@@ -63,6 +66,7 @@ jobs:
 
           {
             echo "run_core_e2e=$run_core_e2e"
+            echo "run_workloads_e2e=$run_workloads_e2e"
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
             echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
@@ -479,6 +483,24 @@ jobs:
         [
           {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"e2e-podman"}
         ]
+
+  # Run the workloads suite (tests/suites/workloads) on tmachine. It needs the
+  # test:e2e:workloads label together with test:e2e, which builds what it runs
+  # on. Its result is not a required gate.
+  workloads-integration:
+    needs: [pr_metadata, prepare-integration]
+    if: needs.pr_metadata.outputs.run_integration == 'true' && needs.pr_metadata.outputs.run_workloads_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-suites.yml
+    with:
+      family: workloads
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   docker-e2e:
     needs: [pr_metadata, build-binaries-linux, build-conformance, build-images]
