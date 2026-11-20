@@ -48,9 +48,9 @@ jobs:
       candidate_ref: ${{ inputs.release-tag }}
       fail-on-static-findings: false
       images: |
-        ghcr.io/nvidia/openshell/gateway:${{ inputs.source-sha }}
-        ghcr.io/nvidia/openshell/sandbox:${{ inputs.source-sha }}
-        ghcr.io/nvidia/openshell/supervisor:${{ inputs.source-sha }}
+        ghcr.io/ai-openshell/openshell/gateway:${{ inputs.source-sha }}
+        ghcr.io/ai-openshell/openshell/sandbox:${{ inputs.source-sha }}
+        ghcr.io/ai-openshell/openshell/supervisor:${{ inputs.source-sha }}
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
@@ -267,7 +267,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
-          ref="ghcr.io/nvidia/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          ref="ghcr.io/ai-openshell/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
           oras push "${ref}" \
             --artifact-type application/vnd.nvidia.openshell.qualification.v1 \
             --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \

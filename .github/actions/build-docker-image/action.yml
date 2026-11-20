@@ -74,7 +74,7 @@ runs:
           --platform linux/amd64,linux/arm64 \
           --file deploy/docker/Dockerfile.${COMPONENT} \
           --target ${COMPONENT} \
-          --tag ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG} \
+          --tag ghcr.io/ai-openshell/openshell/${COMPONENT}:${IMAGE_TAG} \
           --cache-from type=gha,scope=${COMPONENT} \
           --cache-to type=gha,mode=max,scope=${COMPONENT} \
           --provenance=mode=min \
@@ -97,7 +97,7 @@ runs:
         for arch in amd64 arm64; do
           skopeo --insecure-policy copy --override-os linux --override-arch "${arch}" \
             "oci-archive:artifacts/images/${COMPONENT}.tar" \
-            "docker-archive:e2e-images/${COMPONENT}-linux-${arch}.tar:ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG}"
+            "docker-archive:e2e-images/${COMPONENT}-linux-${arch}.tar:ghcr.io/ai-openshell/openshell/${COMPONENT}:${IMAGE_TAG}"
         done
 
     - name: Verify SBOM attestation
@@ -107,7 +107,7 @@ runs:
         # GitHub-hosted runners also ship podman, which the engine helper
         # prefers; the SBOM check needs Docker's buildx imagetools.
         CONTAINER_ENGINE: docker
-        IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
+        IMAGE_REF: ghcr.io/ai-openshell/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
       run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
 
     - name: Upload ${{ inputs.component }} image

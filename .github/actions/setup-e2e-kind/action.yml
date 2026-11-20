@@ -15,7 +15,7 @@ inputs:
   registry:
     description: Container registry and namespace
     required: false
-    default: ghcr.io/nvidia/openshell
+    default: ghcr.io/ai-openshell/openshell
   registry-username:
     description: Registry username
     required: true

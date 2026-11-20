@@ -171,7 +171,7 @@ jobs:
           OPENSHELL_E2E_KUBERNETES_FEATURES: ${{ inputs.kubernetes-features }}
           OPENSHELL_E2E_KUBE_USE_ENVOY: ${{ inputs.use-envoy-gateway && '1' || '0' }}
           IMAGE_TAG: ${{ inputs.image-tag }}
-          OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+          OPENSHELL_REGISTRY: ghcr.io/ai-openshell/openshell
           E2E_TASK: ${{ inputs.e2e-task }}
           OPENSHELL_E2E_APP_TOPOLOGY: ${{ inputs.listener-topology }}
           OPENSHELL_E2E_APP_DELIVERY: ${{ inputs.listener-delivery }}
