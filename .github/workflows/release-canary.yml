@@ -407,10 +407,10 @@ jobs:
       - name: Install Agent Sandbox controller
         run: bash e2e/support/install-agent-sandbox.sh
 
-      - name: Install OpenShell Helm chart from GHCR OCI
+      - name: Install OpenShell Helm chart from Quay
         run: |
           set -euo pipefail
-          helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
+          helm install "$RELEASE_NAME" oci://quay.io/ai-openshell/charts/openshell \
             --version 0.0.0-dev \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \
