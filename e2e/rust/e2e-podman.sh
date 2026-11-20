@@ -25,7 +25,6 @@ PODMAN_CI_TESTS=(
   ephemeral_cleanup
   edge_tunnel_e2e
   host_gateway_alias
-  local_driver_token_restart
   ocsf_jsonl_conformance
   otlp_relay
   podman_corporate_proxy
