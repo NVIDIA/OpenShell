@@ -42,6 +42,7 @@ const DEFAULT_IMAGE_SENTINEL: &str = "mxc:process-container";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 /// Directory in the sandbox host state directory for the proxy CA files.
 const HOST_PROXY_TLS_DIR: &str = "proxy-tls";
+const HOST_SSH_SERVER_NAME: &str = "supervisor-ssh";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const BOUNDARY_CONFIG_FILE: &str = "boundary.json";
 const BOUNDARY_TLS_CERT_FILE: &str = "sandbox.crt";
@@ -538,6 +539,144 @@ impl MxcComputeBackend {
         Ok(())
     }
 
+    /// Replace the retired runtime while keeping the workspace and sandbox ID.
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        requested_generation: &str,
+        fresh_launch_authentication: Vec<u8>,
+    ) -> Result<(), tonic::Status> {
+        if fresh_launch_authentication.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "launch authentication is required to start an MXC sandbox",
+            ));
+        }
+        let gate = {
+            let registry = self.registry.lock().await;
+            let entry = registry.get(sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+            })?;
+            if entry.sandbox.name != sandbox_name {
+                return Err(tonic::Status::failed_precondition(
+                    "sandbox_id did not match sandbox_name",
+                ));
+            }
+            entry.lifecycle_gate.clone()
+        };
+        let startup_guard = gate.clone().lock_owned().await;
+
+        let (mut sandbox, previous) = {
+            let registry = self.registry.lock().await;
+            let entry = registry
+                .get(sandbox_id)
+                .filter(|entry| Arc::ptr_eq(&entry.lifecycle_gate, &gate))
+                .ok_or_else(|| {
+                    tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+                })?;
+            (
+                entry.sandbox.clone(),
+                launch_authentication(&entry.sandbox)?.supervisor,
+            )
+        };
+        sandbox
+            .spec
+            .as_mut()
+            .expect("launch authentication requires a spec")
+            .launch_authentication = fresh_launch_authentication;
+        let launch = launch_authentication(&sandbox)?;
+        launch
+            .validate()
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        let generation = safe_component(launch.supervisor.runtime_generation.as_str())?.to_string();
+        if generation != requested_generation {
+            return Err(tonic::Status::failed_precondition(
+                "start generation does not match MXC launch authentication",
+            ));
+        }
+        let sandbox_config = sandbox_config(&sandbox)?;
+        let host_state_dir = self
+            .config
+            .state_dir
+            .join(safe_component(sandbox_id)?)
+            .join(&generation);
+        let boundary_state_dir = PathBuf::from(&sandbox_config.cwd)
+            .join(BOUNDARY_STAGING_DIR)
+            .join(&generation);
+
+        let (shutdown, terminated, previous_host, previous_boundary) = {
+            let mut registry = self.registry.lock().await;
+            let entry = registry
+                .get_mut(sandbox_id)
+                .expect("lifecycle gate protects the entry");
+            // The gateway can retain the generation ID while rotating the auth
+            // epoch on restart. A completed main process can leave the old
+            // supervisor running, so phase alone cannot make a start idempotent.
+            let epoch = launch.supervisor.auth_epoch;
+            let same_launch = launch.supervisor.runtime_generation == previous.runtime_generation
+                && epoch == previous.auth_epoch;
+            if same_launch
+                && matches!(
+                    entry.phase_state,
+                    PhaseState::Running | PhaseState::Starting
+                )
+            {
+                return Ok(());
+            }
+            if same_launch || epoch < previous.auth_epoch {
+                return Err(tonic::Status::failed_precondition(
+                    "MXC sandbox start requires fresh launch authentication",
+                ));
+            }
+            (
+                entry.shutdown_tx.take(),
+                entry.terminated_rx.clone(),
+                entry.host_state_dir.clone(),
+                entry.boundary_state_dir.clone(),
+            )
+        };
+        if let Some(shutdown) = shutdown {
+            let _ = shutdown.send(());
+        }
+        wait_for_termination(terminated, sandbox_name).await?;
+        cleanup_runtime_directory(&previous_host);
+        cleanup_runtime_directory(&previous_boundary);
+
+        let starting = make_sandbox_with_condition(
+            &sandbox,
+            &condition("Ready", "False", "Starting", "MXC runtime restarting"),
+            false,
+        );
+        {
+            let mut registry = self.registry.lock().await;
+            let entry = registry
+                .get_mut(sandbox_id)
+                .expect("lifecycle gate protects the entry");
+            entry.sandbox = starting.clone();
+            entry.phase_state = PhaseState::Starting;
+            entry.terminated_rx = None;
+            entry.host_state_dir.clone_from(&host_state_dir);
+            entry.boundary_state_dir.clone_from(&boundary_state_dir);
+        }
+        let _ = self.watch_tx.send(sandbox_event(starting));
+        let context = LifecycleContext {
+            invoker: self.invoker.clone(),
+            config: self.config.clone(),
+            gateway: self.gateway.clone(),
+            registry: self.registry.clone(),
+            watch_tx: self.watch_tx.clone(),
+            attribution: self.attribution.clone(),
+            sandbox,
+            sandbox_config,
+            generation,
+            host_state_dir,
+            boundary_state_dir,
+            policy_mapper: self.policy_mapper.clone(),
+        };
+        tokio::spawn(async move { run_lifecycle(context, startup_guard).await });
+        Ok(())
+    }
+
     pub async fn delete_sandbox(
         &self,
         sandbox_id: &str,
@@ -633,14 +772,16 @@ struct LifecycleContext {
 }
 
 async fn run_lifecycle(context: LifecycleContext, startup_guard: tokio::sync::OwnedMutexGuard<()>) {
-    if let Err(error) = run_lifecycle_inner(&context, startup_guard).await {
+    // Retain the lifecycle gate until a pre-launch failure is published.
+    let mut startup_guard = Some(startup_guard);
+    if let Err(error) = run_lifecycle_inner(&context, &mut startup_guard).await {
         set_failed(&context, &error).await;
     }
 }
 
 async fn run_lifecycle_inner(
     context: &LifecycleContext,
-    startup_guard: tokio::sync::OwnedMutexGuard<()>,
+    startup_guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<(), String> {
     let main = mxc_main_process_config(
         context.sandbox.spec.as_ref(),
@@ -843,26 +984,34 @@ async fn run_lifecycle_inner(
         entry.terminated_rx = Some(terminated_rx);
         entry.phase_state = PhaseState::Running;
     }
-    drop(startup_guard);
+    drop(startup_guard.take());
     let result = monitor_runtime_pair(boundary, supervisor, shutdown_rx).await;
     // Whatever ended the pair, end the rest of the tree (workload, conhost,
-    // grandchildren) that `Child::kill` on the two roots does not reach.
+    // grandchildren) that `Child::kill` on the two roots does not reach. This must
+    // happen before the terminated signal below: a restart waits on that signal and
+    // must not start a replacement while any process of this generation is alive.
     job.terminate();
     drop(job);
-    let _ = terminated_tx.send(true);
     if let Ok(mut attribution) = context.attribution.lock() {
         attribution.forget(&context.sandbox.id);
     }
-    match result {
-        RuntimePairExit::Shutdown => Ok(()),
-        RuntimePairExit::Boundary(status) => Err(format!(
+    let failure = match result {
+        RuntimePairExit::Shutdown => None,
+        RuntimePairExit::Boundary(status) => Some(format!(
             "MXC ProcessContainer exited before supervisor shutdown: {status}"
         )),
-        RuntimePairExit::Supervisor(status) => Err(format!(
+        RuntimePairExit::Supervisor(status) => Some(format!(
             "MXC supervisor exited while ProcessContainer was active: {status}"
         )),
-        RuntimePairExit::Wait(error) => Err(error),
+        RuntimePairExit::Wait(error) => Some(error),
+    };
+    if let Some(message) = failure {
+        set_failed(context, &message).await;
     }
+    // A start waiting on this signal can now replace the registry entry and
+    // ETW registration without being overwritten by the retiring runtime.
+    let _ = terminated_tx.send(true);
+    Ok(())
 }
 
 fn spawn_supervisor(
@@ -919,6 +1068,12 @@ fn supervisor_command(
         .env(
             openshell_core::sandbox_env::PROXY_TLS_DIR,
             context.host_state_dir.join(HOST_PROXY_TLS_DIR),
+        )
+        // Enables the supervisor's in-process SSH server for sandbox exec.
+        // Windows uses this path to identify the server.
+        .env(
+            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            context.host_state_dir.join(HOST_SSH_SERVER_NAME),
         )
         .env(
             openshell_core::sandbox_env::LOG_LEVEL,
