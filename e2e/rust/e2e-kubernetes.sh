@@ -83,7 +83,7 @@ run_conformance() {
     return 0
   fi
 
-  OPENSHELL_CONFORMANCE_JUNIT="${OPENSHELL_CONFORMANCE_JUNIT:-${ROOT}/results/${OPENSHELL_E2E_REPORT_NAME:-e2e-kubernetes}-conformance.xml}" \
+  OPENSHELL_TESTKIT_JUNIT="${OPENSHELL_TESTKIT_JUNIT:-${ROOT}/results/${OPENSHELL_E2E_REPORT_NAME:-e2e-kubernetes}-conformance.xml}" \
     OPENSHELL_TEST_PYTHON_IMAGE="${OPENSHELL_TEST_PYTHON_IMAGE:-${E2E_PULLABLE_PYTHON_IMAGE}}" \
     e2e_run_openshell_conformance "Kubernetes"
 }

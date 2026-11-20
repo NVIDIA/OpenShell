@@ -5,6 +5,9 @@
 # Shared helpers for running conformance suites against an already
 # configured e2e gateway.
 
+# shellcheck source=e2e/support/testkit.sh
+source "$(dirname "${BASH_SOURCE[0]}")/testkit.sh"
+
 e2e_require_openshell_bin() {
   if [ -z "${OPENSHELL_BIN:-}" ]; then
     echo "ERROR: OPENSHELL_BIN must point to the openshell CLI under test" >&2
@@ -29,17 +32,17 @@ e2e_require_openshell_bin() {
 # shellcheck disable=SC2034 # Used by the scripts that source this file.
 E2E_PULLABLE_PYTHON_IMAGE="ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3"
 
-# Print the path of the openshell-conformance program: OPENSHELL_CONFORMANCE_BIN
+# Print the path of the openshell-conformance program: OPENSHELL_TESTKIT_BIN
 # if set, else a debug build from this checkout.
 e2e_openshell_conformance_bin() {
   local root=$1
 
-  if [ -n "${OPENSHELL_CONFORMANCE_BIN:-}" ]; then
-    if [ ! -x "${OPENSHELL_CONFORMANCE_BIN}" ]; then
-      echo "ERROR: openshell-conformance is not executable: ${OPENSHELL_CONFORMANCE_BIN}" >&2
+  if [ -n "${OPENSHELL_TESTKIT_BIN:-}" ]; then
+    if [ ! -x "${OPENSHELL_TESTKIT_BIN}" ]; then
+      echo "ERROR: testkit program is not executable: ${OPENSHELL_TESTKIT_BIN}" >&2
       return 2
     fi
-    echo "${OPENSHELL_CONFORMANCE_BIN}"
+    echo "${OPENSHELL_TESTKIT_BIN}"
     return
   fi
 
@@ -61,7 +64,7 @@ e2e_openshell_conformance_bin() {
 }
 
 # Run the conformance suite with openshell-conformance. The JUnit report goes
-# to OPENSHELL_CONFORMANCE_JUNIT, else results/conformance-<gateway>.xml.
+# to OPENSHELL_TESTKIT_JUNIT, else results/conformance-<gateway>.xml.
 e2e_run_openshell_conformance() {
   local gateway_label=${1:-OpenShell}
   local root program junit
@@ -69,7 +72,7 @@ e2e_run_openshell_conformance() {
 
   e2e_require_openshell_bin || return
   program="$(e2e_openshell_conformance_bin "${root}")" || return
-  junit="${OPENSHELL_CONFORMANCE_JUNIT:-${root}/results/conformance-$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]').xml}"
+  junit="${OPENSHELL_TESTKIT_JUNIT:-${root}/results/conformance-$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]').xml}"
   mkdir -p "$(dirname "${junit}")" || return
 
   # The tests this lane can't pass yet, from tests/suites/conformance/unsupported.yaml.
@@ -84,39 +87,8 @@ e2e_run_openshell_conformance() {
   # these for the gateway they started.
   echo "==> Running conformance suites against the ${gateway_label} gateway"
   "${program}" ready || return
-  if [[ -n "${OPENSHELL_CONFORMANCE_TEST_THREADS:-}" ]]; then
-    e2e_nextest_conformance "${program}" "${junit}"
-  else
-    "${program}" run --junit "${junit}"
-  fi
+  e2e_run_testkit "${program}" "${junit}"
 }
-
-e2e_nextest_conformance() (
-  local program=$1 junit=$2
-  local work status=0
-  work="$(mktemp -d)" || return
-  trap 'rm -rf "${work}"' EXIT
-  "${program}" nextest-metadata "${work}" || return
-  cat > "${work}/nextest.toml" <<'EOF'
-[profile.openshell]
-slow-timeout = { period = "900s", terminate-after = 1, grace-period = "10s" }
-
-[profile.openshell.junit]
-path = "junit.xml"
-store-success-output = true
-EOF
-  cargo-nextest nextest run \
-    --cargo-metadata "${work}/cargo-metadata.json" \
-    --binaries-metadata "${work}/binaries-metadata.json" \
-    --config-file "${work}/nextest.toml" --profile openshell \
-    --test-threads "${OPENSHELL_CONFORMANCE_TEST_THREADS}" \
-    --no-tests fail --no-fail-fast --success-output immediate \
-    --failure-output immediate || status=$?
-  if [[ -f "${work}/target/nextest/openshell/junit.xml" ]]; then
-    mv "${work}/target/nextest/openshell/junit.xml" "${junit}" || return
-  fi
-  return "${status}"
-)
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   e2e_run_openshell_conformance

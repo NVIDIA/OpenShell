@@ -84,7 +84,7 @@ jobs:
 
       - name: Run tests
         env:
-          OPENSHELL_CONFORMANCE_TEST_THREADS: "4"
+          OPENSHELL_TESTKIT_THREADS: "4"
         run: ${{ matrix.cmd }}
 
       - name: Print AppArmor denials

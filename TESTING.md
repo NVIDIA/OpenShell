@@ -496,7 +496,7 @@ Suites:
   lifecycle, the CLI, persistent workspaces, file transfer, the policy
   advisor, and credential gating. Driver E2E runs it with
   `openshell-conformance` against the lane's gateway and writes a JUnit report
-  under `results/`; set `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program,
+  under `results/`; set `OPENSHELL_TESTKIT_BIN` to use a prebuilt program,
   as Branch E2E does with the static build it makes once per architecture.
   The Docker and Podman runners build `openshell/e2e-python:dev` for it; the
   Kubernetes and VM runners set `OPENSHELL_TEST_PYTHON_IMAGE` to a pullable
@@ -519,10 +519,10 @@ feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURE
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
 features. The selector is handled by the runner; it is not a Cargo feature.
-Set `OPENSHELL_CONFORMANCE_TEST_THREADS` to make these wrappers run the
-conformance program with nextest and the given number of workers. CI uses
-four. When unset, the wrappers use the serial `openshell-conformance run`
-command, which does not require nextest.
+Set `OPENSHELL_TESTKIT_THREADS` to run the testkit program with nextest and
+the given number of workers. CI uses four. When unset, the wrappers use
+the serial `openshell-conformance run` command, which does not require
+nextest. Set `OPENSHELL_TESTKIT_JUNIT` to override the report path.
 
 ```shell
 OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
