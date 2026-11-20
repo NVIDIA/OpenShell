@@ -39,6 +39,11 @@ Stable images are saved as OCI archives during the build and pushed under the
 stable version tags during publication. Their SBOMs are verified before updating
 `latest`; the qualified prerelease's commit-SHA image tags remain unchanged.
 
+The `release-helm` publication job signs the three runtime images and both OCI
+charts by digest with keyless cosign. It requires `id-token: write` and GHCR
+write access; signing failures block publication of the GitHub Release assets.
+Reruns sign the retained artifacts too. See [OCI signature verification](../../../docs/security/verify-image-contents.mdx#verify-oci-signatures).
+
 If no prerelease exists, agree on the version and source commit, then create and
 push `vX.Y.Z-pre.1`. Prerelease tag pushes start Pre-release. If the tag was
 created using `GITHUB_TOKEN`, dispatch Pre-release explicitly on the intended branch:
