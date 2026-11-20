@@ -658,11 +658,11 @@ the node's address.
 The `routable-host-ip` feature suite (`tests/suites/features/routable-host-ip`)
 checks that a policy endpoint whose host is an IP literal reaches that address,
 with or without `allowed_ips`. The test reaches a host server by
-`host.openshell.internal`, then uses the address that request arrived at, which
-must be one the supervisor lets an IP literal reach. Rootless Podman's is
-link-local and always blocked, and Docker Desktop's is loopback, so CI runs the
-suite on Docker rootful, Podman rootful, and the `k3s` and `k3s-ha`
-installers.
+`host.openshell.internal`, then uses the address that request arrived at, or
+the host's outbound address when it arrived on loopback from a host-network
+supervisor. The address must be one the supervisor lets an IP literal reach.
+Rootless Podman's is link-local and always blocked, so CI runs the suite on
+Docker rootful, Podman rootful, and the `k3s` and `k3s-ha` installers.
 
 The `connect-ssh-supervision` feature suite
 (`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`

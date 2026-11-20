@@ -7,12 +7,17 @@
 //! The servers run on the test host. The sandbox can't learn the host's
 //! address, since policy DNS answers it with a synthetic one, so the test
 //! reaches a server by `host.openshell.internal` first and takes the address
-//! the server saw the request arrive at. Not conformance, because
+//! the server saw the request arrive at. A supervisor on the host network
+//! (Docker's and Podman's default) arrives on loopback, which an IP literal
+//! can't reach, so the test uses the host's outbound address instead; that
+//! supervisor shares it. Not conformance, because
 //! that address must be one the supervisor lets an IP literal reach: rootless
 //! Podman's is link-local, which is always blocked.
 //!
 //! Ported from the `proxy_egress_pipeline` e2e test of IP literals, which
 //! used two support containers on the e2e network instead.
+
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
 use host_server_support::{HttpRecorder, TEST_HOST};
 use sandbox_clients_support::{Request, http};
@@ -52,17 +57,17 @@ async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Resul
         "request to {TEST_HOST}:{} failed: {reply:?}",
         explicit.port
     );
-    let host_ip = explicit
+    let arrived_on = explicit
         .requests()
         .first()
         .and_then(|request| request.local_addr)
         .ok_or_else(|| testkit::Error::msg("the host server didn't record its address"))?
         .ip();
-    // Docker Desktop relays the host gateway through a host-side proxy.
-    testkit::ensure!(
-        !host_ip.is_loopback(),
-        "requests to {TEST_HOST} arrive at the host on {host_ip}, which a sandbox can't reach"
-    );
+    let host_ip = if arrived_on.is_loopback() {
+        outbound_address()?
+    } else {
+        arrived_on
+    };
     let ip = host_ip.to_string();
     let prefix = if host_ip.is_ipv4() { 32 } else { 128 };
 
@@ -95,4 +100,17 @@ async fn ip_literal_endpoints_reach_the_host(cx: &mut Context) -> testkit::Resul
         }
     }
     Ok(())
+}
+
+/// The test host's address on its default route. Connecting a UDP socket
+/// sends nothing; it only picks the route.
+fn outbound_address() -> testkit::Result<IpAddr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+    let address = socket.local_addr()?.ip();
+    testkit::ensure!(
+        !address.is_loopback() && !address.is_unspecified(),
+        "the test host has no outbound address, only {address}"
+    );
+    Ok(address)
 }
