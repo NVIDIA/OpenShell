@@ -34,7 +34,7 @@ struct WebSocketState {
 
 impl WebSocketRecorder {
     pub async fn start() -> Result<Self> {
-        let (listener, port) = bind().await?;
+        let (listener, port) = bind(0).await?;
         let state = Arc::new(WebSocketState::default());
         let task_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
