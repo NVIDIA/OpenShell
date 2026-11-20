@@ -62,5 +62,7 @@ try:
             second_status = 0
         failed_closed = second_status != 200
 finally:
-    with open(RESULT, "w") as result:
+    # The test reads RESULT as soon as it exists, so it appears complete.
+    with open(RESULT + ".tmp", "w") as result:
         json.dump({"failed_closed": failed_closed, "second_status": second_status}, result, sort_keys=True)
+    os.replace(RESULT + ".tmp", RESULT)
