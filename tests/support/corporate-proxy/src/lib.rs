@@ -14,7 +14,7 @@
 //! |---|---|
 //! | `OPENSHELL_TEST_CORPORATE_PROXY_URL` | The proxy URL the gateway uses, e.g. `https://host.openshell.internal:3128` |
 //! | `OPENSHELL_TEST_CORPORATE_PROXY_CA_CERT` | The path of the proxy's CA certificate, in PEM |
-//! | `OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_PORT` | The destination port the gateway's `no_proxy` sends direct |
+//! | `OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_LISTEN` | The port a test listens on for a destination that the gateway's `no_proxy` sends direct |
 //! | `OPENSHELL_TEST_CORPORATE_PROXY_LOG` | The path of the proxy's log, readable by the tests |
 //!
 //! Under `openshell-test-runner`, the tmachine `<base>-corporate-proxy`
@@ -43,7 +43,7 @@ use testkit::{Error, Result};
 
 pub const URL_ENV: &str = "OPENSHELL_TEST_CORPORATE_PROXY_URL";
 pub const CA_CERT_ENV: &str = "OPENSHELL_TEST_CORPORATE_PROXY_CA_CERT";
-pub const BYPASS_PORT_ENV: &str = "OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_PORT";
+pub const BYPASS_LISTEN_ENV: &str = "OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_LISTEN";
 pub const LOG_ENV: &str = "OPENSHELL_TEST_CORPORATE_PROXY_LOG";
 
 /// How to reach the environment's corporate proxy and read its log.
@@ -149,10 +149,10 @@ impl CorporateProxy {
         };
         let url = required(URL_ENV)?;
         let ca_cert = required(CA_CERT_ENV)?.into();
-        let bypass_port = required(BYPASS_PORT_ENV)?;
+        let bypass_port = required(BYPASS_LISTEN_ENV)?;
         let bypass_port = bypass_port.parse().map_err(|error| {
             Error::msg(format!(
-                "{BYPASS_PORT_ENV} is {bypass_port:?}, not a port: {error}"
+                "{BYPASS_LISTEN_ENV} is {bypass_port:?}, not a port: {error}"
             ))
         })?;
         let log = required(LOG_ENV)?.into();
@@ -245,7 +245,7 @@ mod tests {
     const ALL: &[(&str, &str)] = &[
         (URL_ENV, "https://host.openshell.internal:3128"),
         (CA_CERT_ENV, "/etc/ca.pem"),
-        (BYPASS_PORT_ENV, "39443"),
+        (BYPASS_LISTEN_ENV, "39443"),
         (LOG_ENV, "/var/log/proxy.jsonl"),
     ];
 
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn missing_or_empty_variables_fail_naming_them() {
-        for name in [URL_ENV, CA_CERT_ENV, BYPASS_PORT_ENV, LOG_ENV] {
+        for name in [URL_ENV, CA_CERT_ENV, BYPASS_LISTEN_ENV, LOG_ENV] {
             let without: Vec<_> = ALL
                 .iter()
                 .copied()
@@ -278,8 +278,8 @@ mod tests {
     #[test]
     fn bad_bypass_port_fails() {
         let mut pairs = ALL.to_vec();
-        pairs.retain(|(key, _)| *key != BYPASS_PORT_ENV);
-        pairs.push((BYPASS_PORT_ENV, "70000"));
+        pairs.retain(|(key, _)| *key != BYPASS_LISTEN_ENV);
+        pairs.push((BYPASS_LISTEN_ENV, "70000"));
         let error = CorporateProxy::from_vars(vars(&pairs)).unwrap_err();
         assert!(error.to_string().contains("not a port"), "{error}");
     }
