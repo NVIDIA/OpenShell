@@ -43,8 +43,6 @@ The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
 the release-tooling and package lifecycle tests before relying on the canary.
 
-The canary does not install or import `@nvidia/openshell-sdk`. Core's `TypeScript SDK Freeze` branch check rejects added or modified SDK files and directs SDK development to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core no longer runs SDK build checks or publish dry-runs on PRs. The tagged release workflow still publishes the package to GitHub Packages until the publishing cutover; inspect that job when diagnosing publication failures.
-
 ## Trigger paths
 
 The workflow has two triggers:
