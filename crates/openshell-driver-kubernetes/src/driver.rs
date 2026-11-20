@@ -687,6 +687,13 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
     }
 }
 
+/// VMI phases grouped by namespace (managed mode lists VMs across
+/// per-workspace namespaces).
+type VmiPhasesByNamespace = std::collections::HashMap<
+    String,
+    std::collections::HashMap<String, (Option<String>, Option<i64>)>,
+>;
+
 /// Timeout for individual Kubernetes API calls (create, delete, get).
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
@@ -3240,10 +3247,8 @@ impl KubernetesComputeDriver {
             // VMI phases and supervisor-failure probes are fetched per
             // namespace so an empty or multi-namespace listing never
             // issues a malformed (empty-namespace) request.
-            let mut vmi_phases_by_namespace: std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, (Option<String>, Option<i64>)>,
-            > = std::collections::HashMap::new();
+            let mut vmi_phases_by_namespace: VmiPhasesByNamespace =
+                std::collections::HashMap::new();
             let mut namespaces: Vec<String> = list
                 .items
                 .iter()
@@ -7466,13 +7471,14 @@ impl KubernetesComputeDriver {
                         // Pod deletion). The list is cluster-wide in
                         // managed mode and each VM's own namespace is
                         // used for the emit.
-                        let vm_api = match &reconcile_list_api {
-                            Some(api) => api.clone(),
-                            None => crate::kubevirt::virtual_machine_api(
-                                &reconcile_client,
-                                &reconcile_namespace,
-                            ),
-                        };
+                        let vm_api = reconcile_list_api
+                            .clone()
+                            .unwrap_or_else(|| {
+                                crate::kubevirt::virtual_machine_api(
+                                    &reconcile_client,
+                                    &reconcile_namespace,
+                                )
+                            });
                         let selector = openshell_sandbox_label_selector();
                         if let Ok(list) = vm_api
                             .list(&ListParams::default().labels(&selector))
