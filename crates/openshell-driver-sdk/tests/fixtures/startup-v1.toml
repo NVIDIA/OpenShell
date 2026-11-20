@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Golden fixture for startup document schema version 1.
+#
+# Every field the schema defines, optional ones included, must appear here so
+# that removing or renaming a field changes this file and shows up in review.
+
+schema_version = 1
+
+[gateway]
+bind_socket = "/var/lib/openshell/run/compute-driver.sock"
+expected_peer_pid = 4242
+log_level = "info"
+gateway_name = "gateway-a"
+tls_ca = "/etc/openshell/tls/ca.pem"
+
+[gateway.admission]
+allow_driver_config = true
+
+[gateway.admission.resource_admission]
+enabled = true
+
+[gateway.admission.resource_admission.required_labels]
+"openshell.ai/sandbox-attachable" = "true"
+
+[gateway.telemetry.traces]
+endpoint = "https://collector.example:4317"
+protocol = "grpc"
+
+[gateway.telemetry.ocsf]
+endpoint = "https://collector.example:4318"
+protocol = "http/protobuf"
+
+[gateway.telemetry.agent]
+endpoint = "https://collector.example:4319"
+protocol = "grpc"
+
+[gateway.telemetry.collector]
+ca_file = "/etc/openshell/otlp/ca.pem"
+cert_file = "/etc/openshell/otlp/cert.pem"
+key_file = "/etc/openshell/otlp/key.pem"
+
+[gateway.upstream_proxy]
+https_proxy = "http://proxy.example:3128"
+no_proxy = "localhost,127.0.0.1"
+auth_file = "/etc/openshell/proxy-auth"
+auth_allow_insecure = true
+connect_by_hostname = true
+ca_bundle = "/etc/openshell/proxy-ca.pem"
+
+[gateway.network_trust]
+path = "/var/lib/openshell/trust/bundle.pem"
+digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+certificate_count = 3
+
+[driver_config]
+state_dir = "/var/lib/openshell/vm"
+vcpus = 2
+
+[driver_config.nested]
+key = "value"
