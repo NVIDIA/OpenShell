@@ -94,6 +94,10 @@ fi
 
 # Give the package's own restart a moment to show, then restart only if it
 # didn't happen.
+# TODO: measure whether the package's restart is already visible when dnf
+# returns. If so, replace this wait with a single InvocationID read and fail
+# clearly when the unit was not restarted. A second restart interrupts Podman's
+# recovery of sandboxes, so do not remove the wait before measuring.
 restarted=false
 for _ in $(seq 1 20); do
   if [ "$(invocation_of)" != "${invocation}" ]; then
