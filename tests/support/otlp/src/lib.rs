@@ -5,7 +5,7 @@
 //! test runs.
 //!
 //! The environment configures the gateway's `[openshell.gateway.otlp]`
-//! endpoint and publishes it, with the address the test must listen on, in
+//! endpoint and publishes it, with the port the test must listen on, in
 //! `OPENSHELL_TEST_OTLP_*` variables. Under `openshell-test-runner`, the
 //! tmachine `<podman base>-otlp` environments do that
 //! (`tests/tmachine/ansible/playbooks/otlp.yaml`); against your own
@@ -13,14 +13,14 @@
 //!
 //! | Variable | Example |
 //! |---|---|
-//! | `OPENSHELL_TEST_OTLP_LISTEN` | `0.0.0.0:4317` |
+//! | `OPENSHELL_TEST_OTLP_PORT` | `4317` |
 //! | `OPENSHELL_TEST_OTLP_ENDPOINT` | `http://host.containers.internal:4317` |
 //!
 //! A missing variable fails the test; it never skips it. Tests that start a
-//! collector can't run at the same time, since they bind the same address.
+//! collector can't run at the same time, since they bind the same port.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use openshell_otel_test_support::OtlpTestServer;
@@ -31,13 +31,13 @@ pub use openshell_otel_test_support::relay::{
     SANDBOX_ID_KEY, SOURCE_KEY, SOURCE_VALUE, encoded_trace_request,
 };
 
-pub const LISTEN_ENV: &str = "OPENSHELL_TEST_OTLP_LISTEN";
+pub const PORT_ENV: &str = "OPENSHELL_TEST_OTLP_PORT";
 pub const ENDPOINT_ENV: &str = "OPENSHELL_TEST_OTLP_ENDPOINT";
 
 /// String resource attributes, keyed by name.
 pub type Attributes = HashMap<String, String>;
 
-/// An OTLP/gRPC collector on the address the environment chose. It records
+/// An OTLP/gRPC collector on the port the environment chose. It records
 /// what arrives and stops when dropped.
 pub struct Collector {
     server: OtlpTestServer,
@@ -45,13 +45,14 @@ pub struct Collector {
 }
 
 impl Collector {
-    /// Listen on [`LISTEN_ENV`].
+    /// Listen on [`PORT_ENV`] on every host address.
     pub async fn start() -> Result<Self> {
-        let listen = required(LISTEN_ENV)?;
+        let port = required(PORT_ENV)?;
         let endpoint = required(ENDPOINT_ENV)?;
-        let addr: SocketAddr = listen
+        let port: u16 = port
             .parse()
-            .map_err(|error| Error::msg(format!("{LISTEN_ENV}={listen}: {error}")))?;
+            .map_err(|error| Error::msg(format!("{PORT_ENV}={port}: {error}")))?;
+        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
         let server = OtlpTestServer::try_start_on(addr)
             .await
             .context(format!("start the OTLP collector on {addr}"))?;
@@ -113,7 +114,7 @@ impl Collector {
         .await
     }
 
-    /// Stop listening, so the next test can bind the address.
+    /// Stop listening, so the next test can bind the port.
     pub async fn shutdown(self) {
         drop(self.server.shutdown().await);
     }

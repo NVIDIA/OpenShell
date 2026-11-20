@@ -37,5 +37,5 @@
       vars:
         test_env_name: otlp
         test_env_vars:
-          OPENSHELL_TEST_OTLP_LISTEN: "0.0.0.0:{{ otlp_port }}"
+          OPENSHELL_TEST_OTLP_PORT: "{{ otlp_port }}"
           OPENSHELL_TEST_OTLP_ENDPOINT: "{{ otlp_endpoint }}"

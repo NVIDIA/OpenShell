@@ -5,7 +5,8 @@
 //! JWT-SVIDs from Workload APIs the test runs.
 //!
 //! The environment points the gateway's Workload API socket and the driver's
-//! `provider_spiffe_workload_api_socket` at addresses the test listens on, and
+//! `provider_spiffe_workload_api_socket` at a socket and a port the test
+//! listens on, and
 //! publishes them in `OPENSHELL_TEST_SPIFFE_*` variables. Under
 //! `openshell-test-runner`, the tmachine `<podman base>-spiffe` environments
 //! do that (`tests/tmachine/ansible/playbooks/spiffe.yaml`); against your own
@@ -13,19 +14,19 @@
 //!
 //! | Variable | Example |
 //! |---|---|
-//! | `OPENSHELL_TEST_SPIFFE_GATEWAY_LISTEN` | `/var/lib/openshell-test/spiffe/gateway.sock` |
-//! | `OPENSHELL_TEST_SPIFFE_SUPERVISOR_LISTEN` | `0.0.0.0:17690` |
+//! | `OPENSHELL_TEST_SPIFFE_GATEWAY_SOCKET` | `/var/lib/openshell-test/spiffe/gateway.sock` |
+//! | `OPENSHELL_TEST_SPIFFE_SUPERVISOR_PORT` | `17690` |
 //!
 //! Both Workload APIs sign with one fixture key and serve its bundle for
 //! [`TRUST_DOMAIN`]. Every supervisor gets [`SUPERVISOR_SUBJECT`]: suites
 //! test credential isolation with distinct providers and audiences, not
 //! SPIRE attestation. A missing variable fails the test; it never skips it.
 //! Tests that start the Workload APIs can't run at the same time, since they
-//! bind the same addresses.
+//! bind the same socket and port.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,8 +44,8 @@ use tonic::body::Body as TonicBody;
 use tonic::codegen::{Body, http};
 use tonic::{Request, Response, Status};
 
-pub const GATEWAY_LISTEN_ENV: &str = "OPENSHELL_TEST_SPIFFE_GATEWAY_LISTEN";
-pub const SUPERVISOR_LISTEN_ENV: &str = "OPENSHELL_TEST_SPIFFE_SUPERVISOR_LISTEN";
+pub const GATEWAY_SOCKET_ENV: &str = "OPENSHELL_TEST_SPIFFE_GATEWAY_SOCKET";
+pub const SUPERVISOR_PORT_ENV: &str = "OPENSHELL_TEST_SPIFFE_SUPERVISOR_PORT";
 
 pub const TRUST_DOMAIN: &str = "openshell-e2e.test";
 /// The `iss` of every JWT-SVID.
@@ -101,14 +102,15 @@ pub struct WorkloadApis {
 
 impl WorkloadApis {
     /// Serve the gateway's Workload API on the Unix socket
-    /// [`GATEWAY_LISTEN_ENV`] names, and the supervisors' on the TCP address
-    /// [`SUPERVISOR_LISTEN_ENV`] names.
+    /// [`GATEWAY_SOCKET_ENV`] names, and the supervisors' on the TCP port
+    /// [`SUPERVISOR_PORT_ENV`] names, on every host address.
     pub async fn start() -> Result<Self> {
-        let socket = PathBuf::from(required(GATEWAY_LISTEN_ENV)?);
-        let listen = required(SUPERVISOR_LISTEN_ENV)?;
-        let addr: SocketAddr = listen
+        let socket = PathBuf::from(required(GATEWAY_SOCKET_ENV)?);
+        let port = required(SUPERVISOR_PORT_ENV)?;
+        let port: u16 = port
             .parse()
-            .map_err(|error| Error::msg(format!("{SUPERVISOR_LISTEN_ENV}={listen}: {error}")))?;
+            .map_err(|error| Error::msg(format!("{SUPERVISOR_PORT_ENV}={port}: {error}")))?;
+        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
 
         // A socket a stopped test left behind would make the bind fail.
         match std::fs::remove_file(&socket) {

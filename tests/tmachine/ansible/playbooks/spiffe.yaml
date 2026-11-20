@@ -73,5 +73,5 @@
       vars:
         test_env_name: spiffe
         test_env_vars:
-          OPENSHELL_TEST_SPIFFE_GATEWAY_LISTEN: "{{ spiffe_gateway_socket }}"
-          OPENSHELL_TEST_SPIFFE_SUPERVISOR_LISTEN: "0.0.0.0:{{ spiffe_supervisor_port }}"
+          OPENSHELL_TEST_SPIFFE_GATEWAY_SOCKET: "{{ spiffe_gateway_socket }}"
+          OPENSHELL_TEST_SPIFFE_SUPERVISOR_PORT: "{{ spiffe_supervisor_port }}"
