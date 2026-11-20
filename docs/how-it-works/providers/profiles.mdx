@@ -620,8 +620,11 @@ allowed for local tests. The gateway does not follow redirects.
 
 For GitHub Enterprise Server, set `token_url` to
 `https://HOSTNAME/api/v3/app/installations/{installation_id}/access_tokens`
-and adapt the profile's API and Git host rules to your instance. The gateway
-omits `X-GitHub-Api-Version` and uses the endpoint's default REST API version.
+and adapt the profile's API and Git host rules to your instance. For `gh`, set
+the credential's `env_vars` to `[GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN]`
+and use `--credential-key GH_ENTERPRISE_TOKEN` in the commands below. Set
+`GH_HOST` to the instance hostname when `gh` cannot infer it from the repository.
+The gateway omits `X-GitHub-Api-Version` and uses the endpoint's default REST API version.
 
 Load the app's RSA PEM key into the CLI environment, then configure refresh.
 Replace the example IDs with your app client ID, installation ID, and repository IDs.
@@ -663,18 +666,20 @@ must contain the installation ID, not `{installation_id}`.
 
 Configuration stores refresh material and schedules minting. The explicit
 `rotate` command mints immediately, so check its result before creating a sandbox.
-Choose either `GITHUB_TOKEN` or `GH_TOKEN` as the credential key. Only the chosen
+For GitHub.com, choose either `GITHUB_TOKEN` or `GH_TOKEN` as the credential key. Only the chosen
 environment variable is injected, as a placeholder. The private key remains in
 the gateway's credential backend. The gateway sends the app JWT to GitHub to mint
 the installation token.
 
-The logical credential name `api_token` selects the configured alias, or
-`GITHUB_TOKEN` when neither alias has a refresh configuration. Configure, rotate,
+The logical credential name `api_token` selects the configured alias, or the first
+entry in `env_vars` when neither alias has a refresh configuration. Configure, rotate,
 delete, `inline-secrets`, and credential-filtered status use this resolution.
 Status responses report the selected environment alias. A second refresh
 configuration under the other alias is rejected, including when the existing
-configuration is pending or has failed. Update the selected alias, or delete
-its refresh configuration before switching aliases. Deletion retires the minted
+configuration is pending or has failed. Clear any static credential stored under
+the other alias before configuring refresh. If both aliases are already stored,
+the gateway withholds the other alias while refresh is active. To switch aliases,
+delete the selected alias's refresh configuration first. Deletion retires the minted
 token from that provider alias. If you already switched aliases on an older gateway
 and the retired alias is still present, clear it explicitly. For example, after
 switching to `GITHUB_TOKEN`, run `openshell provider update repo-reader --credential GH_TOKEN=`.

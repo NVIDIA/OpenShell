@@ -82,6 +82,32 @@ async fn fixture() -> (Arc<ServerState>, Provider) {
 }
 
 #[tokio::test]
+async fn github_app_export_withholds_preexisting_static_sibling() {
+    use crate::grpc::provider::{
+        handle_configure_provider_refresh, tests::github_app_refresh_fixture,
+    };
+    let (state, _server, provider, config) = github_app_refresh_fixture().await;
+    let mut request = request(&["GH_TOKEN"]);
+    request.name.clone_from(&config.provider);
+    request.workspace_scope.clone_from(&config.workspace_scope);
+    handle_configure_provider_refresh(&state, crate::grpc::test_support::authed_request(config))
+        .await
+        .unwrap();
+    state
+        .store
+        .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+            current
+                .credentials
+                .insert("GH_TOKEN".into(), "legacy-token".into());
+        })
+        .await
+        .unwrap();
+    let err = handle(&state, authenticated(request)).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(err.message().contains("inactive"));
+}
+
+#[tokio::test]
 async fn github_app_scope_reduction_withholds_token_and_respects_retry_after() {
     use crate::grpc::provider::{
         handle_configure_provider_refresh, resolve_provider_environment_with_credentials,

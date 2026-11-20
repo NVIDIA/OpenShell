@@ -20,12 +20,11 @@ use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
-use super::{PROFILE_ID, PROVIDER_NAME};
+use super::{PROFILE_ID, PROVIDER_NAME, TOKEN_ENV};
 
 #[path = "github_app_tls.rs"]
 mod github_app_tls;
 
-const TOKEN_ENV: &str = "REFRESH_E2E_ACCESS_TOKEN";
 const READY_MARKER: &str = "stable-refresh-parent-ready";
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
@@ -267,7 +266,7 @@ async fn rotate() -> Result<(), String> {
 
 async fn trigger_probe(sandbox: &SandboxGuard) -> Result<String, String> {
     // Poll inside one exec rather than opening an SSH relay for every poll.
-    let output = tokio::time::timeout(Duration::from_secs(60), sandbox.exec(&[
+    let output = tokio::time::timeout(Duration::from_mins(1), sandbox.exec(&[
         "sh", "-c",
         "rm -f /sandbox/probe-result; touch /sandbox/probe-trigger; for i in $(seq 1 180); do if [ -f /sandbox/probe-result ]; then cat /sandbox/probe-result; exit 0; fi; sleep 0.25; done; echo 'timed out waiting for credential probe' >&2; exit 1",
     ])).await.map_err(|_| "credential probe exec timed out".to_string())??;
@@ -369,11 +368,10 @@ pub async fn exercise_refresh_handles(github_key: Option<&str>) -> Result<(), St
     let policy_path = policy.path().to_string_lossy().into_owned();
     let probe = if github_key.is_some() {
         format!(
-            r#"export GH_ENTERPRISE_TOKEN="$REFRESH_E2E_ACCESS_TOKEN"
-api_ok=0
+            r#"api_ok=0
 git_ok=0
-if [ "$(timeout 15s gh api -H "Authorization: Bearer $REFRESH_E2E_ACCESS_TOKEN" https://{resource_host}:{resource_port}/repos/e2e/repo/contents/README.md --jq .name)" = README.md ]; then api_ok=1; fi
-auth="Authorization: Basic $(printf 'x-access-token:%s' "$REFRESH_E2E_ACCESS_TOKEN" | base64 -w0)"
+if [ "$(timeout 15s gh api --hostname {resource_host} https://{resource_host}:{resource_port}/repos/e2e/repo/contents/README.md --jq .name)" = README.md ]; then api_ok=1; fi
+auth="Authorization: Basic $(printf 'x-access-token:%s' "$GH_ENTERPRISE_TOKEN" | base64 -w0)"
 if [ -d /sandbox/repo/.git ]; then
   timeout 15s git -c protocol.version=0 -c http.extraHeader="$auth" -C /sandbox/repo fetch --quiet origin && git_ok=1
 else
@@ -393,8 +391,8 @@ fi"#
         )
     };
     let parent_script = format!(
-        r#"case "$REFRESH_E2E_ACCESS_TOKEN" in
-  openshell:resolve:env:s*_REFRESH_E2E_ACCESS_TOKEN) ;;
+        r#"case "${TOKEN_ENV}" in
+  openshell:resolve:env:s*_{TOKEN_ENV}) ;;
   *) exit 64 ;;
 esac
 test -z "${{REFRESH_E2E_PRIVATE_KEY+x}}" || exit 65

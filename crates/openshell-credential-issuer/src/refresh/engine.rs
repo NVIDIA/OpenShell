@@ -8,8 +8,8 @@ use super::minter::{
     refresh_strategy_name,
 };
 use super::{
-    CredentialRefresh, RefreshAttempt, RefreshChange, RefreshOutputs, RefreshRuntime, RefreshState,
-    RefreshStateStore, minter, secret_refs,
+    CommittedRefreshOutputs, CredentialRefresh, RefreshAttempt, RefreshChange, RefreshOutputs,
+    RefreshRuntime, RefreshState, RefreshStateStore, minter, secret_refs,
 };
 use crate::{CredentialIssuer, RefreshMaterialScope, StoreSecrets};
 use crate::{Handles, RefreshMaterialDeletion, SecretOwner};
@@ -24,7 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 use tonic::Status;
 use tracing::{Instrument as _, info, warn};
 const EXPIRATION_PRESENT_ANNOTATION: &str = "openshell.nvidia.com/refresh-expiration-present";
-const COMPLETED_MINT_ANNOTATION: &str = "openshell.nvidia.com/refresh-completed-mint";
+pub const COMPLETED_MINT_ANNOTATION: &str = "openshell.nvidia.com/refresh-completed-mint";
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
 pub fn refresh_material_scope(state: &RefreshState) -> RefreshMaterialScope<'_> {
@@ -460,7 +460,7 @@ fn refresh_lock(state: &RefreshState) -> Result<Arc<tokio::sync::Mutex<()>>, Sta
     Ok(lock)
 }
 
-fn completed_mint(state: &RefreshState) -> Option<&str> {
+pub fn completed_mint(state: &RefreshState) -> Option<&str> {
     state
         .metadata
         .as_ref()?
@@ -827,12 +827,6 @@ async fn refresh_provider_credential_locked(
                 }
                 state.material.remove("refresh_token");
             }
-            state.expires_at_ms = minted.expires_at_ms;
-            set_refresh_expiration_presence(&mut state, true);
-            state.next_refresh_at_ms =
-                next_refresh_at_ms(minted.expires_at_ms, state.refresh_before.as_ref());
-            state.last_refresh_at_ms = now_ms;
-            let completed_next_refresh_at_ms = state.next_refresh_at_ms;
             state.status = "refresh_committing".to_string();
             state.next_refresh_at_ms = i64::MAX;
             state.last_error.clear();
@@ -900,17 +894,18 @@ async fn refresh_provider_credential_locked(
                 provider.as_ref(),
                 credential_key,
                 &minted,
-                Some(effective_authorization_epoch(&state)?),
+                Some((effective_authorization_epoch(&state)?, new_version)),
             )
             .await;
-            match result {
-                Ok(version) => {
+            let new_version = match result {
+                Ok(committed) => {
                     if state.strategy
                         == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
                         && state.first_mint_provider_version == 0
                     {
-                        state.first_mint_provider_version = version;
+                        state.first_mint_provider_version = committed.provider_version;
                     }
+                    committed.grant_version.unwrap_or(new_version)
                 }
                 Err(err) => {
                     // Reflect the failure on the state we just wrote; skip silently
@@ -929,12 +924,16 @@ async fn refresh_provider_credential_locked(
                     );
                     return Err(err);
                 }
-            }
+            };
+            state.last_refresh_at_ms = now_ms;
+            state.expires_at_ms = minted.expires_at_ms;
+            set_refresh_expiration_presence(&mut state, true);
             // A success snapshot must not become visible before its provider
             // handles are committed. Park incomplete commits rather than minting
             // again after a crash or lost database session.
             state.status = "refreshed".to_string();
-            state.next_refresh_at_ms = completed_next_refresh_at_ms;
+            state.next_refresh_at_ms =
+                next_refresh_at_ms(minted.expires_at_ms, state.refresh_before.as_ref());
             if let Some(metadata) = state.metadata.as_mut() {
                 metadata.annotations.insert(
                     COMPLETED_MINT_ANNOTATION.to_string(),
@@ -1017,8 +1016,8 @@ pub async fn apply_minted_credential(
     attempt: &dyn RefreshAttempt,
     credential_key: &str,
     minted: &MintedCredential,
-    grant_epoch: Option<&str>,
-) -> Result<u64, Status> {
+    grant: Option<(&str, u64)>,
+) -> Result<CommittedRefreshOutputs, Status> {
     let expiration =
         openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -1056,7 +1055,7 @@ pub async fn apply_minted_credential(
     let empty = HashMap::new();
     let result = attempt
         .commit(RefreshOutputs {
-            grant_epoch,
+            grant,
             credential_key,
             additional_keys: minted.additional_credentials.keys().cloned().collect(),
             handles: staged.as_ref(),
@@ -1079,7 +1078,7 @@ pub async fn apply_minted_credential(
                 warn!(provider_name = %owner.legacy_scope().provider, error = %cleanup_err,
                     "failed to clean up old provider credential handles after successful refresh");
             }
-            Ok(committed.provider_version)
+            Ok(committed)
         }
     }
 }

@@ -145,7 +145,8 @@ pub trait RefreshStateStore: std::fmt::Debug + Send + Sync {
 /// No Debug: inline outputs are secret. Expiration covers exactly the minted keys.
 pub struct RefreshOutputs<'a> {
     pub credential_key: &'a str,
-    pub grant_epoch: Option<&'a str>,
+    /// Epoch and claimed row version of the grant publishing these outputs.
+    pub grant: Option<(&'a str, u64)>,
     pub additional_keys: Vec<String>,
     pub handles: Option<&'a Handles>,
     pub inline: &'a HashMap<String, String>,
@@ -155,6 +156,8 @@ pub struct RefreshOutputs<'a> {
 pub struct CommittedRefreshOutputs {
     pub replaced: Handles,
     pub provider_version: u64,
+    /// Grant revision if the provider write also recorded its first mint.
+    pub grant_version: Option<u64>,
 }
 
 /// Snapshot-bound provider integration. The implementation owns its observed

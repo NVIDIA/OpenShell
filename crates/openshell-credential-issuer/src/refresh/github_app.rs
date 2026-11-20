@@ -5,7 +5,7 @@
 
 use super::{
     MintRequest, MintedCredential, RefreshFailure, current_time_ms, is_loopback_host,
-    max_lifetime_seconds, required_material,
+    required_material,
 };
 use reqwest::{StatusCode, Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
@@ -227,10 +227,20 @@ pub(super) async fn mint(state: &MintRequest) -> Result<MintedCredential, Refres
     if expires_at_ms <= now_ms {
         return Err(invalid_response());
     }
+    let hour = Duration::from_hours(1);
+    let lifetime = state
+        .max_lifetime
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|_| Status::invalid_argument("invalid maximum token lifetime"))?
+        .unwrap_or(hour)
+        .min(hour);
+    let lifetime_ms =
+        i64::try_from(lifetime.as_millis()).expect("one hour fits in i64 milliseconds");
     Ok(MintedCredential {
         access_token: token.token,
-        expires_at_ms: expires_at_ms
-            .min(now_ms.saturating_add(max_lifetime_seconds(state).min(3600).saturating_mul(1000))),
+        expires_at_ms: expires_at_ms.min(now_ms.saturating_add(lifetime_ms)),
         refresh_token: None,
         additional_credentials: HashMap::new(),
     })
@@ -657,12 +667,12 @@ mod tests {
             .await;
         let mut input = state(&server.uri());
         input.max_lifetime = Some(prost_types::Duration {
-            seconds: 120,
-            nanos: 0,
+            seconds: 1,
+            nanos: 200_000_000,
         });
+        let started = current_time_ms();
         let minted = mint(&input).await.unwrap();
-        assert!(minted.expires_at_ms <= current_time_ms() + 120_000);
-        assert!(minted.expires_at_ms > current_time_ms());
+        assert!((started + 1200..=current_time_ms() + 1200).contains(&minted.expires_at_ms));
         server.reset().await;
         let redirect_target = MockServer::start().await;
         Mock::given(method("POST"))

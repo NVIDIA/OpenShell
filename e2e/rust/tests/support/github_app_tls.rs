@@ -82,5 +82,5 @@ async fn restart() -> Result<(), String> {
         .ok_or_else(|| "GitHub HTTPS fixture requires a harness-managed gateway".to_string())?;
     gateway.stop()?;
     gateway.start()?;
-    wait_for_healthy(Duration::from_secs(120)).await
+    wait_for_healthy(Duration::from_mins(2)).await
 }

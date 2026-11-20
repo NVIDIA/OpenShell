@@ -293,7 +293,12 @@ impl RefreshStateStore for ServerRefreshStore {
         // A managed key cannot be manually replaced while its grant exists. A
         // grant deleted before its first mint may still have a user-supplied value.
         let mut replacement = StoredProviderCredentialRefreshState::from(&*state);
-        if previous.last_refresh_at_ms != 0 {
+        // Older grants have a completed-mint receipt instead of a provider revision.
+        let published = previous.first_mint_provider_version != 0
+            || (previous.last_refresh_at_ms != 0
+                && openshell_credential_issuer::refresh::engine::completed_mint(&previous)
+                    .is_some());
+        if published {
             if let Some(handle) = provider.credential_handles.remove(&state.credential_key) {
                 replacement.retired_output_handles.push(handle);
             }

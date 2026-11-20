@@ -156,9 +156,9 @@ async fn retrieve(
     )
     .ok_or_else(|| {
         Status::failed_precondition("provider has no supported runtime credential profile")
-    })?
-    .to_proto();
-    let broker_keys = super::provider::broker_only_provider_credential_keys(&profile);
+    })?;
+    let profile_proto = profile.to_proto();
+    let broker_keys = super::provider::broker_only_provider_credential_keys(&profile_proto);
     // Prevalidate the entire selection before resolving secrets or minting.
     for key in &request.credential_keys {
         let declaration = profile
@@ -183,6 +183,16 @@ async fn retrieve(
         .iter()
         .map(Into::into)
         .collect();
+    let inactive = super::provider::inactive_github_app_aliases(&profile, &refreshes);
+    if request
+        .credential_keys
+        .iter()
+        .any(|key| inactive.contains(key.as_str()))
+    {
+        return Err(Status::failed_precondition(
+            "selected alias is inactive for this GitHub App credential",
+        ));
+    }
     let mut owners = HashMap::new();
     for key in &request.credential_keys {
         let matching: Vec<_> = refreshes
@@ -365,7 +375,7 @@ async fn retrieve(
         &current.profile_workspace,
     )
     .map(|profile| profile.to_proto());
-    if latest_profile.as_ref() != Some(&profile) {
+    if latest_profile.as_ref() != Some(&profile_proto) {
         return Err(Status::aborted(
             "provider credential declarations changed during retrieval",
         ));

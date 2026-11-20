@@ -864,6 +864,17 @@ impl ProviderTypeProfile {
         vars
     }
 
+    /// GitHub App credential selected by its logical name or an environment alias.
+    #[must_use]
+    pub fn github_app_credential(&self, key: &str) -> Option<&CredentialProfile> {
+        self.credentials.iter().find(|credential| {
+            (credential.name == key || credential.env_vars.iter().any(|alias| alias == key))
+                && credential.refresh.as_ref().is_some_and(|refresh| {
+                    refresh.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation
+                })
+        })
+    }
+
     /// Whether this profile can be created without initial static credentials.
     ///
     /// Empty provider creation is allowed when every required credential can

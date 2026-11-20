@@ -6,17 +6,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openshell_core::proto::Provider;
+use openshell_core::proto::{Provider, ProviderCredentialRefreshStrategy};
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::refresh::{
     CommittedRefreshOutputs, GatewayRefreshCommit, RefreshAttempt, RefreshChange,
     RefreshCommitSink, RefreshOutputs, RefreshStateStore,
 };
 use openshell_credential_issuer::{Handles, SecretOwner};
+use prost::Message;
 use tonic::Status;
 
 use crate::compute::ComputeRuntime;
-use crate::persistence::Store;
+use crate::persistence::{AtomicWrite, ObjectType, Store};
+use crate::storage_proto::StoredProviderCredentialRefreshState;
 
 #[derive(Debug, Clone)]
 pub struct ServerRefreshCommit {
@@ -91,7 +93,7 @@ impl RefreshAttempt for ProviderAttempt {
         // Refresh grants can change while the endpoint call is in flight. Read
         // the provider revision before the epoch check: changing a GitHub grant
         // also bumps that revision, so its old mint cannot win the provider CAS.
-        let mut current = if outputs.grant_epoch.is_some() {
+        let mut current = if outputs.grant.is_some() {
             self.integration
                 .store
                 .get_message::<Provider>(self.provider.object_id())
@@ -101,7 +103,8 @@ impl RefreshAttempt for ProviderAttempt {
         } else {
             self.provider.clone()
         };
-        let expected_version = if let Some(epoch) = outputs.grant_epoch {
+        let mut first_mint = None;
+        let expected_version = if let Some((epoch, grant_version)) = outputs.grant {
             let grant = self
                 .integration
                 .refresh_store
@@ -112,11 +115,20 @@ impl RefreshAttempt for ProviderAttempt {
             {
                 return Err(Status::aborted("provider refresh was reconfigured"));
             }
+            if grant.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+                && grant.first_mint_provider_version == 0
+            {
+                first_mint = Some((
+                    StoredProviderCredentialRefreshState::from(&grant),
+                    grant_version,
+                ));
+            }
             current.get_resource_version()
         } else {
             0
         };
-        apply_outputs(&mut current, &outputs, &mut Handles::new());
+        let mut replaced = Handles::new();
+        apply_outputs(&mut current, &outputs, &mut replaced);
         crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
             &self.integration.store,
             crate::provider_refresh::RefreshStateReader::CommitStore(
@@ -126,6 +138,38 @@ impl RefreshAttempt for ProviderAttempt {
             &current,
         )
         .await?;
+        // Persist ownership in the same transaction as the first publication.
+        // A backend failure leaves the static value intact; even a crash before
+        // the issuer finishes its receipt leaves a published token identifiable.
+        if let Some((mut grant, grant_version)) = first_mint {
+            let provider_version = expected_version + 1;
+            grant.first_mint_provider_version = provider_version;
+            self.integration
+                .store
+                .write_atomically(&[
+                    AtomicWrite::Update {
+                        object_type: Provider::object_type().into(),
+                        id: current.object_id().into(),
+                        payload: current.encode_to_vec(),
+                        expected_version,
+                    },
+                    AtomicWrite::Update {
+                        object_type: StoredProviderCredentialRefreshState::object_type().into(),
+                        id: grant.object_id().into(),
+                        payload: grant.encode_to_vec(),
+                        expected_version: grant_version,
+                    },
+                ])
+                .await
+                .map_err(|e| {
+                    crate::grpc::persistence_error_to_status(e, "publish first GitHub App token")
+                })?;
+            return Ok(CommittedRefreshOutputs {
+                replaced,
+                provider_version,
+                grant_version: Some(grant_version + 1),
+            });
+        }
         let mut replaced = Handles::new();
         let published = self
             .integration
@@ -144,6 +188,7 @@ impl RefreshAttempt for ProviderAttempt {
         Ok(CommittedRefreshOutputs {
             replaced,
             provider_version: published.get_resource_version(),
+            grant_version: None,
         })
     }
 }
@@ -238,6 +283,7 @@ mod tests {
             None,
         )
         .await
+        .map(|_| ())
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Internal);
         let replacement = store

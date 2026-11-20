@@ -106,6 +106,7 @@ impl RefreshAttempt for Attempt {
         let mut live = self.0.live.lock().unwrap();
         Ok(CommittedRefreshOutputs {
             replaced: std::mem::replace(&mut *live, outputs.handles.unwrap().clone()),
+            grant_version: None,
             provider_version: self.0.commits.load(Ordering::SeqCst) as u64,
         })
     }

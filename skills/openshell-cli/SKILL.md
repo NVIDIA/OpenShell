@@ -264,7 +264,9 @@ replacement withdraws the old token from gateway delivery. After reconfiguring,
 rotate and restart processes holding the old workload handle.
 Use one refresh configuration for the GitHub App token credential. The logical
 name selects its configured environment alias; use status without a credential
-filter and exact-key deletion to clean up legacy alias conflicts.
+filter and exact-key deletion to clean up legacy alias conflicts. Clear any
+static sibling alias before configuring refresh. For `gh` on GitHub Enterprise
+Server, declare and configure `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`.
 
 Do not infer GitHub App installation access from `GITHUB_TOKEN` or `GH_TOKEN`.
 These aliases also carry personal access and OAuth tokens. Choose the provider

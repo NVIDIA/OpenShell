@@ -8,6 +8,7 @@ mod support;
 
 const PROVIDER_NAME: &str = "e2e-oauth-refresh-handle";
 const PROFILE_ID: &str = "e2e-oauth-refresh-handle";
+const TOKEN_ENV: &str = "REFRESH_E2E_ACCESS_TOKEN";
 
 #[tokio::test]
 async fn long_running_process_survives_rotations_and_reconfigure_revokes() -> Result<(), String> {

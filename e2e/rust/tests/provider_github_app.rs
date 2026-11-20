@@ -8,6 +8,7 @@ mod support;
 
 const PROVIDER_NAME: &str = "e2e-github-app-refresh-handle";
 const PROFILE_ID: &str = "e2e-github-app-refresh-handle";
+const TOKEN_ENV: &str = "GH_ENTERPRISE_TOKEN";
 
 #[tokio::test]
 async fn github_app_survives_rotations_and_reconfigure_revokes() -> Result<(), String> {

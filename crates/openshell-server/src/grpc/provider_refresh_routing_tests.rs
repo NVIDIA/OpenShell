@@ -144,7 +144,8 @@ async fn provider_snapshot_and_validation_use_injected_refresh_reads() {
     assert!(keys.contains(&"SECONDARY_TOKEN".to_string()));
     let error = reject_refresh_owned_credential_updates(
         &refresh,
-        provider.object_id(),
+        &provider,
+        &catalog,
         &HashMap::from([("ACCESS_TOKEN".into(), "value".into())]),
     )
     .await

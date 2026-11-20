@@ -115,8 +115,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/probe":
             return self.headers.get("Authorization") in (f"Bearer {token}", basic)
         # Require the proper auth style on each surface. Never log headers.
-        expected = basic if self.path.startswith("/repo.git/") else f"Bearer {token}"
-        return self.headers.get("Authorization") == expected
+        auth = self.headers.get("Authorization")
+        if self.path.startswith("/repo.git/"):
+            return auth == basic
+        return auth in (f"Bearer {token}", f"token {token}")
 
     def do_POST(self):
         global current_token, generation
