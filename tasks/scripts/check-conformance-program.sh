@@ -80,21 +80,35 @@ done < "${work}/entries"
 # Accept tmachine rows of every family and the host lanes.
 known="$(yq '.jobs.select.steps[] | select(.id == "rows") | .run' "${root}/.github/workflows/e2e-suites.yml" \
     | sed -n "/rows='\[/,/^ *\]'/p" | sed "1s/.*rows='//; \$s/'.*//" \
-    | yq '.[] | .environment + "/" + .installer')
-docker
-podman
-kubernetes
-vm"
-yq -r '.[].environments[]' "${unsupported_file}" | sort -u > "${work}/environments"
-while IFS= read -r environment; do
-    if ! grep -qxF -- "${environment}" <<< "${known}"; then
-        echo "error: unsupported.yaml: unknown environment ${environment}; use a row of e2e-suites.yml (<environment>/<installer>), docker, podman, kubernetes or vm" >&2
-        exit 1
-    fi
-    unsupported="$("${root}/tasks/scripts/suite-unsupported.sh" "${environment}")"
-    # Each harness validates its own entries (test names, issue URLs and duplicates).
+    | yq -o=json -I=0 'map(.environment + "/" + .installer) + ["docker", "podman", "kubernetes", "vm"]')"
+# shellcheck disable=SC2016 # $name is a yq variable.
+unknown="$(known="${known}" yq -r '[.[].environments[]] | unique | .[]
+    | select(. as $name | env(known) | any_c(. == $name) | not)' "${unsupported_file}")"
+if [[ -n "${unknown}" ]]; then
+    echo "error: unsupported.yaml: unknown environment(s): ${unknown}" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC2016 # $name is a yq variable.
+duplicates="$(yq -r '[.[] | .test as $name | .environments[] | ([$name, .] | @tsv)]
+    | group_by(.) | .[] | select(length > 1) | .[0]' "${unsupported_file}")"
+if [[ -n "${duplicates}" ]]; then
+    echo "error: unsupported.yaml: test listed twice for the same environment (test, environment): ${duplicates}" >&2
+    exit 1
+fi
+
+# A test can have different issues in different environments. Check every URL
+# before collapsing the list to one entry per test for the harnesses.
+bad_issues="$(yq -r '.[] | select((.issue | tag) != "!!str"
+    or (.issue | test("^https://[^,[:space:]]+$") | not)) | .test' "${unsupported_file}")"
+if [[ -n "${bad_issues}" ]]; then
+    echo "error: unsupported.yaml: the issue must be an https:// URL for: ${bad_issues}" >&2
+    exit 1
+fi
+unsupported="$(yq -r 'unique_by(.test) | .[] | .test + "=" + .issue' "${unsupported_file}" | paste -sd, -)"
+if [[ -n "${unsupported}" ]]; then
     for manifest in "${manifests[@]}"; do
         OPENSHELL_TEST_UNSUPPORTED="${unsupported}" \
             cargo nextest list --locked --workspace --manifest-path "${manifest}" > /dev/null
     done
-done < "${work}/environments"
+fi

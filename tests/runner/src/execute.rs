@@ -405,18 +405,12 @@ async fn run_selected(
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
+    let export = test_env::export_script(test_env::ENV_DIR);
     let mut tests = vec!["env"];
     tests.extend(env.iter().map(String::as_str));
     match kind {
         Kind::Nextest => {
-            // Unsupported entries may leave no tests to run.
-            let skip_ok = env
-                .iter()
-                .any(|entry| entry.starts_with("OPENSHELL_TEST_UNSUPPORTED="));
-            tests.extend([
-                "cargo-nextest",
-                "nextest",
-                "run",
+            let mut args: Vec<&str> = vec![
                 "--archive-file",
                 &archive,
                 "--workspace-remap",
@@ -428,17 +422,42 @@ async fn run_selected(
                 &config,
                 "--profile",
                 PROFILE,
+            ];
+            for filter in filters {
+                args.extend(["-E", filter]);
+            }
+            let mut no_tests = "fail";
+            if env
+                .iter()
+                .any(|entry| entry.starts_with("OPENSHELL_TEST_UNSUPPORTED="))
+            {
+                // Only allow zero runnable tests if the filters actually
+                // selected tests and nextest reports them all ignored.
+                let script = format!(r#"{export}; exec "$@""#);
+                let mut list = vec!["sh", "-c", &script, "list-tests"];
+                list.extend(&tests);
+                list.extend(["cargo-nextest", "nextest", "list"]);
+                list.extend(&args);
+                list.extend(["--run-ignored", "all", "--message-format", "json"]);
+                let listing = checked(
+                    "list selected tests including ignored tests",
+                    session.exec_timeout(&list, RUN_TIMEOUT).await?,
+                )?;
+                if all_selected_tests_ignored(&listing)? {
+                    no_tests = "pass";
+                }
+            }
+            tests.extend(["cargo-nextest", "nextest", "run"]);
+            tests.extend(args);
+            tests.extend([
                 "--no-capture",
                 // Tests share one gateway and the guest has 4 GiB; run them
                 // serially whatever --no-capture implies.
                 "--test-threads",
                 "1",
                 "--no-tests",
-                if skip_ok { "pass" } else { "fail" },
+                no_tests,
             ]);
-            for filter in filters {
-                tests.extend(["-E", filter]);
-            }
         }
         // The program runs its tests one at a time, and writes the report
         // where `collect_results` looks for it.
@@ -458,10 +477,7 @@ async fn run_selected(
     // can be credentials, never appear in the command (or its errors).
     let log = format!("{guest}/{NEXTEST_LOG}");
     let redirect = if append { ">>" } else { ">" };
-    let script = format!(
-        r#"exec {redirect}"$0" 2>&1; {}; exec "$@""#,
-        test_env::export_script(test_env::ENV_DIR)
-    );
+    let script = format!(r#"exec {redirect}"$0" 2>&1; {export}; exec "$@""#);
     let mut command = vec!["sh", "-c", &script, &log];
     command.extend(tests);
     let output = session.exec_timeout(&command, RUN_TIMEOUT).await?;
@@ -470,6 +486,41 @@ async fn run_selected(
         Kind::Nextest => Status::of_nextest(output.status, &log),
         Kind::Program => Status::of_program(output.status, &log),
     })
+}
+
+fn all_selected_tests_ignored(listing: &str) -> Result<bool> {
+    use std::collections::BTreeMap;
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Listing {
+        rust_suites: BTreeMap<String, Suite>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Suite {
+        testcases: BTreeMap<String, Testcase>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Testcase {
+        ignored: bool,
+        filter_match: FilterMatch,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "status", rename_all = "kebab-case")]
+    enum FilterMatch {
+        Matches,
+        Mismatch,
+    }
+
+    let listing: Listing = serde_json::from_str(listing).context("parse nextest test list")?;
+    let mut selected = listing
+        .rust_suites
+        .into_values()
+        .flat_map(|suite| suite.testcases.into_values())
+        .filter(|test| matches!(test.filter_match, FilterMatch::Matches))
+        .peekable();
+    Ok(selected.peek().is_some() && selected.all(|test| test.ignored))
 }
 
 /// Copy the nextest log and the JUnit report out of the guest, whether or not
@@ -627,6 +678,32 @@ mod tests {
             Status::Error("no test ran; see log".to_string())
         );
         assert!(matches!(status(1), Status::Error(_)));
+    }
+
+    #[test]
+    fn only_nonempty_ignored_selections_allow_zero_tests() {
+        let check = |testcases| {
+            all_selected_tests_ignored(
+                &serde_json::json!({
+                    "rust-suites": {"host-gateway": {"testcases": testcases}}
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let matched = |ignored| serde_json::json!({"ignored": ignored, "filter-match": {"status": "matches"}});
+        let filtered = serde_json::json!({
+            "ignored": true,
+            "filter-match": {"status": "mismatch", "reason": "expression"}
+        });
+        assert!(!check(serde_json::json!({})));
+        assert!(!check(serde_json::json!({"filtered": filtered})));
+        assert!(check(
+            serde_json::json!({"ignored": matched(true), "filtered": filtered})
+        ));
+        assert!(!check(
+            serde_json::json!({"ignored": matched(true), "runnable": matched(false)})
+        ));
     }
 
     #[test]
