@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Supervisor-direct OTLP trace relay.
+//! Supervisor-direct OTLP relay for agent traces, logs, and metrics.
 //!
-//! A sandboxed agent exports OTLP/HTTP protobuf traces to the reserved
+//! A sandboxed agent exports OTLP/HTTP protobuf to the reserved
 //! address [`openshell_core::sandbox_env::OTLP_RELAY_ADDR`]. The sandbox
 //! broker stages that connection to the supervisor, the network proxy hands
 //! the stream to [`receiver::OtlpConnectionServer`], and the accepted batch
@@ -37,13 +37,56 @@ use self::buffer::new_buffer;
 use self::exporter::Exporter;
 use self::receiver::{OtlpConnectionServer, ReceiverHandle};
 
+/// An OTLP signal the relay forwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Traces,
+    Logs,
+    Metrics,
+}
+
+impl Signal {
+    pub const ALL: [Self; 3] = [Self::Traces, Self::Logs, Self::Metrics];
+
+    /// The signal an OTLP/HTTP export path carries.
+    pub fn from_path(path: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|signal| signal.http_path() == path)
+    }
+
+    /// OTLP/HTTP export path, also the suffix under the collector endpoint.
+    pub const fn http_path(self) -> &'static str {
+        match self {
+            Self::Traces => "/v1/traces",
+            Self::Logs => "/v1/logs",
+            Self::Metrics => "/v1/metrics",
+        }
+    }
+
+    /// Fully qualified name of the gRPC collector service with the `Export`
+    /// method.
+    pub const fn grpc_service(self) -> &'static str {
+        match self {
+            Self::Traces => "opentelemetry.proto.collector.trace.v1.TraceService",
+            Self::Logs => "opentelemetry.proto.collector.logs.v1.LogsService",
+            Self::Metrics => "opentelemetry.proto.collector.metrics.v1.MetricsService",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Maximum accepted request body, in wire bytes.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum size of a batch after attribution, derived from the per-entry
 /// growth bound and the entry cap.
 ///
 /// Relay memory attributable to the agent is bounded by three parts: the
-/// export buffer, [`BUFFER_CAPACITY`] batches of this size (about 67 MiB);
+/// export buffers, [`BUFFER_CAPACITY`] batches of this size for traces and a
+/// quarter of that for each of logs and metrics (about 100 MiB in all);
 /// bodies read but not yet enriched, [`MAX_CONCURRENT_CONNECTIONS`] times
 /// [`MAX_BODY_BYTES`] (32 MiB); and the working set of the
 /// [`ENRICHMENT_CONCURRENCY`] enrichments in progress, each about twice the
@@ -66,7 +109,9 @@ pub const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 /// body plus the decoded resources, so two slots bound that transient
 /// regardless of how many connections hold a body.
 pub const ENRICHMENT_CONCURRENCY: usize = 2;
-/// Number of enriched batches held between receipt and export.
+/// Number of enriched trace batches held between receipt and export. Logs
+/// and metrics each get a quarter of it in a buffer of their own, so a chatty
+/// signal cannot crowd out the others.
 pub const BUFFER_CAPACITY: usize = 32;
 /// Deadline for one export attempt to the collector.
 pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,7 +124,7 @@ pub const SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
 /// `Retry-After` value sent with a 503 back-pressure response.
 pub const RETRY_AFTER_SECS: u64 = 1;
 
-/// Point-in-time copy of the relay counters.
+/// Point-in-time copy of the relay counters, summed over all signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CounterSnapshot {
     /// Batches delivered to the collector.
@@ -90,85 +135,16 @@ pub struct CounterSnapshot {
     pub export_failures: u64,
 }
 
-/// Cumulative relay counters shared by the receiver, exporter, and summary
-/// task. Counts are monotonic for the supervisor's lifetime.
 #[derive(Debug, Default)]
-pub struct RelayCounters {
+struct SignalCounts {
     accepted: AtomicU64,
     exported: AtomicU64,
     rejected: AtomicU64,
     export_failures: AtomicU64,
-    /// Metrics and logs exports acknowledged and dropped, since the relay
-    /// forwards traces only.
-    discarded_signals: AtomicU64,
-    /// Whether the most recent export attempt failed. Cleared by the next
-    /// success; flushes skip waiting while it is set.
-    last_export_failed: AtomicBool,
-    first_rejection_logged: AtomicBool,
-    first_discard_logged: AtomicBool,
-    first_failure_logged: AtomicBool,
-    final_summary_logged: AtomicBool,
 }
 
-impl RelayCounters {
-    /// Records one batch accepted into the buffer.
-    pub fn record_accepted(&self) {
-        self.accepted.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one export request refused with 503 because the buffer was
-    /// full. Warns on the first occurrence only.
-    pub fn record_rejection(&self) {
-        self.rejected.fetch_add(1, Ordering::Relaxed);
-        if !self.first_rejection_logged.swap(true, Ordering::Relaxed) {
-            warn!(
-                buffer_capacity = BUFFER_CAPACITY,
-                "OTLP relay rejected an agent export: buffer full"
-            );
-        }
-    }
-
-    /// Records one metrics or logs export that was acknowledged and dropped.
-    /// Logs the first occurrence only, since an agent SDK sends one per
-    /// export interval for as long as it runs.
-    pub fn record_discarded_signal(&self, signal: &'static str) {
-        self.discarded_signals.fetch_add(1, Ordering::Relaxed);
-        if !self.first_discard_logged.swap(true, Ordering::Relaxed) {
-            info!(
-                signal,
-                "OTLP relay discarded an agent export: the relay forwards traces only"
-            );
-        }
-    }
-
-    /// Metrics and logs exports discarded so far.
-    pub fn discarded_signals(&self) -> u64 {
-        self.discarded_signals.load(Ordering::Relaxed)
-    }
-
-    /// Records one export attempt that failed or timed out. Warns on the
-    /// first occurrence only.
-    pub fn record_export_failure(&self, endpoint: &str, error: &dyn std::fmt::Display) {
-        self.export_failures.fetch_add(1, Ordering::Relaxed);
-        self.last_export_failed.store(true, Ordering::Relaxed);
-        if !self.first_failure_logged.swap(true, Ordering::Relaxed) {
-            warn!(endpoint, %error, "OTLP relay export to collector failed");
-        }
-    }
-
-    /// Records one batch delivered to the collector.
-    pub fn record_export_success(&self) {
-        self.exported.fetch_add(1, Ordering::Relaxed);
-        self.last_export_failed.store(false, Ordering::Relaxed);
-    }
-
-    /// Whether the most recent export attempt failed.
-    fn last_export_failed(&self) -> bool {
-        self.last_export_failed.load(Ordering::Relaxed)
-    }
-
-    /// Current counts.
-    pub fn snapshot(&self) -> CounterSnapshot {
+impl SignalCounts {
+    fn snapshot(&self) -> CounterSnapshot {
         CounterSnapshot {
             exported: self.exported.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
@@ -188,6 +164,104 @@ impl RelayCounters {
             .saturating_sub(exported)
             .saturating_sub(export_failures)
     }
+}
+
+/// Cumulative relay counters shared by the receiver, exporter, and summary
+/// task. Counts are monotonic for the supervisor's lifetime.
+#[derive(Debug, Default)]
+pub struct RelayCounters {
+    signals: [SignalCounts; Signal::ALL.len()],
+    /// Whether the most recent export attempt failed. Cleared by the next
+    /// success; flushes skip waiting while it is set.
+    last_export_failed: AtomicBool,
+    first_rejection_logged: AtomicBool,
+    first_failure_logged: AtomicBool,
+    final_summary_logged: AtomicBool,
+}
+
+impl RelayCounters {
+    fn counts(&self, signal: Signal) -> &SignalCounts {
+        &self.signals[signal.index()]
+    }
+
+    /// Records one batch accepted into the buffer.
+    pub fn record_accepted(&self, signal: Signal) {
+        self.counts(signal).accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one export request refused with 503 because the buffer was
+    /// full. Warns on the first occurrence only.
+    pub fn record_rejection(&self, signal: Signal) {
+        self.counts(signal).rejected.fetch_add(1, Ordering::Relaxed);
+        if !self.first_rejection_logged.swap(true, Ordering::Relaxed) {
+            warn!(
+                buffer_capacity = BUFFER_CAPACITY,
+                "OTLP relay rejected an agent export: buffer full"
+            );
+        }
+    }
+
+    /// Records one export attempt that failed or timed out. Warns on the
+    /// first occurrence only.
+    pub fn record_export_failure(
+        &self,
+        signal: Signal,
+        endpoint: &str,
+        error: &dyn std::fmt::Display,
+    ) {
+        self.counts(signal)
+            .export_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.last_export_failed.store(true, Ordering::Relaxed);
+        if !self.first_failure_logged.swap(true, Ordering::Relaxed) {
+            warn!(endpoint, %error, "OTLP relay export to collector failed");
+        }
+    }
+
+    /// Records one batch delivered to the collector.
+    pub fn record_export_success(&self, signal: Signal) {
+        self.counts(signal).exported.fetch_add(1, Ordering::Relaxed);
+        self.last_export_failed.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the most recent export attempt failed.
+    fn last_export_failed(&self) -> bool {
+        self.last_export_failed.load(Ordering::Relaxed)
+    }
+
+    /// Current counts over all signals.
+    pub fn snapshot(&self) -> CounterSnapshot {
+        self.signals.iter().map(SignalCounts::snapshot).fold(
+            CounterSnapshot {
+                exported: 0,
+                rejected: 0,
+                export_failures: 0,
+            },
+            |total, counts| CounterSnapshot {
+                exported: total.exported + counts.exported,
+                rejected: total.rejected + counts.rejected,
+                export_failures: total.export_failures + counts.export_failures,
+            },
+        )
+    }
+
+    /// Accepted batches not yet exported or failed: buffered plus in flight.
+    fn pending(&self) -> u64 {
+        self.signals.iter().map(SignalCounts::pending).sum()
+    }
+
+    /// Counts every pending batch as an export failure and returns how many
+    /// there were.
+    fn discard_pending(&self) -> u64 {
+        self.signals
+            .iter()
+            .map(|counts| {
+                let pending = counts.pending();
+                counts.export_failures.fetch_add(pending, Ordering::Relaxed);
+                pending
+            })
+            .sum()
+    }
 
     fn log_summary(&self) {
         let CounterSnapshot {
@@ -195,11 +269,20 @@ impl RelayCounters {
             rejected,
             export_failures,
         } = self.snapshot();
+        let [traces, logs, metrics] = Signal::ALL.map(|signal| self.counts(signal).snapshot());
         info!(
             exported,
             rejected,
             export_failures,
-            discarded_signals = self.discarded_signals(),
+            traces_exported = traces.exported,
+            traces_rejected = traces.rejected,
+            traces_export_failures = traces.export_failures,
+            logs_exported = logs.exported,
+            logs_rejected = logs.rejected,
+            logs_export_failures = logs.export_failures,
+            metrics_exported = metrics.exported,
+            metrics_rejected = metrics.rejected,
+            metrics_export_failures = metrics.export_failures,
             "OTLP relay summary"
         );
     }
@@ -287,11 +370,8 @@ impl Drop for OtlpRelay {
         // A lifecycle path that drops the relay without `shutdown` discards
         // whatever is still buffered or in flight; count it so the final
         // summary reports the loss. After `shutdown` nothing is pending.
-        let discarded = self.counters.pending();
+        let discarded = self.counters.discard_pending();
         if discarded > 0 {
-            self.counters
-                .export_failures
-                .fetch_add(discarded, Ordering::Relaxed);
             warn!(
                 discarded,
                 "OTLP relay stopped without a flush; discarding buffered batches"
@@ -465,10 +545,12 @@ fn assemble(
             if let Some(mut gate) = export_gate {
                 let _ = gate.wait_for(|open| *open).await;
             }
-            while let Some(batch) = buffer_rx.recv().await {
-                match exporter.export(batch).await {
-                    Ok(()) => counters.record_export_success(),
-                    Err(error) => counters.record_export_failure(exporter.endpoint(), &error),
+            while let Some((signal, batch)) = buffer_rx.recv().await {
+                match exporter.export(signal, batch).await {
+                    Ok(()) => counters.record_export_success(signal),
+                    Err(error) => {
+                        counters.record_export_failure(signal, exporter.endpoint(), &error);
+                    }
                 }
             }
         }
@@ -574,11 +656,8 @@ impl OtlpRelay {
         if self.counters.last_export_failed() {
             self.export_task.abort();
             let _ = (&mut self.export_task).await;
-            let discarded = self.counters.pending();
+            let discarded = self.counters.discard_pending();
             if discarded > 0 {
-                self.counters
-                    .export_failures
-                    .fetch_add(discarded, Ordering::Relaxed);
                 warn!(
                     discarded,
                     "OTLP relay flush skipped: the last export to the collector failed; discarding buffered batches"
@@ -599,10 +678,7 @@ impl OtlpRelay {
                 );
             }
             Ok(Err(join_error)) => {
-                let discarded = self.counters.pending();
-                self.counters
-                    .export_failures
-                    .fetch_add(discarded, Ordering::Relaxed);
+                let discarded = self.counters.discard_pending();
                 warn!(
                     %join_error,
                     discarded,
@@ -615,10 +691,7 @@ impl OtlpRelay {
                 // discarded.
                 self.export_task.abort();
                 let _ = (&mut self.export_task).await;
-                let discarded = self.counters.pending();
-                self.counters
-                    .export_failures
-                    .fetch_add(discarded, Ordering::Relaxed);
+                let discarded = self.counters.discard_pending();
                 warn!(
                     discarded,
                     "OTLP relay flush deadline exceeded; discarding buffered batches"
@@ -830,6 +903,144 @@ mod tests {
                         ),
                     )
         }));
+    }
+
+    fn export_requests() -> (
+        opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest,
+        opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest,
+    ) {
+        use openshell_otel_test_support::relay::string_attribute;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let resource = || {
+            Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "unit-agent"),
+                    string_attribute(SANDBOX_ID_KEY, "evil"),
+                ],
+                ..Default::default()
+            })
+        };
+        let logs = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: resource(),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("agent-log".into())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let metrics =
+            opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+                resource_metrics: vec![ResourceMetrics {
+                    resource: resource(),
+                    ..Default::default()
+                }],
+            };
+        (logs, metrics)
+    }
+
+    #[tokio::test]
+    async fn logs_and_metrics_reach_a_grpc_collector_with_attribution() {
+        let collector = OtlpTestServer::start().await;
+        let (relay, reserved) = start(OtlpRelayConfig {
+            endpoint: collector.endpoint().to_string(),
+            protocol: OtlpProtocol::Grpc,
+            headers: None,
+            tls: None,
+            sandbox_id: "sb-test".into(),
+        })
+        .unwrap();
+        let (mut client, boundary) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(reserved.handler.serve(Box::new(boundary)).unwrap());
+
+        let (logs, metrics) = export_requests();
+        for (path, body) in [
+            ("/v1/logs", logs.encode_to_vec()),
+            ("/v1/metrics", metrics.encode_to_vec()),
+        ] {
+            client
+                .write_all(&request("POST", path, PROTOBUF, &body))
+                .await
+                .unwrap();
+            assert_eq!(read_head(&mut client).await.status, 200, "{path}");
+        }
+
+        wait_until(Duration::from_secs(5), || {
+            let received = collector.received();
+            !received.log_bodies.is_empty() && !received.metric_exports.is_empty()
+        })
+        .await;
+        let received = collector.shutdown().await;
+        assert_eq!(received.log_bodies, ["agent-log"]);
+        let resource = received.metric_exports[0].resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap();
+        assert!(resource.attributes.iter().any(|attribute| {
+            attribute.key == SANDBOX_ID_KEY
+                && attribute
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref())
+                    == Some(
+                        &opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                            "sb-test".into(),
+                        ),
+                    )
+        }));
+        assert!(
+            received.duplicate_resource_keys.is_empty(),
+            "spoofed attribution keys were appended to, not replaced: {:?}",
+            received.duplicate_resource_keys
+        );
+        assert_eq!(relay.counters.snapshot().exported, 2);
+    }
+
+    #[tokio::test]
+    async fn logs_and_metrics_are_posted_to_their_paths_on_an_http_collector() {
+        let mut collector = OtlpHttpTestServer::start().await;
+        let (_relay, reserved) = start(OtlpRelayConfig {
+            endpoint: collector.endpoint().to_string(),
+            protocol: OtlpProtocol::HttpProtobuf,
+            headers: None,
+            tls: None,
+            sandbox_id: "sb-http".into(),
+        })
+        .unwrap();
+        let (mut client, boundary) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(reserved.handler.serve(Box::new(boundary)).unwrap());
+
+        let (logs, metrics) = export_requests();
+        for (path, body) in [
+            ("/v1/metrics", metrics.encode_to_vec()),
+            ("/v1/logs", logs.encode_to_vec()),
+        ] {
+            client
+                .write_all(&request("POST", path, PROTOBUF, &body))
+                .await
+                .unwrap();
+            assert_eq!(read_head(&mut client).await.status, 200, "{path}");
+            let export = collector.next_export().await;
+            assert_eq!(export.path, path);
+            assert_eq!(export.headers[http::header::CONTENT_TYPE], PROTOBUF);
+            assert!(
+                export
+                    .body
+                    .windows(b"sb-http".len())
+                    .any(|window| window == b"sb-http"),
+                "{path} carries the sandbox id"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1151,9 +1362,11 @@ mod tests {
         for span in ["one", "two"] {
             assert_eq!(post(&relay, span).await, 200);
         }
-        relay
-            .counters
-            .record_export_failure(&collector.endpoint, &"collector down");
+        relay.counters.record_export_failure(
+            Signal::Traces,
+            &collector.endpoint,
+            &"collector down",
+        );
         let counters = Arc::clone(&relay.counters);
         assert_eq!(counters.pending(), 1);
 
@@ -1186,9 +1399,9 @@ mod tests {
     #[tokio::test]
     async fn a_successful_export_clears_the_failure_flag() {
         let counters = RelayCounters::default();
-        counters.record_export_failure("http://collector:4317", &"boom");
+        counters.record_export_failure(Signal::Traces, "http://collector:4317", &"boom");
         assert!(counters.last_export_failed());
-        counters.record_export_success();
+        counters.record_export_success(Signal::Traces);
         assert!(!counters.last_export_failed());
     }
 
@@ -1198,7 +1411,7 @@ mod tests {
         let _guard = logs.install();
         let collector = OtlpTestServer::start().await;
         let (relay, _reserved, _gate) = gated(collector.endpoint());
-        relay.counters.record_rejection();
+        relay.counters.record_rejection(Signal::Traces);
         // An early-exit lifecycle path drops the relay without `shutdown`.
         drop(relay);
         assert_eq!(logs.count(tracing::Level::INFO, "OTLP relay summary"), 1);
@@ -1242,7 +1455,7 @@ mod tests {
         let _guard = logs.install();
         let counters = RelayCounters::default();
         for _ in 0..10 {
-            counters.record_rejection();
+            counters.record_rejection(Signal::Traces);
         }
         assert_eq!(
             logs.count(
@@ -1260,7 +1473,7 @@ mod tests {
         let _guard = logs.install();
         let counters = RelayCounters::default();
         for _ in 0..3 {
-            counters.record_export_failure("http://collector:4317", &"boom");
+            counters.record_export_failure(Signal::Traces, "http://collector:4317", &"boom");
         }
         assert_eq!(
             logs.count(
@@ -1284,7 +1497,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(summaries(), 0, "no summary while nothing was rejected");
 
-        counters.record_rejection();
+        counters.record_rejection(Signal::Traces);
         tokio::time::advance(SUMMARY_INTERVAL).await;
         tokio::task::yield_now().await;
         assert_eq!(summaries(), 1);
@@ -1296,7 +1509,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(summaries(), 1, "unchanged counts emit no summary");
 
-        counters.record_export_failure("http://collector:4317", &"boom");
+        counters.record_export_failure(Signal::Traces, "http://collector:4317", &"boom");
         tokio::time::advance(SUMMARY_INTERVAL).await;
         tokio::task::yield_now().await;
         assert_eq!(summaries(), 2);
@@ -1475,7 +1688,7 @@ mod tests {
         let _guard = logs.install();
         let collector = OtlpTestServer::start().await;
         let (relay, _reserved, gate) = gated(collector.endpoint());
-        relay.counters.record_rejection();
+        relay.counters.record_rejection(Signal::Traces);
         gate.send_replace(true);
         relay.shutdown(FLUSH_TIMEOUT).await;
         assert_eq!(logs.count(tracing::Level::INFO, "OTLP relay summary"), 1);

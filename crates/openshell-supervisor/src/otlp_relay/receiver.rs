@@ -7,8 +7,8 @@
 //! broker stages that connect for the supervisor, whose proxy hands the
 //! resulting duplex stream to [`OtlpConnectionServer::serve`] instead of
 //! dialing upstream. The server speaks HTTP/1.1 on that stream and accepts
-//! `POST /v1/traces` with an uncompressed protobuf body. No socket is ever
-//! bound.
+//! `POST /v1/traces`, `/v1/logs`, and `/v1/metrics` with an uncompressed
+//! protobuf body. No socket is ever bound.
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +34,7 @@ use tonic_types::Status as RpcStatus;
 use super::{
     BODY_READ_TIMEOUT, ENRICHMENT_CONCURRENCY, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
     MAX_CONCURRENT_CONNECTIONS, MAX_ENRICHED_BYTES, RECEIVER_SHUTDOWN_TIMEOUT, RETRY_AFTER_SECS,
-    RelayCounters, enrichment,
+    RelayCounters, Signal, enrichment,
 };
 
 /// Reservation for one relay connection.
@@ -181,29 +181,16 @@ impl OtlpConnectionServer {
         &self,
         request: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
-        // The relay forwards traces only. Agents whose SDK also exports
-        // metrics or logs to the generic endpoint get an OTLP success, so they
-        // do not retry forever, and the body is drained without being kept.
-        if request.method() == Method::POST
-            && let Some(signal) = discarded_signal(request.uri().path())
-        {
-            // A body that is not delivered in time is abandoned; hyper closes
-            // the connection because the request was not consumed.
-            let _ = tokio::time::timeout(BODY_READ_TIMEOUT, drain_body(request.into_body())).await;
-            self.counters.record_discarded_signal(signal);
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/x-protobuf")
-                .body(Full::new(Bytes::new()))
-                .expect("static response builds"));
-        }
-        if request.method() != Method::POST || request.uri().path() != "/v1/traces" {
+        let Some(signal) = (request.method() == Method::POST)
+            .then(|| Signal::from_path(request.uri().path()))
+            .flatten()
+        else {
             return Ok(rejected(
                 StatusCode::NOT_FOUND,
                 "not found",
-                "not found; the relay serves POST /v1/traces only",
+                "not found; the relay serves POST /v1/traces, /v1/logs and /v1/metrics only",
             ));
-        }
+        };
         // `identity` declares an uncompressed body; every other coding is
         // refused rather than decoded.
         let compressed = request
@@ -323,10 +310,12 @@ impl OtlpConnectionServer {
 
         let sent = lock(&self.buffer_tx)
             .as_ref()
-            .map_or(Err(SendError::BufferClosed), |tx| tx.try_send(enriched));
+            .map_or(Err(SendError::BufferClosed), |tx| {
+                tx.try_send(signal, enriched)
+            });
         match sent {
             Ok(()) => {
-                self.counters.record_accepted();
+                self.counters.record_accepted(signal);
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "application/x-protobuf")
@@ -334,7 +323,7 @@ impl OtlpConnectionServer {
                     .expect("static response builds"))
             }
             Err(SendError::BufferFull) => {
-                self.counters.record_rejection();
+                self.counters.record_rejection(signal);
                 Ok(unavailable(
                     "relay buffer is full; retry after the Retry-After interval",
                 ))
@@ -356,30 +345,6 @@ enum BodyRead {
     Complete(Bytes),
     TooLarge,
     Failed(hyper::Error),
-}
-
-/// The OTLP signal a path exports when the relay accepts and discards it.
-fn discarded_signal(path: &str) -> Option<&'static str> {
-    match path {
-        "/v1/metrics" => Some("metrics"),
-        "/v1/logs" => Some("logs"),
-        _ => None,
-    }
-}
-
-/// Reads and drops a discarded export body, up to [`OVERSIZE_DRAIN_CAP`], so
-/// the response is delivered on a connection the client has finished writing
-/// to. Nothing is buffered.
-async fn drain_body(mut body: Incoming) {
-    let mut total = 0usize;
-    while let Some(Ok(frame)) = body.frame().await {
-        if let Some(data) = frame.data_ref() {
-            total += data.len();
-            if total > OVERSIZE_DRAIN_CAP {
-                break;
-            }
-        }
-    }
 }
 
 /// Reads the body up to [`MAX_BODY_BYTES`]. Once the limit is crossed, or
@@ -676,7 +641,7 @@ mod tests {
         assert_eq!(head.status, 200);
         assert_eq!(head.header("content-type"), Some(PROTOBUF));
 
-        let buffered = rx.recv().await.expect("one batch buffered");
+        let buffered = rx.recv().await.expect("one batch buffered").1;
         let attributes = resource_attributes(&buffered);
         assert!(attributes.contains(&("service.name".to_string(), "unit-agent".to_string())));
         assert!(attributes.contains(&(
@@ -702,29 +667,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_and_logs_are_acknowledged_and_discarded() {
+    async fn logs_and_metrics_are_enriched_and_buffered() {
+        use openshell_otel_test_support::relay::string_attribute;
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+        use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let resource = || {
+            Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "unit-agent"),
+                    string_attribute(enrichment::SANDBOX_ID_KEY, "spoofed"),
+                ],
+                ..Default::default()
+            })
+        };
+        let logs = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: resource(),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        let metrics = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: resource(),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
         let (server, _handle, mut rx) = start(BUFFER_CAPACITY);
         let mut client = connect(&server);
-        for path in ["/v1/metrics", "/v1/logs"] {
-            let head = send(&mut client, &request("POST", path, PROTOBUF, &[1, 2, 3])).await;
+        for (path, body) in [("/v1/logs", &logs), ("/v1/metrics", &metrics)] {
+            let head = send(&mut client, &request("POST", path, PROTOBUF, body)).await;
             assert_eq!(head.status, 200, "{path}");
             assert_eq!(head.header("content-type"), Some(PROTOBUF));
         }
-        // The same connection still serves a trace export afterwards, so the
-        // discarded bodies were consumed.
-        let head = send(
-            &mut client,
-            &request("POST", "/v1/traces", PROTOBUF, &body()),
-        )
-        .await;
-        assert_eq!(head.status, 200);
-        assert!(rx.recv().await.is_some(), "the trace batch is buffered");
+
+        let attributes = |resource: Option<Resource>| {
+            let mut attributes = resource
+                .expect("resource present")
+                .attributes
+                .into_iter()
+                .map(|attribute| attribute.key)
+                .collect::<Vec<_>>();
+            attributes.sort();
+            attributes
+        };
+        let expected = vec![
+            enrichment::SANDBOX_ID_KEY.to_string(),
+            enrichment::SOURCE_KEY.to_string(),
+            "service.name".to_string(),
+        ];
+        let (signal, batch) = rx.recv().await.expect("logs buffered");
+        assert_eq!(signal, Signal::Logs);
+        let decoded = ExportLogsServiceRequest::decode(batch).unwrap();
         assert_eq!(
-            server.counters.accepted.load(Ordering::Relaxed),
-            1,
-            "metrics and logs are not buffered"
+            attributes(decoded.resource_logs[0].resource.clone()),
+            expected
         );
-        assert_eq!(server.counters.discarded_signals(), 2);
+        let (signal, batch) = rx.recv().await.expect("metrics buffered");
+        assert_eq!(signal, Signal::Metrics);
+        let decoded = ExportMetricsServiceRequest::decode(batch).unwrap();
+        assert_eq!(
+            attributes(decoded.resource_metrics[0].resource.clone()),
+            expected
+        );
+        assert_eq!(server.counters.pending(), 2);
     }
 
     #[tokio::test]
@@ -876,7 +888,7 @@ mod tests {
         )
         .await;
         assert_eq!(head.status, 200);
-        let buffered = rx.recv().await.expect("the valid batch is buffered");
+        let buffered = rx.recv().await.expect("the valid batch is buffered").1;
         let attributes = resource_attributes(&buffered);
         assert!(attributes.contains(&("service.name".to_string(), "unit-agent".to_string())));
         let rejections = server.counters.snapshot().rejected;
@@ -1154,8 +1166,8 @@ mod tests {
         let first_head = read_head(&mut first).await;
         assert_eq!(first_head.status, 200);
 
-        let a = resource_attributes(&rx.recv().await.unwrap());
-        let b = resource_attributes(&rx.recv().await.unwrap());
+        let a = resource_attributes(&rx.recv().await.unwrap().1);
+        let b = resource_attributes(&rx.recv().await.unwrap().1);
         let id = |attrs: &Vec<(String, String)>| {
             attrs
                 .iter()

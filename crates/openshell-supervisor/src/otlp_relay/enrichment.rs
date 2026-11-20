@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resource attribution for relayed agent traces.
+//! Resource attribution for relayed agent traces, logs, and metrics.
+//!
+//! The three export requests share one wire layout for this purpose: the
+//! repeated `ResourceSpans`, `ResourceLogs`, or `ResourceMetrics` entries are
+//! field 1 of the request and each carries its `Resource` in field 1, so the
+//! walk below serves every signal. Names in this module follow the trace
+//! schema.
 //!
 //! Every forwarded `ResourceSpans` entry carries exactly two supervisor-owned
 //! resource attributes. Agent-supplied values for those keys are always
@@ -113,7 +119,7 @@ pub enum EnrichError {
 impl std::fmt::Display for EnrichError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Malformed(error) => write!(f, "malformed ExportTraceServiceRequest: {error}"),
+            Self::Malformed(error) => write!(f, "malformed OTLP export request: {error}"),
             Self::TooManyResourceSpans => {
                 write!(f, "more than {MAX_RESOURCE_SPANS} resource_spans entries")
             }
