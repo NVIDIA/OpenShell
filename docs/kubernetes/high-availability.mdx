@@ -90,7 +90,7 @@ Install or upgrade OpenShell:
 
 ```shell
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --values values-ha.yaml \
@@ -314,7 +314,7 @@ Change `replicaCount` in `values-ha.yaml`, then apply the release again:
 
 ```shell
 helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version <version> \
   --namespace openshell \
   --values values-ha.yaml \

@@ -1,0 +1,49 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Images and Helm Chart Moved to Quay"
+sidebar-title: "Registry Move"
+description: "Update registry allowlists, mirrors, and Helm references after OpenShell images and the Helm chart moved to Quay."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Upgrade, Quay, Helm, Container Images"
+---
+
+OpenShell releases publish container images and Helm charts to Quay. Earlier releases published them to GitHub Container Registry (GHCR). This page lists what changes for operators.
+
+## New Locations
+
+| Artifact | Previous location | New location |
+|---|---|---|
+| Gateway image | `ghcr.io/nvidia/openshell/gateway` | `quay.io/ai-openshell/gateway` |
+| Supervisor image | `ghcr.io/nvidia/openshell/supervisor` | `quay.io/ai-openshell/supervisor` |
+| Sandbox runtime image | `ghcr.io/nvidia/openshell/sandbox` | `quay.io/ai-openshell/sandbox` |
+| Helm chart | `oci://ghcr.io/nvidia/openshell/helm-chart` | `oci://quay.io/ai-openshell/charts/openshell` |
+| Workspace Helm chart | `oci://ghcr.io/nvidia/openshell/openshell-workspace` | `oci://quay.io/ai-openshell/charts/openshell-workspace` |
+
+The gateway's built-in supervisor and sandbox runtime image defaults, and the Helm chart's image values, point at the new locations.
+
+## Older Versions
+
+Quay holds only releases published after the move. Images and charts released before the move are not copied to Quay and stay available at `ghcr.io/nvidia/openshell`. To install or pin one of those versions, use its GHCR reference. Pinned version tags and digests there keep working, and charts from those versions keep pulling their images from GHCR.
+
+The floating `latest` and `dev` tags at `ghcr.io/nvidia/openshell` no longer update. If you track either tag, pull from Quay instead.
+
+## Registry Allowlists and Mirrors
+
+Allow `quay.io` wherever your hosts or clusters restrict image registries, including egress firewalls, admission policies, and containerd or Podman registry configuration.
+
+If you mirror OpenShell images, mirror the new repositories. The Helm chart now sets `global.image.registry` to `quay.io` and each image repository to `ai-openshell/<name>`. If you set `global.image.registry` to point at a mirror, the chart now pulls `<mirror>/ai-openshell/<name>` instead of `<mirror>/openshell/<name>`. Either mirror under the new path or set each `<component>.image.repository` explicitly.
+
+## Upgrade a Helm Release
+
+Upgrade an existing release from the new chart reference. Set `<version>` to a release published on Quay:
+
+```shell
+helm upgrade openshell oci://quay.io/ai-openshell/charts/openshell \
+  --version <version> \
+  --namespace openshell \
+  -f <your-values>.yaml
+```
+
+The chart is now named `openshell` instead of `helm-chart`. Resource names and selectors do not change, so the upgrade updates the existing release in place. Only the `helm.sh/chart` label changes.
+
+If your values or `gateway.toml` name a GHCR image explicitly, such as `supervisor_image` or `sandbox_runtime_image`, update those references when you move to a release published on Quay.

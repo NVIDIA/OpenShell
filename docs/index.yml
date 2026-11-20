@@ -136,5 +136,7 @@ navigation:
   contents:
   - page: "0.1.0"
     path: upgrade/0-1-0.mdx
+  - page: "Registry Move"
+    path: upgrade/registry-move.mdx
 - folder: resources
   title: "Resources"

@@ -20,16 +20,16 @@ identify the images used for qualification.
 Read a platform's document without pulling the image:
 
 ```shell
-docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
+docker buildx imagetools inspect quay.io/ai-openshell/gateway:latest --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
 ```
 
 List the packages instead of the full document:
 
 ```shell
-docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest --format '{{ range (index .SBOM "linux/amd64").SPDX.packages }}{{ .name }}@{{ .versionInfo }}{{ println }}{{ end }}'
+docker buildx imagetools inspect quay.io/ai-openshell/gateway:latest --format '{{ range (index .SBOM "linux/amd64").SPDX.packages }}{{ .name }}@{{ .versionInfo }}{{ println }}{{ end }}'
 ```
 
-The same commands work for `ghcr.io/nvidia/openshell/supervisor`.
+The same commands work for `quay.io/ai-openshell/supervisor`.
 
 ## Coverage
 

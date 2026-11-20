@@ -10,7 +10,7 @@ position: 8
 
 Use this approach when you want to run the OpenShell gateway as a container instead of installing it with the system package manager. This is useful on immutable OS distributions (Fedora CoreOS, bootc-based images, Silverblue) where the standard installer is not appropriate, or anywhere you prefer a container-first workflow.
 
-The gateway image is published at `ghcr.io/nvidia/openshell/gateway`.
+The gateway image is published at `quay.io/ai-openshell/gateway`.
 
 ## Prerequisites for the Docker Driver
 
@@ -42,7 +42,7 @@ Extract the supervisor binary to the host once, then start the gateway:
 
 ```shell
 mkdir -p ~/openshell/supervisor
-docker create --name tmp-supervisor ghcr.io/nvidia/openshell/supervisor:latest
+docker create --name tmp-supervisor quay.io/ai-openshell/supervisor:latest
 docker cp tmp-supervisor:/openshell-sandbox ~/openshell/supervisor/openshell-sandbox
 docker rm tmp-supervisor
 chmod +x ~/openshell/supervisor/openshell-sandbox
@@ -64,7 +64,7 @@ docker run -d \
   -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
   -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
   -e OPENSHELL_DISABLE_TLS=true \
-  ghcr.io/nvidia/openshell/gateway:latest
+  quay.io/ai-openshell/gateway:latest
 ```
 
 The volume mount uses `~/openshell/supervisor/openshell-sandbox` for both the host and container
@@ -109,7 +109,7 @@ mkdir -p ~/.local/state/openshell/tls
 docker run --rm \
   -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
   -v "$HOME/.config/openshell:/home/openshell/.config/openshell" \
-  ghcr.io/nvidia/openshell/gateway:latest \
+  quay.io/ai-openshell/gateway:latest \
   generate-certs \
     --output-dir /home/openshell/.local/state/openshell/tls \
     --server-san host.openshell.internal
@@ -140,7 +140,7 @@ docker run -d \
   -e OPENSHELL_DOCKER_TLS_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
   -e OPENSHELL_DOCKER_TLS_CERT=/home/openshell/.local/state/openshell/tls/client/tls.crt \
   -e OPENSHELL_DOCKER_TLS_KEY=/home/openshell/.local/state/openshell/tls/client/tls.key \
-  ghcr.io/nvidia/openshell/gateway:latest
+  quay.io/ai-openshell/gateway:latest
 ```
 
 Register the gateway with mTLS:
@@ -235,7 +235,7 @@ podman run --rm \
   --security-opt label=type:container_runtime_t \
   -v "$data_dir:$data_dir" \
   -e HOME="$data_dir" \
-  ghcr.io/nvidia/openshell/gateway:latest \
+  quay.io/ai-openshell/gateway:latest \
   generate-certs --output-dir "$data_dir/tls"
 ```
 
@@ -255,7 +255,7 @@ podman run -d \
   -e OPENSHELL_COMPUTE_DRIVER=podman \
   -e OPENSHELL_PODMAN_SOCKET=/var/run/podman.sock \
   -e "OPENSHELL_DB_URL=sqlite:$data_dir/gateway.db" \
-  ghcr.io/nvidia/openshell/gateway:latest
+  quay.io/ai-openshell/gateway:latest
 ```
 
 If the gateway container exits at startup with `--tls-cert is required when TLS is enabled`, the gateway cannot read its certificates. `OPENSHELL_LOCAL_TLS_DIR` is unset, or it points at a directory that is empty or that the container cannot read. Run `generate-certs`, set the variable, and check `--userns=keep-id:uid=1000,gid=1000` and, on SELinux hosts, `--security-opt label=type:container_runtime_t`. Disabling TLS, as the error message suggests, would remove authentication.

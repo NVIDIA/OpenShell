@@ -19,7 +19,7 @@ if [[ -n "${SPIRE_AGENT_ENV_FILE:-}" ]]; then
 fi
 
 GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-openshell-spiffe-demo-gateway}"
-GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/nvidia/openshell/gateway:latest}"
+GATEWAY_IMAGE="${GATEWAY_IMAGE:-quay.io/ai-openshell/gateway:latest}"
 GATEWAY_ID="${GATEWAY_ID:-podman-spiffe-demo}"
 GATEWAY_PORT="${GATEWAY_PORT:-8888}"
 GATEWAY_HEALTH_PORT="${GATEWAY_HEALTH_PORT:-8889}"

@@ -52,12 +52,12 @@ For Kubernetes, select the corresponding Helm chart version. Helm chart versions
 ```shell
 # Pin an exact candidate
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version 0.1.0-pre.3
 
 # Rolling development build
 helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+  oci://quay.io/ai-openshell/charts/openshell \
   --version 0.0.0-dev
 ```
 

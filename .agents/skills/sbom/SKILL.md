@@ -31,14 +31,14 @@ then runs the SBOM verification before updating `latest`.
 BuildKit uses its default Syft scanner and attaches one SPDX document per platform. Read one without pulling the image:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest \
+docker buildx imagetools inspect quay.io/ai-openshell/gateway:latest \
   --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
 ```
 
 Validate the final attestation, requiring a Cargo package for an auditable image:
 
 ```bash
-tasks/scripts/verify-image-sbom.sh ghcr.io/nvidia/openshell/gateway:latest --require-cargo
+tasks/scripts/verify-image-sbom.sh quay.io/ai-openshell/gateway:latest --require-cargo
 ```
 
 ## Inspecting an Auditable Image Binary
