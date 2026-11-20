@@ -155,7 +155,7 @@ The shared-supervisor failover, credential rotation, and identity fencing checks
 also run. Keep gateway/supervisor/sandbox images from the same branch.
 
 The shared supervisor is always a pool of `supervisor.replicas` members
-(default 2), or an HPA-managed pool when `supervisor.autoscaling.enabled=true`.
+(default 1), or an HPA-managed pool when `supervisor.autoscaling.enabled=true`.
 `ci/values-supervisor-autoscaling.yaml` enables the memory HPA (default `512Mi`
 average per Pod, two to four members, one removal every two minutes after five
 minutes of stabilization). It requires the resource metrics API, usually

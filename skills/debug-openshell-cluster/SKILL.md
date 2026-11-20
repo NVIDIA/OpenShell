@@ -1374,7 +1374,7 @@ and enabling or disabling autoscaling on an existing release.
 
 With `supervisor_topology = "gateway"`, the gateway always coordinates the
 shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
-`supervisor.replicas` members (default 2). The chart renders
+`supervisor.replicas` members (default 1). The chart renders
 `[openshell.gateway.supervisor_pool]` `recovery_timeout_secs`,
 `max_instances_per_member` (Helm `supervisor.pool.maxInstancesPerMember`,
 1 to 1024, default 128, also passed to each member as

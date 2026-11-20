@@ -103,9 +103,9 @@ for name in autoscaled tuned; do
 done
 echo "supervisor autoscaling: enabling and tuning the HPA preserves gateway and supervisor Pod templates"
 
-# Defaults stay small: one gateway, two supervisors, autoscaling off.
+# Defaults stay small: one gateway, one supervisor, autoscaling off.
 render defaults
-[[ "$(supervisor_replicas defaults)" == "2" ]] || fail "the default pool renders $(supervisor_replicas defaults) replicas"
+[[ "$(supervisor_replicas defaults)" == "1" ]] || fail "the default pool renders $(supervisor_replicas defaults) replicas"
 yq ea -e 'select(.kind == "HorizontalPodAutoscaler") | .metadata.name' "${work_dir}/defaults.yaml" >/dev/null 2>&1 \
   && fail "the default pool renders an HPA"
 yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor")
