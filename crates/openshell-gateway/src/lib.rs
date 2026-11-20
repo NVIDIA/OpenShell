@@ -595,6 +595,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         let endpoint = vm::spawn(
             context.gateway_log_level(),
             context.gateway_name(),
+            context.gateway_port(),
             &config,
             context.otlp_config(),
             context.network_trust_bundle(),

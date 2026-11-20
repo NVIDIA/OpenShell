@@ -534,9 +534,7 @@ fn apply_startup_document(
     args.expected_peer_pid = Some(gateway.expected_peer_pid);
     args.log_level.clone_from(&gateway.log_level);
     args.gateway_name = Some(gateway.gateway_name.clone());
-    args.grpc_endpoint = Some(gateway.grpc_endpoint.clone());
     args.guest_tls_ca.clone_from(&gateway.tls_ca);
-    args.admission_config_json = gateway.admission.clone();
 
     let telemetry = &gateway.telemetry;
     if let Some(export) = &telemetry.traces {
@@ -557,16 +555,6 @@ fn apply_startup_document(
         args.otlp.key_file.clone_from(&collector.key_file);
     }
 
-    let proxy = &gateway.upstream_proxy;
-    args.upstream_proxy.clone_from(&proxy.https_proxy);
-    args.upstream_no_proxy.clone_from(&proxy.no_proxy);
-    args.upstream_proxy_auth_file
-        .clone_from(&proxy.proxy_auth_file);
-    args.upstream_proxy_auth_allow_insecure = proxy.proxy_auth_allow_insecure == Some(true);
-    args.upstream_proxy_connect_by_hostname = proxy.proxy_connect_by_hostname == Some(true);
-    args.upstream_proxy_ca_bundle
-        .clone_from(&gateway.upstream_proxy_ca_bundle);
-
     if let Some(trust) = &gateway.network_trust {
         args.additional_ca_bundle = Some(trust.path.clone());
         args.additional_ca_digest = Some(trust.digest.clone());
@@ -577,6 +565,29 @@ fn apply_startup_document(
     }
 
     let config = VmDriverFileConfig::from_document(document)?;
+    if config.allow_driver_config.is_some() || config.resource_admission.is_some() {
+        args.admission_config_json = openshell_core::resource_admission::DriverAdmissionConfig {
+            allow_driver_config: config.allow_driver_config.unwrap_or_default(),
+            resource_admission: config.resource_admission.unwrap_or_default(),
+        };
+    }
+    if let Some(value) = config.grpc_endpoint {
+        args.grpc_endpoint = Some(value);
+    }
+    args.upstream_proxy = config.https_proxy.or_else(|| args.upstream_proxy.take());
+    args.upstream_no_proxy = config.no_proxy.or_else(|| args.upstream_no_proxy.take());
+    args.upstream_proxy_auth_file = config
+        .proxy_auth_file
+        .or_else(|| args.upstream_proxy_auth_file.take());
+    if let Some(value) = config.proxy_auth_allow_insecure {
+        args.upstream_proxy_auth_allow_insecure = value;
+    }
+    if let Some(value) = config.proxy_connect_by_hostname {
+        args.upstream_proxy_connect_by_hostname = value;
+    }
+    args.upstream_proxy_ca_bundle = config
+        .proxy_ca_bundle
+        .or_else(|| args.upstream_proxy_ca_bundle.take());
     if let Some(value) = config.state_dir {
         args.state_dir = value;
     }

@@ -9,8 +9,8 @@
 //! gateway does not interpret.
 //!
 //! Where `openshell-core` already defines a type the gateway and drivers share
-//! (OTLP exports, admission, upstream proxy), the document uses it directly, so
-//! there is one definition to keep in step. Those types' serialized form is
+//! (OTLP exports), the document uses it directly, so there is one definition
+//! to keep in step. Those types' serialized form is
 //! part of the contract: changing it is a schema change.
 //!
 //! # Versioning
@@ -23,8 +23,6 @@
 
 use std::path::PathBuf;
 
-use openshell_core::UpstreamProxyConfig;
-use openshell_core::resource_admission::DriverAdmissionConfig;
 use openshell_core::sandbox_env::OtlpExport;
 use serde::{Deserialize, Serialize};
 
@@ -128,24 +126,15 @@ pub struct GatewayContext {
     pub expected_peer_pid: u32,
     pub log_level: String,
     pub gateway_name: String,
-    /// Endpoint sandboxes use to reach the gateway. The gateway resolves it
-    /// from the operator's setting or its own listener, which the driver
-    /// cannot do.
-    pub grpc_endpoint: String,
-    /// CA certificate the supervisors use to authenticate the gateway. Set
-    /// only when `grpc_endpoint` is `https://`.
+    /// Port the gateway serves on. A driver that derives the endpoint
+    /// sandboxes use to reach the gateway needs it.
+    pub gateway_port: u16,
+    /// CA certificate the supervisors use to authenticate the gateway, when
+    /// the gateway has one for the driver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<PathBuf>,
-    /// CA bundle trusted for the upstream proxy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_proxy_ca_bundle: Option<PathBuf>,
-    /// Resource admission policy the driver must apply and acknowledge.
-    pub admission: DriverAdmissionConfig,
     #[serde(default, skip_serializing_if = "Telemetry::is_empty")]
     pub telemetry: Telemetry,
-    /// Corporate forward proxy the driver reaches the network through.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub upstream_proxy: UpstreamProxyConfig,
     /// Staged network trust artifact. Only its location and identity cross the
     /// process boundary, never the certificate bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,10 +188,6 @@ pub struct NetworkTrust {
     pub certificate_count: u32,
 }
 
-fn is_default<T: Default + PartialEq>(value: &T) -> bool {
-    *value == T::default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,12 +200,9 @@ mod tests {
             expected_peer_pid: 1,
             log_level: "info".into(),
             gateway_name: "gateway".into(),
-            grpc_endpoint: "http://127.0.0.1:8080".into(),
+            gateway_port: 8080,
             tls_ca: None,
-            upstream_proxy_ca_bundle: None,
-            admission: DriverAdmissionConfig::default(),
             telemetry: Telemetry::default(),
-            upstream_proxy: UpstreamProxyConfig::default(),
             network_trust: None,
         }
     }
@@ -255,7 +237,7 @@ mod tests {
         let text = StartupDocument::new(minimal_gateway(), toml::Table::new())
             .to_toml()
             .unwrap();
-        for absent in ["telemetry", "upstream_proxy", "network_trust", "tls_ca"] {
+        for absent in ["telemetry", "network_trust", "tls_ca"] {
             assert!(
                 !text.contains(absent),
                 "{absent} should be omitted:\n{text}"

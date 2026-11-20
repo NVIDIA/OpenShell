@@ -9,8 +9,7 @@
 
 use std::path::Path;
 
-use openshell_core::resource_admission::DriverAdmissionConfig;
-use openshell_core::{Error, NetworkSupervisorTrustBundle, Result, UpstreamProxyConfig};
+use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
 use openshell_driver_sdk as sdk;
 use openshell_server::config_file::OtlpConfig;
 
@@ -19,14 +18,10 @@ pub struct GatewayStartup<'a> {
     pub bind_socket: &'a Path,
     pub log_level: &'a str,
     pub gateway_name: &'a str,
-    /// Endpoint sandboxes use to reach the gateway, already resolved.
-    pub grpc_endpoint: &'a str,
-    /// The gateway's `guest_tls_ca`, for an `https://` `grpc_endpoint` only.
+    pub gateway_port: u16,
+    /// The gateway's `guest_tls_ca`, when the driver should use it.
     pub tls_ca: Option<&'a Path>,
-    pub admission: &'a DriverAdmissionConfig,
     pub otlp: Option<&'a OtlpConfig>,
-    pub upstream_proxy: &'a UpstreamProxyConfig,
-    pub proxy_ca_bundle: Option<&'a Path>,
     pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
 }
 
@@ -61,17 +56,14 @@ impl GatewayStartup<'_> {
             expected_peer_pid: std::process::id(),
             log_level: self.log_level.to_string(),
             gateway_name: self.gateway_name.to_string(),
-            grpc_endpoint: self.grpc_endpoint.to_string(),
+            gateway_port: self.gateway_port,
             tls_ca: self.tls_ca.map(Path::to_path_buf),
-            upstream_proxy_ca_bundle: self.proxy_ca_bundle.map(Path::to_path_buf),
-            admission: self.admission.clone(),
             telemetry: sdk::Telemetry {
                 traces: supervisor_otlp.traces,
                 ocsf: supervisor_otlp.ocsf,
                 agent: supervisor_otlp.agent,
                 collector: self.otlp.and_then(collector_tls),
             },
-            upstream_proxy: self.upstream_proxy.clone(),
             network_trust,
         };
         Ok(sdk::StartupDocument::new(gateway, driver_config))
@@ -93,12 +85,10 @@ fn collector_tls(otlp: &OtlpConfig) -> Option<sdk::CollectorTls> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::resource_admission::ResourceAdmissionConfig;
     use openshell_core::sandbox_env::OtlpProtocol;
     use openshell_server::config_file::{
         AgentOtlpConfig, OcsfOtlpConfig, OtlpCollectorConfig, OtlpTracesConfig,
     };
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn collector_with_tls(dir: &Path) -> OtlpCollectorConfig {
@@ -144,23 +134,6 @@ mod tests {
                 ),
             }),
         };
-        let admission = DriverAdmissionConfig {
-            allow_driver_config: true,
-            resource_admission: ResourceAdmissionConfig {
-                enabled: true,
-                required_labels: BTreeMap::from([(
-                    "openshell.ai/sandbox-attachable".to_string(),
-                    "true".to_string(),
-                )]),
-            },
-        };
-        let proxy = UpstreamProxyConfig {
-            https_proxy: Some("http://proxy.example:3128".into()),
-            no_proxy: Some("localhost,127.0.0.1".into()),
-            proxy_auth_file: Some("/etc/openshell/proxy-auth".into()),
-            proxy_auth_allow_insecure: Some(true),
-            proxy_connect_by_hostname: Some(true),
-        };
         let trust = NetworkSupervisorTrustBundle::new(
             b"pem".to_vec(),
             3,
@@ -176,12 +149,9 @@ mod tests {
             bind_socket: Path::new("/var/lib/openshell/run/compute-driver.sock"),
             log_level: "info",
             gateway_name: "gateway-a",
-            grpc_endpoint: "https://127.0.0.1:8080",
+            gateway_port: 8080,
             tls_ca: Some(Path::new("/etc/openshell/tls/ca.pem")),
-            admission: &admission,
             otlp: Some(&otlp),
-            upstream_proxy: &proxy,
-            proxy_ca_bundle: Some(Path::new("/etc/openshell/proxy-ca.pem")),
             network_trust: Some(&trust),
         }
         .into_document(driver_config)
@@ -210,25 +180,20 @@ mod tests {
 
     #[test]
     fn an_unconfigured_gateway_omits_optional_settings() {
-        let admission = DriverAdmissionConfig::default();
-        let proxy = UpstreamProxyConfig::default();
         let document = GatewayStartup {
             bind_socket: Path::new("/run/driver.sock"),
             log_level: "debug",
             gateway_name: "gateway",
-            grpc_endpoint: "http://127.0.0.1:8080",
+            gateway_port: 8080,
             tls_ca: None,
-            admission: &admission,
             otlp: None,
-            upstream_proxy: &proxy,
-            proxy_ca_bundle: None,
             network_trust: None,
         }
         .into_document(toml::Table::new())
         .unwrap();
 
         let text = document.to_toml().unwrap();
-        for absent in ["telemetry", "upstream_proxy", "network_trust", "tls_ca"] {
+        for absent in ["telemetry", "network_trust", "tls_ca"] {
             assert!(
                 !text.contains(absent),
                 "{absent} should be omitted:\n{text}"
@@ -245,18 +210,13 @@ mod tests {
             "sha256:abc",
             PathBuf::from("/var/lib/openshell/trust/bundle.pem"),
         );
-        let admission = DriverAdmissionConfig::default();
-        let proxy = UpstreamProxyConfig::default();
         let text = GatewayStartup {
             bind_socket: Path::new("/run/driver.sock"),
             log_level: "info",
             gateway_name: "gateway",
-            grpc_endpoint: "http://127.0.0.1:8080",
+            gateway_port: 8080,
             tls_ca: None,
-            admission: &admission,
             otlp: None,
-            upstream_proxy: &proxy,
-            proxy_ca_bundle: None,
             network_trust: Some(&trust),
         }
         .into_document(toml::Table::new())

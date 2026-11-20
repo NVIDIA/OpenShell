@@ -10,14 +10,25 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use openshell_core::resource_admission::ResourceAdmissionConfig;
 use openshell_driver_sdk::{MAX_DOCUMENT_BYTES, StartupDocument};
 use serde::Deserialize;
 
-/// VM-specific settings in the document's `[driver_config]` table. A key left
+/// The operator's settings in the document's `[driver_config]` table. A key left
 /// out keeps the driver's own default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VmDriverFileConfig {
+    pub allow_driver_config: Option<bool>,
+    pub resource_admission: Option<ResourceAdmissionConfig>,
+    /// Endpoint sandboxes use to reach the gateway.
+    pub grpc_endpoint: Option<String>,
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub proxy_auth_file: Option<PathBuf>,
+    pub proxy_auth_allow_insecure: Option<bool>,
+    pub proxy_connect_by_hostname: Option<bool>,
+    pub proxy_ca_bundle: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
     pub default_image: Option<String>,
     pub bootstrap_image: Option<String>,

@@ -529,6 +529,7 @@ pub fn compute_driver_guest_tls_paths(
 pub async fn spawn(
     gateway_log_level: &str,
     gateway_name: &str,
+    gateway_port: u16,
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
     additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
@@ -543,6 +544,7 @@ pub async fn spawn(
     let document = vm_startup_document(
         gateway_log_level,
         gateway_name,
+        gateway_port,
         vm_config,
         otlp_config,
         additional_ca_bundle,
@@ -601,30 +603,20 @@ fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
 #[cfg(unix)]
 const STARTUP_DOCUMENT_NAME: &str = "startup.toml";
 
-/// `VmComputeConfig` keys that the startup document carries in its gateway
-/// context, or that the launcher consumes, instead of in `[driver_config]`.
+/// `VmComputeConfig` keys that stay out of `[driver_config]`: the launcher
+/// consumes `driver_dir`, and `guest_tls_ca` reaches the driver as the gateway
+/// context's `tls_ca`. Everything else the operator sets in the VM driver
+/// table, including admission, proxy, and the endpoint, is passed through.
 #[cfg(unix)]
-const GATEWAY_OWNED_KEYS: &[&str] = &[
-    "allow_driver_config",
-    "resource_admission",
-    "driver_dir",
-    "grpc_endpoint",
-    "guest_tls_ca",
-    "https_proxy",
-    "no_proxy",
-    "proxy_auth_file",
-    "proxy_auth_allow_insecure",
-    "proxy_connect_by_hostname",
-    "proxy_ca_bundle",
-];
+const GATEWAY_OWNED_KEYS: &[&str] = &["driver_dir", "guest_tls_ca"];
 
 #[cfg(unix)]
 fn startup_document_path(socket_path: &Path) -> PathBuf {
     socket_path.with_file_name(STARTUP_DOCUMENT_NAME)
 }
 
-/// The VM driver's `[driver_config]` table: the VM-specific settings, without
-/// the ones the gateway context carries.
+/// The VM driver's `[driver_config]` table: the operator's VM settings, with
+/// the gateway's resolved defaults applied, without the launcher-owned keys.
 #[cfg(unix)]
 fn vm_driver_config_table(config: &VmComputeConfig) -> Result<toml::Table> {
     let mut table =
@@ -645,29 +637,24 @@ fn vm_driver_config_table(config: &VmComputeConfig) -> Result<toml::Table> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn vm_startup_document(
     gateway_log_level: &str,
     gateway_name: &str,
+    gateway_port: u16,
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
     additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
     socket_path: &Path,
     tls_ca: Option<&Path>,
 ) -> Result<openshell_driver_sdk::StartupDocument> {
-    let admission = openshell_core::resource_admission::DriverAdmissionConfig {
-        allow_driver_config: vm_config.allow_driver_config,
-        resource_admission: vm_config.resource_admission.clone(),
-    };
     crate::startup_document::GatewayStartup {
         bind_socket: socket_path,
         log_level: gateway_log_level,
         gateway_name,
-        grpc_endpoint: &vm_config.grpc_endpoint,
+        gateway_port,
         tls_ca,
-        admission: &admission,
         otlp: otlp_config,
-        upstream_proxy: &vm_config.upstream_proxy,
-        proxy_ca_bundle: vm_config.proxy_ca_bundle.as_deref(),
         network_trust: additional_ca_bundle,
     }
     .into_document(vm_driver_config_table(vm_config)?)
@@ -729,6 +716,7 @@ fn apply_trace_headers_env(command: &mut Command, otlp_config: Option<&OtlpConfi
 pub async fn spawn(
     _gateway_log_level: &str,
     _gateway_name: &str,
+    _gateway_port: u16,
     _vm_config: &VmComputeConfig,
     _otlp_config: Option<&OtlpConfig>,
     _additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
@@ -923,6 +911,7 @@ mod tests {
         let mut document = vm_startup_document(
             "debug",
             "gateway-a",
+            8080,
             &config,
             Some(&otlp),
             Some(&trust),
@@ -974,6 +963,7 @@ mod tests {
         let document = vm_startup_document(
             "info",
             "gateway",
+            8080,
             &populated_vm_config(),
             None,
             None,
