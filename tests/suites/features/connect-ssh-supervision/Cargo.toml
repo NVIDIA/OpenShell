@@ -11,6 +11,11 @@ license = "Apache-2.0"
 repository = "https://github.com/ai-openshell/openshell"
 publish = false
 
+[[test]]
+name = "connect-ssh-supervision"
+path = "tests/connect_ssh_supervision.rs"
+harness = false
+
 [dependencies]
 openshell-testkit = { path = "../../../testkit/testkit" }
 tokio = { version = "1.43", features = ["rt", "time"] }

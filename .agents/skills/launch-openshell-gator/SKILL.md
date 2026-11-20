@@ -234,8 +234,18 @@ sandbox_name="gtr-pr-${pr_number}-watch"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label."
+  "Review and monitor PR #${pr_number} in ai-openshell/openshell through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying relevant test labels and approving current-head GitHub Actions workflow runs through approve-gator-workflow. Do not approve PRs, merge, push, rerun workflows, or dispatch workflows."
 ```
+
+Native GitHub Actions approval replaces `/ok to test`; a test label selects the
+suite but does not approve an external contributor's run. The guarded helper
+refuses PRs changing `.github/`, which need manual inspection and approval.
+Do not reuse an old launch assignment's `/ok to test` authorization as permission
+to approve workflow runs. Request explicit workflow-approval authorization.
+
+When payload 15 is published, replace still-active older watchers after checking
+their current state. Baked skills cannot update in place. Keep private-advisory
+watchers scoped to their private repository and review-only authorization.
 
 ## Model Or Image Experiments
 
@@ -391,7 +401,7 @@ Symptoms: host `gh` auth fails, Codex refresh fails, in-sandbox GitHub calls rep
 Actions:
 
 - Re-run the GitHub and Codex preflight checks.
-- Existing refresh-managed providers are reused without an ordinary credential update; the launcher rotates their gateway-managed credential instead.
+- Existing refresh-managed providers are reused without reading host refresh material or forcing rotation. Errors fail closed; the launcher never automatically reseeds from host auth.
 - If host Codex auth changed, relaunch with `--reset-refresh` once.
 - `--reset-refresh` removes the old refresh ownership before rediscovering host credentials, then configures and rotates the replacement refresh state.
 - If Entra or Microsoft auth is involved in a future provider, use the relevant auth skill. Gator's default providers are GitHub and Codex.

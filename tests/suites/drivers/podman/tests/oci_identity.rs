@@ -11,6 +11,10 @@
 use container_engine_support::Engine;
 use testkit::{Context, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const OCI_IDENTITY: &str = "2345:2346";
 /// A complete policy without a `process` section, so the sandbox identity
 /// falls back to the image `USER`.

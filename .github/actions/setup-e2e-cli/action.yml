@@ -3,7 +3,7 @@ description: Download architecture-matched prebuilt OpenShell host CLIs for E2E 
 
 inputs:
   conformance:
-    description: Also download the prebuilt openshell-conformance program and set OPENSHELL_TESTKIT_BIN
+    description: Also download the prebuilt openshell-conformance program and set OPENSHELL_CONFORMANCE_BIN
     required: false
     default: "false"
 
@@ -18,7 +18,7 @@ runs:
 
     - name: Configure prebuilt CLI
       shell: bash
-      run: | # zizmor: ignore[github-env] persists only a fixed path under the trusted workspace
+      run: |
         cli="$GITHUB_WORKSPACE/.e2e/prebuilt-cli/openshell"
         chmod +x "$cli"
         "$cli" --version
@@ -38,4 +38,4 @@ runs:
         program="$GITHUB_WORKSPACE/.e2e/prebuilt-conformance/openshell-conformance"
         chmod +x "$program"
         "$program" list
-        echo "OPENSHELL_TESTKIT_BIN=$program" >> "$GITHUB_ENV"
+        echo "OPENSHELL_CONFORMANCE_BIN=$program" >> "$GITHUB_ENV"

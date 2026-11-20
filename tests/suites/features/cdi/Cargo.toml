@@ -11,6 +11,11 @@ license = "Apache-2.0"
 repository = "https://github.com/ai-openshell/openshell"
 publish = false
 
+[[test]]
+name = "cdi"
+path = "tests/injection.rs"
+harness = false
+
 [dependencies]
 openshell-testkit = { path = "../../../testkit/testkit" }
 serde_json = "1"

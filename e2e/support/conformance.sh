@@ -32,17 +32,17 @@ e2e_require_openshell_bin() {
 # shellcheck disable=SC2034 # Used by the scripts that source this file.
 E2E_PULLABLE_PYTHON_IMAGE="ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3"
 
-# Print the path of the openshell-conformance program: OPENSHELL_TESTKIT_BIN
+# Print the path of the openshell-conformance program: OPENSHELL_CONFORMANCE_BIN
 # if set, else a debug build from this checkout.
 e2e_openshell_conformance_bin() {
   local root=$1
 
-  if [ -n "${OPENSHELL_TESTKIT_BIN:-}" ]; then
-    if [ ! -x "${OPENSHELL_TESTKIT_BIN}" ]; then
-      echo "ERROR: testkit program is not executable: ${OPENSHELL_TESTKIT_BIN}" >&2
+  if [ -n "${OPENSHELL_CONFORMANCE_BIN:-}" ]; then
+    if [ ! -x "${OPENSHELL_CONFORMANCE_BIN}" ]; then
+      echo "ERROR: openshell-conformance is not executable: ${OPENSHELL_CONFORMANCE_BIN}" >&2
       return 2
     fi
-    echo "${OPENSHELL_TESTKIT_BIN}"
+    echo "${OPENSHELL_CONFORMANCE_BIN}"
     return
   fi
 
@@ -64,7 +64,7 @@ e2e_openshell_conformance_bin() {
 }
 
 # Run the conformance suite with openshell-conformance. The JUnit report goes
-# to OPENSHELL_TESTKIT_JUNIT, else results/conformance-<gateway>.xml.
+# to OPENSHELL_CONFORMANCE_JUNIT, else results/conformance-<gateway>.xml.
 e2e_run_openshell_conformance() {
   local gateway_label=${1:-OpenShell}
   local root program junit
@@ -72,13 +72,13 @@ e2e_run_openshell_conformance() {
 
   e2e_require_openshell_bin || return
   program="$(e2e_openshell_conformance_bin "${root}")" || return
-  junit="${OPENSHELL_TESTKIT_JUNIT:-${root}/results/conformance-$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]').xml}"
+  junit="${OPENSHELL_CONFORMANCE_JUNIT:-${root}/results/conformance-$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]').xml}"
   mkdir -p "$(dirname "${junit}")" || return
 
-  # The tests this lane can't pass yet, from tests/suites/conformance/unsupported.yaml.
+  # The tests this lane can't pass yet, from tests/suites/unsupported.yaml.
   # A caller that sets OPENSHELL_TEST_UNSUPPORTED keeps its value.
   if [[ -z "${OPENSHELL_TEST_UNSUPPORTED:-}" ]]; then
-    OPENSHELL_TEST_UNSUPPORTED="$("${root}/tasks/scripts/conformance-unsupported.sh" "$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]')")" || return
+    OPENSHELL_TEST_UNSUPPORTED="$("${root}/tasks/scripts/suite-unsupported.sh" "$(echo "${gateway_label}" | tr '[:upper:]' '[:lower:]')")" || return
     export OPENSHELL_TEST_UNSUPPORTED
   fi
 

@@ -260,8 +260,9 @@ nextest filterset. The runner runs the program's `ready` command in the
 guest, then uses nextest to run the prebuilt binary. It writes `junit.xml`
 and `nextest.log` to the results directory. Branch E2E builds
 `openshell-conformance` once and passes it to every conformance row this way.
-With `--program`, `--test-threads N` runs up to N tests concurrently in the
-guest; the default is one.
+`--test-threads N` runs up to N tests concurrently in the guest, whether
+the runner builds the suite or uses `--bundle` or `--program`. The default
+is one. CI rows can opt in with `test_threads`.
 
 `openshell-test-runner build --family <family> --out <dir>` builds a family's
 test bundle for the guest without booting a VM, and `run --bundle <dir>` runs
@@ -290,7 +291,9 @@ suite, with a name that says what the suite tests.
 1. Add a crate under `tests/suites/features/<name>` that depends on
    `openshell-testkit`, and add it to `members` in
    `tests/suites/features/Cargo.toml`.
-2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions and use
+   [testkit's harness](tests/testkit/README.md#unsupported-tests) so the suite
+   can skip unsupported tests per environment.
 3. Re-lock the workspace: `cargo metadata --manifest-path
    tests/suites/features/Cargo.toml`, then
    `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`. `cargo fmt`
@@ -496,7 +499,7 @@ Suites:
   lifecycle, the CLI, persistent workspaces, file transfer, the policy
   advisor, and credential gating. Driver E2E runs it with
   `openshell-conformance` against the lane's gateway and writes a JUnit report
-  under `results/`; set `OPENSHELL_TESTKIT_BIN` to use a prebuilt program,
+  under `results/`; set `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program,
   as Branch E2E does with the static build it makes once per architecture.
   The Docker and Podman runners build `openshell/e2e-python:dev` for it; the
   Kubernetes and VM runners set `OPENSHELL_TEST_PYTHON_IMAGE` to a pullable
@@ -522,7 +525,7 @@ features. The selector is handled by the runner; it is not a Cargo feature.
 Set `OPENSHELL_TESTKIT_THREADS` to run the testkit program with nextest and
 the given number of workers. CI uses four. When unset, the wrappers use
 the serial `openshell-conformance run` command, which does not require
-nextest. Set `OPENSHELL_TESTKIT_JUNIT` to override the report path.
+nextest.
 
 ```shell
 OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes

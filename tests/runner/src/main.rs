@@ -85,8 +85,8 @@ struct RunArgs {
     /// the guest's architecture (a `*-unknown-linux-musl` build).
     #[arg(long, value_name = "PATH", conflicts_with = "packages")]
     program: Option<PathBuf>,
-    /// Maximum number of tests the prebuilt program runs at once [default: 1].
-    #[arg(long, value_name = "N", requires = "program")]
+    /// Maximum number of tests nextest runs at once [default: 1].
+    #[arg(long, value_name = "N")]
     test_threads: Option<NonZeroUsize>,
     /// The gateway name the installer registers with the CLI. The packaged
     /// installers register `openshell`.
@@ -263,7 +263,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_threads_requires_a_program_and_a_positive_count() {
+    fn test_threads_accepts_a_positive_count_for_programs_and_bundles() {
         let args = [
             "runner",
             "run",
@@ -275,13 +275,14 @@ mod tests {
             "conformance",
             "--test-threads",
         ];
-        assert!(Cli::try_parse_from(args.into_iter().chain(["4"])).is_err());
         assert!(Cli::try_parse_from(args.into_iter().chain(["0", "--program", "p"])).is_err());
-        let cli = Cli::try_parse_from(args.into_iter().chain(["4", "--program", "p"])).unwrap();
-        let Command::Run(run) = cli.command else {
-            panic!("not run")
-        };
-        assert_eq!(run.test_threads.map(NonZeroUsize::get), Some(4));
+        for source in ["--program", "--bundle"] {
+            let cli = Cli::try_parse_from(args.into_iter().chain(["4", source, "p"])).unwrap();
+            let Command::Run(run) = cli.command else {
+                panic!("not run")
+            };
+            assert_eq!(run.test_threads.map(NonZeroUsize::get), Some(4));
+        }
     }
 
     #[test]

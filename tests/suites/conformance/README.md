@@ -68,27 +68,8 @@ Feature and driver suites are not part of it. The
 and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
 lists the same tests as nextest.
 
-`run` is serial. To run a prebuilt binary in parallel without Cargo or a
-checkout, use `nextest-metadata` and the [nextest command in the testkit
-README](../../testkit/README.md#test-programs).
-
-### Marking a test unsupported in CI
-
-When a test can't pass in one environment yet, for example because of a driver
-bug, keep the test and mark it unsupported there:
-
-1. File an issue for the bug.
-2. Add an entry to [`unsupported.yaml`](unsupported.yaml): the test, the issue,
-   and the environments it fails in, each a tmachine row
-   (`<environment>/<installer>`, such as `ubuntu-k3s/k3s-ha`) or a host lane
-   (`docker`, `podman`, `kubernetes` or `vm`).
-3. Delete the entry in the PR that fixes the bug.
-
-CI turns the entries for an environment into `OPENSHELL_TEST_UNSUPPORTED`; the
-[testkit README](../../testkit/README.md#unsupported-tests) describes what the
-program does with it. Branch Checks runs the program with each environment's
-entries, so an unknown test, a bad issue URL or an unknown environment name
-fails there.
+See [Unsupported tests](../../testkit/README.md#unsupported-tests) to skip a
+test in specific CI environments.
 
 ## Adding a test
 
