@@ -629,6 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn github_app_distinguishes_connection_failures_and_timeouts() {
+        openshell_crypto::tls::ensure_default_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         // A bound socket that never serves HTTP produces a real request timeout.
