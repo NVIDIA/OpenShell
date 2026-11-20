@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+# The authorization flag records the operator decision; it is not an auth boundary.
+if [[ $# != 3 || "$1" != --operator-authorized || ! "$2" =~ ^[0-9]+$ || ! "$3" =~ ^[0-9]+$ ]]; then
+    echo 'Usage: approve-gator-workflow --operator-authorized PR_NUMBER RUN_ID' >&2
+    exit 2
+fi
+repo=ai-openshell/openshell
+pr="$2" run="$3"
+deny() { echo "Workflow not approved: $*" >&2; exit 1; }
+actor="$(gh api user --jq .login)"
+permission="$(gh api "repos/$repo/collaborators/$actor/permission" --jq .permission)"
+case "$permission" in admin|maintain|write) ;; *) deny 'repository write permission is required' ;; esac
+pull="$(gh api "repos/$repo/pulls/$pr")"
+head="$(jq -er '.head.sha' <<< "$pull")"
+jq -e --arg repo "$repo" '.state == "open" and .draft == false and (.base.repo.full_name | ascii_downcase) == ($repo | ascii_downcase)' <<< "$pull" >/dev/null || deny 'PR is not open and ready in the target repository'
+
+check_run() {
+    local metadata
+    metadata="$(gh api "repos/$repo/actions/runs/$run")"
+    jq -e --arg repo "$repo" --arg head "$head" --argjson pr "$pr" '
+      (.repository.full_name | ascii_downcase) == ($repo | ascii_downcase) and .event == "pull_request" and
+      .head_sha == $head and .conclusion == "action_required" and
+      any(.pull_requests[]; .number == $pr) and
+      (.path == ".github/workflows/branch-checks.yml" or
+       .path == ".github/workflows/branch-e2e.yml" or
+       .path == ".github/workflows/helm-lint.yml" or
+       .path == ".github/workflows/trivy-changes.yml" or
+       .path == ".github/workflows/dependency-review.yml" or
+       .path == ".github/workflows/workflow-security.yml" or
+       .path == ".github/workflows/windows-msvc.yml")
+    ' <<< "$metadata" >/dev/null || deny 'run is not a recognized pending PR-head workflow'
+}
+check_run
+# A workflow approval executes PR-controlled workflow code. Require a human to
+# approve runs that change CI machinery, rather than trying to judge it here.
+pages="$(gh api --paginate "repos/$repo/pulls/$pr/files?per_page=100")"
+count="$(jq -se 'add | length' <<< "$pages")"
+expected="$(jq -er '.changed_files' <<< "$pull")"
+[[ "$count" == "$expected" ]] || deny 'changed-file listing is incomplete'
+files="$(jq -sr 'add | .[] | .filename, (.previous_filename // empty)' <<< "$pages")"
+if grep -Eq '^\.github/' <<< "$files"; then
+    deny 'PR changes .github/; a maintainer must inspect and approve the run manually'
+fi
+current="$(gh api "repos/$repo/pulls/$pr" --jq .head.sha)"
+[[ "$current" == "$head" ]] || deny 'PR head changed during approval checks'
+check_run
+gh api --method POST "repos/$repo/actions/runs/$run/approve"

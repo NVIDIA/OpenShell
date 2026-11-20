@@ -303,7 +303,14 @@ impl MultiplexService {
             SupervisorHostServer::new(crate::grpc::supervisor_host::SupervisorHostService::new(
                 self.state.clone(),
             ))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE),
+            .max_decoding_message_size(
+                self.state
+                    .compute
+                    .supervisor_host()
+                    .map_or(MAX_GRPC_DECODE_SIZE, |controller| {
+                        controller.pool_limits().max_host_message_bytes()
+                    }),
+            ),
             openshell,
         );
         let reflection = self.state.reflection_service.clone();

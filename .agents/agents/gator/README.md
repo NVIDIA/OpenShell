@@ -108,7 +108,7 @@ The launcher:
 - Selects the requested harness and bakes the common runtime into the immutable sandbox payload.
 - Builds with the latest Codex CLI by default. Docker can reuse the cached install layer; rebuild with that layer's cache disabled to fetch a newer release.
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
-- For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
+- For `--harness codex`, reuses gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN`. Initial setup and explicit resets configure and rotate it once.
 - Passes the non-secret Codex account ID from host auth as `CODEX_ACCOUNT_ID`. The harness writes it literally into `auth.json` for local workspace discovery; access tokens remain opaque provider placeholders and refresh tokens remain gateway-only.
 - Enables `agent_policy_proposals_enabled` and `proposal_approval_mode=auto` on the gator sandbox only. Gateway-global values for these keys take precedence; the launcher does not change them.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
@@ -135,7 +135,15 @@ Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gato
 
 Use `--once` for a single reconciliation cycle. Use `--poll-interval <seconds>` to change the default 15-minute watch cadence.
 
-The launcher preserves existing gateway-owned Codex refresh material by default so multiple gator sandboxes do not overwrite each other's refresh-token lineage from host Codex auth. If gateway rotation fails, the launcher automatically resets gateway refresh material from host Codex auth and retries once. After `codex logout && codex login`, you can also pass `--reset-refresh` to force that reset before rotation.
+The launcher preserves gateway-owned Codex refresh material without reading host refresh material or forcing rotation on subsequent launches. Lookup, configuration, and rotation errors fail the launch rather than triggering an automatic reset. After reauthenticating Codex locally, pass `--reset-refresh` only when you intend to replace the shared provider's refresh ownership; this affects other sandboxes using that provider.
+
+Workspace secrets are optional. Existing provider-owned refresh material remains supported; do not move a rotating Codex refresh token into a shared workspace secret merely to launch more Gators.
+
+## GitHub workflow approval
+
+Test labels select CI suites. Gator can approve current-head workflow runs only
+with explicit launch authorization. PRs changing `.github/` require manual
+approval. PR approval, merging, reruns, and dispatch require separate authorization.
 
 ## Tests
 

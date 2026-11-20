@@ -24,6 +24,25 @@ HPA is enabled, otherwise replicaCount.
 {{- end }}
 
 {{/*
+Fewest gateway replicas the chart runs: autoscaling.minReplicas when the HPA
+is enabled, otherwise replicaCount.
+*/}}
+{{- define "openshell.minReplicas" -}}
+{{- if eq (include "openshell.autoscalingEnabled" .) "true" -}}
+{{- int (get .Values.autoscaling "minReplicas" | default 1) -}}
+{{- else -}}
+{{- int (default 1 .Values.replicaCount) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of the value that sets the fewest replicas, for error messages.
+*/}}
+{{- define "openshell.minReplicasSource" -}}
+{{- ternary "autoscaling.minReplicas" "replicaCount" (eq (include "openshell.autoscalingEnabled" .) "true") -}}
+{{- end }}
+
+{{/*
 Name of the value that sets the largest replica count, for error messages.
 */}}
 {{- define "openshell.maxReplicasSource" -}}

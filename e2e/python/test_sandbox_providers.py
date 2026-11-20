@@ -729,7 +729,15 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
 
 @pytest.mark.parametrize(
     "placement",
-    ["authorization", "missing", "header", "query", "path", "unused-fields"],
+    [
+        "authorization",
+        "missing",
+        "header",
+        "query",
+        "path",
+        "path_subtree",
+        "unused-fields",
+    ],
 )
 def test_static_header_credentials_reject_reflective_request_locations(
     sandbox: Callable[..., Sandbox],
@@ -755,13 +763,14 @@ def test_static_header_credentials_reject_reflective_request_locations(
         credential.header_name = "Authorization"
         credential.query_param = "api_key"
         credential.path_template = "/v1/{credential}/resources"
-    elif placement in {"header", "query", "path"}:
+    elif placement in {"header", "query", "path", "path_subtree"}:
         credential.auth_style = placement
         credential.header_name = "x-api-key" if placement == "header" else ""
         credential.query_param = "api_key" if placement == "query" else ""
-        credential.path_template = (
-            "/credential/{credential}/search" if placement == "path" else ""
-        )
+        if placement == "path":
+            credential.path_template = "/credential/{credential}/search"
+        elif placement == "path_subtree":
+            credential.path_template = "/credential/{credential}"
     profile.endpoints[0].request_body_credential_rewrite = True
 
     def probe_locations(host: str, port: int, placement: str) -> str:
@@ -824,7 +833,7 @@ def test_static_header_credentials_reject_reflective_request_locations(
         elif placement == "query":
             target += "&" + urllib.parse.urlencode({"api_key": token})
             headers = {}
-        elif placement == "path":
+        elif placement in {"path", "path_subtree"}:
             target = (
                 "/credential/"
                 + urllib.parse.quote(token, safe="")

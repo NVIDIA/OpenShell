@@ -868,6 +868,25 @@ On Postgres, each replica opens both pools, so plan for `(database_max_connectio
 
 On SQLite, writers are serialized regardless of pool size, so a larger ceiling buys read concurrency only. A gateway that needs more write throughput wants an external Postgres database (`server.externalDbSecret`), not a larger SQLite pool.
 
+## Shared Supervisor Pool
+
+`[openshell.gateway.supervisor_pool]` tunes the shared supervisor pool used with the Kubernetes driver's `supervisor_topology = "gateway"`. The Helm chart renders this table from `supervisor.*` values and rejects a hand-written one.
+
+```toml
+[openshell.gateway.supervisor_pool]
+recovery_timeout_secs = 60
+max_instances_per_member = 128
+max_members_per_gateway = 32
+```
+
+| Key | Default | Range | Helm value |
+|---|---|---|---|
+| `recovery_timeout_secs` | `60` | `30` to `300` | `supervisor.recoveryTimeoutSeconds` |
+| `max_instances_per_member` | `128` | `1` to `1024` | `supervisor.pool.maxInstancesPerMember` |
+| `max_members_per_gateway` | `32` | `1` or more | `supervisor.pool.maxMembersPerGateway` |
+
+The gateway never places more than `max_instances_per_member` sandboxes on one supervisor and refuses a create when every supervisor is full. The pool runs at most live gateway replicas × `max_members_per_gateway` × `max_instances_per_member` sandboxes, never more than 131,072. Start each supervisor with the same cap through `--pool-max-instances` or `OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES`; the chart sets it. Values outside the ranges fail at startup.
+
 ## OCSF JSONL Output
 
 `[openshell.gateway.ocsf_log]` enables a gateway-local file containing native OCSF events emitted by the gateway, including events without a sandbox association. Omit the table to disable it. Restart the gateway after changing this configuration.
