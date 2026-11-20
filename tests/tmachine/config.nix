@@ -112,6 +112,12 @@ let
       bases = dockerBases ++ podmanBases;
       setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
+    # A TLS-intercepting corporate proxy with Basic auth that the gateway's
+    # driver sends sandbox egress through, for the corporate-proxy suite.
+    corporate-proxy = {
+      bases = dockerBases ++ podmanBases;
+      setup.playbooks = [ "ansible/playbooks/corporate-proxy.yaml" ];
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases

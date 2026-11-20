@@ -1,0 +1,13 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+[Unit]
+Description=OpenShell test corporate proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 {{ corporate_proxy_script }} --port {{ corporate_proxy_port }} --cert {{ corporate_proxy_config_dir }}/proxy-chain.pem --key {{ corporate_proxy_key_dir }}/proxy-key.pem --auth-file {{ corporate_proxy_config_dir }}/auth --log {{ corporate_proxy_log }}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

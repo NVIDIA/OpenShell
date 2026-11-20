@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Files the gateway and the tests read: the proxy's CA, its listener
+# certificate and the credentials file.
+corporate_proxy_config_dir: /etc/openshell-test/corporate-proxy
+# Only the proxy reads the private keys.
+corporate_proxy_key_dir: /etc/openshell-test/corporate-proxy/private
+corporate_proxy_script: /usr/local/libexec/openshell-test/corporate-proxy.py
+corporate_proxy_log: /var/log/openshell-test/corporate-proxy.jsonl
+corporate_proxy_service: openshell-corporate-proxy.service
+# The name sandboxes reach the guest by. The listener certificate and the
+# re-signed tunnel certificates are issued for it.
+corporate_proxy_host: host.openshell.internal
+corporate_proxy_port: 3128
+# The destination port that no_proxy sends direct. Tests bind it themselves.
+corporate_proxy_bypass_port: 39443
+# Throwaway credentials for a proxy that only this guest can reach.
+corporate_proxy_username: proxyuser
+corporate_proxy_password: proxypass
+corporate_proxy_cert_days: 3650
