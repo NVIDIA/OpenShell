@@ -37,7 +37,7 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-latest-8-cores
+            runner: ubuntu-24.04
           - triple: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -69,7 +69,7 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-latest-8-cores
+            runner: ubuntu-24.04
           - triple: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -85,7 +85,7 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest-8-cores
+            runner: ubuntu-24.04
           - triple: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -103,7 +103,7 @@ jobs:
           - package: openshell-sandbox
             binary: openshell-sandbox
             triple: x86_64-unknown-linux-musl
-            runner: ubuntu-latest-8-cores
+            runner: ubuntu-24.04
           - package: openshell-sandbox
             binary: openshell-sandbox
             triple: aarch64-unknown-linux-musl
@@ -111,7 +111,7 @@ jobs:
           - package: openshell-supervisor
             binary: openshell-supervisor
             triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest-8-cores
+            runner: ubuntu-24.04
           - package: openshell-supervisor
             binary: openshell-supervisor
             triple: aarch64-unknown-linux-gnu
@@ -130,7 +130,7 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-latest-8-cores
+            runner: ubuntu-24.04
           - triple: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
