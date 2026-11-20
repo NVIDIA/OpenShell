@@ -28,4 +28,4 @@
       {{ '--default ' ~ openshell_gateway_merge_default
          if openshell_gateway_merge_default | default('') else '' }}
     executable: /usr/bin/python3
-  when: openshell_gateway_overrides.stat.exists
+  when: openshell_gateway_overrides.stat.exists and openshell_gateway_overrides.stat.size > 0

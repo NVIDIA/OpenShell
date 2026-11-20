@@ -21,5 +21,5 @@
         test_env_vars:
           OPENSHELL_TEST_CORPORATE_PROXY_URL: "https://{{ corporate_proxy_host }}:{{ corporate_proxy_port }}"
           OPENSHELL_TEST_CORPORATE_PROXY_CA_CERT: "{{ corporate_proxy_config_dir }}/ca.pem"
-          OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_LISTEN: "{{ corporate_proxy_bypass_port }}"
+          OPENSHELL_TEST_CORPORATE_PROXY_BYPASS_PORT: "{{ corporate_proxy_bypass_port }}"
           OPENSHELL_TEST_CORPORATE_PROXY_LOG: "{{ corporate_proxy_log }}"
