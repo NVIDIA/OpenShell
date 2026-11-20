@@ -38,6 +38,27 @@ pub fn default_state_dir() -> PathBuf {
     )
 }
 
+/// Whether the Podman driver reports that Podman is usable on this host.
+#[must_use]
+pub fn is_available() -> bool {
+    let state_dir = default_state_dir();
+    let process = DriverProcess {
+        name: "podman",
+        binary_name: DRIVER_BIN_NAME,
+        driver_dir: None,
+        driver_dir_key: None,
+        state_dir: &state_dir,
+    };
+    let result = launcher::probe(&process, launcher::PROBE_TIMEOUT);
+    if !result.available {
+        tracing::debug!(
+            reason = result.reason.as_deref().unwrap_or("unknown"),
+            "podman compute driver not available"
+        );
+    }
+    result.available
+}
+
 /// Launch the Podman driver and return a managed endpoint for it.
 pub async fn spawn(launch: PodmanLaunch<'_>) -> Result<AcquiredRemoteDriverEndpoint> {
     let state_dir = default_state_dir();

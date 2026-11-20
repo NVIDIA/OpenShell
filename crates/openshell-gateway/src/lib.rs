@@ -205,17 +205,11 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-podman")]
-        ComputeDriverRegistration::new(
-            "podman",
-            200,
-            Some(openshell_driver_podman::driver::is_available),
-            PodmanFactory,
-        )
-        .map(|registration| {
-            registration
-                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
-                .with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING)
-        }),
+        ComputeDriverRegistration::new("podman", 200, Some(podman::is_available), PodmanFactory)
+            .map(|registration| {
+                registration
+                    .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
+            }),
         #[cfg(feature = "compute-driver-docker")]
         ComputeDriverRegistration::new(
             "docker",

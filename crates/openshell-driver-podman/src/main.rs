@@ -243,8 +243,28 @@ fn apply_gateway_context(args: &mut Args, document: &StartupDocument) {
     gateway.telemetry.apply_to(&mut args.otlp);
 }
 
+/// `probe` reports on stdout whether Podman is usable on this host. It takes
+/// no other arguments and starts nothing.
+fn run_probe() -> ! {
+    let result = if openshell_driver_podman::driver::is_available() {
+        openshell_driver_sdk::probe::ProbeResult::available()
+    } else {
+        openshell_driver_sdk::probe::ProbeResult::unavailable(
+            "no responsive Podman API socket found; set OPENSHELL_PODMAN_SOCKET or start the Podman service",
+        )
+    };
+    println!("{}", result.to_json());
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "probe") {
+        if std::env::args_os().len() > 2 {
+            return Err(miette::miette!("probe takes no arguments"));
+        }
+        run_probe();
+    }
     let (args, document) = parse_args().map_err(|err| miette::miette!("{err}"))?;
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_podman::otel_tracing::TRACING,

@@ -349,6 +349,71 @@ pub async fn launch(
     ))
 }
 
+/// How long auto-detection waits for a driver's `probe` before it counts the
+/// driver as not available.
+#[cfg(unix)]
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `<binary> probe` and report whether the driver is usable here.
+///
+/// A missing or untrusted binary, a failed or timed-out probe, and oversized or
+/// malformed output all count as not available, and the reason names the
+/// driver, so detection never hangs on or trusts one broken driver.
+#[cfg(unix)]
+pub fn probe(
+    driver: &DriverProcess<'_>,
+    timeout: Duration,
+) -> openshell_driver_sdk::probe::ProbeResult {
+    use openshell_driver_sdk::probe::{MAX_PROBE_OUTPUT_BYTES, ProbeResult};
+    use std::io::Read as _;
+
+    let name = driver.name;
+    let unavailable = |reason: String| ProbeResult::unavailable(format!("{name} driver: {reason}"));
+    let binary = match resolve_driver_bin(driver)
+        .and_then(|binary| check_driver_binary_trust(&binary, current_euid()).map(|()| binary))
+    {
+        Ok(binary) => binary,
+        Err(error) => return unavailable(error.to_string()),
+    };
+    let mut child = match std::process::Command::new(&binary)
+        .arg("probe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return unavailable(format!("failed to run '{}': {error}", binary.display())),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return unavailable(format!("probe timed out after {}s", timeout.as_secs()));
+            }
+            Err(error) => return unavailable(format!("failed to wait for probe: {error}")),
+        }
+    };
+    if !status.success() {
+        return unavailable(format!("probe exited with {status}"));
+    }
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take()
+        && let Err(error) = stdout
+            .take(MAX_PROBE_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut output)
+    {
+        return unavailable(format!("failed to read probe output: {error}"));
+    }
+    ProbeResult::parse(&output).unwrap_or_else(unavailable)
+}
+
 #[cfg(unix)]
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -980,5 +1045,65 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(receiver.try_recv().is_err());
         drop(process);
+    }
+
+    fn probe_script(dir: &Path, body: &str) -> PathBuf {
+        let binary = driver_binary(dir, 0o755, 0o755);
+        std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
+        binary
+    }
+
+    fn run_probe(body: &str, timeout: Duration) -> openshell_driver_sdk::probe::ProbeResult {
+        let dir = tempdir().unwrap();
+        probe_script(dir.path(), body);
+        let state = dir.path().join("state");
+        let driver = DriverProcess {
+            name: "test",
+            binary_name: "openshell-driver-test",
+            driver_dir: Some(dir.path()),
+            driver_dir_key: None,
+            state_dir: &state,
+        };
+        super::probe(&driver, timeout)
+    }
+
+    #[test]
+    fn a_probe_reports_availability() {
+        let result = run_probe("echo '{\"available\":true}'", Duration::from_secs(5));
+        assert!(result.available, "{result:?}");
+        let result = run_probe(
+            "echo '{\"available\":false,\"reason\":\"no socket\"}'",
+            Duration::from_secs(5),
+        );
+        assert!(!result.available);
+        assert_eq!(result.reason.as_deref(), Some("no socket"));
+    }
+
+    #[test]
+    fn a_broken_probe_counts_as_unavailable_and_names_the_driver() {
+        for body in [
+            "exit 1",
+            "echo not-json",
+            "head -c 100000 /dev/zero | tr '\\0' ' '",
+            "sleep 30",
+        ] {
+            let result = run_probe(body, Duration::from_millis(300));
+            assert!(!result.available, "{body}");
+            assert!(result.reason.unwrap().starts_with("test driver:"), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_missing_driver_is_unavailable() {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let driver = DriverProcess {
+            name: "test",
+            binary_name: "openshell-driver-absent",
+            driver_dir: Some(dir.path()),
+            driver_dir_key: None,
+            state_dir: &state,
+        };
+        assert!(!super::probe(&driver, Duration::from_secs(1)).available);
     }
 }

@@ -24,6 +24,7 @@
 #[cfg(feature = "clap")]
 pub mod cli;
 pub mod network_trust;
+pub mod probe;
 
 use std::path::PathBuf;
 
