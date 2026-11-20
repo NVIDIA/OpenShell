@@ -359,7 +359,7 @@ resolve_docker_supervisor_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/ai-openshell/openshell}"
     printf '%s/supervisor:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
@@ -388,7 +388,7 @@ resolve_docker_sandbox_runtime_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/ai-openshell/openshell}"
     printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
