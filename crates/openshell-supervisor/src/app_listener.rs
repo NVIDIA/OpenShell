@@ -484,7 +484,11 @@ impl Routes {
                 expiry
             };
             tokio::select! {
-                () = tokio::time::sleep_until(expiry) => return,
+                () = tokio::time::sleep_until(expiry) => {
+                    // A renewal and the old timer can both become ready before
+                    // this task is polled. Check the current lease before closing.
+                    if !self.valid(route, token) { return; }
+                },
                 result = receiver.changed() => if result.is_err() { return; },
             }
         }
@@ -1117,6 +1121,44 @@ mod tests {
         routes.install(&config);
         routes.stopped.store(true, Ordering::Release);
         assert!(source(Duration::from_secs(15)).routes.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_authority_renewal_preserves_stream_until_current_expiry() {
+        // Exercise selection with both the old timer and renewal notification
+        // ready, without letting the stream task observe the renewal early.
+        for _ in 0..64 {
+            let routes = Routes {
+                requires_authority: true,
+                ..Default::default()
+            };
+            routes.serving.store(true, Ordering::Release);
+            let route = SandboxServiceRoute {
+                endpoint_id: "endpoint".into(),
+                name: "web".into(),
+                target_port: 8080,
+                authorization_mode: 1,
+                resource_version: 1,
+                application_hostname: String::new(),
+            };
+            routes.install(&installed(vec![route.clone()]));
+            let source = routes.installation_source();
+            source(Duration::from_secs(15));
+            let (_, token) = routes
+                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .unwrap();
+            let revoked = routes.revoked(&route, token);
+            tokio::pin!(revoked);
+            assert!(futures::poll!(&mut revoked).is_pending());
+            tokio::time::advance(Duration::from_secs(10)).await;
+            source(Duration::from_secs(15));
+            tokio::time::advance(Duration::from_secs(6)).await;
+            assert!(routes.valid(&route, token));
+            assert!(futures::poll!(&mut revoked).is_pending());
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(!routes.valid(&route, token));
+            assert!(futures::poll!(&mut revoked).is_ready());
+        }
     }
 
     #[tokio::test(start_paused = true)]
