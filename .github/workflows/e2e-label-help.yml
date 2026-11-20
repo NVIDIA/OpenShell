@@ -19,7 +19,7 @@ permissions: {}
 jobs:
   hint:
     name: Post next-step hint for E2E label
-    if: github.event.label.name == 'test:e2e' || github.event.label.name == 'test:e2e-gpu' || github.event.label.name == 'test:e2e-kubernetes' || github.event.label.name == 'test:e2e:continuity'
+    if: github.event.label.name == 'test:e2e' || github.event.label.name == 'test:e2e-kubernetes' || github.event.label.name == 'test:e2e:continuity'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -43,11 +43,6 @@ jobs:
             test:e2e)
               suite_summary="the standard E2E suite"
               build_summary="gateway, sandbox, and supervisor images"
-              status_summary="The matching required CI gate status on this PR will flip green automatically once the run finishes."
-              ;;
-            test:e2e-gpu)
-              suite_summary="GPU E2E"
-              build_summary="supervisor image"
               status_summary="The matching required CI gate status on this PR will flip green automatically once the run finishes."
               ;;
             test:e2e-kubernetes)

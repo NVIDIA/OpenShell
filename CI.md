@@ -185,19 +185,20 @@ only in `Branch E2E Checks`. The manual Integration Tests workflow runs the
 remaining tmachine testsuites, such as `e2e-podman`, and downloads the packages
 selected by its matrix.
 
-Four opt-in labels enable the long-running E2E suites:
+Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
   with both managed and standalone compute drivers in `Branch E2E Checks`
-- `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 - `test:e2e:continuity` runs the continuity suites in `Branch E2E Checks`. Apply it
   with `test:e2e`, whose builds it reuses.
 
-When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images, and GPU does not wait for the gateway image. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
-The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status. `test:e2e:continuity` is optional too.
+GPU E2E is disabled because GitHub-hosted runners have no GPUs. `e2e-gpu-test.yaml` stays in the tree, but no workflow calls it.
+
+When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images. Docker, Podman, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
+The `OpenShell / E2E` required status is evaluated from the `Core E2E result` job inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status. `test:e2e:continuity` is optional too.
 
 The continuity suites (`tests/suites/continuity`) check that state created before
 a disruption survives it. Each row of `e2e-suites.yml` names one disruption:
@@ -652,7 +653,7 @@ Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
 2. The mirror push runs `Branch Checks` automatically. `Required CI Gates` keeps the PR blocked until the mirror exists, matches the PR head SHA, and the required push-based workflow succeeds. The first `Branch E2E Checks` run only resolves metadata and skips expensive jobs unless an E2E label is already set.
-3. A maintainer applies `test:e2e`, `test:e2e-gpu`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
+3. A maintainer applies `test:e2e` and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
 5. When the run finishes, the matching `OpenShell / ...` gate status flips to green automatically.
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
@@ -715,7 +716,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels; merge groups do not run E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, Kubernetes HA, Kubernetes credential-driver, and continuity E2E. PR mirror pushes use `test:e2e`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels; merge groups do not run E2E. |
 | `.github/workflows/build-binaries-{linux,macos}.yml`, `build-vm-driver-{linux,macos}.yml` | Shared per-platform binary matrices used by branch and release workflows. Each platform is its own workflow, so a consumer depends only on the platforms it needs. The VM driver remains separate because its build consumes the runtime binaries. Its build steps stay inline rather than in a local action because release builds check out the release tag, which may predate the action. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
@@ -767,10 +768,9 @@ Require these statuses in the branch ruleset for PR and merge-queue CI:
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
 
-The following statuses are opt-in and controlled by labels:
+The following status is opt-in and controlled by a label:
 
 - `OpenShell / E2E`: `test:e2e`
-- `OpenShell / GPU E2E`: `test:e2e-gpu`
 
 For mirror-based workflows, require the statuses published by
 `Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is

@@ -938,8 +938,6 @@ Use `test:e2e` for changes that affect:
 - Docker, Podman, VM, or Kubernetes driver behavior
 - Release packaging that needs a runtime smoke test
 
-Use `test:e2e-gpu` for GPU runtime, CDI, CUDA, GPU driver, or GPU policy behavior.
-
 Use `test:e2e` for Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, workspace mode, or controller behavior; it runs the Kubernetes, managed-workspace, and operator-workspace suites.
 
 Add `test:e2e-kubernetes` for gateway high availability or Kubernetes Secrets and Vault credential driver storage. It runs only the HA and credential-driver suites, so apply it alongside `test:e2e` when other Kubernetes coverage is also needed.
@@ -995,7 +993,6 @@ Required gates include at least:
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
 - `OpenShell / E2E` when `test:e2e` is applied
-- `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
 - Both x64 and ARM64 `Windows MSVC / PR lint and test` checks when `test:windows` is applied
 
 If checks are pending, wait a reasonable interval and re-check.
