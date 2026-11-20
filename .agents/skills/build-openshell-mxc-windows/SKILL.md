@@ -8,14 +8,14 @@ metadata:
 # Build OpenShell-MXC for Windows
 
 This skill maintains the existing native Windows MSVC build lane in the
-OpenShell repository's [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+OpenShell repository's [`windows` branch](https://github.com/ai-openshell/OpenShell/tree/windows).
 That branch owns native Windows implementation and releases. Shared docs may
 also appear on `main`; always direct Windows work to `windows` and use explicit
 Windows branch links for implementation details. See
-[Native Windows support](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
+[Native Windows support](https://github.com/ai-openshell/OpenShell/blob/windows/WINDOWS.md).
 
 Before running the tasks below, use a `windows`-based checkout and read the
-[skill from that branch](https://github.com/NVIDIA/OpenShell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md).
+[skill from that branch](https://github.com/ai-openshell/OpenShell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md).
 The task and runtime descriptions refer to that checkout, not to any older
 Windows source snapshot retained on `main`.
 
