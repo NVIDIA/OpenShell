@@ -26,12 +26,13 @@ current_profile_passed=true
 require_env \
   RELEASE_TAG SOURCE_SHA IS_PRERELEASE GITHUB_RUN_ID GITHUB_RUN_ATTEMPT \
   GITHUB_SERVER_URL GITHUB_REPOSITORY SECURITY_RESULT CONFORMANCE_RESULT \
-  FEATURE_INTEGRATION_RESULT DOCKER_E2E_RESULT VM_E2E_RESULT PROTO_COMPATIBILITY_RESULT
+  CONTINUITY_RESULT FEATURE_INTEGRATION_RESULT DOCKER_E2E_RESULT VM_E2E_RESULT PROTO_COMPATIBILITY_RESULT
 
 for result in \
   "${PROTO_COMPATIBILITY_RESULT}" \
   "${SECURITY_RESULT}" \
   "${CONFORMANCE_RESULT}" \
+  "${CONTINUITY_RESULT}" \
   "${FEATURE_INTEGRATION_RESULT}" \
   "${DOCKER_E2E_RESULT}" \
   "${VM_E2E_RESULT}"; do
@@ -54,6 +55,7 @@ jq -n \
   --arg security "${SECURITY_RESULT}" \
   --arg protobuf_compatibility "${PROTO_COMPATIBILITY_RESULT}" \
   --arg conformance "${CONFORMANCE_RESULT}" \
+  --arg continuity "${CONTINUITY_RESULT}" \
   --arg feature_integration "${FEATURE_INTEGRATION_RESULT}" \
   --arg docker_e2e "${DOCKER_E2E_RESULT}" \
   --arg vm_e2e "${VM_E2E_RESULT}" \
@@ -90,6 +92,7 @@ jq -n \
       protobuf_compatibility: $protobuf_compatibility,
       security: $security,
       conformance_integration: $conformance,
+      continuity_integration: $continuity,
       feature_integration: $feature_integration,
       docker_e2e: $docker_e2e,
       vm_e2e: $vm_e2e
