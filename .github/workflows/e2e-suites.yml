@@ -157,6 +157,8 @@ jobs:
         run: |
           tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName || true)
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          # The latest release moves, so the run must say which one it used.
+          echo "Upgrade baseline for this run: \`${tag:-none found}\`" >> "$GITHUB_STEP_SUMMARY"
 
   suites:
     name: E2E suites (${{ matrix.suite }}, ${{ matrix.environment }}, ${{ matrix.installer }})

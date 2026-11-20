@@ -36,6 +36,10 @@ runs:
           echo "::error::no release tag to use as the upgrade baseline"
           exit 1
         fi
+        # The baseline is the latest release when the run starts, so record it:
+        # a pass or failure means nothing without knowing what it upgraded from.
+        echo "::notice::Upgrade baseline: ${SOURCE_TAG} (${PACKAGE:-deb} package)"
+        echo "Upgrade baseline: \`${SOURCE_TAG}\` (${PACKAGE:-deb} package)" >> "$GITHUB_STEP_SUMMARY"
         if [ "${PACKAGE}" = "rpm" ]; then
           shopt -s nullglob
           source_dir=artifacts/upgrade/rpm/source
