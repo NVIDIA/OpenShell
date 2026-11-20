@@ -35,6 +35,11 @@
 //! - [`http`] sends a [`Request`], and [`http_raw`] sends bytes as they are.
 //!   Both report how the connection went, the bytes that came back, and the
 //!   parsed [`Response`].
+//! - [`resolve`] looks a name up with `getaddrinfo` and returns the
+//!   addresses, such as the synthetic ones policy DNS answers with.
+//! - [`Python`] runs these clients under another interpreter, such as a copy
+//!   of `python3`, with extra environment, to check what the policy allows
+//!   a particular binary. The free functions use the image's `python3`.
 //! - [`scripts`] holds the client scripts, for tests that run one with
 //!   [`testkit::Sandbox::run_python`] and read its result with
 //!   [`testkit::ExecOutput::last_json`]. Protocol clients, such as `GraphQL` or
@@ -45,9 +50,13 @@
 
 mod message;
 mod probe;
+mod python;
+mod resolve;
 
 pub use message::{Http, Request, Response};
 pub use probe::{Connect, ConnectOutcome, ReadEnd, connect, http, http_raw};
+pub use python::Python;
+pub use resolve::{Resolve, resolve};
 
 /// Client scripts, as text to pass to [`testkit::Sandbox::run_python`].
 pub mod scripts {
@@ -55,6 +64,11 @@ pub mod scripts {
     /// reply, and prints the outcome as one JSON line. [`crate::connect`] and
     /// [`crate::http`] run it and parse its output.
     pub const TCP_PROBE: &str = include_str!("../scripts/tcp_probe.py");
+
+    /// Resolves a host and port with `getaddrinfo` and prints the distinct
+    /// addresses, or the resolver's error, as one JSON line.
+    /// [`crate::resolve`] runs it and parses its output.
+    pub const RESOLVE_PROBE: &str = include_str!("../scripts/resolve_probe.py");
 
     /// Serves HTTP on 127.0.0.1 and fetches from it, and prints whether the
     /// environment has proxy variables and the payload it got.
