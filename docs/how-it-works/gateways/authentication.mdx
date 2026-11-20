@@ -126,7 +126,8 @@ curl --request DELETE \
 ```
 
 Revocation is durable across gateway replicas and rejects subsequent application
-requests, including browser sessions using that token. Obtain a new token or
+requests, including browser sessions using that token and equivalent token
+signatures. Obtain a new token or
 rotate the client certificate to regain access. Revocation targets gateway
 application access; it does not revoke the identity provider's token or alter
 control-plane RPC credentials. Offline OIDC JWT validation cannot discover an
@@ -138,7 +139,8 @@ it admits at most 1,024 outstanding application credential revocations.
 Direct supervisor app-listener access delegates authentication to the ingress
 provider. Gateway browser sessions and credentials do not authorize that path.
 The listener strips the gateway's `__Host-openshell-service-session` and
-`__Host-openshell-service-login` cookies, while preserving other application
+`__Host-openshell-service-login` cookies from requests and responses, while
+preserving other application
 cookies, including names such as `__Host-openshell-app`.
 
 ## Gateway Resolution

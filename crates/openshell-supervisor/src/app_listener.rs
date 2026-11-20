@@ -980,12 +980,7 @@ fn sanitize_headers(headers: &mut http::HeaderMap, passthrough: bool, websocket:
             cookie.split_once('=').is_some_and(|(name, _)| {
                 !name.trim().eq_ignore_ascii_case("CF_Authorization")
                     && !name.trim().eq_ignore_ascii_case("cf-authorization")
-                    && !name
-                        .trim()
-                        .eq_ignore_ascii_case("__Host-openshell-service-session")
-                    && !name
-                        .trim()
-                        .eq_ignore_ascii_case("__Host-openshell-service-login")
+                    && !gateway_cookie_name(name.trim().as_bytes())
             })
         })
         .map(str::trim)
@@ -998,6 +993,31 @@ fn sanitize_headers(headers: &mut http::HeaderMap, passthrough: bool, websocket:
         headers.insert(header::COOKIE, cookie);
     }
     true
+}
+
+fn gateway_cookie_name(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"__Host-openshell-service-session")
+        || name.eq_ignore_ascii_case(b"__Host-openshell-service-login")
+}
+
+fn strip_gateway_response_cookies(headers: &mut http::HeaderMap) {
+    let cookies: Vec<_> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter(|value| {
+            let name = value
+                .as_bytes()
+                .split(|byte| *byte == b'=')
+                .next()
+                .unwrap_or_default();
+            !gateway_cookie_name(name.trim_ascii())
+        })
+        .cloned()
+        .collect();
+    headers.remove(header::SET_COOKIE);
+    for cookie in cookies {
+        headers.append(header::SET_COOKIE, cookie);
+    }
 }
 
 async fn proxy(
@@ -1058,6 +1078,7 @@ async fn proxy(
     };
     let upgraded = response.status() == StatusCode::SWITCHING_PROTOCOLS && websocket;
     strip_hop_headers(response.headers_mut(), upgraded);
+    strip_gateway_response_cookies(response.headers_mut());
     if upgraded {
         let upstream = hyper::upgrade::on(&mut response);
         let downstream = downstream.expect("websocket upgrade");
@@ -1410,6 +1431,15 @@ mod tests {
                                 .header("connection", "upgrade")
                                 .header("upgrade", "websocket")
                                 .header("sec-websocket-accept", accept)
+                                .header(
+                                    header::SET_COOKIE,
+                                    "__Host-openshell-service-login=untrusted; Secure; Path=/",
+                                )
+                                .header(
+                                    header::SET_COOKIE,
+                                    "__Host-openshell-service-session=untrusted; Secure; Path=/",
+                                )
+                                .header(header::SET_COOKIE, "app=session; HttpOnly")
                                 .header("x-test-upstream-host", req.headers()[header::HOST].clone())
                                 .header(
                                     "x-test-upstream-origin",
@@ -1445,7 +1475,20 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("absent")
                     );
-                    Ok::<_, std::convert::Infallible>(Response::new(Body::from(body)))
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .header(
+                                header::SET_COOKIE,
+                                "__Host-openshell-service-login=untrusted; Secure; Path=/",
+                            )
+                            .header(
+                                header::SET_COOKIE,
+                                "__Host-openshell-service-session=untrusted; Secure; Path=/",
+                            )
+                            .header(header::SET_COOKIE, "app=session; HttpOnly")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(server), service)
@@ -1887,6 +1930,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn response_cookies_reserve_only_gateway_auth_names() {
+        let mut headers = http::HeaderMap::new();
+        for value in [
+            b"__Host-openshell-service-session=blocked".as_slice(),
+            b" __HOST-openshell-service-login =blocked",
+            b"__Host-openshell-service-login=\xff",
+            b"app=session; HttpOnly",
+            b"__Host-openshell-app=allowed",
+            b"opaque=\xff",
+        ] {
+            headers.append(
+                header::SET_COOKIE,
+                http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        strip_gateway_response_cookies(&mut headers);
+        let cookies: Vec<_> = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(http::HeaderValue::as_bytes)
+            .collect();
+        assert_eq!(
+            cookies,
+            vec![
+                b"app=session; HttpOnly".as_slice(),
+                b"__Host-openshell-app=allowed",
+                b"opaque=\xff"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn tls_routes_only_matching_sni_and_authority() {
         let f = fixture();
@@ -1902,6 +1977,11 @@ mod tests {
             response.contains(&format!("/hello?x=1 {HOST}:18443 stripped")),
             "{response}"
         );
+        assert!(
+            !response.contains("__Host-openshell-service-"),
+            "{response}"
+        );
+        assert!(response.contains("app=session; HttpOnly"), "{response}");
         let mismatch = request(
             &f,
             HOST,
@@ -2038,6 +2118,12 @@ mod tests {
                 format!("https://{hostname}").parse().unwrap(),
             );
             let (mut ws, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .collect();
+            assert_eq!(cookies, vec!["app=session; HttpOnly"]);
             assert_eq!(response.headers()["x-test-upstream-host"], hostname);
             assert_eq!(
                 response.headers()["x-test-upstream-origin"],

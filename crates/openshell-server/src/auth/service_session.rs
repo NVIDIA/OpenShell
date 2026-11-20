@@ -100,13 +100,25 @@ fn token_expiry(token: &str) -> Result<u64, Status> {
         .ok_or_else(|| Status::unauthenticated("token expiration required"))
 }
 
+// Called after authentication. Equivalent signatures must identify the same
+// revoked credential; the authenticated signing input is unchanged by them.
+fn token_revocation_key(token: &str) -> Result<String, Status> {
+    let invalid = || Status::unauthenticated("invalid token");
+    let (signed, signature) = token.rsplit_once('.').ok_or_else(invalid)?;
+    let (header, payload) = signed.split_once('.').ok_or_else(invalid)?;
+    if header.is_empty() || payload.is_empty() || payload.contains('.') || signature.is_empty() {
+        return Err(invalid());
+    }
+    Ok(format!("jwt-{}", digest(signed)?))
+}
+
 pub async fn check_token(state: &ServerState, token: &str) -> Result<(), Status> {
     if token.len() > 16384 || token_expiry(token)? <= now() {
         return Err(Status::unauthenticated("expired or invalid credential"));
     }
     if state
         .store
-        .get(REVOKED, &digest(token)?)
+        .get(REVOKED, &token_revocation_key(token)?)
         .await
         .map_err(|_| internal())?
         .is_some()
@@ -711,7 +723,7 @@ pub async fn handle(
         }
         let token = authorize_request(state, req, workspace).await?;
         let (key, expires) = if let Some(token) = token {
-            (digest(&token)?, token_expiry(&token)?)
+            (token_revocation_key(&token)?, token_expiry(&token)?)
         } else {
             let fingerprint = req
                 .extensions()
