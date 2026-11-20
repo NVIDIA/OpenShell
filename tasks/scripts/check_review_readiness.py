@@ -42,6 +42,25 @@ class LabelRoutingError(ValueError):
     """The PR's area or topic labels prevent requesting reviewers."""
 
 
+class MaintainerEditsError(ValueError):
+    """A ready PR from a personal fork does not allow edits by maintainers."""
+
+
+def needs_maintainer_edits(pr: dict, repository: str) -> bool:
+    """Whether a ready PR must allow maintainer edits but does not.
+
+    GitHub only offers the setting on PRs from personal forks, so PRs from
+    branches in the target repository and from organization-owned forks are
+    exempt, as are PRs whose fork was deleted.
+    """
+    head_repo = (pr.get("head") or {}).get("repo")
+    if pr["draft"] or not head_repo or head_repo.get("full_name") == repository:
+        return False
+    if (head_repo.get("owner") or {}).get("type") == "Organization":
+        return False
+    return not pr.get("maintainer_can_modify")
+
+
 def _api_action(method: str, path: str) -> str:
     """Name the step a failed `gh api` call was performing."""
     if path.endswith("/requested_reviewers"):
@@ -69,6 +88,8 @@ def describe_failure(exc: Exception) -> tuple[str, str]:
     """Return a short category and an actionable message for a failure."""
     if isinstance(exc, LabelRoutingError):
         return "PR labels", str(exc)
+    if isinstance(exc, MaintainerEditsError):
+        return "Maintainer edits", str(exc)
     if isinstance(exc, subprocess.CalledProcessError):
         command = [str(part) for part in exc.cmd]
         method = "GET"
@@ -345,6 +366,13 @@ def check_review_readiness(
             add_labels = (ACCEPTED_LABEL,)
             if apply:
                 _add_accepted_label(repository, pr, evidence)
+    if needs_maintainer_edits(pr, repository):
+        raise MaintainerEditsError(
+            "Allow edits by maintainers is off, so this PR is not ready for review. "
+            "Turn on 'Allow edits by maintainers' in the PR sidebar, or run "
+            f"`gh api -X PATCH {pull} -F maintainer_can_modify=true`, then re-run "
+            "this check. Create PRs with `gh pr create`, which enables it by default."
+        )
     if pr["draft"] or not any(label.startswith("area:") for label in labels):
         if pr["draft"] and not label_accepted_work:
             return None
