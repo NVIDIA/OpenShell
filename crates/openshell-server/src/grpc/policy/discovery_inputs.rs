@@ -181,7 +181,7 @@ impl DiscoveryConfigInputs {
             }
             Some(super::super::service::configured_app_routes_from_endpoints(
                 state, sandbox, endpoints,
-            ))
+            )?)
         } else {
             None
         };

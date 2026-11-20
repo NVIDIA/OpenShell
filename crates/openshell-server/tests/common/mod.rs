@@ -422,6 +422,55 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn create_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_secrets(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSecretsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSecretsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn update_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::UpdateSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn reveal_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RevealSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::RevealSecretResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn inline_provider_refresh_secrets(
+        &self,
+        _request: tonic::Request<openshell_core::proto::InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<openshell_core::proto::InlineProviderRefreshSecretsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,

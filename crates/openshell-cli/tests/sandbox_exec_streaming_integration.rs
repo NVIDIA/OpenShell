@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use helpers::{build_ca, build_client_cert, build_server_cert};
-use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{self, exec_sandbox_event, exec_sandbox_input};
+use openshell_server::test_support::grpc::open_shell_server::{OpenShell, OpenShellServer};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const STDIN_LIMIT: usize = 4 * 1024 * 1024;
-type EventStream = ReceiverStream<Result<proto::ExecSandboxEvent, Status>>;
+type EventStream = tonic::codegen::BoxStream<proto::ExecSandboxEvent>;
 
 #[derive(Clone, Copy)]
 enum Scenario {
@@ -152,163 +152,49 @@ async fn send_trailer_error(output: &mpsc::Sender<Result<proto::ExecSandboxEvent
         .await;
 }
 
-// Generate unused trait methods inside the async_trait expansion so this mock
-// implements only the RPC behavior under test without hand-written boilerplate.
-macro_rules! mock_gateway {
-    (
-        unary { $( $method:ident($request:ty) -> $response:ty; )* }
-        client_stream { $( $client_method:ident($client_request:ty) -> $client_response:ty; )* }
-        server_stream { $( $server_method:ident($server_request:ty) -> $stream_type:ident($server_response:ty); )* }
-        bidi { $( $bidi_method:ident($bidi_request:ty) -> $bidi_type:ident($bidi_response:ty); )* }
-    ) => {
-        #[tonic::async_trait]
-        impl OpenShell for MockGateway {
-            $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
-                Err(Status::unimplemented("unused test RPC"))
-            })*
-            $(async fn $client_method(&self, _: Request<tonic::Streaming<$client_request>>) -> Result<Response<$client_response>, Status> {
-                Err(Status::unimplemented("unused test RPC"))
-            })*
-            $(type $stream_type = ReceiverStream<Result<$server_response, Status>>;
-            async fn $server_method(&self, _: Request<$server_request>) -> Result<Response<Self::$stream_type>, Status> {
-                Err(Status::unimplemented("unused test RPC"))
-            })*
-            $(type $bidi_type = ReceiverStream<Result<$bidi_response, Status>>;
-            async fn $bidi_method(&self, _: Request<tonic::Streaming<$bidi_request>>) -> Result<Response<Self::$bidi_type>, Status> {
-                Err(Status::unimplemented("unused test RPC"))
-            })*
-
-            async fn get_sandbox(&self, _: Request<proto::GetSandboxRequest>) -> Result<Response<proto::SandboxResponse>, Status> {
-                self.calls.lock().unwrap().lookups += 1;
-                Ok(Response::new(proto::SandboxResponse {
-                    sandbox: Some(proto::Sandbox {
-                        metadata: Some(proto::datamodel::v1::ObjectMeta {
-                            id: "test-id".to_string(),
-                            name: "test-sandbox".to_string(),
-                            workspace: "default".to_string(),
-                            ..Default::default()
-                        }),
-                        status: Some(proto::SandboxStatus {
-                            phase: proto::SandboxPhase::Ready.into(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
+#[tonic::async_trait]
+impl OpenShell for MockGateway {
+    async fn get_sandbox(
+        &self,
+        _: Request<proto::GetSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        self.calls.lock().unwrap().lookups += 1;
+        Ok(Response::new(proto::SandboxResponse {
+            sandbox: Some(proto::Sandbox {
+                metadata: Some(proto::datamodel::v1::ObjectMeta {
+                    id: "test-id".to_string(),
+                    name: "test-sandbox".to_string(),
+                    workspace: "default".to_string(),
                     ..Default::default()
-                }))
-            }
-
-            type ExecSandboxStream = EventStream;
-            async fn exec_sandbox(&self, _: Request<proto::ExecSandboxRequest>) -> Result<Response<EventStream>, Status> {
-                self.calls.lock().unwrap().unary += 1;
-                Err(Status::unimplemented("test requires streaming exec"))
-            }
-
-            type ExecSandboxInteractiveStream = EventStream;
-            async fn exec_sandbox_interactive(&self, request: Request<tonic::Streaming<proto::ExecSandboxInput>>) -> Result<Response<EventStream>, Status> {
-                let (sender, receiver) = mpsc::channel(1);
-                let service = self.clone();
-                tokio::spawn(async move {
-                    service.exchange(request.into_inner(), sender).await;
-                });
-                Ok(Response::new(ReceiverStream::new(receiver)))
-            }
-        }
-    };
-}
-
-mock_gateway! {
-    unary {
-        health(proto::HealthRequest) -> proto::HealthResponse;
-        get_current_user(proto::GetCurrentUserRequest) -> proto::GetCurrentUserResponse;
-        get_gateway_info(proto::GetGatewayInfoRequest) -> proto::GetGatewayInfoResponse;
-        create_sandbox(proto::CreateSandboxRequest) -> proto::SandboxResponse;
-        begin_rootfs_tar_staging(proto::BeginRootfsTarStagingRequest) -> proto::BeginRootfsTarStagingResponse;
-        list_sandboxes(proto::ListSandboxesRequest) -> proto::ListSandboxesResponse;
-        create_sandbox_template(proto::CreateSandboxTemplateRequest) -> proto::SandboxTemplateResponse;
-        get_sandbox_template(proto::GetSandboxTemplateRequest) -> proto::SandboxTemplateResponse;
-        list_sandbox_templates(proto::ListSandboxTemplatesRequest) -> proto::ListSandboxTemplatesResponse;
-        delete_sandbox_template(proto::DeleteSandboxTemplateRequest) -> proto::DeleteSandboxTemplateResponse;
-        list_sandbox_providers(proto::ListSandboxProvidersRequest) -> proto::ListSandboxProvidersResponse;
-        attach_sandbox_provider(proto::AttachSandboxProviderRequest) -> proto::AttachSandboxProviderResponse;
-        detach_sandbox_provider(proto::DetachSandboxProviderRequest) -> proto::DetachSandboxProviderResponse;
-        get_sandbox_provider_status(proto::GetSandboxProviderStatusRequest) -> proto::GetSandboxProviderStatusResponse;
-        delete_sandbox(proto::DeleteSandboxRequest) -> proto::DeleteSandboxResponse;
-        stop_sandbox(proto::StopSandboxRequest) -> proto::SandboxResponse;
-        start_sandbox(proto::StartSandboxRequest) -> proto::SandboxResponse;
-        suspend_sandbox(proto::SuspendSandboxRequest) -> proto::SandboxResponse;
-        resume_sandbox(proto::ResumeSandboxRequest) -> proto::SandboxResponse;
-        create_ssh_session(proto::CreateSshSessionRequest) -> proto::CreateSshSessionResponse;
-        expose_service(proto::ExposeServiceRequest) -> proto::ServiceEndpointResponse;
-        get_service(proto::GetServiceRequest) -> proto::ServiceEndpointResponse;
-        list_services(proto::ListServicesRequest) -> proto::ListServicesResponse;
-        delete_service(proto::DeleteServiceRequest) -> proto::DeleteServiceResponse;
-        revoke_ssh_session(proto::RevokeSshSessionRequest) -> proto::RevokeSshSessionResponse;
-        create_provider(proto::CreateProviderRequest) -> proto::ProviderResponse;
-        get_provider_credentials(proto::GetProviderCredentialsRequest) -> proto::GetProviderCredentialsResponse;
-        get_provider(proto::GetProviderRequest) -> proto::ProviderResponse;
-        list_providers(proto::ListProvidersRequest) -> proto::ListProvidersResponse;
-        list_provider_profiles(proto::ListProviderProfilesRequest) -> proto::ListProviderProfilesResponse;
-        get_provider_profile(proto::GetProviderProfileRequest) -> proto::ProviderProfileResponse;
-        import_provider_profiles(proto::ImportProviderProfilesRequest) -> proto::ImportProviderProfilesResponse;
-        update_provider_profiles(proto::UpdateProviderProfilesRequest) -> proto::UpdateProviderProfilesResponse;
-        lint_provider_profiles(proto::LintProviderProfilesRequest) -> proto::LintProviderProfilesResponse;
-        update_provider(proto::UpdateProviderRequest) -> proto::ProviderResponse;
-        get_provider_refresh_status(proto::GetProviderRefreshStatusRequest) -> proto::GetProviderRefreshStatusResponse;
-        configure_provider_refresh(proto::ConfigureProviderRefreshRequest) -> proto::ConfigureProviderRefreshResponse;
-        rotate_provider_credential(proto::RotateProviderCredentialRequest) -> proto::RotateProviderCredentialResponse;
-        delete_provider_refresh(proto::DeleteProviderRefreshRequest) -> proto::DeleteProviderRefreshResponse;
-        delete_provider(proto::DeleteProviderRequest) -> proto::DeleteProviderResponse;
-        delete_provider_profile(proto::DeleteProviderProfileRequest) -> proto::DeleteProviderProfileResponse;
-        get_sandbox_config(proto::GetSandboxConfigRequest) -> proto::GetSandboxConfigResponse;
-        get_gateway_config(proto::GetGatewayConfigRequest) -> proto::GetGatewayConfigResponse;
-        update_config(proto::UpdateConfigRequest) -> proto::UpdateConfigResponse;
-        get_sandbox_policy_status(proto::GetSandboxPolicyStatusRequest) -> proto::GetSandboxPolicyStatusResponse;
-        list_sandbox_policies(proto::ListSandboxPoliciesRequest) -> proto::ListSandboxPoliciesResponse;
-        report_policy_status(proto::ReportPolicyStatusRequest) -> proto::ReportPolicyStatusResponse;
-        report_endpoint_status(proto::ReportEndpointStatusRequest) -> proto::ReportEndpointStatusResponse;
-        report_provider_readiness(proto::ReportProviderReadinessRequest) -> proto::ReportProviderReadinessResponse;
-        report_sandbox_configuration(proto::ReportSandboxConfigurationRequest) -> proto::ReportSandboxConfigurationResponse;
-        get_sandbox_provider_environment(proto::GetSandboxProviderEnvironmentRequest) -> proto::GetSandboxProviderEnvironmentResponse;
-        exchange_provider_subject_token(proto::ExchangeProviderSubjectTokenRequest) -> proto::ExchangeProviderSubjectTokenResponse;
-        get_sandbox_provider_access_token(proto::GetSandboxProviderAccessTokenRequest) -> proto::GetSandboxProviderAccessTokenResponse;
-        get_sandbox_logs(proto::GetSandboxLogsRequest) -> proto::GetSandboxLogsResponse;
-        report_main_process_exit(proto::ReportMainProcessExitRequest) -> proto::ReportMainProcessExitResponse;
-        finalize_main_process_exit(proto::FinalizeMainProcessExitRequest) -> proto::FinalizeMainProcessExitResponse;
-        peer_report_provider_readiness(proto::ReportProviderReadinessRequest) -> proto::ReportProviderReadinessResponse;
-        peer_report_endpoint_status(proto::ReportEndpointStatusRequest) -> proto::ReportEndpointStatusResponse;
-        peer_get_sandbox_provider_status(proto::GetSandboxProviderStatusRequest) -> proto::GetSandboxProviderStatusResponse;
-        peer_notify_config_update(proto::PeerNotifyConfigUpdateRequest) -> proto::PeerNotifyConfigUpdateResponse;
-        submit_policy_analysis(proto::SubmitPolicyAnalysisRequest) -> proto::SubmitPolicyAnalysisResponse;
-        get_draft_policy(proto::GetDraftPolicyRequest) -> proto::GetDraftPolicyResponse;
-        approve_draft_chunk(proto::ApproveDraftChunkRequest) -> proto::ApproveDraftChunkResponse;
-        reject_draft_chunk(proto::RejectDraftChunkRequest) -> proto::RejectDraftChunkResponse;
-        approve_all_draft_chunks(proto::ApproveAllDraftChunksRequest) -> proto::ApproveAllDraftChunksResponse;
-        edit_draft_chunk(proto::EditDraftChunkRequest) -> proto::EditDraftChunkResponse;
-        undo_draft_chunk(proto::UndoDraftChunkRequest) -> proto::UndoDraftChunkResponse;
-        clear_draft_chunks(proto::ClearDraftChunksRequest) -> proto::ClearDraftChunksResponse;
-        get_draft_history(proto::GetDraftHistoryRequest) -> proto::GetDraftHistoryResponse;
-        issue_sandbox_token(proto::IssueSandboxTokenRequest) -> proto::IssueSandboxTokenResponse;
-        refresh_sandbox_token(proto::RefreshSandboxTokenRequest) -> proto::RefreshSandboxTokenResponse;
-        create_workspace(proto::CreateWorkspaceRequest) -> proto::CreateWorkspaceResponse;
-        get_workspace(proto::GetWorkspaceRequest) -> proto::GetWorkspaceResponse;
-        list_workspaces(proto::ListWorkspacesRequest) -> proto::ListWorkspacesResponse;
-        delete_workspace(proto::DeleteWorkspaceRequest) -> proto::DeleteWorkspaceResponse;
-        add_workspace_member(proto::AddWorkspaceMemberRequest) -> proto::AddWorkspaceMemberResponse;
-        remove_workspace_member(proto::RemoveWorkspaceMemberRequest) -> proto::RemoveWorkspaceMemberResponse;
-        list_workspace_members(proto::ListWorkspaceMembersRequest) -> proto::ListWorkspaceMembersResponse;
+                }),
+                status: Some(proto::SandboxStatus {
+                    phase: proto::SandboxPhase::Ready.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
     }
-    client_stream {
-        push_sandbox_logs(proto::PushSandboxLogsRequest) -> proto::PushSandboxLogsResponse;
+
+    async fn exec_sandbox(
+        &self,
+        _: Request<proto::ExecSandboxRequest>,
+    ) -> Result<Response<EventStream>, Status> {
+        self.calls.lock().unwrap().unary += 1;
+        Err(Status::unimplemented("test requires streaming exec"))
     }
-    server_stream {
-        watch_sandbox(proto::WatchSandboxRequest) -> WatchSandboxStream(proto::SandboxStreamEvent);
-    }
-    bidi {
-        forward_tcp(proto::TcpForwardFrame) -> ForwardTcpStream(proto::TcpForwardFrame);
-        connect_supervisor(proto::SupervisorMessage) -> ConnectSupervisorStream(proto::GatewayMessage);
-        relay_stream(proto::RelayFrame) -> RelayStreamStream(proto::RelayFrame);
-        peer_relay(proto::PeerRelayFrame) -> PeerRelayStream(proto::PeerRelayFrame);
+
+    async fn exec_sandbox_interactive(
+        &self,
+        request: Request<tonic::Streaming<proto::ExecSandboxInput>>,
+    ) -> Result<Response<EventStream>, Status> {
+        let (sender, receiver) = mpsc::channel(1);
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.exchange(request.into_inner(), sender).await;
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 }
 

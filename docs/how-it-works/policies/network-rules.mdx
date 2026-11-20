@@ -121,6 +121,21 @@ protocol combine. Rules using another protocol cannot authorize the request;
 for example, a broader REST rule cannot allow a method excluded by a JSON-RPC
 route. Matching deny rules still take precedence over allows.
 
+### HTTP Connection Failures
+
+When an HTTP upstream closes an idle connection, OpenShell closes the client
+connection so clients can retire it from their pools. If an allowed request
+encounters an upstream failure before its final response starts, OpenShell
+returns `502 Bad Gateway` with `Connection: close` and a request ID. A completed
+informational response, such as `100 Continue`, still permits a final `502`.
+After any final response bytes reach the client, OpenShell closes the connection
+without appending another status.
+
+This applies to every HTTP method, including `GET`. Clients that automatically
+retry a closed connection may treat the `502` as a response and leave retry
+decisions to the application. OpenShell does not reconnect or replay requests;
+an upstream may have processed a request even when its response was lost.
+
 ### Enforcement
 
 The `enforcement` field on an inspected endpoint decides what happens when a

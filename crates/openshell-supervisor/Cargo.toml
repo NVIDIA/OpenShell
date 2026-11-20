@@ -68,6 +68,7 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 bytes = { workspace = true }

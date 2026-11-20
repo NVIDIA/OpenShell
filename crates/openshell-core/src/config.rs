@@ -394,6 +394,9 @@ pub struct Config {
     /// Disabled by default; not a license to run mixed-version writers.
     pub enable_sandbox_updates: bool,
 
+    /// Workspace secret activation and reveal settings.
+    pub workspace_secrets: WorkspaceSecretsConfig,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -512,6 +515,8 @@ pub struct Config {
 /// Part of the programmatically-built [`Config`]; never deserialized directly.
 #[derive(Debug, Clone)]
 pub struct ServiceRoutingConfig {
+    /// Publish gateway URLs and forward application requests through the gateway.
+    pub enabled: bool,
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
     pub base_domains: Vec<String>,
@@ -655,6 +660,18 @@ pub struct MetricsTlsConfig {
     pub require_client_auth: bool,
 }
 
+/// Workspace secret settings. Both default to off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSecretsConfig {
+    /// Operator activation for creating workspace secrets and referencing them
+    /// from provider refresh configuration. Enable only after every gateway
+    /// that can serve traffic supports workspace secrets.
+    pub enabled: bool,
+    /// Allow `RevealSecret` to return values to mTLS operators. Enable only
+    /// for a control-plane service that needs it.
+    pub reveal_enabled: bool,
+}
+
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
 ///
 /// When configured, the server validates `authorization: Bearer <JWT>`
@@ -725,6 +742,11 @@ pub struct GatewayAuditConfig {
     /// sets. Bytes values are never recorded.
     #[serde(default)]
     pub capture_setting_values: bool,
+    /// Record the command arguments of `ExecSandbox` and
+    /// `ExecSandboxInteractive` calls. Environment variables and standard
+    /// input are never recorded.
+    #[serde(default)]
+    pub capture_exec_command: bool,
 }
 
 /// mTLS user authentication for gateway users.
@@ -1212,6 +1234,7 @@ impl Config {
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
             enable_sandbox_updates: false,
+            workspace_secrets: WorkspaceSecretsConfig::default(),
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
@@ -1454,6 +1477,13 @@ impl Config {
             .then_some(self.name.as_str())
     }
 
+    /// Enable gateway-mediated application routing independently of app listeners.
+    #[must_use]
+    pub const fn with_service_routing(mut self, enabled: bool) -> Self {
+        self.service_routing.enabled = enabled;
+        self
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1473,6 +1503,7 @@ impl Config {
 impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
             service_hostname_format: ServiceHostnameFormat::default(),

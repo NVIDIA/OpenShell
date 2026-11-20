@@ -7,9 +7,9 @@ use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
 use openshell_core::proto::{
-    CreateSandboxRequest, SandboxServiceExposure, SandboxSpec, SandboxWorkloadConfig,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-    WorkspaceMember, WorkspaceRole,
+    CreateSandboxRequest, ExposeServiceRequest, SandboxServiceExposure, SandboxSpec,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    ServiceAuthorizationMode, WorkspaceMember, WorkspaceRole,
 };
 use openshell_core::rpc_error::StatusExt;
 use std::collections::HashMap;
@@ -91,6 +91,225 @@ fn canonical_payload_ignores_map_order_and_id_but_preserves_presence() {
     let absent = fingerprint(&template).unwrap();
     template.template = Some(SandboxWorkloadTemplate::default());
     assert_ne!(absent, fingerprint(&template).unwrap());
+}
+
+async fn url_replay_state() -> (Arc<ServerState>, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("private-key");
+    std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
+    let mut state = test_server_state().await;
+    let config = &mut Arc::get_mut(&mut state).unwrap().config;
+    config.gateway_jwt = Some(openshell_core::config::GatewayJwtConfig {
+        signing_key_path: key,
+        public_key_path: directory.path().join("public"),
+        kid_path: directory.path().join("kid"),
+        gateway_id: "test".into(),
+        ttl_secs: None,
+    });
+    (state, directory)
+}
+
+#[tokio::test]
+async fn create_url_maps_follow_independent_routing_flags_and_replays_keep_recorded_urls() {
+    for gateway_enabled in [false, true] {
+        for application_enabled in [false, true] {
+            let (mut state, _directory) = url_replay_state().await;
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.service_routing.enabled = gateway_enabled;
+            config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+                enabled: application_enabled,
+                base_url: application_enabled.then(|| "https://services.example.com:10443".into()),
+                ..Default::default()
+            };
+            let request = CreateSandboxRequest {
+                name: "routing-matrix".into(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                service_exposures: ["", "web"]
+                    .into_iter()
+                    .map(|service| SandboxServiceExposure {
+                        service: service.into(),
+                        target_port: 8080,
+                        ..Default::default()
+                    })
+                    .collect(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                ..Default::default()
+            };
+            let original = run(&state, authed_request(request.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                original.gateway_service_urls.len(),
+                if gateway_enabled { 2 } else { 0 }
+            );
+            assert_eq!(
+                original.application_service_urls.len(),
+                if application_enabled { 2 } else { 0 }
+            );
+            for service in ["", "web"] {
+                if application_enabled {
+                    assert_eq!(
+                        original.service_urls[service],
+                        original.application_service_urls[service]
+                    );
+                } else if gateway_enabled {
+                    assert_eq!(
+                        original.service_urls[service],
+                        original.gateway_service_urls[service]
+                    );
+                } else {
+                    assert!(original.service_urls[service].is_empty());
+                }
+            }
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.service_routing.enabled = !gateway_enabled;
+            config.supervisor_app_listener.enabled = !application_enabled;
+            config.supervisor_app_listener.base_url =
+                (!application_enabled).then(|| "https://services.example.com:10443".into());
+            let replay = run(&state, authed_request(request)).await.unwrap();
+            assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+            assert_eq!(replay.get_ref().service_urls, original.service_urls);
+            assert_eq!(
+                replay.get_ref().gateway_service_urls,
+                original.gateway_service_urls
+            );
+            assert_eq!(
+                replay.get_ref().application_service_urls,
+                original.application_service_urls
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_replay_preserves_all_recorded_urls_when_origins_change() {
+    let (mut state, _directory) = url_replay_state().await;
+    let request = CreateSandboxRequest {
+        name: "origin-replay".into(),
+        spec: Some(SandboxSpec::default()),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        service_exposures: ["", "web"]
+            .into_iter()
+            .map(|service| SandboxServiceExposure {
+                service: service.into(),
+                target_port: 8080,
+                ..Default::default()
+            })
+            .collect(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+    let original = run(&state, authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let config = &mut Arc::get_mut(&mut state).unwrap().config;
+    config.service_routing.base_domains = vec!["gateway.example.com".into()];
+    config.bind_address.set_port(12443);
+    config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+        enabled: true,
+        port: 9443,
+        base_url: Some("https://services.example.com:10443".into()),
+    };
+    let replay = run(&state, authed_request(request)).await.unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(
+        original.sandbox.as_ref().unwrap().metadata,
+        replay.get_ref().sandbox.as_ref().unwrap().metadata
+    );
+    assert_eq!(replay.get_ref().service_urls, original.service_urls);
+    assert_eq!(
+        replay.get_ref().application_service_urls,
+        original.application_service_urls
+    );
+    assert_eq!(
+        replay.get_ref().gateway_service_urls,
+        original.gateway_service_urls
+    );
+}
+
+#[tokio::test]
+async fn expose_replay_preserves_recorded_url_when_origins_change_or_are_disabled() {
+    let (mut state, _directory) = url_replay_state().await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+        enabled: true,
+        port: 9443,
+        base_url: Some("https://old.example.com:10443".into()),
+    };
+    run(
+        &state,
+        authed_request(CreateSandboxRequest {
+            name: "expose-replay".into(),
+            spec: Some(SandboxSpec::default()),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let request = ExposeServiceRequest {
+        sandbox: "expose-replay".into(),
+        name: "web".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        target_port: 8080,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+    let original = run(&state, authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        original.url,
+        "https://default--expose-replay--web.old.example.com:10443/"
+    );
+    let config = &mut Arc::get_mut(&mut state).unwrap().config;
+    config.service_routing.base_domains = vec!["gateway.example.com".into()];
+    config.bind_address.set_port(12443);
+    config.supervisor_app_listener.base_url = Some("https://new.example.com:11443".into());
+    let replay = run(&state, authed_request(request.clone())).await.unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(replay.get_ref(), &original);
+    let current = super::super::service::handle_get_service(
+        &state,
+        authed_request(openshell_core::proto::GetServiceRequest {
+            sandbox: "expose-replay".into(),
+            name: "web".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(
+        current.url,
+        "https://default--expose-replay--web.new.example.com:11443/"
+    );
+    assert_eq!(current.url, current.application_url);
+    let config = &mut Arc::get_mut(&mut state).unwrap().config;
+    config.supervisor_app_listener.enabled = false;
+    config.supervisor_app_listener.base_url = None;
+    let without_application = run(&state, authed_request(request.clone())).await.unwrap();
+    assert_eq!(
+        without_application
+            .metadata()
+            .get("openshell-replayed")
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(without_application.get_ref(), &original);
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .service_routing
+        .enabled = false;
+    let without_either_path = run(&state, authed_request(request)).await.unwrap();
+    assert_eq!(without_either_path.get_ref(), &original);
 }
 
 #[tokio::test]

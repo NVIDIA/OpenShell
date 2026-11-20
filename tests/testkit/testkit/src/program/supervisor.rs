@@ -12,6 +12,7 @@
 //! handle `SIGTERM` yet, so sandboxes named `test-<run id>-*` can be left
 //! behind.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -47,6 +48,8 @@ pub enum Outcome {
     Passed,
     /// Ignored and not asked for.
     Skipped,
+    /// Listed in `OPENSHELL_TEST_UNSUPPORTED` with this issue.
+    Unsupported(String),
     Failed(String),
     TimedOut(String),
     /// The test could not be run.
@@ -59,18 +62,21 @@ impl Outcome {
     fn label(&self) -> &'static str {
         match self {
             Self::Passed => "PASS",
-            Self::Skipped => "SKIP",
+            Self::Skipped | Self::Unsupported(_) => "SKIP",
             Self::Failed(_) => "FAIL",
             Self::TimedOut(_) => "TIMEOUT",
             Self::Error(_) | Self::Interrupted => "ERROR",
         }
     }
 
-    fn message(&self) -> Option<&str> {
+    fn message(&self) -> Option<Cow<'_, str>> {
         match self {
             Self::Passed | Self::Skipped => None,
-            Self::Failed(message) | Self::TimedOut(message) | Self::Error(message) => Some(message),
-            Self::Interrupted => Some("interrupted"),
+            Self::Unsupported(issue) => Some(format!("unsupported: {issue}").into()),
+            Self::Failed(message) | Self::TimedOut(message) | Self::Error(message) => {
+                Some(message.into())
+            }
+            Self::Interrupted => Some("interrupted".into()),
         }
     }
 }
@@ -94,7 +100,7 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
         "{program}: running {to_run} test{} one at a time{}",
         plural(to_run),
         if skipped > 0 {
-            format!(", skipping {skipped} ignored")
+            format!(", skipping {skipped} ignored or unsupported")
         } else {
             String::new()
         }
@@ -109,10 +115,15 @@ pub fn run(program: &str, exe: &Path, tests: &[Test], options: &Options) -> Exit
         if process::stop_requested() {
             break;
         }
-        if disposition == Disposition::Skip {
+        let skip = match disposition {
+            Disposition::Run => None,
+            Disposition::Skip => Some(Outcome::Skipped),
+            Disposition::Unsupported(issue) => Some(Outcome::Unsupported(issue)),
+        };
+        if let Some(outcome) = skip {
             runs.push(TestRun {
                 test,
-                outcome: Outcome::Skipped,
+                outcome,
                 duration: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
@@ -157,7 +168,8 @@ fn run_one<'a>(exe: &Path, test: &'a Test, options: &Options) -> TestRun<'a> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if test.ignored {
+    // The test process lists an unsupported test as ignored, then refuses it.
+    if test.ignored || options.selection.unsupported.issue(test).is_some() {
         command.arg("--ignored");
     }
 
@@ -229,7 +241,7 @@ fn summarize(program: &str, runs: &[TestRun<'_>], not_run: usize, elapsed: Durat
     let passed = count(|outcome| matches!(outcome, Outcome::Passed));
     let failed = count(|outcome| matches!(outcome, Outcome::Failed(_) | Outcome::TimedOut(_)));
     let errors = count(|outcome| matches!(outcome, Outcome::Error(_) | Outcome::Interrupted));
-    let skipped = count(|outcome| matches!(outcome, Outcome::Skipped));
+    let skipped = count(|outcome| matches!(outcome, Outcome::Skipped | Outcome::Unsupported(_)));
     let mut summary = format!("{program}: {passed} passed, {failed} failed");
     if errors > 0 {
         let _ = write!(summary, ", {errors} could not run");
@@ -294,6 +306,7 @@ mod tests {
     fn exit_code_separates_failures_from_runs_that_could_not_complete() {
         let code = |outcomes| summarize("p", &runs(outcomes), 0, Duration::ZERO);
         assert_eq!(code(vec![Outcome::Passed, Outcome::Skipped]), 0);
+        assert_eq!(code(vec![Outcome::Unsupported("i".into())]), 0);
         assert_eq!(code(vec![Outcome::Passed, Outcome::Failed("f".into())]), 1);
         assert_eq!(code(vec![Outcome::TimedOut("t".into())]), 1);
         assert_eq!(

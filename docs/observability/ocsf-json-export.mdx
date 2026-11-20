@@ -64,9 +64,9 @@ The gateway also emits an API Activity event for each call a user or mTLS operat
 
 `status_detail` qualifies the outcome: `no_op:<reason>` when a successful call changed nothing, `rejected:<code>` (Low) or `error:<code>` (Medium) with the gRPC code when it failed, and `unknown:cancelled` (Medium) when the client disconnected before the call finished, which may still have applied the change.
 
-`resources` names the workspace and the resources the call acted on.
+`resources` names the workspace and the resources the call acted on. An exec's `exec` resource has as its `uid` the `channel_id` from the exec's `command started` line in the gateway's sandbox logs, so you can match the record to the command's log lines.
 
-Records never include credentials, tokens, environment variables, or standard input. Setting values appear only when [enabled](/how-it-works/gateways/configuration#gateway-mutation-records).
+Records never include credentials, tokens, environment variables, or standard input. Setting values and exec command arguments appear only when [enabled](/how-it-works/gateways/configuration#gateway-mutation-records).
 
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 

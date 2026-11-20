@@ -310,11 +310,11 @@ service.
   setup playbook starts the service (with a restart policy, since setup is
   cached as a disk) and writes the variables as `KEY=VALUE` lines to
   `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
-  through the environment's setup `inputs`, and add them to the tmachine disk
-  cache key in `e2e-suites.yml`. The runner rejects names without the
-  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
-  values never appear in a runner command. Values are taken literally, without
-  quoting.
+  through the environment's setup `inputs`; they are part of the setup layer's
+  hash, which CI's disk cache keys on too. The runner rejects names without
+  the `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest,
+  so values never appear in a runner command. Values are taken literally,
+  without quoting.
 - **Fixture.** Put the service's fixture in a support crate under
   `tests/support/<service>`, named `<service>-support`, so any suite can
   depend on it, or reuse the existing one. It defines the variable names as constants and a

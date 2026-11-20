@@ -385,7 +385,7 @@ async fn accept_inner(
             .collect(),
     };
     if !report.routes.is_empty() {
-        if report.service_domain != state.config.supervisor_app_listener.domain {
+        if report.service_domain != state.config.supervisor_app_listener.domain() {
             return Err(Status::failed_precondition(
                 "installed listener domain is not current",
             ));
@@ -498,7 +498,7 @@ pub(super) async fn current_sandbox(
 ) -> Result<Option<Sandbox>, Status> {
     if !state.config.supervisor_app_listener.enabled
         || record.expires_at_ms <= current_time_ms()
-        || record.service_domain != state.config.supervisor_app_listener.domain
+        || record.service_domain != state.config.supervisor_app_listener.domain()
         || record.routes.is_empty()
     {
         return Ok(None);
@@ -1003,6 +1003,7 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 2,
+            application_hostname: String::new(),
         }
     }
 
@@ -1195,6 +1196,17 @@ pub(super) mod test_support {
     use super::*;
     pub async fn installed_fixture()
     -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
+        installed_fixture_for_gateway(
+            "gateway-a",
+            openshell_core::config::ServiceHostnameFormat::Readable,
+        )
+        .await
+    }
+
+    pub async fn installed_fixture_for_gateway(
+        gateway: &str,
+        format: openshell_core::config::ServiceHostnameFormat,
+    ) -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
         use openshell_core::proto::datamodel::v1::ObjectMeta;
         use openshell_core::proto::{SandboxPolicy, SandboxSpec, ServiceEndpoint};
         let endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
@@ -1220,11 +1232,14 @@ pub(super) mod test_support {
             .unwrap()
             .config
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            base_url: Some("https://services.example.com".into()),
             enabled: true,
             port: 9443,
-            domain: "services.example.com".into(),
         };
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.name = gateway.into();
+        inner.config.service_routing.service_hostname_format = format;
+        inner.admin_role = "openshell-admin".into();
         let sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: "sandbox".into(),

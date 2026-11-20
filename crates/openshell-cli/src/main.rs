@@ -409,6 +409,15 @@ const WORKSPACE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell workspace delete staging
 ";
 
+const SECRET_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ openshell secret create acme-oauth-client --value-env CLIENT_SECRET \\
+      --allowed-endpoint https://login.example.com/oauth/token
+  $ openshell secret create signing-key --value-file ./signing-key.pem
+  $ openshell secret update acme-oauth-client --value-file ./client-secret
+  $ openshell secret list
+  $ openshell secret delete acme-oauth-client
+";
+
 const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   gw
 
@@ -601,6 +610,13 @@ enum Commands {
     Workspace {
         #[command(subcommand)]
         command: Option<WorkspaceCommands>,
+    },
+
+    /// Manage workspace secrets used as shared credential minting material.
+    #[command(after_help = SECRET_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Secret {
+        #[command(subcommand)]
+        command: Option<SecretCommands>,
     },
 
     // ===================================================================
@@ -1044,6 +1060,11 @@ enum ProviderRefreshCommands {
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
 
+        /// Secret refresh material supplied by a workspace secret
+        /// (`KEY=SECRET`); `KEY` is auto-marked secret.
+        #[arg(long = "material-secret", value_name = "KEY=SECRET")]
+        material_secrets: Vec<String>,
+
         /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
         #[arg(
             long = "credential-expires-at",
@@ -1068,6 +1089,21 @@ enum ProviderRefreshCommands {
     /// Delete refresh metadata for a provider credential.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+
+    /// Copy referenced workspace secrets into provider-owned refresh material.
+    ///
+    /// Keeps the current grant, including a rotated refresh token. Run it
+    /// before deleting a secret or rolling back workspace secrets.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    InlineSecrets {
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
@@ -2578,6 +2614,109 @@ enum WorkspaceCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum SecretCommands {
+    /// Create a workspace secret.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Secret name (DNS-1123 label).
+        name: String,
+
+        /// Read the value from this local environment variable.
+        #[arg(long = "value-env", value_name = "ENVVAR")]
+        value_env: Option<String>,
+
+        /// Read the value from this file, stored exactly as read, including any
+        /// trailing newline. Write it with `printf '%s'` to avoid one.
+        #[arg(long = "value-file", value_name = "PATH")]
+        value_file: Option<PathBuf>,
+
+        /// Token endpoint provider refresh may send the value to. Repeatable;
+        /// cannot be changed after creation. Omit for a reveal-only secret.
+        #[arg(long = "allowed-endpoint", value_name = "URL")]
+        allowed_endpoints: Vec<String>,
+
+        /// Human-readable description.
+        #[arg(long, default_value = "")]
+        description: String,
+
+        /// Labels to attach to the secret (KEY=VALUE).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Replace a workspace secret's value, description, or labels.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Secret name.
+        name: String,
+
+        /// Read the new value from this local environment variable.
+        #[arg(long = "value-env", value_name = "ENVVAR")]
+        value_env: Option<String>,
+
+        /// Read the new value from this file, stored exactly as read, including
+        /// any trailing newline. Write it with `printf '%s'` to avoid one.
+        #[arg(long = "value-file", value_name = "PATH")]
+        value_file: Option<PathBuf>,
+
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Replace all labels (KEY=VALUE). Repeatable.
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Option<Vec<String>>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show workspace secret metadata. The value is never shown.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Secret name.
+        name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List workspace secrets.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of secrets to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Filter by label selector (e.g. "team=platform").
+        #[arg(long)]
+        label_selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Delete workspace secrets. Fails while a provider refresh references one.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Secret name(s) to delete.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum WorkspaceMemberCommands {
     /// Add a member to a workspace.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -4021,6 +4160,7 @@ async fn run_async() -> Result<()> {
                         material,
                         secret_material_env,
                         secret_material_keys,
+                        material_secrets,
                         credential_expires_at,
                     } => {
                         run::provider_refresh_config(
@@ -4032,6 +4172,7 @@ async fn run_async() -> Result<()> {
                                 material: &material,
                                 secret_material_env: &secret_material_env,
                                 secret_material_keys: &secret_material_keys,
+                                material_secrets: &material_secrets,
                                 credential_expires_at_ms: credential_expires_at,
                             },
                             &cli.workspace,
@@ -4057,6 +4198,19 @@ async fn run_async() -> Result<()> {
                         credential_key,
                     } => {
                         run::provider_refresh_delete(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::InlineSecrets {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_inline_secrets(
                             endpoint,
                             &name,
                             &credential_key,
@@ -4256,6 +4410,98 @@ async fn run_async() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("settings")
                 .expect("settings subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Secret {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            match command {
+                SecretCommands::Create {
+                    name,
+                    value_env,
+                    value_file,
+                    allowed_endpoints,
+                    description,
+                    labels,
+                    output,
+                } => {
+                    run::secret_create(
+                        endpoint,
+                        run::SecretCreateInput {
+                            name: &name,
+                            description: &description,
+                            value: run::SecretValueSource {
+                                env: value_env.as_deref(),
+                                file: value_file.as_deref(),
+                            },
+                            allowed_endpoints: &allowed_endpoints,
+                            labels: &labels,
+                        },
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Update {
+                    name,
+                    value_env,
+                    value_file,
+                    description,
+                    labels,
+                    output,
+                } => {
+                    run::secret_update(
+                        endpoint,
+                        run::SecretUpdateInput {
+                            name: &name,
+                            value: run::SecretValueSource {
+                                env: value_env.as_deref(),
+                                file: value_file.as_deref(),
+                            },
+                            description: description.as_deref(),
+                            labels: labels.as_deref(),
+                        },
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Get { name, output } => {
+                    run::secret_get(endpoint, &name, output.as_str(), &cli.workspace, &tls).await?;
+                }
+                SecretCommands::List {
+                    page_size,
+                    page_token,
+                    label_selector,
+                    output,
+                } => {
+                    run::secret_list(
+                        endpoint,
+                        page_size,
+                        &page_token,
+                        label_selector.as_deref().unwrap_or(""),
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Delete { names } => {
+                    run::secret_delete(endpoint, &names, &cli.workspace, &tls).await?;
+                }
+            }
+        }
+        Some(Commands::Secret { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("secret")
+                .expect("secret subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
