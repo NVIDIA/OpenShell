@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "corporate-proxy"
+description = "Features suite: sandbox egress through an authenticated, TLS-intercepting corporate proxy"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+[dependencies]
+container-engine-support = { path = "../../../support/container-engine" }
+corporate-proxy-support = { path = "../../../support/corporate-proxy" }
+host-server-support = { path = "../../../support/host-server" }
+openshell-testkit = { path = "../../../testkit/testkit" }
+serde_json = "1"
