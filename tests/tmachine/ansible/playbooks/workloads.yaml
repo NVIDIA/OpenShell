@@ -1,78 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build the images of the workloads suite (tests/suites/workloads) into the
-# container engine's image store, and publish their names.
-#
-# Environment setup applies this once and caches the disk, keyed on the
-# Dockerfiles, so the tests find the images in place and need no network.
-# Each workload names its Dockerfile in a setup input, and the suite reads
-# OPENSHELL_TEST_WORKLOAD_<NAME>_IMAGE.
+# Build the workloads suite's images (tests/suites/workloads) into Docker and
+# publish their names. Environment setup applies this once and caches the
+# disk, keyed on the Dockerfiles, so the tests need no network.
 ---
 - name: Workload images for tests
   hosts: all
   gather_facts: false
-  vars:
-    workload_images:
-      - name: make
-        dockerfile: "{{ workload_make_dockerfile }}"
-        image: localhost/openshell/workload-make:dev
-        variable: OPENSHELL_TEST_WORKLOAD_MAKE_IMAGE
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Detect the container runtime
-      ansible.builtin.include_role:
-        name: tmachine_container_runtime
-
-    # Rootless Podman keeps its images in the tmachine user's store, the one
-    # the gateway uses.
-    - name: Select the user that owns the image store
-      ansible.builtin.set_fact:
-        workload_image_user: "{{ 'tmachine' if tmachine_container_runtime_is_rootless | bool else 'root' }}"
-        workload_image_root: /var/lib/openshell-test/workloads
-        workload_image_environment: >-
-          {{ {'HOME': '/home/tmachine',
-              'XDG_RUNTIME_DIR': '/run/user/' ~ tmachine_container_runtime_tmachine_uid.stdout}
-             if tmachine_container_runtime_is_rootless | bool else {} }}
-
-    - name: Create the workload build directories
+    - name: Create the make workload build directory
       become: true
       ansible.builtin.file:
-        path: "{{ workload_image_root }}/{{ item.name }}"
+        path: /var/lib/openshell-test/workloads/make
         state: directory
-        owner: "{{ workload_image_user }}"
-        group: "{{ workload_image_user }}"
         mode: "0755"
-      loop: "{{ workload_images }}"
 
-    - name: Copy the workload Dockerfiles
+    - name: Copy the make workload Dockerfile
       become: true
       ansible.builtin.copy:
-        src: "{{ item.dockerfile }}"
-        dest: "{{ workload_image_root }}/{{ item.name }}/Dockerfile"
-        owner: "{{ workload_image_user }}"
-        group: "{{ workload_image_user }}"
+        src: "{{ workload_make_dockerfile }}"
+        dest: /var/lib/openshell-test/workloads/make/Dockerfile
         mode: "0644"
-      loop: "{{ workload_images }}"
 
-    - name: Build the workload images
+    - name: Build the make workload image
       become: true
-      become_user: "{{ workload_image_user }}"
       ansible.builtin.command:
-        argv:
-          - "{{ tmachine_container_runtime_name }}"
-          - build
-          - --tag
-          - "{{ item.image }}"
-          - "{{ workload_image_root }}/{{ item.name }}"
-        chdir: "{{ workload_image_root }}"
-      environment: "{{ workload_image_environment }}"
-      loop: "{{ workload_images }}"
+        argv: [docker, build, --tag, localhost/openshell/workload-make:dev, /var/lib/openshell-test/workloads/make]
+      changed_when: true
 
     - name: Publish the workload image variables
       ansible.builtin.include_tasks: test-env.yaml
       vars:
         test_env_name: workloads
-        test_env_vars: "{{ workload_images | items2dict(key_name='variable', value_name='image') }}"
+        test_env_vars:
+          OPENSHELL_TEST_WORKLOAD_MAKE_IMAGE: localhost/openshell/workload-make:dev
