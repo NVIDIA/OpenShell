@@ -1013,6 +1013,7 @@ fn build_staged_transparent_denial_event(
         .status(StatusId::Failure)
         .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
         .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
+        .guest_sourced()
         .message(format!("Transparent TCP denied before relay: {reason}"))
         .status_detail(status_detail)
         .build()
@@ -1534,6 +1535,7 @@ fn build_transparent_tcp_allow_ocsf_event(
             "authorization_policy_generation",
             audit.authorization_policy_generation,
         )
+        .guest_sourced()
         .message(message)
         .status_detail("transparent_tcp_allowed");
     if let Some(destination) = audit.connected_real_destination {
@@ -1623,6 +1625,7 @@ fn emit_transparent_policy_denial(
             .dst_endpoint(Endpoint::from_domain(host, port))
             .src_endpoint_addr(workload.ip(), workload.port())
             .actor_process(Process::from_bypass(&binary, &pid, "-"))
+            .guest_sourced()
             .firewall_rule("-", "opa")
             .message(format!("Transparent TCP denied {host}:{port}"))
             .status_detail(status_detail)
@@ -2046,7 +2049,9 @@ fn build_connect_allow_ocsf_event(
     } else {
         "CONNECT"
     };
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    // The acting-process identity is boundary-reported; for an untrusted
+    // guest it is guest data, so the event carries the guest-sourced mark.
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Allowed)
         .disposition(DispositionId::Allowed)
@@ -2056,8 +2061,11 @@ fn build_connect_allow_ocsf_event(
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
         .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
         .firewall_rule(policy, "opa")
-        .message(format!("{connect_msg} allowed {host}:{port}"))
-        .build()
+        .message(format!("{connect_msg} allowed {host}:{port}"));
+    if openshell_ocsf::ctx::guest_data_origin() {
+        builder = builder.guest_sourced();
+    }
+    builder.build()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2073,7 +2081,9 @@ fn build_forward_allow_ocsf_event(
     cmdline: &str,
     policy: &str,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    // The acting-process identity is boundary-reported; for an untrusted
+    // guest it is guest data, so the event carries the guest-sourced mark.
+    let mut builder = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::for_http_method(method))
         .action(ActionId::Allowed)
         .disposition(DispositionId::Allowed)
@@ -2087,8 +2097,11 @@ fn build_forward_allow_ocsf_event(
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
         .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
         .firewall_rule(policy, "opa")
-        .message(format!("FORWARD allowed {method} {host}:{port}{path}"))
-        .build()
+        .message(format!("FORWARD allowed {method} {host}:{port}{path}"));
+    if openshell_ocsf::ctx::guest_data_origin() {
+        builder = builder.guest_sourced();
+    }
+    builder.build()
 }
 
 fn build_forward_rejection_event(
@@ -9043,7 +9056,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         assert_eq!(
             mapped.format_shorthand(),
             format!(
-                "NET:OPEN [MED] DENIED {}(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]",
+                "NET:OPEN [MED] [data_origin:guest] DENIED {}(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]",
                 executable_path("/usr/bin/curl").display()
             )
         );

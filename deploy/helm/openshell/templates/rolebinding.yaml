@@ -2,7 +2,8 @@
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
 {{- $additionalCaEnabled := ne (get $supervisorNetwork "additionalCaConfigMapName" | default "") "" -}}
-{{- if and (eq $workspaceMode "shared") (include "openshell.rbacCreate" .) (or (include "openshell.workspaceResourcesEnabled" .) $additionalCaEnabled) }}
+{{- $kubevirtRuntime := eq (include "openshell.kubernetesRuntime" .) "kubevirt" -}}
+{{- if and (eq $workspaceMode "shared") (include "openshell.rbacCreate" .) (or (include "openshell.workspaceResourcesEnabled" .) $additionalCaEnabled $kubevirtRuntime) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1

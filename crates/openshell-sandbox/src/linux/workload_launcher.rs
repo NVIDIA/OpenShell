@@ -65,6 +65,46 @@ impl WorkloadLauncher {
     }
 }
 
+/// Start a privileged workload launcher.
+///
+/// The same job-execution thread as [], but WITHOUT the
+/// seccomp-notify filter. Workload children spawned from this thread have
+/// no syscall interception — socket calls go straight to the kernel, where
+/// the network fence (not the broker) is the enforcement point. Used only
+/// for the privileged (root-workload) mode.
+pub fn start_privileged() -> io::Result<WorkloadLauncher> {
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<LaunchJob>(64);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), io::Error>>(1);
+    let alive = Arc::new(AtomicBool::new(true));
+    let thread_alive = alive.clone();
+    thread::Builder::new()
+        .name("openshell-workload-launcher".to_string())
+        .spawn(move || {
+            // No seccomp filter: the ready signal confirms the thread is
+            // running, nothing else.
+            if ready_tx.send(Ok(())).is_err() {
+                thread_alive.store(false, Ordering::Release);
+                return;
+            }
+            while let Ok(job) = jobs_rx.recv() {
+                job();
+            }
+            thread_alive.store(false, Ordering::Release);
+        })
+        .map_err(|error| io::Error::other(format!("start workload launcher thread: {error}")))?;
+
+    ready_rx.recv().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "workload launcher exited before publishing readiness",
+        )
+    })??;
+    Ok(WorkloadLauncher {
+        jobs: jobs_tx,
+        alive,
+    })
+}
+
 /// Start the only workload launcher and return its listener to an unfiltered
 /// sandbox thread.
 pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {

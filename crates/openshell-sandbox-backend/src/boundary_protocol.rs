@@ -159,6 +159,27 @@ impl NativeLinuxSandboxAuditEvidence {
             ))
         }
     }
+
+    /// Validate the evidence an untrusted guest reports: only what is
+    /// still meaningful. The boundary honestly reports no
+    /// seccomp/Landlock/`no_new_privs` evidence because none are enforced
+    /// for an untrusted guest — the security boundary is outside the
+    /// guest. The kernel release and architecture must still be present
+    /// (the boundary measured them from the host kernel). Everything
+    /// the guest reports after start is advisory and is never treated as
+    /// proof of enforcement.
+    pub fn validate_untrusted_guest(&self) -> Result<(), BackendError> {
+        let present = !self.native_architecture.is_empty() && !self.kernel_release.is_empty();
+        if present {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(
+                "privileged audit evidence is incomplete: kernel release and \
+                 architecture are required"
+                    .to_string(),
+            ))
+        }
+    }
 }
 
 /// Ephemeral identity of the supervisor process that owns one sandbox runtime.
@@ -1992,5 +2013,216 @@ mod tests {
             decoded.runtime_helper,
             Some(openshell_isolation_interface::contract::RuntimeHelper::Sftp)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VM-guest claim markers
+// ---------------------------------------------------------------------------
+
+/// Resource-claim key marking a libkrun VM guest generation (emitted by
+/// `openshell-driver-vm`).
+pub const VM_GENERATION_CLAIM: &str = "vm.generation";
+
+/// Resource-claim key marking a `KubeVirt` VM guest generation (emitted by
+/// the Kubernetes driver's kubevirt runtime).
+pub const KUBEVIRT_GENERATION_CLAIM: &str = "kubevirt.generation";
+
+/// Whether the boundary's resource claims mark it as a VM guest (libkrun or
+/// `KubeVirt`).
+///
+/// VM guests get VM policy-identity semantics: the `run_as_user`/
+/// `run_as_group` policy selectors must be `sandbox` or the resolved guest
+/// uid/gid, not arbitrary account lookups.
+pub fn is_vm_guest(resource_claims: &std::collections::BTreeMap<String, String>) -> bool {
+    resource_claims.contains_key(VM_GENERATION_CLAIM)
+        || resource_claims.contains_key(KUBEVIRT_GENERATION_CLAIM)
+}
+
+/// Whether the trusted launch descriptor's resource claims mark the
+/// boundary as an untrusted `KubeVirt` guest.
+///
+/// Every `KubeVirt` guest runs its workload as root and its in-guest
+/// boundary is untrusted: the guest, including the boundary program, is
+/// untrusted as soon as a workload executes, so the supervisor must not
+/// trust boundary reports (image policy, binary identity, enforcement
+/// evidence) from it. The claim is read only from the TRUSTED descriptor,
+/// never from boundary reports. libkrun VM guests (`vm.generation`) keep
+/// the trusted-boundary model.
+pub fn is_kubevirt_guest(resource_claims: &std::collections::BTreeMap<String, String>) -> bool {
+    resource_claims.contains_key(KUBEVIRT_GENERATION_CLAIM)
+}
+
+#[cfg(test)]
+mod vm_guest_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn claims(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn is_kubevirt_guest_keys_on_the_generation_claim() {
+        // Fail closed: only the kubevirt generation claim marks the
+        // untrusted guest class; libkrun guests and unmarked boundaries
+        // keep the trusted-boundary model.
+        assert!(is_kubevirt_guest(&claims(&[("kubevirt.generation", "g1")])));
+        assert!(!is_kubevirt_guest(&claims(&[("vm.generation", "g1")])));
+        assert!(!is_kubevirt_guest(&claims(&[])));
+    }
+
+    #[test]
+    fn is_vm_guest_accepts_vm_generation_claim() {
+        assert!(is_vm_guest(&claims(&[("vm.generation", "g1")])));
+    }
+
+    #[test]
+    fn is_vm_guest_accepts_kubevirt_generation_claim() {
+        assert!(is_vm_guest(&claims(&[("kubevirt.generation", "g1")])));
+    }
+
+    #[test]
+    fn is_vm_guest_rejects_no_marker() {
+        assert!(!is_vm_guest(&claims(&[(
+            "kubernetes.workload_pod_uid",
+            "x"
+        )])));
+        assert!(!is_vm_guest(&BTreeMap::new()));
+    }
+
+    #[test]
+    fn is_vm_guest_accepts_both_markers() {
+        assert!(is_vm_guest(&claims(&[
+            ("vm.generation", "g1"),
+            ("kubevirt.generation", "g2")
+        ])));
+    }
+}
+
+/// Whether a runtime descriptor matches the provisioned boundary config.
+///
+/// Compares every identity field: `boundary_id`, `generation`,
+/// `session_id`, `workload_identity`, `resource_claims`, and
+/// `provisioning_evidence`. This is the consistency check the boundary
+/// runs at open (via `isolation_protocol::validate_open`); drivers and
+/// tests use the same function so the comparison cannot drift between
+/// implementations.
+pub fn descriptor_matches_config(
+    descriptor: &SandboxRuntimeDescriptor,
+    config: &BoundaryConfig,
+) -> bool {
+    descriptor.boundary_id == config.boundary_id
+        && descriptor.generation == config.generation
+        && descriptor.session_id == config.session_id
+        && descriptor.workload_identity == config.workload_identity
+        && descriptor.resource_claims == config.resource_claims
+        && descriptor.provisioning_evidence == config.provisioning_evidence
+}
+
+#[cfg(test)]
+mod descriptor_config_consistency_tests {
+    use super::*;
+    use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
+    use std::collections::BTreeMap;
+
+    fn descriptor(claims: &BTreeMap<String, String>) -> SandboxRuntimeDescriptor {
+        SandboxRuntimeDescriptor {
+            boundary_id: "sandbox-1".to_string(),
+            generation: "generation-1".to_string(),
+            session_id: SandboxSessionId::new(),
+            workload_identity: ResolvedWorkloadIdentity::new(
+                1000,
+                1000,
+                Vec::new(),
+                "test".to_string(),
+                "test-resource".to_string(),
+            )
+            .unwrap(),
+            transport: SandboxTransport::Unix {
+                socket_path: "/unused".into(),
+            },
+            tls: SandboxTlsClientConfig {
+                server_name: "unused".to_string(),
+                trust_anchor_pem: String::new(),
+            },
+            host_gateway_ip: None,
+            resource_claims: claims.clone(),
+            provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+                "generation-1",
+                b"test-evidence",
+            )
+            .unwrap(),
+        }
+    }
+
+    fn config(claims: &BTreeMap<String, String>) -> BoundaryConfig {
+        BoundaryConfig {
+            boundary_id: "sandbox-1".to_string(),
+            generation: "generation-1".to_string(),
+            session_id: SandboxSessionId::new(),
+            session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            gateway_id: "gateway-1".to_string(),
+            verification_keys: vec![],
+            listener: BoundaryListener::Unix {
+                socket_path: "/unused".into(),
+                tls: SandboxTlsServerConfig {
+                    certificate_chain_path: "/unused".into(),
+                    private_key_path: "/unused".into(),
+                },
+            },
+            resource_claims: claims.clone(),
+            resource_claim_files: BTreeMap::new(),
+            workload_identity: ResolvedWorkloadIdentity::new(
+                1000,
+                1000,
+                Vec::new(),
+                "test".to_string(),
+                "test-resource".to_string(),
+            )
+            .unwrap(),
+            provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+                "generation-1",
+                b"test-evidence",
+            )
+            .unwrap(),
+            child_env: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn matching_descriptor_and_config_pass() {
+        let claims = BTreeMap::from([("test.claim".to_string(), "value".to_string())]);
+        // The session_id must match too; build both from the same descriptor's
+        // session_id.
+        let d = descriptor(&claims);
+        let mut c = config(&claims);
+        c.session_id = d.session_id;
+        assert!(descriptor_matches_config(&d, &c));
+    }
+
+    #[test]
+    fn different_generation_fails() {
+        let claims = BTreeMap::new();
+        let d = descriptor(&claims);
+        let mut c = config(&claims);
+        c.session_id = d.session_id;
+        c.generation = "generation-2".to_string();
+        assert!(!descriptor_matches_config(&d, &c));
+    }
+
+    #[test]
+    fn different_claims_fail() {
+        let d = descriptor(&BTreeMap::new());
+        let mut c = config(&BTreeMap::from([(
+            "extra".to_string(),
+            "claim".to_string(),
+        )]));
+        c.session_id = d.session_id;
+        assert!(!descriptor_matches_config(&d, &c));
     }
 }

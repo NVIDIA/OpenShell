@@ -92,6 +92,14 @@ impl<'a> DetectionFindingBuilder<'a> {
         self
     }
 
+    /// Mark the event's payload as guest-sourced: the data originated
+    /// from the in-guest boundary (untrusted after start in root-workload
+    /// mode), not from a supervisor-verified observation.
+    #[must_use]
+    pub fn guest_sourced(self) -> Self {
+        self.unmapped("data_origin", "guest")
+    }
+
     /// Add a remediation description.
     #[must_use]
     pub fn remediation(mut self, desc: &str) -> Self {

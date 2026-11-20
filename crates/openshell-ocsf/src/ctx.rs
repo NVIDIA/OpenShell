@@ -16,6 +16,29 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 static OCSF_CTX: OnceLock<EventContext> = OnceLock::new();
 
+/// Whether events emitted by this process carry guest-sourced payload
+/// (`data_origin=guest`).
+///
+/// Set once at startup by a supervisor whose launch descriptor marks the
+/// boundary as an untrusted guest: every event whose payload was reported
+/// by that boundary — process exits, connection identity — is then marked
+/// so log readers cannot mistake guest reports for verified observations.
+/// Trusted boundaries (container sandboxes, libkrun VM guests) leave it
+/// unset. Untrusted guests always run under a dedicated supervisor, so the
+/// process-wide flag cannot leak across sandbox instances.
+static GUEST_DATA_ORIGIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark every event emitted by this process as guest-sourced.
+pub fn set_guest_data_origin(enabled: bool) {
+    GUEST_DATA_ORIGIN.store(enabled, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether events emitted by this process carry guest-sourced payload.
+#[must_use]
+pub fn guest_data_origin() -> bool {
+    GUEST_DATA_ORIGIN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static OCSF_CTX_FALLBACK: LazyLock<EventContext> = LazyLock::new(|| EventContext {
     sandbox_id: String::new(),
     sandbox_name: String::new(),

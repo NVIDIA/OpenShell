@@ -145,7 +145,10 @@ pub struct BackendDescriptor {
 /// Validation and normalization run in [`ResolvedWorkloadIdentity::new`] and
 /// again when a value is decoded from a serialized descriptor: deserialization
 /// routes through the same constructor, so an invalid identity fails to decode
-/// instead of bypassing the contract.
+/// instead of bypassing the contract. The exception is the privileged
+/// (root-workload) VM class, whose canonical zero identity is only producible
+/// by [`ResolvedWorkloadIdentity::new_privileged`]; decoding routes a zero
+/// uid through that constructor and requires its canonical form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawResolvedWorkloadIdentity")]
 pub struct ResolvedWorkloadIdentity {
@@ -191,6 +194,30 @@ impl ResolvedWorkloadIdentity {
             resource_digest,
         })
     }
+
+    /// Construct the identity for a privileged (root-workload) sandbox.
+    ///
+    /// The standard [`Self::new`] refuses UID or GID zero, which is the
+    /// right invariant for container and sandboxed-VM workloads: a UID-0
+    /// process defeats in-guest enforcement. The privileged VM class
+    /// deliberately runs the workload as root (kernel separation is the
+    /// boundary; see the root-workload VM plan), so this constructor
+    /// accepts zero. It is only for that class: callers must gate it on
+    /// the workload mode.
+    pub fn new_privileged(source: String, resource_digest: String) -> Result<Self, BackendError> {
+        if source.trim().is_empty() || resource_digest.trim().is_empty() {
+            return Err(BackendError::Descriptor(
+                "workload identity source and resource digest are required".to_string(),
+            ));
+        }
+        Ok(Self {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+            source,
+            resource_digest,
+        })
+    }
 }
 
 /// Unvalidated wire shape of [`ResolvedWorkloadIdentity`], existing only so
@@ -209,6 +236,20 @@ impl TryFrom<RawResolvedWorkloadIdentity> for ResolvedWorkloadIdentity {
     type Error = BackendError;
 
     fn try_from(raw: RawResolvedWorkloadIdentity) -> Result<Self, Self::Error> {
+        if raw.uid == 0 {
+            // The privileged (root-workload) VM class: a zero uid is only
+            // producible by `new_privileged`, whose canonical form is gid 0
+            // with no supplementary groups. Require that form; anything
+            // else fails closed.
+            if raw.gid != 0 || !raw.supplementary_gids.is_empty() {
+                return Err(BackendError::Descriptor(
+                    "privileged workload identity must be canonical (uid 0, gid 0, no \
+                     supplementary groups)"
+                        .to_string(),
+                ));
+            }
+            return Self::new_privileged(raw.source, raw.resource_digest);
+        }
         Self::new(
             raw.uid,
             raw.gid,

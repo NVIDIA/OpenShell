@@ -221,3 +221,59 @@ tests:
       - equal:
           path: metadata.name
           value: openshell-node-reader-my-namespace
+
+  - it: grants the least-privilege KubeVirt rules in managed mode (cluster-wide)
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          runtime: kubevirt
+          workspace_mode: managed
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["kubevirt.io"]
+            resources: ["virtualmachines"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["kubevirt.io"]
+            resources: ["virtualmachineinstances"]
+            verbs: ["get", "list", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+      # H4: never get/list on Secrets in a cluster-wide role.
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["list"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["list"]
+
+  - it: grants no KubeVirt rules in shared mode
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["kubevirt.io"]
+            resources: ["virtualmachines"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]

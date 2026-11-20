@@ -44,6 +44,17 @@ impl<'a> BaseEventBuilder<'a> {
         self
     }
 
+    /// Mark the event's payload as guest-sourced: the destination,
+    /// identity, or query data originated from the in-guest boundary (which
+    /// is untrusted after start in root-workload mode — root can read its
+    /// memory), not from a supervisor-verified observation. Applied at the
+    /// supervisor's ingestion of boundary-reported data (network decisions,
+    /// DNS queries, process reports).
+    #[must_use]
+    pub fn guest_sourced(self) -> Self {
+        self.unmapped("data_origin", "guest")
+    }
+
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity_name.as_deref().unwrap_or("Other");

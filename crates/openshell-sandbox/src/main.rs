@@ -43,6 +43,7 @@ const CAPABILITY_PROBE_LAUNCH_SUBCOMMAND: &str = "capability-probe-launch";
 const CAPABILITY_SOCKET_CHILD_SUBCOMMAND: &str = "capability-socket-child";
 const CAPABILITY_LANDLOCK_CHILD_SUBCOMMAND: &str = "capability-landlock-child";
 const CAPABILITY_FREE_LAUNCH_SUBCOMMAND: &str = "launch-capability-free";
+const PRIVILEGED_LAUNCH_SUBCOMMAND: &str = "launch-privileged";
 #[cfg(target_os = "linux")]
 const PROBE_DENIED_TCP_PEER: &str = "203.0.113.1:9";
 #[cfg(target_os = "linux")]
@@ -204,6 +205,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_deny_round_trip: true,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
+        privileged: false,
         seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
             new_listener: notification.notification_round_trip(),
             notification_round_trip: notification.notification_round_trip(),
@@ -1482,6 +1484,87 @@ fn launch_capability_free(_args: &[String]) -> Result<()> {
     ))
 }
 
+/// Launch the boundary for a privileged (root-workload) sandbox: the same
+/// authenticated tunnel, claims, exec/PTY/SSH relay, and network relay as
+/// the capability-free launch, but the workload runs as root and the
+/// in-guest enforcement (capability drop, `no_new_privs`, Landlock, seccomp)
+/// is removed — it is meaningless against root. The security boundary is
+/// everything outside the guest: the fence, the supervisor's policy, and
+/// the VM boundary itself. The guest is untrusted as soon as a workload
+/// executes; guest reports are marked `data_origin=guest`.
+#[cfg(target_os = "linux")]
+fn launch_privileged(args: &[String]) -> Result<()> {
+    use miette::Context as _;
+
+    let [bootstrap, _workspace @ ..] = args else {
+        return Err(miette::miette!(
+            "usage: openshell-sandbox {PRIVILEGED_LAUNCH_SUBCOMMAND} <BOOTSTRAP> [WORKSPACE]"
+        ));
+    };
+
+    // Privileged qualification: assert uid 0. The capability-free probe
+    // (zero caps, no_new_privs) is NOT run — it is the trusted-boundary
+    // path's invariant; this boundary is the untrusted-guest (root-
+    // workload) class.
+    let uid = nix::unistd::geteuid().as_raw();
+    let gid = nix::unistd::getegid().as_raw();
+    if uid != 0 || gid != 0 {
+        return Err(miette::miette!(
+            "privileged launch requires root UID and GID, got {uid}:{gid}"
+        ));
+    }
+    let config_bytes = std::fs::read(bootstrap)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("read boundary config {bootstrap}"))?;
+    let config: openshell_sandbox_backend::boundary_protocol::BoundaryConfig =
+        serde_json::from_slice(&config_bytes)
+            .into_diagnostic()
+            .wrap_err("decode boundary config")?;
+    if !openshell_sandbox_backend::boundary_protocol::is_kubevirt_guest(&config.resource_claims) {
+        return Err(miette::miette!(
+            "privileged launch is only for KubeVirt guests (kubevirt.generation claim)"
+        ));
+    }
+
+    let log_level = std::env::var(openshell_core::sandbox_env::LOG_LEVEL)
+        .unwrap_or_else(|_| "warn".to_string());
+    run_privileged_boundary(Path::new(bootstrap), &log_level)
+}
+
+/// Run the boundary in privileged (root-workload) mode: the same
+/// authenticated tunnel and Sandbox Protocol as the capability-free path,
+/// but without the in-guest enforcement. The network broker and provider
+/// files are seccomp-based today and are unavailable in this mode; the
+/// boundary reports that clearly rather than silently starting a workload
+/// with broken networking.
+#[cfg(target_os = "linux")]
+fn run_privileged_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let _ = tracing_subscriber::registry()
+        .with(
+            OcsfShorthandLayer::new(
+                openshell_sandbox::container_log::ContainerLog::process().launcher_writer(),
+            )
+            .with_non_ocsf(true)
+            .with_filter(console_filter),
+        )
+        .try_init();
+    // A placeholder qualification for the privileged path: the
+    // enforcement evidence fields are advisory in this mode (root can
+    // forge them), and the seccomp-based network broker is unavailable
+    // until the nftables relay (commit 5).
+    let qualification = openshell_sandbox::RuntimeQualification::privileged();
+    openshell_sandbox::run(bootstrap, qualification)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn launch_privileged(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "privileged launch is only supported on Linux"
+    ))
+}
+
 #[cfg(not(target_os = "linux"))]
 fn run_capability_probe() -> Result<()> {
     Err(miette::miette!(
@@ -1850,6 +1933,9 @@ fn main() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_FREE_LAUNCH_SUBCOMMAND) {
         return launch_capability_free(&raw_args[2..]);
+    }
+    if raw_args.get(1).map(String::as_str) == Some(PRIVILEGED_LAUNCH_SUBCOMMAND) {
+        return launch_privileged(&raw_args[2..]);
     }
 
     let args = BoundaryArgs::parse();

@@ -22,6 +22,7 @@ pub struct ProcessActivityBuilder<'a, ActorState = MissingActor> {
     launch_type: Option<LaunchTypeId>,
     exit_code: Option<i32>,
     message: Option<String>,
+    unmapped: serde_json::Map<String, serde_json::Value>,
     actor_state: std::marker::PhantomData<ActorState>,
 }
 
@@ -55,6 +56,7 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
             launch_type: None,
             exit_code: None,
             message: None,
+            unmapped: serde_json::Map::new(),
             actor_state: std::marker::PhantomData,
         }
     }
@@ -74,6 +76,7 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
             launch_type: self.launch_type,
             exit_code: self.exit_code,
             message: self.message,
+            unmapped: self.unmapped,
             actor_state: std::marker::PhantomData,
         }
     }
@@ -100,6 +103,21 @@ impl<ActorState> ProcessActivityBuilder<'_, ActorState> {
         self.exit_code = Some(code);
         self
     }
+
+    /// Add an unmapped field.
+    #[must_use]
+    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.unmapped.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// Mark the event's payload as guest-sourced: the data originated
+    /// from the in-guest boundary (untrusted after start in root-workload
+    /// mode), not from a supervisor-verified observation.
+    #[must_use]
+    pub fn guest_sourced(self) -> Self {
+        self.unmapped("data_origin", "guest")
+    }
 }
 
 impl_activity_setter!(ProcessActivityBuilder<ActorState>);
@@ -123,6 +141,9 @@ impl ProcessActivityBuilder<'_, HasActor> {
         );
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+        if !self.unmapped.is_empty() {
+            base.unmapped = Some(serde_json::Value::Object(self.unmapped));
+        }
 
         OcsfEvent::ProcessActivity(ProcessActivityEvent {
             base,
@@ -175,5 +196,197 @@ mod tests {
 
         let json = event.to_json().unwrap();
         assert_eq!(json["exit_code"], 0);
+    }
+}
+
+#[cfg(test)]
+mod guest_sourced_tests {
+    use super::*;
+    use crate::{ActivityId, SeverityId};
+
+    #[test]
+    fn guest_sourced_process_exit_carries_the_marker() {
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(137)
+            .guest_sourced()
+            .message("main process exit reported by the boundary: code 137")
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("guest")
+        );
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("data_origin:guest"),
+            "the shorthand must render the marker: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn exec_exit_carries_the_marker_in_root_mode() {
+        // The exec exit status is boundary-reported; in root mode the
+        // boundary is untrusted after start, so the event is marked.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new("sh", 0))
+            .guest_sourced()
+            .message("exec exit reported by the boundary: code 0")
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("guest"),
+            "the exec exit event must carry the guest-sourced marking in root mode"
+        );
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("data_origin:guest"),
+            "the shorthand must render the marker: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn exec_exit_has_no_marker_in_sandboxed_mode() {
+        // The exec exit status is boundary-reported but the boundary is
+        // supervised in sandboxed mode; the event stays unmarked.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new("sh", 0))
+            .message("exec process exited: code 0")
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .is_none(),
+            "the exec exit event must NOT carry the marking in sandboxed mode"
+        );
+        let shorthand = event.format_shorthand();
+        assert!(
+            !shorthand.contains("data_origin:guest"),
+            "the shorthand must not render the marker: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn adopted_exec_exit_carries_the_marker_in_root_mode() {
+        // The adopted-exec exit is boundary-reported; in root mode the
+        // event is marked (same lifecycle semantics as the exec exit).
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(137)
+            .process(Process::new("python3", 0))
+            .guest_sourced()
+            .message("adopted exec exit reported by the boundary: code 137")
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("guest"),
+            "the adopted-exec exit must carry the guest-sourced marking in root mode"
+        );
+    }
+
+    #[test]
+    fn forged_process_name_cannot_create_a_marker() {
+        // The PROC shorthand escapes guest-controlled fields (process name,
+        // command line) with bracket escaping: a name starting with
+        // "[data_origin:guest] " renders as "\\[data_origin:guest\\] "
+        // (escaped brackets), visually distinct from the real
+        // fixed-position marker. The shorthand of an unmarked event must
+        // NOT start with the marked prefix.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new("[data_origin:guest] fake-cmd", 0))
+            .message("exec process exited: code 0")
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        // The event is NOT marked: the forged name is in the process field,
+        // not in the unmapped data_origin field.
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .is_none(),
+            "a forged process name must not create a data_origin marking: {json}"
+        );
+        // The shorthand of an unmarked event must NOT start with the
+        // marked prefix. The escaped brackets make the forged name
+        // render as \\[data_origin:guest\\], not [data_origin:guest].
+        let shorthand = event.format_shorthand();
+        assert!(
+            !shorthand.starts_with("PROC:TERMINATE [INFO] [data_origin:guest]"),
+            "the forged name must not make the shorthand look marked: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("\\[data_origin:guest\\]"),
+            "the forged brackets must be escaped: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn newline_in_process_name_cannot_start_a_forged_line() {
+        // A newline in a process name would start a new line in the
+        // shorthand output, potentially forging a subsequent event. The
+        // escape quotes the field, preventing this.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new(
+                "cmd\nOCSF NET:OPEN [INFO] [data_origin:guest] fake",
+                0,
+            ))
+            .message("exec process exited: code 0")
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .build();
+        let shorthand = event.format_shorthand();
+        // The shorthand must not contain a newline (the escaped name is quoted).
+        assert!(
+            !shorthand.contains('\n'),
+            "a newline in the process name must not create a line break: {shorthand:?}"
+        );
+    }
+
+    #[test]
+    fn unmarked_process_exit_has_no_marker() {
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .message("main process exited: code 0")
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .is_none()
+        );
     }
 }

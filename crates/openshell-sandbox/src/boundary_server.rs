@@ -264,8 +264,15 @@ mod linux {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
         crate::process::install_boundary_user_environment(config.child_env.clone())?;
-        crate::sandbox::apply_supervisor_startup_hardening()
-            .map_err(|error| format!("install sandbox process prelude: {error}"))?;
+        // The supervisor prelude (no_new_privs + TSYNC seccomp blocking
+        // mount/umount/bpf/etc) is the sandboxed boundary's defense. In
+        // privileged mode it is skipped: the guest is the user's by design,
+        // and the inherited no_new_privs and filter would defeat setuid
+        // binaries, container runtimes, and package managers that mount.
+        if !qualification.privileged {
+            crate::sandbox::apply_supervisor_startup_hardening()
+                .map_err(|error| format!("install sandbox process prelude: {error}"))?;
+        }
         // Keep orphaned workload descendants in this process tree so
         // termination can find and kill them, then reap the adopted ones.
         // PID 1 already receives orphans; elsewhere become a child subreaper.
@@ -275,8 +282,7 @@ mod linux {
         }
         crate::managed_children::start_orphan_reaper()
             .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
-        let (launcher, listener) = crate::linux::workload_launcher::start()
-            .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
+
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
             // Validation requires every supervisor address to share one port.
@@ -288,12 +294,56 @@ mod linux {
             | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
             | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => None,
         };
-        let network_broker = NetworkBroker::start(listener, protected_control_port)
-            .map_err(|error| format!("start sandbox network broker: {error}"))?;
+        // The transparent relay's accept loops need the async runtime; the
+        // broker is otherwise constructed before it exists.
         let process_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("create boundary process runtime: {error}"))?;
+        let (launcher, network_broker) = if qualification.privileged {
+            // B3c: the privileged (root-workload) mode launches workload
+            // children WITHOUT the seccomp-notify filter. Commit 5: the
+            // transparent nftables relay captures outbound workload
+            // traffic inside the guest (TCP redirected to a local relay,
+            // DNS to the loopback resolver) and feeds the SAME Mediate
+            // accept/decision/bridge flow the seccomp broker uses — the
+            // supervisor's proxy and policy DNS run unchanged. Deleting
+            // the ruleset restores direct egress, which the network fence
+            // blocks (fail-closed: the workload only breaks its own
+            // connectivity).
+            let launcher = crate::linux::workload_launcher::start_privileged()
+                .map_err(|error| format!("start privileged workload launcher: {error}"))?;
+            let control_endpoints: Vec<std::net::SocketAddr> = match &config.listener {
+                BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
+                    addresses.clone()
+                }
+                // The other listener kinds (unix, vsock, in-guest TCP)
+                // have no supervisor IP:port to exclude from the
+                // capture ruleset; the relay is only wired for the
+                // runtime-initiated TCP transport the KubeVirt driver
+                // renders. Fall back to the unavailable broker there.
+                _ => Vec::new(),
+            };
+            let broker = if control_endpoints.is_empty() {
+                tracing::warn!(
+                    "privileged (root-workload) boundary: the transparent relay needs \
+                     the runtime-initiated TCP transport; network mediation is unavailable \
+                     and workload requests are blocked by the fence"
+                );
+                NetworkBroker::unavailable()
+                    .map_err(|error| format!("create unavailable network broker: {error}"))?
+            } else {
+                NetworkBroker::start_transparent_relay(&control_endpoints, process_runtime.handle())
+                    .map_err(|error| format!("start transparent network relay: {error}"))?
+            };
+            (launcher, broker)
+        } else {
+            let (launcher, listener) = crate::linux::workload_launcher::start()
+                .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
+            let broker = NetworkBroker::start(listener, protected_control_port)
+                .map_err(|error| format!("start sandbox network broker: {error}"))?;
+            (launcher, broker)
+        };
         let runtime = Arc::new(BoundaryRuntime::new(
             config.clone(),
             process_runtime.handle().clone(),
@@ -347,6 +397,54 @@ mod linux {
             // lifetime of the boundary process.
             unsafe { nix::sys::signal::sigaction(signal, &action) }
                 .map_err(|error| format!("install boundary {signal:?} handler: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Mode-gated workload identity validation (pure, testable): uid 0 is
+    /// allowed ONLY when the  claim says "root" (the
+    /// privileged VM class, entered only through launch-privileged); the
+    /// sandboxed default and any unknown mode refuse it (fail closed).
+    /// Conversely, the root mode requires uid/gid zero — a nonzero
+    /// identity under a root claim is a config error. Each entry point
+    /// refuses the other mode's config.
+    /// Refuse provider material (files and environment variables) in the
+    /// privileged (root-workload) mode — the user's decision: nothing
+    /// secret enters the guest. This is the boundary-side defence in
+    /// depth; the supervisor-side refusal is the real guarantee (the
+    /// request maps are deserialized before this check runs, so a root
+    /// guest could theoretically observe them in that window).
+    fn validate_provider_material_privileged(
+        privileged: bool,
+        provider_files: &std::collections::HashMap<String, String>,
+        provider_env: &std::collections::HashMap<String, String>,
+    ) -> Result<(), String> {
+        if privileged && (!provider_files.is_empty() || !provider_env.is_empty()) {
+            return Err("provider files and provider environment variables are not \
+                 supported in privileged (root-workload) mode: the guest runs as \
+                 root and would be fully exposed to the credentials"
+                .to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_workload_mode_identity(
+        resource_claims: &std::collections::BTreeMap<String, String>,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), String> {
+        // A `KubeVirt` guest is the untrusted root-workload class: its
+        // workload identity is uid/gid zero by design. Everything else
+        // (container boundaries, libkrun VM guests) must be nonzero.
+        if openshell_sandbox_backend::boundary_protocol::is_kubevirt_guest(resource_claims) {
+            if uid != 0 || gid != 0 {
+                return Err(
+                    "untrusted-guest (root-workload) boundary requires UID and GID zero"
+                        .to_string(),
+                );
+            }
+        } else if uid == 0 || gid == 0 {
+            return Err("sandbox workload UID and GID must be nonzero".to_string());
         }
         Ok(())
     }
@@ -434,9 +532,11 @@ mod linux {
             | BoundaryListenerConfig::TlsTcp { .. }
             | BoundaryListenerConfig::Vsock { .. } => {}
         }
-        if config.workload_identity.uid == 0 || config.workload_identity.gid == 0 {
-            return Err("sandbox workload UID and GID must be nonzero".to_string());
-        }
+        validate_workload_mode_identity(
+            &config.resource_claims,
+            config.workload_identity.uid,
+            config.workload_identity.gid,
+        )?;
         Ok(())
     }
 
@@ -447,7 +547,7 @@ mod linux {
         config: &BoundaryConfig,
         policy: &SandboxPolicyWire,
     ) -> Result<(), String> {
-        if !config.resource_claims.contains_key("vm.generation") {
+        if !openshell_sandbox_backend::boundary_protocol::is_vm_guest(&config.resource_claims) {
             return Ok(());
         }
         let identity = &config.workload_identity;
@@ -3929,6 +4029,18 @@ mod linux {
             provider_env: std::collections::HashMap<String, String>,
             provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
+            // The user's decision: provider files and provider environment
+            // variables are unsupported in the privileged (root-workload)
+            // mode — nothing secret enters the guest. A root guest reads
+            // boundary memory (/proc/<pid>/mem), so storing the maps even
+            // without serving them is exposure.
+            if let Err(error) = validate_provider_material_privileged(
+                self.qualification.privileged,
+                &provider_files,
+                &provider_env,
+            ) {
+                return guest_error(BoundaryErrorKind::Unsupported, error);
+            }
             let Some(policy) = lock(&self.attached_policy).clone() else {
                 return guest_error(
                     BoundaryErrorKind::Invalid,
@@ -4010,6 +4122,7 @@ mod linux {
                 provider_env_revision,
                 provider_env,
                 ca_file_paths,
+                privileged: self.qualification.privileged,
             };
             let provider_file_count = provider_files.len();
             if let Err(error) = self.network_broker.provider_files().replace(provider_files) {
@@ -4053,6 +4166,15 @@ mod linux {
             provider_env: std::collections::HashMap<String, String>,
             provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
+            // Same refusal as start_agent: no provider material in
+            // privileged mode, including on later updates.
+            if let Err(error) = validate_provider_material_privileged(
+                self.qualification.privileged,
+                &provider_files,
+                &provider_env,
+            ) {
+                return guest_error(BoundaryErrorKind::Unsupported, error);
+            }
             let process = {
                 let state = lock(&self.state);
                 let RuntimeState::Running(process) = &*state else {
@@ -4397,6 +4519,7 @@ mod linux {
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
         ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+        privileged: bool,
     }
 
     fn resolve_agent_spec(mut spec: AgentSpecWire) -> Result<AgentSpecWire, String> {
@@ -4431,6 +4554,7 @@ mod linux {
                 provider_env_revision,
                 provider_env,
                 ca_file_paths,
+                privileged,
             } = launch;
             debug_assert!(!spec.program.is_empty());
             let boundary_runtime = BoundaryRuntimeState::new_exclusive_pid_namespace();
@@ -4449,6 +4573,7 @@ mod linux {
                     spec.interactive,
                     &policy,
                     entrypoint_pid,
+                    privileged,
                     provider_credentials.clone(),
                     provider_env,
                     ca_file_paths,
@@ -6746,8 +6871,96 @@ mod linux {
             .unwrap()
         }
 
+        #[test]
+        fn provider_material_refused_in_privileged_mode() {
+            use std::collections::HashMap;
+
+            let files = || {
+                let mut map = HashMap::new();
+                map.insert("secret.txt".to_string(), "data".to_string());
+                map
+            };
+            let env = || {
+                let mut map = HashMap::new();
+                map.insert("API_KEY".to_string(), "value".to_string());
+                map
+            };
+            let empty = HashMap::new();
+
+            // Privileged + provider files: refused.
+            assert!(
+                validate_provider_material_privileged(true, &files(), &empty).is_err(),
+                "provider files must be refused in privileged mode"
+            );
+
+            // Privileged + provider env: refused.
+            assert!(
+                validate_provider_material_privileged(true, &empty, &env()).is_err(),
+                "provider env must be refused in privileged mode"
+            );
+
+            // Privileged + both: refused.
+            assert!(
+                validate_provider_material_privileged(true, &files(), &env()).is_err(),
+                "both provider maps must be refused in privileged mode"
+            );
+
+            // Privileged + neither: accepted.
+            assert!(
+                validate_provider_material_privileged(true, &empty, &empty).is_ok(),
+                "empty provider maps are fine in privileged mode"
+            );
+
+            // Sandboxed + provider files: accepted (the normal path).
+            assert!(
+                validate_provider_material_privileged(false, &files(), &empty).is_ok(),
+                "provider files are fine in sandboxed mode"
+            );
+
+            // Sandboxed + provider env: accepted.
+            assert!(
+                validate_provider_material_privileged(false, &empty, &env()).is_ok(),
+                "provider env is fine in sandboxed mode"
+            );
+        }
+
+        #[test]
+        fn workload_mode_identity_allows_root_only_for_kubevirt_guests() {
+            use std::collections::BTreeMap;
+
+            let claims = |kubevirt: bool, vm: bool| {
+                let mut map = BTreeMap::new();
+                if kubevirt {
+                    map.insert("kubevirt.generation".to_string(), "g1".to_string());
+                }
+                if vm {
+                    map.insert("vm.generation".to_string(), "g1".to_string());
+                }
+                map
+            };
+
+            // KubeVirt guest + uid 0: passes (the untrusted root-workload class).
+            assert!(validate_workload_mode_identity(&claims(true, false), 0, 0).is_ok());
+
+            // KubeVirt guest + nonzero uid: fails (config error).
+            assert!(validate_workload_mode_identity(&claims(true, false), 1000, 1000).is_err());
+
+            // libkrun VM guest + uid 0: fails (trusted-boundary invariant).
+            assert!(validate_workload_mode_identity(&claims(false, true), 0, 0).is_err());
+
+            // libkrun VM guest + nonzero uid: passes.
+            assert!(validate_workload_mode_identity(&claims(false, true), 1000, 1000).is_ok());
+
+            // No claims + uid 0: fails (fail closed).
+            assert!(validate_workload_mode_identity(&claims(false, false), 0, 0).is_err());
+
+            // No claims + nonzero uid: passes (the container default).
+            assert!(validate_workload_mode_identity(&claims(false, false), 1000, 1000).is_ok());
+        }
+
         fn test_runtime_qualification() -> crate::RuntimeQualification {
             crate::RuntimeQualification {
+                privileged: false,
                 seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
                     new_listener: true,
                     notification_round_trip: true,
@@ -6924,9 +7137,27 @@ mod linux {
             let config = &mut Arc::get_mut(&mut boundary)
                 .expect("test boundary has one owner")
                 .config;
+            config.resource_claims.insert(
+                openshell_sandbox_backend::boundary_protocol::VM_GENERATION_CLAIM.to_string(),
+                config.generation.clone(),
+            );
+            (process_runtime, boundary)
+        }
+
+        fn kubevirt_identity_test_runtime() -> (tokio::runtime::Runtime, Arc<BoundaryRuntime>) {
+            let (process_runtime, mut boundary) = vm_identity_test_runtime();
+            let config = &mut Arc::get_mut(&mut boundary)
+                .expect("test boundary has one owner")
+                .config;
+            // Swap the libkrun marker for the KubeVirt one; the predicate
+            // must treat both as VM guests.
             config
                 .resource_claims
-                .insert("vm.generation".to_string(), config.generation.clone());
+                .remove(openshell_sandbox_backend::boundary_protocol::VM_GENERATION_CLAIM);
+            config.resource_claims.insert(
+                openshell_sandbox_backend::boundary_protocol::KUBEVIRT_GENERATION_CLAIM.to_string(),
+                config.generation.clone(),
+            );
             (process_runtime, boundary)
         }
 
@@ -6941,6 +7172,33 @@ mod linux {
                     run_as_group: group.map(str::to_string),
                 },
             })
+        }
+
+        #[test]
+        fn kubevirt_claimed_guest_gets_vm_policy_identity_validation() {
+            let (_runtime, boundary) = kubevirt_identity_test_runtime();
+            let uid = boundary.config.workload_identity.uid.to_string();
+            let gid = boundary.config.workload_identity.gid.to_string();
+            // Matching and omitted selectors pass.
+            for (user, group) in [
+                (None, None),
+                (Some(uid.as_str()), Some(gid.as_str())),
+                (Some("sandbox"), Some("sandbox")),
+            ] {
+                validate_vm_policy_identity(
+                    &boundary.config,
+                    &vm_identity_test_policy(user, group),
+                )
+                .expect("matching or omitted VM selectors for a KubeVirt guest");
+            }
+            // Conflicting selectors are denied, exactly like a libkrun VM.
+            let wrong = if uid == "10000" { "10001" } else { "10000" };
+            let error = validate_vm_policy_identity(
+                &boundary.config,
+                &vm_identity_test_policy(Some(wrong), Some(wrong)),
+            )
+            .expect_err("conflicting VM selectors must be denied");
+            assert!(error.contains("conflicts with the resolved workload identity"));
         }
 
         #[test]
@@ -7004,7 +7262,7 @@ mod linux {
                 .expect("test boundary has one owner")
                 .config
                 .resource_claims
-                .remove("vm.generation");
+                .remove(openshell_sandbox_backend::boundary_protocol::VM_GENERATION_CLAIM);
             validate_vm_policy_identity(
                 &boundary.config,
                 &vm_identity_test_policy(Some(wrong_user), Some("image-user")),
@@ -10365,6 +10623,7 @@ mod linux {
                         provider_env_revision: 0,
                         provider_env: std::collections::HashMap::new(),
                         ca_file_paths: None,
+                        privileged: false,
                     },
                     prepared,
                 )

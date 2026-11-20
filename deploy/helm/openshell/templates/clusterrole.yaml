@@ -30,6 +30,37 @@ rules:
     resources: ["persistentvolumeclaims"]
     verbs: ["get"]
   {{- end }}
+  {{- if and (ne $workspaceMode "shared") (eq (include "openshell.kubernetesRuntime" .) "kubevirt") }}
+  # KubeVirt runtime in managed/operator mode: the same minimal per-
+  # sandbox verbs the shared-mode Role grants, needed cluster-wide
+  # because the sandbox namespaces are per-workspace. The driver never
+  # reads Secrets (create/delete only — the bootstrap Secret is
+  # immutable per generation), never lists Services, PVCs, or
+  # NetworkPolicies (companions are derived from the VM's name and
+  # recorded generation), and the fence reconciler restores drift with
+  # delete-and-recreate, never patch.
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "patch", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "delete"]
+  {{- end }}
   # Validate projected ServiceAccount tokens during sandbox bootstrap and
   # internal gateway peer authentication.
   - apiGroups:

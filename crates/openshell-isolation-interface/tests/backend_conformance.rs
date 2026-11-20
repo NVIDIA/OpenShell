@@ -246,3 +246,56 @@ async fn port_forward_rejects_non_loopback() {
     let loopback = LoopbackTarget::new("127.0.0.1".parse().unwrap(), 8080).expect("loopback ok");
     assert_eq!(loopback.port(), 8080);
 }
+
+#[test]
+fn workload_identity_decoding_rejects_non_canonical_zero_forms() {
+    let privileged =
+        ResolvedWorkloadIdentity::new_privileged("policy".to_string(), "sha256:test".to_string())
+            .unwrap();
+
+    // The canonical privileged identity round-trips through serialization.
+    let json = serde_json::to_string(&privileged).unwrap();
+    let decoded: ResolvedWorkloadIdentity = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, privileged);
+
+    // A zero uid with a non-zero gid fails closed instead of decoding.
+    let forged = serde_json::json!({
+        "uid": 0,
+        "gid": 1000,
+        "supplementary_gids": [],
+        "source": "policy",
+        "resource_digest": "sha256:test",
+    });
+    let error = serde_json::from_value::<ResolvedWorkloadIdentity>(forged)
+        .expect_err("non-canonical zero identity must fail to decode");
+    assert!(
+        error.to_string().contains("canonical"),
+        "unexpected error: {error}"
+    );
+
+    // A zero gid with a non-zero uid still routes through the standard
+    // constructor, which refuses it.
+    let forged = serde_json::json!({
+        "uid": 1000,
+        "gid": 0,
+        "supplementary_gids": [],
+        "source": "policy",
+        "resource_digest": "sha256:test",
+    });
+    let error = serde_json::from_value::<ResolvedWorkloadIdentity>(forged)
+        .expect_err("zero gid must fail to decode");
+    assert!(
+        error.to_string().contains("UID or GID zero"),
+        "unexpected error: {error}"
+    );
+
+    // A zero uid with supplementary groups fails closed.
+    let forged = serde_json::json!({
+        "uid": 0,
+        "gid": 0,
+        "supplementary_gids": [1000],
+        "source": "policy",
+        "resource_digest": "sha256:test",
+    });
+    assert!(serde_json::from_value::<ResolvedWorkloadIdentity>(forged).is_err());
+}

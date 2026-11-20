@@ -697,13 +697,28 @@ pub fn validate_runtime_coordinates(
         ));
     }
     let identity = &runtime_descriptor.workload_identity;
-    let normalized = ResolvedWorkloadIdentity::new(
-        identity.uid,
-        identity.gid,
-        identity.supplementary_gids.clone(),
-        identity.source.clone(),
-        identity.resource_digest.clone(),
-    )?;
+    // A `KubeVirt` guest runs its workload as root by design, so its
+    // identity uses the privileged constructor (uid 0, gid 0, no
+    // supplementary groups). The class is read from the descriptor's
+    // resource claims (`kubevirt.generation`); everything else —
+    // including libkrun VM guests — keeps the standard constructor,
+    // which refuses uid 0 and fails closed.
+    let untrusted_guest =
+        crate::boundary_protocol::is_kubevirt_guest(&runtime_descriptor.resource_claims);
+    let normalized = if untrusted_guest {
+        ResolvedWorkloadIdentity::new_privileged(
+            identity.source.clone(),
+            identity.resource_digest.clone(),
+        )?
+    } else {
+        ResolvedWorkloadIdentity::new(
+            identity.uid,
+            identity.gid,
+            identity.supplementary_gids.clone(),
+            identity.source.clone(),
+            identity.resource_digest.clone(),
+        )?
+    };
     if normalized != *identity {
         return Err(BackendError::Descriptor(
             "workload identity is not canonical".into(),
@@ -840,7 +855,20 @@ impl BoundBoundary {
             ));
         }
         if self.client.backend_name == crate::BACKEND_NAME {
-            crate::audit::validate_native_linux_audit(&confirmation.backend_audit)?;
+            // The per-class evidence check (item 3): the guest class comes
+            // from the trusted launch descriptor's resource_claims, never
+            // from the boundary's own report. A trusted boundary (container
+            // or libkrun VM) requires the full capability-free posture; an
+            // untrusted KubeVirt guest requires only what is still
+            // meaningful (kernel release and architecture), because the
+            // boundary honestly reports no seccomp/Landlock evidence for
+            // that class.
+            let untrusted_guest =
+                crate::boundary_protocol::is_kubevirt_guest(&self.resource_claims);
+            crate::audit::validate_native_linux_audit(
+                &confirmation.backend_audit,
+                untrusted_guest,
+            )?;
         }
         let client = self.client.clone();
         // Adopt from a snapshot taken after the promotion: the replaced owner

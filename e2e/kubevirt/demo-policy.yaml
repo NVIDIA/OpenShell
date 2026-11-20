@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Acceptance policy for e2e/kubevirt/run-demo.sh.
+#
+# Every KubeVirt guest runs its workload as root and its boundary is
+# untrusted, so the policy carries network rules only:
+#
+# - No filesystem_policy, landlock, or process sections. In-guest
+#   enforcement is meaningless against a root workload (the fence and
+#   supervisor-side policy evaluation are the boundary), and the
+#   supervisor rejects an untrusted-guest policy that authors them.
+# - No binaries lists. Per-binary identity is unenforceable in-guest for
+#   a root workload, so the supervisor REJECTS any policy that authors
+#   them (require_binary_identity=false would otherwise silently ignore
+#   the restriction); they are omitted here.
+# - L4: one.one.one.one:443 is the only raw-TCP allowance; the demo dials
+#   example.org:80 and expects a denial.
+# - L7: on example.com:443 (HTTPS) GET / is allowed and POST / is denied.
+version: 1
+
+network_policies:
+  l4_allowed:
+    name: l4-allowed
+    endpoints:
+      - host: one.one.one.one
+        port: 443
+        protocol: tcp
+  l7_https:
+    name: l7-https
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /
+        deny_rules:
+          - method: POST
+            path: /

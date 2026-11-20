@@ -29,6 +29,8 @@ pub mod main_session;
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
+#[cfg(target_os = "linux")]
+pub mod network_relay;
 #[cfg(all(target_os = "linux", feature = "perf-harness"))]
 pub mod perf;
 #[cfg(target_os = "linux")]
@@ -42,8 +44,9 @@ pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;
 
-/// Results of actively qualifying the admitted workload runtime before the
-/// sandbox consumes protected bootstrap material.
+/// Results of actively qualifying the admitted workload runtime.
+///
+/// Produced before the sandbox consumes protected bootstrap material.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 #[allow(
@@ -52,6 +55,10 @@ pub mod sftp;
 )]
 pub struct RuntimeQualification {
     pub seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence,
+    /// Marks the privileged (root-workload) qualification: the in-guest
+    /// enforcement evidence is advisory, and the seccomp-based network
+    /// broker and provider files are unavailable.
+    pub privileged: bool,
     pub landlock_abi: u32,
     pub landlock_allow_deny: bool,
     pub udp_dns_round_trip: bool,
@@ -59,6 +66,36 @@ pub struct RuntimeQualification {
     pub tcp_allow_round_trip: bool,
     pub tcp_deny_round_trip: bool,
     pub socket_loopback_confinement: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeQualification {
+    /// A qualification for the privileged (root-workload) mode: the
+    /// enforcement evidence fields are advisory (root can forge them),
+    /// the seccomp-based network broker is unavailable, and no Landlock
+    /// is applied. The boundary still runs the authenticated tunnel,
+    /// exec/PTY/SSH relay, and status reporting.
+    pub fn privileged() -> Self {
+        Self {
+            seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
+                new_listener: false,
+                notification_round_trip: false,
+                id_validation: false,
+                addfd_send: false,
+                retained_socket_operation: false,
+                proc_fd_identity: false,
+                task_memory_read: false,
+            },
+            privileged: true,
+            landlock_abi: 0,
+            landlock_allow_deny: false,
+            udp_dns_round_trip: false,
+            tcp_dns_round_trip: false,
+            tcp_allow_round_trip: false,
+            tcp_deny_round_trip: false,
+            socket_loopback_confinement: false,
+        }
+    }
 }
 
 /// Placeholder used when compiling the package on a non-Linux host.
