@@ -5378,6 +5378,7 @@ dependencies = [
  "openshell-core",
  "openshell-otel",
  "openshell-sandbox-backend",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",

@@ -30,10 +30,9 @@ const ASSIGNMENT_FRAMING_BYTES: usize = 1024;
 const REPORTED_INSTANCE_BYTES: usize = 1024;
 /// Smallest bound on a host message.
 const MIN_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
-/// Smallest bound on a gateway message. A snapshot also lists every route in
-/// the pool, so a small per-member cap keeps room for that directory.
-const MIN_GATEWAY_MESSAGE_BYTES: usize =
-    16 * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES);
+/// Allowance per entry of the pool-wide route directory every snapshot
+/// carries: a route handle of up to 64 bytes, an `IP:port`, and framing.
+const ROUTE_DIRECTORY_ENTRY_BYTES: usize = 128;
 /// Fewest instances a status report may describe, so a member with a small
 /// cap can still report instances it is removing or keeping.
 const MIN_REPORTED_INSTANCES: usize = 64;
@@ -108,11 +107,12 @@ impl PoolLimits {
     }
 
     /// Largest gateway message a member decodes: a full snapshot of its cap
-    /// of assignments at their largest, plus framing.
+    /// of assignments at their largest, plus the route directory of the
+    /// largest pool.
     #[must_use]
     pub fn max_gateway_message_bytes(self) -> usize {
-        (self.max_instances_per_member * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES))
-            .max(MIN_GATEWAY_MESSAGE_BYTES)
+        self.max_instances_per_member * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES)
+            + MAX_POOL_INSTANCES_CEILING * ROUTE_DIRECTORY_ENTRY_BYTES
     }
 
     /// Largest member message: a status report of every instance it may
@@ -155,15 +155,33 @@ mod tests {
     #[test]
     fn buffers_follow_the_configured_cap_above_a_floor() {
         let tiny = PoolLimits::new(1, 1).unwrap();
-        let small = PoolLimits::new(16, 1).unwrap();
         let largest = PoolLimits::new(1024, 1).unwrap();
         assert_eq!(
             PoolLimits::default().max_gateway_message_bytes(),
             128 * (MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES)
+                + MAX_POOL_INSTANCES_CEILING * ROUTE_DIRECTORY_ENTRY_BYTES
         );
-        assert_eq!(tiny.max_gateway_message_bytes(), MIN_GATEWAY_MESSAGE_BYTES);
-        assert_eq!(small.max_gateway_message_bytes(), MIN_GATEWAY_MESSAGE_BYTES);
         assert_eq!(tiny.max_host_message_bytes(), MIN_HOST_MESSAGE_BYTES);
         assert_eq!(largest.max_host_message_bytes(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_small_cap_decodes_the_route_directory_of_the_largest_pool() {
+        use crate::proto::{AssignmentSnapshot, RouteOwner};
+        use prost::Message as _;
+
+        let route_directory = (0..MAX_POOL_INSTANCES_CEILING)
+            .map(|index| RouteOwner {
+                route: format!("rt-{index:061}"),
+                runtime_address: "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535".to_string(),
+            })
+            .collect();
+        let snapshot = AssignmentSnapshot {
+            route_directory,
+            ..Default::default()
+        };
+        let limits = PoolLimits::new(1, 1).unwrap();
+        let own_assignments = MAX_LAUNCH_MATERIAL_BYTES + ASSIGNMENT_FRAMING_BYTES;
+        assert!(snapshot.encoded_len() <= limits.max_gateway_message_bytes() - own_assignments);
     }
 }
