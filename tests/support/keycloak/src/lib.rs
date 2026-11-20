@@ -15,9 +15,14 @@
 //! | `OPENSHELL_TEST_KEYCLOAK_CLIENT_ID` | `openshell-cli` |
 //! | `OPENSHELL_TEST_KEYCLOAK_USERNAME` | `admin@test` |
 //! | `OPENSHELL_TEST_KEYCLOAK_PASSWORD` | `admin` |
+//! | `OPENSHELL_TEST_KEYCLOAK_USER_USERNAME` | `user@test` |
+//! | `OPENSHELL_TEST_KEYCLOAK_USER_PASSWORD` | `user` |
+//! | `OPENSHELL_TEST_KEYCLOAK_USER_B_USERNAME` | `user-b@test` |
+//! | `OPENSHELL_TEST_KEYCLOAK_USER_B_PASSWORD` | `user-b` |
 //!
 //! The issuer must be reachable from the test process. The client must allow
-//! password grants. A missing variable fails the test; it never skips it.
+//! password grants. The `USER` and `USER_B` variables name plain users, and
+//! are read only by tests that sign in as them ([`User`]). A missing variable fails the test; it never skips it.
 //! The fixture waits for the realm to answer, since Keycloak may still be
 //! starting when the tests begin.
 //!
@@ -33,6 +38,13 @@
 //! }
 //! ```
 //!
+//! A suite whose gateway trusts the realm signs users in to it with
+//! [`KeycloakContext::session`]: a [`Session`] holds an SDK client and a CLI
+//! that send the user's token. [`browser_login`] runs the CLI's own browser
+//! login once, with curl as the browser. The tmachine `<base>-oidc`
+//! environment (`tests/tmachine/ansible/playbooks/oidc.yaml`) runs such a
+//! gateway.
+//!
 //! The fixture owns no Keycloak state, so it has nothing to clean up. Tests
 //! that create resources in Keycloak or `OpenShell` must remove them, for
 //! example with [`Context::on_cleanup`].
@@ -47,10 +59,26 @@ use testkit::{Context, Error, Poll, Result, ResultExt as _, poll_until};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
+mod browser;
+mod session;
+mod token;
+
+pub use browser::{BrowserLogin, browser_login};
+pub use session::Session;
+pub use token::{audience_contains, claims, has_realm_role, subject};
+
 pub const ISSUER_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_ISSUER";
 pub const CLIENT_ID_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_CLIENT_ID";
 pub const USERNAME_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_USERNAME";
 pub const PASSWORD_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_PASSWORD";
+pub const USER_USERNAME_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_USER_USERNAME";
+pub const USER_PASSWORD_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_USER_PASSWORD";
+pub const USER_B_USERNAME_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_USER_B_USERNAME";
+pub const USER_B_PASSWORD_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_USER_B_PASSWORD";
+/// The scopes a login asks for so the gateway authorizes its token. The
+/// `OpenShell` scopes are optional on the client, so Keycloak grants them
+/// only when asked.
+pub const OPENSHELL_SCOPES: &str = "openid profile email openshell:all";
 /// How long Keycloak has to start answering, e.g. after the environment boots.
 // The wait runs inside the test, so it must leave room for the test body
 // within the runner's 2-minute per-test budget (`slow-timeout` in
@@ -71,6 +99,29 @@ pub struct Keycloak {
     client_id: String,
     username: String,
     password: String,
+}
+
+/// A user in the realm. [`User::Admin`] is the user the
+/// `OPENSHELL_TEST_KEYCLOAK_USERNAME` variables name; the others are plain
+/// users, read from their own variables only when a test logs in as them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum User {
+    /// A platform admin.
+    Admin,
+    /// A user with no platform role beyond signing in.
+    User,
+    /// A second plain user, for tests across two users' workspaces.
+    UserB,
+}
+
+impl User {
+    fn env(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Admin => (USERNAME_ENV, PASSWORD_ENV),
+            Self::User => (USER_USERNAME_ENV, USER_PASSWORD_ENV),
+            Self::UserB => (USER_B_USERNAME_ENV, USER_B_PASSWORD_ENV),
+        }
+    }
 }
 
 /// Tokens from one Keycloak login.
@@ -175,15 +226,36 @@ impl Keycloak {
 
     /// Log in as the configured user with the password grant.
     pub async fn password_grant(&self) -> Result<Grant> {
+        self.grant(&self.username, &self.password, "openid").await
+    }
+
+    /// Log in as `user` with the password grant, asking for `scope`, such
+    /// as [`OPENSHELL_SCOPES`].
+    pub async fn password_grant_as(&self, user: User, scope: &str) -> Result<Grant> {
+        let (username, password) = self.credentials(user)?;
+        self.grant(&username, &password, scope).await
+    }
+
+    /// The username and password of `user`.
+    pub fn credentials(&self, user: User) -> Result<(String, String)> {
+        if user == User::Admin {
+            return Ok((self.username.clone(), self.password.clone()));
+        }
+        let (username, password) = user.env();
+        Ok((required(username)?, required(password)?))
+    }
+
+    async fn grant(&self, username: &str, password: &str, scope: &str) -> Result<Grant> {
         let client_id = format!("client_id={}", self.client_id);
-        let username = format!("username={}", self.username);
+        let username_field = format!("username={username}");
+        let scope = format!("scope={scope}");
         let stdout = post_form(
             &self.token_endpoint(),
-            &["grant_type=password", &client_id, &username, "scope=openid"],
-            ("password", &self.password),
+            &["grant_type=password", &client_id, &username_field, &scope],
+            ("password", password),
         )
         .await
-        .context("Keycloak password grant")?;
+        .context(format!("Keycloak password grant for {username}"))?;
 
         let response: Value =
             serde_json::from_slice(&stdout).context("decode Keycloak grant response")?;
