@@ -2071,15 +2071,10 @@ pub async fn relay_prepared_ssh(
         .map(str::parse)
         .transpose()
         .into_diagnostic()?;
-    let opened = open_ssh_relay(
-        &grant.endpoint,
-        name,
-        tls,
-        workspace,
-        &grant.session,
-        replica.as_ref(),
-    )
-    .await?;
+    let opened = tokio::select! {
+        result = open_ssh_relay(&grant.endpoint, name, tls, workspace, &grant.session, replica.as_ref()) => result?,
+        _ = peer.read_u8() => return Err(miette::miette!("SSH handoff closed before relay admission")),
+    };
     peer.write_u8(1).await.into_diagnostic()?;
     peer.read_u8().await.into_diagnostic()?;
     drop(peer);

@@ -20,6 +20,7 @@ struct Gateway {
     relay_status: Status,
     port: u16,
     revoked: Arc<AtomicBool>,
+    stall_open: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[tonic::async_trait]
@@ -64,6 +65,10 @@ impl OpenShell for Gateway {
         assert!(
             matches!(init, Some(tcp_forward_frame::Payload::Init(i)) if i.authorization_token == TOKEN)
         );
+        if let Some(started) = &self.stall_open {
+            started.notify_one();
+            return std::future::pending().await;
+        }
         let status = self.relay_status.clone();
         let stream = futures::stream::once(async move {
             // Leave stdin open after one chunk traverses the proxy.
@@ -95,6 +100,7 @@ async fn proxy_exits_with_stdin_open(relay_status: Status) {
         relay_status,
         port: address.port(),
         revoked: revoked.clone(),
+        stall_open: None,
     };
     let server = tokio::spawn(
         tonic::transport::Server::builder()
@@ -141,6 +147,57 @@ async fn proxy_exits_with_stdin_open(relay_status: Status) {
         assert!(stderr.contains("Deadline expired"), "{stderr}");
     }
     assert!(revoked.load(Ordering::SeqCst));
+    server.abort();
+}
+
+#[tokio::test]
+async fn dropping_handoff_cancels_a_stalled_relay_open() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(OpenShellServer::new(Gateway {
+                relay_status: Status::ok(""),
+                port: address.port(),
+                revoked: Arc::default(),
+                stall_open: Some(started.clone()),
+            }))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let (owner, peer) = tokio::io::duplex(8);
+    let proxy = tokio::spawn(async move {
+        let grant = openshell_core::ssh_handoff::RelayGrant {
+            session: proto::CreateSshSessionResponse {
+                sandbox_id: "id-repro".into(),
+                token: TOKEN.into(),
+                gateway_scheme: "http".into(),
+                gateway_host: "127.0.0.1".into(),
+                gateway_port: address.port().into(),
+                ..proto::CreateSshSessionResponse::default()
+            },
+            endpoint: format!("http://{address}"),
+            gateway_name: "test".into(),
+            replica: None,
+        };
+        openshell_cli::ssh::relay_prepared_ssh(
+            grant,
+            peer,
+            "repro",
+            "default",
+            &openshell_cli::tls::TlsOptions::default(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    drop(owner);
+    let result = tokio::time::timeout(Duration::from_secs(2), proxy)
+        .await
+        .expect("proxy must leave the blocked RPC when the issuer exits")
+        .unwrap();
+    assert!(result.is_err());
     server.abort();
 }
 
