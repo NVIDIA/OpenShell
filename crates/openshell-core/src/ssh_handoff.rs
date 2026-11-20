@@ -39,7 +39,7 @@ pub struct SshTarget {
     pub workspace: String,
     pub id: String,
     pub replica: Option<String>,
-    revocations: tokio_util::task::TaskTracker,
+    pub cleanup: SshCleanup,
 }
 
 #[derive(Message)]
@@ -57,7 +57,25 @@ pub struct RelayGrant {
 pub struct PreparedProxy {
     command: String,
     cancel: oneshot::Sender<()>,
-    cleanup: tokio::task::JoinHandle<bool>,
+    cleanup: tokio::task::JoinHandle<Option<Duration>>,
+}
+
+/// Work that must finish before an SSH command or TUI releases its runtime.
+#[derive(Clone, Debug, Default)]
+pub struct SshCleanup(tokio_util::task::TaskTracker);
+
+impl SshCleanup {
+    pub fn spawn<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        self.0.spawn(future)
+    }
+
+    pub async fn drain(&self) {
+        self.0.close();
+        self.0.wait().await;
+    }
 }
 
 impl SshTarget {
@@ -69,15 +87,8 @@ impl SshTarget {
             workspace: workspace.into(),
             id: id.into(),
             replica: None,
-            revocations: tokio_util::task::TaskTracker::new(),
+            cleanup: SshCleanup::default(),
         }
-    }
-
-    /// An interrupted transfer drops its in-flight SSH future. Drain the
-    /// associated revocations before the caller can shut down its runtime.
-    pub async fn wait_for_revocations(&self) {
-        self.revocations.close();
-        self.revocations.wait().await;
     }
 
     pub async fn prepare<I: Interceptor + Clone + Send + Sync + 'static>(
@@ -121,7 +132,7 @@ impl SshTarget {
         let (listener, command) = match setup() {
             Ok(parts) => parts,
             Err(error) => {
-                self.revocations.spawn(revoke).await.into_diagnostic()?;
+                self.cleanup.spawn(revoke).await.into_diagnostic()?;
                 return Err(error);
             }
         };
@@ -133,7 +144,7 @@ impl SshTarget {
         }
         .encode_to_vec();
         let (cancel, cancelled) = oneshot::channel();
-        let cleanup = self.revocations.spawn(async move {
+        let cleanup = self.cleanup.spawn(async move {
             let serve = async {
                 let mut peer = listener.accept().await?;
                 peer.write_u32(u32::try_from(payload.len()).map_err(std::io::Error::other)?)
@@ -149,12 +160,13 @@ impl SshTarget {
                 result = serve => result.ok(),
                 _ = cancelled => None,
             };
+            let started = std::time::Instant::now();
             revoke.await;
             if let Some(mut peer) = peer {
                 let _ = peer.write_u8(1).await;
-                true
+                Some(started.elapsed())
             } else {
-                false
+                None
             }
         });
         Ok(PreparedProxy {
@@ -189,16 +201,16 @@ impl PreparedProxy {
             .map(|(value, _)| value)
     }
 
-    /// Report whether the proxy actually opened `ForwardTcp`. Elapsed SSH
-    /// startup time alone cannot distinguish a slow rejection from a session.
+    /// An admitted proxy waits for revocation before it can carry SSH bytes.
+    /// Return that interval so it does not count as time attached to a sandbox.
     pub async fn run_with_admission<T>(
         self,
         operation: impl Future<Output = Result<T>>,
-    ) -> Result<(T, bool)> {
+    ) -> Result<(T, Option<Duration>)> {
         let result = operation.await;
         drop(self.cancel);
-        let admitted = self.cleanup.await.into_diagnostic()?;
-        Ok((result?, admitted))
+        let revocation_wait = self.cleanup.await.into_diagnostic()?;
+        Ok((result?, revocation_wait))
     }
 }
 

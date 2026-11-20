@@ -20,7 +20,7 @@ use openshell_core::proto::{
     CreateSshSessionRequest, CreateSshSessionResponse, GetSandboxRequest, SandboxPhase,
     SshRelayTarget, TcpForwardFrame, TcpForwardInit, tcp_forward_init,
 };
-use openshell_core::ssh_handoff::{PreparedProxy, SshTarget};
+use openshell_core::ssh_handoff::{PreparedProxy, SshCleanup, SshTarget};
 use openshell_core::upload::{
     DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
 };
@@ -452,6 +452,7 @@ async fn sandbox_connect_supervised(
     name: &str,
     tls: &TlsOptions,
     workspace: &str,
+    cleanup: &SshCleanup,
 ) -> Result<i32> {
     let mut selected_id = None;
     let mut recovery_deadline = None;
@@ -467,7 +468,8 @@ async fn sandbox_connect_supervised(
         let session_attempt = match Box::pin(cancellation.wait(await_before_recovery_deadline(
             recovery_deadline,
             async {
-                let session = ssh_session_config(server, name, tls, workspace).await?;
+                let mut session = ssh_session_config(server, name, tls, workspace).await?;
+                session.target.cleanup.clone_from(cleanup);
                 if selected_id.get_or_insert_with(|| session.target.id.clone())
                     != &session.target.id
                 {
@@ -509,7 +511,7 @@ async fn sandbox_connect_supervised(
         };
 
         let command = main_attach_command(&proxy, main_terminal);
-        let ((exit_code, attached_for), admitted) = proxy
+        let ((exit_code, elapsed), revocation_wait) = proxy
             .run_with_admission(async {
                 let started = Instant::now();
                 let code = run_main_attach_supervised(command, &mut cancellation).await?;
@@ -517,9 +519,11 @@ async fn sandbox_connect_supervised(
             })
             .await?;
         let recovery_active = recovery_deadline.is_some();
-        if !admitted && !recovery_active {
+        if revocation_wait.is_none() && !recovery_active {
             return Ok(exit_code);
         }
+        let attached_for =
+            revocation_wait.map_or(Duration::ZERO, |wait| elapsed.saturating_sub(wait));
         let main_has_terminal_result = if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
             match cancellation
                 .wait(canonical_main_has_terminal_result(
@@ -584,7 +588,10 @@ pub async fn sandbox_connect(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_supervised(server, name, tls, workspace).await
+    let cleanup = SshCleanup::default();
+    let result = sandbox_connect_supervised(server, name, tls, workspace, &cleanup).await;
+    cleanup.drain().await;
+    result
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
@@ -1545,7 +1552,7 @@ async fn upload_source(
     })
     .await;
     if let Some(session) = selected.get() {
-        session.target.wait_for_revocations().await;
+        session.target.cleanup.drain().await;
     }
     result
 }
@@ -1704,7 +1711,7 @@ pub async fn sandbox_sync_down(
         .await
         .unwrap_or_else(|_| Err(miette::miette!("download interrupted")));
     if let Some(session) = selected.get() {
-        session.target.wait_for_revocations().await;
+        session.target.cleanup.drain().await;
     }
     result
 }
@@ -1805,48 +1812,69 @@ async fn stream_sandbox_tar(
 ) -> Result<()> {
     let proxy = session.prepare().await?;
     let ssh = ssh_base_command(proxy.command());
-    proxy.run(extract_ssh_tar(ssh, tar_cmd, extract_into)).await
+    proxy
+        .run(extract_ssh_tar(
+            ssh,
+            tar_cmd,
+            extract_into,
+            &session.target.cleanup,
+        ))
+        .await
 }
 
-async fn extract_ssh_tar(mut ssh: Command, tar_cmd: String, extract_into: &Path) -> Result<()> {
+async fn extract_ssh_tar(
+    mut ssh: Command,
+    tar_cmd: String,
+    extract_into: &Path,
+    cleanup: &SshCleanup,
+) -> Result<()> {
+    let (reader, writer) = std::io::pipe().into_diagnostic()?;
     ssh.arg("-T")
         .arg("-o")
         .arg("RequestTTY=no")
         .arg("sandbox")
         .arg(tar_cmd)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-
-    let mut child = ssh.spawn().into_diagnostic()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| miette::miette!("failed to open stdout for ssh process"))?;
-
-    let extract_into = extract_into.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut archive = tar::Archive::new(stdout);
-        archive
-            .unpack(&extract_into)
-            .into_diagnostic()
-            .wrap_err("failed to extract tar archive from sandbox")?;
-        Ok(())
-    })
-    .await
-    .into_diagnostic()??;
-
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .into_diagnostic()?
+    let mut child = TokioCommand::from(ssh)
+        .stdout(writer)
+        .kill_on_drop(true)
+        .spawn()
         .into_diagnostic()?;
+    let extract_into = extract_into.to_path_buf();
+    let mut unpack = tokio::task::spawn_blocking(move || {
+        tar::Archive::new(reader)
+            .unpack(extract_into)
+            .into_diagnostic()
+            .wrap_err("failed to extract tar archive from sandbox")
+    });
 
-    if !status.success() {
-        return Err(miette::miette!(
-            "ssh tar create exited with status {status}"
-        ));
-    }
-    Ok(())
+    // The blocking tar reader can only stop when the SSH writer closes.
+    // Keep both owned even if the caller drops this transfer on a signal.
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let worker = cleanup.spawn(async move {
+        let result = tokio::select! {
+            _ = cancelled => Err(miette::miette!("download interrupted")),
+            result = async {
+                (&mut unpack).await.into_diagnostic()??;
+                let status = child.wait().await.into_diagnostic()?;
+                if !status.success() {
+                    return Err(miette::miette!("ssh tar create exited with status {status}"));
+                }
+                Ok(())
+            } => result,
+        };
+        if result.is_err() {
+            let _ = child.kill().await;
+            if !unpack.is_finished() {
+                let _ = unpack.await;
+            }
+        }
+        result
+    });
+    let result = worker.await.into_diagnostic()?;
+    drop(cancel);
+    result
 }
 
 /// Build the `tar cf - -C <parent> -- <basename>` command used to wrap a
@@ -2619,6 +2647,43 @@ mod tests {
         assert!(sync_error_is_retryable(&Report::new(
             upload::UploadError::Transport("SSH relay disconnected".into())
         )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_download_reaps_ssh_while_the_tar_reader_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ssh.pid");
+        let mut ssh = Command::new("sh");
+        ssh.args(["-c", "printf '%s' $$ > \"$1\"; exec sleep 5", "ssh"])
+            .arg(&marker);
+        let cleanup = SshCleanup::default();
+        let owner = cleanup.clone();
+        let dest = dir.path().to_owned();
+        let transfer =
+            tokio::spawn(async move { extract_ssh_tar(ssh, String::new(), &dest, &owner).await });
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|pid| pid.parse::<i32>().ok())
+                {
+                    break nix::unistd::Pid::from_raw(pid);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        transfer.abort();
+        assert!(transfer.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), cleanup.drain())
+            .await
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
     }
 
     #[cfg(unix)]

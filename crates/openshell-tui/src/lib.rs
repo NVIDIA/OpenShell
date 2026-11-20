@@ -25,7 +25,7 @@ use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{SandboxPhase, SandboxRestartPolicy};
-use openshell_core::ssh_handoff::SshTarget;
+use openshell_core::ssh_handoff::{SshCleanup, SshTarget};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -129,6 +129,8 @@ pub async fn run(
     refresh_global_settings(&mut app).await;
     spawn_list_refresh(&mut app, events.sender());
 
+    let ssh_cleanup = SshCleanup::default();
+    let mut create_tasks = tokio::task::JoinSet::new();
     while app.running {
         terminal
             .draw(|frame| ui::draw(frame, &mut app))
@@ -151,7 +153,12 @@ pub async fn run(
                 }
                 if app.pending_create_sandbox {
                     app.pending_create_sandbox = false;
-                    spawn_create_sandbox(&mut app, events.sender());
+                    spawn_create_sandbox(
+                        &mut app,
+                        events.sender(),
+                        &mut create_tasks,
+                        &ssh_cleanup,
+                    );
                     start_anim_ticker(&mut app, events.sender());
                 }
                 // --- Provider CRUD ---
@@ -196,7 +203,8 @@ pub async fn run(
                 }
                 if app.pending_shell_connect {
                     app.pending_shell_connect = false;
-                    handle_shell_connect(&mut app, &mut terminal, &mut events).await?;
+                    handle_shell_connect(&mut app, &mut terminal, &mut events, &ssh_cleanup)
+                        .await?;
                 }
                 // --- Draft actions ---
                 if app.pending_draft_approve {
@@ -498,6 +506,8 @@ pub async fn run(
     // Cancel any running background tasks.
     app.cancel_log_stream();
     app.stop_anim();
+    create_tasks.shutdown().await;
+    ssh_cleanup.drain().await;
 
     disable_raw_mode().into_diagnostic()?;
     execute!(
@@ -946,6 +956,7 @@ async fn handle_shell_connect(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     events: &mut EventHandler,
+    cleanup: &SshCleanup,
 ) -> Result<()> {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
@@ -955,13 +966,14 @@ async fn handle_shell_connect(
     let Some(id) = app.sandbox_ids.get(app.sandbox_selected) else {
         return Ok(());
     };
-    let target = SshTarget::new(
+    let mut target = SshTarget::new(
         &app.endpoint,
         &app.gateway_name,
         &sandbox_name,
         &app.selected_sandbox_workspace(),
         id,
     );
+    target.cleanup.clone_from(cleanup);
     run_sandbox_ssh(app, terminal, events, &target, &[]).await
 }
 
@@ -1300,7 +1312,12 @@ fn start_anim_ticker(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 // Create sandbox (simplified — uses pre-selected provider names)
 // ---------------------------------------------------------------------------
 
-fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+fn spawn_create_sandbox(
+    app: &mut App,
+    tx: mpsc::UnboundedSender<Event>,
+    create_tasks: &mut tokio::task::JoinSet<()>,
+    cleanup: &SshCleanup,
+) {
     let mut client = app.client.clone();
     let Some((name, image, selected_providers, ports)) = app.create_form_data() else {
         return;
@@ -1314,7 +1331,9 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
     let workspace = app.current_workspace.clone();
 
-    tokio::spawn(async move {
+    while create_tasks.try_join_next().is_some() {}
+    let cleanup = cleanup.clone();
+    create_tasks.spawn(async move {
         let has_custom_image = !image.is_empty();
         let template = if has_custom_image {
             Some(openshell_core::proto::SandboxTemplate {
@@ -1380,6 +1399,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             &workspace,
             created.object_id(),
         );
+        target.cleanup = cleanup;
         // If ports or command are set, wait for Ready before finishing.
         if need_ready {
             let mut attempts = 0;
