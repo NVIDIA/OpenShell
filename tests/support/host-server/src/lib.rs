@@ -11,7 +11,8 @@
 //! host, such as one on a remote cluster, can't run tests that use them.
 //!
 //! - [`HttpRecorder`] answers HTTP requests with a fixed body or a handler's
-//!   [`Response`], and records each parsed [`Request`].
+//!   [`Response`], and records each parsed [`Request`]. It serves HTTPS with
+//!   a certificate from a [`TestCa`].
 //! - [`WebSocketRecorder`] completes the WebSocket handshake and records the
 //!   frames that arrive.
 //! - [`TcpServer`] records raw bytes, and echoes them or answers once the
@@ -21,6 +22,7 @@
 
 mod http;
 mod tcp;
+mod tls;
 mod websocket;
 
 use std::time::Duration;
@@ -30,6 +32,7 @@ use tokio::net::TcpListener;
 
 pub use http::{HttpRecorder, Request, Response};
 pub use tcp::{TcpServer, exchange};
+pub use tls::{ADDITIONAL_CA_CERT_ENV, ADDITIONAL_CA_KEY_ENV, Identity, TestCa};
 pub use websocket::{TEXT_REPLY, WebSocketRecorder};
 
 /// The name a sandbox reaches these servers by.
