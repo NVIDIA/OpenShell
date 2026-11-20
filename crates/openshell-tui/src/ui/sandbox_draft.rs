@@ -829,7 +829,11 @@ fn format_endpoint_summary(endpoint: &NetworkEndpoint) -> String {
         endpoint.host.clone()
     };
 
-    let mut tags = vec![endpoint_layer_label(endpoint).to_string()];
+    let layer = endpoint_layer_label(endpoint);
+    if is_transport_endpoint(endpoint) {
+        return format!("{host_port} [{layer}]");
+    }
+    let mut tags = vec![layer.to_string()];
     if endpoint.access != 0 {
         tags.push(format!(
             "access={}",
@@ -850,8 +854,9 @@ fn format_endpoint_summary(endpoint: &NetworkEndpoint) -> String {
 
 fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
     let mut details = Vec::new();
+    let transport_only = is_transport_endpoint(endpoint);
 
-    if !endpoint.path.is_empty() {
+    if !transport_only && !endpoint.path.is_empty() {
         details.push(format!("Path scope: {}", endpoint.path));
     }
     if endpoint.tls != 0 {
@@ -860,7 +865,7 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
             openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown")
         ));
     }
-    if endpoint.enforcement != 0 {
+    if !transport_only && endpoint.enforcement != 0 {
         details.push(format!(
             "Enforcement: {}",
             openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
@@ -873,6 +878,10 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
     if endpoint.websocket_credential_rewrite {
         details.push("WebSocket credential rewrite".to_string());
     }
+    if transport_only {
+        details.push("no HTTP method/path filter".to_string());
+        return details;
+    }
     for rule in &endpoint.rules {
         if let Some(allow) = &rule.allow {
             details.push(format!("Allow: {}", format_allow_rule(allow)));
@@ -883,6 +892,10 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
     }
 
     details
+}
+
+fn is_transport_endpoint(endpoint: &NetworkEndpoint) -> bool {
+    endpoint.protocol.is_empty() || endpoint.protocol.eq_ignore_ascii_case("tcp")
 }
 
 fn endpoint_layer_label(endpoint: &NetworkEndpoint) -> &str {

@@ -7166,6 +7166,9 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
     } else {
         endpoint.protocol.as_str()
     };
+    if endpoint.protocol.is_empty() || endpoint.protocol.eq_ignore_ascii_case("tcp") {
+        return format!("{host_port} [{layer_tag}, no HTTP method/path filter]");
+    }
     tags.push(layer_tag.to_string());
 
     if endpoint.access != 0 {
