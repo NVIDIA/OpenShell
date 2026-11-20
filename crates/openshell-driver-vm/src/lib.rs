@@ -37,6 +37,8 @@ mod rootfs;
 #[cfg(feature = "compute-driver")]
 mod runtime;
 
+pub mod startup_config;
+
 #[cfg(feature = "compute-driver")]
 pub use driver::{VmDriver, VmDriverConfig};
 #[cfg(feature = "compute-driver")]
