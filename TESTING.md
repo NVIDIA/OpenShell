@@ -278,7 +278,9 @@ out of every environment until it's fixed.
 an explicit matrix and runs the runner once per row. Branch E2E calls it once
 per family when the `test:e2e` label is set, and a failure fails the Core E2E
 result. Release Dev and Release Qualification run the conformance and feature
-families. To run a suite in another environment on CI, add a row.
+families. To run a suite in another environment on CI, add a row. A row's
+`filter`, a nextest filterset, runs only some of the package's tests, for a
+package whose tests need different environments.
 
 ### Adding a feature suite
 

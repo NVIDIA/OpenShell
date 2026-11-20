@@ -4,8 +4,9 @@
 # Runs testkit suites in tmachine environments on CI. Each row of `ROWS` below
 # names a tmachine environment and installer, the family (the path of a
 # workspace under tests/suites/, such as conformance or drivers/podman) and,
-# optionally, the package in it, the gateway name the installer registers, and
-# the runner label for the environment's architecture. `openshell-test-runner`
+# optionally, the package in it, a nextest filterset (`filter`) for a package
+# whose tests need different environments, the gateway name the installer
+# registers, and the runner label for the environment's architecture. `openshell-test-runner`
 # builds the tests, boots the environment, runs them inside it and checks the
 # results. With `prebuilt`, the rows run what the caller built once for the
 # run instead: conformance rows the static `openshell-conformance`, the other
@@ -109,6 +110,8 @@ jobs:
             {"environment":"ubuntu-k3s","installer":"k3s","family":"features","package":"routable-host-ip","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"routable-host-ip","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"connect-ssh-supervision","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-otlp","installer":"rpm","family":"features","package":"otlp-relay","filter":"not test(relay_is_inert_without_collector)","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"otlp-relay","filter":"test(relay_is_inert_without_collector)","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
@@ -125,6 +128,7 @@ jobs:
               select($family == "" or .family == $family or (.family | startswith($family + "/")))
               | select((.external_driver // false) == false or $external == "true")
               | .package //= ""
+              | .filter //= ""
               | .suite = (if .package == "" then .family else "\(.family)/\(.package)" end)
               | .artifact = ([.suite, .environment, .installer] | join("-") | gsub("/"; "-"))
               | .bundle = "openshell-e2e-bundle-\(.family | gsub("/"; "-"))-x86_64-unknown-linux-musl"
@@ -221,6 +225,7 @@ jobs:
           INSTALLER: ${{ matrix.installer }}
           FAMILY: ${{ matrix.family }}
           PACKAGE: ${{ matrix.package }}
+          FILTER: ${{ matrix.filter }}
           GATEWAY: ${{ matrix.gateway }}
         run: |
           # The tests this environment can't pass yet; the runner passes the
@@ -246,6 +251,9 @@ jobs:
             fi
             if [ -n "${PACKAGE}" ]; then
               selection+=(--package "${PACKAGE}")
+            fi
+            if [ -n "${FILTER}" ]; then
+              selection+=(--filter "${FILTER}")
             fi
           fi
           nix run .#openshell-test-runner -- run \
