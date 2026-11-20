@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Point the gateway and the supervisors at SPIFFE Workload APIs the tests run,
+# and publish where the tests listen.
+#
+# The gateway reads its Workload API socket only from
+# OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET. The packaged gateway is a
+# systemd user service whose installer rewrites gateway.env, so a user-unit
+# drop-in sets the variable. Supervisors use the driver's
+# provider_spiffe_workload_api_socket. Podman supervisors share the test VM's
+# network, so they reach the test's listener over loopback. Nothing listens
+# until a test starts its Workload API. The SPIFFE fixture
+# (tests/support/spiffe) reads the variables published below.
+---
+- name: SPIFFE Workload APIs for tests
+  hosts: all
+  gather_facts: false
+  vars:
+    spiffe_directory: /var/lib/openshell-test/spiffe
+    spiffe_gateway_socket: "{{ spiffe_directory }}/gateway.sock"
+    spiffe_supervisor_port: 17690
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Require the environment's driver
+      ansible.builtin.assert:
+        that: [environment_driver is defined]
+        fail_msg: environment_driver names the gateway driver and comes from the environment's base in config.nix
+
+    # The test binds the socket as tmachine. A root gateway connects anyway.
+    - name: Create the gateway Workload API socket directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ spiffe_directory }}"
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0755"
+
+    - name: Create the gateway user-unit drop-in directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/systemd/user/openshell-gateway.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Point the gateway at the test's Workload API
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/systemd/user/openshell-gateway.service.d/spiffe.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          Environment=OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET={{ spiffe_gateway_socket }}
+
+    - name: Point supervisors at the test's Workload API
+      ansible.builtin.include_role:
+        name: gateway_overrides
+      vars:
+        gateway_overrides_name: spiffe
+        gateway_overrides_content: |
+          [openshell.drivers.{{ environment_driver }}]
+          provider_spiffe_workload_api_socket = "tcp:127.0.0.1:{{ spiffe_supervisor_port }}"
+
+    - name: Publish SPIFFE test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: spiffe
+        test_env_vars:
+          OPENSHELL_TEST_SPIFFE_GATEWAY_SOCKET: "{{ spiffe_gateway_socket }}"
+          OPENSHELL_TEST_SPIFFE_SUPERVISOR_PORT: "{{ spiffe_supervisor_port }}"

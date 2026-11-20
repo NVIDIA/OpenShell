@@ -4,8 +4,9 @@
 # Runs testkit suites in tmachine environments on CI. Each row of `ROWS` below
 # names a tmachine environment and installer, the family (the path of a
 # workspace under tests/suites/, such as conformance or drivers/podman) and,
-# optionally, the package in it, the gateway name the installer registers, and
-# the runner label for the environment's architecture. `openshell-test-runner`
+# optionally, the package in it, a nextest filterset (`filter`) for a package
+# whose tests need different environments, the gateway name the installer
+# registers, and the runner label for the environment's architecture. `openshell-test-runner`
 # builds the tests, boots the environment, runs them inside it and checks the
 # results. With `prebuilt`, the rows run what the caller built once for the
 # run instead: conformance rows the static `openshell-conformance`, the other
@@ -116,6 +117,13 @@ jobs:
             {"environment":"ubuntu-k3s","installer":"k3s","family":"features","package":"routable-host-ip","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-k3s","installer":"k3s-ha","family":"features","package":"routable-host-ip","gateway":"tmachine","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"connect-ssh-supervision","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-otlp","installer":"rpm","family":"features","package":"otlp-relay","filter":"not test(relay_is_inert_without_collector)","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"otlp-relay","filter":"test(relay_is_inert_without_collector)","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootless-spiffe","installer":"rpm","family":"features","package":"provider-token-exchange","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful","installer":"deb","family":"features","package":"provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"features","package":"provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"ubuntu-docker-rootful-additional-ca","installer":"deb","family":"features","package":"provider-rotation","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful-additional-ca","installer":"rpm","family":"features","package":"provider-rotation","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-keycloak","installer":"rpm","family":"features","package":"keycloak-provider-refresh","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootful-userns-default","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
@@ -135,6 +143,7 @@ jobs:
               | select((.external_driver // false) == false or $external == "true")
               | select((.upgrade_source // false) == false or $upgrade == "true")
               | .package //= ""
+              | .filter //= ""
               | .disruption //= ""
               | .suite = ([.family, .package, .disruption] | map(select(. != "")) | join("/"))
               | .artifact = ([.suite, .environment, .installer] | join("-") | gsub("/"; "-"))
@@ -254,6 +263,7 @@ jobs:
           INSTALLER: ${{ matrix.installer }}
           FAMILY: ${{ matrix.family }}
           PACKAGE: ${{ matrix.package }}
+          FILTER: ${{ matrix.filter }}
           GATEWAY: ${{ matrix.gateway }}
           DISRUPTION: ${{ matrix.disruption }}
         run: |
@@ -280,6 +290,9 @@ jobs:
             fi
             if [ -n "${PACKAGE}" ]; then
               selection+=(--package "${PACKAGE}")
+            fi
+            if [ -n "${FILTER}" ]; then
+              selection+=(--filter "${FILTER}")
             fi
           fi
           # A continuity row seeds state, applies the disruption, and verifies.

@@ -6,10 +6,8 @@
 //! Keycloak is only the provider's token issuer here; the CLI still reaches
 //! the gateway the usual way.
 
-use std::io::Write as _;
-
 use keycloak_support::KeycloakContext;
-use testkit::{CliOutput, Context, ResultExt as _};
+use testkit::{CliOutput, Context};
 
 const CREDENTIAL_KEY: &str = "KEYCLOAK_ACCESS_TOKEN";
 
@@ -20,68 +18,28 @@ const CREDENTIAL_KEY: &str = "KEYCLOAK_ACCESS_TOKEN";
 async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -> testkit::Result {
     let kc = KeycloakContext::new(cx).await?;
     let provider = kc.name("kc-refresh");
-    let profile_id = kc.name("kc-refresh-profile");
     let grant = kc.keycloak().password_grant().await?;
-    let profile = write_profile(&profile_id, kc.keycloak())?;
-    let profile_path = profile.path().to_string_lossy().into_owned();
-
-    // Register each delete before its create, so cleanup also covers a create
-    // the gateway applied but the CLI reported as failed. Both deletes succeed
-    // when there is nothing to delete.
-    delete_on_cleanup(&kc, "profile", &profile_id);
-    kc.cli(["profile", "import", "--file", &profile_path])
+    let profile_id = kc
+        .import_profile(&profile(&kc.name("kc-refresh-profile"), kc.keycloak()))
+        .await?;
+    kc.create_provider(
+        &provider,
+        &profile_id,
+        &[(CREDENTIAL_KEY, &grant.access_token)],
+    )
+    .await?;
+    let refresh = kc.provider_refresh(&provider, CREDENTIAL_KEY);
+    refresh
+        .configure(
+            "oauth2-refresh-token",
+            &[("client_id", kc.keycloak().client_id())],
+            &[("refresh_token", &grant.refresh_token)],
+        )
         .await?
         .success()?;
-    delete_on_cleanup(&kc, "provider", &provider);
-    kc.cli_with_env(
-        &[(CREDENTIAL_KEY, &grant.access_token)],
-        [
-            "provider",
-            "create",
-            "--name",
-            &provider,
-            "--type",
-            &profile_id,
-            "--credential",
-            CREDENTIAL_KEY,
-        ],
-    )
-    .await?
-    .success()?;
-    let client_id = format!("client_id={}", kc.keycloak().client_id());
-    kc.cli_with_env(
-        &[("KEYCLOAK_REFRESH_TOKEN", &grant.refresh_token)],
-        [
-            "provider",
-            "refresh",
-            "configure",
-            &provider,
-            "--credential-key",
-            CREDENTIAL_KEY,
-            "--strategy",
-            "oauth2-refresh-token",
-            "--material",
-            &client_id,
-            "--secret-material-env",
-            "refresh_token=KEYCLOAK_REFRESH_TOKEN",
-        ],
-    )
-    .await?
-    .success()?;
 
-    let refresh = |verb: &'static str| {
-        [
-            "provider",
-            "refresh",
-            verb,
-            provider.as_str(),
-            "--credential-key",
-            CREDENTIAL_KEY,
-        ]
-    };
-
-    kc.cli(refresh("rotate")).await?.success()?;
-    let status = kc.cli(refresh("status")).await?.success()?;
+    refresh.rotate().await?.success()?;
+    let status = refresh.status().await?.success()?;
     testkit::ensure!(
         combined(&status).contains("refreshed"),
         "a valid refresh did not reach the refreshed state:\n{}",
@@ -89,14 +47,14 @@ async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -
     );
 
     kc.keycloak().revoke(&grant.refresh_token).await?;
-    let rotate = kc.cli(refresh("rotate")).await?.failure()?;
+    let rotate = refresh.rotate().await?.failure()?;
     testkit::ensure!(
         combined(&rotate).contains("invalid_grant"),
         "a revoked refresh failed without invalid_grant:\n{}",
         combined(&rotate)
     );
 
-    let status = combined(&kc.cli(refresh("status")).await?.success()?);
+    let status = combined(&refresh.status().await?.success()?);
     for expected in [
         "reauthorization_required",
         "reauthorize",
@@ -117,27 +75,13 @@ async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -
     Ok(())
 }
 
-/// Delete the `kind` named `name` when the test ends, since testkit only
-/// cleans up sandboxes by itself.
-fn delete_on_cleanup(cx: &Context, kind: &'static str, name: &str) {
-    let cli = cx.cli_handle();
-    let name = name.to_string();
-    cx.on_cleanup(format!("delete {kind} {name}"), async move || {
-        cli.run([kind, "delete", &name]).await?.success()?;
-        Ok(())
-    });
-}
-
 fn combined(output: &CliOutput) -> String {
     format!("{}{}", output.stdout, output.stderr)
 }
 
-fn write_profile(
-    profile_id: &str,
-    keycloak: &keycloak_support::Keycloak,
-) -> testkit::Result<tempfile::NamedTempFile> {
+fn profile(profile_id: &str, keycloak: &keycloak_support::Keycloak) -> String {
     let issuer_token_url = keycloak.token_endpoint();
-    let profile = format!(
+    format!(
         r#"id: {profile_id}
 display_name: Keycloak provider refresh test
 category: other
@@ -168,13 +112,5 @@ endpoints:
 binaries:
   - /usr/bin/curl
 "#
-    );
-    let mut file = tempfile::Builder::new()
-        .suffix(".yaml")
-        .tempfile()
-        .context("create provider profile")?;
-    file.write_all(profile.as_bytes())
-        .and_then(|()| file.flush())
-        .context("write provider profile")?;
-    Ok(file)
+    )
 }

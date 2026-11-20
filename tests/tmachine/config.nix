@@ -114,6 +114,25 @@ let
       bases = dockerBases ++ podmanBases;
       setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
+    # A test-run OTLP collector for the gateway and the agent trace relay, for
+    # the otlp-relay suite. Its endpoint names Podman's host alias.
+    otlp = {
+      bases = podmanBases;
+      setup.playbooks = [ "ansible/playbooks/otlp.yaml" ];
+    };
+    # Test-run SPIFFE Workload APIs for the gateway and supervisors, for the
+    # provider-token-exchange suite. Supervisors reach theirs over loopback,
+    # which needs Podman's host-network supervisors.
+    spiffe = {
+      bases = podmanBases;
+      setup.playbooks = [ "ansible/playbooks/spiffe.yaml" ];
+    };
+    # A CA that sandboxes trust for egress, whose key tests use to sign their
+    # TLS servers' certificates.
+    additional-ca = {
+      bases = dockerBases ++ podmanBases;
+      setup.playbooks = [ "ansible/playbooks/additional-ca.yaml" ];
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases

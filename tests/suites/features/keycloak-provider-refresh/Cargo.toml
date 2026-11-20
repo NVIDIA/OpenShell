@@ -14,4 +14,3 @@ publish = false
 [dependencies]
 keycloak-support = { path = "../../../support/keycloak" }
 openshell-testkit = { path = "../../../testkit/testkit" }
-tempfile = "3"

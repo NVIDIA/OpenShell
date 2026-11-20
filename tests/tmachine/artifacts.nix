@@ -100,8 +100,6 @@ let
     # Its move to conformance is deferred until the isolation work in #4120; see
     # #4246.
     "provider_auto_create"
-    # Needs the SPIFFE fixtures that the wrapper sets up. Wrapper lane.
-    "provider_token_exchange"
     # Holds only the on-failure restart test until #5507; the rest moved to
     # testkit. Nextest archive filters cannot select individual tests, so keep
     # the complete binary in the follow-up bucket.

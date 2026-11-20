@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Make a CA that sandboxes trust for egress (`additional_ca_bundle`), and
+# publish its certificate and key so tests can sign certificates for the TLS
+# servers they run. The key stays on the test VM; only tests read it. The
+# host-server fixture (TestCa::from_env in tests/support/host-server) reads
+# the variables published below.
+---
+- name: Additional destination CA for tests
+  hosts: all
+  gather_facts: false
+  vars:
+    additional_ca_directory: /var/lib/openshell-test/additional-ca
+    additional_ca_cert: "{{ additional_ca_directory }}/ca.pem"
+    additional_ca_key: "{{ additional_ca_directory }}/ca.key"
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create the additional CA directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ additional_ca_directory }}"
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0755"
+
+    # The gateway reads the certificate as its own user, which may be root
+    # or tmachine. Only tmachine, which runs the tests, reads the key.
+    - name: Generate the additional CA
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - ec
+          - -pkeyopt
+          - ec_paramgen_curve:P-256
+          - -nodes
+          - -days
+          - "7"
+          - -subj
+          - /CN=openshell-test-additional-ca
+          - -addext
+          - basicConstraints=critical,CA:TRUE
+          - -addext
+          - keyUsage=critical,keyCertSign,cRLSign
+          - -keyout
+          - "{{ additional_ca_key }}"
+          - -out
+          - "{{ additional_ca_cert }}"
+        creates: "{{ additional_ca_cert }}"
+
+    - name: Restrict the additional CA key to the test user
+      become: true
+      ansible.builtin.file:
+        path: "{{ additional_ca_key }}"
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
+
+    - name: Let the gateway read the additional CA certificate
+      become: true
+      ansible.builtin.file:
+        path: "{{ additional_ca_cert }}"
+        owner: tmachine
+        group: tmachine
+        mode: "0644"
+
+    - name: Trust the additional CA for sandbox egress
+      ansible.builtin.include_role:
+        name: gateway_overrides
+      vars:
+        gateway_overrides_name: additional-ca
+        gateway_overrides_content: |
+          [openshell.supervisor.network]
+          additional_ca_bundle = "{{ additional_ca_cert }}"
+
+    - name: Publish additional CA test variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: additional-ca
+        test_env_vars:
+          OPENSHELL_TEST_ADDITIONAL_CA_CERT: "{{ additional_ca_cert }}"
+          OPENSHELL_TEST_ADDITIONAL_CA_KEY: "{{ additional_ca_key }}"

@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "provider-token-exchange"
+description = "Features suite: provider token grants that exchange SPIFFE JWT-SVIDs at token endpoints the test runs"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+[dependencies]
+openshell-testkit = { path = "../../../testkit/testkit" }
+serde_json = "1"
+spiffe-support = { path = "../../../support/spiffe" }
+tokio = { version = "1.43", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+url = "2"

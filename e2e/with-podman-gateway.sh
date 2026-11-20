@@ -97,18 +97,6 @@ podman_cmd() {
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
 WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-podman.XXXXXX")"
-if [ "${OPENSHELL_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
-  mkdir -p "${WORKDIR}/spiffe"
-  export OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET="${OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET:-${WORKDIR}/spiffe/gateway.sock}"
-  export OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET="${OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET}"
-  if [ -z "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
-    OPENSHELL_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
-    # Podman supervisors run with host networking, so reach the host-side
-    # Workload API fixture over loopback rather than the workload bridge.
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:127.0.0.1:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
-  fi
-fi
 GATEWAY_BIN=""
 CLI_BIN=""
 GATEWAY_PID=""
@@ -583,7 +571,6 @@ e2e_write_podman_gateway_config \
   "${PODMAN_STOP_TIMEOUT_SECS}" \
   "${SUPERVISOR_IMAGE}" \
   "${SANDBOX_BOUNDARY_IMAGE}" \
-  "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
   "${OPENSHELL_PODMAN_SOCKET:-}" \
   "${OIDC_MODE}" \
   "${OPENSHELL_OIDC_ISSUER:-}"
