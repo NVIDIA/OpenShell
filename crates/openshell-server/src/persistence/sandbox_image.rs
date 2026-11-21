@@ -376,7 +376,7 @@ ORDER BY id LIMIT $2",
             (IMAGE_STATE_OBJECT_TYPE, image_state_id.as_str()),
         ] {
             match &mut tx {
-                ImageTransaction::Sqlite(tx) => {
+                ImageTransaction::Sqlite { tx, .. } => {
                     sqlx::query("DELETE FROM objects WHERE object_type = ?1 AND id = ?2")
                         .bind(object_type)
                         .bind(id)
@@ -489,18 +489,25 @@ ORDER BY id LIMIT $2",
 
 /// Dropping an unfinished `SQLx` transaction rolls back both projections.
 enum ImageTransaction {
-    Sqlite(Transaction<'static, Sqlite>),
+    /// Holds the store's write gate for the life of the transaction.
+    Sqlite {
+        tx: Transaction<'static, Sqlite>,
+        _write: tokio::sync::OwnedMutexGuard<()>,
+    },
     Postgres(Transaction<'static, Postgres>),
 }
 
 impl ImageTransaction {
     async fn begin(store: &Store) -> PersistenceResult<Self> {
         match store {
-            Store::Sqlite(store) => store
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map(Self::Sqlite),
+            Store::Sqlite(store) => {
+                let write = store.lock_writes().await;
+                store
+                    .pool
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .map(|tx| Self::Sqlite { tx, _write: write })
+            }
             Store::Postgres(store) => store.pool.begin().await.map(Self::Postgres),
         }
         .map_err(|error| map_db_error(&error))
@@ -508,7 +515,7 @@ impl ImageTransaction {
 
     async fn lock_sandbox(&mut self, sandbox_id: &str) -> PersistenceResult<Sandbox> {
         let row = match self {
-            Self::Sqlite(tx) => {
+            Self::Sqlite { tx, .. } => {
                 sqlx::query_as::<_, (Vec<u8>, i64)>(
                     r#"SELECT "payload", "resource_version" FROM "objects"
 WHERE "object_type" = 'sandbox' AND "id" = ?1"#,
@@ -538,7 +545,7 @@ WHERE object_type = 'sandbox' AND id = $1 FOR UPDATE",
     ) -> PersistenceResult<Option<StoredSandboxImageState>> {
         let id = state_id(sandbox_id);
         let payload = match self {
-            Self::Sqlite(tx) => {
+            Self::Sqlite { tx, .. } => {
                 sqlx::query_scalar::<_, Vec<u8>>(
                     r#"SELECT "payload" FROM "objects" WHERE "object_type" = ?1 AND "id" = ?2"#,
                 )
@@ -579,7 +586,7 @@ WHERE object_type = 'sandbox' AND id = $1 FOR UPDATE",
         let labels = serde_json::to_value(labels)
             .map_err(|error| PersistenceError::Encode(error.to_string()))?;
         let affected = match self {
-            Self::Sqlite(tx) => sqlx::query(
+            Self::Sqlite { tx, .. } => sqlx::query(
                 r#"UPDATE "objects"
 SET "payload" = ?2, "updated_at_ms" = ?3, "resource_version" = "resource_version" + 1, "labels" = ?5
 WHERE "object_type" = 'sandbox' AND "id" = ?1 AND "resource_version" = ?4"#,
@@ -622,7 +629,7 @@ WHERE object_type = 'sandbox' AND id = $1 AND resource_version = $4",
             "completed"
         };
         let affected = match self {
-            Self::Sqlite(tx) => sqlx::query(
+            Self::Sqlite { tx, .. } => sqlx::query(
                 r#"INSERT INTO "objects" (
     "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "status"
 ) VALUES (?1, ?2, NULL, '', ?3, ?4, ?4, ?5)
@@ -668,7 +675,7 @@ WHERE objects.object_type = $1 AND objects.name IS NULL AND objects.workspace = 
 
     async fn commit(self) -> PersistenceResult<()> {
         match self {
-            Self::Sqlite(tx) => tx.commit().await,
+            Self::Sqlite { tx, .. } => tx.commit().await,
             Self::Postgres(tx) => tx.commit().await,
         }
         .map_err(|error| map_db_error(&error))

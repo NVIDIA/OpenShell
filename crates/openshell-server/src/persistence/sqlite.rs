@@ -34,6 +34,21 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
         .find(|migration| migration.version == version)
         .map(|migration| migration.sql.as_ref())
 }
+
+/// How long a statement may wait in `SQLite`'s busy handler for another
+/// connection's lock. This is sqlx's implicit default made explicit.
+///
+/// The busy handler polls with growing sleeps (up to 100 ms) and is not
+/// fair: under a steady stream of short writes from other connections in
+/// this process, a waiting writer can lose every retry and fail with
+/// `SQLITE_BUSY` ("database is locked") after this timeout even though no
+/// single write holds the lock for long (#3679). Writers are therefore
+/// queued in-process behind `write_gate` (a FIFO `tokio` mutex) so they wait
+/// in order instead of polling, and this timeout only covers contention
+/// from outside the gateway process (another process opening the file,
+/// WAL checkpoints).
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use super::mutation_admission::{
@@ -60,6 +75,8 @@ pub struct SqliteStore {
     /// [`SqliteStore::create_relaxed`]. On-disk stores open it with
     /// `synchronous=NORMAL`; in-memory stores share `pool`.
     relaxed_pool: SqlitePool,
+    /// Serializes writers inside this process; see [`SQLITE_BUSY_TIMEOUT`].
+    write_gate: Arc<Mutex<()>>,
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     in_memory_keepalive: Option<Arc<Mutex<Option<SqliteConnection>>>>,
 }
@@ -256,7 +273,8 @@ impl SqliteStore {
 
         let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
 
         if is_in_memory {
             if options.get_filename().as_os_str().is_empty()
@@ -320,8 +338,16 @@ impl SqliteStore {
         Ok(Self {
             pool,
             relaxed_pool,
+            write_gate: Arc::new(Mutex::new(())),
             in_memory_keepalive,
         })
+    }
+
+    /// Acquire the in-process write gate for a caller that opens its own
+    /// write transaction on [`SqliteStore::pool`]. Hold the guard until the
+    /// transaction commits or rolls back.
+    pub(super) async fn lock_writes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.write_gate).lock_owned().await
     }
 
     pub async fn migrate(&self) -> PersistenceResult<()> {
@@ -393,6 +419,7 @@ impl SqliteStore {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
 
         sqlx::query(
@@ -433,6 +460,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
+        let _write = self.write_gate.lock().await;
         insert_new_object(
             &self.relaxed_pool,
             object_type,
@@ -456,6 +484,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         labels: Option<&str>,
         condition: WriteCondition,
     ) -> PersistenceResult<WriteResult> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
 
         match condition {
@@ -541,6 +570,7 @@ RETURNING "resource_version", "created_at_ms", "updated_at_ms"
     ) -> PersistenceResult<Vec<Option<WriteResult>>> {
         let now_ms = current_time_ms();
         let mut results = vec![None; writes.len()];
+        let _write = self.write_gate.lock().await;
         // Dropping the transaction on an early return rolls every write back.
         let mut tx = self
             .pool
@@ -639,6 +669,7 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
         id: &str,
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -677,6 +708,7 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
 
         sqlx::query(
@@ -716,6 +748,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
 
         sqlx::query(
@@ -754,6 +787,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
         labels: Option<&str>,
         max_count: u64,
     ) -> PersistenceResult<Option<WriteResult>> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
         let mut tx = self
             .pool
@@ -961,6 +995,7 @@ WHERE "object_type" = ?1 AND "workspace" = ?2 AND "name" = ?3
     }
 
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -976,6 +1011,7 @@ WHERE "object_type" = ?1 AND "id" = ?2
     }
 
     pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        let _write = self.write_gate.lock().await;
         let mut deleted = 0_u64;
         for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
             let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM objects WHERE object_type = ");
@@ -1046,6 +1082,7 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
+        let _write = self.write_gate.lock().await;
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -1061,6 +1098,7 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
     }
 
     pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
+        let _write = self.write_gate.lock().await;
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -1081,6 +1119,7 @@ WHERE "object_type" = ?1 AND "scope" = ?2
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -1501,6 +1540,7 @@ WHERE o."object_type" = "#,
         payload: &[u8],
         hash: &str,
     ) -> PersistenceResult<()> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
         let record = PolicyRecord {
             id: id.to_string(),
@@ -1544,6 +1584,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
         workspace: &str,
     ) -> PersistenceResult<()> {
         let wrapped_payload = policy_payload_from_record(record)?;
+        let _write = self.write_gate.lock().await;
         sqlx::query(
             r#"
 INSERT INTO "objects" (
@@ -1572,6 +1613,7 @@ ON CONFLICT DO NOTHING
         &self,
         write: &AtomicPolicyRevisionWrite,
     ) -> PersistenceResult<Sandbox> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
         let record = policy_record_for_atomic_write(write, now_ms);
         let wrapped_payload = policy_payload_from_record(&record)?;
@@ -1796,6 +1838,7 @@ LIMIT ?4
         load_error: Option<&str>,
         loaded_at_ms: Option<i64>,
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let Some(mut record) = self.get_policy_by_version(sandbox_id, version).await? else {
             return Ok(false);
         };
@@ -1830,6 +1873,7 @@ WHERE "object_type" = ?1 AND "scope" = ?2 AND "version" = ?3
         sandbox_id: &str,
         before_version: i64,
     ) -> PersistenceResult<u64> {
+        let _write = self.write_gate.lock().await;
         let now_ms = current_time_ms();
         let result = sqlx::query(
             r#"
@@ -1857,6 +1901,7 @@ WHERE "object_type" = ?1
         dedup_key: Option<&str>,
         workspace: &str,
     ) -> PersistenceResult<String> {
+        let _write = self.write_gate.lock().await;
         let payload = draft_chunk_payload_from_record(chunk)?;
         // RETURNING "id" gives us the row's effective id regardless of
         // whether INSERT inserted a fresh row or ON CONFLICT updated an
@@ -1952,6 +1997,7 @@ ORDER BY "created_at_ms" DESC
         decided_at_ms: Option<i64>,
         rejection_reason: Option<&str>,
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let Some(mut record) = self.get_draft_chunk(id).await? else {
             return Ok(false);
         };
@@ -1988,6 +2034,7 @@ WHERE "object_type" = ?1 AND "id" = ?2
         decided_at_ms: i64,
         rejection_reason: &str,
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let Some(mut record) = self.get_draft_chunk(id).await? else {
             return Ok(false);
         };
@@ -2025,6 +2072,7 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "status" = 'pending'
         id: &str,
         proposed_rule: &[u8],
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let Some(mut record) = self.get_draft_chunk(id).await? else {
             return Ok(false);
         };
@@ -2058,6 +2106,7 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "status" = 'pending'
         &self,
         chunk: &DraftChunkRecord,
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let payload = draft_chunk_payload_from_record(chunk)?;
         let result = sqlx::query(
             r#"
@@ -2081,6 +2130,7 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
         expected: &DraftChunkRecord,
         evaluated: &DraftChunkRecord,
     ) -> PersistenceResult<bool> {
+        let _write = self.write_gate.lock().await;
         let Some(row) = sqlx::query(
             r#"
 SELECT "id", "scope", "status", "hit_count", "payload", "created_at_ms", "updated_at_ms"
@@ -2129,6 +2179,7 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
         sandbox_id: &str,
         status: &str,
     ) -> PersistenceResult<u64> {
+        let _write = self.write_gate.lock().await;
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
