@@ -164,6 +164,12 @@ openshell gateway remove production
 
 ## Troubleshoot
 
+If `openshell term` cannot connect, its error names the selected gateway and the
+endpoint it tried, including a `--gateway-endpoint` override. Inspect saved
+endpoints with `openshell gateway list`, which works without a live connection.
+Check the underlying error to distinguish a connection refusal from a TLS or
+authentication failure, then inspect the gateway service or tunnel.
+
 Check gateway health:
 
 ```shell

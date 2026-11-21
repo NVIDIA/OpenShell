@@ -44,6 +44,9 @@ pub enum SdkError {
     Connect {
         /// Error message.
         message: String,
+        /// Original channel error, including TCP and TLS failure causes.
+        #[source]
+        source: Option<Box<tonic::transport::Error>>,
     },
 
     /// Auth-related failure: OIDC discovery / refresh, token format invalid
@@ -139,6 +142,7 @@ impl SdkError {
     pub fn connect(message: impl Into<String>) -> Self {
         Self::Connect {
             message: message.into(),
+            source: None,
         }
     }
 
@@ -244,6 +248,15 @@ impl SdkError {
             Self::AlreadyExists { .. } => "already_exists",
             Self::Rpc { .. } => "rpc",
             Self::OutOfRange { .. } => "out_of_range",
+        }
+    }
+}
+
+impl From<tonic::transport::Error> for SdkError {
+    fn from(source: tonic::transport::Error) -> Self {
+        Self::Connect {
+            message: source.to_string(),
+            source: Some(Box::new(source)),
         }
     }
 }
