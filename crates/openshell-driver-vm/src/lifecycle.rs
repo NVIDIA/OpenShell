@@ -82,20 +82,9 @@ pub type LifecycleResult<T> = Result<T, LifecycleError>;
 ///
 /// Extensions declare features they need (e.g. PCI passthrough or an
 /// external kernel image) and the VM driver resolves a concrete
-/// [`VmBackend`] that can satisfy them. The mapping from feature to
-/// backend lives in [`BackendFeature::requires_qemu`] for now; once a
-/// third backend exists this should evolve into a per-backend capability
-/// table that the resolver intersects against feature requirements.
-///
-/// # Current limitations
-///
-/// Until the non-GPU QEMU launch path (PCI device transport / VFIO root
-/// port wiring) lands, the driver still rejects launches where the
-/// resolved backend is QEMU but the sandbox has no GPU. As a result,
-/// declaring [`Self::PciPassthrough`] or [`Self::ExternalKernelImage`] on
-/// a non-GPU sandbox is accepted by [`LifecycleExtensionRegistry::validate`]
-/// at registration time but will fail provisioning with a
-/// `FailedPrecondition` status.
+/// [`VmBackend`] that can satisfy them. [`Self::is_supported_by`] describes
+/// each backend independently. Explicit backend requirements are preserved;
+/// an unsupported feature fails before the launcher starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendFeature {
     /// Extension supplies its own kernel image via
@@ -105,8 +94,8 @@ pub enum BackendFeature {
     /// [`LaunchPlan::guest_init_dropins`]. Supported by all backends.
     GuestInitDropins,
     /// Extension needs PCI device passthrough on the guest. Currently
-    /// QEMU-only and currently rejected for non-GPU sandboxes pending the
-    /// non-GPU QEMU launch path landing.
+    /// QEMU-only. The current device model requires an assigned GPU BDF;
+    /// arbitrary PCI device descriptors are not supported.
     PciPassthrough,
 }
 
@@ -120,13 +109,15 @@ impl BackendFeature {
         }
     }
 
-    /// Returns true when satisfying this feature requires the QEMU backend
-    /// today. This is the simplest possible resolver and is expected to be
-    /// replaced with a per-backend capability table once a third backend
-    /// exists.
+    /// Whether the backend implements this feature. Device assignment and
+    /// kernel compatibility are validated separately for the concrete plan.
     #[must_use]
-    pub fn requires_qemu(self) -> bool {
-        matches!(self, Self::ExternalKernelImage | Self::PciPassthrough)
+    pub fn is_supported_by(self, backend: &VmBackend) -> bool {
+        match (backend, self) {
+            (VmBackend::Libkrun, Self::ExternalKernelImage | Self::PciPassthrough) => false,
+            (VmBackend::Libkrun | VmBackend::Qemu, Self::GuestInitDropins)
+            | (VmBackend::Qemu, Self::ExternalKernelImage | Self::PciPassthrough) => true,
+        }
     }
 }
 
@@ -287,7 +278,7 @@ pub enum ExtensionActivation {
 ///    and allocates backend-specific host resources such as a vsock CID.
 /// 3. [`before_launch`](Self::before_launch) — perform host-side
 ///    side effects with the resolved plan in hand, optionally append
-///    additional guest env via [`LaunchPlan::env`].
+///    guest environment entries or init drop-ins.
 /// 4. The driver spawns the VM launcher process.
 ///
 /// On launch failure or sandbox deletion, the driver invokes
@@ -338,19 +329,13 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
 
     /// Perform host-side preparation with the resolved launch plan.
     ///
-    /// At this point [`LaunchPlan::backend`],
-    /// [`LaunchPlan::required_backends`], and
-    /// [`LaunchPlan::required_backend_features`] are finalized and any
-    /// backend-specific host resources have been
-    /// allocated. This hook is the right place to bind PCI devices, set
-    /// up filesystem state, or otherwise prepare the host.
+    /// The driver has finalized the backend, requirements, kernel, sizing,
+    /// GPU assignment, and vsock CID. Use this hook to bind a reserved PCI
+    /// device, set up filesystem state, or otherwise prepare the host.
     ///
-    /// Implementations MAY append entries to [`LaunchPlan::env`] to
-    /// inject additional guest environment variables, and MAY return an
-    /// error to abort the launch. Implementations MUST NOT change
-    /// [`LaunchPlan::backend`], [`LaunchPlan::required_backends`], or
-    /// [`LaunchPlan::required_backend_features`]; those changes are
-    /// ignored by the driver once `before_launch` is reached.
+    /// Implementations can append entries to [`LaunchPlan::env`] and
+    /// [`LaunchPlan::guest_init_dropins`] or return an error to abort the
+    /// launch. The registry rejects changes to finalized launch fields.
     ///
     /// If this hook performs allocations that must be released on failure
     /// or delete, implement
@@ -604,8 +589,37 @@ impl LifecycleExtensionRegistry {
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let assigned_gpu = plan.gpu_bdf.clone();
+        let backend = plan.backend.clone();
+        let required_backends = plan.required_backends.clone();
+        let required_backend_features = plan.required_backend_features.clone();
+        let kernel_profile = plan.kernel_profile.clone();
+        let kernel_image = plan.kernel_image.clone();
+        let vsock_cid = plan.vsock_cid;
+        let vcpus = plan.vcpus;
+        let mem_mib = plan.mem_mib;
         for ext in self.active_for(sandbox) {
             ext.before_launch(sandbox, state_dir, plan).await?;
+            if plan.gpu_bdf != assigned_gpu {
+                return Err(LifecycleError::new(format!(
+                    "extension '{}' changed the assigned GPU device in before_launch",
+                    ext.name()
+                )));
+            }
+            if plan.backend != backend
+                || plan.required_backends != required_backends
+                || plan.required_backend_features != required_backend_features
+                || plan.kernel_profile != kernel_profile
+                || plan.kernel_image != kernel_image
+                || plan.vsock_cid != vsock_cid
+                || plan.vcpus != vcpus
+                || plan.mem_mib != mem_mib
+            {
+                return Err(LifecycleError::new(format!(
+                    "extension '{}' changed finalized launch fields in before_launch",
+                    ext.name()
+                )));
+            }
         }
         span_status.finish(Ok(()))
     }
@@ -906,6 +920,10 @@ mod tests {
                 )));
             }
             plan.env.push(format!("RECORDING_{}=1", self.name));
+            plan.guest_init_dropins.push(GuestInitDropin::new(
+                format!("90-{}.sh", self.name),
+                b"#!/bin/sh\n".to_vec(),
+            ));
             Ok(())
         }
 
@@ -976,6 +994,67 @@ mod tests {
         T: LifecycleExtension + 'static,
     {
         extension.clone()
+    }
+
+    type PlanMutation = fn(&mut LaunchPlan);
+
+    #[derive(Debug)]
+    struct PlanMutatingExtension(PlanMutation);
+
+    #[tonic::async_trait]
+    impl LifecycleExtension for PlanMutatingExtension {
+        fn name(&self) -> &'static str {
+            "plan-mutator"
+        }
+
+        async fn before_launch(
+            &self,
+            _sandbox: &Sandbox,
+            _state_dir: &Path,
+            plan: &mut LaunchPlan,
+        ) -> LifecycleResult<()> {
+            (self.0)(plan);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn before_launch_rejects_changes_to_finalized_fields() {
+        let mutations: [(&str, PlanMutation); 10] = [
+            ("assigned GPU device", |plan| plan.gpu_bdf = None),
+            ("assigned GPU device", |plan| {
+                plan.gpu_bdf = Some("0000:02:00.0".to_string());
+            }),
+            ("finalized launch fields", |plan| {
+                plan.backend = VmBackend::Libkrun;
+            }),
+            ("finalized launch fields", |plan| {
+                plan.require_backend(VmBackend::Libkrun);
+            }),
+            ("finalized launch fields", |plan| {
+                plan.require_backend_feature(BackendFeature::PciPassthrough);
+            }),
+            ("finalized launch fields", |plan| {
+                plan.kernel_profile = Some("other".into());
+            }),
+            ("finalized launch fields", |plan| {
+                plan.kernel_image = Some("other".into());
+            }),
+            ("finalized launch fields", |plan| plan.vsock_cid = Some(8)),
+            ("finalized launch fields", |plan| plan.vcpus = 4),
+            ("finalized launch fields", |plan| plan.mem_mib = 4096),
+        ];
+        for (message, mutate) in mutations {
+            let registry =
+                LifecycleExtensionRegistry::with(vec![Arc::new(PlanMutatingExtension(mutate))]);
+            let mut plan = sample_plan(VmBackend::Qemu);
+            plan.gpu_bdf = Some("0000:01:00.0".to_string());
+            let error = registry
+                .before_launch(&sample_sandbox(), Path::new("/tmp/state"), &mut plan)
+                .await
+                .expect_err("finalized launch fields must survive before_launch");
+            assert!(error.message().contains(message));
+        }
     }
 
     #[tokio::test]
@@ -1096,7 +1175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_launch_runs_each_extension_in_order_and_collects_env() {
+    async fn before_launch_runs_each_extension_in_order_and_collects_guest_inputs() {
         let ext_a = RecordingExtension::new("a");
         let ext_b = RecordingExtension::new("b");
         let registry =
@@ -1110,6 +1189,13 @@ mod tests {
             .expect("before_launch succeeds");
 
         assert_eq!(plan.env, vec!["RECORDING_a=1", "RECORDING_b=1"]);
+        assert_eq!(
+            plan.guest_init_dropins
+                .iter()
+                .map(|dropin| dropin.name.as_str())
+                .collect::<Vec<_>>(),
+            ["90-a.sh", "90-b.sh"]
+        );
         assert_eq!(ext_a.calls(), vec!["a:before_launch"]);
         assert_eq!(ext_b.calls(), vec!["b:before_launch"]);
     }
