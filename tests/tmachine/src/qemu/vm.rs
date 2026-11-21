@@ -225,8 +225,14 @@ fn command(
         .arg("virtio-blk-pci,drive=rootfs,bootindex=1")
         .arg("-device")
         .arg("virtio-rng-pci")
+        // A unique local IPv6 prefix instead of user networking's default
+        // site-local fec0::/64. Linux ranks a site-local source below any
+        // global address, so on a dual-stack K3s guest it picks flannel's
+        // address to reach an IPv6 Service and never gets the reply.
         .arg("-netdev")
-        .arg(format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"))
+        .arg(format!(
+            "user,id=net0,ipv6-net=fd00:10::/64,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"
+        ))
         .arg("-device")
         .arg("virtio-net-pci,netdev=net0");
 

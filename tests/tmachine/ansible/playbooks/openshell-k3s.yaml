@@ -66,7 +66,9 @@
     # address must be the one of the node the tests run on. QEMU user
     # networking gives every boot the same guest address (10.0.2.15), so the
     # value stays valid when the disk is reused.
-    # The node can also list an IPv6 address after it, so take the IPv4 one.
+    # A dual-stack node also lists an IPv6 address, first on an IPv6-first
+    # cluster. Take the IPv4 one: the servers tests start for sandboxes to
+    # reach (tests/support/host-server) listen on IPv4 only.
     - name: Discover the K3s node address
       ansible.builtin.command:
         argv:
@@ -91,9 +93,12 @@
       changed_when: false
       failed_when: k3s_nodes.rc != 0 or k3s_nodes.stdout_lines | length != 1
 
-    - name: Select the K3s node IPv4 address
+    # On an IPv6-first cluster (playbooks/k3s-ipv6.yaml) the node lists its
+    # IPv6 address first, and the gateway and supervisor must listen on IPv6.
+    - name: Select the K3s node IPv4 address and listen address
       ansible.builtin.set_fact:
         k3s_node_ipv4: "{{ k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | first }}"
+        k3s_listen_address: "{{ '::' if ':' in k3s_node_address.stdout.split()[0] else '0.0.0.0' }}"
 
     - name: Write OpenShell Helm values
       ansible.builtin.copy:
@@ -104,6 +109,7 @@
             image:
               registry: ""
           gateway:
+            listenAddress: "{{ k3s_listen_address }}"
             image:
               repository: openshell/gateway
               tag: tmachine
@@ -114,6 +120,7 @@
               tag: tmachine
               pullPolicy: never
           supervisor:
+            listenAddress: "{{ k3s_listen_address }}"
             image:
               repository: openshell/supervisor
               tag: tmachine
@@ -196,16 +203,28 @@
           - get
           - service
           - openshell
-          - --output=jsonpath={.spec.clusterIP}:{.spec.ports[?(@.name=="grpc")].port}
+          - --output=jsonpath={.spec.clusterIP} {.spec.ports[?(@.name=="grpc")].port}
       register: k3s_gateway_address
       changed_when: false
 
     # Rejects headless Services (ClusterIP "None") and a missing grpc port.
+    # The ClusterIP is IPv6 on a cluster whose primary family is IPv6.
     - name: Require a gateway Service address
       ansible.builtin.assert:
         that:
-          - k3s_gateway_address.stdout is match('^[0-9.]+:[0-9]+$')
+          - k3s_gateway_address.stdout is match('^([0-9.]+|[0-9a-f:]+) [0-9]+$')
         fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
+
+    # A URL needs brackets around an IPv6 address, for example
+    # http://[fd00:43::a]:8080; without them the port can't be told apart.
+    - name: Record the gateway Service address
+      vars:
+        gateway_ip: "{{ k3s_gateway_address.stdout.split()[0] }}"
+        gateway_port: "{{ k3s_gateway_address.stdout.split()[1] }}"
+      ansible.builtin.set_fact:
+        k3s_gateway_ip: "{{ gateway_ip }}"
+        k3s_gateway_port: "{{ gateway_port }}"
+        k3s_gateway_authority: "{{ ('[' ~ gateway_ip ~ ']') if ':' in gateway_ip else gateway_ip }}:{{ gateway_port }}"
 
     # Deployment readiness doesn't establish that the controller reconciles
     # Sandboxes. This checks the installed cluster; a booted guest restarts the
@@ -218,6 +237,6 @@
   hosts: all
   gather_facts: false
   vars:
-    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_address.stdout }}"
+    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_authority }}"
   roles:
     - openshell_client
