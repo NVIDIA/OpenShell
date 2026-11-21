@@ -352,8 +352,8 @@ report content. `msg` and `title` are validated per the spec, then discarded.
    limits, and record semantics. A prototype harness has run Claude Code
    2.1.327 and Codex 0.170.0 through the scanner on a host PTY.
 2. **Reporting.** Add `SupervisorWorkloadActivity` and the supervisor reporter
-   task. Add the gateway handler and the throttled `ProgramStatus` condition,
-   and preserve the condition across driver snapshots.
+   task. Add the gateway handler, the read-time `ProgramStatus` condition, and
+   the `PeerGetSandboxProgramStatus` peer read.
 3. **Policy.** Register the `idle_stop_after_seconds` setting. Add the idle
    sweep and the `IdleStopped` reason, and document them on the sandbox
    lifecycle page.
@@ -396,7 +396,8 @@ sets a gateway value or a user opts in per sandbox.
 - **Partial visibility.** `ProgramStatus` is not in `ListSandboxes`, and a
   watcher connected to a replica without the session sees no condition or
   updates. Fanning reports out to every replica would fix that at the cost of
-  cross-replica traffic per report.
+  cross-replica traffic per report. A separate status record, listed under
+  Open questions, would too.
 
 ## Alternatives
 
@@ -420,7 +421,7 @@ each agent needs its own configuration inside the sandbox image, and the hook
 runs as workload code with network access. The terminal channel needs nothing
 from the image.
 
-### Store the program status condition
+### Store the program status on the sandbox record
 
 An earlier version wrote `ProgramStatus` to the sandbox record on each state
 change and on input progress of a minute or more. Every reader, on every
@@ -428,7 +429,8 @@ replica, then saw it. But an active agent cost two writes per turn even with
 idle stop disabled, each write bumped the resource version and woke watchers,
 and the writes needed owner fencing, conflict retries, and preservation across
 driver snapshots and phase changes. Reading the live report at serve time
-removes all of that.
+removes all of that. Storing the status in its own record avoids most of these
+costs and remains open; see Open questions.
 
 ### Do nothing
 
@@ -481,5 +483,12 @@ holding capacity.
   snapshot has no lag, but the sweep would still need it to avoid needless
   confirmation requests, so the first request is delayed either way.
 - Should `ListSandboxes`, or watchers on a replica without the session, show
-  `ProgramStatus`? Doing so needs per-report fan-out or a peer read per
-  sandbox.
+  `ProgramStatus`? Per-report fan-out or a peer read per sandbox would do it.
+  A later change could instead store the status in its own lightweight
+  object, keyed by sandbox ID and written by the session owner on state
+  changes only, like `supervisor_service_installation`, and merge it on read.
+  That works across replicas without fan-out, and because it never touches the
+  sandbox record it causes no compare-and-swap conflicts with lifecycle writes
+  and no resource-version churn. It costs a write per state change, roughly
+  two per turn, plus owner fencing and cleanup when a session ends, and live
+  activity would still be the only input to an idle stop.
