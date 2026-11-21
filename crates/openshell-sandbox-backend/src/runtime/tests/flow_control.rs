@@ -89,7 +89,10 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
         test_bearer(&"a".repeat(32)),
     );
     client
-        .build_grpc_channel(&BoundaryCredential::capture(&client.sandbox_bearer).unwrap())
+        .build_grpc_channel(
+            &BoundaryCredential::capture(&client.sandbox_bearer).unwrap(),
+            CONNECT_RETRY_TIMEOUT,
+        )
         .await
         .unwrap()
         .0

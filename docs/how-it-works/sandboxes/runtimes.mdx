@@ -21,7 +21,7 @@ the sandbox record and driver-supported persistent storage.
 | [Podman](#podman-driver) | `podman` | Rootless Linux workstations without a Docker daemon. |
 | [MicroVM](#microvm-driver) | `vm` | Workloads need a VM boundary instead of a container boundary. |
 | [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
-| [Windows MXC](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) | `mxc` | Native Windows workloads on x64 or ARM64. |
+| [Windows MXC](https://github.com/ai-openshell/openshell/blob/windows/WINDOWS.md) | `mxc` | Native Windows workloads on x64 or ARM64. |
 
 ## Select a Compute Driver
 
@@ -51,7 +51,7 @@ unset. Sandbox requests cannot override either trusted image.
 
 When building your own gateway or supervisor image, the `GATEWAY_BASE_IMAGE`
 and `SUPERVISOR_BASE_IMAGE` build arguments override their pinned bases. See
-[Container Image Base Overrides](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#container-image-base-overrides)
+[Container Image Base Overrides](https://github.com/ai-openshell/openshell/blob/main/CONTRIBUTING.md#container-image-base-overrides)
 for build commands and base compatibility requirements.
 
 For TLS-enabled Docker, Podman, and MicroVM gateways, set `guest_tls_ca` in
@@ -118,6 +118,13 @@ socket_path = "/var/run/docker.sock"
 ```
 
 Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `supervisor_network_mode`, `host_gateway_ip`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
+
+Set `persist_workspace = true` for driver-owned persistent storage in newly
+created default `/sandbox` workspaces. Stop/start retains data; sandbox deletion
+removes the owned volume. It defaults to `false`, does not migrate existing
+workspaces. Image-only updates additionally require the gateway's
+`enable_sandbox_updates` setting. See
+[Docker configuration](/how-it-works/gateways/configuration#docker).
 
 `supervisor_network_mode` defaults to `host`. Set `bridge` to use Docker bridge networking; `auto` also selects host. The workload always retains `network=none`.
 

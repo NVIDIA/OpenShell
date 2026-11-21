@@ -20,7 +20,7 @@ jobs:
   issue-acceptance:
     name: OpenShell / PR Issue Acceptance
     timeout-minutes: 5
-    if: github.repository_owner == 'NVIDIA'
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     steps:
       # pull_request_target supplies the trusted default-branch SHA. Load

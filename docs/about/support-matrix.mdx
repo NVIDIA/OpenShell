@@ -42,7 +42,7 @@ to the newest patch on each maintained minor line. Update to that patch to
 receive fixes; OpenShell does not issue fixes for every older patch. Maintenance
 updates do not backport features.
 
-Refer to [RFC 0014](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0014-release-stability/README.md)
+Refer to [RFC 0014](https://github.com/ai-openshell/openshell/blob/main/rfc/0014-release-stability/README.md)
 for the complete release and compatibility policy.
 
 ## Supported Platforms
@@ -62,7 +62,7 @@ On Linux, the `openshell` CLI is a static musl binary and does not require glibc
 ### Windows
 
 Native Windows uses MXC and is separate from WSL 2. Use the
-[Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+[Windows guide](https://github.com/ai-openshell/openshell/blob/windows/WINDOWS.md)
 for builds from `windows`, host requirements, and enforcement limitations.
 
 ## Standalone Gateway Binary
@@ -130,7 +130,7 @@ The gateway can manage sandboxes through several runtimes.
 |---|---|---|
 | Docker | Supported for local development and single-machine gateways. | Requires an accessible Docker API socket. Supervisor networking defaults to host; operators can select bridge. See [Docker runtime setup](/how-it-works/sandboxes/runtimes#docker-driver) for endpoint and isolation requirements. |
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
-| Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
+| Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/ai-openshell/openshell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
 | MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
 
 ## Software Prerequisites
@@ -141,7 +141,7 @@ Install the software for the compute driver you use:
 |---|---|---|
 | Docker Desktop or Docker Engine | 28.0 | Required for Docker-backed gateways, local image builds, and Docker development workflows. |
 | Podman | 5.x | Required for Podman-backed gateways. |
-| Kubernetes | 1.29 | Required for Helm deployments and Kubernetes sandbox scheduling. |
+| Kubernetes | 1.33 (tested) | Older cluster versions are untested; compatibility is not guaranteed. |
 | Helm | 3.x | Required to install `deploy/helm/openshell`. |
 | kubectl | Compatible with your cluster | Required for Kubernetes operational inspection and secret creation. |
 | Host virtualization | Host dependent | Required for MicroVM-backed gateways. MicroVM uses Hypervisor.framework on macOS and KVM on Linux. |

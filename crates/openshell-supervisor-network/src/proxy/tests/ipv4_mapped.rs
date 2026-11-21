@@ -5,18 +5,22 @@
 
 use super::*;
 
-fn engine_for(host: &str) -> OpaEngine {
-    native_identity_engine(
-        include_str!("../../../data/sandbox-policy.rego"),
-        &policy_with_native_executable_paths(&POLICY_DNS_OPEN_POLICY.replace("db.example", host)),
+fn engine_for(host: &str) -> Arc<OpaEngine> {
+    Arc::new(
+        native_identity_engine(
+            include_str!("../../../data/sandbox-policy.rego"),
+            &policy_with_native_executable_paths(
+                &POLICY_DNS_OPEN_POLICY.replace("db.example", host),
+            ),
+        )
+        .unwrap(),
     )
-    .unwrap()
 }
 
 async fn probe(
     destination: SocketAddr,
     store: Option<&Arc<ResolvedEndpointStore>>,
-    engine: &OpaEngine,
+    engine: &Arc<OpaEngine>,
 ) -> (
     Option<TransparentOpen>,
     TcpOpenDecision,
@@ -24,9 +28,10 @@ async fn probe(
 ) {
     let (open, completion) = staged_curl_open(destination, engine.current_generation());
     let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+    let dns = store.map(|store| policy_dns_test_service(store, engine));
     let accepted = preauthorize_transparent_open(
         open,
-        store,
+        dns.as_ref(),
         engine,
         &BinaryIdentityCache::new(),
         None,

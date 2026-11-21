@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Conformance, features and drivers tests an environment can't pass yet.
+# CI turns the entries for each environment into OPENSHELL_TEST_UNSUPPORTED.
+#
+# Each entry is one issue and the environments it breaks the test in:
+#
+#   - test: conformance::<module>::<name>
+#     issue: https://github.com/ai-openshell/openshell/issues/<n>
+#     environments:
+#       - ubuntu-k3s/k3s-ha   # a tmachine row: <environment>/<installer>
+#       - vm                  # a host lane: docker, podman, kubernetes or vm
+#
+# Add an entry when a migration finds a bug, and delete it in the PR that fixes
+# the bug. A test can appear more than once with different issues, but not twice
+# for one environment. See tests/testkit/README.md#unsupported-tests.
+[]

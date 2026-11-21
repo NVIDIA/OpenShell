@@ -22,6 +22,10 @@ pub struct ResourceDetails {
     /// Resource type (e.g. "sandbox", "workspace").
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub type_label: Option<String>,
+
+    /// Additional details about the resource.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 impl ResourceDetails {
@@ -32,6 +36,7 @@ impl ResourceDetails {
             uid: Some(uid.into()),
             name: None,
             type_label: Some(type_label.into()),
+            data: None,
         }
     }
 
@@ -42,7 +47,15 @@ impl ResourceDetails {
             uid: None,
             name: Some(name.into()),
             type_label: Some(type_label.into()),
+            data: None,
         }
+    }
+
+    /// This resource with additional details.
+    #[must_use]
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = Some(data);
+        self
     }
 }
 
@@ -54,6 +67,17 @@ mod tests {
     fn resource_serializes_type_under_its_schema_name() {
         let json = serde_json::to_value(ResourceDetails::new("sandbox", "sb-1")).unwrap();
         assert_eq!(json, serde_json::json!({"uid": "sb-1", "type": "sandbox"}));
+    }
+
+    #[test]
+    fn resource_carries_data() {
+        let resource = ResourceDetails::named("setting", "log_level")
+            .with_data(serde_json::json!({"value": "debug"}));
+        let json = serde_json::to_value(resource).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"name": "log_level", "type": "setting", "data": {"value": "debug"}})
+        );
     }
 
     #[test]

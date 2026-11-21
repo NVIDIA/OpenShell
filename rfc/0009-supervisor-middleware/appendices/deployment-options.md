@@ -30,7 +30,7 @@ Package the middleware as a container image and run it inside an OpenShell sandb
 
 This is the most direct answer to the trust concern. Instead of trusting the middleware not to exfiltrate the content it inspects, the operator constrains it the same way any other sandbox is constrained. A PII redactor with no network egress cannot leak what it sees, even if the image is compromised.
 
-This option depends on sandbox-to-sandbox communication ([#1049](https://github.com/NVIDIA/OpenShell/issues/1049)), which is not available yet. When it lands, this becomes the most attractive shape for untrusted or third-party middleware.
+This option depends on sandbox-to-sandbox communication ([#1049](https://github.com/ai-openshell/openshell/issues/1049)), which is not available yet. When it lands, this becomes the most attractive shape for untrusted or third-party middleware.
 
 ### WASM middleware
 

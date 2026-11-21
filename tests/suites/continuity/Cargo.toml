@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The continuity family is one crate; each module in `src/` is a scenario.
+[package]
+name = "continuity"
+description = "Continuity suite: state survives a disruption of the gateway or its environment"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/ai-openshell/openshell"
+publish = false
+
+[dependencies]
+openshell-testkit = { path = "../../testkit/testkit" }
+tokio = { version = "1", features = ["time"] }
+
+[workspace]

@@ -32,8 +32,9 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 
 - A train has one base version, such as `v0.1.4`, fixed by its `-pre.1` tag. A
   patch train can't take breaking changes to Stable interfaces.
-- `Release Auto-Tag` runs on weekdays at 14:00 Europe/Zurich. If `main` has
-  commits since the latest `-pre.N`, it tags the next one and dispatches
+- `Release Auto-Tag` has no schedule while scheduled pre-releases are paused.
+  Dispatch it with `gh workflow run release-auto-tag.yml --ref main`. If `main`
+  has commits since the latest `-pre.N`, it tags the next one and dispatches
   `Pre-release` (`release-prerelease.yml`, about 45 minutes). It skips when the
   train has no `-pre.1` or the base version is already stable.
 - `Pre-release` builds, then publishes and qualifies in parallel, and writes a
@@ -50,7 +51,7 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 ## Setup
 
 ```shell
-export GH_REPO=NVIDIA/OpenShell
+export GH_REPO=ai-openshell/openshell
 git fetch origin main --tags --force
 PREV=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 git tag -l 'v*' --sort=-v:refname | grep -E -- '-pre\.[0-9]+$' | head -5
@@ -71,7 +72,7 @@ Preview the candidate `Release` would promote, read-only:
 VERSION=vX.Y.Z
 wt=$(mktemp -d)
 git worktree add -q --detach "$wt" origin/main
-(cd "$wt" && GITHUB_REPOSITORY=NVIDIA/OpenShell uv run -q --no-project python tasks/scripts/select-release-candidate.py "$VERSION" --branch main | jq .)
+(cd "$wt" && GITHUB_REPOSITORY=ai-openshell/openshell uv run -q --no-project python tasks/scripts/select-release-candidate.py "$VERSION" --branch main | jq .)
 git worktree remove --force "$wt"
 ```
 
@@ -180,7 +181,7 @@ git worktree remove --force "$wt"
    to the release notes rather than repeating them:
 
    ```text
-   :white_check_mark: :ship: OpenShell vX.Y.Z is out: https://github.com/NVIDIA/OpenShell/releases/tag/vX.Y.Z
+   :white_check_mark: :ship: OpenShell vX.Y.Z is out: https://github.com/ai-openshell/openshell/releases/tag/vX.Y.Z
 
    It shipped from vX.Y.Z-pre.N (<commit>). I'll be starting the <next version>-pre.* jobs shortly for next week.
 

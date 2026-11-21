@@ -13,12 +13,28 @@
     rust_2018_idioms
 )]
 
-include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
+pub(crate) mod v1 {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
+}
+pub use v1::{
+    DraftChunkPayload, PolicyRevisionPayload, StoredConfigUpdateOperation, StoredDraftChunk,
+    StoredPolicyRevision, StoredProviderProfile, StoredRefreshMaterialDeletion,
+};
+
+mod v2 {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.v2.rs"));
+}
+pub(crate) use v2::StoredProviderCredentialRefreshState;
 
 mod sandbox_image {
     include!(concat!(env!("OUT_DIR"), "/openshell.storage.image.v1.rs"));
 }
 pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
+
+mod workspace_secret {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.secret.v1.rs"));
+}
+pub(crate) use workspace_secret::{StoredSecretRefreshUse, StoredWorkspaceSecret};
 
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
@@ -70,25 +86,25 @@ impl ObjectWorkspace for StoredProviderProfile {
     }
 }
 
-impl ObjectId for StoredProviderCredentialRefreshStateV2 {
+impl ObjectId for StoredProviderCredentialRefreshState {
     fn object_id(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
-impl ObjectName for StoredProviderCredentialRefreshStateV2 {
+impl ObjectName for StoredProviderCredentialRefreshState {
     fn object_name(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
-impl ObjectLabels for StoredProviderCredentialRefreshStateV2 {
+impl ObjectLabels for StoredProviderCredentialRefreshState {
     fn object_labels(&self) -> Option<HashMap<String, String>> {
         self.metadata.as_ref().map(|m| m.labels.clone())
     }
 }
 
-impl SetResourceVersion for StoredProviderCredentialRefreshStateV2 {
+impl SetResourceVersion for StoredProviderCredentialRefreshState {
     fn set_resource_version(&mut self, version: u64) {
         if let Some(meta) = self.metadata.as_mut() {
             meta.resource_version = version;
@@ -96,13 +112,55 @@ impl SetResourceVersion for StoredProviderCredentialRefreshStateV2 {
     }
 }
 
-impl GetResourceVersion for StoredProviderCredentialRefreshStateV2 {
+impl GetResourceVersion for StoredProviderCredentialRefreshState {
     fn get_resource_version(&self) -> u64 {
         self.metadata.as_ref().map_or(0, |m| m.resource_version)
     }
 }
 
-impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
+impl ObjectWorkspace for StoredProviderCredentialRefreshState {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
+impl ObjectId for StoredWorkspaceSecret {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredWorkspaceSecret {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredWorkspaceSecret {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for StoredWorkspaceSecret {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for StoredWorkspaceSecret {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for StoredWorkspaceSecret {
     fn object_workspace(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
     }
@@ -123,6 +181,9 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+    // GitHub App refresh adds enum value 7 to the public refresh strategy,
+    // also referenced by durable provider profiles. Existing values and fields
+    // retain their meaning; the set of shared type names is unchanged.
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
@@ -177,11 +238,15 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
-    // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
+    // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
+    // public-only messages alongside main's public APIs; durable schemas
+    // and the public/durable overlap remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "daa132037ee47c7a46b08dfab9bab379961bc06ff3e9ebbb329809b724f2a4f6";
+        "3f6f958d6907255c148c366a45bd998beddd39432f2165bebe6c060eb28ef10c";
+    // The storage.v2 refresh root adds retired handles and the first mint's
+    // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "e956b54b3f121eaae7d492437a3fa8f56fb3c8bbe8d3366a46dd730caed63203";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -242,9 +307,10 @@ mod tests {
         ".openshell.storage.v1.DraftChunkPayload",
         ".openshell.storage.v1.PolicyRevisionPayload",
         ".openshell.storage.v1.StoredConfigUpdateOperation",
-        ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
+        ".openshell.storage.v2.StoredProviderCredentialRefreshState",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.storage.image.v1.StoredSandboxImageState",
+        ".openshell.storage.secret.v1.StoredWorkspaceSecret",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -655,7 +721,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            113 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            121 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -665,7 +731,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            91 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -675,7 +741,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            88 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -726,8 +792,8 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (344, 31),
-                (100, 22),
+                (367, 31),
+                (102, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
@@ -840,7 +906,7 @@ mod tests {
 
     #[test]
     fn pre_move_storage_payloads_decode_after_package_relocation() {
-        let refresh = StoredProviderCredentialRefreshState::decode(
+        let refresh = v1::StoredProviderCredentialRefreshState::decode(
             legacy_bytes(V0_0_116_REFRESH_STATE).as_slice(),
         )
         .expect("legacy refresh state must decode");
@@ -1004,7 +1070,7 @@ mod tests {
         }
 
         let refresh = current_store
-            .get_message::<StoredProviderCredentialRefreshStateV2>("legacy-id")
+            .get_message::<StoredProviderCredentialRefreshState>("legacy-id")
             .await
             .expect("decode refresh fixture")
             .expect("refresh fixture must remain present");

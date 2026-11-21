@@ -19,12 +19,12 @@ use openshell_core::proto::{
     DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
     DetachSandboxProviderRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRequest, GetSandboxRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxProvidersRequest, Provider, ProviderCredentialRefreshRecoveryAction,
-    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    ProviderCredentialTokenGrantType, ProviderMutationKind, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest,
+    InlineProviderRefreshSecretsRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxProvidersRequest, Provider,
+    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderMutationKind,
+    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    RotateProviderCredentialRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -1291,6 +1291,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (workspace).to_string(),
                 )),
+                material_secrets: HashMap::new(),
             })
             .await
         {
@@ -1943,7 +1944,7 @@ pub async fn provider_refresh_status(
 
 fn refresh_status_header() -> String {
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {:<32}  {}",
         "PROVIDER".bold(),
         "CREDENTIAL_KEY".bold(),
         "STRATEGY".bold(),
@@ -1953,6 +1954,7 @@ fn refresh_status_header() -> String {
         "NEXT_REFRESH".bold(),
         "LAST_REFRESH".bold(),
         "FAILURE_CODE".bold(),
+        "MATERIAL_SECRETS".bold(),
         "LAST_ERROR".bold(),
     )
 }
@@ -1964,6 +1966,7 @@ pub struct ProviderRefreshConfigInput<'a> {
     pub material: &'a [String],
     pub secret_material_env: &'a [String],
     pub secret_material_keys: &'a [String],
+    pub material_secrets: &'a [String],
     pub credential_expires_at_ms: Option<i64>,
 }
 
@@ -1989,6 +1992,20 @@ pub async fn provider_refresh_config(
         }
         material.insert(key, value);
     }
+    // Workspace-secret references are secret material too. Listing them in
+    // secret_material_keys makes gateways that predate workspace secrets reject
+    // the request instead of ignoring the references.
+    let material_secrets = parse_key_value_pairs(input.material_secrets, "--material-secret")?;
+    for key in material_secrets.keys() {
+        if material.contains_key(key) {
+            return Err(miette!(
+                "duplicate material key '{key}': supplied via both inline material and --material-secret"
+            ));
+        }
+        if !secret_material_keys.contains(key) {
+            secret_material_keys.push(key.clone());
+        }
+    }
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
@@ -1998,6 +2015,7 @@ pub async fn provider_refresh_config(
             strategy: strategy as i32,
             material,
             secret_material_keys,
+            material_secrets,
             expiration_time: input
                 .credential_expires_at_ms
                 .map(openshell_core::time::timestamp_from_millis)
@@ -2062,6 +2080,37 @@ pub async fn provider_rotate(
     Ok(())
 }
 
+pub async fn provider_refresh_inline_secrets(
+    server: &str,
+    name: &str,
+    credential_key: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let status = client
+        .inline_provider_refresh_secrets(InlineProviderRefreshSecretsRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            provider: name.to_string(),
+            credential_key: credential_key.to_string(),
+            request_id: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .status
+        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
+    println!(
+        "{} Copied workspace secrets into provider-owned material for {} {}",
+        "✓".green().bold(),
+        status.provider,
+        status.credential_key
+    );
+    Ok(())
+}
+
 pub async fn provider_refresh_delete(
     server: &str,
     name: &str,
@@ -2107,6 +2156,7 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "github_app_installation" => Ok(ProviderCredentialRefreshStrategy::GithubAppInstallation),
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -2121,7 +2171,7 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     let recovery_action = ProviderCredentialRefreshRecoveryAction::try_from(status.recovery_action)
         .unwrap_or(ProviderCredentialRefreshRecoveryAction::Unspecified);
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {:<32}  {}",
         status.provider,
         status.credential_key,
         provider_refresh_strategy_name(strategy),
@@ -2134,8 +2184,23 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
         ),
         format_optional_epoch_ms(proto_timestamp_ms(status.last_refresh_time.as_ref())),
         status.failure_code,
+        material_secrets_field(&status.material_secrets),
         truncate_status_field(&status.last_error, 72),
     )
+}
+
+/// Material keys supplied by workspace secrets, as `key=secret`, sorted. These
+/// are the credentials to convert with `provider refresh inline-secrets`.
+fn material_secrets_field(material_secrets: &HashMap<String, String>) -> String {
+    if material_secrets.is_empty() {
+        return "-".to_string();
+    }
+    let mut bindings: Vec<_> = material_secrets
+        .iter()
+        .map(|(key, secret)| format!("{key}={secret}"))
+        .collect();
+    bindings.sort();
+    bindings.join(",")
 }
 
 pub fn provider_refresh_recovery_action_name(
@@ -2150,7 +2215,9 @@ pub fn provider_refresh_recovery_action_name(
     }
 }
 
-fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
+pub(super) fn provider_refresh_strategy_name(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> &'static str {
     match strategy {
         ProviderCredentialRefreshStrategy::Static => "static",
         ProviderCredentialRefreshStrategy::External => "external",
@@ -2158,6 +2225,7 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -3461,6 +3529,7 @@ binaries: [/usr/bin/curl]
         assert!(header.contains("RECOVERY"));
         assert!(header.contains("FAILURE_CODE"));
         assert!(header.contains("LAST_ERROR"));
+        assert!(header.contains("MATERIAL_SECRETS"));
 
         let row = refresh_status_row(&ProviderCredentialRefreshStatus {
             provider: "my-graph".to_string(),
@@ -3477,6 +3546,7 @@ binaries: [/usr/bin/curl]
             failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
             provider_error_subtype: "invalid_rapt".to_string(),
             last_error_time: openshell_core::time::timestamp_from_millis(1_767_225_000_000).ok(),
+            material_secrets: HashMap::new(),
         });
 
         assert!(row.contains("my-graph"));
@@ -3488,6 +3558,21 @@ binaries: [/usr/bin/curl]
         assert!(row.contains("2026-01-01 00:00:00"));
         assert!(!row.contains("292278994"));
         assert!(row.contains("..."));
+        assert!(row.contains("  -  "), "no secret references render as '-'");
+    }
+
+    #[test]
+    fn refresh_status_row_lists_workspace_secret_bindings() {
+        let row = refresh_status_row(&ProviderCredentialRefreshStatus {
+            provider: "alice-mcp".to_string(),
+            credential_key: "MCP_ACCESS_TOKEN".to_string(),
+            material_secrets: HashMap::from([
+                ("private_key".to_string(), "signing-key".to_string()),
+                ("client_secret".to_string(), "acme-oauth-client".to_string()),
+            ]),
+            ..Default::default()
+        });
+        assert!(row.contains("client_secret=acme-oauth-client,private_key=signing-key"));
     }
 
     #[test]

@@ -129,16 +129,16 @@ The root client also exposes subclients for providers, services, files, SSH,
 TCP forwarding, policy, configuration, templates, and workspaces. List methods
 return lazy pagers so callers choose when to fetch the next page.
 
-## Migrate from `github.com/NVIDIA/OpenShell/sdk/go`
+## Migrate from `github.com/ai-openshell/openshell/sdk/go`
 
-The SDK used to live in this repository as `github.com/NVIDIA/OpenShell/sdk/go`.
+The SDK used to live in this repository as `github.com/ai-openshell/openshell/sdk/go`.
 That module is deprecated and gets no further changes, including dependency and
 security updates. As of the move, packages and APIs are the same; only the
 module path is new. Rewrite the imports, then fetch the SDK version that
 matches your gateway:
 
 ```shell
-grep -rlZ --include='*.go' --include=go.mod 'github.com/NVIDIA/OpenShell/sdk/go' . | xargs -0 perl -pi -e 's#github.com/NVIDIA/OpenShell/sdk/go#github.com/ai-openshell/sdk-go#g'
+grep -rlZ --include='*.go' --include=go.mod 'github.com/ai-openshell/openshell/sdk/go' . | xargs -0 perl -pi -e 's#github.com/ai-openshell/openshell/sdk/go#github.com/ai-openshell/sdk-go#g'
 go get github.com/ai-openshell/sdk-go@vX.Y.Z && go mod tidy
 ```
 

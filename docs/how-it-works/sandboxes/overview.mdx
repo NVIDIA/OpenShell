@@ -265,7 +265,7 @@ Override it with any image visible to the active compute driver:
 openshell sandbox create --from registry.example.com/agents/my-agent:1.0
 ```
 
-Refer to [Default Policy](/how-it-works/policies/default-policy), [Run Your First Agent](/about/run-your-first-agent), and the [bring-your-own-container example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
+Refer to [Default Policy](/how-it-works/policies/default-policy), [Run Your First Agent](/about/run-your-first-agent), and the [bring-your-own-container example](https://github.com/ai-openshell/openshell/tree/main/examples/bring-your-own-container).
 
 ## Connect to a Sandbox
 
@@ -407,6 +407,8 @@ openshell sandbox create --env-from AGENT_TOKEN=SESSION_TOKEN -- my-agent
 `--env-from` changes only how the CLI receives the value. The resulting variable is still available to processes in the sandbox, just like `--env`.
 
 When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/how-it-works/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
+
+Choose the suggested profile that matches how you authenticate. For example, when both profiles are available, `GITHUB_TOKEN` produces an existing-token option for `github` and a gateway-managed refresh option for `github-app`. The variable name does not identify the token's origin. The App option uses `--runtime-credentials` and requires [GitHub App refresh configuration](/how-it-works/providers/profiles#github-app-installation-tokens) before attaching the provider; storing an installation token as a static credential does not enable rotation.
 
 You can also set per-command environment variables with `sandbox exec`:
 
@@ -1027,8 +1029,9 @@ For a provisioning timeout, wait for cleanup to finish, then run `sandbox start`
 Use `openshell.v1.SandboxUpdates/UpdateSandbox` to change a stopped sandbox's
 workload image, command, environment overrides, labels, and annotations together. This separate service uses the same gateway listener
 and authentication as `OpenShell`; it requires `sandbox:write` and workspace
-user access. This operation initially supports the Kubernetes compute driver
-for workload changes; metadata-only updates work with every compute driver. There is no
+user access. Kubernetes supports workload changes; Docker supports image-only
+changes for newly created persistent `/sandbox` workspaces. Metadata-only updates
+work with every compute driver. There is no
 `sandbox update` CLI command or curated SDK update method.
 
 Image updates default to disabled. Ask the operator to complete the
@@ -1036,8 +1039,17 @@ Image updates default to disabled. Ask the operator to complete the
 before enabling `enable_sandbox_updates` in the
 [gateway configuration](/how-it-works/gateways/configuration#sandbox-updates).
 
-The update preserves the sandbox ID, Kubernetes custom resource, and persistent
-volume claim. It does not delete and recreate the sandbox, reseed its existing
+The update preserves the sandbox ID and persistent workspace. Kubernetes retains
+its custom resource and persistent volume claim; Docker replaces the stopped
+workload container while retaining the owned workspace volume. Docker requires
+`persist_workspace = true`, locally cached source and target images, and no
+image-declared volumes. The target must declare an explicit numeric `USER UID:GID`
+matching the recorded non-root workload identity; symbolic or implicit identities
+are rejected before replacement. Existing writable-layer Docker
+workspaces and custom working directories cannot be updated. Docker rejects
+command and environment changes before acceptance.
+
+An update does not reseed its existing
 workspace from the new image, or change the trusted supervisor and sandbox
 runtime images. Omitted fields retain their current values. A supplied command
 replaces the argv list without shell expansion; an empty list restores the default

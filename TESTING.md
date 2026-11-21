@@ -111,18 +111,12 @@ report `SKIP` when the executor or backend is absent; E2E returns nonzero
 when required runtime coverage is missing. Report passed, failed, and
 skipped/ignored executions separately, including why any probe gated coverage.
 Passing E2E does not qualify the [known Windows enforcement gaps](WINDOWS.md#runtime-and-current-limits).
-See the [Windows test task definitions](https://github.com/NVIDIA/OpenShell/blob/windows/tasks/windows.toml)
+See the [Windows test task definitions](https://github.com/ai-openshell/openshell/blob/windows/tasks/windows.toml)
 for boundary, loopback, network, and audit suites.
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
 skipping them.
-
-`mise run --skip-tools sdk:ts:ci` selects the x64 Biome executable on Windows
-(including ARM64 hosts running it under emulation), resolves the protobuf
-plugin through its Windows `.cmd` launcher, and installs the matching locked
-ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
-resolution; it must not upgrade unrelated test dependencies.
 
 Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
@@ -180,6 +174,11 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
+To run Python in a testkit sandbox, use `Sandbox::run_python` with a sandbox
+from `testkit::python_image()`, not the Python SDK's `exec_python` described
+under Python E2E. [Writing a sandbox client](tests/testkit/README.md#writing-a-sandbox-client)
+covers scripts that probe the network from inside a sandbox.
+
 The conformance crate also builds `openshell-conformance`, a program that
 runs the conformance suite against a gateway without cargo or nextest
 (`openshell-conformance list`, `ready`, `run`). It covers only the
@@ -219,7 +218,7 @@ contract and nothing a driver is free to change.
 - The only way to skip a test is `#[ignore = "<issue link>"]`, for a broken or
   flaky test.
 
-Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
+Adapted from the handover notes in ai-openshell/openshell#4629 by Evan Lezar.
 
 ### Running suites in a tmachine environment (`tests/runner/`)
 
@@ -284,7 +283,9 @@ suite, with a name that says what the suite tests.
 1. Add a crate under `tests/suites/features/<name>` that depends on
    `openshell-testkit`, and add it to `members` in
    `tests/suites/features/Cargo.toml`.
-2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions and use
+   [testkit's harness](tests/testkit/README.md#unsupported-tests) so the suite
+   can skip unsupported tests per environment.
 3. Re-lock the workspace: `cargo metadata --manifest-path
    tests/suites/features/Cargo.toml`, then
    `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`. `cargo fmt`
@@ -305,11 +306,11 @@ service.
   setup playbook starts the service (with a restart policy, since setup is
   cached as a disk) and writes the variables as `KEY=VALUE` lines to
   `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
-  through the environment's setup `inputs`, and add them to the tmachine disk
-  cache key in `e2e-suites.yml`. The runner rejects names without the
-  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
-  values never appear in a runner command. Values are taken literally, without
-  quoting.
+  through the environment's setup `inputs`; they are part of the setup layer's
+  hash, which CI's disk cache keys on too. The runner rejects names without
+  the `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest,
+  so values never appear in a runner command. Values are taken literally,
+  without quoting.
 - **Fixture.** Put the service's fixture in a support crate under
   `tests/support/<service>`, named `<service>-support`, so any suite can
   depend on it, or reuse the existing one. It defines the variable names as constants and a
@@ -344,6 +345,41 @@ expects. Any environment that creates matching devices and sets the variable
 can run the suite. The expectations characterize the sandbox's behavior today,
 not a specification, and the `echo-socket` check needs `perl` in the workload
 image, which the default image has.
+
+### Continuity suites (`tests/suites/continuity/`)
+
+A continuity scenario checks that state created before a disruption survives it.
+Each scenario is a module with a `seed` test and a `verify` test that share a
+run id through `CONTINUITY_RUN_ID` and derive resource names from it
+(`scenario::name`). `seed` creates state through the CLI, so testkit's cleanup
+leaves it in place. `verify` adopts it and checks it, then does something new.
+
+`openshell-test-runner run --disruption <name>` runs the `seed` tests, applies the
+disruption in the guest, waits for the gateway, and runs the `verify` tests.
+Scenarios run under every disruption. The installer provides each disruption as an
+executable in `/var/lib/openshell-qualification/disruptions/<name>`, because how to
+restart or upgrade OpenShell depends on how it is installed. The runner stops
+before seeding if the installer doesn't provide the one you ask for.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family continuity --disruption gateway-restart
+```
+
+The `upgrade` disruption installs the candidate over a released package. Use the
+`deb-upgrade-source` installer, which installs the latest release as the baseline.
+The candidate is this checkout's `nix run .#build-artifacts` output, which CI also
+builds. CI downloads the baseline; locally, put the release's Debian package at
+`artifacts/upgrade/deb/source/openshell.deb` and its sandbox and supervisor images,
+saved with `docker save`, at
+`artifacts/upgrade/source-images/openshell-{sandbox,supervisor}-tmachine.tar`.
+
+```shell
+nix run .#openshell-test-runner -- run \
+  --environment ubuntu-docker-rootful --installer deb-upgrade-source \
+  --family continuity --disruption upgrade
+```
 
 ### Python E2E (`e2e/python/`)
 
@@ -650,6 +686,12 @@ rootful and rootless, and the `k3s` and `k3s-ha` installers. The tests run on
 the K3s node, so the K3s installers set the chart's `server.hostGatewayIP` to
 the node's address.
 
+The `connect-ssh-supervision` feature suite
+(`tests/suites/features/connect-ssh-supervision`) checks how `sandbox connect`
+supervises its `ssh` process: it reconnects after losing the SSH transport and
+forwards a SIGTERM to `ssh`. The tests find those processes in `/proc`, so they
+need a Linux test host. CI runs them on Docker rootful.
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell
@@ -668,7 +710,7 @@ mise run e2e:kubernetes:credential-drivers
 
 The `e2e-kubernetes` nextest profile temporarily excludes only
 `canonical_main_connect_recovers_its_ssh_transport` while
-[#4445](https://github.com/NVIDIA/OpenShell/issues/4445) investigates delayed SSH
+[#4445](https://github.com/ai-openshell/openshell/issues/4445) investigates delayed SSH
 input-owner release through port-forwarding. The test remains available to other
 driver profiles; the remaining Kubernetes tests stay enabled.
 
@@ -707,7 +749,7 @@ failure or interrupt.
 
 Sandbox pods use the namespace-assigned UID/GID and run under `restricted-v2`
 without a privileged SCC grant to `openshell-sandbox`. Earlier versions required
-that grant for in-container isolation setup. [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
+that grant for in-container isolation setup. [RFC 0012](https://github.com/ai-openshell/openshell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
 explains the isolation backend separation behind the capability-free runtime.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
@@ -715,7 +757,7 @@ on the sandbox-side `host.openshell.internal` alias reaching the machine running
 the tests, which is unreachable from pods on a remote cluster, so they fail.
 The conformance suite's `credential_gating` tests need the alias to reach that
 machine too, and the feature selection doesn't skip them, so they fail on a
-remote cluster. [#5409](https://github.com/NVIDIA/OpenShell/issues/5409)
+remote cluster. [#5409](https://github.com/ai-openshell/openshell/issues/5409)
 tracks handling that.
 Left enabled, the `host_gateway_alias` suite fails because
 `host.openshell.internal` does not resolve inside the pod, so the gateway
@@ -838,7 +880,7 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_TLS` | `1` reaches the gateway over mTLS through the port-forward; pair it with an overlay that keeps gateway TLS on, such as `ci/values-tls-port-forward.yaml` |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
-| `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |
+| `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/ai-openshell/openshell`) |
 | `GATEWAY_IMAGE` | Kubernetes gateway image repository or complete tagged/digest-pinned image reference; digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
 | `SUPERVISOR_IMAGE` | Gateway/supervisor image repository or complete tagged/digest-pinned image reference; Kubernetes digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
 | `SANDBOX_IMAGE` | Trusted sandbox runtime image repository or complete tagged/digest-pinned image reference |

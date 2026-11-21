@@ -5,6 +5,11 @@ name = "openshell-test-feature-kubernetes-updates"
 version = "0.0.0"
 edition = "2024"
 
+[[test]]
+name = "kubernetes-updates"
+path = "tests/update.rs"
+harness = false
+
 [dependencies]
 openshell-testkit = { path = "../../../testkit/testkit" }
 serde_json = "1"

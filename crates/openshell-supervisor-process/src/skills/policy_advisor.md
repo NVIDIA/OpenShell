@@ -92,7 +92,7 @@ A complete narrow REST-inspected rule looks like this:
 
 ```json
 {
-  "intent_summary": "Allow gh to update repository contents in NVIDIA/OpenShell only.",
+  "intent_summary": "Allow gh to update repository contents in ai-openshell/openshell only.",
   "operations": [
     {
       "addRule": {
@@ -109,7 +109,7 @@ A complete narrow REST-inspected rule looks like this:
                 {
                   "allow": {
                     "method": "PUT",
-                    "path": "/repos/NVIDIA/OpenShell/contents/**"
+                    "path": "/repos/ai-openshell/openshell/contents/**"
                   }
                 }
               ]

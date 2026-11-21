@@ -4,12 +4,12 @@
 //! Field-preserving adaptation of issuer refresh state to gateway persistence.
 use crate::persistence::{ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition};
 use crate::storage_proto::{
-    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredRefreshMaterialDeletion,
+    StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion, StoredWorkspaceSecret,
 };
 use async_trait::async_trait;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_credential_issuer::RefreshMaterialDeletion;
+use openshell_credential_issuer::refresh::secret_refs::WorkspaceSecretMaterial;
 use openshell_credential_issuer::refresh::{
     RefreshLease, RefreshState, RefreshStateStore, refresh_state_name,
 };
@@ -120,6 +120,16 @@ pub async fn list_all_refresh_states(
         .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
 }
 
+pub async fn list_refresh_states_in_workspace(
+    store: &Store,
+    workspace: &str,
+) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
+    store
+        .collect_messages(ObjectListQuery::Workspace(workspace))
+        .await
+        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
+}
+
 pub async fn get_refresh_state(
     store: &Store,
     workspace: &str,
@@ -155,6 +165,8 @@ impl From<&StoredProviderCredentialRefreshState> for RefreshState {
             additional_output_keys: state.additional_output_keys.clone(),
             authorization_epoch: state.authorization_epoch.clone(),
             secret_material_handles: state.secret_material_handles.clone(),
+            retired_output_handles: state.retired_output_handles.clone(),
+            first_mint_provider_version: state.first_mint_provider_version,
             pending_secret_deletions: state
                 .pending_secret_deletions
                 .iter()
@@ -193,6 +205,8 @@ impl From<&RefreshState> for StoredProviderCredentialRefreshState {
             additional_output_keys: state.additional_output_keys.clone(),
             authorization_epoch: state.authorization_epoch.clone(),
             secret_material_handles: state.secret_material_handles.clone(),
+            retired_output_handles: state.retired_output_handles.clone(),
+            first_mint_provider_version: state.first_mint_provider_version,
             pending_secret_deletions: state
                 .pending_secret_deletions
                 .iter()
@@ -248,6 +262,80 @@ impl RefreshStateStore for ServerRefreshStore {
     async fn replace(&self, state: &RefreshState, version: u64) -> Result<Option<u64>, Status> {
         persist_refresh_state_if_current(&self.0, &state.into(), version).await
     }
+    async fn replace_configuration(
+        &self,
+        state: &mut RefreshState,
+        version: u64,
+    ) -> Result<Option<u64>, Status> {
+        use crate::persistence::AtomicWrite;
+        use openshell_core::proto::{Provider, ProviderCredentialRefreshStrategy};
+
+        let Some(previous) = self.get_by_id(state.object_id()).await? else {
+            return Ok(None);
+        };
+        let github = ProviderCredentialRefreshStrategy::GithubAppInstallation as i32;
+        if previous.authorization_epoch == state.authorization_epoch
+            || (previous.strategy != github && state.strategy != github)
+        {
+            return self.replace(state, version).await;
+        }
+        let Some(mut provider) = self
+            .0
+            .get_message::<Provider>(&state.provider_id)
+            .await
+            .map_err(|e| {
+                Status::internal(format!("fetch provider to retire refresh output: {e}"))
+            })?
+        else {
+            // Provider deletion also finalizes its refresh grants.
+            return self.replace(state, version).await;
+        };
+        // A managed key cannot be manually replaced while its grant exists. A
+        // grant deleted before its first mint may still have a user-supplied value.
+        let mut replacement = StoredProviderCredentialRefreshState::from(&*state);
+        // Older grants have a completed-mint receipt instead of a provider revision.
+        let published = previous.first_mint_provider_version != 0
+            || (previous.last_refresh_at_ms != 0
+                && openshell_credential_issuer::refresh::engine::completed_mint(&previous)
+                    .is_some());
+        if published {
+            if let Some(handle) = provider.credential_handles.remove(&state.credential_key) {
+                replacement.retired_output_handles.push(handle);
+            }
+            provider.credentials.remove(&state.credential_key);
+            provider
+                .credential_expiration_times
+                .remove(&state.credential_key);
+        } else if openshell_credential_issuer::refresh::refresh_has_expiration(&previous) {
+            crate::provider_refresh::clear_refresh_owned_expiries(
+                &mut provider,
+                previous.expires_at_ms,
+                std::slice::from_ref(&state.credential_key),
+            );
+        }
+        let writes = [
+            AtomicWrite::Update {
+                object_type: StoredProviderCredentialRefreshState::object_type().into(),
+                id: state.object_id().into(),
+                payload: replacement.encode_to_vec(),
+                expected_version: version,
+            },
+            AtomicWrite::Update {
+                object_type: Provider::object_type().into(),
+                id: provider.object_id().into(),
+                payload: provider.encode_to_vec(),
+                expected_version: provider.metadata.as_ref().map_or(0, |m| m.resource_version),
+            },
+        ];
+        match self.0.write_atomically(&writes).await {
+            Ok(results) => {
+                state.retired_output_handles = replacement.retired_output_handles;
+                Ok(results[0].as_ref().map(|result| result.resource_version))
+            }
+            Err(PersistenceError::Conflict { .. }) => Ok(None),
+            Err(err) => Err(Status::internal(format!("retire refresh output: {err}"))),
+        }
+    }
     async fn delete(&self, id: &str, version: u64) -> Result<(), Status> {
         self.0
             .delete_if(
@@ -270,6 +358,37 @@ impl RefreshStateStore for ServerRefreshStore {
             .await
             .map(|guard| -> Box<dyn RefreshLease> { Box::new(guard) })
             .map_err(|_| Status::unavailable("credential refresh coordination unavailable"))
+    }
+    async fn get_workspace_secret(
+        &self,
+        workspace: &str,
+        secret_id: &str,
+    ) -> Result<Option<WorkspaceSecretMaterial>, Status> {
+        let stored = self
+            .0
+            .get_message::<StoredWorkspaceSecret>(secret_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch workspace secret failed: {e}")))?;
+        Ok(stored
+            .filter(|stored| {
+                stored.object_workspace() == workspace
+                    && stored.create_pending_since.is_none()
+                    && stored
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_time.is_none())
+            })
+            .and_then(|stored| {
+                stored.value_handle.map(|handle| WorkspaceSecretMaterial {
+                    handle,
+                    // A reveal-only secret allows no endpoint, so a mint
+                    // carrying it fails closed. Configure refuses to bind one.
+                    allowed_endpoints: stored
+                        .refresh_use
+                        .map(|refresh_use| refresh_use.allowed_endpoints)
+                        .unwrap_or_default(),
+                })
+            }))
     }
 }
 

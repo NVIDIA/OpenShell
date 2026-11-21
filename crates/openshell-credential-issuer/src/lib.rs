@@ -5,6 +5,7 @@
 //! in the gateway; existing driver contracts and durable identities are unchanged.
 
 mod embedded;
+pub use openshell_core::token_endpoint as endpoint;
 mod owner;
 pub mod refresh;
 mod refresh_material;

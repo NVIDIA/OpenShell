@@ -3,8 +3,8 @@ authors:
   - "@alwatson"
 state: accepted
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1062
-  - https://github.com/NVIDIA/OpenShell/blob/main/architecture/policy-advisor.md
+  - https://github.com/ai-openshell/openshell/issues/1062
+  - https://github.com/ai-openshell/openshell/blob/df38d1f66f05dac6a3995844ab96c68c80595265/architecture/policy-advisor.md
 ---
 
 # RFC 0002 - Agent-Driven Policy Management
@@ -41,7 +41,7 @@ This RFC proposes the next layer: make policy adaptation an intentional, agent-n
 
 ## MVP implementation note
 
-The first implementation is tracked in [#1062](https://github.com/NVIDIA/OpenShell/issues/1062). It intentionally starts with the smallest agent-driven loop that can validate the product experience:
+The first implementation is tracked in [#1062](https://github.com/ai-openshell/openshell/issues/1062). It intentionally starts with the smallest agent-driven loop that can validate the product experience:
 
 - structured L7 REST deny responses for agent-readable failures
 - a sandbox-local `policy.local` HTTP API backed by existing files, logs, and per-sandbox mTLS gateway calls
@@ -153,8 +153,8 @@ Current implementation points:
   TUI review and approval surface for network rules.
 - `crates/openshell-cli/src/run.rs`
   `openshell rule get|approve|reject|approve-all|history`.
-- `architecture/policy-advisor.md`
-  Current sandbox-side recommendation design.
+- [Original Policy Advisor design](https://github.com/ai-openshell/openshell/blob/df38d1f66f05dac6a3995844ab96c68c80595265/architecture/policy-advisor.md)
+  Sandbox-side recommendation design referenced by this RFC.
 
 Important capabilities that already exist and should be preserved:
 

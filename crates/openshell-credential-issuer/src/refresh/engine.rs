@@ -8,8 +8,8 @@ use super::minter::{
     refresh_strategy_name,
 };
 use super::{
-    CredentialRefresh, RefreshAttempt, RefreshChange, RefreshOutputs, RefreshRuntime, RefreshState,
-    RefreshStateStore, minter,
+    CommittedRefreshOutputs, CredentialRefresh, RefreshAttempt, RefreshChange, RefreshOutputs,
+    RefreshRuntime, RefreshState, RefreshStateStore, minter, secret_refs,
 };
 use crate::{CredentialIssuer, RefreshMaterialScope, StoreSecrets};
 use crate::{Handles, RefreshMaterialDeletion, SecretOwner};
@@ -24,7 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 use tonic::Status;
 use tracing::{Instrument as _, info, warn};
 const EXPIRATION_PRESENT_ANNOTATION: &str = "openshell.nvidia.com/refresh-expiration-present";
-const COMPLETED_MINT_ANNOTATION: &str = "openshell.nvidia.com/refresh-completed-mint";
+pub const COMPLETED_MINT_ANNOTATION: &str = "openshell.nvidia.com/refresh-completed-mint";
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
 pub fn refresh_material_scope(state: &RefreshState) -> RefreshMaterialScope<'_> {
@@ -131,9 +131,7 @@ pub async fn delete_observed_refresh_state_with_credentials(
         state.authorization_epoch = uuid::Uuid::new_v4().to_string();
         state.status = "deleting".to_string();
         state.next_refresh_at_ms = i64::MAX;
-        let Some(current_version) =
-            persist_refresh_state_if_current(store, &state, version).await?
-        else {
+        let Some(current_version) = store.replace_configuration(&mut state, version).await? else {
             if store
                 .get_by_id(state.object_id())
                 .await
@@ -189,16 +187,21 @@ pub async fn delete_refresh_states_for_provider_with_credentials(
 }
 
 async fn resolve_refresh_material(
+    store: &Arc<dyn RefreshStateStore>,
     credentials: Option<&Arc<dyn CredentialIssuer>>,
     state: &RefreshState,
-) -> Result<minter::MintRequest, Status> {
+) -> Result<minter::MintRequest, RefreshFailure> {
     let mut request = minter::MintRequest::from(state);
+    let bindings = secret_refs::material_secret_bindings(state.metadata.as_ref())?;
+    if state.secret_material_handles.is_empty() && bindings.is_empty() {
+        return Ok(request);
+    }
+    let credentials = credentials.ok_or_else(|| {
+        Status::failed_precondition(
+            "provider refresh material requires the configured credential runtime",
+        )
+    })?;
     if !state.secret_material_handles.is_empty() {
-        let credentials = credentials.ok_or_else(|| {
-            Status::failed_precondition(
-                "provider refresh material requires the configured credential runtime",
-            )
-        })?;
         request.material.extend(
             credentials
                 .resolve_refresh_material(
@@ -208,7 +211,77 @@ async fn resolve_refresh_material(
                 .await?,
         );
     }
+    for (material_key, binding) in &bindings {
+        let (value, allowed_endpoints) =
+            resolve_workspace_secret(store, credentials, state.object_workspace(), binding).await?;
+        request.material.insert(material_key.clone(), value);
+        request.secret_endpoint_allowlists.push(allowed_endpoints);
+    }
+    // Values copied from a workspace secret keep the endpoint constraint the
+    // secret's owner set.
+    let constraints = secret_refs::material_endpoint_constraints(state.metadata.as_ref())?;
+    request.secret_endpoint_allowlists.extend(
+        constraints
+            .into_iter()
+            .filter(|(material_key, _)| request.material.contains_key(material_key))
+            .map(|(_, endpoints)| endpoints),
+    );
     Ok(request)
+}
+
+/// Read a referenced workspace secret's current value. A concurrent update can
+/// delete the handle read from the record, so a failed read re-reads the record
+/// once before giving up.
+async fn resolve_workspace_secret(
+    store: &Arc<dyn RefreshStateStore>,
+    credentials: &Arc<dyn CredentialIssuer>,
+    workspace: &str,
+    binding: &secret_refs::MaterialSecretBinding,
+) -> Result<(String, Vec<String>), RefreshFailure> {
+    let mut last_error = None;
+    for _ in 0..2 {
+        let Some(material) = store.get_workspace_secret(workspace, &binding.id).await? else {
+            return Err(RefreshFailure::fix_configuration(
+                Status::failed_precondition(format!(
+                    "referenced workspace secret '{}' no longer exists; reconfigure the refresh grant",
+                    binding.name
+                )),
+                "referenced_secret_missing",
+            ));
+        };
+        let handles = HashMap::from([(
+            secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(),
+            material.handle,
+        )]);
+        match credentials
+            .resolve(
+                SecretOwner::workspace_secret(workspace, &binding.id),
+                &handles,
+            )
+            .await
+        {
+            Ok(resolved) => {
+                if let Some(value) = resolved
+                    .into_iter()
+                    .find(|secret| secret.credential_key == secret_refs::WORKSPACE_SECRET_VALUE_KEY)
+                    .map(|secret| secret.value)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Ok((value, material.allowed_endpoints));
+                }
+                last_error = Some("credential storage returned no value".to_string());
+            }
+            Err(err) => last_error = Some(err.message().to_string()),
+        }
+    }
+    Err(RefreshFailure::retryable(
+        Status::unavailable(format!(
+            "referenced workspace secret '{}' could not be read: {}",
+            binding.name,
+            last_error.unwrap_or_default()
+        )),
+        "referenced_secret_unavailable",
+    ))
 }
 
 pub fn enqueue_pending_secret_deletion(
@@ -228,6 +301,18 @@ async fn delete_pending_secret_handles(
     credentials: &Arc<dyn CredentialIssuer>,
     state: &RefreshState,
 ) -> Result<(), Status> {
+    for handle in &state.retired_output_handles {
+        credentials
+            .delete(
+                SecretOwner::provider(
+                    state.object_workspace(),
+                    &state.provider_id,
+                    &state.provider_name,
+                ),
+                &HashMap::from([(state.credential_key.clone(), handle.clone())]),
+            )
+            .await?;
+    }
     credentials
         .delete_refresh_material_deletions(
             refresh_material_scope(state),
@@ -242,7 +327,7 @@ async fn cleanup_pending_secret_deletions(
     state: &mut RefreshState,
     expected_version: u64,
 ) -> Result<u64, Status> {
-    if state.pending_secret_deletions.is_empty() {
+    if !state.has_pending_deletions() {
         return Ok(expected_version);
     }
     let credentials = credentials.ok_or_else(|| {
@@ -256,6 +341,7 @@ async fn cleanup_pending_secret_deletions(
     // cleared tombstone list over the durable retry references.
     let mut cleaned = state.clone();
     cleaned.pending_secret_deletions.clear();
+    cleaned.retired_output_handles.clear();
     let new_version = persist_refresh_state_if_current(store, &cleaned, expected_version)
         .await?
         .ok_or_else(|| {
@@ -308,6 +394,9 @@ async fn persist_refresh_failure_state(
         RefreshRetrySchedule::Short => {
             now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000))
         }
+        RefreshRetrySchedule::NotBefore(deadline) => {
+            deadline.max(now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS * 1000))
+        }
         RefreshRetrySchedule::Configuration => {
             now_ms.saturating_add(REFRESH_CONFIGURATION_RETRY_SECONDS.saturating_mul(1000))
         }
@@ -327,11 +416,14 @@ async fn persist_refresh_failure_state(
 }
 
 pub fn validate_secret_material_references(state: &RefreshState) -> Result<(), Status> {
+    let bindings = secret_refs::material_secret_bindings(state.metadata.as_ref())?;
     let mut missing: Vec<_> = state
         .secret_material_keys
         .iter()
         .filter(|key| {
-            !state.material.contains_key(*key) && !state.secret_material_handles.contains_key(*key)
+            !state.material.contains_key(*key)
+                && !state.secret_material_handles.contains_key(*key)
+                && !bindings.contains_key(*key)
         })
         .cloned()
         .collect();
@@ -368,7 +460,7 @@ fn refresh_lock(state: &RefreshState) -> Result<Arc<tokio::sync::Mutex<()>>, Sta
     Ok(lock)
 }
 
-fn completed_mint(state: &RefreshState) -> Option<&str> {
+pub fn completed_mint(state: &RefreshState) -> Option<&str> {
     state
         .metadata
         .as_ref()?
@@ -386,7 +478,7 @@ async fn cleanup_pending_secret_deletions_coordinated(
     credentials: Option<&Arc<dyn CredentialIssuer>>,
     state: &mut RefreshState,
 ) -> Result<(), Status> {
-    if state.pending_secret_deletions.is_empty() {
+    if !state.has_pending_deletions() {
         return Ok(());
     }
     let _local = tokio::time::timeout(Duration::from_secs(40), refresh_lock(state)?.lock_owned())
@@ -656,9 +748,9 @@ async fn refresh_provider_credential_locked(
     let expected_version = persist_refresh_state_if_current(store, &state, expected_version)
         .await?
         .ok_or_else(|| Status::aborted("provider refresh changed before minting"))?;
-    let mint_result = match resolve_refresh_material(Some(credentials), &state).await {
+    let mint_result = match resolve_refresh_material(store, Some(credentials), &state).await {
         Ok(transient_state) => mint_credential(&transient_state).await,
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err),
     };
     match mint_result {
         Ok(minted) => {
@@ -735,12 +827,6 @@ async fn refresh_provider_credential_locked(
                 }
                 state.material.remove("refresh_token");
             }
-            state.expires_at_ms = minted.expires_at_ms;
-            set_refresh_expiration_presence(&mut state, true);
-            state.next_refresh_at_ms =
-                next_refresh_at_ms(minted.expires_at_ms, state.refresh_before.as_ref());
-            state.last_refresh_at_ms = now_ms;
-            let completed_next_refresh_at_ms = state.next_refresh_at_ms;
             state.status = "refresh_committing".to_string();
             state.next_refresh_at_ms = i64::MAX;
             state.last_error.clear();
@@ -803,35 +889,51 @@ async fn refresh_provider_credential_locked(
             };
 
             // Generation is ours; write the minted credentials into the provider.
-            if let Err(err) = apply_minted_credential(
+            let result = apply_minted_credential(
                 Some(credentials),
                 provider.as_ref(),
                 credential_key,
                 &minted,
+                Some((effective_authorization_epoch(&state)?, new_version)),
             )
-            .await
-            {
-                // Reflect the failure on the state we just wrote; skip silently
-                // if it was deleted concurrently (it is not recreated).
-                let failure = RefreshFailure::from_status(&err);
-                persist_refresh_failure_state(store, &mut state, new_version, &failure).await?;
-                warn!(
-                    provider = %state.provider_name,
-                    credential_key = %state.credential_key,
-                    strategy = %refresh_strategy_name(state.strategy),
-                    status = %state.status,
-                    next_refresh_at_ms = state.next_refresh_at_ms,
-                    seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
-                    error = %err,
-                    "provider credential refresh errored"
-                );
-                return Err(err);
-            }
+            .await;
+            let new_version = match result {
+                Ok(committed) => {
+                    if state.strategy
+                        == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+                        && state.first_mint_provider_version == 0
+                    {
+                        state.first_mint_provider_version = committed.provider_version;
+                    }
+                    committed.grant_version.unwrap_or(new_version)
+                }
+                Err(err) => {
+                    // Reflect the failure on the state we just wrote; skip silently
+                    // if it was deleted concurrently (it is not recreated).
+                    let failure = RefreshFailure::from_status(&err);
+                    persist_refresh_failure_state(store, &mut state, new_version, &failure).await?;
+                    warn!(
+                        provider = %state.provider_name,
+                        credential_key = %state.credential_key,
+                        strategy = %refresh_strategy_name(state.strategy),
+                        status = %state.status,
+                        next_refresh_at_ms = state.next_refresh_at_ms,
+                        seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
+                        error = %err,
+                        "provider credential refresh errored"
+                    );
+                    return Err(err);
+                }
+            };
+            state.last_refresh_at_ms = now_ms;
+            state.expires_at_ms = minted.expires_at_ms;
+            set_refresh_expiration_presence(&mut state, true);
             // A success snapshot must not become visible before its provider
             // handles are committed. Park incomplete commits rather than minting
             // again after a crash or lost database session.
             state.status = "refreshed".to_string();
-            state.next_refresh_at_ms = completed_next_refresh_at_ms;
+            state.next_refresh_at_ms =
+                next_refresh_at_ms(minted.expires_at_ms, state.refresh_before.as_ref());
             if let Some(metadata) = state.metadata.as_mut() {
                 metadata.annotations.insert(
                     COMPLETED_MINT_ANNOTATION.to_string(),
@@ -853,7 +955,7 @@ async fn refresh_provider_credential_locked(
                 seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
                 "provider credential refresh completed"
             );
-            if !state.pending_secret_deletions.is_empty()
+            if state.has_pending_deletions()
                 && let Err(err) = cleanup_pending_secret_deletions(
                     store,
                     Some(credentials),
@@ -914,7 +1016,8 @@ pub async fn apply_minted_credential(
     attempt: &dyn RefreshAttempt,
     credential_key: &str,
     minted: &MintedCredential,
-) -> Result<(), Status> {
+    grant: Option<(&str, u64)>,
+) -> Result<CommittedRefreshOutputs, Status> {
     let expiration =
         openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -952,6 +1055,7 @@ pub async fn apply_minted_credential(
     let empty = HashMap::new();
     let result = attempt
         .commit(RefreshOutputs {
+            grant,
             credential_key,
             additional_keys: minted.additional_credentials.keys().cloned().collect(),
             handles: staged.as_ref(),
@@ -966,15 +1070,15 @@ pub async fn apply_minted_credential(
             }
             Err(error)
         }
-        Ok(old_handles) => {
-            if !old_handles.is_empty()
+        Ok(committed) => {
+            if !committed.replaced.is_empty()
                 && let Some(credentials) = credentials
-                && let Err(cleanup_err) = credentials.delete(owner, &old_handles).await
+                && let Err(cleanup_err) = credentials.delete(owner, &committed.replaced).await
             {
                 warn!(provider_name = %owner.legacy_scope().provider, error = %cleanup_err,
                     "failed to clean up old provider credential handles after successful refresh");
             }
-            Ok(())
+            Ok(committed)
         }
     }
 }
@@ -1000,7 +1104,7 @@ pub async fn run_refresh_worker_tick(
     let watched_count = states.len();
     let due_count = states
         .iter()
-        .filter(|state| state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms)
+        .filter(|state| refresh_due(state, now_ms))
         .count();
     let rotation_requested_count = states
         .iter()
@@ -1025,14 +1129,22 @@ pub async fn run_refresh_worker_tick(
     Ok(Box::pin(refresh_states(runtime, states, now_ms).instrument(span)).await)
 }
 
+fn refresh_due(state: &RefreshState, now_ms: i64) -> bool {
+    // Older gateways scheduled the first installation mint using the previous token's expiry.
+    state.next_refresh_at_ms <= 0
+        || state.next_refresh_at_ms <= now_ms
+        || (state.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+            && state.first_mint_provider_version == 0
+            && state.status == "configured")
+}
+
 fn refresh_state_has_work(state: &RefreshState, now_ms: i64) -> bool {
     state
         .metadata
         .as_ref()
         .is_some_and(|metadata| metadata.deletion_time.is_some())
-        || !state.pending_secret_deletions.is_empty()
-        || state.next_refresh_at_ms <= 0
-        || state.next_refresh_at_ms <= now_ms
+        || state.has_pending_deletions()
+        || refresh_due(state, now_ms)
         || state.status == "rotation_requested"
 }
 
@@ -1058,14 +1170,9 @@ pub async fn refresh_states(
                 );
                 continue;
             };
-            if let Err(err) = delete_refresh_state_with_credentials(
-                store,
-                credentials,
-                state.object_workspace(),
-                &state.provider_id,
-                &state.credential_key,
-            )
-            .await
+            if let Err(err) =
+                delete_observed_refresh_state_with_credentials(store, credentials, state.clone())
+                    .await
             {
                 warn!(
                     provider = %state.provider_name,
@@ -1101,7 +1208,7 @@ pub async fn refresh_states(
             );
             continue;
         }
-        let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
+        let due = refresh_due(&state, now_ms);
         let rotation_requested = state.status == "rotation_requested";
         info!(
             provider = %state.provider_name,
@@ -1226,8 +1333,12 @@ impl CredentialRefresh for RefreshRuntime {
     async fn create(&self, state: RefreshState) -> Result<(), Status> {
         self.store.create(&state).await
     }
-    async fn replace(&self, state: RefreshState, version: u64) -> Result<bool, Status> {
-        Ok(self.store.replace(&state, version).await?.is_some())
+    async fn replace(&self, mut state: RefreshState, version: u64) -> Result<bool, Status> {
+        Ok(self
+            .store
+            .replace_configuration(&mut state, version)
+            .await?
+            .is_some())
     }
     async fn delete(&self, state: RefreshState) -> Result<(), Status> {
         let credentials = self.credentials.as_ref().ok_or_else(|| {
@@ -1250,5 +1361,185 @@ impl CredentialRefresh for RefreshRuntime {
     }
     async fn sweep(&self) -> Result<Vec<RefreshChange>, Status> {
         run_refresh_worker_tick(self).await
+    }
+}
+
+#[cfg(test)]
+mod secret_reference_tests {
+    use super::*;
+    use crate::{EmbeddedCredentialIssuer, IssuerConfig};
+    use openshell_core::proto::ObjectMeta;
+    use std::sync::Mutex;
+
+    /// Serves a scripted sequence of secret records, then repeats the last.
+    #[derive(Debug)]
+    struct ScriptedSecrets(Mutex<Vec<Option<CredentialHandle>>>);
+
+    #[async_trait]
+    impl RefreshStateStore for ScriptedSecrets {
+        async fn get(&self, _: &str, _: &str, _: &str) -> Result<Option<RefreshState>, Status> {
+            Ok(None)
+        }
+        async fn get_by_id(&self, _: &str) -> Result<Option<RefreshState>, Status> {
+            Ok(None)
+        }
+        async fn list(&self, _: Option<&str>) -> Result<Vec<RefreshState>, Status> {
+            Ok(Vec::new())
+        }
+        async fn create(&self, _: &RefreshState) -> Result<(), Status> {
+            Ok(())
+        }
+        async fn replace(&self, _: &RefreshState, _: u64) -> Result<Option<u64>, Status> {
+            Ok(None)
+        }
+        async fn delete(&self, _: &str, _: u64) -> Result<(), Status> {
+            Ok(())
+        }
+        async fn acquire(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Box<dyn super::super::RefreshLease>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn get_workspace_secret(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<secret_refs::WorkspaceSecretMaterial>, Status> {
+            let mut script = self.0.lock().unwrap();
+            let next = if script.len() > 1 {
+                script.remove(0)
+            } else {
+                script[0].clone()
+            };
+            Ok(next.map(|handle| secret_refs::WorkspaceSecretMaterial {
+                handle,
+                allowed_endpoints: vec!["https://login.example.com/token".to_string()],
+            }))
+        }
+    }
+
+    async fn store_value(credentials: &Arc<dyn CredentialIssuer>, value: &str) -> CredentialHandle {
+        let values = HashMap::from([(
+            secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(),
+            value.to_string(),
+        )]);
+        let object_id = format!("secret-id-{}", uuid::Uuid::new_v4());
+        credentials
+            .store(StoreSecrets {
+                owner: SecretOwner::workspace_secret("default", "secret-id"),
+                object_id: Some(&object_id),
+                values: &values,
+                existing_handles: &HashMap::new(),
+            })
+            .await
+            .unwrap()
+            .remove(secret_refs::WORKSPACE_SECRET_VALUE_KEY)
+            .unwrap()
+    }
+
+    fn binding() -> secret_refs::MaterialSecretBinding {
+        secret_refs::MaterialSecretBinding {
+            id: "secret-id".to_string(),
+            name: "acme".to_string(),
+        }
+    }
+
+    fn credentials() -> Arc<dyn CredentialIssuer> {
+        Arc::new(
+            EmbeddedCredentialIssuer::from_config(&IssuerConfig {
+                credential_drivers: vec!["test-static".into()],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_mint_racing_a_value_update_rereads_the_secret() {
+        let credentials = credentials();
+        let stale = store_value(&credentials, "old-value").await;
+        let current = store_value(&credentials, "new-value").await;
+        // The update deleted the value the mint read first.
+        credentials
+            .delete(
+                SecretOwner::workspace_secret("default", "secret-id"),
+                &HashMap::from([(
+                    secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(),
+                    stale.clone(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn RefreshStateStore> = Arc::new(ScriptedSecrets(Mutex::new(vec![
+            Some(stale),
+            Some(current),
+        ])));
+        let (value, endpoints) =
+            resolve_workspace_secret(&store, &credentials, "default", &binding())
+                .await
+                .unwrap();
+        assert_eq!(value, "new-value");
+        assert_eq!(
+            endpoints,
+            vec!["https://login.example.com/token".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_secret_is_retryable_and_a_missing_one_is_not() {
+        let credentials = credentials();
+        let deleted = store_value(&credentials, "value").await;
+        credentials
+            .delete(
+                SecretOwner::workspace_secret("default", "secret-id"),
+                &HashMap::from([(
+                    secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(),
+                    deleted.clone(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn RefreshStateStore> =
+            Arc::new(ScriptedSecrets(Mutex::new(vec![Some(deleted)])));
+        let failure = resolve_workspace_secret(&store, &credentials, "default", &binding())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.failure_code, "referenced_secret_unavailable");
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Short);
+
+        let store: Arc<dyn RefreshStateStore> = Arc::new(ScriptedSecrets(Mutex::new(vec![None])));
+        let failure = resolve_workspace_secret(&store, &credentials, "default", &binding())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.failure_code, "referenced_secret_missing");
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Configuration);
+    }
+
+    #[test]
+    fn a_binding_satisfies_listed_secret_material_but_its_loss_fails_closed() {
+        let mut metadata = ObjectMeta::default();
+        secret_refs::set_material_secret_bindings(
+            &mut metadata,
+            &secret_refs::MaterialSecretBindings::from([("client_secret".to_string(), binding())]),
+        );
+        let mut state = RefreshState {
+            metadata: Some(metadata),
+            secret_material_keys: vec!["client_secret".to_string()],
+            ..Default::default()
+        };
+        validate_secret_material_references(&state).unwrap();
+        // An older gateway that dropped the binding sees a listed secret key
+        // with neither a value nor a handle, and refuses to mint.
+        state.metadata = Some(ObjectMeta::default());
+        assert_eq!(
+            validate_secret_material_references(&state)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 }

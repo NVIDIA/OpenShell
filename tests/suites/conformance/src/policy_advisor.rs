@@ -5,7 +5,7 @@
 //! connection produces.
 //!
 //! Ported from the policy-advisor scenarios of the old `conformance/cli` suite.
-//! Adapted from the `policy-advisor` suite in NVIDIA/OpenShell#4629 by Evan
+//! Adapted from the `policy-advisor` suite in ai-openshell/openshell#4629 by Evan
 //! Lezar. Requests to `policy.local` run inside the sandbox; settings and drafts
 //! go through the gateway's gRPC API.
 
@@ -224,9 +224,7 @@ async fn create(
     suffix: &str,
     policy: Option<proto::SandboxPolicy>,
 ) -> testkit::Result<Sandbox> {
-    let mut builder = cx
-        .sandbox(suffix)
-        .command(["sh", "-c", "exec sleep infinity"]);
+    let mut builder = cx.sandbox(suffix).command(["sleep", "infinity"]);
     if let Some(policy) = policy {
         builder = builder.policy(policy);
     }

@@ -11,7 +11,7 @@ on:
         description: "GitHub Actions runner label"
         required: false
         type: string
-        default: "linux-amd64-cpu8"
+        default: "ubuntu-24.04"
       checkout-ref:
         description: "Git ref to check out for test inputs (defaults to the workflow SHA)"
         required: false
@@ -148,7 +148,6 @@ jobs:
         uses: ./.github/actions/setup-e2e-kind
         with:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
-          image-tag: ${{ inputs.image-tag }}
           images: ${{ inputs.cluster-images }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
@@ -172,7 +171,7 @@ jobs:
           OPENSHELL_E2E_KUBERNETES_FEATURES: ${{ inputs.kubernetes-features }}
           OPENSHELL_E2E_KUBE_USE_ENVOY: ${{ inputs.use-envoy-gateway && '1' || '0' }}
           IMAGE_TAG: ${{ inputs.image-tag }}
-          OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+          OPENSHELL_REGISTRY: ghcr.io/ai-openshell/openshell
           E2E_TASK: ${{ inputs.e2e-task }}
           OPENSHELL_E2E_APP_TOPOLOGY: ${{ inputs.listener-topology }}
           OPENSHELL_E2E_APP_DELIVERY: ${{ inputs.listener-delivery }}

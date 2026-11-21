@@ -40,6 +40,15 @@ def pr(*labels, requested=(), author="author", draft=False, state="open"):
     }
 
 
+def fork(owner, *, full_name=None, owner_type="User"):
+    return {
+        "repo": {
+            "full_name": full_name or f"{owner}/repo",
+            "owner": {"login": owner, "type": owner_type},
+        }
+    }
+
+
 def reviewers(*, requested=(), engaged=(), manual=()):
     return {"requested": set(requested), "engaged": set(engaged), "manual": set(manual)}
 
@@ -368,6 +377,39 @@ class ReconciliationTests(unittest.TestCase):
                 api.assert_called_once_with(PULL)
                 load.assert_not_called()
 
+    def test_ready_fork_pr_without_maintainer_edits_is_not_ready(self):
+        value = pr("area:build", draft=False)
+        value["head"] = fork("user")
+        value["maintainer_can_modify"] = False
+        with self.assertRaises(routing.MaintainerEditsError) as caught:
+            self.run_routing(CATEGORIES, snapshots=[], responses=[value])
+        self.assertIn("gh pr create", str(caught.exception))
+        self.assertEqual(
+            routing.describe_failure(caught.exception)[0], "Maintainer edits"
+        )
+
+    def test_maintainer_edits_check_applies_only_where_github_offers_it(self):
+        cases = {
+            "enabled": (fork("user"), True, False),
+            "draft": (fork("user"), False, True),
+            "same repository": (fork("owner", full_name=REPO), False, False),
+            "organization fork": (fork("org", owner_type="Organization"), False, False),
+            "deleted fork": ({"repo": None}, False, False),
+            "unknown head": (None, False, False),
+        }
+        for name, (head, allowed, draft) in cases.items():
+            with self.subTest(name):
+                value = pr(draft=draft)
+                value["maintainer_can_modify"] = allowed
+                if head is not None:
+                    value["head"] = head
+                self.assertFalse(routing.needs_maintainer_edits(value, REPO))
+
+    def test_fork_pr_without_maintainer_edits_needs_them(self):
+        value = pr()
+        value["head"] = fork("user")
+        self.assertTrue(routing.needs_maintainer_edits(value, REPO))
+
     def test_preview_makes_no_changes(self):
         plan, api, _ = self.run_routing(
             CATEGORIES,
@@ -444,12 +486,19 @@ class ReconciliationTests(unittest.TestCase):
             reviewers(requested=("alice",)),
             reviewers(requested=("alice", "dave")),
         ]
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.run_routing(
-                CATEGORIES,
-                snapshots=snapshots,
-                responses=[before, None, after, subprocess.CalledProcessError(1, "gh")],
-            )
+        failed, _, _ = self.run_routing(
+            CATEGORIES,
+            snapshots=snapshots,
+            responses=[
+                before,
+                None,
+                after,
+                subprocess.CalledProcessError(1, "gh"),
+                [],
+                None,
+            ],
+        )
+        self.assertTrue(failed.assignment_error)
         plan, api, _ = self.run_routing(
             CATEGORIES, snapshots=[snapshots[1]] * 2, responses=[after, after, None]
         )
@@ -457,6 +506,90 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(
             any(call.kwargs.get("method") == "POST" for call in api.call_args_list)
         )
+
+
+class AssignmentFailureTests(unittest.TestCase):
+    COMMENTS = "repos/owner/repo/issues/42/comments"
+    REJECTED = subprocess.CalledProcessError(
+        1,
+        ["gh", "api", f"{PULL}/requested_reviewers", "--method", "POST"],
+        stderr="gh: Reviews may only be requested from collaborators. (HTTP 422)\n",
+    )
+
+    def run_routing(self, responses):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(routing, "_api", side_effect=responses) as api,
+            mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
+        ):
+            plan = routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+        return plan, api
+
+    def test_rejected_request_is_noted_on_the_pr_without_failing(self):
+        plan, api = self.run_routing([pr("area:build"), self.REJECTED, [], None])
+        self.assertEqual(plan.add, ("dave",))
+        self.assertIn("Requesting reviewers failed", plan.assignment_error)
+        self.assertIn("HTTP 422", plan.assignment_error)
+        comment = api.call_args
+        self.assertEqual(comment.args, (self.COMMENTS,))
+        self.assertEqual(comment.kwargs["method"], "POST")
+        body = comment.kwargs["data"]["body"]
+        self.assertTrue(body.startswith(routing.ASSIGNMENT_MARKER))
+        self.assertIn("HTTP 422", body)
+        self.assertNotIn(
+            "DELETE", [call.kwargs.get("method") for call in api.call_args_list]
+        )
+
+    def test_repeated_failure_updates_the_existing_bot_comment(self):
+        marked = routing.ASSIGNMENT_MARKER + "\nold"
+        comments = [
+            {"id": 7, "user": {"type": "User"}, "body": marked},
+            {"id": 9, "user": {"type": "Bot"}, "body": marked},
+        ]
+        _, api = self.run_routing([pr("area:build"), self.REJECTED, comments, None])
+        self.assertEqual(api.call_args.args, ("repos/owner/repo/issues/comments/9",))
+        self.assertEqual(api.call_args.kwargs["method"], "PATCH")
+
+    def test_comment_failure_is_reported_without_failing(self):
+        denied = subprocess.CalledProcessError(
+            1,
+            ["gh", "api", self.COMMENTS, "--method", "POST"],
+            stderr="gh: Resource not accessible by integration (HTTP 403)",
+        )
+        plan, _ = self.run_routing([pr("area:build"), self.REJECTED, [], denied])
+        self.assertIn("HTTP 422", plan.assignment_error)
+        self.assertIn("Commenting on the PR failed", plan.assignment_error)
+
+    def test_comment_links_the_workflow_run(self):
+        body = routing.assignment_failure_comment("x", "https://github.test/run/1")
+        self.assertIn("[workflow](https://github.test/run/1)", body)
+        self.assertIn("re-run the check", routing.assignment_failure_comment("x"))
+
+    def test_label_errors_still_fail(self):
+        with self.assertRaises(routing.LabelRoutingError):
+            self.run_routing([pr("area:build", "area:runtime")])
+
+    def test_cli_passes_with_a_warning_annotation(self):
+        plan = routing.ReviewPlan(("dave",), (), assignment_error="boom")
+        errors, output = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}),
+            mock.patch.object(routing, "check_review_readiness", return_value=plan),
+            tempfile.TemporaryDirectory() as directory,
+            contextlib.redirect_stderr(errors),
+            contextlib.redirect_stdout(output),
+        ):
+            path = Path(directory) / "REVIEWERS.md"
+            path.write_text(DOCUMENT, encoding="utf-8")
+            result = routing.main(
+                ["--reviewers", str(path), "--repo", REPO, "--pr", "42", "--apply"]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "::warning title=Review Readiness%3A reviewer assignment::boom",
+            errors.getvalue(),
+        )
+        self.assertEqual(json.loads(output.getvalue())["assignment_error"], "boom")
 
 
 class AcceptedWorkIntegrationTests(unittest.TestCase):
@@ -877,6 +1010,7 @@ class CliTests(unittest.TestCase):
                     "remove": [],
                     "accepted_work": None,
                     "add_labels": [],
+                    "assignment_error": "",
                 },
             )
             check.assert_called_once_with(

@@ -6,6 +6,7 @@ name: Maintainers Change Alert
 on:
   pull_request_target:
     types: [opened, reopened, synchronize]
+    branches: [main]
     paths:
       - MAINTAINERS.md
 
@@ -20,7 +21,7 @@ concurrency:
 jobs:
   describe-change:
     name: Comment on the approver set change if MAINTAINERS.md has changed
-    if: github.repository_owner == 'NVIDIA'
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -76,8 +77,29 @@ jobs:
             return 1
           }
 
+          # GitHub computes the prospective merge asynchronously, and the ref
+          # can still point at the previous merge right after a push. Retry
+          # until its parents match this event. Never compare the head file
+          # directly: it may omit changes already on main.
+          merge_info="$(mktemp)"
+          MERGE_SHA=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if gh api "repos/$GH_REPO/commits/refs/pull/$PR_NUMBER/merge" > "$merge_info" 2>/dev/null \
+              && MERGE_SHA=$(jq -er --arg base "$BASE_SHA" --arg head "$HEAD_SHA" \
+                'select(.parents | length == 2 and .[0].sha == $base and .[1].sha == $head) | .sha' "$merge_info"); then
+              break
+            fi
+            MERGE_SHA=""
+            sleep 3
+          done
+          rm -f "$merge_info"
+          if [ -z "$MERGE_SHA" ]; then
+            echo "::error::Could not obtain a prospective merge commit matching this event's base and head"
+            exit 1
+          fi
+
           fetch_maintainers "$BASE_SHA" before.md
-          fetch_maintainers "$HEAD_SHA" after.md
+          fetch_maintainers "$MERGE_SHA" after.md
 
           # An unparseable result exits non-zero, but the comment explaining
           # why still has to be posted before this job fails.

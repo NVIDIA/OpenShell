@@ -3,12 +3,12 @@ authors:
   - "@pimlock"
 state: accepted
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/1043
-  - https://github.com/NVIDIA/OpenShell/issues/1733
-  - https://github.com/NVIDIA/OpenShell/issues/1734
-  - https://github.com/NVIDIA/OpenShell/issues/1919
-  - https://github.com/NVIDIA/OpenShell/issues/2010
-  - https://github.com/NVIDIA/OpenShell/pull/2027
+  - https://github.com/ai-openshell/openshell/issues/1043
+  - https://github.com/ai-openshell/openshell/issues/1733
+  - https://github.com/ai-openshell/openshell/issues/1734
+  - https://github.com/ai-openshell/openshell/issues/1919
+  - https://github.com/ai-openshell/openshell/issues/2010
+  - https://github.com/ai-openshell/openshell/pull/2027
 ---
 
 # RFC 0009 - Supervisor Middleware
@@ -17,9 +17,9 @@ links:
 
 | Date | References | Change |
 |------|------------|--------|
-| 2026-07-17 | [#2010](https://github.com/NVIDIA/OpenShell/issues/2010) | Added unary HTTP request middleware with built-in and operator-run services. |
-| 2026-07-28 | [#2428](https://github.com/NVIDIA/OpenShell/issues/2428) | Added WebSocket preflight and text-message evaluation, and aligned the middleware API names, limits, and diagnostics. |
-| 2026-10-08 | [#2431](https://github.com/NVIDIA/OpenShell/issues/2431), [#3307](https://github.com/NVIDIA/OpenShell/issues/3307) | Added HTTP hooks (`HttpHooks.EvaluateHttpRequestHook` and `HttpHooks.EvaluateHttpResponseHook`), selected by a required extension capability, with buffered and streamed bodies, and deprecated legacy HTTP hooks. |
+| 2026-07-17 | [#2010](https://github.com/ai-openshell/openshell/issues/2010) | Added unary HTTP request middleware with built-in and operator-run services. |
+| 2026-07-28 | [#2428](https://github.com/ai-openshell/openshell/issues/2428) | Added WebSocket preflight and text-message evaluation, and aligned the middleware API names, limits, and diagnostics. |
+| 2026-10-08 | [#2431](https://github.com/ai-openshell/openshell/issues/2431), [#3307](https://github.com/ai-openshell/openshell/issues/3307) | Added HTTP hooks (`HttpHooks.EvaluateHttpRequestHook` and `HttpHooks.EvaluateHttpResponseHook`), selected by a required extension capability, with buffered and streamed bodies, and deprecated legacy HTTP hooks. |
 
 ## Summary
 
@@ -45,7 +45,7 @@ Beyond redaction, middleware also produces structured findings and string metada
 
 ## Non-goals
 
-- **Model routing.** This RFC defines the v1 string metadata that middleware can emit, but not the component that consumes findings or metadata to pick a model. Routing a request to a different model based on findings is a separate concern tracked in [#1734](https://github.com/NVIDIA/OpenShell/issues/1734). Here we only avoid blocking a future routing contract: v1 middleware decisions stay `allow`/`deny`, and any later route-selection hook should be limited to OpenShell-managed routes rather than arbitrary rewrites from one external endpoint to another.
+- **Model routing.** This RFC defines the v1 string metadata that middleware can emit, but not the component that consumes findings or metadata to pick a model. Routing a request to a different model based on findings is a separate concern tracked in [#1734](https://github.com/ai-openshell/openshell/issues/1734). Here we only avoid blocking a future routing contract: v1 middleware decisions stay `allow`/`deny`, and any later route-selection hook should be limited to OpenShell-managed routes rather than arbitrary rewrites from one external endpoint to another.
 - **A general-purpose OpenShell plugin framework.** The first version targets supervisor-owned request processing, beginning with outbound HTTP requests in the supervisor proxy flow. It is not an arbitrary plugin system for every extension point in OpenShell, and it does not cover gateway control-plane hooks, compute driver behavior, or non-supervisor extension points.
 - **Constraining or sandboxing the middleware itself.** A middleware gets raw access to request content. OpenShell routes payloads to a service the operator chose to trust; it does not sandbox the middleware, verify its behavior, or prevent a malicious one from mishandling the data it inspects. Authenticated encrypted transport protects the connection but does not make the service trustworthy. Stronger service isolation, such as running middleware in its own sandbox, remains follow-up work.
 - **Runtime management of middleware.** Middleware is declared in gateway configuration. A runtime CLI or API to add, list, or validate middleware - and ergonomic tooling to make registration easy, such as a dedicated command or an agent skill that scaffolds and registers a new service - is deferred to follow-up work once the contract stabilizes.
@@ -305,7 +305,7 @@ The `originating_process` is the same identity OpenShell resolves on the egress 
 
 ### Relationship to RFC 0010
 
-[RFC 0010](https://github.com/NVIDIA/OpenShell/pull/1927) defines gateway interceptors: gateway control-plane extensions that evaluate gateway RPCs such as `CreateSandbox`. This RFC defines supervisor middleware: supervisor data-plane extensions that evaluate supervisor-managed operations such as `HTTP_REQUEST/PRE_CREDENTIALS`. The feature names may differ because the API surfaces and mechanics differ, but the two extension systems should align on shared plumbing where doing so avoids duplicate infrastructure.
+[RFC 0010](https://github.com/ai-openshell/openshell/pull/1927) defines gateway interceptors: gateway control-plane extensions that evaluate gateway RPCs such as `CreateSandbox`. This RFC defines supervisor middleware: supervisor data-plane extensions that evaluate supervisor-managed operations such as `HTTP_REQUEST/PRE_CREDENTIALS`. The feature names may differ because the API surfaces and mechanics differ, but the two extension systems should align on shared plumbing where doing so avoids duplicate infrastructure.
 
 Shared mechanics:
 
@@ -435,7 +435,7 @@ A later stage sees the earlier stage's accepted body and header mutations. A mid
 
 ### Metadata and downstream routing
 
-Beyond allow/deny and transformation, middleware emits string metadata (for example `modalities = "text,image"`, `sensitivity = "restricted"`, `requires_local_model = "true"`) into a request-local metadata bag. The supervisor stores that metadata under the middleware config's stable map key, so `anonymize.sensitivity` and `budget.sensitivity` do not collide even if two services return the same key. V1 metadata is intentionally string-only and never carries raw sensitive values. This gives early middleware a safe annotation surface while deferring routing-grade typed metadata and usage markings to the model-router work; the router itself is out of scope ([#1734](https://github.com/NVIDIA/OpenShell/issues/1734)).
+Beyond allow/deny and transformation, middleware emits string metadata (for example `modalities = "text,image"`, `sensitivity = "restricted"`, `requires_local_model = "true"`) into a request-local metadata bag. The supervisor stores that metadata under the middleware config's stable map key, so `anonymize.sensitivity` and `budget.sensitivity` do not collide even if two services return the same key. V1 metadata is intentionally string-only and never carries raw sensitive values. This gives early middleware a safe annotation surface while deferring routing-grade typed metadata and usage markings to the model-router work; the router itself is out of scope ([#1734](https://github.com/ai-openshell/openshell/issues/1734)).
 
 Because `HTTP_REQUEST/PRE_CREDENTIALS` runs before route selection and credential injection, v1 does not guarantee that metadata visible at this hook includes the final routed model or upstream route. Budget-style middleware that needs post-call status, final route/model, content length, or token usage needs a later metadata-only notification hook such as `HttpResponse/completed`; that hook is listed as a future extension in the [protocol-extensions appendix](appendices/protocol-extensions.md#additional-operation-phases), not part of the v1 request hook.
 

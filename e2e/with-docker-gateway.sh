@@ -84,13 +84,13 @@ github_actions_host_docker_tmpdir() {
   # exist on the host, but the gateway also validates those same paths inside
   # the job container before handing them to Docker. This must be a real mount
   # rather than a symlink because the Docker driver canonicalizes file paths.
-  if [ -d /home/runner/_work/_temp ]; then
-    printf '%s\n' /home/runner/_work/_temp
+  if [ -d /home/runner/work/_temp ]; then
+    printf '%s\n' /home/runner/work/_temp
     return 0
   fi
 
-  echo "ERROR: GitHub Actions Docker e2e requires /home/runner/_work mounted inside the job container." >&2
-  echo "       Mount /home/runner/_work:/home/runner/_work so Docker bind paths resolve on both sides." >&2
+  echo "ERROR: GitHub Actions Docker e2e requires /home/runner/work mounted inside the job container." >&2
+  echo "       Mount /home/runner/work:/home/runner/work so Docker bind paths resolve on both sides." >&2
   return 2
 }
 
@@ -126,6 +126,17 @@ ADDITIONAL_CA_SERVER_PID=""
 ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
 ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
 ADDITIONAL_CA_PORT=""
+IMAGE_UPDATES_MODE="${OPENSHELL_E2E_DOCKER_IMAGE_UPDATES:-0}"
+SUPERVISOR_NETWORK_MODE="${OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE:-}"
+case "${SUPERVISOR_NETWORK_MODE}" in
+  ""|host|bridge|auto) ;;
+  *) echo "ERROR: invalid Docker supervisor network mode for e2e." >&2; exit 2 ;;
+esac
+
+if [ "${IMAGE_UPDATES_MODE}" = "1" ] && [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
+  echo "ERROR: Docker image-update qualification requires a new gateway owned by this wrapper." >&2
+  exit 2
+fi
 
 if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
   echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
@@ -348,7 +359,7 @@ resolve_docker_supervisor_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/ai-openshell/openshell}"
     printf '%s/supervisor:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
@@ -377,7 +388,7 @@ resolve_docker_sandbox_runtime_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/ai-openshell/openshell}"
     printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
@@ -618,6 +629,9 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 {
   printf '[openshell]\nversion = 2\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n'
+  if [ "${IMAGE_UPDATES_MODE}" = "1" ]; then
+    printf 'enable_sandbox_updates = true\n'
+  fi
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
   if [ "${OIDC_MODE}" != "1" ]; then
@@ -644,6 +658,12 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     fi
   fi
   printf '[openshell.drivers.docker]\n'
+  if [ -n "${SUPERVISOR_NETWORK_MODE}" ]; then
+    printf 'supervisor_network_mode = %s\n' "$(toml_string "${SUPERVISOR_NETWORK_MODE}")"
+  fi
+  if [ "${IMAGE_UPDATES_MODE}" = "1" ]; then
+    printf 'persist_workspace = true\n'
+  fi
   printf 'allow_driver_config = true\n'
   printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
   # Container jobs need their bridge address; host runs exercise discovery.

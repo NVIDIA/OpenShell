@@ -149,10 +149,10 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
                 ..Default::default()
             },
             spec: Some(NetworkPolicySpec {
-                pod_selector: LabelSelector {
+                pod_selector: Some(LabelSelector {
                     match_labels: Some(workload_labels.clone()),
                     ..Default::default()
-                },
+                }),
                 policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
                 // Any trusted OpenShell supervisor in this namespace may
                 // reach a sandbox listener. The Sandbox Protocol enforces the
@@ -189,10 +189,10 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
                 ..Default::default()
             },
             spec: Some(NetworkPolicySpec {
-                pod_selector: LabelSelector {
+                pod_selector: Some(LabelSelector {
                     match_labels: Some(control_labels.clone()),
                     ..Default::default()
-                },
+                }),
                 policy_types: Some(vec!["Egress".to_string()]),
                 egress: Some(vec![NetworkPolicyEgressRule::default()]),
                 ..Default::default()
@@ -265,13 +265,13 @@ pub fn runtime_control_policy(namespace: &str, name: &str, pair: &str, port: u16
             ..Default::default()
         },
         spec: Some(NetworkPolicySpec {
-            pod_selector: LabelSelector {
+            pod_selector: Some(LabelSelector {
                 match_labels: Some(BTreeMap::from([(
                     BOUNDARY_PAIR_LABEL.to_string(),
                     pair.to_string(),
                 )])),
                 ..Default::default()
-            },
+            }),
             policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
             ingress: Some(vec![NetworkPolicyIngressRule {
                 from: pair_role(WORKLOAD_ROLE),
@@ -308,10 +308,10 @@ pub fn shared_runtime_control_policy(
             ..Default::default()
         },
         spec: Some(NetworkPolicySpec {
-            pod_selector: LabelSelector {
+            pod_selector: Some(LabelSelector {
                 match_labels: Some(pair_role_labels(pair, WORKLOAD_ROLE)),
                 ..Default::default()
-            },
+            }),
             policy_types: Some(vec!["Egress".to_string()]),
             egress: Some(vec![NetworkPolicyEgressRule {
                 to: Some(vec![NetworkPolicyPeer {
@@ -755,7 +755,7 @@ mod tests {
         );
         assert_eq!(policy_spec.egress, Some(Vec::new()));
         assert_eq!(
-            policy_spec.pod_selector.match_labels,
+            policy_spec.pod_selector.unwrap().match_labels,
             Some(fence.workload_labels)
         );
     }
@@ -814,7 +814,7 @@ mod tests {
             .expect("supervisor policy has a spec");
         assert_eq!(policy_spec.policy_types, Some(vec!["Egress".to_string()]));
         assert_eq!(
-            policy_spec.pod_selector.match_labels,
+            policy_spec.pod_selector.unwrap().match_labels,
             Some(fence.control_labels)
         );
         assert_eq!(

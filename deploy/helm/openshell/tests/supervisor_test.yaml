@@ -30,6 +30,22 @@ tests:
       - hasDocuments:
           count: 0
         template: templates/supervisor-pdb.yaml
+  - it: brackets an IPv6 listen address
+    template: templates/supervisor.yaml
+    set:
+      supervisor.listenAddress: "::"
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args[4]
+          value: "[::]:5501"
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].args[8]
+          value: "[::]:5500"
+        documentIndex: 0
   - it: deploys the supervisor pool without Kubernetes identity in the gateway namespace
     template: templates/supervisor.yaml
     set:
@@ -332,6 +348,15 @@ tests:
           path: spec.replicas
           value: 1
         documentIndex: 0
+      - notExists:
+          path: spec.template.spec.containers[0].resources
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES
+            value: "128"
+        documentIndex: 0
       - equal:
           path: spec.strategy
           value:
@@ -602,11 +627,11 @@ tests:
           pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '\[openshell\.gateway\.supervisor_pool\]\nrecovery_timeout_secs = 60\n'
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nmax_instances_per_member = 128\nmax_members_per_gateway = 32\nrecovery_timeout_secs = 60\n'
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: 'supervisor_pool\]\n[^\[]*(enabled|high_availability)'
-  - it: renders no pool tuning when the recovery timeout is null, leaving the gateway's defaults
+  - it: renders only the pool limits when the recovery timeout is null, leaving the gateway's default deadline
     template: templates/gateway-config.yaml
     set:
       supervisor:
@@ -618,9 +643,12 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'supervisor_topology = "gateway"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nmax_instances_per_member = 128\nmax_members_per_gateway = 32\n'
       - notMatchRegex:
           path: data["gateway.toml"]
-          pattern: supervisor_pool|recovery_timeout_secs
+          pattern: recovery_timeout_secs
   - it: renders a configured recovery timeout into the supervisor pool table
     template: templates/gateway-config.yaml
     set:
@@ -633,7 +661,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '\[openshell\.gateway\.supervisor_pool\]\nrecovery_timeout_secs = 45\n'
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\n(max_[a-z_]+ = [0-9]+\n)*recovery_timeout_secs = 45\n'
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
@@ -659,7 +687,7 @@ tests:
           enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas, supervisor.pool, and supervisor.recoveryTimeoutSeconds
   - it: rejects a hand-written supervisor pool inside the gateway table
     template: templates/supervisor.yaml
     set:
@@ -671,7 +699,7 @@ tests:
             enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas, supervisor.pool, and supervisor.recoveryTimeoutSeconds
   - it: rejects a hand-written supervisor pool without the gateway topology
     template: templates/supervisor.yaml
     set:
@@ -680,7 +708,135 @@ tests:
           enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas, supervisor.pool, and supervisor.recoveryTimeoutSeconds
+  - it: renders configured pool limits for the gateway and every supervisor
+    set:
+      supervisor:
+        replicas: 3
+        pool:
+          maxInstancesPerMember: 16
+          maxMembersPerGateway: 4
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nmax_instances_per_member = 16\nmax_members_per_gateway = 4\n'
+        template: templates/gateway-config.yaml
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES
+            value: "16"
+        template: templates/supervisor.yaml
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 512Mi
+        template: templates/supervisor.yaml
+        documentIndex: 0
+  - it: accepts a per-member cap of one sandbox
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        pool:
+          maxInstancesPerMember: 1
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES
+            value: "1"
+        documentIndex: 0
+  - it: rejects a per-member cap of zero
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        pool:
+          maxInstancesPerMember: 0
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.pool.maxInstancesPerMember must be an integer between 1 and 1024
+  - it: rejects a per-member cap above 1024
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        pool:
+          maxInstancesPerMember: 1025
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.pool.maxInstancesPerMember must be an integer between 1 and 1024
+  - it: rejects zero members per gateway
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        pool:
+          maxMembersPerGateway: 0
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.pool.maxMembersPerGateway must be an integer of at least 1
+  - it: accepts any number of members per gateway
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 500
+        pool:
+          maxMembersPerGateway: 500
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 500
+        documentIndex: 0
+  - it: rejects more supervisor replicas than the gateways serve
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 3
+        pool:
+          maxMembersPerGateway: 2
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.replicas (3) exceeds replicaCount (1) * supervisor.pool.maxMembersPerGateway (2) = 2; add gateway replicas or raise maxMembersPerGateway
+  - it: rejects a supervisor HPA maximum above what the gateways serve
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        pool:
+          maxMembersPerGateway: 3
+        autoscaling:
+          enabled: true
+          maxReplicas: 4
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.maxReplicas (4) exceeds replicaCount (1) * supervisor.pool.maxMembersPerGateway (3) = 3; add gateway replicas or raise maxMembersPerGateway
   - it: rejects zero supervisor replicas
     template: templates/supervisor.yaml
     set:
@@ -791,7 +947,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity
+          errorMessage: supervisor_topology=gateway does not support upstream proxy settings
   - it: rejects workspace until implemented
     template: templates/supervisor.yaml
     set:

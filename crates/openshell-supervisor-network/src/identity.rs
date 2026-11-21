@@ -312,6 +312,7 @@ mod tests {
                 })
                 .collect(),
             cmdline_paths: Vec::new(),
+            process: None,
         }
     }
 
@@ -540,6 +541,7 @@ mod tests {
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         };
         let different = supplied_identity(path.to_str().unwrap(), Some("11"), &[]);
 
@@ -562,6 +564,7 @@ mod tests {
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            process: None,
         };
         let cache = BinaryIdentityCache::new();
 

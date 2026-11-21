@@ -52,13 +52,13 @@ def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
 
     formula = output.read_text(encoding="utf-8")
     assert (
-        "https://github.com/NVIDIA/OpenShell/releases/download/"
+        "https://github.com/ai-openshell/openshell/releases/download/"
         "v0.1.0-pre.3/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'version "0.1.0-pre.3"' in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
     assert (
-        "https://github.com/NVIDIA/OpenShell/releases/download/"
+        "https://github.com/ai-openshell/openshell/releases/download/"
         "v0.1.0-pre.3/openshell-prover-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'sha256 "' + "e" * 64 + '"' in formula

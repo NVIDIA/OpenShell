@@ -21,6 +21,7 @@ use tmachine::Session;
 use tmachine::config::Config;
 
 use crate::bundle::{Bundle, Kind, PROFILE, PROGRAM_BINARY, READY_BINARY};
+use crate::disruption::Disruption;
 use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
@@ -48,6 +49,13 @@ const PROGRAM_TEST_FAILED: i32 = 1;
 /// How much of the end of the nextest log to print after a failure. nextest
 /// ends its output with a summary that names the failed tests.
 const LOG_TAIL_LINES: usize = 40;
+
+/// The nextest filtersets that select the `seed` and `verify` tests of every
+/// scenario in the `continuity` family.
+const SEED_FILTER: &str = "test(/::seed$/)";
+const VERIFY_FILTER: &str = "test(/::verify$/)";
+/// How long a disruption may take to make its change.
+const DISRUPTION_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// The runner's exit code when a test failed.
 const TEST_FAILED_EXIT: u8 = 1;
@@ -136,6 +144,9 @@ pub struct Run<'a> {
     pub results: &'a Path,
     /// Keep the VM running after the tests until Enter is pressed.
     pub keep: bool,
+    /// Run the bundle's `seed` tests, apply this disruption, and then run its
+    /// `verify` tests, instead of running every test once.
+    pub disruption: Option<&'a Disruption>,
 }
 
 /// Run the tests. Every failure, including provisioning, becomes a status.
@@ -241,10 +252,18 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         !openshell_bin.is_empty(),
         "the installer did not put openshell on the guest's PATH"
     );
-    let env = [
+    let mut env = vec![
         format!("OPENSHELL_GATEWAY={}", run.gateway),
         format!("OPENSHELL_BIN={openshell_bin}"),
     ];
+    // The tests the environment can't pass yet, for the program to skip. The
+    // guest doesn't inherit the runner's environment, so pass it on.
+    if let Some(unsupported) = std::env::var("OPENSHELL_TEST_UNSUPPORTED")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        env.push(format!("OPENSHELL_TEST_UNSUPPORTED={unsupported}"));
+    }
     test_env::check(session)
         .await
         .context("check the variables the environment publishes for tests")?;
@@ -261,11 +280,66 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
             .exec(&["mkdir", "-p", &format!("{guest}/extract")])
             .await?,
     )?;
-    let kind = run.bundle.kind();
 
     // A booted guest restarts its gateway, so wait for it once here rather
     // than in every test. Failing here is an environment error, not a test
     // failure.
+    wait_for_gateway(session, run.bundle.kind(), &env).await?;
+
+    match run.disruption {
+        Some(disruption) => run_disruption(session, run, disruption, env).await,
+        None => run_selected(session, run, &env, run.filters, false).await,
+    }
+}
+
+/// A continuity run: seed, apply `disruption`, then verify, with one id shared
+/// by the phases (see the `continuity` family). The caller has already waited
+/// for the gateway.
+async fn run_disruption(
+    session: &Session,
+    run: &Run<'_>,
+    disruption: &Disruption,
+    mut env: Vec<String>,
+) -> Result<Status> {
+    ensure!(
+        run.bundle.kind() == Kind::Nextest,
+        "--disruption runs a nextest bundle, not a program"
+    );
+    let label = format!("{} / {}", run.environment, run.installer);
+    // The installer provides the disruption. Check that it does before seeding.
+    let step = disruption.path();
+    let provided = session.exec(&["test", "-x", &step]).await?.status.success();
+    ensure!(
+        provided,
+        "the {} installer does not provide the {} disruption: {step} is not an executable in the guest",
+        run.installer,
+        disruption.name
+    );
+    env.push(format!("CONTINUITY_RUN_ID={}", continuity_id()));
+
+    eprintln!("==> {label}: seeding");
+    let seeded = run_selected(session, run, &env, &[SEED_FILTER.to_string()], false).await?;
+    if seeded != Status::Passed {
+        return Ok(seeded);
+    }
+
+    eprintln!("==> {label}: applying {}", disruption.name);
+    checked(
+        &format!("apply the {} disruption", disruption.name),
+        session
+            .exec_timeout(&[step.as_str()], DISRUPTION_TIMEOUT)
+            .await?,
+    )?;
+    wait_for_gateway(session, run.bundle.kind(), &env).await?;
+
+    eprintln!("==> {label}: verifying");
+    run_selected(session, run, &env, &[VERIFY_FILTER.to_string()], true).await
+}
+
+/// Wait for the gateway to report healthy, and on a k3s guest for the Agent
+/// Sandbox controller.
+async fn wait_for_gateway(session: &Session, kind: Kind, env: &[String]) -> Result<()> {
+    let guest = GUEST_DIR;
     let program = format!("{guest}/{PROGRAM_BINARY}");
     let ready_binary = format!("{guest}/{READY_BINARY}");
     let ready_timeout = READY_TIMEOUT_SECS.to_string();
@@ -303,30 +377,58 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
                 .await?,
         )?;
     }
+    Ok(())
+}
 
+/// The id a continuity run's phases share: the start time in hex, which is
+/// short enough for sandbox names and distinct between runs on a guest.
+fn continuity_id() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    format!("{secs:x}")
+}
+
+/// Run the tests selected by `filters` once. With `append`, the output is added
+/// to the existing log instead of replacing it.
+async fn run_selected(
+    session: &Session,
+    run: &Run<'_>,
+    env: &[String],
+    filters: &[String],
+    append: bool,
+) -> Result<Status> {
+    let guest = GUEST_DIR;
+    let kind = run.bundle.kind();
+    let program = format!("{guest}/{PROGRAM_BINARY}");
     let junit = format!("{guest}/junit.xml");
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
-    let mut tests = vec!["env"];
-    tests.extend(env.iter().map(String::as_str));
+    let export = test_env::export_script(test_env::ENV_DIR);
+    let mut args: Vec<&str> = vec![
+        "--archive-file",
+        &archive,
+        "--workspace-remap",
+        guest,
+        "--extract-to",
+        &extract,
+        "--extract-overwrite",
+        "--config-file",
+        &config,
+        "--profile",
+        PROFILE,
+    ];
+    for filter in filters {
+        args.extend(["-E", filter]);
+    }
+    let env_args = std::iter::once("env").chain(env.iter().map(String::as_str));
+    let mut tests: Vec<_> = env_args.clone().collect();
     match kind {
         Kind::Nextest => {
+            tests.extend(["cargo-nextest", "nextest", "run"]);
+            tests.extend(&args);
             tests.extend([
-                "cargo-nextest",
-                "nextest",
-                "run",
-                "--archive-file",
-                &archive,
-                "--workspace-remap",
-                guest,
-                "--extract-to",
-                &extract,
-                "--extract-overwrite",
-                "--config-file",
-                &config,
-                "--profile",
-                PROFILE,
                 "--no-capture",
                 // Tests share one gateway and the guest has 4 GiB; run them
                 // serially whatever --no-capture implies.
@@ -335,9 +437,6 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
                 "--no-tests",
                 "fail",
             ]);
-            for filter in run.filters {
-                tests.extend(["-E", filter]);
-            }
         }
         // The program runs its tests one at a time, and writes the report
         // where `collect_results` looks for it.
@@ -345,9 +444,9 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
             tests.extend([program.as_str(), "run", "--junit", &junit]);
             // `run` takes name filters as arguments, after `--` so that one
             // starting with a dash isn't read as an option.
-            if !run.filters.is_empty() {
+            if !filters.is_empty() {
                 tests.push("--");
-                tests.extend(run.filters.iter().map(String::as_str));
+                tests.extend(filters.iter().map(String::as_str));
             }
         }
     }
@@ -356,13 +455,35 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
     // shell exports the published variables itself, so their values, which
     // can be credentials, never appear in the command (or its errors).
     let log = format!("{guest}/{NEXTEST_LOG}");
-    let script = format!(
-        r#"exec >"$0" 2>&1; {}; exec "$@""#,
-        test_env::export_script(test_env::ENV_DIR)
-    );
+    let redirect = if append { ">>" } else { ">" };
+    let script = format!(r#"exec {redirect}"$0" 2>&1; {export}; exec "$@""#);
     let mut command = vec!["sh", "-c", &script, &log];
     command.extend(tests);
     let output = session.exec_timeout(&command, RUN_TIMEOUT).await?;
+    if kind == Kind::Nextest
+        && output.status.code() == Some(NEXTEST_NO_TESTS_RUN)
+        && env
+            .iter()
+            .any(|entry| entry.starts_with("OPENSHELL_TEST_UNSUPPORTED="))
+    {
+        // Nothing ran. Ask nextest whether the same filters match ignored
+        // tests, so a mistyped filter still fails.
+        let script = format!(r#"{export}; exec "$@""#);
+        let mut list = vec!["sh", "-c", &script, "list-tests"];
+        list.extend(env_args);
+        list.extend(["cargo-nextest", "nextest", "list"]);
+        list.extend(args);
+        list.extend(["--run-ignored", "only", "--message-format", "oneline"]);
+        let ignored = checked(
+            "list selected ignored tests",
+            session.exec_timeout(&list, RUN_TIMEOUT).await?,
+        )?;
+        if !ignored.trim().is_empty() {
+            let ignored = ignored.trim_end();
+            eprintln!("==> all selected tests are ignored:\n{ignored}");
+            return Ok(Status::Passed);
+        }
+    }
     let log = run.results.join(NEXTEST_LOG);
     Ok(match kind {
         Kind::Nextest => Status::of_nextest(output.status, &log),

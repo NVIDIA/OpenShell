@@ -10,6 +10,10 @@
 
 use testkit::Context;
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 /// A file mounted by the CDI spec under a directory the sandbox baseline
 /// already makes read-only needs nothing derived from the spec: the workload
 /// can read the mount and cannot write it. The spec-level environment variable
