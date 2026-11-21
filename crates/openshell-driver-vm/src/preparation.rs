@@ -12,7 +12,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -406,7 +406,7 @@ fn reclaim(directory: &Path, lease_path: &Path) -> io::Result<bool> {
     if marker != LEASE_MARKER {
         return Ok(false);
     }
-    match fs::remove_dir_all(directory) {
+    match remove_staging_tree(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -417,6 +417,29 @@ fn reclaim(directory: &Path, lease_path: &Path) -> io::Result<bool> {
         Err(error) => return Err(error),
     }
     Ok(true)
+}
+
+/// Remove a private staging tree after its writers have stopped. Image
+/// directory modes may deny the driver permission to unlink their children.
+pub(super) fn remove_staging_tree(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
+        result => return result,
+    }
+
+    let mut pending = vec![path.to_owned()];
+    while let Some(dir) = pending.pop() {
+        if dir.symlink_metadata()?.is_dir() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+            for child in dir.read_dir()? {
+                let child = child?;
+                if child.file_type()?.is_dir() {
+                    pending.push(child.path());
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(path)
 }
 
 fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
@@ -565,6 +588,26 @@ pub(super) fn send(message: &Message) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn removes_inaccessible_staging_directories_without_following_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("staged");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"outside").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o750)).unwrap();
+        symlink(&outside, dir.join("link")).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        remove_staging_tree(&dir).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside");
+        assert_eq!(
+            fs::metadata(outside).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
 
     fn request(root: &Path) -> Request {
         Request {

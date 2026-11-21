@@ -6,15 +6,120 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write as _;
+use std::io::{self, Read, Write as _};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
-pub fn apply_layer_dir_to_rootfs(layer_root: &Path, rootfs: &Path) -> Result<(), String> {
-    LayerApplier::new(rootfs)?.apply(layer_root)
+const MIN_ENTRY_BYTES: u64 = 4096;
+
+/// Both limits span every layer of one bootstrap build. Tar headers and padding
+/// consume decoded bytes. Sparse holes and copies of hard links consume output
+/// bytes even when there is little or no corresponding data in the tar.
+pub struct BootstrapExtractionBudget {
+    limit: u64,
+    decoded_left: u64,
+    output_left: u64,
+}
+
+impl BootstrapExtractionBudget {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            decoded_left: limit,
+            output_left: limit,
+        }
+    }
+
+    fn exceeded(&self, kind: &str) -> io::Error {
+        io::Error::other(format!(
+            "bootstrap extraction limit of {} bytes exceeded for {kind}",
+            self.limit
+        ))
+    }
+
+    fn reserve_entry(&mut self, bytes: u64) -> io::Result<()> {
+        self.output_left = self
+            .output_left
+            .checked_sub(bytes.max(MIN_ENTRY_BYTES))
+            .ok_or_else(|| self.exceeded("filesystem output"))?;
+        Ok(())
+    }
+
+    pub fn unpack_tar(&mut self, reader: impl Read, dest: &Path) -> io::Result<()> {
+        fs::create_dir_all(dest)?;
+        let dest = dest.canonicalize()?;
+        let mut input = reader.take(self.decoded_left);
+        let unpack = self.unpack_entries(&mut tar::Archive::new(&mut input), &dest);
+        if unpack.is_ok() {
+            // The tar parser stops at the first end marker. Account for padding,
+            // trailing data and concatenated compression frames through EOF.
+            io::copy(&mut input, &mut io::sink())?;
+        }
+        self.decoded_left = input.limit();
+        if self.decoded_left == 0 && input.into_inner().read(&mut [0])? != 0 {
+            return Err(self.exceeded("decoded layer tars"));
+        }
+        unpack
+    }
+
+    fn unpack_entries(
+        &mut self,
+        archive: &mut tar::Archive<impl Read>,
+        dest: &Path,
+    ) -> io::Result<()> {
+        // Match Archive::unpack: validate each path with unpack_in and apply
+        // directory modes after descendants, deepest first.
+        let mut directories = Vec::new();
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let kind = entry.header().entry_type();
+            if kind.is_pax_global_extensions()
+                || kind.is_pax_local_extensions()
+                || kind.is_gnu_longname()
+                || kind.is_gnu_longlink()
+            {
+                continue;
+            }
+            // unpack_in can create every parent of a member, even if the tar
+            // has no entries for those directories. Reserve before it writes.
+            for _ in entry
+                .path()?
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .skip(1)
+            {
+                self.reserve_entry(0)?;
+            }
+            let bytes = if kind.is_symlink() {
+                entry
+                    .link_name_bytes()
+                    .map_or(0, |target| target.len() as u64)
+            } else if kind.is_dir() {
+                0
+            } else {
+                // tar resolves PAX size overrides and GNU sparse extents here.
+                entry.size()
+            };
+            self.reserve_entry(bytes)?;
+            if kind.is_dir() {
+                directories.push(entry);
+            } else {
+                entry.unpack_in(dest)?;
+            }
+        }
+        directories.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
+        for mut directory in directories {
+            directory.unpack_in(dest)?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_layer(&mut self, layer_root: &Path, rootfs: &Path) -> Result<(), String> {
+        LayerApplier::new(rootfs)?.apply(layer_root, self)
+    }
 }
 
 /// Owns all filesystem mutations performed while merging an extracted OCI
@@ -91,23 +196,32 @@ impl LayerApplier {
         })
     }
 
-    fn apply(&self, layer_root: &Path) -> Result<(), String> {
+    fn apply(
+        &self,
+        layer_root: &Path,
+        budget: &mut BootstrapExtractionBudget,
+    ) -> Result<(), String> {
         #[cfg(unix)]
         {
             let root = ResolvedDirectory {
                 fd: self.open_root_dir()?,
                 components: Vec::new(),
             };
-            self.merge_directory(layer_root, &root)
+            self.merge_directory(layer_root, &root, budget)
         }
         #[cfg(not(unix))]
         {
-            self.merge_directory(layer_root, &self.rootfs)
+            self.merge_directory(layer_root, &self.rootfs, budget)
         }
     }
 
     #[cfg(not(unix))]
-    fn merge_directory(&self, source_dir: &Path, target_dir: &Path) -> Result<(), String> {
+    fn merge_directory(
+        &self,
+        source_dir: &Path,
+        target_dir: &Path,
+        budget: &mut BootstrapExtractionBudget,
+    ) -> Result<(), String> {
         fs::create_dir_all(target_dir)
             .map_err(|err| format!("create {}: {err}", target_dir.display()))?;
 
@@ -140,6 +254,12 @@ impl LayerApplier {
             let metadata = fs::symlink_metadata(&source_path)
                 .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
             let file_type = metadata.file_type();
+            let bytes = if file_type.is_dir() {
+                0
+            } else {
+                metadata.len()
+            };
+            budget.reserve_entry(bytes).map_err(|err| err.to_string())?;
 
             if file_type.is_dir() {
                 let plan = self.plan_directory_merge(&dest_path)?;
@@ -148,7 +268,7 @@ impl LayerApplier {
                 }
                 fs::create_dir_all(plan.path())
                     .map_err(|err| format!("create {}: {err}", plan.path().display()))?;
-                self.merge_directory(&source_path, plan.path())?;
+                self.merge_directory(&source_path, plan.path(), budget)?;
                 if plan.applies_directory_metadata() {
                     fs::set_permissions(plan.path(), metadata.permissions())
                         .map_err(|err| format!("chmod {}: {err}", plan.path().display()))?;
@@ -186,6 +306,7 @@ impl LayerApplier {
         &self,
         source_dir: &Path,
         target_dir: &ResolvedDirectory,
+        budget: &mut BootstrapExtractionBudget,
     ) -> Result<(), String> {
         let mut entries = fs::read_dir(source_dir)
             .map_err(|err| format!("read {}: {err}", source_dir.display()))?
@@ -215,6 +336,12 @@ impl LayerApplier {
             let metadata = fs::symlink_metadata(&source_path)
                 .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
             let file_type = metadata.file_type();
+            let bytes = if file_type.is_dir() {
+                0
+            } else {
+                metadata.len()
+            };
+            budget.reserve_entry(bytes).map_err(|err| err.to_string())?;
 
             if file_type.is_dir() {
                 let plan = self.plan_directory_merge(target_dir, &file_name)?;
@@ -231,7 +358,7 @@ impl LayerApplier {
                         self.create_child_directory(target_dir, &file_name)?
                     }
                 };
-                self.merge_directory(&source_path, &child)?;
+                self.merge_directory(&source_path, &child, budget)?;
                 if apply_metadata {
                     rustix::fs::fchmod(&child.fd, Self::mode_from_metadata(&metadata)).map_err(
                         |err| format!("chmod {}: {err}", self.directory_path(&child).display()),
@@ -441,7 +568,7 @@ impl LayerApplier {
         )
         .map_err(|err| format!("create {}: {err}", path.display()))?;
         let mut destination = fs::File::from(fd);
-        std::io::copy(&mut source, &mut destination).map_err(|err| {
+        io::copy(&mut source, &mut destination).map_err(|err| {
             format!(
                 "copy {} to {}: {err}",
                 source_path.display(),
@@ -764,7 +891,13 @@ mod tests {
 
         fs::rename(rootfs.join("pivot"), rootfs.join("detached")).unwrap();
         std::os::unix::fs::symlink(&outside, rootfs.join("pivot")).unwrap();
-        applier.merge_directory(&upper, &opened).unwrap();
+        applier
+            .merge_directory(
+                &upper,
+                &opened,
+                &mut super::BootstrapExtractionBudget::new(4096),
+            )
+            .unwrap();
 
         assert_eq!(
             fs::read_to_string(outside.join("victim")).unwrap(),

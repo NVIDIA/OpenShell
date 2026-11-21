@@ -13,7 +13,7 @@ mod registry_cache_tests;
 use crate::gpu::{GpuInventory, allocate_vsock_cid};
 
 use crate::isolation::VmBoundarySpec;
-use crate::layer_applier::apply_layer_dir_to_rootfs;
+use crate::layer_applier::BootstrapExtractionBudget;
 use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
@@ -32,7 +32,7 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
-use flate2::read::{GzDecoder, MultiGzDecoder};
+use flate2::read::MultiGzDecoder;
 use futures::{Stream, StreamExt, TryStreamExt};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -116,6 +116,7 @@ const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
 const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
+const DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
 const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
@@ -358,6 +359,9 @@ pub struct VmDriverConfig {
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
     pub bootstrap_image: String,
+    /// Per-image byte limit for host extraction of registry bootstrap layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_extraction_max_bytes: Option<std::num::NonZeroU64>,
     pub log_level: String,
     pub krun_log_level: u32,
     pub vcpus: u8,
@@ -431,6 +435,10 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
             .field("bootstrap_image", &self.bootstrap_image)
+            .field(
+                "bootstrap_extraction_max_bytes",
+                &self.bootstrap_extraction_max_bytes,
+            )
             .field("log_level", &self.log_level)
             .field("krun_log_level", &self.krun_log_level)
             .field("vcpus", &self.vcpus)
@@ -504,6 +512,7 @@ impl Default for VmDriverConfig {
             launcher_bin: None,
             default_image: String::new(),
             bootstrap_image: String::new(),
+            bootstrap_extraction_max_bytes: None,
             log_level: "info".to_string(),
             krun_log_level: 1,
             vcpus: DEFAULT_VCPUS,
@@ -4860,12 +4869,9 @@ impl VmDriver {
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
             .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
-        tokio::fs::create_dir_all(&cache_dir)
-            .await
-            .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
 
         if tokio::fs::metadata(&staging_dir).await.is_ok() {
-            tokio::fs::remove_dir_all(&staging_dir)
+            remove_bootstrap_staging(&staging_dir)
                 .await
                 .map_err(|err| {
                     Status::internal(format!(
@@ -4901,7 +4907,7 @@ impl VmDriver {
                 error = %err.message(),
                 "vm driver: pull_registry_image_rootfs failed"
             );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = remove_bootstrap_staging(&staging_dir).await;
             return Err(err);
         }
         info!(
@@ -4948,7 +4954,7 @@ impl VmDriver {
                 error = %err,
                 "vm driver: rootfs preparation failed"
             );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = remove_bootstrap_staging(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
 
@@ -4976,14 +4982,20 @@ impl VmDriver {
                 error = %err,
                 "vm driver: rootfs image build failed"
             );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = remove_bootstrap_staging(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
 
-        self.publish_prepared_image(&prepared_image, &image_path)
-            .await?;
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        Ok(())
+        let published = async {
+            tokio::fs::create_dir_all(&cache_dir)
+                .await
+                .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
+            self.publish_prepared_image(&prepared_image, &image_path)
+                .await
+        }
+        .await;
+        let _ = remove_bootstrap_staging(&staging_dir).await;
+        published
     }
 
     /// Watch the launcher child process and surface errors as driver
@@ -6245,8 +6257,12 @@ impl VmDriver {
             .map_err(|err| Status::internal(format!("create layer staging dir failed: {err}")))?;
 
         let total_layers = manifest.layers.len();
-        let total_bytes: i64 = manifest.layers.iter().map(|layer| layer.size.max(0)).sum();
-        let mut layers = futures::stream::iter(manifest.layers.iter().cloned().enumerate())
+        let total_bytes = manifest
+            .layers
+            .iter()
+            .map(|layer| layer.size.max(0))
+            .fold(0, i64::saturating_add);
+        let mut layers = futures::stream::iter(manifest.layers.into_iter().enumerate())
             .map(|(index, layer)| async move {
                 self.publish_registry_layer_progress(
                     sandbox_id,
@@ -6271,9 +6287,35 @@ impl VmDriver {
             .await?;
         layers.sort_by_key(|layer| layer.index);
 
-        for layer in &layers {
-            apply_registry_layer_blob(image_ref, rootfs, layer).await?;
-        }
+        // The blobs are verified. One writer owns the budget and each staged
+        // tree stays immutable while its files are copied into the rootfs.
+        let limit = self.config.bootstrap_extraction_max_bytes.map_or(
+            DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES,
+            std::num::NonZeroU64::get,
+        );
+        let layer_root = staging_dir.join("layers/root");
+        let rootfs = rootfs.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut budget = BootstrapExtractionBudget::new(limit);
+            for layer in layers {
+                extract_layer_blob_to_dir(
+                    &layer.blob_path,
+                    &layer.media_type,
+                    &layer_root,
+                    &mut budget,
+                )
+                .and_then(|()| budget.apply_layer(&layer_root, &rootfs))
+                .map_err(|err| format!("layer '{}': {err}", layer.digest))?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|err| Status::internal(format!("bootstrap layer extraction panicked: {err}")))?
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to extract vm bootstrap image '{image_ref}': {err}"
+            ))
+        })?;
 
         remove_registry_layer_staging(staging_dir).await?;
 
@@ -6336,7 +6378,8 @@ impl VmDriver {
 struct DownloadedRegistryLayer {
     index: usize,
     digest: String,
-    layer_root: PathBuf,
+    blob_path: PathBuf,
+    media_type: String,
 }
 
 async fn download_registry_layer_blob(
@@ -6351,9 +6394,6 @@ async fn download_registry_layer_blob(
     let blob_path = staging_dir
         .join("layers")
         .join(format!("{index:02}-{digest_component}.blob"));
-    let layer_root = staging_dir
-        .join("layers")
-        .join(format!("{index:02}-{digest_component}.root"));
 
     let mut file = pull_registry_blob_file(
         "download image layer",
@@ -6390,56 +6430,27 @@ async fn download_registry_layer_blob(
         ))
     })?;
 
-    let blob_path_for_unpack = blob_path.clone();
-    let layer_root_for_unpack = layer_root.clone();
-    let media_type = layer.media_type.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer extraction panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to extract layer '{}' for vm sandbox image '{image_ref}': {err}",
-            layer.digest
-        ))
-    })?;
-
     Ok(DownloadedRegistryLayer {
         index,
         digest: layer.digest,
-        layer_root,
-    })
-}
-
-async fn apply_registry_layer_blob(
-    image_ref: &str,
-    rootfs: &Path,
-    layer: &DownloadedRegistryLayer,
-) -> Result<(), Status> {
-    let layer_root_for_unpack = layer.layer_root.clone();
-    let rootfs_for_unpack = rootfs.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        apply_layer_dir_to_rootfs(&layer_root_for_unpack, &rootfs_for_unpack)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer application panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to apply layer '{}' for vm sandbox image '{image_ref}': {err}",
-            layer.digest
-        ))
+        blob_path,
+        media_type: layer.media_type,
     })
 }
 
 async fn remove_registry_layer_staging(staging_dir: &Path) -> Result<(), Status> {
     let layers_dir = staging_dir.join("layers");
-    tokio::fs::remove_dir_all(&layers_dir).await.map_err(|err| {
+    remove_bootstrap_staging(&layers_dir).await.map_err(|err| {
         Status::internal(format!(
             "remove registry layer staging dir '{}' failed: {err}",
             layers_dir.display()
         ))
     })
+}
+
+async fn remove_bootstrap_staging(dir: &Path) -> std::io::Result<()> {
+    let dir = dir.to_owned();
+    tokio::task::spawn_blocking(move || preparation::remove_staging_tree(&dir)).await?
 }
 
 async fn download_registry_descriptor_blob_file(
@@ -6642,30 +6653,24 @@ fn extract_layer_blob_to_dir(
     blob_path: &Path,
     media_type: &str,
     dest: &Path,
+    budget: &mut BootstrapExtractionBudget,
 ) -> Result<(), String> {
     if dest.exists() {
-        fs::remove_dir_all(dest).map_err(|err| format!("remove {}: {err}", dest.display()))?;
+        preparation::remove_staging_tree(dest)
+            .map_err(|err| format!("remove {}: {err}", dest.display()))?;
     }
-    fs::create_dir_all(dest).map_err(|err| format!("create {}: {err}", dest.display()))?;
-
     let file =
         fs::File::open(blob_path).map_err(|err| format!("open {}: {err}", blob_path.display()))?;
     match layer_compression_from_media_type(media_type)? {
-        LayerCompression::None => extract_tar_reader_to_dir(file, dest),
-        LayerCompression::Gzip => extract_tar_reader_to_dir(GzDecoder::new(file), dest),
+        LayerCompression::None => budget.unpack_tar(file, dest),
+        LayerCompression::Gzip => budget.unpack_tar(MultiGzDecoder::new(file), dest),
         LayerCompression::Zstd => {
             let decoder = zstd::stream::read::Decoder::new(file)
                 .map_err(|err| format!("decompress {}: {err}", blob_path.display()))?;
-            extract_tar_reader_to_dir(decoder, dest)
+            budget.unpack_tar(decoder, dest)
         }
     }
-}
-
-fn extract_tar_reader_to_dir(reader: impl Read, dest: &Path) -> Result<(), String> {
-    let mut archive = tar::Archive::new(reader);
-    archive
-        .unpack(dest)
-        .map_err(|err| format!("extract layer into {}: {err}", dest.display()))
+    .map_err(|err| format!("extract layer into {}: {err}", dest.display()))
 }
 
 // `media_type` is an OCI media type string (e.g. `application/vnd.oci.image.layer.v1.tar+gzip`),
@@ -12084,6 +12089,11 @@ mod tests {
         assert!(err.contains("unknown/unknown"));
     }
 
+    fn apply_layer_dir_to_rootfs(layer: &Path, rootfs: &Path) -> Result<(), String> {
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .apply_layer(layer, rootfs)
+    }
+
     #[test]
     fn apply_layer_dir_to_rootfs_honors_whiteouts() {
         let base = unique_temp_dir();
@@ -12293,10 +12303,14 @@ mod tests {
         let mut lower_tar = tar::Builder::new(Vec::new());
         append_test_tar_symlink(&mut lower_tar, "escape", &outside);
         let lower_tar = lower_tar.into_inner().expect("finish lower tar");
-        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(lower_tar), &lower)
+            .unwrap();
 
         let upper_tar = tar_bytes_with_file("escape/payload", b"escaped");
-        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(upper_tar), &upper)
+            .unwrap();
 
         apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
         let error = apply_layer_dir_to_rootfs(&upper, &rootfs)
@@ -12328,12 +12342,16 @@ mod tests {
         append_test_tar_file(&mut lower_tar, "usr/bin/bash", b"bash");
         append_test_tar_symlink(&mut lower_tar, "bin", Path::new("usr/bin"));
         let lower_tar = lower_tar.into_inner().expect("finish lower tar");
-        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(lower_tar), &lower)
+            .unwrap();
 
         // The tar contains no explicit `bin/` entry. Extraction necessarily
         // materializes it as an implicit parent for `bin/tool`.
         let upper_tar = tar_bytes_with_file("bin/tool", b"tool");
-        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(upper_tar), &upper)
+            .unwrap();
 
         apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
         apply_layer_dir_to_rootfs(&upper, &rootfs).unwrap();
@@ -12354,6 +12372,183 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_extraction_bounds_decoded_tar_through_eof_for_each_compression() {
+        let mut tar = tar_bytes_with_file("tool", b"contents");
+        tar.resize(8192, 0);
+        let tail = b"after the tar end marker";
+        let decoded_bytes = (tar.len() + tail.len()) as u64;
+        let gzip = [gzip_bytes(&tar), gzip_bytes(tail)].concat();
+        let zstd = [
+            zstd::encode_all(&tar[..], 0).unwrap(),
+            zstd::encode_all(&tail[..], 0).unwrap(),
+        ]
+        .concat();
+        for (media, bytes) in [
+            (
+                "application/vnd.oci.image.layer.v1.tar",
+                [&tar[..], tail].concat(),
+            ),
+            ("application/vnd.oci.image.layer.v1.tar+gzip", gzip),
+            ("application/vnd.oci.image.layer.v1.tar+zstd", zstd),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let blob = temp.path().join("blob");
+            fs::write(&blob, bytes).unwrap();
+            for limit in [decoded_bytes + 1, decoded_bytes, decoded_bytes - 1] {
+                let dest = temp.path().join(limit.to_string());
+                let result = extract_layer_blob_to_dir(
+                    &blob,
+                    media,
+                    &dest,
+                    &mut BootstrapExtractionBudget::new(limit),
+                );
+                if limit < decoded_bytes {
+                    assert!(result.unwrap_err().contains("decoded layer tars"));
+                } else {
+                    result.unwrap();
+                    assert_eq!(fs::read(dest.join("tool")).unwrap(), b"contents");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_extraction_counts_decoded_tar_across_layers() {
+        let mut tar = tar_bytes_with_file("tool", b"small");
+        tar.resize(8192, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let mut budget = BootstrapExtractionBudget::new(2 * tar.len() as u64 - 1);
+        budget
+            .unpack_tar(tar.as_slice(), &temp.path().join("lower"))
+            .unwrap();
+        let error = budget
+            .unpack_tar(tar.as_slice(), &temp.path().join("upper"))
+            .unwrap_err();
+        assert!(error.to_string().contains("decoded layer tars"), "{error}");
+    }
+
+    #[test]
+    fn bootstrap_extraction_global_pax_header_only_spends_decoded_bytes() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        let comment = b"13 comment=x\n";
+        header.set_entry_type(tar::EntryType::XGlobalHeader);
+        header.set_mode(0o644);
+        header.set_size(comment.len() as u64);
+        builder
+            .append_data(&mut header, "pax", &comment[..])
+            .unwrap();
+        append_test_tar_file(&mut builder, "payload", &[1; 8192]);
+        let tar = builder.into_inner().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("layer");
+        let root = temp.path().join("root");
+        let mut budget = BootstrapExtractionBudget::new(2 * 8192);
+        budget.unpack_tar(&tar[..], &stage).unwrap();
+        budget.apply_layer(&stage, &root).unwrap();
+        assert_eq!(fs::read(root.join("payload")).unwrap(), [1; 8192]);
+        assert!(!root.join("pax").exists());
+    }
+
+    #[test]
+    fn bootstrap_extraction_bounds_path_entries_before_creating_parents() {
+        let tar = tar_bytes_with_file("a/b/c/empty", b"");
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("layer");
+        let root = temp.path().join("root");
+        let mut too_small = BootstrapExtractionBudget::new(4 * 4096 - 1);
+        let err = too_small.unpack_tar(&tar[..], &stage).unwrap_err();
+        assert!(err.to_string().contains("filesystem output"), "{err}");
+        assert!(!stage.join("a").exists());
+
+        let mut budget = BootstrapExtractionBudget::new(8 * 4096);
+        budget.unpack_tar(&tar[..], &stage).unwrap();
+        budget.apply_layer(&stage, &root).unwrap();
+        assert!(root.join("a/b/c/empty").is_file());
+    }
+
+    #[test]
+    fn bootstrap_extraction_checks_sparse_logical_size_before_creating_file() {
+        for logical_size in [1024 * 1024, u64::MAX] {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::GNUSparse);
+            header.set_size(1);
+            header.set_mode(0o644);
+            let gnu = header.as_gnu_mut().unwrap();
+            gnu.set_real_size(logical_size);
+            gnu.sparse[0].set_offset(logical_size - 1);
+            gnu.sparse[0].set_length(1);
+            builder
+                .append_data(&mut header, "sparse", &b"x"[..])
+                .unwrap();
+            let tar = builder.into_inner().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let dest = temp.path();
+            let error = BootstrapExtractionBudget::new(1024 * 1024 - 1)
+                .unpack_tar(&tar[..], dest)
+                .unwrap_err();
+            assert!(error.to_string().contains("filesystem output"), "{error}");
+            assert!(!dest.join("sparse").exists());
+            if logical_size == 1024 * 1024 {
+                BootstrapExtractionBudget::new(logical_size)
+                    .unpack_tar(&tar[..], dest)
+                    .unwrap();
+                assert_eq!(
+                    fs::metadata(dest.join("sparse")).unwrap().len(),
+                    logical_size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_extraction_checks_pax_size_before_creating_file() {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("size", &b"8192"[..])])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "file", &[7; 8192][..])
+            .unwrap();
+        let tar = builder.into_inner().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let error = BootstrapExtractionBudget::new(8191)
+            .unpack_tar(tar.as_slice(), temp.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("filesystem output"), "{error}");
+        assert!(!temp.path().join("file").exists());
+    }
+
+    #[test]
+    fn bootstrap_extraction_reserves_each_hard_link_copy_before_replacement() {
+        let mut builder = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut builder, "a", &[3; 4096]);
+        for name in ["b", "c"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            builder.append_link(&mut header, name, "a").unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("layer");
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("c"), b"old").unwrap();
+        // Three staged entries and three merged copies each consume one block.
+        let mut budget = BootstrapExtractionBudget::new(6 * 4096 - 1);
+        budget.unpack_tar(&tar[..], &staged).unwrap();
+        let error = budget.apply_layer(&staged, &root).unwrap_err();
+        assert!(error.contains("filesystem output"), "{error}");
+        assert_eq!(fs::read(root.join("b")).unwrap(), [3; 4096]);
+        assert_eq!(fs::read(root.join("c")).unwrap(), b"old");
+    }
+
+    #[test]
     fn extracts_zstd_compressed_oci_layer() {
         let temp = tempfile::tempdir().unwrap();
         let archive = tar_bytes_with_file("bin/tool", b"tool contents");
@@ -12366,6 +12561,7 @@ mod tests {
             &blob,
             "application/vnd.oci.image.layer.v1.tar+zstd",
             &extracted,
+            &mut BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES),
         )
         .unwrap();
 
@@ -13421,13 +13617,17 @@ while :; do sleep 0.05; done"#,
     const TEST_STAGING_LIMIT: u64 = 10 * 1024 * 1024;
 
     /// Build an uncompressed tar holding a single file.
-    fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
+    pub(super) fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         append_test_tar_file(&mut builder, name, contents);
         builder.into_inner().expect("finish tar")
     }
 
-    fn append_test_tar_file(builder: &mut tar::Builder<Vec<u8>>, name: &str, contents: &[u8]) {
+    pub(super) fn append_test_tar_file(
+        builder: &mut tar::Builder<Vec<u8>>,
+        name: &str,
+        contents: &[u8],
+    ) {
         let mut header = tar::Header::new_gnu();
         header.set_size(u64::try_from(contents.len()).expect("tar entry size fits u64"));
         header.set_mode(0o644);
@@ -13449,7 +13649,7 @@ while :; do sleep 0.05; done"#,
             .expect("append symlink entry");
     }
 
-    fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+    pub(super) fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(bytes).expect("gzip payload");
         encoder.finish().expect("finish gzip")

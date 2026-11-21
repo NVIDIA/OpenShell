@@ -7,7 +7,7 @@ use oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE;
 use tokio::io::AsyncReadExt as _;
 
 /// A loopback registry with independent HEAD identity and GET contents. Blob
-/// requests deliberately fail, so a rejected manifest needs no VM or formatter.
+/// requests without fixture contents fail before reaching a VM or formatter.
 struct Registry {
     address: String,
     requests: Arc<std::sync::Mutex<Vec<String>>>,
@@ -17,7 +17,7 @@ struct Registry {
 impl Registry {
     async fn start(
         head_digest: String,
-        manifests: HashMap<String, Vec<u8>>,
+        objects: HashMap<String, Vec<u8>>,
         get_digest: Option<String>,
         mut retry_once: bool,
     ) -> Self {
@@ -46,7 +46,7 @@ impl Registry {
                 } else if manifest.is_some() && method == "HEAD" {
                     digest = Some(head_digest.clone());
                     ("200 OK", b"".as_slice())
-                } else if let Some(body) = manifest.and_then(|key| manifests.get(key)) {
+                } else if let Some(body) = manifest.and_then(|key| objects.get(key)) {
                     if retry_once {
                         retry_once = false;
                         ("503 Service Unavailable", b"retry".as_slice())
@@ -54,6 +54,11 @@ impl Registry {
                         digest = Some(get_digest.clone().unwrap_or_else(|| sha256(body)));
                         ("200 OK", body.as_slice())
                     }
+                } else if let Some(body) = path
+                    .strip_prefix("/v2/test/image/blobs/")
+                    .and_then(|key| objects.get(key))
+                {
+                    ("200 OK", body.as_slice())
                 } else {
                     ("404 Not Found", b"fixture has no blob".as_slice())
                 };
@@ -74,6 +79,27 @@ impl Registry {
             requests,
             server,
         }
+    }
+
+    async fn with_layers(layers: Vec<(&str, Vec<u8>)>) -> Self {
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest("config")).unwrap();
+        let mut objects = HashMap::new();
+        manifest["layers"] = layers
+            .into_iter()
+            .map(|(media_type, bytes)| {
+                let digest = sha256(&bytes);
+                let descriptor = serde_json::json!({
+                    "mediaType": media_type, "digest": digest, "size": bytes.len()
+                });
+                objects.insert(digest, bytes);
+                descriptor
+            })
+            .collect();
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let digest = sha256(&body);
+        objects.insert(digest.clone(), body.clone());
+        objects.insert("latest".into(), body);
+        Self::start(digest, objects, None, false).await
     }
 
     fn reference(&self, digest: Option<&str>) -> String {
@@ -537,4 +563,118 @@ async fn bootstrap_registry_cache_hit_for_a_digest_pin_makes_no_registry_request
         "{:?}",
         registry.requests()
     );
+}
+
+#[tokio::test]
+async fn empty_bootstrap_layers_reuse_one_staging_directory() {
+    let empty = tests::gzip_bytes(&[]);
+    let mut layers = vec![("application/vnd.oci.image.layer.v1.tar+gzip", empty); 3];
+    layers.push((
+        "application/vnd.oci.image.layer.v1.tar",
+        tests::tar_bytes_with_file("over-limit", b"x"),
+    ));
+    let registry = Registry::with_layers(layers).await;
+    let image = registry.reference(None);
+    let state = tempfile::tempdir().unwrap();
+    let mut driver = driver(state.path());
+    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(1);
+    let scratch = state.path().join("stage");
+    let error = driver
+        .pull_registry_image_rootfs(
+            "test",
+            &client(),
+            &parse_registry_reference(&image).unwrap(),
+            &RegistryAuth::Anonymous,
+            &image,
+            &scratch,
+            &scratch.join("rootfs"),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("decoded layer tars"), "{error}");
+    let staging_dirs = fs::read_dir(scratch.join("layers"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .count();
+    assert_eq!(staging_dirs, 1);
+}
+
+#[tokio::test]
+async fn bootstrap_extraction_limit_spans_layers_and_cleans_failed_build() {
+    let mut lower = tar::Builder::new(Vec::new());
+    let mut dir = tar::Header::new_gnu();
+    dir.set_entry_type(tar::EntryType::Directory);
+    dir.set_mode(0o555);
+    dir.set_size(0);
+    lower
+        .append_data(&mut dir, "readonly", std::io::empty())
+        .unwrap();
+    tests::append_test_tar_file(&mut lower, "readonly/empty", b"");
+    tests::append_test_tar_file(&mut lower, "shared", &[1; 4096]);
+    let lower = lower.into_inner().unwrap();
+    let upper = tests::tar_bytes_with_file("shared", &[2; 4096]);
+    let registry = Registry::with_layers(vec![
+        (
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            tests::gzip_bytes(&lower),
+        ),
+        (
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            zstd::encode_all(&upper[..], 0).unwrap(),
+        ),
+    ])
+    .await;
+    let image = registry.reference(None);
+    let client = client();
+    let state = tempfile::tempdir().unwrap();
+    let mut driver = driver(state.path());
+    let attempt = state.path().join("attempt");
+    fs::create_dir(&attempt).unwrap();
+    driver.preparation_root = Some(attempt.clone());
+    // Four path components staged and three entries merged in the lower layer.
+    // The upper file is charged again when staged and when merged.
+    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(9 * 4096 - 1);
+    let error = ensure_image(&driver, &image, &client, true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.message().contains("bootstrap extraction limit"),
+        "{error}"
+    );
+    assert!(attempt.read_dir().unwrap().next().is_none());
+    assert!(
+        fs::read_dir(image_cache_root_dir(state.path()))
+            .unwrap()
+            .next()
+            .is_none(),
+        "a rejected image must not leave a cache entry"
+    );
+
+    driver.config.bootstrap_extraction_max_bytes = std::num::NonZeroU64::new(9 * 4096);
+    let staging = state.path().join("retry");
+    let rootfs = staging.join("rootfs");
+    driver
+        .pull_registry_image_rootfs(
+            "test",
+            &client,
+            &parse_registry_reference(&image).unwrap(),
+            &RegistryAuth::Anonymous,
+            &image,
+            &staging,
+            &rootfs,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read(rootfs.join("shared")).unwrap(), [2; 4096]);
+    assert!(!staging.join("layers").exists());
+    assert_eq!(
+        fs::metadata(rootfs.join("readonly"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o555
+    );
+    fs::set_permissions(rootfs.join("readonly"), fs::Permissions::from_mode(0o755)).unwrap();
 }
