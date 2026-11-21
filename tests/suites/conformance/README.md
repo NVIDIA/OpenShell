@@ -21,6 +21,7 @@ target (`harness = false`), so `openshell-conformance run`,
 | `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |
 | `create-upload` | `sandbox create --upload`: directory basename and nested files, multiple uploads, a single file |
 | `credential-gating` | Provider credentials: admission of credentialed endpoints, REST body placeholders and rewriting, WebSocket binary frames, live policy binding |
+| `providers` | Provider profile files: path, mode, config update, detach; `sandbox create --auto-providers` creates a provider from local credentials and injects a placeholder |
 | `image` | A sandbox runs the default image or the one it is created from |
 | `labels` | Labels are stored and select sandboxes in `sandbox list` |
 | `templates` | A sandbox created from a template uses its workload; duplicate, deleted and missing templates return the right errors |

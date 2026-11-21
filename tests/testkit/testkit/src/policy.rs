@@ -101,6 +101,10 @@ pub trait Endpoint {
     fn credential_binding(&mut self, provider: &str) -> &mut Self;
     /// `allow_uninspected_credentials: true`.
     fn allow_uninspected_credentials(&mut self) -> &mut Self;
+    /// `enforcement: enforce`.
+    fn enforce(&mut self) -> &mut Self;
+    /// `path: <path>`.
+    fn path(&mut self, path: &str) -> &mut Self;
 }
 
 impl Endpoint for proto::NetworkEndpoint {
@@ -137,6 +141,16 @@ impl Endpoint for proto::NetworkEndpoint {
         self.allow_uninspected_credentials = true;
         self
     }
+
+    fn enforce(&mut self) -> &mut Self {
+        self.enforcement = proto::NetworkEnforcementMode::Enforce as i32;
+        self
+    }
+
+    fn path(&mut self, path: &str) -> &mut Self {
+        self.path = path.to_string();
+        self
+    }
 }
 
 #[cfg(test)]
@@ -167,7 +181,9 @@ mod tests {
             &["/usr/bin/python*"],
         )
         .websocket(Access::ReadWrite)
-        .allow_uninspected_credentials();
+        .allow_uninspected_credentials()
+        .enforce()
+        .path("/ws");
 
         let yaml = format!(
             "{BASE}network_policies:
@@ -186,6 +202,8 @@ mod tests {
         protocol: websocket
         access: read-write
         allow_uninspected_credentials: true
+        enforcement: enforce
+        path: /ws
     binaries:
       - path: /usr/bin/python*
 "

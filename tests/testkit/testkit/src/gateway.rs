@@ -121,6 +121,12 @@ impl Gateway {
         })
     }
 
+    /// The directory holding the gateway's CA and client certificate, for
+    /// an mTLS gateway.
+    pub(crate) fn mtls_dir(&self) -> Option<&Path> {
+        self.mtls_dir.as_deref()
+    }
+
     /// One line naming the gateway, for test logs.
     pub fn describe(&self) -> String {
         let auth = match (&self.mtls_dir, self.endpoint.starts_with("https://")) {
