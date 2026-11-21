@@ -161,9 +161,11 @@ ensure_podman_runtime_image \
   "sandbox runtime"
 export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
 
-echo "Building openshell-gateway..."
+echo "Building openshell-gateway and the Podman compute driver..."
 require_mise
 mise run build:gateway
+# The gateway launches the driver binary found beside it.
+cargo build -p openshell-driver-podman
 
 if [[ ! -x "${GATEWAY_BIN}" ]]; then
   echo "ERROR: expected gateway binary at ${GATEWAY_BIN}" >&2

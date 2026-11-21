@@ -1,135 +1,34 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! VM compute driver plumbing.
+//! Launching the VM compute driver through the generic launcher.
 //!
-//! This module owns everything needed to hand the gateway a `Channel` speaking
-//! the `openshell.compute.v1.ComputeDriver` RPC surface against an
-//! `openshell-driver-vm` subprocess over a Unix domain socket:
-//!
-//! - [`VmComputeConfig`]: gateway-local configuration (state dir, driver binary,
-//!   VM shape, guest TLS material).
-//! - [`spawn`]: spawn the driver subprocess, wait for its UDS to be ready,
-//!   and return a live gRPC channel plus a [`ManagedDriverProcess`] handle
-//!   that will reap the subprocess and clean up the socket on drop.
-//! - Helpers to resolve the driver binary, compute the socket path, and
-//!   validate guest TLS material when the gateway runs an `https://` control
-//!   plane.
-//!
-//! The VM-driver fields deliberately live here rather than in
-//! [`openshell_core::Config`] so the shared core stays free of driver-specific
-//! plumbing.
-//!
-//! Process launch remains deliberately VM-specific at this binary composition
-//! boundary: it translates gateway configuration into the standalone driver's
-//! argv and then connects through the same public compute-driver RPC interface
-//! used by operator-managed external drivers.
+//! The gateway reads only the launcher's own keys (`driver_dir`, `state_dir`)
+//! from the operator's `[openshell.drivers.vm]` table. The VM driver owns and
+//! validates the rest of the table, which the gateway passes through as the
+//! startup document's `driver_config`.
 
-#[cfg(unix)]
-use hyper_util::rt::TokioIo;
-#[cfg(unix)]
-use openshell_core::proto::compute::v1::{
-    GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
-};
-use openshell_core::sandbox_env::{self, OtlpExport, OtlpProtocol};
-use openshell_core::{Error, NetworkSupervisorTrustBundle, Result, UpstreamProxyConfig};
-#[cfg(unix)]
-use openshell_otel::TraceContextInterceptor;
+use crate::launcher::{self, DriverProcess};
+use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
 use openshell_server::AcquiredRemoteDriverEndpoint;
-#[cfg(unix)]
-use openshell_server::ManagedDriverProcess;
 use openshell_server::config_file::OtlpConfig;
-#[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
-#[cfg(unix)]
-use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
-#[cfg(unix)]
-use tokio::net::UnixStream;
-#[cfg(unix)]
-use tokio::process::Command;
-use tonic::transport::Channel;
-#[cfg(unix)]
-use tonic::transport::Endpoint;
-#[cfg(unix)]
-use tower::service_fn;
+use std::path::{Path, PathBuf};
 
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
-const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
-const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
+const DRIVER_DIR_KEY: &str = "[openshell.drivers.vm].driver_dir";
 
-/// Configuration for launching and talking to the VM compute driver.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct VmComputeConfig {
-    pub allow_driver_config: bool,
-    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
-    /// Working directory for VM driver sandbox state.
-    pub state_dir: PathBuf,
-
+/// The launcher's view of `[openshell.drivers.vm]`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct VmLaunchSettings {
     /// Directory to search for compute-driver binaries before the gateway
     /// falls back to its conventional install paths and sibling binary.
     pub driver_dir: Option<PathBuf>,
-
-    /// Default sandbox image the driver should use when a request omits one.
-    pub default_image: String,
-
-    /// Gateway gRPC endpoint the sandbox guest connects back to.
-    pub grpc_endpoint: String,
-
-    /// Bootstrap image used to boot and prepare VM sandbox target images.
-    pub bootstrap_image: String,
-
-    /// libkrun log level used by the VM driver helper.
-    pub krun_log_level: u32,
-
-    /// Default vCPU count for VM sandboxes.
-    pub vcpus: u8,
-
-    /// Default memory allocation for VM sandboxes, in MiB.
-    pub mem_mib: u32,
-
-    /// Writable overlay disk size for each VM sandbox, in MiB.
-    pub overlay_disk_mib: u64,
-
-    /// Optional UID override for the VM guest sandbox account.
-    pub sandbox_uid: Option<u32>,
-
-    /// Optional GID override for the VM guest sandbox account.
-    pub sandbox_gid: Option<u32>,
-
-    /// Directory shared with the gateway for request-scoped rootfs tar staging.
-    pub rootfs_tar_staging_dir: Option<PathBuf>,
-
-    /// Maximum accepted rootfs tar size, in bytes, before and after decompression.
-    pub rootfs_tar_max_bytes: Option<u64>,
-
-    /// Host-side CA certificate used to authenticate the gateway.
-    pub guest_tls_ca: Option<PathBuf>,
-
-    /// Corporate forward-proxy settings passed to the VM driver. Flattening
-    /// preserves the shared local-driver TOML field names.
-    #[serde(flatten)]
-    pub upstream_proxy: UpstreamProxyConfig,
-
-    /// Path on the gateway host to a PEM CA bundle trusted for the corporate
-    /// proxy and for server certificates re-signed by a TLS-intercepting proxy.
-    pub proxy_ca_bundle: Option<PathBuf>,
-
-    /// Explicit guest-reachable SPIFFE Workload API TCP listener. VM guests
-    /// cannot receive a host UNIX socket, so this requires acknowledgement.
-    pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
-    #[serde(default)]
-    pub provider_spiffe_allow_guest_tcp: bool,
-
-    /// Allow bind-mounting host directories into VM sandboxes.
-    #[serde(default)]
-    pub enable_bind_mounts: bool,
+    /// Working directory for VM driver state, which holds the private run
+    /// directory with the driver socket and startup document.
+    pub state_dir: Option<PathBuf>,
 }
 
-impl VmComputeConfig {
+impl VmLaunchSettings {
     /// Default working directory for VM driver state.
     #[must_use]
     pub fn default_state_dir() -> PathBuf {
@@ -139,792 +38,150 @@ impl VmComputeConfig {
         )
     }
 
-    /// Default libkrun log level.
-    #[must_use]
-    pub const fn default_krun_log_level() -> u32 {
-        1
-    }
-
-    /// Default vCPU count.
-    #[must_use]
-    pub const fn default_vcpus() -> u8 {
-        2
-    }
-
-    /// Default memory allocation, in MiB.
-    #[must_use]
-    pub const fn default_mem_mib() -> u32 {
-        2048
-    }
-
-    /// Default writable overlay disk size, in MiB.
-    #[must_use]
-    pub const fn default_overlay_disk_mib() -> u64 {
-        4096
-    }
-
-    /// Validate startup configuration without resolving binaries, creating
-    /// state directories, spawning a process, or connecting a socket.
-    pub fn validate_configuration(&self) -> Result<()> {
-        self.resource_admission.validate().map_err(Error::config)?;
-        if self.grpc_endpoint.trim().is_empty() {
-            return Err(Error::config(
-                "grpc_endpoint is required when using the vm compute driver",
-            ));
-        }
-        if self.bootstrap_image.trim().is_empty() && self.default_image.trim().is_empty() {
-            return Err(Error::config(
-                "bootstrap_image or default_image is required when using the vm compute driver; sandbox images cannot be used as VM bootstrap images",
-            ));
-        }
-        validate_vm_sandbox_identity(self)?;
-        if self
-            .rootfs_tar_staging_dir
+    /// Read the launcher's keys from the operator's driver table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `driver_dir` or `state_dir` has the wrong type.
+    pub fn from_table(table: &toml::Table) -> Result<Self> {
+        let mut settings: Self =
+            toml::Value::Table(table.clone())
+                .try_into()
+                .map_err(|error: toml::de::Error| {
+                    Error::config(format!("invalid [openshell.drivers.vm] table: {error}"))
+                })?;
+        if settings
+            .state_dir
             .as_ref()
-            .is_some_and(|path| path.as_os_str().is_empty())
+            .is_none_or(|dir| dir.as_os_str().is_empty())
         {
-            return Err(Error::config(
-                "rootfs_tar_staging_dir must not be empty when set",
-            ));
+            settings.state_dir = Some(Self::default_state_dir());
         }
-        if self.rootfs_tar_max_bytes == Some(0) {
-            return Err(Error::config(
-                "rootfs_tar_max_bytes must be greater than zero when set",
-            ));
-        }
-        self.validate_proxy_config()?;
-        if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
-            openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
-                endpoint,
-                self.provider_spiffe_allow_guest_tcp,
-            )
-            .map_err(Error::config)?;
-        } else if self.provider_spiffe_allow_guest_tcp {
-            return Err(Error::config(
-                "provider_spiffe_allow_guest_tcp is set but no provider_spiffe_workload_api_tcp_endpoint is configured",
-            ));
-        }
-        Ok(())
+        Ok(settings)
     }
 
-    fn validate_proxy_config(&self) -> Result<()> {
-        self.upstream_proxy.validate().map_err(Error::config)?;
-        if let Some(path) = self.proxy_ca_bundle.as_ref() {
-            if path.as_os_str().is_empty() {
-                return Err(Error::config("proxy_ca_bundle must not be empty when set"));
-            }
-            if self.upstream_proxy.https_proxy.is_none() {
-                return Err(Error::config(
-                    "proxy_ca_bundle is set but no https_proxy is configured",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        if let Some(home) = home {
-            dirs.push(home.join(".local").join("libexec").join("openshell"));
-        }
-        push_unique_path(&mut dirs, PathBuf::from("/usr/libexec/openshell"));
-        push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec/openshell"));
-        push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec"));
-        dirs
+    fn state_dir(&self) -> PathBuf {
+        self.state_dir
+            .clone()
+            .unwrap_or_else(Self::default_state_dir)
     }
 }
 
-impl Default for VmComputeConfig {
-    fn default() -> Self {
-        Self {
-            state_dir: Self::default_state_dir(),
-            allow_driver_config: false,
-            resource_admission:
-                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
-            driver_dir: None,
-            default_image: openshell_core::image::default_sandbox_image(),
-            grpc_endpoint: String::new(),
-            bootstrap_image: String::new(),
-            krun_log_level: Self::default_krun_log_level(),
-            vcpus: Self::default_vcpus(),
-            mem_mib: Self::default_mem_mib(),
-            overlay_disk_mib: Self::default_overlay_disk_mib(),
-            sandbox_uid: None,
-            sandbox_gid: None,
-            rootfs_tar_staging_dir: None,
-            rootfs_tar_max_bytes: None,
-            guest_tls_ca: None,
-            upstream_proxy: UpstreamProxyConfig::default(),
-            proxy_ca_bundle: None,
-            provider_spiffe_workload_api_tcp_endpoint: None,
-            provider_spiffe_allow_guest_tcp: false,
-            enable_bind_mounts: false,
-        }
-    }
+/// Everything the gateway supplies to launch the VM driver.
+pub struct VmLaunch<'a> {
+    pub gateway_log_level: &'a str,
+    pub gateway_name: &'a str,
+    pub gateway_port: u16,
+    /// The gateway's `guest_tls_ca`, when it serves TLS.
+    pub tls_ca: Option<&'a Path>,
+    pub otlp_config: Option<&'a OtlpConfig>,
+    pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
+    pub settings: &'a VmLaunchSettings,
+    /// The operator's `[openshell.drivers.vm]` table, passed through.
+    pub driver_config: toml::Table,
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmGuestTlsPaths {
-    pub ca: PathBuf,
-}
-
-/// Resolve the `openshell-driver-vm` binary path.
-///
-/// Resolution order:
-/// 1. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
-///    `[openshell.drivers.vm].driver_dir`.
-/// 2. Conventional install directories:
-///    `~/.local/libexec/openshell`, `/usr/libexec/openshell`,
-///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
-/// 3. Sibling of the gateway's own executable (last-resort fallback so
-///    local development builds still work out of the box).
-pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
-    let mut searched: Vec<PathBuf> = Vec::new();
-
-    // 1. Configured driver directory, or the conventional install locations
-    // when no explicit override is configured.
-    for dir in resolve_driver_search_dirs(vm_config) {
-        let candidate = dir.join(DRIVER_BIN_NAME);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        push_unique_path(&mut searched, candidate);
-    }
-
-    // 2. Sibling-of-gateway fallback.
-    let current_exe = std::env::current_exe()
-        .map_err(|e| Error::config(format!("failed to resolve current executable: {e}")))?;
-    let Some(parent) = current_exe.parent() else {
-        return Err(Error::config(format!(
-            "current executable '{}' has no parent directory",
-            current_exe.display()
-        )));
+/// Launch the VM driver and return a managed endpoint for it.
+pub async fn spawn(launch: VmLaunch<'_>) -> Result<AcquiredRemoteDriverEndpoint> {
+    let settings = launch.settings;
+    let state_dir = settings.state_dir();
+    let process = DriverProcess {
+        name: "vm",
+        binary_name: DRIVER_BIN_NAME,
+        driver_dir: settings.driver_dir.as_deref(),
+        driver_dir_key: Some(DRIVER_DIR_KEY),
+        state_dir: &state_dir,
     };
-    let sibling = parent.join(DRIVER_BIN_NAME);
-    if sibling.is_file() {
-        return Ok(sibling);
-    }
-    push_unique_path(&mut searched, sibling);
-
-    let searched_display = searched
-        .iter()
-        .map(|p| format!("'{}'", p.display()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(Error::config(format!(
-        "vm compute driver binary not found (searched {searched_display}); install it under [openshell.drivers.vm].driver_dir, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
-    )))
-}
-
-fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
-    vm_config.driver_dir.clone().map_or_else(
-        || {
-            let mut dirs = Vec::new();
-            if let Ok(current_exe) = std::env::current_exe()
-                && let Some(prefix) = current_exe.parent().and_then(Path::parent)
-            {
-                push_unique_path(&mut dirs, prefix.join("libexec"));
-                push_unique_path(&mut dirs, prefix.join("libexec").join("openshell"));
-            }
-            for dir in VmComputeConfig::default_driver_search_dirs(
-                std::env::var_os("HOME").map(PathBuf::from),
-            ) {
-                push_unique_path(&mut dirs, dir);
-            }
-            dirs
-        },
-        |dir| vec![dir],
-    )
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
-}
-
-/// Path of the Unix domain socket the driver will listen on.
-pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
-    vm_config
-        .state_dir
-        .join(COMPUTE_DRIVER_SOCKET_RUN_DIR)
-        .join(COMPUTE_DRIVER_SOCKET_NAME)
-}
-
-#[cfg(unix)]
-fn prepare_compute_driver_socket_path(
-    vm_config: &VmComputeConfig,
-    socket_path: &Path,
-) -> Result<()> {
-    let expected_uid = current_euid();
-    prepare_vm_state_dir(&vm_config.state_dir, expected_uid)?;
-    let parent = socket_path.parent().ok_or_else(|| {
-        Error::execution(format!(
-            "vm compute driver socket path '{}' has no parent directory",
-            socket_path.display()
-        ))
-    })?;
-    prepare_private_socket_dir(parent, expected_uid)?;
-    remove_stale_socket(socket_path, expected_uid)
-}
-
-#[cfg(unix)]
-fn current_euid() -> u32 {
-    rustix::process::geteuid().as_raw()
-}
-
-#[cfg(unix)]
-fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
-    std::fs::create_dir_all(state_dir).map_err(|err| {
-        Error::execution(format!(
-            "failed to create vm driver state dir '{}': {err}",
-            state_dir.display()
-        ))
-    })?;
-    let metadata = checked_directory_metadata(state_dir, expected_uid, "vm driver state dir")?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).map_err(
-            |err| {
-                Error::execution(format!(
-                    "failed to restrict vm driver state dir '{}': {err}",
-                    state_dir.display()
-                ))
-            },
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn prepare_private_socket_dir(socket_dir: &Path, expected_uid: u32) -> Result<()> {
-    std::fs::create_dir_all(socket_dir).map_err(|err| {
-        Error::execution(format!(
-            "failed to create vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
-    })?;
-    let _ = checked_directory_metadata(socket_dir, expected_uid, "vm compute driver socket dir")?;
-    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
-        Error::execution(format!(
-            "failed to restrict vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
+    let otlp_config = launch.otlp_config;
+    launcher::launch(&process, otlp_config, |socket_path| {
+        vm_startup_document(launch, socket_path)
     })
+    .await
 }
 
-#[cfg(unix)]
-fn checked_directory_metadata(
-    path: &Path,
-    expected_uid: u32,
-    label: &str,
-) -> Result<std::fs::Metadata> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|err| {
-        Error::execution(format!(
-            "failed to stat {label} '{}': {err}",
-            path.display()
-        ))
-    })?;
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(Error::execution(format!(
-            "{label} '{}' is a symlink; refusing to use it",
-            path.display()
-        )));
-    }
-    if !file_type.is_dir() {
-        return Err(Error::execution(format!(
-            "{label} '{}' is not a directory",
-            path.display()
-        )));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(Error::execution(format!(
-            "{label} '{}' is owned by uid {} but current euid is {}",
-            path.display(),
-            metadata.uid(),
-            expected_uid
-        )));
-    }
-    Ok(metadata)
-}
-
-#[cfg(unix)]
-fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(Error::execution(format!(
-                "failed to stat vm compute driver socket '{}': {err}",
-                socket_path.display()
-            )));
-        }
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is a symlink; refusing to remove it",
-            socket_path.display()
-        )));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is owned by uid {} but current euid is {}",
-            socket_path.display(),
-            metadata.uid(),
-            expected_uid
-        )));
-    }
-    if !file_type.is_socket() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket path '{}' exists but is not a Unix socket",
-            socket_path.display()
-        )));
-    }
-    std::fs::remove_file(socket_path).map_err(|err| {
-        Error::execution(format!(
-            "failed to remove stale vm compute driver socket '{}': {err}",
-            socket_path.display()
-        ))
-    })
-}
-
-#[cfg(unix)]
-pub fn compute_driver_guest_tls_paths(
-    vm_config: &VmComputeConfig,
-) -> Result<Option<VmGuestTlsPaths>> {
-    if !vm_config.grpc_endpoint.starts_with("https://") {
-        return Ok(None);
-    }
-
-    if vm_config.guest_tls_ca.is_none() {
-        return Err(Error::config(
-            "vm compute driver requires guest_tls_ca when grpc_endpoint uses https://",
-        ));
-    }
-
-    let Some(ca) = vm_config.guest_tls_ca.clone() else {
-        return Err(Error::config(
-            "guest_tls_ca is required when VM guest TLS materials are configured",
-        ));
-    };
-    for path in [&ca] {
-        if !path.is_file() {
-            return Err(Error::config(format!(
-                "vm guest TLS material '{}' does not exist or is not a file",
-                path.display()
-            )));
-        }
-    }
-
-    Ok(Some(VmGuestTlsPaths { ca }))
-}
-
-/// Launch the VM compute-driver subprocess, wait for its UDS to come up,
-/// and return a gRPC `Channel` connected to it plus a process handle that
-/// kills the subprocess and removes the socket on drop.
-#[cfg(unix)]
-pub async fn spawn(
+/// Have the VM driver validate the document the gateway would launch it with.
+/// Values the gateway only knows once it serves, such as its TLS CA and the
+/// staged network trust bundle, are left out.
+pub fn preflight(
     gateway_log_level: &str,
     gateway_name: &str,
-    vm_config: &VmComputeConfig,
-    otlp_config: Option<&OtlpConfig>,
-    additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
-) -> Result<AcquiredRemoteDriverEndpoint> {
-    vm_config.validate_configuration()?;
-    let driver_bin = resolve_compute_driver_bin(vm_config)?;
-    let socket_path = compute_driver_socket_path(vm_config);
-    let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
-    prepare_compute_driver_socket_path(vm_config, &socket_path)?;
-
-    let mut command = Command::new(&driver_bin);
-    command.kill_on_drop(true);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::inherit());
-    command.stderr(Stdio::inherit());
-    command.arg("--bind-socket").arg(&socket_path);
-    command.arg("--admission-config-json").arg(
-        serde_json::to_string(&openshell_core::resource_admission::DriverAdmissionConfig {
-            allow_driver_config: vm_config.allow_driver_config,
-            resource_admission: vm_config.resource_admission.clone(),
-        })
-        .map_err(|error| Error::config(error.to_string()))?,
-    );
-    command
-        .arg("--expected-peer-pid")
-        .arg(std::process::id().to_string());
-    command.arg("--log-level").arg(gateway_log_level);
-    append_otlp_args(&mut command, otlp_config, gateway_name);
-    command.arg("--grpc-endpoint").arg(&vm_config.grpc_endpoint);
-    command.arg("--state-dir").arg(&vm_config.state_dir);
-    if !vm_config.default_image.trim().is_empty() {
-        command.arg("--default-image").arg(&vm_config.default_image);
-    }
-    if !vm_config.bootstrap_image.trim().is_empty() {
-        command
-            .arg("--bootstrap-image")
-            .arg(&vm_config.bootstrap_image);
-    }
-    command
-        .arg("--krun-log-level")
-        .arg(vm_config.krun_log_level.to_string());
-    command.arg("--vcpus").arg(vm_config.vcpus.to_string());
-    command.arg("--mem-mib").arg(vm_config.mem_mib.to_string());
-    command
-        .arg("--overlay-disk-mib")
-        .arg(vm_config.overlay_disk_mib.to_string());
-    append_vm_identity_args(&mut command, vm_config);
-    append_vm_rootfs_tar_args(&mut command, vm_config);
-    if let Some(tls) = guest_tls_paths {
-        command.arg("--guest-tls-ca").arg(tls.ca);
-    }
-    append_vm_proxy_and_spiffe_args(&mut command, vm_config);
-    append_vm_network_trust_args(&mut command, additional_ca_bundle);
-    if vm_config.enable_bind_mounts {
-        command.arg("--enable-bind-mounts");
-    }
-
-    let mut child = command.spawn().map_err(|e| {
-        Error::execution(format!(
-            "failed to launch vm compute driver '{}': {e}",
-            driver_bin.display()
-        ))
-    })?;
-    let channel = wait_for_compute_driver(&socket_path, &mut child).await?;
-    let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
-    Ok(AcquiredRemoteDriverEndpoint::managed(
-        "vm", channel, process,
-    ))
+    gateway_port: u16,
+    driver_config: toml::Table,
+) -> Result<()> {
+    let settings = VmLaunchSettings::from_table(&driver_config)?;
+    let state_dir = settings.state_dir();
+    let process = DriverProcess {
+        name: "vm",
+        binary_name: DRIVER_BIN_NAME,
+        driver_dir: settings.driver_dir.as_deref(),
+        driver_dir_key: Some(DRIVER_DIR_KEY),
+        state_dir: &state_dir,
+    };
+    launcher::preflight(&process, launcher::PREFLIGHT_TIMEOUT, |socket_path| {
+        vm_startup_document(
+            VmLaunch {
+                gateway_log_level,
+                gateway_name,
+                gateway_port,
+                tls_ca: None,
+                otlp_config: None,
+                network_trust: None,
+                settings: &settings,
+                driver_config,
+            },
+            socket_path,
+        )
+    })
 }
 
-fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
-    let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
-    for (field, value) in [
-        ("sandbox_uid", config.sandbox_uid),
-        ("sandbox_gid", config.sandbox_gid),
-    ] {
-        if let Some(value) = value
-            && !range.contains(&value)
-        {
-            return Err(Error::config(format!(
-                "{field} {value} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID
-            )));
-        }
-    }
-    Ok(())
+/// The VM driver's `[driver_config]`: the operator's table, passed through,
+/// without the launcher-owned `driver_dir`.
+fn vm_driver_config_table(mut table: toml::Table) -> toml::Table {
+    table.remove("driver_dir");
+    table
 }
 
-#[cfg(unix)]
-fn append_vm_identity_args(command: &mut Command, config: &VmComputeConfig) {
-    if let Some(uid) = config.sandbox_uid {
-        command.arg("--sandbox-uid").arg(uid.to_string());
-    }
-    if let Some(gid) = config.sandbox_gid {
-        command.arg("--sandbox-gid").arg(gid.to_string());
-    }
-}
-
-#[cfg(unix)]
-fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
-    if let Some(path) = config.rootfs_tar_staging_dir.as_ref() {
-        command.arg("--rootfs-tar-staging-dir").arg(path);
-    }
-    if let Some(max_bytes) = config.rootfs_tar_max_bytes {
-        command
-            .arg("--rootfs-tar-max-bytes")
-            .arg(max_bytes.to_string());
-    }
-}
-
-#[cfg(unix)]
-fn append_vm_network_trust_args(
-    command: &mut Command,
-    bundle: Option<&NetworkSupervisorTrustBundle>,
-) {
-    if let Some(bundle) = bundle {
-        // Only stable, non-secret artifact metadata crosses the process
-        // boundary. The child reads and verifies the bounded artifact once,
-        // then retains its own immutable snapshot for sandbox launches.
-        command
-            .arg("--additional-ca-bundle")
-            .arg(bundle.artifact_path());
-        command.arg("--additional-ca-digest").arg(bundle.digest());
-        command
-            .arg("--additional-ca-certificate-count")
-            .arg(bundle.certificate_count().to_string());
-    }
-}
-
-#[cfg(unix)]
-fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConfig) {
-    let proxy = &config.upstream_proxy;
-    if let Some(url) = proxy.https_proxy.as_ref() {
-        command.arg("--upstream-proxy").arg(url);
-    }
-    if let Some(no_proxy) = proxy.no_proxy.as_ref() {
-        command.arg("--upstream-no-proxy").arg(no_proxy);
-    }
-    if let Some(auth_file) = proxy.proxy_auth_file.as_ref() {
-        command.arg("--upstream-proxy-auth-file").arg(auth_file);
-    }
-    if proxy.proxy_auth_allow_insecure == Some(true) {
-        command.arg("--upstream-proxy-auth-allow-insecure");
-    }
-    if proxy.proxy_connect_by_hostname == Some(true) {
-        command.arg("--upstream-proxy-connect-by-hostname");
-    }
-    if let Some(path) = config.proxy_ca_bundle.as_ref() {
-        command.arg("--upstream-proxy-ca-bundle").arg(path);
-    }
-    if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
-        command
-            .arg("--provider-spiffe-workload-api-tcp-endpoint")
-            .arg(endpoint);
-        command.arg("--provider-spiffe-allow-guest-tcp");
-    }
-}
-
-fn append_otlp_export_args(
-    command: &mut Command,
-    export: Option<&OtlpExport>,
-    endpoint_flag: &str,
-    protocol_flag: &str,
-) {
-    if let Some(export) = export {
-        command
-            .arg(format!("--{endpoint_flag}"))
-            .arg(&export.endpoint);
-        if export.protocol != OtlpProtocol::Grpc {
-            command
-                .arg(format!("--{protocol_flag}"))
-                .arg(export.protocol.as_str());
-        }
-    }
-}
-
-fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gateway_name: &str) {
-    let otlp = otlp_config
-        .map(OtlpConfig::supervisor_otlp)
-        .unwrap_or_default();
-    append_otlp_export_args(
-        command,
-        otlp.traces.as_ref(),
-        sandbox_env::OTLP_ENDPOINT_FLAG,
-        sandbox_env::OTLP_PROTOCOL_FLAG,
-    );
-    append_otlp_export_args(
-        command,
-        otlp.ocsf.as_ref(),
-        sandbox_env::OTLP_OCSF_ENDPOINT_FLAG,
-        sandbox_env::OTLP_OCSF_PROTOCOL_FLAG,
-    );
-    append_otlp_export_args(
-        command,
-        otlp.agent.as_ref(),
-        sandbox_env::OTLP_AGENT_ENDPOINT_FLAG,
-        sandbox_env::OTLP_AGENT_PROTOCOL_FLAG,
-    );
-    if let Some(traces) = otlp_config.and_then(|otlp| otlp.traces.as_ref()) {
-        let collector = &traces.collector;
-        for (flag, path) in [
-            (sandbox_env::OTLP_CA_FILE_FLAG, collector.ca_file()),
-            (sandbox_env::OTLP_CERT_FILE_FLAG, collector.cert_file()),
-            (sandbox_env::OTLP_KEY_FILE_FLAG, collector.key_file()),
-        ] {
-            if let Some(path) = path {
-                command.arg(format!("--{flag}")).arg(path);
-            }
-        }
-    }
-    // The driver's own trace exporter reads this like any OTLP SDK; keeping
-    // it out of the arguments keeps the headers out of process listings.
-    if let Some(headers) = openshell_server::gateway_trace_headers(otlp_config) {
-        command.env("OTEL_EXPORTER_OTLP_TRACES_HEADERS", headers.expose_secret());
-    }
-    // The driver names its own spans with the gateway name, and supervisors
-    // name their spans, OCSF records, and relayed traces with it.
-    if !otlp.is_empty() {
-        command.arg("--gateway-name").arg(gateway_name);
-    }
-}
-
-#[cfg(not(unix))]
-pub async fn spawn(
-    _gateway_log_level: &str,
-    _gateway_name: &str,
-    _vm_config: &VmComputeConfig,
-    _otlp_config: Option<&OtlpConfig>,
-    _additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
-) -> Result<AcquiredRemoteDriverEndpoint> {
-    Err(Error::config(
-        "the vm compute driver requires unix domain socket support",
-    ))
-}
-
-#[cfg(unix)]
-#[tracing::instrument(
-    name = "driver.wait_for_ready",
-    skip_all,
-    fields(
-        otel.name = "driver.wait_for_ready",
-        otel.status_code = tracing::field::Empty,
-        driver.name = "vm",
-    )
-)]
-async fn wait_for_compute_driver(
+fn vm_startup_document(
+    launch: VmLaunch<'_>,
     socket_path: &Path,
-    child: &mut tokio::process::Child,
-) -> Result<Channel> {
-    let mut last_error: Option<String> = None;
-    for _ in 0..100 {
-        let try_wait_result = child.try_wait().map_err(|e| {
-            Error::execution(format!("failed to poll vm compute driver process: {e}"))
-        })?;
-        if let Some(status) = try_wait_result {
-            return Err(Error::execution(format!(
-                "vm compute driver exited before becoming ready with status {status}"
-            )));
-        }
-
-        match connect_compute_driver(socket_path).await {
-            Ok(channel) => {
-                let mut client =
-                    ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor);
-                match client
-                    .get_capabilities(tonic::Request::new(GetCapabilitiesRequest {
-                        gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                            openshell_core::extension_protocol::ExtensionFamily::Compute,
-                        )),
-                    }))
-                    .await
-                {
-                    Ok(_) => return Ok(channel),
-                    Err(status) => last_error = Some(status.to_string()),
-                }
-            }
-            Err(err) => last_error = Some(err.to_string()),
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+) -> Result<openshell_driver_sdk::StartupDocument> {
+    crate::startup_document::GatewayStartup {
+        bind_socket: socket_path,
+        log_level: launch.gateway_log_level,
+        gateway_name: launch.gateway_name,
+        gateway_port: launch.gateway_port,
+        tls_ca: launch.tls_ca,
+        otlp: launch.otlp_config,
+        network_trust: launch.network_trust,
     }
-
-    Err(Error::execution(format!(
-        "timed out waiting for vm compute driver socket '{}': {}",
-        socket_path.display(),
-        last_error.unwrap_or_else(|| "unknown error".to_string())
-    )))
-}
-
-#[cfg(unix)]
-async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
-    let socket_path = socket_path.to_path_buf();
-    let display_path = socket_path.clone();
-    Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
-            let socket_path = socket_path.clone();
-            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
-        }))
-        .await
-        .map_err(|e| {
-            Error::execution(format!(
-                "failed to connect to vm compute driver socket '{}': {e}",
-                display_path.display()
-            ))
-        })
+    .into_document(vm_driver_config_table(launch.driver_config))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{
-        VmComputeConfig, append_otlp_args, append_vm_identity_args, append_vm_network_trust_args,
-        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        validate_vm_sandbox_identity,
-    };
+    use super::{VmLaunch, VmLaunchSettings, vm_driver_config_table, vm_startup_document};
+    use openshell_core::NetworkSupervisorTrustBundle;
     use openshell_core::sandbox_env::OtlpProtocol;
-    use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
     use openshell_server::config_file::{
         AgentOtlpConfig, OcsfOtlpConfig, OtlpCollectorConfig, OtlpConfig, OtlpTracesConfig,
     };
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener as StdUnixListener;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
-    #[test]
-    fn vm_uses_nvidia_ubuntu_default_image() {
-        assert_eq!(
-            VmComputeConfig::default().default_image,
-            openshell_core::image::DEFAULT_SANDBOX_BASE_IMAGE
-        );
+    const VM_STARTUP_FIXTURE: &str =
+        include_str!("../../openshell-driver-vm/tests/fixtures/startup-vm.toml");
+
+    fn fixture_driver_config() -> toml::Table {
+        openshell_driver_sdk::StartupDocument::parse(VM_STARTUP_FIXTURE)
+            .unwrap()
+            .driver_config
     }
 
+    /// The gateway passes the operator's table through unchanged, apart from
+    /// the launcher-owned `driver_dir`, and adds the gateway context the
+    /// driver's own tests read from the same fixture.
     #[test]
-    fn vm_gateway_requires_a_trusted_bootstrap_image_source() {
-        let config = VmComputeConfig {
-            grpc_endpoint: "http://127.0.0.1:50051".to_string(),
-            default_image: String::new(),
-            bootstrap_image: String::new(),
-            ..Default::default()
-        };
-        let error = config
-            .validate_configuration()
-            .expect_err("the gateway must reject an empty bootstrap configuration");
-        assert!(error.to_string().contains("sandbox images cannot be used"));
-
-        VmComputeConfig {
-            default_image: "openshell/sandbox:default".to_string(),
-            ..config.clone()
-        }
-        .validate_configuration()
-        .expect("the operator-controlled default image is a valid fallback");
-
-        VmComputeConfig {
-            bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
-            ..config
-        }
-        .validate_configuration()
-        .expect("an explicit bootstrap image is valid");
-    }
-
-    #[test]
-    fn vm_driver_receives_trace_headers_in_its_environment_only() {
-        crate::test_environment::Environment::new()
-            .remove("OTEL_EXPORTER_OTLP_HEADERS")
-            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
-            .run(|| {
-                let otlp: OtlpConfig = toml::from_str(
-                    "endpoint = 'http://collector.internal:4318'\n\
-                 headers = { authorization = 'Bearer secret-token' }\n",
-                )
-                .unwrap();
-                let mut command = tokio::process::Command::new("openshell-driver-vm");
-                append_otlp_args(&mut command, Some(&otlp), "production-us-west");
-
-                let env = command
-                    .as_std()
-                    .get_envs()
-                    .find(|(name, _)| *name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS")
-                    .and_then(|(_, value)| value)
-                    .map(|value| value.to_string_lossy().into_owned());
-                assert_eq!(env.as_deref(), Some("authorization=Bearer%20secret-token"));
-                assert!(
-                    command
-                        .as_std()
-                        .get_args()
-                        .all(|arg| !arg.to_string_lossy().contains("secret-token"))
-                );
-            });
-    }
-
-    #[test]
-    fn vm_driver_receives_the_trace_collectors_tls_file_paths() {
+    fn the_gateway_writes_the_documented_startup_document() {
         let dir = tempdir().unwrap();
         let certified = rcgen::generate_simple_self_signed(vec!["collector".into()]).unwrap();
         let [ca, cert, key] = ["ca.pem", "client.pem", "client-key.pem"].map(|name| {
@@ -937,667 +194,88 @@ mod tests {
             std::fs::write(&path, pem).unwrap();
             path
         });
-        let collector = OtlpCollectorConfig::new("https://collector:4317", OtlpProtocol::Grpc)
-            .with_tls_files(Some(ca.clone()), Some(cert.clone()), Some(key.clone()))
-            .unwrap();
-        assert!(collector.tls().client_identity().is_some());
         let otlp = OtlpConfig {
             metrics: None,
             service_name: None,
-            traces: Some(OtlpTracesConfig { collector }),
-            ocsf: None,
-            agent: None,
+            traces: Some(OtlpTracesConfig {
+                collector: OtlpCollectorConfig::new(
+                    "https://collector.example:4317",
+                    OtlpProtocol::Grpc,
+                )
+                .with_tls_files(Some(ca), Some(cert), Some(key))
+                .unwrap(),
+            }),
+            ocsf: Some(OcsfOtlpConfig {
+                collector: OtlpCollectorConfig::new(
+                    "https://collector.example:4318",
+                    OtlpProtocol::HttpProtobuf,
+                ),
+                schema_version: None,
+            }),
+            agent: Some(AgentOtlpConfig {
+                collector: OtlpCollectorConfig::new(
+                    "https://collector.example:4319",
+                    OtlpProtocol::Grpc,
+                ),
+            }),
         };
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_otlp_args(&mut command, Some(&otlp), "production-us-west");
-
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        for (flag, path) in [
-            ("--otlp-ca-file", ca),
-            ("--otlp-cert-file", cert),
-            ("--otlp-key-file", key),
-        ] {
-            let pair = [flag.to_string(), path.display().to_string()];
-            assert!(
-                args.windows(2).any(|window| window == pair),
-                "{pair:?} in {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn vm_driver_command_includes_gateway_otlp_configuration() {
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_otlp_args(
-            &mut command,
-            Some(&OtlpConfig {
-                metrics: None,
-                service_name: Some("custom-gateway".to_string()),
-                traces: Some(OtlpTracesConfig {
-                    collector: OtlpCollectorConfig::new(
-                        "http://collector.internal:4317",
-                        OtlpProtocol::Grpc,
-                    ),
-                }),
-                ocsf: None,
-                agent: None,
-            }),
-            "production-us-west",
-        );
-
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "--otlp-endpoint",
-                "http://collector.internal:4317",
-                "--gateway-name",
-                "production-us-west"
-            ]
-        );
-
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_otlp_args(
-            &mut command,
-            Some(&OtlpConfig {
-                metrics: None,
-                service_name: None,
-                traces: Some(OtlpTracesConfig {
-                    collector: OtlpCollectorConfig::new(
-                        "http://collector.internal:4318",
-                        OtlpProtocol::HttpProtobuf,
-                    ),
-                }),
-                ocsf: None,
-                agent: None,
-            }),
-            "production-us-west",
-        );
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args[..4],
-            [
-                "--otlp-endpoint",
-                "http://collector.internal:4318",
-                "--otlp-protocol",
-                "http/protobuf",
-            ]
-        );
-    }
-
-    #[test]
-    fn vm_driver_command_includes_gateway_ocsf_export() {
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_otlp_args(
-            &mut command,
-            Some(&OtlpConfig {
-                metrics: None,
-                service_name: None,
-                traces: None,
-                ocsf: Some(OcsfOtlpConfig {
-                    collector: OtlpCollectorConfig::new(
-                        "http://siem.internal:4318",
-                        OtlpProtocol::HttpProtobuf,
-                    ),
-                    schema_version: Some("2.0".into()),
-                }),
-                agent: None,
-            }),
-            "production-us-west",
-        );
-
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "--otlp-ocsf-endpoint",
-                "http://siem.internal:4318",
-                "--otlp-ocsf-protocol",
-                "http/protobuf",
-                "--gateway-name",
-                "production-us-west"
-            ]
-        );
-    }
-
-    #[test]
-    fn vm_driver_command_includes_the_agent_trace_relay() {
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_otlp_args(
-            &mut command,
-            Some(&OtlpConfig {
-                metrics: None,
-                service_name: None,
-                traces: None,
-                ocsf: None,
-                agent: Some(AgentOtlpConfig {
-                    collector: OtlpCollectorConfig::new(
-                        "http://agents.internal:4318",
-                        OtlpProtocol::HttpProtobuf,
-                    ),
-                }),
-            }),
-            "production-us-west",
-        );
-
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "--otlp-agent-endpoint",
-                "http://agents.internal:4318",
-                "--otlp-agent-protocol",
-                "http/protobuf",
-                "--gateway-name",
-                "production-us-west"
-            ]
-        );
-    }
-
-    #[test]
-    fn vm_driver_command_forwards_corporate_proxy_settings() {
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_vm_proxy_and_spiffe_args(
-            &mut command,
-            &VmComputeConfig {
-                upstream_proxy: UpstreamProxyConfig {
-                    https_proxy: Some("http://proxy.corp.com:8080".to_string()),
-                    no_proxy: Some("10.0.0.0/8".to_string()),
-                    proxy_auth_file: Some(PathBuf::from("/etc/openshell/secrets/proxy-auth")),
-                    proxy_auth_allow_insecure: Some(true),
-                    proxy_connect_by_hostname: Some(true),
-                },
-                proxy_ca_bundle: Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem")),
-                provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
-                provider_spiffe_allow_guest_tcp: true,
-                ..VmComputeConfig::default()
-            },
-        );
-
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "--upstream-proxy",
-                "http://proxy.corp.com:8080",
-                "--upstream-no-proxy",
-                "10.0.0.0/8",
-                "--upstream-proxy-auth-file",
-                "/etc/openshell/secrets/proxy-auth",
-                "--upstream-proxy-auth-allow-insecure",
-                "--upstream-proxy-connect-by-hostname",
-                "--upstream-proxy-ca-bundle",
-                "/etc/openshell/tls/proxy-ca.pem",
-                "--provider-spiffe-workload-api-tcp-endpoint",
-                "tcp:192.0.2.10:8081",
-                "--provider-spiffe-allow-guest-tcp",
-            ]
-        );
-    }
-
-    #[test]
-    fn vm_driver_command_omits_unset_corporate_proxy_settings() {
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_vm_proxy_and_spiffe_args(&mut command, &VmComputeConfig::default());
-        assert_eq!(command.as_std().get_args().count(), 0);
-    }
-
-    #[test]
-    fn vm_driver_command_forwards_only_network_trust_artifact_metadata() {
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        let pem =
-            b"-----BEGIN CERTIFICATE-----\nprivate-fixture-bytes\n-----END CERTIFICATE-----\n";
-        let bundle = NetworkSupervisorTrustBundle::new(
-            pem.to_vec(),
-            2,
+        let trust = NetworkSupervisorTrustBundle::new(
+            b"pem".to_vec(),
+            3,
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            PathBuf::from("/var/lib/openshell/network/additional-ca.crt"),
+            PathBuf::from("/var/lib/openshell/trust/bundle.pem"),
         );
-        append_vm_network_trust_args(&mut command, Some(&bundle));
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "--additional-ca-bundle",
-                "/var/lib/openshell/network/additional-ca.crt",
-                "--additional-ca-digest",
-                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                "--additional-ca-certificate-count",
-                "2",
-            ]
-        );
-        assert!(!args.iter().any(|arg| arg == "OPENSHELL_TLS_CA"));
-        assert!(
-            !args.iter().any(|arg| arg.contains("private-fixture-bytes")),
-            "CA material must not cross the process boundary in argv: {args:?}"
-        );
+        let mut operator_table = fixture_driver_config();
+        operator_table.insert("driver_dir".into(), "/usr/libexec/openshell".into());
+        let settings = VmLaunchSettings::from_table(&operator_table).unwrap();
 
-        let mut unset = tokio::process::Command::new("openshell-driver-vm");
-        append_vm_network_trust_args(&mut unset, None);
-        assert_eq!(unset.as_std().get_args().count(), 0);
-    }
-
-    #[test]
-    fn invalid_corporate_proxy_config_is_rejected_before_the_driver_starts() {
-        let err = UpstreamProxyConfig {
-            https_proxy: Some("socks5://proxy.corp.com:1080".to_string()),
-            ..Default::default()
-        }
-        .validate()
-        .expect_err("only http:// and https:// proxies are supported");
-        assert!(err.contains("https_proxy"), "{err}");
-
-        VmComputeConfig {
-            proxy_ca_bundle: Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem")),
-            ..Default::default()
-        }
-        .validate_proxy_config()
-        .expect_err("a CA bundle without a proxy URL must fail closed");
-
-        VmComputeConfig {
-            upstream_proxy: UpstreamProxyConfig {
-                https_proxy: Some("http://proxy.corp.com:8080".to_string()),
-                ..Default::default()
+        let mut document = vm_startup_document(
+            VmLaunch {
+                gateway_log_level: "debug",
+                gateway_name: "gateway-a",
+                gateway_port: 8080,
+                tls_ca: Some(Path::new("/etc/openshell/tls/ca.pem")),
+                otlp_config: Some(&otlp),
+                network_trust: Some(&trust),
+                settings: &settings,
+                driver_config: operator_table,
             },
-            ..Default::default()
-        }
-        .validate_proxy_config()
-        .expect("a lone proxy URL is a complete configuration");
-    }
-
-    #[test]
-    fn vm_driver_command_includes_configured_sandbox_identity() {
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        let config = VmComputeConfig {
-            sandbox_uid: Some(2000),
-            sandbox_gid: Some(3000),
-            ..Default::default()
-        };
-
-        validate_vm_sandbox_identity(&config).expect("valid identity");
-        append_vm_identity_args(&mut command, &config);
-
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(args, ["--sandbox-uid", "2000", "--sandbox-gid", "3000"]);
-    }
-
-    #[test]
-    fn vm_gateway_toml_forwards_rootfs_tar_settings() {
-        let config: VmComputeConfig = toml::from_str(
-            r#"
-                grpc_endpoint = "http://127.0.0.1:50051"
-                rootfs_tar_staging_dir = "/var/lib/openshell/rootfs-tar-staging"
-                rootfs_tar_max_bytes = 1073741824
-            "#,
+            Path::new("/var/lib/openshell/vm/run/compute-driver.sock"),
         )
-        .expect("schema-v2 VM rootfs tar settings must deserialize");
-        config
-            .validate_configuration()
-            .expect("rootfs tar settings must pass static validation");
+        .unwrap();
 
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_vm_rootfs_tar_args(&mut command, &config);
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+        document.gateway.expected_peer_pid = 4242;
+        let tls = document.gateway.telemetry.collector.as_mut().unwrap();
+        tls.ca_file = Some("/etc/openshell/otlp/ca.pem".into());
+        tls.cert_file = Some("/etc/openshell/otlp/cert.pem".into());
+        tls.key_file = Some("/etc/openshell/otlp/key.pem".into());
 
+        let fixture = openshell_driver_sdk::StartupDocument::parse(VM_STARTUP_FIXTURE).unwrap();
+        assert_eq!(document, fixture);
+    }
+
+    #[test]
+    fn only_the_launcher_owned_key_is_removed_from_the_operator_table() {
+        let mut table = fixture_driver_config();
+        let before = table.clone();
+        table.insert("driver_dir".into(), "/opt/drivers".into());
+        assert_eq!(vm_driver_config_table(table), before);
+    }
+
+    #[test]
+    fn launch_settings_default_the_state_dir_and_read_the_driver_dir() {
+        let settings = VmLaunchSettings::from_table(&toml::Table::new()).unwrap();
+        assert_eq!(settings.state_dir(), VmLaunchSettings::default_state_dir());
+        assert!(settings.driver_dir.is_none());
+
+        let table: toml::Table =
+            toml::from_str("driver_dir = '/opt/drivers'\nstate_dir = '/var/lib/vm'\nvcpus = 4\n")
+                .unwrap();
+        let settings = VmLaunchSettings::from_table(&table).unwrap();
         assert_eq!(
-            args,
-            [
-                "--rootfs-tar-staging-dir",
-                "/var/lib/openshell/rootfs-tar-staging",
-                "--rootfs-tar-max-bytes",
-                "1073741824",
-            ]
+            settings.driver_dir.as_deref(),
+            Some(Path::new("/opt/drivers"))
         );
-    }
-
-    #[test]
-    fn vm_gateway_rejects_zero_rootfs_tar_limit() {
-        let config = VmComputeConfig {
-            grpc_endpoint: "http://127.0.0.1:50051".to_string(),
-            rootfs_tar_max_bytes: Some(0),
-            ..Default::default()
-        };
-
-        let error = config
-            .validate_configuration()
-            .expect_err("a zero rootfs tar limit must fail before driver startup");
-        assert!(error.to_string().contains("rootfs_tar_max_bytes"));
-    }
-
-    #[test]
-    fn vm_driver_command_forwards_proxy_and_spiffe_configuration_without_credentials() {
-        let config = VmComputeConfig {
-            upstream_proxy: UpstreamProxyConfig {
-                https_proxy: Some("https://proxy.internal:8443".to_string()),
-                no_proxy: Some("localhost,.svc".to_string()),
-                proxy_auth_file: Some(PathBuf::from("/gateway/secrets/proxy-auth")),
-                proxy_auth_allow_insecure: Some(true),
-                proxy_connect_by_hostname: Some(true),
-            },
-            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
-            provider_spiffe_allow_guest_tcp: true,
-            ..Default::default()
-        };
-        let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_vm_proxy_and_spiffe_args(&mut command, &config);
-
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "--upstream-proxy",
-                "https://proxy.internal:8443",
-                "--upstream-no-proxy",
-                "localhost,.svc",
-                "--upstream-proxy-auth-file",
-                "/gateway/secrets/proxy-auth",
-                "--upstream-proxy-auth-allow-insecure",
-                "--upstream-proxy-connect-by-hostname",
-                "--provider-spiffe-workload-api-tcp-endpoint",
-                "tcp:192.0.2.10:8081",
-                "--provider-spiffe-allow-guest-tcp",
-            ]
-        );
-        assert!(!args.iter().any(|arg| arg.contains("user:password")));
-    }
-
-    #[test]
-    fn vm_gateway_config_rejects_root_identity() {
-        let config = VmComputeConfig {
-            sandbox_uid: Some(0),
-            ..Default::default()
-        };
-        let error = validate_vm_sandbox_identity(&config).expect_err("root UID must fail");
-        assert!(error.to_string().contains("sandbox_uid 0"));
-    }
-
-    #[test]
-    fn resolve_driver_bin_uses_driver_dir_when_binary_present() {
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join("openshell-driver-vm");
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let vm_config = VmComputeConfig {
-            driver_dir: Some(dir.path().to_path_buf()),
-            ..Default::default()
-        };
-        assert_eq!(resolve_compute_driver_bin(&vm_config).unwrap(), bin);
-    }
-
-    #[test]
-    fn resolve_driver_bin_error_mentions_driver_dir_hint() {
-        let dir = tempdir().unwrap(); // empty — no driver binary present
-
-        let vm_config = VmComputeConfig {
-            driver_dir: Some(dir.path().to_path_buf()),
-            ..Default::default()
-        };
-        let err = resolve_compute_driver_bin(&vm_config)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("[openshell.drivers.vm].driver_dir"));
-        assert!(err.contains("openshell-driver-vm"));
-    }
-
-    #[test]
-    fn resolve_driver_search_dirs_include_libexec_fallbacks() {
-        let dirs = resolve_driver_search_dirs(&VmComputeConfig {
-            driver_dir: None,
-            ..Default::default()
-        });
-
-        assert!(dirs.contains(&PathBuf::from("/usr/libexec/openshell")));
-        assert!(dirs.contains(&PathBuf::from("/usr/local/libexec/openshell")));
-        assert!(dirs.contains(&PathBuf::from("/usr/local/libexec")));
-    }
-
-    #[test]
-    fn vm_compute_driver_tls_requires_explicit_guest_bundle() {
-        let vm_config = VmComputeConfig {
-            grpc_endpoint: "https://gateway.internal:8443".to_string(),
-            ..Default::default()
-        };
-
-        let err = compute_driver_guest_tls_paths(&vm_config)
-            .expect_err("https vm endpoints should require an explicit gateway CA");
-        assert!(err.to_string().contains("guest_tls_ca"));
-    }
-
-    #[test]
-    fn vm_compute_driver_tls_uses_only_gateway_ca() {
-        let dir = tempdir().unwrap();
-        let guest_ca = dir.path().join("guest-ca.crt");
-        std::fs::write(&guest_ca, guest_ca.display().to_string()).unwrap();
-
-        let vm_config = VmComputeConfig {
-            grpc_endpoint: "https://gateway.internal:8443".to_string(),
-            guest_tls_ca: Some(guest_ca.clone()),
-            ..Default::default()
-        };
-
-        let guest_paths = compute_driver_guest_tls_paths(&vm_config)
-            .unwrap()
-            .expect("https vm endpoints should pass an explicit gateway CA");
-        assert_eq!(guest_paths.ca, guest_ca);
-    }
-
-    #[test]
-    fn compute_driver_socket_path_uses_private_run_dir() {
-        let state_dir = PathBuf::from("/tmp/openshell-vm-state");
-        let vm_config = VmComputeConfig {
-            state_dir: state_dir.clone(),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            compute_driver_socket_path(&vm_config),
-            state_dir.join("run").join("compute-driver.sock")
-        );
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_creates_private_run_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        let mode = std::fs::metadata(vm_config.state_dir.join("run"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_restricts_existing_run_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let run_dir = vm_config.state_dir.join("run");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        let mode = std::fs::metadata(run_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_restricts_existing_state_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
-        std::fs::set_permissions(&vm_config.state_dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        let mode = std::fs::metadata(vm_config.state_dir)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_state_dir() {
-        let dir = tempdir().unwrap();
-        let target = dir.path().join("target");
-        let state_link = dir.path().join("state-link");
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &state_link).unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: state_link,
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("symlinked state dir should be rejected")
-            .to_string();
-        assert!(err.contains("is a symlink"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_run_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let target = dir.path().join("run-target");
-        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&target, vm_config.state_dir.join("run")).unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("symlinked run dir should be rejected")
-            .to_string();
-        assert!(err.contains("is a symlink"));
-    }
-
-    #[test]
-    fn prepare_vm_state_dir_rejects_wrong_owner() {
-        let dir = tempdir().unwrap();
-        let state_dir = dir.path().join("state");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let wrong_uid = if current_euid() == u32::MAX {
-            u32::MAX - 1
-        } else {
-            current_euid() + 1
-        };
-
-        let err = prepare_vm_state_dir(&state_dir, wrong_uid)
-            .expect_err("wrong owner should be rejected")
-            .to_string();
-        assert!(err.contains("is owned by uid"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_socket() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink("/tmp/not-a-socket", &socket_path).unwrap();
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("symlinked socket should be rejected")
-            .to_string();
-        assert!(err.contains("is a symlink"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_non_socket_stale_path() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        std::fs::write(&socket_path, "not a socket").unwrap();
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("regular file should be rejected")
-            .to_string();
-        assert!(err.contains("is not a Unix socket"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_removes_same_owner_stale_socket() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        let listener = StdUnixListener::bind(&socket_path).unwrap();
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        drop(listener);
-        assert!(!socket_path.exists());
+        assert_eq!(settings.state_dir(), PathBuf::from("/var/lib/vm"));
     }
 }

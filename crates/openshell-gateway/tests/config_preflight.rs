@@ -114,6 +114,7 @@ fn normalized_diagnostic(output: &Output) -> String {
 }
 
 #[tokio::test]
+
 async fn local_vm_reports_tools_without_starting_driver_or_creating_state() {
     let fixture = Fixture::new();
     let output = fixture.run(&[]).await;
@@ -135,6 +136,7 @@ async fn local_vm_reports_tools_without_starting_driver_or_creating_state() {
 }
 
 #[tokio::test]
+
 async fn config_file_retains_selected_tool_error_and_corrective_guidance() {
     let fixture = Fixture::new();
     fixture.tool("debugfs", "echo 'fixture loader failure' >&2\nexit 42");
@@ -157,6 +159,7 @@ async fn config_file_retains_selected_tool_error_and_corrective_guidance() {
 }
 
 #[tokio::test]
+
 async fn local_vm_rejects_nonexecutable_and_unsupported_tools() {
     let fixture = Fixture::new();
     fs::set_permissions(
@@ -177,6 +180,7 @@ async fn local_vm_rejects_nonexecutable_and_unsupported_tools() {
 }
 
 #[tokio::test]
+
 async fn local_vm_rejects_hanging_tool_with_deadline() {
     let fixture = Fixture::new();
     fixture.tool("mke2fs", "exec /bin/sleep 30");
@@ -192,6 +196,7 @@ async fn local_vm_rejects_hanging_tool_with_deadline() {
 }
 
 #[tokio::test]
+
 async fn signals_stop_probe_wrapper_and_descendants_before_cli_exit() {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;

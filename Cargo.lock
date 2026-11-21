@@ -4756,6 +4756,7 @@ dependencies = [
  "nix 0.29.0",
  "openshell-core",
  "openshell-crypto",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4774,6 +4775,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower-http 0.6.8",
  "tracing",
@@ -4781,6 +4783,21 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "openshell-driver-sdk"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "libc",
+ "openshell-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "toml",
 ]
 
 [[package]]
@@ -4827,6 +4844,7 @@ dependencies = [
  "openshell-core",
  "openshell-crypto",
  "openshell-driver-podman",
+ "openshell-driver-sdk",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4848,6 +4866,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower-http 0.6.8",
  "tracing",
@@ -4888,7 +4907,7 @@ dependencies = [
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-mxc",
- "openshell-driver-podman",
+ "openshell-driver-sdk",
  "openshell-otel",
  "openshell-policy",
  "openshell-server",

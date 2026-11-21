@@ -15,18 +15,20 @@ name = "openshell-gateway"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3"
 serde_json = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
+openshell-driver-sdk = { path = "../openshell-driver-sdk" }
 openshell-server = { path = "../openshell-server", default-features = false }
 openshell-otel = { path = "../openshell-otel", optional = true }
 async-trait = "0.1"
 miette = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
-openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 openshell-policy = { path = "../openshell-policy", optional = true }
 hyper-util = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
@@ -51,7 +53,7 @@ in-tree-compute-drivers = [
 compute-driver-mxc = ["dep:openshell-driver-mxc"]
 compute-driver-docker = ["dep:openshell-driver-docker", "dep:openshell-otel"]
 compute-driver-kubernetes = ["dep:openshell-driver-kubernetes", "dep:openshell-otel"]
-compute-driver-podman = ["dep:openshell-driver-podman", "dep:openshell-otel"]
+compute-driver-podman = ["dep:openshell-otel"]
 compute-driver-vm = [
     "dep:openshell-policy",
     "dep:openshell-otel",
@@ -81,5 +83,3 @@ workspace = true
 [dev-dependencies]
 openshell-crypto = { workspace = true, default-features = false, features = ["aws-lc"] }
 rcgen = { workspace = true }
-tempfile = "3"
-toml = { workspace = true }

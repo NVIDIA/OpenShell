@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
+use openshell_driver_sdk::StartupDocument;
+use openshell_driver_vm::startup_config::VmComputeConfig;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -26,6 +29,11 @@ use tracing::info;
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Gateway startup document (TOML). It supplies the settings the gateway
+    /// otherwise passes as flags, and flags it covers cannot be combined with it.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
     #[arg(
         long,
@@ -275,9 +283,35 @@ struct Args {
     vm_mount: Vec<String>,
 }
 
+/// `preflight --config <path>` validates the startup document's configuration
+/// and reports on stdout. It starts nothing and creates no state.
+fn run_preflight(arguments: &[std::ffi::OsString]) -> ! {
+    use openshell_driver_sdk::preflight::PreflightResult;
+
+    let result = match arguments {
+        [flag, path] if flag == "--config" => {
+            match parse_args_from([
+                std::ffi::OsString::from("openshell-driver-vm"),
+                flag.clone(),
+                path.clone(),
+            ]) {
+                Ok(_) => PreflightResult::ok(),
+                Err(error) => PreflightResult::rejected(error.message()),
+            }
+        }
+        _ => PreflightResult::rejected("usage: preflight --config <path>"),
+    };
+    println!("{}", result.to_json());
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "preflight") {
+        run_preflight(&arguments[1..]);
+    }
+    let args = parse_args().map_err(|err| miette::miette!("{err}"))?;
     if let Some(request) = args.internal_prepare_image {
         openshell_driver_vm::driver::run_image_preparation_worker(&request)
             .await
@@ -407,6 +441,191 @@ async fn main() -> Result<()> {
     };
     socket_cleanup.remove_socket_root();
     result
+}
+
+/// Flags the startup document supplies. Giving one on the command line
+/// together with `--config` is an error, so precedence is never ambiguous.
+const FLAGS_COVERED_BY_CONFIG: &[&str] = &[
+    "admission_config_json",
+    "bind_socket",
+    "expected_peer_pid",
+    "log_level",
+    "gateway_name",
+    "grpc_endpoint",
+    "guest_tls_ca",
+    "upstream_proxy",
+    "upstream_no_proxy",
+    "upstream_proxy_auth_file",
+    "upstream_proxy_auth_allow_insecure",
+    "upstream_proxy_connect_by_hostname",
+    "upstream_proxy_ca_bundle",
+    "additional_ca_bundle",
+    "additional_ca_digest",
+    "additional_ca_certificate_count",
+    "endpoint",
+    "protocol",
+    "ca_file",
+    "cert_file",
+    "key_file",
+    "ocsf_endpoint",
+    "ocsf_protocol",
+    "agent_endpoint",
+    "agent_protocol",
+    "state_dir",
+    "default_image",
+    "bootstrap_image",
+    "krun_log_level",
+    "vcpus",
+    "mem_mib",
+    "overlay_disk_mib",
+    "sandbox_uid",
+    "sandbox_gid",
+    "rootfs_tar_staging_dir",
+    "rootfs_tar_max_bytes",
+    "enable_bind_mounts",
+    "provider_spiffe_workload_api_tcp_endpoint",
+    "provider_spiffe_allow_guest_tcp",
+];
+
+#[derive(Debug)]
+enum ArgsError {
+    /// A command-line error, including `--help` and `--version`, which clap
+    /// prints and exits for.
+    Clap(clap::Error),
+    /// A problem with the startup document or its combination with flags.
+    Config(String),
+}
+
+impl ArgsError {
+    fn message(&self) -> String {
+        match self {
+            Self::Clap(error) => error.to_string(),
+            Self::Config(message) => message.clone(),
+        }
+    }
+}
+
+fn parse_args() -> std::result::Result<Args, String> {
+    parse_args_from(std::env::args_os()).map_err(|error| match error {
+        ArgsError::Clap(error) => error.exit(),
+        ArgsError::Config(message) => message,
+    })
+}
+
+fn parse_args_from<I, T>(arguments: I) -> std::result::Result<Args, ArgsError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let command = Args::command();
+    let matches = command
+        .clone()
+        .try_get_matches_from(arguments)
+        .map_err(ArgsError::Clap)?;
+    let mut args = Args::from_arg_matches(&matches).map_err(ArgsError::Clap)?;
+    if let Some(path) = args.config.clone() {
+        if let Some(flag) = flag_covered_by_config(&command, &matches) {
+            return Err(ArgsError::Config(format!(
+                "--{flag} cannot be combined with --config; the startup document supplies it"
+            )));
+        }
+        let document = StartupDocument::read(&path).map_err(ArgsError::Config)?;
+        apply_startup_document(&mut args, &document).map_err(ArgsError::Config)?;
+    }
+    Ok(args)
+}
+
+/// The first flag given on the command line that the startup document covers.
+fn flag_covered_by_config(command: &clap::Command, matches: &ArgMatches) -> Option<String> {
+    command
+        .get_arguments()
+        .filter(|arg| FLAGS_COVERED_BY_CONFIG.contains(&arg.get_id().as_str()))
+        .find(|arg| matches.value_source(arg.get_id().as_str()) == Some(ValueSource::CommandLine))
+        .map(|arg| {
+            arg.get_long()
+                .map_or_else(|| arg.get_id().to_string(), str::to_string)
+        })
+}
+
+/// Overlay the startup document onto the parsed flags. The document is
+/// authoritative for everything it carries; a driver setting it leaves out
+/// keeps its flag, environment, or default value.
+fn apply_startup_document(
+    args: &mut Args,
+    document: &StartupDocument,
+) -> std::result::Result<(), String> {
+    let gateway = &document.gateway;
+    args.bind_socket = Some(gateway.bind_socket.clone());
+    args.expected_peer_pid = Some(gateway.expected_peer_pid);
+    args.log_level.clone_from(&gateway.log_level);
+    args.gateway_name = Some(gateway.gateway_name.clone());
+    args.guest_tls_ca.clone_from(&gateway.tls_ca);
+
+    gateway.telemetry.apply_to(&mut args.otlp);
+
+    if let Some(trust) = &gateway.network_trust {
+        args.additional_ca_bundle = Some(trust.path.clone());
+        args.additional_ca_digest = Some(trust.digest.clone());
+        args.additional_ca_certificate_count = Some(
+            usize::try_from(trust.certificate_count)
+                .map_err(|_| "network trust certificate count is too large".to_string())?,
+        );
+    }
+
+    let mut config = VmComputeConfig::from_document(document)?;
+    if config.state_dir.as_os_str().is_empty() {
+        config.state_dir = VmComputeConfig::default_state_dir();
+    }
+    // The gateway's own listener is the default endpoint for sandboxes. It has
+    // a gateway CA exactly when it serves TLS.
+    if config.grpc_endpoint.trim().is_empty() {
+        let scheme = if gateway.tls_ca.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", gateway.gateway_port);
+    }
+    config
+        .validate_configuration()
+        .map_err(|error| error.to_string())?;
+    // The CA authenticates the gateway for an https endpoint only.
+    if !config.grpc_endpoint.starts_with("https://") {
+        args.guest_tls_ca = None;
+    }
+
+    args.admission_config_json = openshell_core::resource_admission::DriverAdmissionConfig {
+        allow_driver_config: config.allow_driver_config,
+        resource_admission: config.resource_admission.clone(),
+    };
+    args.grpc_endpoint = Some(config.grpc_endpoint);
+    let proxy = config.upstream_proxy;
+    args.upstream_proxy = proxy.https_proxy;
+    args.upstream_no_proxy = proxy.no_proxy;
+    args.upstream_proxy_auth_file = proxy.proxy_auth_file;
+    args.upstream_proxy_auth_allow_insecure = proxy.proxy_auth_allow_insecure == Some(true);
+    args.upstream_proxy_connect_by_hostname = proxy.proxy_connect_by_hostname == Some(true);
+    args.upstream_proxy_ca_bundle = config.proxy_ca_bundle;
+    args.state_dir = config.state_dir;
+    if !config.default_image.trim().is_empty() {
+        args.default_image = config.default_image;
+    }
+    if !config.bootstrap_image.trim().is_empty() {
+        args.bootstrap_image = config.bootstrap_image;
+    }
+    args.krun_log_level = config.krun_log_level;
+    args.vcpus = config.vcpus;
+    args.mem_mib = config.mem_mib;
+    args.overlay_disk_mib = config.overlay_disk_mib;
+    args.sandbox_uid = config.sandbox_uid;
+    args.sandbox_gid = config.sandbox_gid;
+    args.rootfs_tar_staging_dir = config.rootfs_tar_staging_dir;
+    args.rootfs_tar_max_bytes = config.rootfs_tar_max_bytes;
+    args.enable_bind_mounts = config.enable_bind_mounts;
+    args.provider_spiffe_workload_api_tcp_endpoint =
+        config.provider_spiffe_workload_api_tcp_endpoint;
+    args.provider_spiffe_allow_guest_tcp = config.provider_spiffe_allow_guest_tcp;
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -784,11 +1003,107 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode, parse_vm_mount_arg,
+        Args, ComputeDriverListenMode, PeerCredentials, StartupDocument, apply_startup_document,
+        authorize_peer_credentials, compute_driver_listen_mode, parse_args_from,
+        parse_vm_mount_arg,
     };
     use clap::Parser;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    const VM_STARTUP_FIXTURE: &str = include_str!("../tests/fixtures/startup-vm.toml");
+
+    #[test]
+    fn startup_document_supplies_the_settings_the_gateway_used_to_pass_as_flags() {
+        let document = StartupDocument::parse(VM_STARTUP_FIXTURE).unwrap();
+        let mut args = Args::parse_from(["openshell-driver-vm"]);
+        apply_startup_document(&mut args, &document).unwrap();
+
+        assert_eq!(
+            args.bind_socket.as_deref(),
+            Some(Path::new("/var/lib/openshell/vm/run/compute-driver.sock"))
+        );
+        assert_eq!(args.expected_peer_pid, Some(4242));
+        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.gateway_name.as_deref(), Some("gateway-a"));
+        assert_eq!(
+            args.grpc_endpoint.as_deref(),
+            Some("https://127.0.0.1:8080")
+        );
+        assert_eq!(
+            args.guest_tls_ca.as_deref(),
+            Some(Path::new("/etc/openshell/tls/ca.pem"))
+        );
+        assert!(args.admission_config_json.allow_driver_config);
+        assert_eq!(
+            args.otlp.endpoint.as_deref(),
+            Some("https://collector.example:4317")
+        );
+        assert_eq!(
+            args.otlp.ocsf_protocol,
+            openshell_core::sandbox_env::OtlpProtocol::HttpProtobuf
+        );
+        assert_eq!(
+            args.otlp.agent_endpoint.as_deref(),
+            Some("https://collector.example:4319")
+        );
+        assert_eq!(
+            args.otlp.key_file.as_deref(),
+            Some(Path::new("/etc/openshell/otlp/key.pem"))
+        );
+        assert_eq!(
+            args.upstream_proxy.as_deref(),
+            Some("http://proxy.example:3128")
+        );
+        assert!(args.upstream_proxy_auth_allow_insecure);
+        assert!(args.upstream_proxy_connect_by_hostname);
+        assert_eq!(
+            args.upstream_proxy_ca_bundle.as_deref(),
+            Some(Path::new("/etc/openshell/proxy-ca.pem"))
+        );
+        assert_eq!(args.additional_ca_certificate_count, Some(3));
+        assert_eq!(args.state_dir, Path::new("/var/lib/openshell/vm"));
+        assert_eq!(args.vcpus, 4);
+        assert_eq!(args.mem_mib, 4096);
+        assert_eq!(args.overlay_disk_mib, 8192);
+        assert_eq!(args.sandbox_uid, Some(2000));
+        assert_eq!(args.rootfs_tar_max_bytes, Some(1_073_741_824));
+        assert!(args.enable_bind_mounts);
+        assert!(args.provider_spiffe_allow_guest_tcp);
+    }
+
+    #[test]
+    fn config_cannot_be_combined_with_a_flag_it_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.toml");
+        std::fs::write(&path, VM_STARTUP_FIXTURE).unwrap();
+        let path = path.to_str().unwrap();
+
+        let error = parse_args_from(["openshell-driver-vm", "--config", path, "--vcpus", "8"])
+            .unwrap_err()
+            .message();
+        assert!(
+            error.contains("--vcpus") && error.contains("--config"),
+            "{error}"
+        );
+
+        let args = parse_args_from(["openshell-driver-vm", "--config", path]).unwrap();
+        assert_eq!(args.vcpus, 4);
+    }
+
+    #[test]
+    fn config_with_another_schema_version_is_refused_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.toml");
+        std::fs::write(
+            &path,
+            VM_STARTUP_FIXTURE.replace("schema_version = 1", "schema_version = 9"),
+        )
+        .unwrap();
+        let error = parse_args_from(["openshell-driver-vm", "--config", path.to_str().unwrap()])
+            .unwrap_err()
+            .message();
+        assert!(error.contains('9') && error.contains('1'), "{error}");
+    }
 
     #[test]
     fn corporate_proxy_flags_parse_into_driver_settings() {
