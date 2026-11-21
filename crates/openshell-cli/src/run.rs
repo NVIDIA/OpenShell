@@ -4172,6 +4172,33 @@ pub async fn sandbox_start(
     Ok(())
 }
 
+/// Start a sandbox that the gateway stopped because its program sat idle, so
+/// a connect can proceed. Any other phase is left for the connect to report.
+pub async fn start_if_idle_stopped(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox;
+    if !sandbox.is_some_and(|sandbox| sandbox.idle_stopped()) {
+        return Ok(());
+    }
+    eprintln!("Sandbox {name} was stopped while idle; starting it");
+    sandbox_start(server, name, workspace, tls).await
+}
+
 /// Suspend a ready sandbox, retaining its memory state, and wait until it is suspended.
 pub async fn sandbox_suspend(
     server: &str,

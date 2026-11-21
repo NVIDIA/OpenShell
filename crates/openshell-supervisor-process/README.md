@@ -3,6 +3,36 @@
 This crate manages workload processes and SSH sessions through the admitted
 isolation backend.
 
+## Program status
+
+`program_status` scans PTY output of the canonical process and of SSH PTY
+sessions for OSC 7501 program status reports. It keeps the protocol's
+per-terminal records: ids, `clear`, dropping `working` and `blocked` at an OSC
+133 `A` prompt, clearing every record on a full reset (RIS), and the record and
+sequence limits. Reports, prompts, and resets apply in output order regardless
+of how reads split them. A terminal's records end with its process. Report bytes are forwarded
+unchanged; `msg` and `title` are validated and then discarded.
+
+The supervisor answers the support query (`OSC 7501 ; ?`) itself by writing the
+reply to the program's input, and removes the query from forwarded output.
+Claude Code reports only when that reply arrives before the reply to the DA1
+query it sends next. Only the bytes of a possible query are held back, and a
+20 ms pause releases them.
+
+A sandbox-wide summary takes the most active state across terminals
+(working, then blocked, error, done, idle) and the latest client input, which
+outlives the terminal that received it. Each gateway session receives the
+summary at start, on every change, and within 15 seconds of new input, including
+the last keystroke before typing stops. It also answers each
+`WorkloadActivityRequest` with the current summary, which the gateway requires
+before an idle stop. Every transition, including one undone within the same
+read, restarts the state timer and advances a revision. Summaries are published
+under the activity lock, so concurrent terminals never republish an older one.
+Pushes and request replies take one ordering lock from snapshot to enqueue and
+carry increasing sequence numbers, so the gateway can drop an older summary that
+arrives late. Ages are relative, so supervisor and gateway clocks need
+not agree.
+
 ## Bounded streaming uploads
 
 The CLI's built-in uploads use the `openshell-upload-v1` SSH subsystem. Russh

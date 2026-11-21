@@ -167,6 +167,53 @@ A provisioning timeout can be repaired by Stop after its original driver work
 settles and cleanup completes. Stop exposes Stopped without discarding the timeout
 diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
 
+## Idle stop
+
+The replica that holds a sandbox's supervisor session keeps that session's
+latest `SupervisorWorkloadActivity` report in memory, in gateway time, and only
+that report authorizes an idle stop. After a gateway restart or a session
+change, nothing stops until the current session reports. The report also
+becomes the `ProgramStatus` condition for display. The condition is written,
+with conflict retries, only when its state changes or input moves its time
+forward by a minute. It is fenced to the running main-process instance,
+survives driver snapshots, and is removed on every phase change.
+
+Every replica sweeps its own sessions every 30 seconds. A sandbox becomes a
+candidate when it is Ready, its program is idle, done, blocked, or in error, and
+`idle_stop_after_seconds` (gateway scope, then sandbox scope) plus a 15-second
+input report lag has elapsed. The lag runs from the later of the report's time
+and the main-process start.
+
+Before taking any lifecycle lock, the stop task does three things:
+
+1. Requires a fresh shared owner record naming the session.
+2. Sends a `WorkloadActivityRequest`.
+3. Waits up to 5 seconds for a fresh report.
+
+Supervisors that do not advertise `supports_workload_activity_requests` are
+never idle-stopped. Under the lifecycle lock, each `Stopping` write attempt then
+runs a final check. It requires:
+
+- a confirmation at most 2 seconds old;
+- the re-read setting;
+- a still-due live report from the confirming session;
+- a fresh owner record that still names that session.
+
+The final check holds that sandbox's activity gate through the write. Every live
+report update takes the same gate, so a report received first always counts. A
+conflicting write releases the gate and checks again.
+
+Live reports carry the supervisor's summary sequence, and an older summary from
+the same session is dropped. The display condition is persisted on a
+background task, so the session never waits on the sandbox lock to read its
+next message.
+
+The stop records the `internal.openshell.ai/idle-stop` annotation with
+`IdleStopping`. That marker survives gateway recovery and settles the stop as
+`IdleStopped`. Any other lifecycle write removes it. An explicit stop, whether
+the idle stop is settled or still in flight on another replica, rewrites it as
+an ordinary stop.
+
 ## Static credential delivery
 
 Existing polling and configuration-push environments keep their original wire

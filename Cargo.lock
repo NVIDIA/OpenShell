@@ -5510,6 +5510,7 @@ dependencies = [
  "openshell-ocsf",
  "openshell-ocsf-validate",
  "openshell-sandbox-backend",
+ "prost-types",
  "rand 0.10.2",
  "russh",
  "rustix 1.1.6",

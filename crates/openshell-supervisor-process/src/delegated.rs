@@ -134,6 +134,7 @@ pub async fn start_boundary_access(
                     config_apply_tx,
                     config_push_updates,
                     gateway_home,
+                    workload_activity: Some(main_session.program_activity().clone()),
                 },
             );
             (Some(task), Some(accepted))

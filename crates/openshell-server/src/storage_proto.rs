@@ -227,8 +227,13 @@ mod tests {
     // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
     // public-only messages alongside main's public APIs; durable schemas
     // and the public/durable overlap remain unchanged.
+    // Workload program status adds SupervisorWorkloadActivity, its two enums,
+    // and WorkloadActivityRequest to supervisor control traffic, which is
+    // never stored. The stored
+    // ProgramStatus condition reuses SandboxCondition, so durable schemas
+    // remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ba37ee30d2e8618b947517c67fa6d336a87097978a55cfa82034366ee36a740e";
+        "b05c436c6d9133d948bfe8120a2ba1434f1e8603e28bc69eaba3d3fbedff2702";
     const DURABLE_SCHEMA_SHA256: &str =
         "9a025fc84af7c71bce42a52a282d1a96a02f8d71319478bcdb0e0c6367305888";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -776,7 +781,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (367, 31),
+                (369, 33),
                 (102, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

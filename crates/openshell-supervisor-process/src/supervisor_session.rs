@@ -136,6 +136,8 @@ pub struct SessionRuntimeContext {
     /// Peer endpoint of the gateway replica serving this supervisor's shared
     /// host. When set, sessions dial it instead of the configured address.
     pub gateway_home: Option<watch::Receiver<Option<String>>>,
+    /// Program status from workload terminals, reported to every session.
+    pub workload_activity: Option<Arc<crate::program_status::ProgramActivity>>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -432,6 +434,7 @@ pub fn spawn_with_readiness(
         config_apply_tx: runtime.config_apply_tx,
         config_push_updates: runtime.config_push_updates,
         gateway_home: runtime.gateway_home,
+        workload_activity: runtime.workload_activity,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -453,6 +456,7 @@ struct SessionConfig {
     /// reconnect to a gateway that does not push resumes polling.
     config_push_updates: watch::Sender<bool>,
     gateway_home: Option<watch::Receiver<Option<String>>>,
+    workload_activity: Option<Arc<crate::program_status::ProgramActivity>>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -714,6 +718,7 @@ async fn run_single_session(
             supports_session_redirect: true,
             supports_config_push: true,
             supports_service_advertisements: config.app_installations.is_some(),
+            supports_workload_activity_requests: config.workload_activity.is_some(),
         })),
     })
     .await
@@ -793,6 +798,12 @@ async fn run_single_session(
         spawn_config_apply(apply_tx.clone(), bootstrap, tx.clone(), &config.sandbox_id);
     }
 
+    // Each session starts with a full report; the task ends with the session.
+    let _activity_reporter = config
+        .workload_activity
+        .as_ref()
+        .map(|activity| crate::program_status::spawn_activity_reporter(activity, tx.clone()));
+
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
@@ -822,6 +833,16 @@ async fn run_single_session(
                         peer_endpoint: r.peer_endpoint.clone(),
                         owner_replica_id: r.owner_replica_id.clone(),
                     });
+                }
+                if let Some(gateway_message::Payload::WorkloadActivityRequest(request)) = &msg.payload {
+                    // Answer before an idle stop so it sees current input and work.
+                    if let Some(activity) = &config.workload_activity {
+                        activity
+                            .send_report(&tx, &request.request_id)
+                            .await
+                            .map_err(|()| "outbound channel closed")?;
+                    }
+                    continue;
                 }
                 if let Some(gateway_message::Payload::ServiceRouteLease(lease)) = &msg.payload {
                     if let Some(source) = &config.app_installations {

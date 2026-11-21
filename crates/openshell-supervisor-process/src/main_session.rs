@@ -18,6 +18,8 @@ use tokio::sync::watch;
 
 use openshell_isolation_interface::contract::BoundarySignal;
 
+use crate::program_status::{InputMarker, ProgramActivity, TerminalTap};
+
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -190,6 +192,9 @@ pub struct MainSession {
     finished: std::sync::atomic::AtomicBool,
     terminal_attachments: Mutex<TerminalAttachmentState>,
     terminal_attachments_done: Notify,
+    activity: Arc<ProgramActivity>,
+    /// Records client input for the canonical terminal, when it has one.
+    input_marker: Option<InputMarker>,
 }
 
 impl MainSession {
@@ -219,6 +224,8 @@ impl MainSession {
                 expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
+            activity: ProgramActivity::new(),
+            input_marker: None,
         });
         (session, input_rx)
     }
@@ -239,6 +246,15 @@ impl MainSession {
         } = attachment;
         let terminal_mode = terminal.is_some();
         let (input, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let activity = ProgramActivity::new();
+        let tap = terminal_mode.then(|| {
+            let reply = input.clone();
+            activity.register(move |bytes| {
+                let _ = reply.try_send(bytes.to_vec());
+            })
+        });
+        let input_marker = tap.as_ref().map(TerminalTap::input_marker);
+        crate::program_status::spawn_transition_log(&activity);
         let session = Arc::new(Self {
             terminal: terminal_mode,
             input,
@@ -256,16 +272,26 @@ impl MainSession {
                 expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
+            activity,
+            input_marker,
         });
         let stdout_session = Arc::clone(&session);
         tokio::spawn(async move {
             let mut stdout = stdout;
             let mut buffer = [0u8; 4096];
-            loop {
-                match stdout.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => stdout_session
-                        .publish(MainOutput::Stdout(Bytes::copy_from_slice(&buffer[..read]))),
+            if let Some(mut tap) = tap {
+                while let Some(forward) =
+                    crate::program_status::read_observed(&mut stdout, &mut buffer, &mut tap).await
+                {
+                    stdout_session.publish(MainOutput::Stdout(Bytes::from(forward)));
+                }
+            } else {
+                loop {
+                    match stdout.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => stdout_session
+                            .publish(MainOutput::Stdout(Bytes::copy_from_slice(&buffer[..read]))),
+                    }
                 }
             }
             stdout_session.reader_finished();
@@ -303,6 +329,19 @@ impl MainSession {
 
     fn publish(&self, event: MainOutput) {
         self.output.publish(event);
+    }
+
+    /// Program status reported by every workload terminal in this sandbox.
+    #[must_use]
+    pub fn program_activity(&self) -> &Arc<ProgramActivity> {
+        &self.activity
+    }
+
+    /// Record client input to the canonical terminal.
+    pub fn mark_input(&self) {
+        if let Some(marker) = &self.input_marker {
+            marker.mark();
+        }
     }
 
     fn reader_finished(&self) {

@@ -1546,6 +1546,7 @@ pub mod test_support {
             .send(SupervisorMessage {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     supports_service_advertisements: false,
+                    supports_workload_activity_requests: false,
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
                     supports_config_push: features == StreamFeatures::Apply,

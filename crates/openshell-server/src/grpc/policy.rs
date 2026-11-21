@@ -8102,6 +8102,60 @@ fn upsert_setting_value(
     }
 }
 
+/// The raw `idle_stop_after_seconds` value for a sandbox, if any scope sets
+/// it. Gateway scope wins over sandbox scope, as for every runtime setting.
+/// `global` lets a sweep load gateway settings once for many sandboxes.
+pub async fn idle_stop_after_seconds(
+    store: &Store,
+    global: Option<i64>,
+    workspace: &str,
+    sandbox_name: &str,
+) -> Result<Option<i64>, Status> {
+    if global.is_some() {
+        return Ok(global);
+    }
+    let sandbox = load_sandbox_settings(store, workspace, sandbox_name).await?;
+    Ok(
+        match sandbox.settings.get(settings::IDLE_STOP_AFTER_SECONDS_KEY) {
+            Some(StoredSettingValue::Int(seconds)) => Some(*seconds),
+            _ => None,
+        },
+    )
+}
+
+#[cfg(test)]
+pub async fn put_int_setting_for_test(
+    store: &Store,
+    sandbox: Option<(&str, &str)>,
+    key: &str,
+    value: i64,
+) {
+    let mut settings = match sandbox {
+        Some((workspace, name)) => load_sandbox_settings(store, workspace, name).await,
+        None => load_global_settings(store).await,
+    }
+    .expect("load test settings");
+    settings
+        .settings
+        .insert(key.to_string(), StoredSettingValue::Int(value));
+    match sandbox {
+        Some((workspace, name)) => save_sandbox_settings(store, workspace, name, &settings).await,
+        None => save_global_settings(store, &settings).await,
+    }
+    .expect("save test settings");
+}
+
+/// The gateway-scope `idle_stop_after_seconds` value, if set.
+pub async fn global_idle_stop_after_seconds(store: &Store) -> Result<Option<i64>, Status> {
+    let global = load_global_settings(store).await?;
+    Ok(
+        match global.settings.get(settings::IDLE_STOP_AFTER_SECONDS_KEY) {
+            Some(StoredSettingValue::Int(seconds)) => Some(*seconds),
+            _ => None,
+        },
+    )
+}
+
 pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, "", GLOBAL_SETTINGS_NAME).await
 }

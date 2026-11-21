@@ -3463,7 +3463,29 @@ message SupervisorMessage {
     RelayClose relay_close = 4;
     ConfigUpdateResult config_update_result = 5;
     SupervisorServiceAdvertisement service_advertisement = 6;
+    SupervisorWorkloadActivity workload_activity = 7;
   }
+}
+
+// Program status summary across workload terminals. Sent when each session
+// starts, when the summary changes, and within seconds of new client input.
+// Ages are relative so supervisor and gateway clocks need not agree.
+message SupervisorWorkloadActivity {
+  WorkloadProgramState state = 1;
+  WorkloadBlockedKind blocked_kind = 2;
+  string app = 3;
+  // Time spent in `state`.
+  google.protobuf.Duration state_age = 4;
+  // Time since the latest client input to a workload terminal. Absent when no
+  // client has written to one.
+  google.protobuf.Duration input_age = 5;
+  // Workload terminals with a current program report.
+  uint32 reporting_terminals = 6;
+  // Set when this summary answers a WorkloadActivityRequest.
+  string request_id = 7;
+  // Increases with every summary the supervisor sends, pushes and replies
+  // alike. The gateway drops a summary older than the one it holds.
+  uint64 sequence = 8;
 }
 
 // Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
@@ -3477,7 +3499,16 @@ message GatewayMessage {
     SessionRedirect session_redirect = 6;
     ConfigUpdate config_update = 7;
     ServiceRouteLease service_route_lease = 8;
+    WorkloadActivityRequest workload_activity_request = 9;
   }
+}
+
+// Ask the supervisor for a current program status summary before an idle
+// stop. Sent only to supervisors that advertise
+// `supports_workload_activity_requests`. The reply is a
+// SupervisorWorkloadActivity carrying the same `request_id`.
+message WorkloadActivityRequest {
+  string request_id = 1;
 }
 
 // Supervisor identifies itself and the sandbox it manages.
@@ -3506,6 +3537,10 @@ message SupervisorHello {
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
   bool supports_service_advertisements = 8;
+  // The supervisor reports workload program status and answers
+  // WorkloadActivityRequest. Gateways idle-stop only sandboxes whose current
+  // supervisor confirms idleness this way.
+  bool supports_workload_activity_requests = 9;
 }
 
 // Gateway accepts the supervisor session.
@@ -4186,6 +4221,28 @@ enum SandboxRestartPolicy {
   SANDBOX_RESTART_POLICY_NEVER = 1;
   SANDBOX_RESTART_POLICY_ON_FAILURE = 2;
   SANDBOX_RESTART_POLICY_ALWAYS = 3;
+}
+
+// Program state declared by an OSC 7501 report. Kept after existing enums so
+// generated enum descriptors remain stable.
+enum WorkloadProgramState {
+  WORKLOAD_PROGRAM_STATE_UNSPECIFIED = 0;
+  // At rest, waiting for the user's next instruction.
+  WORKLOAD_PROGRAM_STATE_IDLE = 1;
+  WORKLOAD_PROGRAM_STATE_WORKING = 2;
+  // Finished; the result is ready for the user.
+  WORKLOAD_PROGRAM_STATE_DONE = 3;
+  // Cannot continue until the user acts.
+  WORKLOAD_PROGRAM_STATE_BLOCKED = 4;
+  WORKLOAD_PROGRAM_STATE_ERROR = 5;
+}
+
+// What a blocked program waits for.
+enum WorkloadBlockedKind {
+  WORKLOAD_BLOCKED_KIND_UNSPECIFIED = 0;
+  WORKLOAD_BLOCKED_KIND_PERMISSION = 1;
+  WORKLOAD_BLOCKED_KIND_QUESTION = 2;
+  WORKLOAD_BLOCKED_KIND_AUTH = 3;
 }
 
 // Workspace membership record.

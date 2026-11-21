@@ -1043,6 +1043,7 @@ mod tests {
             supports_session_redirect: false,
             pushes_config: true,
             advertises_services: false,
+            confirms_activity: false,
         }
     }
 

@@ -11,6 +11,7 @@ pub mod debug_rpc;
 pub mod delegated;
 pub mod log_push;
 pub mod main_session;
+pub mod program_status;
 pub mod skills;
 #[cfg(unix)]
 pub mod ssh;
