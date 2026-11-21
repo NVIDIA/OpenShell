@@ -1565,6 +1565,7 @@ async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection(
             expected_resource_version: current_version,
             annotations: provenance.clone(),
             backfill_policy: Some(policy.clone()),
+            allow_policy_replacement: false,
         })
         .await
         .unwrap();
@@ -1634,6 +1635,7 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
             expected_resource_version: before_version,
             annotations: StdHashMap::from([("signature".to_string(), "new".to_string())]),
             backfill_policy: Some(policy),
+            allow_policy_replacement: false,
         })
         .await
         .unwrap_err();
@@ -1679,6 +1681,7 @@ async fn policy_atomic_write_persists_workspace() {
             expected_resource_version: current_version,
             annotations: StdHashMap::new(),
             backfill_policy: Some(policy),
+            allow_policy_replacement: false,
         })
         .await
         .unwrap();

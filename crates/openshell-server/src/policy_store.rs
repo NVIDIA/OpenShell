@@ -37,6 +37,9 @@ pub struct AtomicPolicyRevisionWrite {
     /// Populate the create-time baseline, or replace it while startup admission
     /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
+    /// Allow replacing saved `Sandbox.spec.policy` during first-start repair.
+    /// Set only for authorized users or operators, never sandbox uploads.
+    pub allow_policy_replacement: bool,
 }
 
 pub fn policy_record_for_atomic_write(
@@ -108,7 +111,7 @@ pub fn project_policy_revision_onto_sandbox(
                 changed = true;
             }
             Some(current) if current == backfill_policy => {}
-            Some(_) if startup_blocked => {
+            Some(_) if startup_blocked && write.allow_policy_replacement => {
                 spec.policy = Some(backfill_policy.clone());
                 changed = true;
             }
@@ -740,6 +743,7 @@ mod tests {
             expected_resource_version: 0,
             annotations: HashMap::new(),
             backfill_policy: Some(replacement.clone()),
+            allow_policy_replacement: true,
         };
         for activated in [None, Some(false), Some(true)] {
             for state in [Admission::Pending, Admission::Rejected, Admission::Accepted] {
