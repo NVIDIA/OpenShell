@@ -73,11 +73,12 @@ pub mod transport_errors;
 pub mod upload;
 
 pub use config::{
-    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuditConfig, GatewayAuthConfig,
-    GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
-    GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,
-    OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    AppArmorProfile, Config, EdgeAuthConfig, EdgeAuthProvider, ExtensionBindingPolicy,
+    GatewayAuditConfig, GatewayAuthConfig, GatewayInterceptorBindingOverride,
+    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
+    ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode,
+    TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

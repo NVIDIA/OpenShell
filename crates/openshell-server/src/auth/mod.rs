@@ -4,6 +4,7 @@
 //! Authentication and authorization for the gateway server.
 //!
 //! - `oidc`: JWT validation against OIDC providers (Keycloak, Entra ID, Okta)
+//! - `edge`: signed-token validation for gateways behind an authenticating proxy
 //! - `authz`: Role-based and scope-based access control
 //! - `identity`: Provider-agnostic identity representation
 //! - `http`: HTTP endpoints for auth discovery and token exchange
@@ -13,6 +14,7 @@ pub mod authenticator;
 pub mod authz;
 pub mod compute_driver;
 pub mod descriptor_authz;
+pub mod edge;
 pub mod extension_mint_limit;
 pub mod guard;
 mod http;

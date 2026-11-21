@@ -326,6 +326,8 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 
 **Re-authentication**: If the token expires, run `openshell gateway login` to open the browser flow again and update the stored token.
 
+By default the gateway trusts the proxy and does not check the token. Configure `[openshell.gateway.edge_auth]` to have the gateway verify the Cloudflare Access token on every request. See [Verify Cloudflare Access Tokens](/kubernetes/access-control#verify-cloudflare-access-tokens).
+
 ### Browser Login Callbacks
 
 Both browser login flows (OIDC Authorization Code + PKCE and edge JWT) receive their result on a short-lived local HTTP server. By default the CLI binds this listener to an ephemeral port on `127.0.0.1`, which requires no configuration on a normal host machine.
