@@ -23245,6 +23245,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_global_policy_rejects_overbroad_wildcard_host() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("open", "**.*.*")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("'**.*.*' is too broad"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_ambiguity_before_persisting() {
         let state = test_server_state().await;
 
@@ -25621,6 +25644,42 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    #[tokio::test]
+    async fn update_config_user_policy_rejects_overbroad_wildcard_host() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-user-overbroad",
+                "user-overbroad",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "user-overbroad".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(test_policy_with_rule("open", "**.*.*")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("'**.*.*' is too broad"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]

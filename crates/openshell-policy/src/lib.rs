@@ -1059,6 +1059,9 @@ pub enum PolicyViolation {
     },
     /// A network endpoint uses a wildcard shape that does not match runtime semantics.
     InvalidHostWildcard { policy_name: String, host: String },
+    /// A wildcard host lacks a fixed suffix of at least two DNS labels after
+    /// its last wildcard (e.g. `**.*.*` or `*.*.com`).
+    OverbroadHostWildcard { policy_name: String, host: String },
     /// `credential_signing` is set but `signing_service` is missing.
     MissingSigningService { policy_name: String, host: String },
     /// `credential_signing` has an unrecognized value.
@@ -1204,6 +1207,15 @@ impl fmt::Display for PolicyViolation {
                     "network policy '{policy_name}': invalid host wildcard '{host}'; \
                      middle DNS label wildcards must be the entire label '*' and recursive '**' \
                      is only allowed as the entire first label"
+                )
+            }
+            Self::OverbroadHostWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': host wildcard '{host}' is too broad; \
+                     a wildcard host must end in at least two fixed DNS labels after its \
+                     last wildcard, such as '*.example.com' or 's3.*.amazonaws.com'; \
+                     list other hosts explicitly"
                 )
             }
             Self::MissingSigningService { policy_name, host } => {
@@ -1525,6 +1537,12 @@ fn validate_sandbox_policy_with_mcp_presence(
                     host: ep.host.clone(),
                 });
             }
+            if host_wildcard_overbroad(&ep.host) {
+                violations.push(PolicyViolation::OverbroadHostWildcard {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
             if !ep.credential_signing.is_empty()
                 && !matches!(
                     ep.credential_signing.as_str(),
@@ -1703,6 +1721,31 @@ fn host_wildcard_shape_invalid(host: &str) -> bool {
         .skip(1)
         .copied()
         .any(|label| label.contains("**") || (label.contains('*') && label != "*"))
+}
+
+/// Minimum number of fixed DNS labels that must follow the last wildcard label
+/// of a host selector.
+const MIN_FIXED_SUFFIX_LABELS: usize = 2;
+
+/// Whether a wildcard host has fewer than two fixed labels after its last wildcard.
+///
+/// Such hosts match names under unrelated registrable domains (`**.*.*`,
+/// `*.*.com`, `api.github.*`).
+pub fn host_wildcard_overbroad(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+    if !host.contains('*') {
+        // Hosts without `*` match exactly, so other characters are literal.
+        return false;
+    }
+    // Runtime glob matching also treats `?`, `[...]`, `{a,b}`, and `\` as
+    // patterns, so a label containing any of them is not fixed.
+    let Some(last_wildcard) = labels
+        .iter()
+        .rposition(|label| label.contains(['*', '?', '[', ']', '{', '}', '\\']))
+    else {
+        return false;
+    };
+    labels.len() - last_wildcard - 1 < MIN_FIXED_SUFFIX_LABELS
 }
 
 /// Validate that an explicit-TCP host selector can produce names accepted by
@@ -4088,6 +4131,91 @@ network_policies:
                 "expected bare host wildcard {host:?} to be rejected, got {violations:?}"
             );
         }
+    }
+
+    fn policy_with_endpoint_host(host: &str) -> SandboxPolicy {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "wildcard".into(),
+            NetworkPolicyRule {
+                name: "wildcard".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: host.into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn validate_rejects_wildcard_host_without_fixed_suffix() {
+        for host in [
+            "**.*.*",
+            "*.*.*",
+            "**.*.*.*",
+            "a*.*",
+            "*.*.com",
+            "**.*.com",
+            "foo.*.com",
+            "a*.com",
+            "api.github.*",
+            "*.example.*",
+            "*.{?,??,???}.{??,???}",
+            "*.example.{com,io}",
+            "*.example.c?m",
+            "*.example.[a-z]om",
+        ] {
+            let violations =
+                validate_sandbox_policy(&policy_with_endpoint_host(host)).expect_err(host);
+            assert_eq!(
+                violations,
+                vec![PolicyViolation::OverbroadHostWildcard {
+                    policy_name: "wildcard".into(),
+                    host: host.into(),
+                }],
+                "{host}"
+            );
+            let message = violations[0].to_string();
+            assert!(
+                message.contains("at least two fixed DNS labels") && message.contains(host),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_wildcard_host_with_fixed_suffix() {
+        for host in [
+            "example.com",
+            "*.example.com",
+            "**.example.com",
+            "*-api.example.com",
+            "*.*.example.com",
+            "s3.*.amazonaws.com",
+            "*.s3.*.amazonaws.com",
+            "*.co.uk",
+            "10.0.0.1",
+        ] {
+            let policy = policy_with_endpoint_host(host);
+            validate_sandbox_policy(&policy).unwrap_or_else(|v| panic!("{host}: {v:?}"));
+        }
+
+        let mut hostless = restrictive_default_policy();
+        hostless.network_policies.insert(
+            "hostless".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    port: 443,
+                    allowed_ips: vec!["203.0.113.0/24".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        validate_sandbox_policy(&hostless).expect("hostless endpoint");
     }
 
     #[test]

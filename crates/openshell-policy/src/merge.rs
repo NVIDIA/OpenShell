@@ -3033,6 +3033,29 @@ mod tests {
     }
 
     #[test]
+    fn add_rule_rejects_overbroad_wildcard_host() {
+        let error = merge_policy(
+            restrictive_default_policy(),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "open".to_string(),
+                rule: rule_with_endpoint("open", "**.*.*", 443),
+            }],
+        )
+        .expect_err("an AddRule must not author a wildcard without a fixed suffix");
+
+        assert!(matches!(
+            &error,
+            PolicyMergeError::InvalidOperationPolicy {
+                operation_index: 0,
+                violations,
+            } if matches!(
+                violations.as_slice(),
+                [crate::PolicyViolation::OverbroadHostWildcard { host, .. }] if host == "**.*.*"
+            )
+        ));
+    }
+
+    #[test]
     fn invalid_mcp_add_rule_reports_its_request_index() {
         let operations = [
             PolicyMergeOp::RemoveRule {

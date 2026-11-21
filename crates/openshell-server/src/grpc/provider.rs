@@ -7407,6 +7407,43 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn import_provider_profile_rejects_overbroad_wildcard_host() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("open-egress");
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "**.*.*".to_string(),
+            port: 443,
+            ..Default::default()
+        }];
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "open-egress.yaml".to_string(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(
+            response.diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "endpoints[0].host"
+                    && diagnostic.message.contains("'**.*.*' is too broad")
+            }),
+            "{:?}",
+            response.diagnostics
+        );
+    }
+
+    #[tokio::test]
     async fn import_provider_profile_waits_for_sandbox_mutation_in_workspace() {
         let state = test_server_state().await;
         let guard = state

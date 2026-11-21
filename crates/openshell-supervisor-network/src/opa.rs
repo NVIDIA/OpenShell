@@ -1594,7 +1594,8 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
         PolicyViolation::TldWildcard { .. }
         | PolicyViolation::TcpEndpointIpLiteral { .. }
         | PolicyViolation::InvalidTcpEndpointHost { .. }
-        | PolicyViolation::InvalidHostWildcard { .. } => "invalid network endpoint host",
+        | PolicyViolation::InvalidHostWildcard { .. }
+        | PolicyViolation::OverbroadHostWildcard { .. } => "invalid network endpoint host",
         PolicyViolation::MissingEndpointHost { .. }
         | PolicyViolation::MissingTcpEndpointHost { .. } => "missing network endpoint host",
         PolicyViolation::MissingEndpointPort { .. }
@@ -10726,6 +10727,28 @@ network_policies:
             "*-aiplatform.googleapis.com must NOT match us-central1.aiplatform.googleapis.com \
              (would cross a `.` boundary)"
         );
+    }
+
+    /// A policy stored before the gateway rejected `**.*.*` must not reach
+    /// enforcement: the supervisor refuses to load it.
+    #[test]
+    fn overbroad_wildcard_host_fails_to_load_from_proto() {
+        let mut proto = test_proto();
+        proto.network_policies.insert(
+            "open".to_string(),
+            NetworkPolicyRule {
+                name: "open".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "**.*.*".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }],
+            },
+        );
+        assert!(OpaEngine::from_proto(&proto).is_err());
     }
 
     #[test]

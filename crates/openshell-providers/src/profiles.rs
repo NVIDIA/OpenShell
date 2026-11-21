@@ -2781,6 +2781,17 @@ pub fn validate_profile_set(
                     format!("invalid endpoint '{}:{}'", endpoint.host, endpoint.port),
                 ));
             }
+            if openshell_policy::host_wildcard_overbroad(&endpoint.host) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}].host"),
+                    format!(
+                        "host wildcard '{}' is too broad; a wildcard host must end in at least two fixed DNS labels after its last wildcard, such as '*.example.com' or 's3.*.amazonaws.com'",
+                        endpoint.host
+                    ),
+                ));
+            }
             collect_mcp_profile_diagnostics(source, profile_id, index, endpoint, &mut diagnostics);
 
             if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
