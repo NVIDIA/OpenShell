@@ -690,9 +690,19 @@ through its trusted resolver and validates the new addresses before connecting.
 The placeholder stays the same while its endpoint policy is unchanged. A failed
 refresh denies the connection; OpenShell does not use expired upstream addresses.
 Policy changes can still invalidate cached mappings and require a new client DNS
-lookup. OpenShell returns an
-empty answer to AAAA queries, so dual-stack clients must fall back to the A
-record.
+lookup. By default, OpenShell returns an empty answer to AAAA queries, so
+dual-stack clients must fall back to the A record. When the supervisor host has
+an IPv6 default route and no IPv4 default route, such as an IPv6-only host
+behind NAT64/DNS64, OpenShell also answers AAAA queries with placeholder IPv6
+addresses. Set `policy_dns_ipv6_egress` to `enabled` or `disabled` in the
+compute driver configuration to force either behavior. The sandbox logs record
+the decision and the detected route state.
+
+On NAT64 networks, an IPv6 address inside the NAT64 prefix is checked as the
+IPv4 address it embeds, so the IPv4 rules for private, loopback, link-local,
+and cloud metadata addresses still apply. OpenShell recognizes `64:ff9b::/96`
+and discovers the network's prefix automatically. If your network uses a prefix
+that cannot be discovered, list it in the driver's `nat64_prefixes` setting.
 
 ## Next Steps
 

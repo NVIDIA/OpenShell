@@ -136,6 +136,8 @@ from sandbox runtimes)",
                 ),
                 pool,
                 limits,
+                policy_dns_ipv6_egress: args.policy_dns_ipv6_egress.into(),
+                nat64_prefixes: args.nat64_prefixes,
             },
         )?;
         let health = tokio::net::TcpListener::bind(address)

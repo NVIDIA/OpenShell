@@ -174,6 +174,10 @@ pub struct SharedHostConfig {
     /// This member's cap of sandbox instances, which also sizes its stream's
     /// message bounds. The gateway enforces the same cap before it assigns.
     pub limits: PoolLimits,
+    /// AAAA handling for the policy DNS of every hosted instance.
+    pub policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
+    /// NAT64 prefixes for the SSRF checks of every hosted instance.
+    pub nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
 }
 
 /// The sandbox instance registry and the routed runtime listener its
@@ -195,6 +199,8 @@ pub struct SharedHost {
     pool: PoolIdentity,
     /// This member's cap, which also sizes its stream's message bounds.
     limits: PoolLimits,
+    policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
+    nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
     /// Routes of the latest snapshot listed for stopping. Every other route
     /// it omits is relinquished.
     stop_routes: Mutex<std::collections::BTreeSet<String>>,
@@ -310,6 +316,8 @@ impl SharedHost {
             desired_routes: Mutex::new(None),
             pool: config.pool,
             limits: config.limits,
+            policy_dns_ipv6_egress: config.policy_dns_ipv6_egress,
+            nat64_prefixes: config.nat64_prefixes,
             stop_routes: Mutex::new(std::collections::BTreeSet::new()),
             deferred: Mutex::new(None),
             deferred_reports: Mutex::new(BTreeMap::new()),
@@ -815,6 +823,8 @@ impl SharedHost {
             upstream_proxy_args:
                 openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
             additional_ca_bundle: None,
+            policy_dns_ipv6_egress: self.policy_dns_ipv6_egress,
+            nat64_prefixes: self.nat64_prefixes.clone(),
             backend_descriptor: descriptor,
             auth_bundle: registration.auth,
             admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),
@@ -1716,6 +1726,8 @@ mod tests {
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
             limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         for (revision, (offered, kept)) in [
@@ -1740,6 +1752,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn hosted_instances_get_the_configured_policy_dns_ipv6_settings() {
+        use openshell_supervisor_network::run::PolicyDnsIpv6Egress;
+        let prefix: openshell_supervisor_network::run::Nat64Prefix =
+            "2001:db8:64::/96".parse().unwrap();
+        for mode in [PolicyDnsIpv6Egress::Enabled, PolicyDnsIpv6Egress::Disabled] {
+            let root = tempfile::tempdir().unwrap();
+            let host = SharedHost::start(SharedHostConfig {
+                gateway_endpoint: "https://gateway.invalid".to_string(),
+                instance_root: root.path().join("instances"),
+                runtime_listen: "127.0.0.1:0".parse().unwrap(),
+                removal_grace: Duration::from_secs(10),
+                attach_request_timeout: Duration::from_mins(5),
+                pool: PoolIdentity {
+                    member_id: "member-1".to_string(),
+                    runtime_address: "127.0.0.1:5500".parse().unwrap(),
+                },
+                limits: test_limits(),
+                policy_dns_ipv6_egress: mode,
+                nat64_prefixes: vec![prefix],
+            })
+            .unwrap();
+            assert_eq!(host.policy_dns_ipv6_egress, mode);
+            assert_eq!(host.nat64_prefixes, [prefix]);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn pool_members_keep_release_or_stop_unassigned_instances_as_snapshots_say() {
         let root = tempfile::tempdir().unwrap();
@@ -1754,6 +1793,8 @@ mod tests {
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
             limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let routes = [
@@ -1877,6 +1918,8 @@ mod tests {
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
             limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let (released, stopped) = ("rt-released-0123456789", "rt-stopped-0123456789");
@@ -1975,6 +2018,8 @@ mod tests {
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
             limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let (hosted_route, stopped_route) = ("rt-hosted-0123456789", "rt-stopped-0123456789");
@@ -2199,6 +2244,8 @@ mod tests {
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
             limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let (opened, streams) = tokio::sync::mpsc::unbounded_channel();
@@ -2637,6 +2684,8 @@ mod tests {
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
             limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let reconciler = Reconciler::start(host.clone());
