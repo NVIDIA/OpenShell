@@ -12,6 +12,43 @@ use std::time::Duration;
 
 use testkit::{Context, ResultExt as _};
 
+/// `/sandbox`, the sandbox user's home and default workspace, belongs to the
+/// sandbox user, and no other user can write to it.
+#[testkit::test]
+async fn workspace_belongs_to_the_sandbox_user(cx: &mut Context) -> testkit::Result {
+    let sandbox = cx
+        .sandbox("kw")
+        .command(["sleep", "infinity"])
+        .create_ready()
+        .await?;
+
+    let output = sandbox
+        .exec([
+            "sh",
+            "-c",
+            "printf '%s %s %s' \"$(id -u)\" \"$(stat -c %u /sandbox)\" \"$(stat -c %a /sandbox)\"",
+        ])
+        .await?
+        .success()
+        .context("read the owner and mode of /sandbox")?;
+    let fields: Vec<&str> = output.stdout.split_whitespace().collect();
+    let [user, owner, mode] = fields[..] else {
+        return Err(testkit::Error::msg(format!(
+            "unexpected id/stat output {:?}",
+            output.stdout
+        )));
+    };
+    let mode = u32::from_str_radix(mode, 8)
+        .map_err(|error| testkit::Error::msg(format!("parse mode {mode:?}: {error}")))?;
+    if owner != user || mode & 0o022 != 0 {
+        return Err(testkit::Error::msg(format!(
+            "/sandbox is owned by UID {owner} with mode {mode:o}; \
+             expected the sandbox user's UID {user} and no group or other write permission"
+        )));
+    }
+    Ok(())
+}
+
 /// Files in the workspace survive stop and start, and start runs the main
 /// command again.
 #[testkit::test]
