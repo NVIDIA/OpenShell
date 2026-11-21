@@ -213,10 +213,14 @@ payload to a temporary bootstrap VM, and guest init runs `umoci raw unpack` onto
 Linux-owned ext4 storage. The resulting disk is cached under
 `<state-dir>/images/<cache-id>/rootfs.ext4` and attached read-only to later
 sandboxes. Local Docker images are still exported as rootfs tar archives and
-prepared inside the bootstrap VM. The driver checks that a prepared disk
-contains the unpacked rootfs before caching it; on failure it caches nothing
-and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
-tune registry layer download parallelism (default `4`, maximum `16`).
+prepared inside the bootstrap VM. Local exports report bytes written as
+progress, and the image step completes once the payload is staged. The driver
+hard-links staged rootfs archives and registry layout blobs into the disk-format
+input tree when possible, falling back to a copy across filesystems. The driver
+checks that a prepared disk contains the unpacked rootfs before caching it; on
+failure, it caches nothing and reports the image-prep console tail. Set
+`OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to tune registry layer download
+parallelism (default `4`, maximum `16`).
 Registry pulls in both caches use the resolved digest as an immutable reference.
 The driver verifies the downloaded manifest against that digest before downloading
 layers. For multi-platform images, it verifies the index and then the selected
