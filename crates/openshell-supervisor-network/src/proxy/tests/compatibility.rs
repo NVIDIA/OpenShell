@@ -100,7 +100,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             "target.example",
             8443,
             "/usr/bin/curl",
-            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl"),
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh"),
             &allowed_decision(EgressIntent::connect("target.example".to_string(), 8443)),
             &None,
             &None,
@@ -145,7 +145,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             8080,
             "/v1/items",
             "/usr/bin/curl",
-            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl"),
+            &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh"),
             "proxy_compatibility",
             &allowed_decision(EgressIntent::forward_http(
                 "target.example".to_string(),
@@ -187,7 +187,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
         peer,
         "target.example",
         8443,
-        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh"),
     ))
     .unwrap();
     assert_eq!(connect["class_name"], "Network Activity");
@@ -215,7 +215,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
         "target.example",
         8080,
         "/v1/items",
-        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh"),
         "proxy_compatibility",
     ))
     .unwrap();
@@ -244,7 +244,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         peer,
         "target.example",
         8443,
-        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh"),
         "proxy_compatibility",
         true,
     ))
@@ -268,7 +268,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         "target.example",
         8080,
         "/v1/items",
-        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh").with_cmd_line("curl --proxy"),
+        &Process::from_bypass("/usr/bin/curl", "42", "/usr/bin/sh"),
         "proxy_compatibility",
     ))
     .unwrap();

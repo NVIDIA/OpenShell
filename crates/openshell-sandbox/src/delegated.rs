@@ -16,13 +16,32 @@ use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, LaunchTypeId, Process as OcsfProcess,
-    ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit,
+    ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit, sanitize_cmd_line_for_audit,
 };
 
 use crate::process::{ProcessHandle, ProcessStatus, ResolvedWorkspace};
 
 fn ocsf_ctx() -> openshell_ocsf::ContextRef<'static> {
     openshell_ocsf::ctx::ctx()
+}
+
+/// The Process Activity event for a launched workload. `cmd_line` is bounded and
+/// redacted; the arguments stay out of `message`.
+fn process_launch_event(program: &str, args: &[String], pid: u32) -> openshell_ocsf::OcsfEvent {
+    let cmd_line = sanitize_cmd_line_for_audit(
+        std::iter::once(program).chain(args.iter().map(String::as_str)),
+    );
+    ProcessActivityBuilder::new(ocsf_ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .launch_type(LaunchTypeId::Spawn)
+        .process(OcsfProcess::new(program, i64::from(pid)).with_cmd_line(&cmd_line))
+        .actor_process(crate::process::ocsf_launcher_process())
+        .message(format!("Process started: pid={pid}"))
+        .build()
 }
 
 /// Spawn the admitted workload without placing the gateway or policy authority
@@ -129,19 +148,7 @@ pub async fn spawn_workload(
         .register_process_group(handle.pid(), terminal.clone(), signal_lock.clone())
         .map_err(|error| miette::miette!(error.to_string()))?;
 
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .launch_type(LaunchTypeId::Spawn)
-            .process(OcsfProcess::new(program, i64::from(handle.pid())))
-            .actor_process(crate::process::ocsf_launcher_process())
-            .message(format!("Process started: pid={}", handle.pid()))
-            .build()
-    );
+    ocsf_emit!(process_launch_event(program, args, handle.pid()));
 
     Ok(SpawnedAgent {
         handle,
@@ -261,5 +268,30 @@ impl AgentSignaler {
 
     pub fn hangup(&self) -> Result<()> {
         self.deliver(nix::sys::signal::Signal::SIGHUP)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_launch_event;
+
+    #[test]
+    fn launch_event_carries_redacted_command_line() {
+        let args = [
+            "--name".to_string(),
+            "two words".to_string(),
+            "--token=s3cret".to_string(),
+        ];
+        let event = process_launch_event("/usr/bin/agent", &args, 42);
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["process"]["name"], "/usr/bin/agent");
+        assert_eq!(json["process"]["pid"], 42);
+        assert_eq!(
+            json["process"]["cmd_line"],
+            r#"/usr/bin/agent --name "two words" --token=[REDACTED]"#
+        );
+        assert_eq!(json["message"], "Process started: pid=42");
+        assert!(!json.to_string().contains("s3cret"));
     }
 }

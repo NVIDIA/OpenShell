@@ -103,12 +103,19 @@ fn escape_quoted_field(text: &str) -> String {
 }
 
 fn escape_context_field(text: &str) -> String {
+    escape_bracketed(text, false)
+}
+
+/// Escape `text` for a `[key:value]` context field. Spaces stay readable when
+/// `keep_spaces` is set; other whitespace and control characters never do.
+fn escape_bracketed(text: &str, keep_spaces: bool) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
             '\\' => escaped.push_str("\\\\"),
             '[' => escaped.push_str("\\["),
             ']' => escaped.push_str("\\]"),
+            ' ' if keep_spaces => escaped.push(' '),
             character if character.is_whitespace() || character.is_control() => {
                 use std::fmt::Write as _;
                 let _ = write!(escaped, "\\u{{{:x}}}", u32::from(character));
@@ -517,7 +524,11 @@ impl OcsfEvent {
 
             Self::ProcessActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let proc_str = format!("{}({})", e.process.name, e.process.pid);
+                let proc_str = format!(
+                    "{}({})",
+                    escape_bracketed(&e.process.name, true),
+                    e.process.pid
+                );
                 let exit_ctx = e
                     .exit_code
                     .map(|c| format!(" [exit:{c}]"))
@@ -526,7 +537,7 @@ impl OcsfEvent {
                     .process
                     .cmd_line
                     .as_ref()
-                    .map(|c| format!(" [cmd:{c}]"))
+                    .map(|c| format!(" [cmd:{}]", escape_bracketed(c, true)))
                     .unwrap_or_default();
 
                 format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
@@ -1210,6 +1221,24 @@ mod tests {
         assert_eq!(
             shorthand,
             "PROC:LAUNCH [INFO] python3(42) [cmd:python3 /app/main.py]"
+        );
+    }
+
+    #[test]
+    fn test_process_activity_shorthand_escapes_cmd_line() {
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
+            process: Process::new("sh", 7).with_cmd_line("sh -c a]\nNET:OPEN [x\\"),
+            actor: None,
+            launch_type: Some(LaunchTypeId::Spawn),
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "PROC:LAUNCH [INFO] sh(7) [cmd:sh -c a\\]\\u{a}NET:OPEN \\[x\\\\]"
         );
     }
 

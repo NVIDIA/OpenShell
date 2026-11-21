@@ -129,7 +129,7 @@ async fn forward_denials_use_the_saved_connect_parent() {
                 443,
                 "/",
                 "curl",
-                &Process::from_bypass("curl", "42", "-").with_cmd_line("curl"),
+                &Process::from_bypass("curl", "42", "-"),
                 "forward-policy",
                 &decision,
                 None,
