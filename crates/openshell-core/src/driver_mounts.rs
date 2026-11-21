@@ -31,6 +31,21 @@ pub enum SelinuxLabel {
 /// directory and by drivers whose workspace remains fixed.
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/sandbox";
 
+/// Paths reserved by MicroVM guest initialization.
+pub const VM_RESERVED_GUEST_PATHS: &[&str] = &[
+    "/.openshell",
+    "/.openshell-bootstrap",
+    "/overlay",
+    "/lower",
+    "/newroot",
+    "/image-cache",
+    "/srv",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/tmp",
+];
+
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<(), String> {
     if source.is_empty() {
@@ -118,6 +133,38 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
     }
 
     Ok(workspace_root)
+}
+
+/// Resolve an image-declared working directory for a MicroVM workload.
+pub fn resolve_vm_image_workspace_root(working_dir: &str) -> Result<String, String> {
+    let root = resolve_oci_workspace_root(working_dir)?;
+    for reserved in VM_RESERVED_GUEST_PATHS.iter().copied().chain(["/run"]) {
+        if paths_overlap(Path::new(&root), Path::new(reserved)) {
+            return Err(format!(
+                "VM workspace '{root}' conflicts with guest path '{reserved}'"
+            ));
+        }
+    }
+    Ok(root)
+}
+
+/// Resolve a MicroVM workspace that guest init will assign to the sandbox user.
+pub fn resolve_vm_managed_workspace_root(root: &str) -> Result<String, String> {
+    if root.is_empty() || root == "/" || root.contains(':') {
+        return Err("VM workspace_root must be a non-root absolute path without ':'".to_string());
+    }
+    let root = resolve_vm_image_workspace_root(root)?;
+    if matches!(root.as_str(), "/home" | "/var")
+        || [
+            "/etc", "/root", "/boot", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
+            "/usr",
+        ]
+        .iter()
+        .any(|reserved| Path::new(&root).starts_with(reserved))
+    {
+        return Err(format!("VM workspace '{root}' is a protected system path"));
+    }
+    Ok(root)
 }
 
 fn normalize_absolute_container_path(value: &str, field: &str) -> Result<String, String> {

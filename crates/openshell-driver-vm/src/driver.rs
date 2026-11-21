@@ -46,7 +46,7 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
-use openshell_core::driver_mounts;
+use openshell_core::driver_mounts::{self, VM_RESERVED_GUEST_PATHS};
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -101,7 +101,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -121,6 +121,7 @@ const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
 const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
 const REGISTRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const MAX_REGISTRY_IMAGE_CONFIG_BYTES: usize = 16 * 1024 * 1024;
 /// 10 GiB — configurable via `rootfs_tar_max_bytes`.
 const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
@@ -248,6 +249,8 @@ const SANDBOX_OWNER_STATE_FILE: &str = "sandbox-owner-state";
 const SANDBOX_OWNER_STATE_V1: &str = "sandbox-owner-v1";
 const SANDBOX_OWNER_STATE_V2: &str = "sandbox-owner-v2";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
+const SANDBOX_WORKSPACE_FILE: &str = "workspace.json";
+const OVERLAY_WORKSPACE_FILE: &str = "/config/openshell-workspace";
 const SANDBOX_STOPPED_FILE: &str = "stopped";
 /// Durable tombstone preventing driver restart from relaunching a sandbox
 /// whose canonical main process already terminated.
@@ -281,12 +284,15 @@ struct RuntimeImagePlan {
     image_disk: Option<PathBuf>,
     image_identity: String,
     bootstrap_image_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct PreparedImageDisk {
     image_identity: String,
     disk_path: PathBuf,
+    working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +343,47 @@ impl std::fmt::Debug for VmNetworkSupervisorTrustSnapshot {
     }
 }
 
+/// How the VM driver selects a workspace for a new sandbox.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VmWorkspaceMode {
+    #[default]
+    Managed,
+    Image,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct VmWorkspace {
+    mode: VmWorkspaceMode,
+    root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_identity: Option<String>,
+}
+
+impl Default for VmWorkspace {
+    fn default() -> Self {
+        Self {
+            mode: VmWorkspaceMode::Managed,
+            root: default_vm_workspace_root(),
+            image_identity: None,
+        }
+    }
+}
+
+fn default_vm_workspace_root() -> String {
+    driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string()
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
@@ -363,6 +410,10 @@ pub struct VmDriverConfig {
     pub vcpus: u8,
     pub mem_mib: u32,
     pub overlay_disk_mib: u64,
+    #[serde(default)]
+    pub workspace_mode: VmWorkspaceMode,
+    #[serde(default = "default_vm_workspace_root")]
+    pub workspace_root: String,
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
@@ -509,6 +560,8 @@ impl Default for VmDriverConfig {
             vcpus: DEFAULT_VCPUS,
             mem_mib: DEFAULT_MEM_MIB,
             overlay_disk_mib: DEFAULT_OVERLAY_DISK_MIB,
+            workspace_mode: VmWorkspaceMode::Managed,
+            workspace_root: default_vm_workspace_root(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -533,6 +586,25 @@ impl Default for VmDriverConfig {
 }
 
 impl VmDriverConfig {
+    fn configured_workspace_root(&self) -> Option<&str> {
+        (self.workspace_mode == VmWorkspaceMode::Managed).then_some(self.workspace_root.as_str())
+    }
+
+    fn resolve_workspace(&self, working_dir: Option<&str>) -> Result<VmWorkspace, String> {
+        let root = self
+            .configured_workspace_root()
+            .unwrap_or_else(|| working_dir.unwrap_or_default());
+        let root = validate_vm_workspace_root(root, self.workspace_mode)?;
+        if root == driver_mounts::DEFAULT_WORKSPACE_ROOT {
+            return Ok(VmWorkspace::default());
+        }
+        Ok(VmWorkspace {
+            mode: self.workspace_mode,
+            root,
+            image_identity: None,
+        })
+    }
+
     /// Resolve a fallback sandbox UID for an image that has no sandbox account.
     pub fn resolve_sandbox_uid(&self) -> u32 {
         self.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID)
@@ -1169,6 +1241,9 @@ impl VmDriver {
             .validate()
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
+        if config.workspace_mode == VmWorkspaceMode::Managed {
+            config.workspace_root = config.resolve_workspace(None)?.root;
+        }
         config.validate_runtime_security_config()?;
         config.validate_bootstrap_image_config()?;
         config.validate_rootfs_tar_config()?;
@@ -1365,6 +1440,7 @@ impl VmDriver {
         .map_err(|error| Status::internal(format!("stage host additional CA: {error}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_host_supervisor(
         &self,
         sandbox: &Sandbox,
@@ -1373,6 +1449,7 @@ impl VmDriver {
         runtime_descriptor: &SandboxRuntimeDescriptor,
         auth_bundle: &openshell_core::jwt::SupervisorAuthBundle,
         sandbox_owner: SandboxOwnerIdentity,
+        workspace_root: &str,
     ) -> Result<(Child, Option<fs::File>), Status> {
         // The destination CA is staged on the host before either resolving
         // the supervisor binary or spawning it. It never crosses into a VM
@@ -1441,7 +1518,7 @@ impl VmDriver {
             .arg("--auth-bundle-file")
             .arg(&auth_bundle_path)
             .arg("--workdir")
-            .arg("/sandbox")
+            .arg(workspace_root)
             .args(upstream_proxy_args)
             .args(network_trust_args)
             .env(
@@ -1582,6 +1659,15 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        self.validate_sandbox_for_workspace(sandbox, self.config.configured_workspace_root())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_sandbox_for_workspace(
+        &self,
+        sandbox: &Sandbox,
+        workspace_root: Option<&str>,
+    ) -> Result<(), Status> {
         openshell_core::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
             sandbox,
@@ -1594,6 +1680,9 @@ impl VmDriver {
             &self.config,
             sandbox_requests_gpu(sandbox),
         )?;
+        if let Some(workspace_root) = workspace_root {
+            validate_vm_workspace_mounts(&driver_config.mounts, workspace_root)?;
+        }
         let has_rootfs_tar = driver_config.rootfs_tar_path.is_some();
         if self.resolved_sandbox_image(sandbox).is_none() && !has_rootfs_tar {
             return Err(Status::failed_precondition(
@@ -1601,6 +1690,19 @@ impl VmDriver {
             ));
         }
         Ok(())
+    }
+
+    async fn validate_persisted_sandbox(
+        &self,
+        sandbox: &Sandbox,
+        state_dir: &Path,
+    ) -> Result<(), Status> {
+        let workspace = read_sandbox_workspace(state_dir).await?;
+        let workspace_root = workspace
+            .as_ref()
+            .map(|workspace| workspace.root.as_str())
+            .or_else(|| self.config.configured_workspace_root());
+        self.validate_sandbox_for_workspace(sandbox, workspace_root)
     }
 
     // `tonic::Status` is large but is the standard error type across the
@@ -1825,6 +1927,15 @@ impl VmDriver {
             }
             Some(_) | None => None,
         };
+        let persisted_workspace = if overlay_preparation == OverlayPreparation::PreserveExisting {
+            read_sandbox_workspace(&state_dir).await?
+        } else {
+            None
+        };
+        let prepared_workspace_mode = (persisted_workspace.is_none()
+            && self.config.configured_workspace_root()
+                != Some(driver_mounts::DEFAULT_WORKSPACE_ROOT))
+        .then_some(self.config.workspace_mode);
 
         self.publish_platform_event(
             sandbox.id.clone(),
@@ -1836,28 +1947,37 @@ impl VmDriver {
             ),
         );
 
-        let image_plan = if overlay_preparation == OverlayPreparation::PreserveExisting
+        let mut retained_image_identity = persisted_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.image_identity.clone());
+        if retained_image_identity.is_none()
+            && overlay_preparation == OverlayPreparation::PreserveExisting
             && driver_config_had_rootfs_tar
         {
-            let persisted_identity =
+            retained_image_identity = Some(
                 read_persisted_image_identity(&state_dir).await.map_err(|err| {
                     Status::internal(format!(
                         "cannot restore rootfs-tar sandbox: persisted image identity not found: {err}"
                     ))
-                })?;
+                })?,
+            );
+        }
+        let image_plan = if let Some(retained_image_identity) = retained_image_identity {
             let bootstrap_image_ref = self.bootstrap_image_ref()?;
             let bootstrap_image_identity = self
-                .prepare_images_in_worker(&sandbox.id, &bootstrap_image_ref, None, true)
+                .prepare_images_in_worker(&sandbox.id, &bootstrap_image_ref, None, true, None)
                 .await?
                 .bootstrap_image_identity;
             let root_disk =
                 image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
-            let image_disk = image_cache_rootfs_image(&self.config.state_dir, &persisted_identity);
+            let image_disk =
+                image_cache_rootfs_image(&self.config.state_dir, &retained_image_identity);
             RuntimeImagePlan {
                 root_disk,
                 image_disk: Some(image_disk),
-                image_identity: persisted_identity,
+                image_identity: retained_image_identity,
                 bootstrap_image_identity,
+                working_dir: None,
             }
         } else {
             self.prepare_images_in_worker(
@@ -1865,8 +1985,26 @@ impl VmDriver {
                 &image_ref,
                 rootfs_tar_path.as_deref(),
                 false,
+                prepared_workspace_mode,
             )
             .await?
+        };
+        let workspace = match persisted_workspace {
+            Some(workspace) => workspace,
+            None => {
+                let mut workspace = self
+                    .config
+                    .resolve_workspace(image_plan.working_dir.as_deref())
+                    .map_err(Status::invalid_argument)?;
+                validate_vm_workspace_mounts(&driver_config.mounts, &workspace.root)?;
+                // Keep original image contents across restarts even for
+                // workspace files that have not been copied up.
+                if prepared_workspace_mode.is_some() {
+                    workspace.image_identity = Some(image_plan.image_identity.clone());
+                }
+                write_sandbox_workspace(&state_dir, &workspace).await?;
+                workspace
+            }
         };
         let image_identity = image_plan.image_identity.clone();
         self.ensure_provisioning_active(&sandbox.id).await?;
@@ -2045,6 +2183,7 @@ impl VmDriver {
                 inject_guest_mount_manifest(&overlay_disk, &driver_config.mounts)
                     .map_err(|error| Status::internal(format!("inject VM mount manifest: {error}")))
             })
+            .and_then(|()| inject_guest_workspace(&overlay_disk, &workspace))
         {
             self.lifecycle_extensions
                 .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
@@ -2251,6 +2390,7 @@ impl VmDriver {
                 &runtime_descriptor,
                 &launch_authentication.supervisor,
                 sandbox_owner_state,
+                &workspace.root,
             )
             .await
         {
@@ -2479,7 +2619,8 @@ impl VmDriver {
             .map_err(|error| {
                 Status::failed_precondition(format!("read VM admission provenance: {error}"))
             })?;
-        self.validate_sandbox(&sandbox)?;
+        self.validate_persisted_sandbox(&sandbox, &state_dir)
+            .await?;
         if already_running {
             // The gateway keeps launch sessions in memory. A non-empty bundle
             // during startup recovery represents a new gateway session, so
@@ -2812,7 +2953,7 @@ impl VmDriver {
             warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by launch authentication");
             return false;
         }
-        if let Err(error) = self.validate_sandbox(&sandbox) {
+        if let Err(error) = self.validate_persisted_sandbox(&sandbox, &state_dir).await {
             warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by admission");
             return false;
         }
@@ -3287,9 +3428,17 @@ impl VmDriver {
         image_ref: &str,
         rootfs_tar: Option<&Path>,
         bootstrap_only: bool,
+        prepared_workspace_mode: Option<VmWorkspaceMode>,
     ) -> Result<RuntimeImagePlan, Status> {
         match self
-            .run_preparation_in_worker(sandbox_id, image_ref, rootfs_tar, bootstrap_only, None)
+            .run_preparation_in_worker(
+                sandbox_id,
+                image_ref,
+                rootfs_tar,
+                bootstrap_only,
+                prepared_workspace_mode,
+                None,
+            )
             .await?
         {
             preparation::Output::Images(plan) => Ok(plan),
@@ -3318,7 +3467,7 @@ impl VmDriver {
                 .map(preparation::WorkloadIdentitySelectors::from),
         };
         match self
-            .run_preparation_in_worker(sandbox_id, "", None, false, Some(overlay))
+            .run_preparation_in_worker(sandbox_id, "", None, false, None, Some(overlay))
             .await?
         {
             preparation::Output::Overlay(owner) => Ok(owner),
@@ -3366,6 +3515,7 @@ impl VmDriver {
         image_ref: &str,
         rootfs_tar: Option<&Path>,
         bootstrap_only: bool,
+        prepared_workspace_mode: Option<VmWorkspaceMode>,
         overlay: Option<preparation::OverlayRequest>,
     ) -> Result<preparation::Output, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
@@ -3408,6 +3558,7 @@ impl VmDriver {
                     image_ref: image_ref.to_string(),
                     rootfs_tar: rootfs_tar.map(Path::to_path_buf),
                     bootstrap_only,
+                    prepared_workspace_mode,
                     overlay,
                     lease_fd: -1,
                     parent_pid: 0,
@@ -3517,6 +3668,7 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
         rootfs_tar_path: Option<&Path>,
+        prepared_workspace_mode: Option<VmWorkspaceMode>,
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref()?;
@@ -3534,26 +3686,32 @@ impl VmDriver {
                 image_disk: Some(prepared.disk_path),
                 image_identity: prepared.image_identity,
                 bootstrap_image_identity,
+                working_dir: None,
             });
         }
 
-        if image_ref.trim() == bootstrap_image_ref.trim() {
+        // Prepare custom workspaces from a distinct guest image disk so the
+        // host bootstrap builder cannot change image file ownership there.
+        if prepared_workspace_mode.is_none() && image_ref.trim() == bootstrap_image_ref.trim() {
             return span_status.finish(Ok(RuntimeImagePlan {
                 root_disk,
                 image_disk: None,
                 image_identity: bootstrap_image_identity.clone(),
                 bootstrap_image_identity,
+                working_dir: None,
             }));
         }
 
+        let inspect_workdir = prepared_workspace_mode == Some(VmWorkspaceMode::Image);
         let prepared = self
-            .ensure_prepared_image_disk(sandbox_id, image_ref, &root_disk)
+            .ensure_prepared_image_disk(sandbox_id, image_ref, &root_disk, inspect_workdir)
             .await?;
         span_status.finish(Ok(RuntimeImagePlan {
             root_disk,
             image_disk: Some(prepared.disk_path),
             image_identity: prepared.image_identity,
             bootstrap_image_identity,
+            working_dir: prepared.working_dir,
         }))
     }
 
@@ -3716,7 +3874,7 @@ impl VmDriver {
         image_ref: &str,
     ) -> Result<String, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        if let Some((engine, image_identity)) =
+        if let Some((engine, image_identity, _)) =
             self.resolve_local_container_image(image_ref).await?
         {
             let result = self
@@ -3938,7 +4096,7 @@ impl VmDriver {
     async fn resolve_local_container_image(
         &self,
         image_ref: &str,
-    ) -> Result<Option<(Docker, String)>, Status> {
+    ) -> Result<Option<(Docker, String, Option<String>)>, Status> {
         let required_local_image = is_openshell_local_build_image_ref(image_ref);
         let engine = match connect_local_container_engine().await {
             Some(engine) => engine,
@@ -3986,7 +4144,8 @@ impl VmDriver {
                     image_identity = %image_identity,
                     "vm driver: resolved image from local container engine"
                 );
-                Ok(Some((engine, image_identity)))
+                let working_dir = inspect.config.and_then(|config| config.working_dir);
+                Ok(Some((engine, image_identity, working_dir)))
             }
             Err(err) if is_docker_not_found_error(&err) && required_local_image => {
                 Err(Status::failed_precondition(format!(
@@ -4095,11 +4254,12 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
         bootstrap_root_disk: &Path,
+        inspect_workdir: bool,
     ) -> Result<PreparedImageDisk, Status> {
-        if let Some((docker, image_identity)) =
+        if let Some((docker, image_identity, working_dir)) =
             self.resolve_local_container_image(image_ref).await?
         {
-            return self
+            let mut prepared = self
                 .ensure_prepared_local_image_disk(
                     sandbox_id,
                     image_ref,
@@ -4107,7 +4267,9 @@ impl VmDriver {
                     &image_identity,
                     bootstrap_root_disk,
                 )
-                .await;
+                .await?;
+            prepared.working_dir = working_dir.filter(|_| inspect_workdir);
+            return Ok(prepared);
         }
 
         self.ensure_prepared_registry_image_disk(
@@ -4116,6 +4278,7 @@ impl VmDriver {
             bootstrap_root_disk,
             &registry_client(),
             &registry_auth(image_ref)?,
+            inspect_workdir,
         )
         .await
     }
@@ -4128,7 +4291,12 @@ impl VmDriver {
         image_identity: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
-        let cache_identity = prepared_image_cache_identity(image_identity, &self.config);
+        // Old local cache entries were exported by tag. Keep those entries
+        // separate from exports bound to the inspected image and its config.
+        let cache_identity = prepared_image_cache_identity(
+            &format!("local-image-id:{image_identity}"),
+            &self.config,
+        );
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
@@ -4136,6 +4304,7 @@ impl VmDriver {
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
+                working_dir: None,
             });
         }
 
@@ -4146,6 +4315,7 @@ impl VmDriver {
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
+                working_dir: None,
             });
         }
 
@@ -4164,7 +4334,7 @@ impl VmDriver {
             ]),
         );
         if let Err(err) =
-            export_local_image_rootfs_to_path(docker, image_ref, &rootfs_archive).await
+            export_local_image_rootfs_to_path(docker, image_identity, &rootfs_archive).await
         {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(err);
@@ -4189,6 +4359,7 @@ impl VmDriver {
         Ok(PreparedImageDisk {
             image_identity: cache_identity,
             disk_path: image_path,
+            working_dir: None,
         })
     }
 
@@ -4243,6 +4414,7 @@ impl VmDriver {
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
+                working_dir: None,
             });
         }
 
@@ -4259,6 +4431,7 @@ impl VmDriver {
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
+                working_dir: None,
             });
         }
 
@@ -4332,6 +4505,7 @@ impl VmDriver {
         Ok(PreparedImageDisk {
             image_identity: cache_identity,
             disk_path: image_path,
+            working_dir: None,
         })
     }
 
@@ -4342,6 +4516,7 @@ impl VmDriver {
         bootstrap_root_disk: &Path,
         client: &OciClient,
         auth: &RegistryAuth,
+        inspect_workdir: bool,
     ) -> Result<PreparedImageDisk, Status> {
         let reference = parse_registry_reference(image_ref)?;
 
@@ -4383,21 +4558,25 @@ impl VmDriver {
         let cache_identity = prepared_image_cache_identity(&source_image_identity, &self.config);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
-        if tokio::fs::metadata(&image_path).await.is_ok() {
+        let cache_hit = tokio::fs::metadata(&image_path).await.is_ok();
+        let cache_guard = if cache_hit {
+            None
+        } else {
+            self.publish_prepared_cache_miss(sandbox_id, image_ref, "registry", &cache_identity);
+            Some(self.image_cache_lock.lock().await)
+        };
+        if cache_hit || tokio::fs::metadata(&image_path).await.is_ok() {
+            drop(cache_guard);
             self.publish_prepared_cache_hit(sandbox_id, image_ref, "registry", &cache_identity);
+            let working_dir = if inspect_workdir {
+                pull_registry_image_workdir(client, &reference, auth, image_ref).await?
+            } else {
+                None
+            };
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
-            });
-        }
-
-        self.publish_prepared_cache_miss(sandbox_id, image_ref, "registry", &cache_identity);
-        let _cache_guard = self.image_cache_lock.lock().await;
-        if tokio::fs::metadata(&image_path).await.is_ok() {
-            self.publish_prepared_cache_hit(sandbox_id, image_ref, "registry", &cache_identity);
-            return Ok(PreparedImageDisk {
-                image_identity: cache_identity,
-                disk_path: image_path,
+                working_dir,
             });
         }
 
@@ -4427,6 +4606,15 @@ impl VmDriver {
             "config",
         )
         .await?;
+        let working_dir = if inspect_workdir {
+            let path =
+                oci_layout_blob_path(&layout_dir, &manifest.config.digest).map_err(|err| {
+                    Status::failed_precondition(format!("invalid config digest: {err}"))
+                })?;
+            read_registry_image_workdir(&path, image_ref).await?
+        } else {
+            None
+        };
 
         let total_layers = manifest.layers.len();
         let total_bytes: i64 = manifest.layers.iter().map(|layer| layer.size.max(0)).sum();
@@ -4481,6 +4669,7 @@ impl VmDriver {
         Ok(PreparedImageDisk {
             image_identity: cache_identity,
             disk_path: image_path,
+            working_dir,
         })
     }
 
@@ -5242,6 +5431,7 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
                 image_disk: None,
                 image_identity: identity.clone(),
                 bootstrap_image_identity: identity,
+                working_dir: None,
             }))
         } else {
             driver
@@ -5249,6 +5439,7 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
                     &request.sandbox_id,
                     &request.image_ref,
                     request.rootfs_tar.as_deref(),
+                    request.prepared_workspace_mode,
                 )
                 .await
                 .map(preparation::Output::Images)
@@ -5580,19 +5771,12 @@ fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status
 /// from GSI 32), so 32 leaves headroom on both.
 const VM_MAX_BIND_MOUNTS: usize = if cfg!(target_arch = "aarch64") { 32 } else { 3 };
 
-const VM_RESERVED_GUEST_PATHS: &[&str] = &[
-    "/.openshell",
-    "/.openshell-bootstrap",
-    "/overlay",
-    "/lower",
-    "/newroot",
-    "/image-cache",
-    "/srv",
-    "/proc",
-    "/sys",
-    "/dev",
-    "/tmp",
-];
+fn validate_vm_workspace_root(root: &str, mode: VmWorkspaceMode) -> Result<String, String> {
+    match mode {
+        VmWorkspaceMode::Managed => driver_mounts::resolve_vm_managed_workspace_root(root),
+        VmWorkspaceMode::Image => driver_mounts::resolve_vm_image_workspace_root(root),
+    }
+}
 
 const VIRTIOFS_TAG_PREFIX: &str = "osfs";
 
@@ -5673,11 +5857,6 @@ fn validate_vm_driver_mounts(
         driver_mounts::validate_container_mount_target(&mount.target)
             .map_err(Status::invalid_argument)?;
         let normalized = driver_mounts::normalize_mount_target(&mount.target);
-        driver_mounts::validate_workspace_mount_target(
-            &normalized,
-            driver_mounts::DEFAULT_WORKSPACE_ROOT,
-        )
-        .map_err(Status::invalid_argument)?;
         for reserved in VM_RESERVED_GUEST_PATHS {
             if driver_mounts::paths_overlap(Path::new(&normalized), Path::new(reserved)) {
                 return Err(Status::invalid_argument(format!(
@@ -5698,6 +5877,15 @@ fn validate_vm_driver_mounts(
             }));
         }
         targets.push(normalized);
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_vm_workspace_mounts(mounts: &[VmMountConfig], root: &str) -> Result<(), Status> {
+    for mount in mounts {
+        driver_mounts::validate_workspace_mount_target(&mount.target, root)
+            .map_err(Status::invalid_argument)?;
     }
     Ok(())
 }
@@ -5921,6 +6109,7 @@ async fn export_local_image_rootfs_to_path(
             Some(create_options),
             ContainerCreateBody {
                 image: Some(image_ref.to_string()),
+                working_dir: Some("/".to_string()),
                 ..Default::default()
             },
         )
@@ -6004,6 +6193,77 @@ async fn pin_registry_reference(
     // the index first, then the selected platform manifest against its entry.
     // All retries must use this same reference before publishing to the cache.
     Ok((reference.clone_with_digest(digest.clone()), digest))
+}
+
+async fn pull_registry_image_workdir(
+    client: &OciClient,
+    pinned_reference: &Reference,
+    auth: &RegistryAuth,
+    image_ref: &str,
+) -> Result<Option<String>, Status> {
+    let config = retry_registry_request("pull image working directory", || async {
+        let (manifest, _) = client.pull_image_manifest(pinned_reference, auth).await?;
+        let mut stream = client
+            .pull_blob_stream(pinned_reference, &manifest.config)
+            .await?;
+        let mut config = Vec::new();
+        while let Some(chunk) = stream.try_next().await? {
+            if config.len().saturating_add(chunk.len()) > MAX_REGISTRY_IMAGE_CONFIG_BYTES {
+                return Err(OciDistributionError::GenericError(Some(
+                    "image config exceeds the size limit".to_string(),
+                )));
+            }
+            config.extend_from_slice(&chunk);
+        }
+        Ok(config)
+    })
+    .await
+    .map_err(|err| {
+        Status::failed_precondition(format!(
+            "failed to read config for vm sandbox image '{image_ref}': {err}"
+        ))
+    })?;
+    parse_registry_image_workdir(&config, image_ref)
+}
+
+async fn read_registry_image_workdir(
+    config_path: &Path,
+    image_ref: &str,
+) -> Result<Option<String>, Status> {
+    let mut config = Vec::new();
+    tokio::fs::File::open(config_path)
+        .await
+        .map_err(|err| Status::internal(format!("open staged OCI image config: {err}")))?
+        .take(MAX_REGISTRY_IMAGE_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut config)
+        .await
+        .map_err(|err| Status::internal(format!("read staged OCI image config: {err}")))?;
+    if config.len() > MAX_REGISTRY_IMAGE_CONFIG_BYTES {
+        return Err(Status::failed_precondition(format!(
+            "config for vm sandbox image '{image_ref}' exceeds the size limit"
+        )));
+    }
+    parse_registry_image_workdir(&config, image_ref)
+}
+
+fn parse_registry_image_workdir(config: &[u8], image_ref: &str) -> Result<Option<String>, Status> {
+    #[derive(serde::Deserialize)]
+    struct ImageConfig {
+        config: Option<ExecutionConfig>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ExecutionConfig {
+        #[serde(rename = "WorkingDir")]
+        working_dir: Option<String>,
+    }
+
+    let image: ImageConfig = serde_json::from_slice(config).map_err(|err| {
+        Status::failed_precondition(format!(
+            "invalid config for vm sandbox image '{image_ref}': {err}"
+        ))
+    })?;
+    Ok(image.config.and_then(|config| config.working_dir))
 }
 
 async fn retry_registry_request<T, F, Fut>(
@@ -7358,6 +7618,45 @@ async fn read_persisted_image_identity(state_dir: &Path) -> Result<String, std::
     Ok(raw.trim().to_string())
 }
 
+#[allow(clippy::result_large_err)]
+async fn read_sandbox_workspace(state_dir: &Path) -> Result<Option<VmWorkspace>, Status> {
+    let bytes = match tokio::fs::read(state_dir.join(SANDBOX_WORKSPACE_FILE)).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Older overlays have no workspace metadata. A create interrupted
+            // before resolving its workspace has neither a marker nor a disk.
+            return tokio::fs::try_exists(sandbox_runtime_disk_paths(state_dir).overlay_disk)
+                .await
+                .map(|exists| exists.then(VmWorkspace::default))
+                .map_err(|error| Status::internal(format!("stat VM overlay disk: {error}")));
+        }
+        Err(error) => return Err(Status::internal(format!("read VM workspace: {error}"))),
+    };
+    let workspace: VmWorkspace = serde_json::from_slice(&bytes)
+        .map_err(|error| Status::internal(format!("decode VM workspace: {error}")))?;
+    let root =
+        validate_vm_workspace_root(&workspace.root, workspace.mode).map_err(Status::internal)?;
+    if workspace.root != root {
+        return Err(Status::internal(
+            "persisted VM workspace path is not normalized",
+        ));
+    }
+    Ok(Some(workspace))
+}
+
+#[allow(clippy::result_large_err)]
+async fn write_sandbox_workspace(state_dir: &Path, workspace: &VmWorkspace) -> Result<(), Status> {
+    let bytes = serde_json::to_vec(workspace)
+        .map_err(|error| Status::internal(format!("encode VM workspace: {error}")))?;
+    let staging = state_dir.join("workspace.json.tmp");
+    write_private_file(&staging, bytes)
+        .await
+        .map_err(|error| Status::internal(format!("stage VM workspace: {error}")))?;
+    tokio::fs::rename(staging, state_dir.join(SANDBOX_WORKSPACE_FILE))
+        .await
+        .map_err(|error| Status::internal(format!("persist VM workspace: {error}")))
+}
+
 async fn write_sandbox_request(state_dir: &Path, sandbox: &Sandbox) -> Result<(), std::io::Error> {
     restrict_owner_only_dir(state_dir).await?;
     let destination = state_dir.join(SANDBOX_REQUEST_FILE);
@@ -7644,6 +7943,21 @@ fn inject_guest_mount_manifest(
     write_rootfs_image_file(overlay_disk, &guest_path, manifest.as_bytes())?;
     set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644)?;
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn inject_guest_workspace(overlay_disk: &Path, workspace: &VmWorkspace) -> Result<(), Status> {
+    if workspace.root == driver_mounts::DEFAULT_WORKSPACE_ROOT {
+        return Ok(());
+    }
+    let mode = match workspace.mode {
+        VmWorkspaceMode::Managed => "managed",
+        VmWorkspaceMode::Image => "image",
+    };
+    let contents = format!("{mode}\n{}\n", workspace.root);
+    write_rootfs_image_file(overlay_disk, OVERLAY_WORKSPACE_FILE, contents.as_bytes())
+        .and_then(|()| set_rootfs_image_file_mode(overlay_disk, OVERLAY_WORKSPACE_FILE, 0o600))
+        .map_err(|error| Status::internal(format!("inject VM workspace: {error}")))
 }
 
 fn guest_boundary_config_path(generation: &str) -> String {
@@ -10912,6 +11226,7 @@ mod tests {
                 image_disk: None,
                 image_identity: "warm".to_string(),
                 bootstrap_image_identity: "warm".to_string(),
+                working_dir: None,
             })));
         let overlay = preparation::Message::Complete(Ok(preparation::Output::Overlay(
             SandboxOwnerIdentity {
@@ -10970,7 +11285,7 @@ mod tests {
         let slow_driver = driver.clone();
         let slow = tokio::spawn(async move {
             slow_driver
-                .prepare_images_in_worker("slow-a", "test-bootstrap", None, true)
+                .prepare_images_in_worker("slow-a", "test-bootstrap", None, true, None)
                 .await
         });
         let warm_driver = driver.clone();
@@ -10980,7 +11295,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let plan = warm_driver
-                .prepare_images_in_worker("warm-b", "test-bootstrap", None, true)
+                .prepare_images_in_worker("warm-b", "test-bootstrap", None, true, None)
                 .await
                 .map_err(|error| error.to_string())?;
             if plan.root_disk != cached_root {
@@ -11050,6 +11365,7 @@ mod tests {
                     image_ref: "test-image".to_string(),
                     rootfs_tar: None,
                     bootstrap_only: false,
+                    prepared_workspace_mode: None,
                     overlay: None,
                     lease_fd: -1,
                     parent_pid: 0,
@@ -14352,6 +14668,62 @@ while :; do sleep 0.05; done"#,
         config
     }
 
+    #[tokio::test]
+    async fn vm_workspace_selection_persists_and_protects_the_selected_path() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let state_dir = state_dir.path();
+        let mut config = mount_test_config(true);
+        let default = driver_mounts::DEFAULT_WORKSPACE_ROOT;
+        assert_eq!(
+            config.resolve_workspace(Some("/home/app")).unwrap().root,
+            default
+        );
+
+        config.workspace_mode = VmWorkspaceMode::Image;
+        assert_eq!(config.resolve_workspace(None).unwrap().root, default);
+        assert!(config.resolve_workspace(Some("/overlay/data")).is_err());
+        let mut workspace = config.resolve_workspace(Some("/home/app")).unwrap();
+        assert_eq!(workspace.root, "/home/app");
+        assert_eq!(workspace.mode, VmWorkspaceMode::Image);
+        workspace.image_identity = Some("pinned-image".to_string());
+
+        let overlay_disk = sandbox_runtime_disk_paths(state_dir).overlay_disk;
+        tokio::fs::write(&overlay_disk, b"pre-existing overlay")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_sandbox_workspace(state_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .root,
+            default
+        );
+        write_sandbox_workspace(state_dir, &workspace)
+            .await
+            .unwrap();
+
+        config.workspace_mode = VmWorkspaceMode::Managed;
+        config.workspace_root = "/work".to_string();
+        assert_eq!(config.resolve_workspace(None).unwrap().root, "/work");
+        let restored = read_sandbox_workspace(state_dir).await.unwrap().unwrap();
+        assert_eq!(restored.root, workspace.root);
+        assert_eq!(restored.mode, workspace.mode);
+        assert_eq!(restored.image_identity, workspace.image_identity);
+
+        let mut mount = VmMountConfig {
+            mount_type: None,
+            source: "/host/data".to_string(),
+            target: "/home".to_string(),
+            read_only: true,
+        };
+        let error =
+            validate_vm_workspace_mounts(std::slice::from_ref(&mount), &restored.root).unwrap_err();
+        assert!(error.message().contains("workspace"));
+        mount.target = "/home/app/data".to_string();
+        assert!(validate_vm_workspace_mounts(&[mount], &restored.root).is_ok());
+    }
+
     #[test]
     fn vm_mount_validation_rejects_when_resource_admission_enabled() {
         let dir = std::env::temp_dir();
@@ -14764,17 +15136,17 @@ while :; do sleep 0.05; done"#,
         ));
     }
 
-    /// Runs `prepare_virtiofs_target` from the guest init script against a
+    /// Runs `prepare_guest_directory` from the guest init script against a
     /// host directory standing in for the guest root.
     #[cfg(unix)]
     fn run_prepare_virtiofs_target(root: &Path, target: &str) -> std::process::Output {
         let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
         let start = script
-            .find("prepare_virtiofs_target() {")
-            .expect("init script defines prepare_virtiofs_target");
+            .find("prepare_guest_directory() {")
+            .expect("init script defines prepare_guest_directory");
         let end = start + script[start..].find("\n}\n").expect("function end") + 3;
         let program = format!(
-            "set -euo pipefail\nts() {{ echo \"$@\"; }}\n{}\nprepare_virtiofs_target \"$1\" \"$(id -u):$(id -g)\"\n",
+            "set -euo pipefail\nts() {{ echo \"$@\"; }}\n{}\nprepare_guest_directory \"$1\" \"$(id -u):$(id -g)\" /sandbox\n",
             &script[start..end]
         );
         std::process::Command::new("bash")

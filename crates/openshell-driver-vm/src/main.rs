@@ -7,6 +7,7 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
+use openshell_driver_vm::driver::VmWorkspaceMode;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -220,6 +221,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
 
+    /// Use a managed workspace or the image's OCI working directory.
+    #[arg(long, value_enum, default_value = "managed")]
+    workspace_mode: VmWorkspaceMode,
+
+    /// Absolute guest workspace path used in `managed` mode.
+    #[arg(long, default_value = openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT)]
+    workspace_root: String,
+
     // Corporate forward proxy for sandbox egress. Operator-owned: these reach
     // the host supervisor on its argv, which the sandbox image and the
     // user-supplied environment cannot influence.
@@ -365,6 +374,8 @@ async fn main() -> Result<()> {
         gpu_vcpus: args.gpu_vcpus,
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
+        workspace_mode: args.workspace_mode,
+        workspace_root: args.workspace_root,
         rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
         enable_bind_mounts: args.enable_bind_mounts,

@@ -6,8 +6,8 @@ use oci_client::client::ClientProtocol;
 use oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE;
 use tokio::io::AsyncReadExt as _;
 
-/// A loopback registry with independent HEAD identity and GET contents. Blob
-/// requests deliberately fail, so a rejected manifest needs no VM or formatter.
+/// A loopback registry with independent HEAD identity and GET contents. Only
+/// explicitly registered blobs are served.
 struct Registry {
     address: String,
     requests: Arc<std::sync::Mutex<Vec<String>>>,
@@ -19,7 +19,24 @@ impl Registry {
         head_digest: String,
         manifests: HashMap<String, Vec<u8>>,
         get_digest: Option<String>,
+        retry_once: bool,
+    ) -> Self {
+        Self::start_with_blobs(
+            head_digest,
+            manifests,
+            get_digest,
+            retry_once,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    async fn start_with_blobs(
+        head_digest: String,
+        manifests: HashMap<String, Vec<u8>>,
+        get_digest: Option<String>,
         mut retry_once: bool,
+        blobs: HashMap<String, Vec<u8>>,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -54,6 +71,12 @@ impl Registry {
                         digest = Some(get_digest.clone().unwrap_or_else(|| sha256(body)));
                         ("200 OK", body.as_slice())
                     }
+                } else if let Some(body) = path
+                    .strip_prefix("/v2/test/image/blobs/")
+                    .and_then(|key| blobs.get(key))
+                {
+                    digest = Some(sha256(body));
+                    ("200 OK", body.as_slice())
                 } else {
                     ("404 Not Found", b"fixture has no blob".as_slice())
                 };
@@ -186,6 +209,7 @@ async fn ensure_image(
                 Path::new("unused"),
                 client,
                 &RegistryAuth::Anonymous,
+                false,
             )
             .await
             .map(|prepared| prepared.image_identity)
@@ -265,6 +289,54 @@ async fn rejects_unbound_manifest(bootstrap: bool) {
 #[tokio::test]
 async fn prepared_registry_cache_rejects_manifest_identity_mismatch() {
     rejects_unbound_manifest(false).await;
+}
+
+#[tokio::test]
+async fn registry_workspace_workdir_is_bound_to_the_cached_image() {
+    let config = r#"{"config":{"WorkingDir":"/home/app"}}"#;
+    let trusted = manifest(config);
+    let image_digest = sha256(&trusted);
+    let config_digest = sha256(config.as_bytes());
+    let registry = Registry::start_with_blobs(
+        image_digest.clone(),
+        HashMap::from([
+            (
+                "latest".to_string(),
+                manifest(r#"{"config":{"WorkingDir":"/other"}}"#),
+            ),
+            (image_digest.clone(), trusted),
+        ]),
+        None,
+        false,
+        HashMap::from([(config_digest.clone(), config.as_bytes().to_vec())]),
+    )
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let driver = driver(root.path());
+    let identity = prepared_image_cache_identity(&image_digest, &driver.config);
+    let path = image_cache_rootfs_image(root.path(), &identity);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"cached disk").unwrap();
+
+    let reference = registry.reference(None);
+    let client = client();
+    let prepared = driver
+        .ensure_prepared_registry_image_disk(
+            "test",
+            &reference,
+            Path::new("unused"),
+            &client,
+            &RegistryAuth::Anonymous,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.working_dir.as_deref(), Some("/home/app"));
+
+    let requests = registry.requests();
+    assert!(requests.contains(&format!("GET /v2/test/image/manifests/{image_digest}")));
+    assert!(requests.contains(&format!("GET /v2/test/image/blobs/{config_digest}")));
+    assert!(!requests.contains(&"GET /v2/test/image/manifests/latest".to_string()));
 }
 
 #[tokio::test]
