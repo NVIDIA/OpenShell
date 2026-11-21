@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Upgrades the installed RPM packages to the candidates in
+# /var/lib/openshell-qualification/candidate, and runs the gateway on the
+# candidate's runtime images. The rpm-upgrade-source installer renders this
+# for the gateway's user, which differs between rootless Podman (the login
+# user) and rootful Podman (root), and stages it as
+# /var/lib/openshell-qualification/disruptions/upgrade for the runner.
+#
+# The gateway package restarts the user service after an upgrade
+# (%systemd_user_postun_with_restart), so this selects the candidate's images
+# before installing and restarts the service itself only if the package did
+# not. A second restart right after the package's would interrupt the new
+# gateway while it brings its sandboxes back.
+set -euo pipefail
+
+stage=/var/lib/openshell-qualification/candidate
+unit=openshell-gateway.service
+gateway_user={{ openshell_gateway_user }}
+gateway_home={{ openshell_gateway_home }}
+gateway_uid={{ openshell_gateway_uid }}
+
+# Run a command as the user that runs the gateway, with its user manager.
+as_gateway_user() {
+  sudo -n -u "${gateway_user}" env \
+    HOME="${gateway_home}" \
+    XDG_RUNTIME_DIR="/run/user/${gateway_uid}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${gateway_uid}/bus" \
+    "$@"
+}
+
+# The epoch, version, release and architecture of each package, one per line.
+versions_of() {
+  rpm --query --queryformat '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' "$@"
+}
+
+diagnostics() {
+  set +e
+  echo "=== upgrade failed; diagnostics ===" >&2
+  versions_of openshell openshell-gateway >&2
+  openshell --version >&2
+  as_gateway_user systemctl --user status "${unit}" --no-pager >&2
+  as_gateway_user journalctl --user -u "${unit}" --no-pager -n 100 >&2
+  as_gateway_user podman images >&2
+}
+trap diagnostics EXIT
+
+load_state=$(as_gateway_user systemctl --user show --property=LoadState --value "${unit}" || true)
+if [ "${load_state}" != loaded ]; then
+  echo "${unit} is not a loaded user service of ${gateway_user} (LoadState=${load_state:-unknown})" >&2
+  exit 1
+fi
+
+before=$(versions_of openshell openshell-gateway)
+candidate=$(versions_of --package "${stage}/openshell.rpm" "${stage}/openshell-gateway.rpm")
+if [ "${before}" = "${candidate}" ]; then
+  echo "the candidates are the installed versions ($(tr '\n' ' ' <<< "${before}")); nothing to upgrade" >&2
+  exit 1
+fi
+
+# The images go into the gateway user's Podman storage: root's for rootful.
+as_gateway_user podman load --input "${stage}/sandbox.tar"
+as_gateway_user podman load --input "${stage}/supervisor.tar"
+
+# Select the candidate's runtime images, which carry the tmachine tag, so the
+# gateway the package restarts uses them. ${HOME} is the gateway user's, so it
+# expands in the inner shell.
+# shellcheck disable=SC2016
+as_gateway_user sh -c '
+  umask 077
+  mkdir -p "${HOME}/.config/openshell"
+  cat > "${HOME}/.config/openshell/gateway.env"
+' <<ENV
+OPENSHELL_COMPUTE_DRIVER=podman
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
+OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
+ENV
+
+invocation_of() {
+  as_gateway_user systemctl --user show --property=InvocationID --value "${unit}"
+}
+invocation=$(invocation_of)
+
+sudo -n dnf --assumeyes install --allowerasing \
+  "${stage}/openshell.rpm" "${stage}/openshell-gateway.rpm"
+
+after=$(versions_of openshell openshell-gateway)
+if [ "${after}" != "${candidate}" ]; then
+  echo "installed $(tr '\n' ' ' <<< "${after}"), expected the candidates $(tr '\n' ' ' <<< "${candidate}")" >&2
+  exit 1
+fi
+
+# Give the package's own restart a moment to show, then restart only if it
+# didn't happen.
+# TODO: measure whether the package's restart is already visible when dnf
+# returns. If so, replace this wait with a single InvocationID read and fail
+# clearly when the unit was not restarted. A second restart interrupts Podman's
+# recovery of sandboxes, so do not remove the wait before measuring.
+restarted=false
+for _ in $(seq 1 20); do
+  if [ "$(invocation_of)" != "${invocation}" ]; then
+    restarted=true
+    break
+  fi
+  sleep 0.5
+done
+if [ "${restarted}" = false ]; then
+  as_gateway_user systemctl --user daemon-reload
+  as_gateway_user systemctl --user restart "${unit}"
+fi
+echo "upgraded openshell $(tr '\n' ' ' <<< "${before}")-> $(tr '\n' ' ' <<< "${after}")(restarted by $([ "${restarted}" = true ] && echo the package || echo this step))"
+trap - EXIT

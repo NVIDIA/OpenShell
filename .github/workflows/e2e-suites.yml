@@ -123,7 +123,10 @@ jobs:
             {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"continuity","disruption":"gateway-restart","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","family":"continuity","disruption":"upgrade","gateway":"openshell","runner":"ubuntu-24.04","upgrade_source":true,"upgrade_package":"deb"}
+            {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","family":"continuity","disruption":"upgrade","gateway":"openshell","runner":"ubuntu-24.04","upgrade_source":true,"upgrade_package":"deb"},
+            {"environment":"fedora-podman-rootless","installer":"rpm-upgrade-source","family":"continuity","disruption":"upgrade","gateway":"openshell","runner":"ubuntu-24.04","upgrade_source":true,"upgrade_package":"rpm"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","family":"continuity","disruption":"gateway-restart","gateway":"openshell","runner":"ubuntu-24.04"},
+            {"environment":"fedora-podman-rootful","installer":"rpm-upgrade-source","family":"continuity","disruption":"upgrade","gateway":"openshell","runner":"ubuntu-24.04","upgrade_source":true,"upgrade_package":"rpm"}
           ]'
           # `suite` names the row's tests in the job and artifact names.
           matrix=$(jq -c --arg family "${FAMILY}" --arg external "${EXTERNAL_DRIVERS}" --arg upgrade "${UPGRADE_SOURCE}" '{include: map(
@@ -154,6 +157,8 @@ jobs:
         run: |
           tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName || true)
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          # The latest release moves, so the run must say which one it used.
+          echo "Upgrade baseline for this run: \`${tag:-none found}\`" >> "$GITHUB_STEP_SUMMARY"
 
   suites:
     name: E2E suites (${{ matrix.suite }}, ${{ matrix.environment }}, ${{ matrix.installer }})

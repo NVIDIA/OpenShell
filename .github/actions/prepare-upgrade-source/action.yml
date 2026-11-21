@@ -12,7 +12,7 @@ inputs:
     description: Release tag to use as the baseline, such as v0.1.9
     required: true
   package:
-    description: Package type of the baseline; only deb is supported
+    description: Package type of the baseline, deb or rpm
     required: false
     default: deb
   github-token:
@@ -35,6 +35,36 @@ runs:
         if [ -z "${SOURCE_TAG}" ]; then
           echo "::error::no release tag to use as the upgrade baseline"
           exit 1
+        fi
+        # The baseline is the latest release when the run starts, so record it:
+        # a pass or failure means nothing without knowing what it upgraded from.
+        echo "::notice::Upgrade baseline: ${SOURCE_TAG} (${PACKAGE:-deb} package)"
+        echo "Upgrade baseline: \`${SOURCE_TAG}\` (${PACKAGE:-deb} package)" >> "$GITHUB_STEP_SUMMARY"
+        if [ "${PACKAGE}" = "rpm" ]; then
+          shopt -s nullglob
+          source_dir=artifacts/upgrade/rpm/source
+          download_dir="${source_dir}/download"
+          gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'openshell-[0-9]*.x86_64.rpm' \
+            --pattern 'openshell-gateway-[0-9]*.x86_64.rpm' \
+            --pattern openshell-checksums-sha256.txt \
+            --dir "$download_dir"
+          cli_rpms=("$download_dir"/openshell-[0-9]*.x86_64.rpm)
+          gateway_rpms=("$download_dir"/openshell-gateway-[0-9]*.x86_64.rpm)
+          if [[ ${#cli_rpms[@]} -ne 1 || ${#gateway_rpms[@]} -ne 1 ]]; then
+            echo "::error::release ${SOURCE_TAG} must contain exactly one CLI and one gateway x86_64 RPM"
+            exit 1
+          fi
+          # Both packages are listed in the release's one checksum file.
+          (
+            cd "$download_dir"
+            grep -F " $(basename "${cli_rpms[0]}")" openshell-checksums-sha256.txt | sha256sum --check --status
+            grep -F " $(basename "${gateway_rpms[0]}")" openshell-checksums-sha256.txt | sha256sum --check --status
+          )
+          mv "${cli_rpms[0]}" "${source_dir}/openshell.rpm"
+          mv "${gateway_rpms[0]}" "${source_dir}/openshell-gateway.rpm"
+          rm -rf "$download_dir"
+          exit 0
         fi
         if [ "${PACKAGE}" != "deb" ]; then
           echo "::error::unsupported upgrade source package type: ${PACKAGE}"
