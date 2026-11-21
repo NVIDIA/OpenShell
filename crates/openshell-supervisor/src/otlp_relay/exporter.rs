@@ -24,7 +24,7 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{GrpcMethod, Status};
 
-use super::EXPORT_TIMEOUT;
+use super::{EXPORT_TIMEOUT, Signal};
 
 /// HTTP/2 PING cadence while an export is in flight. Pings are never sent on
 /// an idle connection: stock collectors (grpc-go) close connections that
@@ -38,9 +38,7 @@ const HTTP2_PING_TIMEOUT: Duration = Duration::from_secs(2);
 /// that ends a slow export.
 const CLIENT_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
 
-const SERVICE: &str = "opentelemetry.proto.collector.trace.v1.TraceService";
 const METHOD: &str = "Export";
-const PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
 /// One export attempt failed. The batch is discarded by the caller.
 #[derive(Debug)]
@@ -94,11 +92,12 @@ enum Transport {
     Grpc(Grpc<Channel>),
     Http {
         client: Box<OtlpHttpClient>,
-        uri: http::Uri,
+        /// Export URI per signal, indexed like [`Signal::ALL`].
+        uris: [http::Uri; Signal::ALL.len()],
     },
 }
 
-/// Forwards encoded `ExportTraceServiceRequest` batches to one collector.
+/// Forwards encoded OTLP export request batches to one collector.
 pub struct Exporter {
     transport: Transport,
     endpoint: String,
@@ -124,8 +123,18 @@ impl Exporter {
                     OtlpHttpClient::new(tls, EXPORT_TIMEOUT + CLIENT_TIMEOUT_MARGIN)
                         .map_err(EndpointError::Setup)?,
                 ),
-                uri: openshell_otel::signal_url(endpoint, "v1/traces")
-                    .map_err(EndpointError::Http)?,
+                uris: Signal::ALL
+                    .into_iter()
+                    .map(|signal| {
+                        openshell_otel::signal_url(
+                            endpoint,
+                            signal.http_path().trim_start_matches('/'),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(EndpointError::Http)?
+                    .try_into()
+                    .expect("one URI per signal"),
             },
         };
         Ok(Self {
@@ -141,13 +150,15 @@ impl Exporter {
         &self.endpoint
     }
 
-    /// Sends one encoded batch, bounded by [`EXPORT_TIMEOUT`].
-    pub async fn export(&self, batch: Bytes) -> Result<(), ExportError> {
+    /// Sends one encoded batch of `signal`, bounded by [`EXPORT_TIMEOUT`].
+    pub async fn export(&self, signal: Signal, batch: Bytes) -> Result<(), ExportError> {
         let send = async {
             match &self.transport {
-                Transport::Grpc(client) => export_grpc(client.clone(), &self.headers, batch).await,
-                Transport::Http { client, uri } => {
-                    export_http(client, uri, &self.headers, batch).await
+                Transport::Grpc(client) => {
+                    export_grpc(client.clone(), &self.headers, signal, batch).await
+                }
+                Transport::Http { client, uris } => {
+                    export_http(client, &uris[signal.index()], &self.headers, batch).await
                 }
             }
         };
@@ -191,6 +202,7 @@ fn grpc_channel(
 async fn export_grpc(
     mut client: Grpc<Channel>,
     headers: &http::HeaderMap,
+    signal: Signal,
     batch: Bytes,
 ) -> Result<(), ExportError> {
     client.ready().await.map_err(|error| {
@@ -200,11 +212,14 @@ async fn export_grpc(
     })?;
     let mut request = tonic::Request::new(batch);
     *request.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers.clone());
+    let service = signal.grpc_service();
     request
         .extensions_mut()
-        .insert(GrpcMethod::new(SERVICE, METHOD));
+        .insert(GrpcMethod::new(service, METHOD));
+    let path = PathAndQuery::try_from(format!("/{service}/{METHOD}"))
+        .expect("service and method names are valid path characters");
     client
-        .unary(request, PathAndQuery::from_static(PATH), PassthroughCodec)
+        .unary(request, path, PassthroughCodec)
         .await
         .map(|_| ())
         .map_err(ExportError::Status)
@@ -247,7 +262,9 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 }
 
 /// gRPC codec that writes a pre-encoded request body as-is and decodes the
-/// collector's `ExportTraceServiceResponse`.
+/// collector's response. The logs and metrics responses share the wire layout
+/// of `ExportTraceServiceResponse` (a `partial_success` message in field 1),
+/// so one decoder serves every signal.
 struct PassthroughCodec;
 
 impl Codec for PassthroughCodec {
@@ -382,7 +399,7 @@ mod tests {
             let batch = Bytes::from(encoded_request("over-http", &[]));
 
             exporter
-                .export(batch.clone())
+                .export(Signal::Traces, batch.clone())
                 .await
                 .expect("export succeeds");
             let export = collector.next_export().await;
@@ -408,7 +425,7 @@ mod tests {
         )
         .unwrap();
         let error = exporter
-            .export(Bytes::from(encoded_request("s", &[])))
+            .export(Signal::Traces, Bytes::from(encoded_request("s", &[])))
             .await
             .expect_err("403 fails");
         assert!(
@@ -432,7 +449,7 @@ mod tests {
 
         let started = Instant::now();
         let error = exporter
-            .export(Bytes::from(encoded_request("s", &[])))
+            .export(Signal::Traces, Bytes::from(encoded_request("s", &[])))
             .await
             .expect_err("closed port fails");
         assert!(matches!(error, ExportError::Http(_)), "{error}");
@@ -463,7 +480,7 @@ mod tests {
 
         let started = Instant::now();
         let error = exporter
-            .export(Bytes::from(encoded_request("s", &[])))
+            .export(Signal::Traces, Bytes::from(encoded_request("s", &[])))
             .await
             .expect_err("silent collector times out");
         assert!(matches!(error, ExportError::Timeout), "{error}");
@@ -473,7 +490,7 @@ mod tests {
             "elapsed {elapsed:?}"
         );
         exporter
-            .export(Bytes::from(encoded_request("s", &[])))
+            .export(Signal::Traces, Bytes::from(encoded_request("s", &[])))
             .await
             .expect("the next export reconnects");
         collector.abort();
@@ -518,7 +535,7 @@ mod tests {
         let grpc = OtlpTestServer::start().await;
         Exporter::new(grpc.endpoint(), OtlpProtocol::Grpc, headers(), None)
             .unwrap()
-            .export(batch())
+            .export(Signal::Traces, batch())
             .await
             .expect("gRPC export succeeds");
         grpc.wait_for_export().await;
@@ -527,7 +544,7 @@ mod tests {
         let mut http = OtlpHttpTestServer::start().await;
         Exporter::new(http.endpoint(), OtlpProtocol::HttpProtobuf, headers(), None)
             .unwrap()
-            .export(batch())
+            .export(Signal::Traces, batch())
             .await
             .expect("HTTP export succeeds");
         assert_eq!(
@@ -559,7 +576,7 @@ mod tests {
             Some(&tls),
         )
         .unwrap()
-        .export(batch())
+        .export(Signal::Traces, batch())
         .await
         .expect("gRPC export over mutual TLS succeeds");
         assert_eq!(grpc.shutdown().await.spans.len(), 1);
@@ -572,7 +589,7 @@ mod tests {
             Some(&tls),
         )
         .unwrap()
-        .export(batch())
+        .export(Signal::Traces, batch())
         .await
         .expect("HTTP export over mutual TLS succeeds");
         assert_eq!(http.next_export().await.path, "/v1/traces");
@@ -593,7 +610,10 @@ mod tests {
             &[("service.name", "unit-agent"), ("custom", "kept")],
         ));
 
-        exporter.export(batch).await.expect("export succeeds");
+        exporter
+            .export(Signal::Traces, batch)
+            .await
+            .expect("export succeeds");
         collector.wait_for_export().await;
         let received = collector.shutdown().await;
 
@@ -622,7 +642,7 @@ mod tests {
 
         let started = Instant::now();
         let error = exporter
-            .export(Bytes::from(encoded_request("s", &[])))
+            .export(Signal::Traces, Bytes::from(encoded_request("s", &[])))
             .await
             .expect_err("closed port fails");
         assert!(matches!(error, ExportError::Status(_)), "{error}");
@@ -646,7 +666,7 @@ mod tests {
         .unwrap();
         let started = Instant::now();
         let error = exporter
-            .export(Bytes::from(encoded_request("s", &[])))
+            .export(Signal::Traces, Bytes::from(encoded_request("s", &[])))
             .await
             .expect_err("silent collector fails");
         assert!(matches!(error, ExportError::Status(_)), "{error}");

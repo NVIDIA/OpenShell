@@ -62,7 +62,7 @@ protocol = "http/protobuf"
 headers  = { x-mlflow-experiment-id = "0" }
 ```
 
-While the relay is on, every workload process gets `OTEL_EXPORTER_OTLP_ENDPOINT` pointing at it, so an agent that uses a standard OpenTelemetry SDK exports without further configuration. Each relayed trace carries `openshell.telemetry.source=agent` and the sandbox's `openshell.sandbox.id`, so you can separate agent traces from OpenShell's own and join them with the sandbox's supervisor spans. For the workload environment, request limits, and delivery guarantees, refer to [Agent Trace Relay](/how-it-works/gateways/configuration#agent-trace-relay).
+While the relay is on, every workload process gets `OTEL_EXPORTER_OTLP_ENDPOINT` pointing at it, so an agent that uses a standard OpenTelemetry SDK exports without further configuration. The relay also forwards the agent's OTLP logs and metrics to the same collector. Each relayed record carries `openshell.telemetry.source=agent` and the sandbox's `openshell.sandbox.id`, so you can separate agent telemetry from OpenShell's own and join them with the sandbox's supervisor spans. For the workload environment, request limits, and delivery guarantees, refer to [Agent Trace Relay](/how-it-works/gateways/configuration#agent-trace-relay).
 
 ## Metrics
 
