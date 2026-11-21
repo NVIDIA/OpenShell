@@ -4,14 +4,10 @@ authors:
 state: draft
 links:
   - https://github.com/ai-openshell/openshell/issues/5852
+  - https://github.com/ai-openshell/openshell/pull/5856
 ---
 
-# RFC NNNN - Stop Idle Agent Sandboxes
-
-<!--
-See rfc/README.md for the full RFC process and state definitions. NNNN is a
-placeholder until maintainers assign the number from the originating issue.
--->
+# RFC 0025 - Stop Idle Agent Sandboxes
 
 ## Summary
 
@@ -172,8 +168,9 @@ sends requests only to supervisors that advertise it.
 
 Ages are relative so supervisor and gateway clocks need not agree. The
 supervisor sends the summary when each gateway session starts, on every change,
-and within 15 seconds of new client input, including the last keystroke before
-typing stops. The latest input time outlives the terminal that received it.
+and, while the program waits on the user, within 15 seconds of new client
+input, including the last keystroke before typing stops. Input to a working
+program is reported with its next state change. The latest input time outlives the terminal that received it.
 `reporting_terminals` counts terminals with a current report, whether or not
 their program sent the support query.
 
@@ -186,25 +183,28 @@ order, so concurrent terminals never hide a transition from the reporter.
 
 The replica holding the supervisor session keeps that session's latest report
 in memory. Only that live report authorizes an idle stop. The gateway also
-records the latest report as a `ProgramStatus` condition in the
-existing `SandboxStatus.conditions` list. This keeps the public `Sandbox`
-messages unchanged: SDK users who build exhaustive `SandboxStatus` literals
-still compile, as the `sandbox_status_compatibility` fixture requires.
+shows it as a `ProgramStatus` condition in the existing
+`SandboxStatus.conditions` list. This keeps the public `Sandbox` messages
+unchanged: SDK users who build exhaustive `SandboxStatus` literals still
+compile, as the `sandbox_status_compatibility` fixture requires.
 
 | Field | Value |
 |-------|-------|
 | `reason` | `Idle`, `Working`, `Done`, `Blocked`, or `Error` |
 | `message` | For example `claude-code is blocked on permission` |
-| `transition_time` | The later of the state change and the latest client input, in gateway time |
+| `transition_time` | When the program entered the state, in gateway time |
 
-The gateway writes the condition only when its reason or message changes, or
-when input moves its time forward by a minute or more. That bounds
-resource-version churn for the reconcile sweep. Writes retry on conflict and are
-fenced to the running main-process instance. The condition is for display only:
-it can lag input by a minute, a failed write can leave it stale, and it outlives
-the session that reported it. Driver snapshots keep the condition, and every lifecycle
-phase change removes it. `openshell sandbox get` and `WatchSandbox` show it
-like any other condition.
+The condition is never stored. `GetSandbox` and each `WatchSandbox` snapshot
+attach it when they read the sandbox, only while the sandbox is `Ready` and the
+report belongs to the running main-process instance. A replica that does not
+hold the session reads it from the owner with the peer RPC
+`PeerGetSandboxProgramStatus`, using the same owner routing as provider status.
+A report that changes the state, blocked kind, or app notifies local watchers.
+Input alone notifies no one, and the supervisor sends input-only reports only
+while the program waits on the user. Reports therefore cost no store writes,
+no resource-version churn for the reconcile sweep, and nothing when idle stop
+is disabled. `ListSandboxes`, and watchers on a replica without the session,
+do not see the condition.
 
 ### Stop idle sandboxes
 
@@ -238,11 +238,7 @@ Before taking any lifecycle lock, the stop task:
 3. waits up to 5 seconds for the reply.
 
 No reply, as from a dead or replaced stream, cancels the stop. Keeping the round
-trip outside the lock lets the session keep reading messages throughout. The
-gateway persists the display condition through one coalescing writer per
-sandbox, never on the message path. Each display write is fenced to the session
-named by the owner record, so a former owner cannot overwrite the new owner's
-status after a handoff.
+trip outside the lock lets the session keep reading messages throughout.
 
 Under the lifecycle lock, each `Stopping` write attempt runs a final check. It
 requires:
@@ -397,11 +393,10 @@ sets a gateway value or a user opts in per sandbox.
   The window is at most one round trip, plus 2 seconds, plus the write's
   latency, and only for a sandbox that already waited past its timeout. Closing it fully would need the
   supervisor to hold input during the commit.
-- **Store churn.** Display writes bump the resource version that the
-  reconcile sweep compares. The one-minute input threshold and
-  transition-only state writes limit this. An active agent still writes twice
-  per turn (`working`, then `done`). Decisions use in-memory reports, so this
-  throttling never delays an input from counting.
+- **Partial visibility.** `ProgramStatus` is not in `ListSandboxes`, and a
+  watcher connected to a replica without the session sees no condition or
+  updates. Fanning reports out to every replica would fix that at the cost of
+  cross-replica traffic per report.
 
 ## Alternatives
 
@@ -424,6 +419,16 @@ Claude Code hooks and similar mechanisms can call out when a turn ends, but
 each agent needs its own configuration inside the sandbox image, and the hook
 runs as workload code with network access. The terminal channel needs nothing
 from the image.
+
+### Store the program status condition
+
+An earlier version wrote `ProgramStatus` to the sandbox record on each state
+change and on input progress of a minute or more. Every reader, on every
+replica, then saw it. But an active agent cost two writes per turn even with
+idle stop disabled, each write bumped the resource version and woke watchers,
+and the writes needed owner fencing, conflict retries, and preservation across
+driver snapshots and phase changes. Reading the live report at serve time
+removes all of that.
 
 ### Do nothing
 
@@ -475,6 +480,6 @@ holding capacity.
 - Should the final check drop the 15-second input report lag? The confirmed
   snapshot has no lag, but the sweep would still need it to avoid needless
   confirmation requests, so the first request is delayed either way.
-- What does `ProgramStatus` display cost fleet-wide? An active agent writes
-  twice per turn, and each write bumps the resource version and notifies
-  watchers. Display writes happen even when idle stop is disabled.
+- Should `ListSandboxes`, or watchers on a replica without the session, show
+  `ProgramStatus`? Doing so needs per-report fan-out or a peer read per
+  sandbox.

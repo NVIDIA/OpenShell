@@ -1065,6 +1065,7 @@ pub(super) async fn handle_get_sandbox(
     } else {
         None
     };
+    let sandbox = with_program_status(state, sandbox).await;
     let mut response = Response::new(SandboxResponse {
         application_service_urls: HashMap::new(),
         gateway_service_urls: HashMap::new(),
@@ -1077,6 +1078,81 @@ pub(super) async fn handle_get_sandbox(
             .insert(openshell_core::replica_routing::OWNER_REPLICA_HEADER, value);
     }
     Ok(response)
+}
+
+/// How long a read waits for the session owner's `ProgramStatus`. The
+/// condition is for display, so a slow owner only hides it.
+const PROGRAM_STATUS_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Attach the live `ProgramStatus` condition. Only the replica that owns the
+/// sandbox's supervisor session holds it, in memory, so another replica asks
+/// the owner. A failed lookup leaves the sandbox without the condition rather
+/// than failing the read.
+pub(super) async fn with_program_status(state: &Arc<ServerState>, mut sandbox: Sandbox) -> Sandbox {
+    let sandbox_id = sandbox.object_id().to_string();
+    let condition = if state.store.is_single_replica()
+        || state.supervisor_sessions.has_session(&sandbox_id)
+    {
+        state.compute.program_status_condition(&sandbox)
+    } else {
+        match crate::supervisor_session::remote_supervisor_owner(state, &sandbox_id).await {
+            Ok(Some(owner)) => {
+                let lookup = crate::supervisor_session::forward_program_status_query_to_owner(
+                    state,
+                    &owner,
+                    &sandbox_id,
+                );
+                match tokio::time::timeout(PROGRAM_STATUS_PEER_TIMEOUT, lookup).await {
+                    Ok(Ok(condition)) => condition,
+                    Ok(Err(status)) => {
+                        debug!(sandbox_id = %sandbox_id, error = %status.message(), "program status lookup failed");
+                        None
+                    }
+                    Err(_) => {
+                        debug!(sandbox_id = %sandbox_id, "program status lookup timed out");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    };
+    if let Some(status) = sandbox.status.as_mut() {
+        status.conditions.retain(|condition| {
+            condition.r#type != openshell_core::metadata::PROGRAM_STATUS_CONDITION
+        });
+        status.conditions.extend(condition);
+    }
+    sandbox
+}
+
+/// Serve a peer replica's read of the live `ProgramStatus` condition. Only
+/// the replica holding the sandbox's supervisor session answers.
+pub(super) async fn handle_peer_get_sandbox_program_status(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::PeerGetSandboxProgramStatusRequest>,
+) -> Result<Response<openshell_core::proto::PeerGetSandboxProgramStatusResponse>, Status> {
+    super::provider_readiness::ensure_peer_request(&request)?;
+    let request = request.into_inner();
+    if request.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&request.sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if !state.supervisor_sessions.has_session(sandbox.object_id()) {
+        return Err(Status::failed_precondition(
+            "gateway peer does not own the sandbox supervisor session",
+        ));
+    }
+    Ok(Response::new(
+        openshell_core::proto::PeerGetSandboxProgramStatusResponse {
+            condition: state.compute.program_status_condition(&sandbox),
+        },
+    ))
 }
 
 pub(super) async fn handle_list_sandboxes(
@@ -2248,11 +2324,12 @@ pub(super) async fn handle_watch_sandbox(
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => {
                     state.sandbox_index.update_from_sandbox(&sandbox);
+                    let shown = with_program_status(&state, sandbox.clone()).await;
                     let _ = tx
                         .send(Ok(SandboxStreamEvent {
                             payload: Some(
                                 openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
-                                    sandbox.clone(),
+                                    shown,
                                 ),
                             ),
                             // Status snapshots are re-read, not resumed by cursor.
@@ -2532,7 +2609,8 @@ pub(super) async fn handle_watch_sandbox(
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                     Ok(Some(sandbox)) => {
                                         state.sandbox_index.update_from_sandbox(&sandbox);
-                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())), cursor: String::new() })).await.is_err() {
+                                        let shown = with_program_status(&state, sandbox.clone()).await;
+                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(shown)), cursor: String::new() })).await.is_err() {
                                             return;
                                         }
                                         if stop_on_terminal {
@@ -7957,6 +8035,123 @@ mod tests {
                 .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
                 .is_none()
         );
+    }
+
+    fn program_status(sandbox: &Sandbox) -> Option<&openshell_core::proto::SandboxCondition> {
+        sandbox
+            .status
+            .as_ref()?
+            .conditions
+            .iter()
+            .find(|condition| {
+                condition.r#type == openshell_core::metadata::PROGRAM_STATUS_CONDITION
+            })
+    }
+
+    async fn sandbox_reporting_done(state: &Arc<ServerState>, name: &str) -> Sandbox {
+        let sandbox = test_sandbox(name, Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        for sessions in [
+            &*state.supervisor_sessions,
+            state.compute.supervisor_sessions_for_test(),
+        ] {
+            sessions.register(
+                sandbox.object_id().to_string(),
+                "session-a".to_string(),
+                mpsc::channel(1).0,
+                oneshot::channel().0,
+            );
+        }
+        state
+            .compute
+            .record_workload_activity(
+                sandbox.object_id(),
+                "session-a",
+                "",
+                true,
+                &openshell_core::proto::SupervisorWorkloadActivity {
+                    state: openshell_core::proto::WorkloadProgramState::Done.into(),
+                    app: "codex".into(),
+                    reporting_terminals: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_shows_the_live_program_status_without_storing_it() {
+        let state = test_server_state().await;
+        let sandbox = sandbox_reporting_done(&state, "reporting").await;
+        let response = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "reporting".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let shown = program_status(response.sandbox.as_ref().unwrap()).unwrap();
+        assert_eq!(shown.reason, "Done");
+        assert_eq!(shown.message, "codex is done");
+
+        let stored = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(program_status(&stored).is_none());
+    }
+
+    #[tokio::test]
+    async fn peers_read_program_status_only_from_the_session_owner() {
+        use openshell_core::proto::PeerGetSandboxProgramStatusRequest;
+        let state = test_server_state().await;
+        let sandbox = sandbox_reporting_done(&state, "owned").await;
+        let peer = |sandbox_id: &str| {
+            let mut request = Request::new(PeerGetSandboxProgramStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+            });
+            request
+                .extensions_mut()
+                .insert(crate::auth::principal::Principal::Peer(
+                    crate::auth::principal::PeerPrincipal {
+                        replica_id: "other-replica".into(),
+                        pod_uid: "peer-pod".into(),
+                    },
+                ));
+            request
+        };
+
+        let answer = handle_peer_get_sandbox_program_status(&state, peer(sandbox.object_id()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(answer.condition.unwrap().reason, "Done");
+
+        let denied = handle_peer_get_sandbox_program_status(
+            &state,
+            authed_request(PeerGetSandboxProgramStatusRequest {
+                sandbox_id: sandbox.object_id().to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let unowned = test_sandbox("unowned", Vec::new());
+        state.store.put_message(&unowned).await.unwrap();
+        let error = handle_peer_get_sandbox_program_status(&state, peer(unowned.object_id()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[test]

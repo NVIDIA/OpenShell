@@ -728,6 +728,15 @@ service OpenShell {
     };
   }
 
+  // Read the live ProgramStatus condition from the replica that owns the
+  // sandbox's supervisor session, which holds it only in memory.
+  rpc PeerGetSandboxProgramStatus(PeerGetSandboxProgramStatusRequest)
+      returns (PeerGetSandboxProgramStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "peer"
+    };
+  }
+
   // Best-effort notification to the replica that owns a supervisor session.
   // The receiver rebuilds snapshots from authoritative state.
   rpc PeerNotifyConfigUpdate(PeerNotifyConfigUpdateRequest)
@@ -3465,6 +3474,17 @@ message SupervisorMessage {
     SupervisorServiceAdvertisement service_advertisement = 6;
     SupervisorWorkloadActivity workload_activity = 7;
   }
+}
+
+// Peer request for a sandbox's live ProgramStatus condition.
+message PeerGetSandboxProgramStatusRequest {
+  string sandbox_id = 1;
+}
+
+// The live ProgramStatus condition, absent when no program currently reports
+// on the owner's session.
+message PeerGetSandboxProgramStatusResponse {
+  SandboxCondition condition = 1;
 }
 
 // Program status summary across workload terminals. Sent when each session

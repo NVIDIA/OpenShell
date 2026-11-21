@@ -1377,6 +1377,13 @@ impl OpenShell for OpenShellService {
         provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
     }
 
+    async fn peer_get_sandbox_program_status(
+        &self,
+        request: Request<openshell_core::proto::PeerGetSandboxProgramStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerGetSandboxProgramStatusResponse>, Status> {
+        sandbox::handle_peer_get_sandbox_program_status(&self.state, request).await
+    }
+
     async fn peer_notify_config_update(
         &self,
         request: Request<PeerNotifyConfigUpdateRequest>,

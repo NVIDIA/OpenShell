@@ -94,8 +94,8 @@ pub const IDLE_STOPPING_REASON: &str = "IdleStopping";
 /// Condition type for the program status workload terminals declare via OSC 7501.
 ///
 /// Its reason is the state (`Idle`, `Working`, `Done`, `Blocked`, or `Error`),
-/// and its transition time is when the program began that state or a client
-/// last typed into a workload terminal, whichever is later.
+/// and its transition time is when the program entered that state. The gateway
+/// attaches it when it serves a sandbox; it is never stored.
 pub const PROGRAM_STATUS_CONDITION: &str = "ProgramStatus";
 
 impl Sandbox {
@@ -127,16 +127,8 @@ impl Sandbox {
         self.status.as_ref().map_or(0, |s| s.phase)
     }
 
-    /// Set the lifecycle phase. A phase change ends the program whose status
-    /// was reported, so its condition is removed with it.
     pub fn set_phase(&mut self, phase: i32) {
-        let status = self.status.get_or_insert_with(SandboxStatus::default);
-        if status.phase != phase {
-            status
-                .conditions
-                .retain(|condition| condition.r#type != PROGRAM_STATUS_CONDITION);
-        }
-        status.phase = phase;
+        self.status.get_or_insert_with(SandboxStatus::default).phase = phase;
     }
 
     pub fn current_policy_version(&self) -> u32 {
@@ -494,24 +486,5 @@ mod tests {
         assert!(!sandbox(SandboxPhase::Stopped, "Stopped").idle_stopped());
         assert!(!sandbox(SandboxPhase::Stopped, IDLE_STOPPING_REASON).idle_stopping());
         assert!(!sandbox(SandboxPhase::Ready, IDLE_STOPPED_REASON).idle_stopped());
-    }
-
-    #[test]
-    fn a_phase_change_removes_the_program_status_condition() {
-        let mut sandbox = sandbox(SandboxPhase::Ready, "DependenciesReady");
-        sandbox
-            .status
-            .as_mut()
-            .unwrap()
-            .conditions
-            .push(SandboxCondition {
-                r#type: super::PROGRAM_STATUS_CONDITION.to_string(),
-                reason: "Done".to_string(),
-                ..Default::default()
-            });
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        assert_eq!(sandbox.status.as_ref().unwrap().conditions.len(), 2);
-        sandbox.set_phase(SandboxPhase::Stopping as i32);
-        assert_eq!(sandbox.status.as_ref().unwrap().conditions.len(), 1);
     }
 }

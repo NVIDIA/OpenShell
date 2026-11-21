@@ -1631,6 +1631,33 @@ pub(crate) async fn forward_provider_status_query_to_owner(
     })
 }
 
+/// Read a sandbox's live `ProgramStatus` condition from the replica that owns
+/// its supervisor session.
+pub(crate) async fn forward_program_status_query_to_owner(
+    state: &Arc<ServerState>,
+    owner: &crate::supervisor_owner::OwnerRecord,
+    sandbox_id: &str,
+) -> Result<Option<openshell_core::proto::SandboxCondition>, Status> {
+    let mut timer = RoutedRequestTimer::start(PeerRpc::GetSandboxProgramStatus);
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
+        .await
+        .inspect_err(|status| timer.local_error(status))?;
+    let result = client
+        .peer_get_sandbox_program_status(
+            openshell_core::proto::PeerGetSandboxProgramStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+            },
+        )
+        .await;
+    timer.finish(&result);
+    result
+        .map(|response| response.into_inner().condition)
+        .inspect_err(|_| {
+            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+            state.peer_routes.evict_owner(sandbox_id);
+        })
+}
+
 pub async fn open_routed_relay_with_target(
     state: &Arc<ServerState>,
     sandbox_id: &str,

@@ -7,10 +7,9 @@
 //! The supervisor reports OSC 7501 program status with relative ages. The
 //! replica that holds a sandbox's supervisor session keeps the latest report
 //! of that session in memory, with exact input time, and decides idleness
-//! from it alone. The stored `ProgramStatus` condition is for display: it is
-//! written only on state changes or coarse input progress, can lag, and can
-//! outlive the session that reported it, so it never authorizes a stop. A
-//! sandbox with no report on its current session is never idle.
+//! from it alone. The same report is shown as the `ProgramStatus` condition,
+//! attached when the sandbox is read and never stored. A sandbox with no
+//! report on its current session is never idle.
 
 use std::time::{Duration, SystemTime};
 
@@ -39,8 +38,6 @@ pub const CONFIRM_FRESHNESS: Duration = Duration::from_secs(2);
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_millis(200);
-/// Input progress smaller than this does not rewrite the displayed condition.
-pub const INPUT_WRITE_GRANULARITY: Duration = Duration::from_mins(1);
 /// Durable marker that the in-flight stop was started by the idle sweep. It
 /// survives gateway restarts and driver snapshots that rewrite conditions.
 pub const IDLE_STOP_ANNOTATION: &str = "internal.openshell.ai/idle-stop";
@@ -115,6 +112,15 @@ pub struct LiveActivity {
 }
 
 impl LiveActivity {
+    /// Whether `other` would be displayed differently: another state, kind,
+    /// or app. Input and ages alone do not change the display.
+    #[must_use]
+    pub fn shows_differently_from(&self, other: &Self) -> bool {
+        self.state != other.state
+            || self.report.blocked_kind != other.report.blocked_kind
+            || self.report.app != other.report.app
+    }
+
     /// Whether `report` from `session_id` is older than this one. A new
     /// session always replaces the entry.
     #[must_use]
@@ -148,7 +154,8 @@ pub fn live_from_report(
 }
 
 /// The `ProgramStatus` condition for a supervisor report received at `now`,
-/// or `None` when no program currently reports.
+/// or `None` when no program currently reports. Its time is when the program
+/// entered the state; input does not move it.
 pub fn condition_from_report(
     report: &SupervisorWorkloadActivity,
     now: SystemTime,
@@ -156,70 +163,18 @@ pub fn condition_from_report(
     let state = WorkloadProgramState::try_from(report.state).ok()?;
     let reason = state_reason(state)?;
     let state_since = before(now, report.state_age.as_ref()).unwrap_or(now);
-    let since =
-        before(now, report.input_age.as_ref()).map_or(state_since, |input| input.max(state_since));
     Some(SandboxCondition {
         r#type: PROGRAM_STATUS_CONDITION.to_string(),
         status: "True".to_string(),
         reason: reason.to_string(),
         message: condition_message(report, reason),
-        transition_time: timestamp(since),
+        transition_time: timestamp(state_since),
     })
 }
 
-/// The stored program condition of a sandbox.
-pub fn program_condition(sandbox: &Sandbox) -> Option<&SandboxCondition> {
-    sandbox
-        .status
-        .as_ref()?
-        .conditions
-        .iter()
-        .find(|condition| condition.r#type == PROGRAM_STATUS_CONDITION)
-}
-
-/// How to update the stored program condition.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ConditionWrite {
-    /// The stored condition is close enough.
-    Keep,
-    Set(SandboxCondition),
-    Remove,
-}
-
-/// How to update the stored condition for the next report.
-///
-/// A repeated state keeps its stored time unless input moved it forward by
-/// the write granularity, so frequent reports do not churn the record and a
-/// reconnecting supervisor cannot postpone an idle stop.
-pub fn merge_condition(
-    stored: Option<&SandboxCondition>,
-    next: Option<SandboxCondition>,
-) -> ConditionWrite {
-    match (stored, next) {
-        (None, None) => ConditionWrite::Keep,
-        (Some(_), None) => ConditionWrite::Remove,
-        (None, Some(next)) => ConditionWrite::Set(next),
-        (Some(stored), Some(next)) => {
-            if stored.reason != next.reason || stored.message != next.message {
-                return ConditionWrite::Set(next);
-            }
-            let advanced = match (
-                system_time(stored.transition_time.as_ref()),
-                system_time(next.transition_time.as_ref()),
-            ) {
-                (Some(stored), Some(next)) => next
-                    .duration_since(stored)
-                    .is_ok_and(|advance| advance >= INPUT_WRITE_GRANULARITY),
-                (None, Some(_)) => true,
-                (_, None) => false,
-            };
-            if advanced {
-                ConditionWrite::Set(next)
-            } else {
-                ConditionWrite::Keep
-            }
-        }
-    }
+/// The `ProgramStatus` condition for a live report.
+pub fn condition_from_live(live: &LiveActivity) -> Option<SandboxCondition> {
+    condition_from_report(&live.report, live.received)
 }
 
 /// The effective idle timeout for a raw setting value, or `None` when idle
@@ -335,10 +290,6 @@ mod tests {
         }
     }
 
-    fn condition(state: WorkloadProgramState, received: u64) -> SandboxCondition {
-        condition_from_report(&report(state, 0, None), at(received)).unwrap()
-    }
-
     fn ready_sandbox(started: u64) -> Sandbox {
         Sandbox {
             status: Some(SandboxStatus {
@@ -362,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn report_becomes_condition_at_the_later_of_state_and_input() {
+    fn report_becomes_condition_at_its_state_change() {
         let done =
             condition_from_report(&report(WorkloadProgramState::Done, 30, Some(90)), at(100))
                 .unwrap();
@@ -372,7 +323,11 @@ mod tests {
         let typed =
             condition_from_report(&report(WorkloadProgramState::Done, 30, Some(5)), at(100))
                 .unwrap();
-        assert_eq!(system_time(typed.transition_time.as_ref()), Some(at(95)));
+        assert_eq!(
+            system_time(typed.transition_time.as_ref()),
+            Some(at(70)),
+            "input does not move the displayed time"
+        );
 
         let mut blocked = report(WorkloadProgramState::Blocked, 0, None);
         blocked.blocked_kind = WorkloadBlockedKind::Permission.into();
@@ -387,27 +342,19 @@ mod tests {
     }
 
     #[test]
-    fn merge_writes_changes_and_coarse_progress_only() {
-        let stored = condition(WorkloadProgramState::Done, 0);
-        assert_eq!(
-            merge_condition(
-                Some(&stored),
-                Some(condition(WorkloadProgramState::Done, 20))
-            ),
-            ConditionWrite::Keep
-        );
-        let later = condition(WorkloadProgramState::Done, 90);
-        assert_eq!(
-            merge_condition(Some(&stored), Some(later.clone())),
-            ConditionWrite::Set(later)
-        );
-        let working = condition(WorkloadProgramState::Working, 5);
-        assert_eq!(
-            merge_condition(Some(&stored), Some(working.clone())),
-            ConditionWrite::Set(working)
-        );
-        assert_eq!(merge_condition(Some(&stored), None), ConditionWrite::Remove);
-        assert_eq!(merge_condition(None, None), ConditionWrite::Keep);
+    fn only_state_kind_and_app_change_the_display() {
+        let done = live(WorkloadProgramState::Done, 100, Some(90));
+        let typed = live(WorkloadProgramState::Done, 160, Some(1));
+        assert!(!done.shows_differently_from(&typed));
+        let working = live(WorkloadProgramState::Working, 160, None);
+        assert!(done.shows_differently_from(&working));
+        let mut other_app = typed;
+        other_app.report.app = "codex".into();
+        assert!(done.shows_differently_from(&other_app));
+        let mut blocked = live(WorkloadProgramState::Blocked, 160, None);
+        let question = blocked.clone();
+        blocked.report.blocked_kind = WorkloadBlockedKind::Permission.into();
+        assert!(blocked.shows_differently_from(&question));
     }
 
     #[test]

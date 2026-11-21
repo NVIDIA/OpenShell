@@ -141,14 +141,16 @@ pub enum PeerRpc {
     ReportProviderReadiness,
     ReportEndpointStatus,
     GetSandboxProviderStatus,
+    GetSandboxProgramStatus,
 }
 
 impl PeerRpc {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Relay,
         Self::ReportProviderReadiness,
         Self::ReportEndpointStatus,
         Self::GetSandboxProviderStatus,
+        Self::GetSandboxProgramStatus,
     ];
 
     const fn operation(self) -> &'static str {
@@ -157,6 +159,7 @@ impl PeerRpc {
             Self::ReportProviderReadiness => "report_provider_readiness",
             Self::ReportEndpointStatus => "report_endpoint_status",
             Self::GetSandboxProviderStatus => "get_sandbox_provider_status",
+            Self::GetSandboxProgramStatus => "get_sandbox_program_status",
         }
     }
 }
@@ -752,6 +755,7 @@ mod tests {
             "report_provider_readiness",
             "report_endpoint_status",
             "get_sandbox_provider_status",
+            "get_sandbox_program_status",
         ] {
             let series = format!(
                 "openshell_server_routed_request_attempts_total{{operation=\"{operation}\",route=\"peer\",relay_kind=\"none\",outcome=\"success\",grpc_code=\"ok\"}}"
@@ -784,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn routed_attempts_have_seven_bounded_success_series_and_keep_counts_on_initialize() {
+    fn routed_attempts_have_eight_bounded_success_series_and_keep_counts_on_initialize() {
         let metrics = MetricsCapture::install();
         for kind in RelayKind::ALL {
             for route in RelayRoute::ALL {
@@ -816,7 +820,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("openshell_server_routed_request_attempts_total{"))
                 .count(),
-            7
+            8
         );
     }
 

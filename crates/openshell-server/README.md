@@ -172,11 +172,14 @@ diagnosis or storage. This lifecycle behavior also applies when updates are disa
 The replica that holds a sandbox's supervisor session keeps that session's
 latest `SupervisorWorkloadActivity` report in memory, in gateway time, and only
 that report authorizes an idle stop. After a gateway restart or a session
-change, nothing stops until the current session reports. The report also
-becomes the `ProgramStatus` condition for display. The condition is written,
-with conflict retries, only when its state changes or input moves its time
-forward by a minute. It is fenced to the running main-process instance,
-survives driver snapshots, and is removed on every phase change.
+change, nothing stops until the current session reports. The same report is
+shown as the `ProgramStatus` condition, which is never stored. `GetSandbox` and
+each `WatchSandbox` snapshot attach it at read time, only while the sandbox is
+`Ready` and the report belongs to the running main-process instance. A replica
+without the session reads it from the owner with
+`PeerGetSandboxProgramStatus`. A report that changes the state, blocked kind,
+or app notifies local watchers; input alone does not. `ListSandboxes` and
+watchers on other replicas do not see it.
 
 Every replica sweeps its own sessions every 30 seconds. A sandbox becomes a
 candidate when it is Ready, its program is idle, done, blocked, or in error, and
@@ -213,11 +216,8 @@ A report is recorded only while its session is still current, checked under the
 gate, so a superseded session's late report never displaces its replacement's.
 
 Live reports carry the supervisor's summary sequence, and an older summary from
-the same session is dropped. One background writer per sandbox persists the
-newest report's display condition, coalescing bursts, so the session never
-waits on the sandbox lock to read its next message. Each write attempt rereads
-the newest report and requires a fresh owner record naming its session, so a
-former owner cannot overwrite the current owner's status after a handoff.
+the same session is dropped. Recording a report writes nothing to the store,
+so the session never waits on the sandbox lock to read its next message.
 
 The stop records the `internal.openshell.ai/idle-stop` annotation with
 `IdleStopping`. That marker survives gateway recovery and settles the stop as

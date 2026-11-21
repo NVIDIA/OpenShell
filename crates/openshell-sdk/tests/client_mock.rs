@@ -280,6 +280,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn peer_get_sandbox_program_status(
+        &self,
+        _request: tonic::Request<proto::PeerGetSandboxProgramStatusRequest>,
+    ) -> Result<Response<proto::PeerGetSandboxProgramStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_endpoint_status(
         &self,
         _request: tonic::Request<proto::ReportEndpointStatusRequest>,

@@ -1038,7 +1038,8 @@ openshell settings set --global --key idle_stop_after_seconds --value 3600
 A global value overrides per-sandbox values. Zero or unset disables idle stop.
 A sandbox keeps running while its agent reports `working`, and a sandbox whose
 programs never report status is never stopped. `openshell sandbox get` shows the
-latest report as the `ProgramStatus` condition.
+latest report as the `ProgramStatus` condition while the sandbox is `Ready`.
+`openshell sandbox list` does not show it.
 
 A waiting report describes only the program that sent it. Idle stop does not
 see other work in the same sandbox, such as a build in another terminal, a

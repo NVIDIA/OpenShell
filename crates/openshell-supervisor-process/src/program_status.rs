@@ -932,8 +932,25 @@ impl Drop for ReporterGuard {
     }
 }
 
+/// Whether new input alone warrants a report. Input only matters while the
+/// program waits on the user: a working program is never idle, and the next
+/// state change reports the input it missed.
+fn input_report_due(
+    snapshot: &ActivitySnapshot,
+    reported_input: Option<Instant>,
+    last_send: Option<Instant>,
+) -> bool {
+    snapshot.last_input != reported_input
+        && snapshot
+            .summary
+            .state
+            .is_some_and(ProgramState::awaits_user)
+        && last_send.is_none_or(|sent| sent.elapsed() >= INPUT_REPORT_INTERVAL)
+}
+
 /// Report activity on one gateway session: once at start, on every summary
-/// change, and within seconds of new client input.
+/// change, and within seconds of new client input while the program waits
+/// on the user.
 pub fn spawn_activity_reporter(
     activity: &Arc<ProgramActivity>,
     tx: tokio::sync::mpsc::Sender<openshell_core::proto::SupervisorMessage>,
@@ -948,9 +965,7 @@ pub fn spawn_activity_reporter(
         let mut send_now = true;
         loop {
             let snapshot = activity.snapshot();
-            let input_advanced = snapshot.last_input != reported_input
-                && last_send.is_none_or(|sent| sent.elapsed() >= INPUT_REPORT_INTERVAL);
-            if send_now || input_advanced {
+            if send_now || input_report_due(&snapshot, reported_input, last_send) {
                 let Ok(sent) = activity.send_report(&tx, "").await else {
                     return;
                 };
@@ -1404,6 +1419,32 @@ mod tests {
         tokio::task::yield_now().await;
         tap.output(b"\x1b]7501;state=working\x07");
         assert!(rx.recv().await.is_none(), "the guard ends the reporter");
+    }
+
+    #[test]
+    fn input_alone_is_reported_only_while_the_program_waits() {
+        let activity = ProgramActivity::new();
+        let mut tap = activity.register(|_| {});
+        let long_ago = Instant::now().checked_sub(INPUT_REPORT_INTERVAL * 2);
+        let marker = tap.input_marker();
+        tap.output(b"\x1b]7501;state=working:app=codex\x07");
+        marker.mark();
+        assert!(
+            !input_report_due(&activity.snapshot(), None, long_ago),
+            "input to a working program waits for its next state change"
+        );
+        tap.output(b"\x1b]7501;state=done:app=codex\x07");
+        marker.mark();
+        let snapshot = activity.snapshot();
+        assert!(input_report_due(&snapshot, None, long_ago));
+        assert!(
+            !input_report_due(&snapshot, snapshot.last_input, long_ago),
+            "input already reported is not reported again"
+        );
+        assert!(
+            !input_report_due(&snapshot, None, Some(Instant::now())),
+            "input reports are spaced"
+        );
     }
 
     #[tokio::test]

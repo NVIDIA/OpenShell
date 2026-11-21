@@ -212,7 +212,7 @@ Mutation locks:
 The labels take these values:
 
 - `operation` is `relay`, `report_provider_readiness`, `report_endpoint_status`,
-  or `get_sandbox_provider_status`. Only relay setup includes the local route;
+  `get_sandbox_provider_status`, or `get_sandbox_program_status`. Only relay setup includes the local route;
   the other operations count outbound peer calls, not local API handling. On the
   owning replica, `openshell_server_grpc_requests_total` records the matching
   `method`, such as `PeerRelay` for `relay`.
@@ -251,9 +251,9 @@ The labels take these values:
 Gauges and counters exist from startup. They start at `0`, except
 `openshell_server_relay_pending_capacity` and
 `openshell_server_mutation_lock_connections_capacity`, which start at their
-limits. `openshell_server_routed_request_attempts_total` starts with seven
+limits. `openshell_server_routed_request_attempts_total` starts with eight
 `outcome="success", grpc_code="ok"` series: four relay kind and route
-combinations, and three other peer operations with `relay_kind="none"`. Other outcomes and codes,
+combinations, and four other peer operations with `relay_kind="none"`. Other outcomes and codes,
 and every histogram, appear after their first sample, so write alert expressions
 that tolerate absent series.
 

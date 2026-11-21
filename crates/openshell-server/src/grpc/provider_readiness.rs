@@ -694,7 +694,7 @@ async fn handle_report_provider_readiness_inner(
     }))
 }
 
-fn ensure_peer_request<T>(request: &Request<T>) -> Result<(), Status> {
+pub(super) fn ensure_peer_request<T>(request: &Request<T>) -> Result<(), Status> {
     if matches!(
         request
             .extensions()

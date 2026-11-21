@@ -233,7 +233,7 @@ mod tests {
     // ProgramStatus condition reuses SandboxCondition, so durable schemas
     // remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "b05c436c6d9133d948bfe8120a2ba1434f1e8603e28bc69eaba3d3fbedff2702";
+        "7f1be3ab9f458e6203d83c9917745b16a6b76ffe6074de25759c869c8151d919";
     const DURABLE_SCHEMA_SHA256: &str =
         "9a025fc84af7c71bce42a52a282d1a96a02f8d71319478bcdb0e0c6367305888";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -277,7 +277,8 @@ mod tests {
         "openshell.v1.OpenShell/GetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/ReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
     ];
-    const PEER_OWNER_RPC_SIGNATURES: [&str; 3] = [
+    const PEER_OWNER_RPC_SIGNATURES: [&str; 4] = [
+        "openshell.v1.OpenShell/PeerGetSandboxProgramStatus|.openshell.v1.PeerGetSandboxProgramStatusRequest|.openshell.v1.PeerGetSandboxProgramStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerGetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
@@ -781,7 +782,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (369, 33),
+                (371, 33),
                 (102, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

@@ -22,8 +22,9 @@ query it sends next. Only the bytes of a possible query are held back, and a
 A sandbox-wide summary takes the most active state across terminals
 (working, then blocked, error, done, idle) and the latest client input, which
 outlives the terminal that received it. Each gateway session receives the
-summary at start, on every change, and within 15 seconds of new input, including
-the last keystroke before typing stops. It also answers each
+summary at start, on every change, and, while the program waits on the user,
+within 15 seconds of new input, including the last keystroke before typing
+stops. Input to a working program is reported with its next state change. It also answers each
 `WorkloadActivityRequest` with the current summary, which the gateway requires
 before an idle stop. Every transition, including one undone within the same
 read, restarts the state timer and advances a revision. Summaries are published
