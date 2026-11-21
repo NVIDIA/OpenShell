@@ -513,6 +513,11 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 
 ### Step 6: Check Kubernetes Helm Gateways
 
+For a dev Helm install, verify that the cluster has pull access to the
+`ghcr.io/ai-openshell/openshell` runtime images, or that matching images were
+preloaded on the nodes. An `ImagePullBackOff` after a successful chart download
+can indicate that Helm had registry access but the cluster did not.
+
 ```bash
 helm -n openshell status openshell
 helm -n openshell get values openshell
