@@ -28,6 +28,7 @@ depends = [
   "test:merge-gateway-toml",
   "test:accepted-work",
   "test:label-issue",
+  "test:commit-policy",
 ]
 
 ["test:gator"]
@@ -122,6 +123,11 @@ run = [
   "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py",
   "uv run --no-project python -m unittest discover -s tasks/scripts -p check_reviewer_collaborators_test.py",
 ]
+hide = true
+
+["test:commit-policy"]
+description = "Test commit signing and agent attribution checks"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_commit_policy_test.py"
 hide = true
 
 ["test:accepted-work"]

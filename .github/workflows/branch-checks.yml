@@ -625,7 +625,28 @@ jobs:
         run: mise run test:qualification-summary
 
       - name: Test accepted-work library, review-readiness, and issue labeling
-        run: "mise run test:accepted-work ::: test:review-readiness ::: test:label-issue"
+        run: "mise run test:accepted-work ::: test:review-readiness ::: test:label-issue ::: test:commit-policy"
+
+  commit-policy:
+    # Commits are checked while the author can still fix them. Merge queue runs
+    # skip this job; the PR already passed it and the queue creates its own
+    # merge commits.
+    name: Commit Policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check commit signing and agent attribution
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 tasks/scripts/check_commit_policy.py --repo "$GH_REPO" --pr "$PR_NUMBER"
+
   python-sdk-freeze:
     # The Python SDK moved to ai-openshell/sdk-python (#5287), which imported it
     # at v0.1.7. Its files stay only until core removes them, so PRs must not
