@@ -12,6 +12,10 @@ inputs:
     description: Whether this job writes the Rust target cache
     required: false
     default: "false"
+  cache-workspace-crates:
+    description: Retain workspace build artifacts as well as dependencies
+    required: false
+    default: "false"
 
 outputs:
   cache-hit:
@@ -49,4 +53,5 @@ runs:
         save-if: ${{ inputs.save-cache }}
         cache-on-failure: ${{ inputs.save-cache }}
         cache-bin: "false"
+        cache-workspace-crates: ${{ inputs.cache-workspace-crates }}
         cmd-format: nix develop -c {0}

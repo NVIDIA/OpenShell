@@ -143,7 +143,10 @@ For a preloaded image, `setup-nix` verifies its global Cachix substituter and
 skips adding it again. A cache-configuration permission failure indicates the
 image/setup contract is out of sync. Rust jobs report shared memcached
 sccache statistics; distinguish backend connectivity errors from compiler/test
-failures. See `CI.md` for the trial scope and cache setup.
+failures. The x86 GKE lint/test jobs also trial separate full Cargo artifact
+caches. Confirm the restored key and cache size in setup-rust, and include the
+post-job save time when comparing cold and warm runs. A hit does not guarantee
+Cargo will reuse every artifact. See `CI.md` for the trial scope and cache setup.
 
 ## View Job Logs
 

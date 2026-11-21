@@ -312,8 +312,10 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: rust-checks-v2
-          save-cache: "false"
+          # Trial full artifacts only on GKE; retain hosted cache behavior.
+          cache-key: ${{ matrix.runner == 'openshell-ci-amd64' && 'gke-rust-lint-artifacts-v1' || 'rust-checks-v2' }}
+          save-cache: ${{ matrix.runner == 'openshell-ci-amd64' && 'true' || 'false' }}
+          cache-workspace-crates: ${{ matrix.runner == 'openshell-ci-amd64' && 'true' || 'false' }}
 
       - name: Lint
         shell: nix develop -c bash -euo pipefail {0}
@@ -360,8 +362,10 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: rust-checks-v2
+          # Trial full artifacts only on GKE; retain hosted cache behavior.
+          cache-key: ${{ matrix.runner == 'openshell-ci-amd64' && 'gke-rust-test-artifacts-v1' || 'rust-checks-v2' }}
           save-cache: "true"
+          cache-workspace-crates: ${{ matrix.runner == 'openshell-ci-amd64' && 'true' || 'false' }}
 
       - name: Verify crypto backend independence
         shell: nix develop -c bash -euo pipefail {0}

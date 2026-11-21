@@ -21,7 +21,13 @@ environment variable expected by the existing checks and Cachix. The custom
 image preloads Nix shells and configures the signed Cachix substituter globally;
 setup verifies that cache and skips duplicate user-level cache configuration.
 Rust jobs use the shared memcached sccache backend and report cache statistics;
-the existing GitHub Rust target/registry cache remains enabled. Inspect the job's
+the existing GitHub Rust target/registry cache remains enabled. The x86 GKE
+lint and test jobs trial separate `gke-rust-*-artifacts-v1` cache namespaces,
+retain workspace crates in the root target directory. Independent-workspace
+targets continue using sccache without expanding the artifact cache trial.
+Compare a populating run with a same-commit rerun, including restore/save time:
+checkout timestamps and build-script invalidation can still trigger rebuilds.
+These trial caches are PR-scoped until compatible caches are seeded on `main`. Inspect the job's
 runner name to confirm whether it ran on GKE. ARM, macOS, and fork jobs do not
 use the cluster-local cache endpoint.
 
