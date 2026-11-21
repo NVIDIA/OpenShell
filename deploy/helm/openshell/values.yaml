@@ -650,6 +650,8 @@ server:
       address: ""
       # -- ConfigMap containing the private Vault CA certificate bundle in the ca.crt key. Leave empty to use platform trust roots.
       caConfigMapName: ""
+      # -- Optional enterprise routing prefix inserted immediately after /v1/ in Vault API URLs, for example business-unit. Leave empty for standard Vault paths.
+      apiPathPrefix: ""
       # -- Default KV mount name.
       mount: secret
       # -- Default KV engine version. Use "1" or "2".
