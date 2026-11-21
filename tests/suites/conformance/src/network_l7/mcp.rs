@@ -129,24 +129,16 @@ fn fixture(request: &Request, supported: &[String], received: &Mutex<Vec<Value>>
         received.push(json!([version, method, params.get("name")]));
         received.clone()
     };
-    let Some(version) =
-        version.filter(|version| request.path() == "/mcp" && supported.contains(version))
-    else {
-        return bad_request("request revision did not reach the fixture intact");
+    // The revision, and for the sessionless revision its metadata, must
+    // arrive as the client sent them.
+    let Some(version) = version.filter(|version| {
+        request.path() == "/mcp"
+            && supported.contains(version)
+            && (version != SESSIONLESS || sessionless_metadata_intact(request, &message, version))
+    }) else {
+        return bad_request("request revision or metadata did not reach the fixture intact");
     };
     let sessionless = version == SESSIONLESS;
-    if sessionless {
-        let meta = &params["_meta"];
-        let intact = request.header("mcp-protocol-version").as_deref() == Some(&version)
-            && request.header("mcp-method").as_deref() == Some(method)
-            && meta["io.modelcontextprotocol/protocolVersion"] == version.as_str()
-            && meta["io.modelcontextprotocol/clientCapabilities"] == json!({})
-            && (method != "tools/call"
-                || request.header("mcp-name").as_deref() == params["name"].as_str());
-        if !intact {
-            return bad_request("request metadata did not reach the fixture intact");
-        }
-    }
 
     let result = match method {
         "initialize" if !sessionless => json!({
@@ -212,6 +204,20 @@ fn subscription(message: &Value) -> Response {
     Response::new(200)
         .header("Content-Type", "text/event-stream")
         .body(body)
+}
+
+/// Whether a sessionless request carries its `version` and method in the
+/// MCP headers and `_meta`, and a tool call its tool name in `Mcp-Name`.
+fn sessionless_metadata_intact(request: &Request, message: &Value, version: &str) -> bool {
+    let method = message["method"].as_str().unwrap_or_default();
+    let params = &message["params"];
+    let meta = &params["_meta"];
+    request.header("mcp-protocol-version").as_deref() == Some(version)
+        && request.header("mcp-method").as_deref() == Some(method)
+        && meta["io.modelcontextprotocol/protocolVersion"] == version
+        && meta["io.modelcontextprotocol/clientCapabilities"] == json!({})
+        && (method != "tools/call"
+            || request.header("mcp-name").as_deref() == params["name"].as_str())
 }
 
 fn bad_request(reason: &str) -> Response {

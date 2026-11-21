@@ -67,7 +67,8 @@ pub mod scripts {
     pub const SOCKET_NOT_INHERITED: &str = include_str!("../scripts/socket_not_inherited.py");
 
     /// Holds a keep-alive connection to a host and port across a policy
-    /// reload, signalling through files in the directory it's given.
+    /// reload: prints `ready`, waits for a line on stdin, then prints the
+    /// status of a second request on the same connection.
     pub const RELOAD_KEEP_ALIVE_CLIENT: &str =
         include_str!("../scripts/reload_keep_alive_client.py");
 

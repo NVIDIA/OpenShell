@@ -434,11 +434,10 @@ fn graphql_post(query: &str) -> clients::Request {
 
 /// `GET /graphql` with `params` form-encoded in the query string.
 fn graphql_get(params: &[(&str, &str)]) -> clients::Request {
-    let query: Vec<String> = params
-        .iter()
-        .map(|(name, value)| format!("{}={}", form_encode(name), form_encode(value)))
-        .collect();
-    clients::Request::get(format!("/graphql?{}", query.join("&")))
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params)
+        .finish();
+    clients::Request::get(format!("/graphql?{query}"))
 }
 
 /// A JSON-RPC message in a `POST /rpc`.
@@ -450,20 +449,6 @@ fn json_post(path: &str, body: &Value) -> clients::Request {
     clients::Request::new("POST", path)
         .header("Content-Type", "application/json")
         .body(body.to_string())
-}
-
-/// `value` encoded for an `application/x-www-form-urlencoded` query string.
-fn form_encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                char::from(byte).to_string()
-            }
-            b' ' => "+".to_string(),
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
 
 /// The `error` code in the JSON body of `reply`'s response, if any.

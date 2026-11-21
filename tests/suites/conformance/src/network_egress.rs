@@ -19,10 +19,6 @@ use testkit::policy::{self, Endpoint as _};
 use testkit::sdk::raw::proto;
 use testkit::{Context, PYTHON_BINARIES, Result, ResultExt as _, Sandbox};
 
-/// The directory [`scripts::RELOAD_KEEP_ALIVE_CLIENT`] signals through, and
-/// where its output goes to `log`.
-const RELOAD_DIR: &str = "/tmp/proxy-reload";
-
 /// The reply [`TcpServer::reply_when_idle`] gives a pipelined request, so the
 /// connection stays usable for the next one.
 const PIPELINE_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -37,35 +33,36 @@ async fn policy_reload_denies_new_and_open_connections(cx: &mut Context) -> test
     allow_host(&mut allowed, "egress", server.port);
     let sandbox = cx.python_sandbox("reld", allowed).create_ready().await?;
 
-    sandbox
-        .exec([
-            "sh",
-            "-c",
-            r#"mkdir -p "$2" && nohup python3 -c "$1" "$3" "$4" "$2" >"$2/log" 2>&1 &"#,
-            "reload-client",
-            scripts::RELOAD_KEEP_ALIVE_CLIENT,
-            RELOAD_DIR,
-            TEST_HOST,
-            &server.port.to_string(),
-        ])
-        .await?
-        .success()
-        .context("start the keep-alive client")?;
-    reload_file(&sandbox, "ready").await?;
+    // The client runs through the CLI so the test can read its stdout and
+    // release it through stdin while it holds the connection open.
+    let mut client = cx.cli_spawn([
+        "sandbox",
+        "exec",
+        "--name",
+        sandbox.name(),
+        "--no-tty",
+        "--",
+        "python3",
+        "-c",
+        scripts::RELOAD_KEEP_ALIVE_CLIENT,
+        TEST_HOST,
+        &server.port.to_string(),
+    ])?;
+    let ready = client.stdout_line(Duration::from_secs(60)).await?;
+    testkit::ensure!(ready == "ready", "keep-alive client: {ready}");
     expect_statuses(&sandbox, server.port, |status| status == Some(200))
         .await
         .context("before the reload")?;
 
     policy::set(&sandbox, &policy::base()).await?;
-    sandbox
-        .exec(["touch", &format!("{RELOAD_DIR}/go")])
-        .await?
-        .success()
+    client
+        .write_stdin(b"go\n")
+        .await
         .context("release the keep-alive client")?;
-    let result: Value = serde_json::from_str(reload_file(&sandbox, "result").await?.trim())
+    let result: Value = serde_json::from_str(&client.stdout_line(Duration::from_secs(60)).await?)
         .context("parse the keep-alive client's result")?;
     testkit::ensure!(
-        result["failed_closed"] == true,
+        result["second_status"] != 200,
         "the open connection forwarded a request after the reload: {result}"
     );
     expect_statuses(&sandbox, server.port, |status| status != Some(200))
@@ -366,25 +363,4 @@ async fn expect_echo(sandbox: &Sandbox, port: u16, payload: &[u8]) -> Result {
         "the payload changed in transit: {reply:?}"
     );
     Ok(())
-}
-
-/// The contents of `name` in [`RELOAD_DIR`], once it exists. A timeout
-/// reports the keep-alive client's log.
-async fn reload_file(sandbox: &Sandbox, name: &str) -> Result<String> {
-    Ok(sandbox
-        .poll_exec(
-            &format!("{RELOAD_DIR}/{name} to appear"),
-            Duration::from_secs(60),
-            [
-                "sh",
-                "-c",
-                r#"cat "$1/$2" || { cat "$1/log"; exit 1; }"#,
-                "reload-file",
-                RELOAD_DIR,
-                name,
-            ],
-            |output| output.exit_code == 0,
-        )
-        .await?
-        .stdout)
 }

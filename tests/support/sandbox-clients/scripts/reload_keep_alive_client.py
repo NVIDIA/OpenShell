@@ -1,19 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Sends a keep-alive GET to argv[1]:argv[2] and creates `ready` in the
-# directory argv[3] once it succeeds. When `go` appears there, sends a second
-# request on the same connection and writes to `result` whether it was
-# refused.
+# Sends a keep-alive GET to argv[1]:argv[2] and prints `ready` once it
+# succeeds, or the error. After a line arrives on stdin, sends a second request
+# on the same connection and prints its status as JSON, 0 if it was refused.
 import json
-import os
 import socket
 import sys
-import time
 
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
-READY, GO, RESULT = (os.path.join(sys.argv[3], name) for name in ("ready", "go", "result"))
 
 
 def read_response(sock):
@@ -37,31 +33,21 @@ def read_response(sock):
 
 
 target = f"{HOST}:{PORT}"
-failed_closed = False
-second_status = 0
-try:
-    with socket.create_connection((HOST, PORT), timeout=10) as sock:
+with socket.create_connection((HOST, PORT), timeout=10) as sock:
+    try:
         sock.sendall(
             f"GET /before-reload HTTP/1.1\r\nHost: {target}\r\nConnection: keep-alive\r\n\r\n".encode()
         )
-        if read_response(sock) != 200:
-            raise RuntimeError("the first request was denied")
-        open(READY, "w").close()
-        deadline = time.monotonic() + 120
-        while not os.path.exists(GO) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if not os.path.exists(GO):
-            raise RuntimeError("timed out waiting for the policy reload")
-        try:
-            sock.sendall(
-                f"GET /after-reload HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode()
-            )
-            second_status = read_response(sock)
-        except OSError:
-            second_status = 0
-        failed_closed = second_status != 200
-finally:
-    # The test reads RESULT as soon as it exists, so it appears complete.
-    with open(RESULT + ".tmp", "w") as result:
-        json.dump({"failed_closed": failed_closed, "second_status": second_status}, result, sort_keys=True)
-    os.replace(RESULT + ".tmp", RESULT)
+        first_status = read_response(sock)
+    except OSError as error:
+        first_status = repr(error)
+    print("ready" if first_status == 200 else f"first request failed: {first_status}", flush=True)
+    sys.stdin.readline()
+    try:
+        sock.sendall(
+            f"GET /after-reload HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode()
+        )
+        second_status = read_response(sock)
+    except OSError:
+        second_status = 0
+    print(json.dumps({"second_status": second_status}), flush=True)

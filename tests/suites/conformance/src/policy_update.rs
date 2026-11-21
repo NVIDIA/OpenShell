@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use testkit::policy;
 use testkit::sdk::raw::proto;
-use testkit::{Context, Result, Sandbox};
+use testkit::{CliOutput, Context, Result, Sandbox};
 
 /// A network-only policy the supervisor fills in with the filesystem paths it
 /// needs at startup, which makes a second revision.
@@ -105,28 +105,15 @@ async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> t
     // Each partial update matches one of ports and binaries fully, so a check
     // that needs both to mismatch can't pass.
     for (target, binaries) in [
-        (
-            "api.example.com:443:POST:/admin",
-            &["/usr/bin/curl", "/usr/bin/python3"][..],
-        ),
+        ("api.example.com:443:POST:/admin", BOTH_BINARIES),
         (
             "api.example.com:443,8443:POST:/admin",
             &["/usr/bin/curl"][..],
         ),
     ] {
-        let mut args = vec![
-            "policy",
-            "update",
-            sandbox.name(),
-            "--rule-name",
-            "internal_api",
-            "--add-allow",
-            target,
-        ];
-        for binary in binaries {
-            args.extend(["--binary", binary]);
-        }
-        cx.cli(args).await?.failure()?;
+        update(cx, &sandbox, "--add-allow", target, binaries)
+            .await?
+            .failure()?;
         let unchanged = policy_get(&sandbox).await?;
         for field in ["version", "hash", "policy"] {
             testkit::ensure!(
@@ -156,7 +143,9 @@ async fn policy_update_changes_only_the_selected_endpoint(cx: &mut Context) -> t
             "/admin/private",
         ),
     ] {
-        update(cx, &sandbox, flag, target).await?;
+        update(cx, &sandbox, flag, target, BOTH_BINARIES)
+            .await?
+            .success()?;
         let updated = policy_get(&sandbox).await?;
         testkit::ensure!(
             version(&updated)? > version(&previous)? && updated["hash"] != previous["hash"],
@@ -237,26 +226,32 @@ fn scoped_policy() -> Result<proto::SandboxPolicy> {
     )
 }
 
-/// Add `rule` to the `internal_api` rule for curl and Python with
-/// `policy update --wait`.
-async fn update(cx: &Context, sandbox: &Sandbox, flag: &str, rule: &str) -> Result {
-    cx.cli([
+/// The binaries of the `internal_api` rule in [`scoped_policy`].
+const BOTH_BINARIES: &[&str] = &["/usr/bin/curl", "/usr/bin/python3"];
+
+/// Run `policy update --wait` on the `internal_api` rule with `flag rule` and
+/// `binaries`, and return the output whether or not it succeeded.
+async fn update(
+    cx: &Context,
+    sandbox: &Sandbox,
+    flag: &str,
+    rule: &str,
+    binaries: &[&str],
+) -> Result<CliOutput> {
+    let mut args = vec![
         "policy",
         "update",
         sandbox.name(),
         "--rule-name",
         "internal_api",
-        "--binary",
-        "/usr/bin/curl",
-        "--binary",
-        "/usr/bin/python3",
         flag,
         rule,
         "--wait",
-    ])
-    .await?
-    .success()?;
-    Ok(())
+    ];
+    for binary in binaries {
+        args.extend(["--binary", binary]);
+    }
+    cx.cli(args).await
 }
 
 /// The sandbox's active policy, checked for a version and hash.
