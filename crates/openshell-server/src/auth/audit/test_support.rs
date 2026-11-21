@@ -41,6 +41,18 @@ pub async fn audited<F: Future>(path: &str, handler: F) -> (F::Output, Vec<Value
     (output, capture.json_events())
 }
 
+/// The credential disclosure events in `capture`, in emission order.
+///
+/// Handlers also emit authorization events, so tests that count disclosures
+/// select by class (Device Config State Change).
+pub fn disclosure_events(capture: &OcsfCapture) -> Vec<Value> {
+    capture
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 5019)
+        .collect()
+}
+
 /// Run a gateway service `call` as a routed request to `path` by
 /// `principal`, returning its result and the mutation records it produced.
 pub async fn audited_mutation<T, F>(

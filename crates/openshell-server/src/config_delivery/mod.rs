@@ -1505,6 +1505,101 @@ mod tests {
         );
     }
 
+    async fn disclosure_events_after(
+        capture: &openshell_ocsf::test_support::OcsfCapture,
+        expected: usize,
+    ) -> Vec<serde_json::Value> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = crate::auth::audit::test_support::disclosure_events(capture);
+                if events.len() >= expected {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("disclosure event")
+    }
+
+    // Over a real ConnectSupervisor stream: credential deliveries are
+    // recorded once the supervisor answers, or as cancelled if it never does.
+    #[tokio::test]
+    async fn stream_credential_deliveries_are_audited() {
+        const CANARY: &str = "canary-stream-token-3017";
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let state = push_state().await;
+        put_provider_with_token(&state, "github", Some(CANARY)).await;
+        put_sandbox(&state, "sandbox", &["github"]).await;
+        let mut harness = connect_supervisor_stream(&state, "sandbox", StreamFeatures::Apply)
+            .await
+            .unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("session acceptance")
+                .payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        let bootstrap = accepted.bootstrap.expect("bootstrap");
+        let environment = bootstrap.provider_environment.as_ref().unwrap();
+        assert!(environment.values.iter().any(|value| value.value == CANARY));
+        // The stream being open is not a disclosure; the answer is.
+        assert!(crate::auth::audit::test_support::disclosure_events(&capture).is_empty());
+
+        let answer = |update: &openshell_core::proto::ConfigUpdate| {
+            openshell_core::proto::SupervisorMessage {
+                payload: Some(
+                    openshell_core::proto::supervisor_message::Payload::ConfigUpdateResult(
+                        session::applied_result(update),
+                    ),
+                ),
+            }
+        };
+        harness.outbound.send(answer(&bootstrap)).await.unwrap();
+        let events = disclosure_events_after(&capture, 1).await;
+        assert_eq!(events[0]["unmapped"]["outcome"], "disclosed");
+        assert_eq!(events[0]["unmapped"]["delivery"], "bootstrap");
+        assert_eq!(events[0]["unmapped"]["actor"], "sandbox:sandbox");
+        assert_eq!(events[0]["unmapped"]["sandbox_id"], "sandbox");
+
+        change_policy(&state, "sandbox", 1).await;
+        publish_sandbox(&state, "sandbox");
+        let Some(gateway_message::Payload::ConfigUpdate(update)) =
+            next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("live update")
+                .payload
+        else {
+            panic!("expected ConfigUpdate");
+        };
+        assert_eq!(
+            crate::auth::audit::test_support::disclosure_events(&capture).len(),
+            1
+        );
+        harness.outbound.send(answer(&update)).await.unwrap();
+        let events = disclosure_events_after(&capture, 2).await;
+        assert_eq!(events[1]["unmapped"]["outcome"], "disclosed");
+        assert_eq!(events[1]["unmapped"]["delivery"], "update");
+        assert_eq!(events[1]["unmapped"]["update_id"], update.update_id);
+
+        // A further update the supervisor never answers is cancelled when
+        // the session ends.
+        change_policy(&state, "sandbox", 2).await;
+        publish_sandbox(&state, "sandbox");
+        next_update(&mut harness, Duration::from_secs(5))
+            .await
+            .expect("second live update");
+        assert!(state.supervisor_sessions.disconnect("sandbox"));
+        let events = disclosure_events_after(&capture, 3).await;
+        assert_eq!(events[2]["unmapped"]["outcome"], "cancelled");
+        for event in &events {
+            crate::auth::audit::test_support::assert_redacted(event, CANARY);
+        }
+    }
+
     fn has_recipient(state: &ServerState, sandbox_id: &str) -> bool {
         state.config_delivery.has_session(sandbox_id)
     }
