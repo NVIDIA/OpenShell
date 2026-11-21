@@ -86,6 +86,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::debug;
 
+#[cfg(test)]
+thread_local! {
+    // Deterministically interleave publication with a relay's revalidation.
+    pub(super) static BEFORE_CONTRACTS_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Endpoint keys that are policy metadata rather than policy semantics.
 ///
 /// `policy_hash` hashes the complete canonical policy, so it differs after
@@ -346,14 +353,11 @@ impl PolicyRevalidator {
     }
 
     fn evaluate(&self, captured_generation: u64) -> Option<u64> {
-        if !self
-            .credentials
-            .as_ref()
-            .is_none_or(CredentialPin::is_current)
-        {
-            return None;
-        }
         let engine = self.engine.upgrade()?;
+        #[cfg(test)]
+        if let Some(checkpoint) = BEFORE_CONTRACTS_CHECK.with_borrow_mut(Option::take) {
+            checkpoint();
+        }
         // Every generation since the pin, not only the latest: a reload that
         // would have closed this connection must close it even if a later one
         // restored its rules before it woke. That includes fail-closed
@@ -363,6 +367,17 @@ impl PolicyRevalidator {
             .connection_contracts_since(&self.input, captured_generation)
             .ok()
             .flatten()?;
+        // Reading contracts waits for policy and credential publication to
+        // finish. Checking credentials earlier can accept the old material,
+        // then re-pin to the generation that replaced it. A later publication
+        // advances the live generation again, so `follow` retries it.
+        if !self
+            .credentials
+            .as_ref()
+            .is_none_or(CredentialPin::is_current)
+        {
+            return None;
+        }
         if !contracts
             .iter()
             .all(|contract| contract.relays_identically_to(&self.baseline))

@@ -1966,7 +1966,7 @@ network_policies:
         inject_static_credential(&request, "API_TOKEN");
 
         change_provider_credentials(&engine, &credentials, 2, &[("API_TOKEN", "b")]);
-        change_provider_credentials(&engine, &credentials, 3, &[("API_TOKEN", "c")]);
+        change_provider_credentials(&engine, &credentials, 3, &[("API_TOKEN", "a")]);
 
         assert!(guard.is_stale());
     }

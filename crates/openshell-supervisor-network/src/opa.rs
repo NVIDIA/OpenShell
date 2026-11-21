@@ -12138,6 +12138,82 @@ network_policies:
         assert!(engine.clone_engine_for_tunnel(2).is_ok());
     }
 
+    #[test]
+    fn revalidation_rechecks_credentials_after_configuration_publication() {
+        use openshell_core::provider_credentials::ProviderCredentialState;
+
+        let proto = test_proto();
+        let engine = Arc::new(OpaEngine::from_proto(&proto).unwrap());
+        let credentials = ProviderCredentialState::from_environment(
+            1,
+            std::collections::HashMap::from([("API_TOKEN".to_string(), "a".to_string())]),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+        .with_use_tracking();
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let guard = engine
+            .revalidating_generation_guard(input, engine.current_generation(), Some(&credentials))
+            .unwrap();
+        let resolver = credentials
+            .resolver_for_endpoint("api.anthropic.com", 443, "/")
+            .unwrap();
+        assert_eq!(
+            resolver
+                .resolve_current_env_key_checked("API_TOKEN", "test")
+                .unwrap(),
+            Some("a")
+        );
+        let (publishing, paused) = std::sync::mpsc::sync_channel(0);
+        let (complete, resume) = std::sync::mpsc::sync_channel(0);
+        let publishing_engine = Arc::clone(&engine);
+        let publisher = std::thread::spawn(move || {
+            publishing_engine
+                .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+                    publishing.send(()).unwrap();
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    credentials.install_environment(
+                        2,
+                        std::collections::HashMap::from([(
+                            "API_TOKEN".to_string(),
+                            "b".to_string(),
+                        )]),
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                    );
+                })
+                .unwrap();
+        });
+        // The generation has advanced, but publication holds the engine lock
+        // and A remains installed. Let revalidation reach the contract query
+        // before allowing the publisher to install B and release that lock.
+        paused
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        revalidation::BEFORE_CONTRACTS_CHECK.set(Some(Box::new(move || {
+            complete.send(()).unwrap();
+            publisher.join().unwrap();
+        })));
+
+        assert!(
+            guard.is_stale(),
+            "the connection authenticated with A, not B"
+        );
+        assert!(
+            guard.is_stale(),
+            "credential invalidation must be permanent"
+        );
+    }
+
     #[tokio::test]
     async fn failed_combined_reload_preserves_policy_registry_and_generation() {
         let proto = test_proto();

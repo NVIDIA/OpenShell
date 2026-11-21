@@ -60,8 +60,8 @@ struct ProviderCredentialStateInner {
     // Revocation must retain this requirement so retrying against a downgraded
     // gateway cannot silently publish revision-scoped replacements.
     requires_stable_placeholders: bool,
-    /// Per-credential versions, refreshed lazily from `current`; see
-    /// [`CredentialVersions`]. Locked only while the state lock is held.
+    /// Per-credential versions, updated before releasing each snapshot's
+    /// write lock; see [`CredentialVersions`]. Locked only under the state lock.
     credential_versions: std::sync::Mutex<CredentialVersions>,
 }
 
@@ -74,11 +74,11 @@ struct ProviderCredentialStateInner {
 /// new one, so a connection can never see an old version become current
 /// again.
 ///
-/// Every change to credential material replaces `current` with a new
-/// snapshot, so versions are recomputed on the first read after `current`
-/// changes, not by each install path. The previous snapshot and resolver are
-/// held to compare against, which also keeps their allocations alive so a
-/// later snapshot can never reuse their addresses.
+/// Every snapshot mutation refreshes versions under the state write lock,
+/// including intermediate installs that no reader observes. Otherwise a
+/// rotation back to an earlier value could revive its old version. Version
+/// accounting starts at the first version read or mutation. The previous
+/// snapshot and resolver remain available for content comparison.
 #[derive(Default)]
 struct CredentialVersions {
     observed: Option<Arc<ProviderCredentialSnapshot>>,
@@ -481,6 +481,7 @@ impl ProviderCredentialState {
         inner.known_static_credential_keys.clear();
         inner.static_credential_identity_epochs.clear();
         inner.body_inventory_available = false;
+        drop(inner.refreshed_versions());
         inner.current.child_env.len()
     }
 
@@ -817,6 +818,7 @@ impl ProviderCredentialState {
         env.child_env.remove(key);
         env.installation_id = uuid::Uuid::new_v4().to_string();
         inner.current = Arc::new(env);
+        drop(inner.refreshed_versions());
     }
 
     /// Return `child_env` with explicitly non-secret config vars resolved.
@@ -973,6 +975,7 @@ impl ProviderCredentialState {
         inner.static_credential_bindings.clear();
         inner.known_static_credential_keys.clear();
         inner.static_credential_identity_epochs.clear();
+        drop(inner.refreshed_versions());
         Ok(revision)
     }
 
@@ -1078,6 +1081,7 @@ impl ProviderCredentialState {
         inner.combined_resolver =
             merge_resolvers(&inner.generations, inner.current_resolver.as_ref());
         inner.non_secret_environment_keys.clear();
+        drop(inner.refreshed_versions());
         inner.current.child_env.len()
     }
 
@@ -1189,6 +1193,7 @@ impl ProviderCredentialState {
         inner.non_secret_environment_keys = non_secret_environment_keys.into_iter().collect();
         inner.static_credential_bindings = static_credential_bindings;
         inner.requires_stable_placeholders = !stable_placeholder_environment_keys.is_empty();
+        drop(inner.refreshed_versions());
         Ok(inner.current.child_env.len())
     }
 
@@ -1264,6 +1269,7 @@ impl ProviderCredentialState {
             .known_body_keys
             .extend(snapshot.child_env.keys().cloned());
         inner.current = Arc::new(snapshot);
+        drop(inner.refreshed_versions());
         inner.current.child_env.len()
     }
 
@@ -1304,6 +1310,7 @@ impl ProviderCredentialState {
         inner.non_secret_environment_keys.clear();
         inner.static_credential_bindings.clear();
         inner.body_inventory_available = false;
+        drop(inner.refreshed_versions());
     }
 }
 
@@ -4613,6 +4620,54 @@ mod tests {
             state.static_credential_version("OTHER_TOKEN"),
             Some(other_rotated)
         );
+    }
+
+    #[test]
+    fn credential_history_survives_coalesced_installs_and_revocations() {
+        for prepared in [false, true] {
+            for intermediate in [Some("b"), None] {
+                let tracked = token_state(10, &[("GITHUB_TOKEN", "a")]).with_use_tracking();
+                inject_static(&tracked, "GITHUB_TOKEN");
+                if let Some(value) = intermediate {
+                    if prepared {
+                        tracked.install_prepared(&token_state(11, &[("GITHUB_TOKEN", value)]));
+                    } else {
+                        reinstall_tokens(&tracked, 11, &[("GITHUB_TOKEN", value)]);
+                    }
+                } else {
+                    tracked.revoke_static_provider_environment(11);
+                }
+                // No version reader observes the intermediate installation.
+                if prepared {
+                    tracked.install_prepared(&token_state(12, &[("GITHUB_TOKEN", "a")]));
+                } else {
+                    reinstall_tokens(&tracked, 12, &[("GITHUB_TOKEN", "a")]);
+                }
+                assert!(
+                    !tracked.credential_uses_current(),
+                    "restoring A must not revive an earlier use (prepared={prepared}, intermediate={intermediate:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grant_history_survives_a_coalesced_configuration_round_trip() {
+        let tracked =
+            grant_state(&[(API_GRANT, "https://idp.example.com/token")]).with_use_tracking();
+        tracked.record_grant_use(API_GRANT);
+        for (revision, endpoint) in [
+            (11, "https://other-idp.example.com/token"),
+            (12, "https://idp.example.com/token"),
+        ] {
+            tracked.install_environment(
+                revision,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(API_GRANT.to_string(), grant_credential(endpoint))]),
+            );
+        }
+        assert!(!tracked.credential_uses_current());
     }
 
     #[test]
