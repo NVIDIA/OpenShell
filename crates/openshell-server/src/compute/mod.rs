@@ -391,12 +391,53 @@ enum QuiesceOperation {
 }
 
 /// Who asked for a quiesce operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum QuiesceCause {
     /// A client request or gateway recovery.
     Requested,
-    /// The idle sweep found the sandbox's program waiting past its timeout.
-    Idle,
+    /// The idle sweep found the sandbox's program waiting past its timeout,
+    /// and its supervisor confirmed that for this stop attempt.
+    Idle(IdleConfirmation),
+}
+
+/// A supervisor's confirmation that its sandbox is idle, owned by the one
+/// stop attempt that requested it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdleConfirmation {
+    /// The session that answered.
+    session_id: String,
+    /// When the reply reached the report handler.
+    arrived: Instant,
+}
+
+/// Marks one sandbox's idle stop as in flight until dropped.
+struct IdleStopInFlight {
+    set: Arc<StdMutex<std::collections::HashSet<String>>>,
+    sandbox_id: String,
+}
+
+impl IdleStopInFlight {
+    fn claim(
+        set: &Arc<StdMutex<std::collections::HashSet<String>>>,
+        sandbox_id: &str,
+    ) -> Option<Self> {
+        set.lock()
+            .expect("idle stop lock poisoned")
+            .insert(sandbox_id.to_string())
+            .then(|| Self {
+                set: Arc::clone(set),
+                sandbox_id: sandbox_id.to_string(),
+            })
+    }
+}
+
+impl Drop for IdleStopInFlight {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .expect("idle stop lock poisoned")
+            .remove(&self.sandbox_id);
+    }
 }
 
 /// What an explicit quiesce request does with the current durable phase.
@@ -431,11 +472,11 @@ impl QuiesceOperation {
         }
     }
 
-    const fn requested_condition(self, cause: QuiesceCause) -> (&'static str, &'static str) {
+    const fn requested_condition(self, cause: &QuiesceCause) -> (&'static str, &'static str) {
         match (self, cause) {
-            (Self::Stop, QuiesceCause::Idle) => (
+            (Self::Stop, QuiesceCause::Idle(_)) => (
                 idle_stop::IDLE_STOPPING_REASON,
-                "Sandbox stop requested after its program waited on the user past its idle timeout",
+                idle_stop::IDLE_STOPPING_MESSAGE,
             ),
             (Self::Stop, QuiesceCause::Requested) => ("Stopping", "Sandbox stop requested"),
             (Self::Suspend, _) => ("Suspending", "Sandbox suspend requested"),
@@ -975,9 +1016,9 @@ pub struct ComputeRuntime {
     /// idle check and the `Stopping` write, so a report received before the
     /// write is never overtaken by a stop decided from an older one.
     activity_gates: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Supervisor confirmations awaiting their idle stop: session and when the
-    /// reply arrived.
-    idle_confirmations: Arc<StdMutex<HashMap<String, (String, Instant)>>>,
+    /// Sandboxes with an idle stop in flight on this replica. A later sweep
+    /// skips them instead of starting a second confirmation and stop.
+    idle_stops_in_flight: Arc<StdMutex<std::collections::HashSet<String>>>,
     /// Sandboxes with a display writer running, and whether a newer report
     /// arrived since it started. One writer per sandbox persists the newest.
     display_writers: Arc<StdMutex<HashMap<String, bool>>>,
@@ -1109,7 +1150,7 @@ impl ComputeRuntime {
             provisioning_repair_window_ms: 300_000,
             live_activity: Arc::default(),
             activity_gates: Arc::default(),
-            idle_confirmations: Arc::default(),
+            idle_stops_in_flight: Arc::default(),
             display_writers: Arc::default(),
             activity_requests: Arc::default(),
             sandbox_updates_enabled: false,
@@ -2132,7 +2173,7 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         self.quiesce_sandbox(
             QuiesceOperation::Stop,
-            QuiesceCause::Requested,
+            &QuiesceCause::Requested,
             workspace,
             name,
         )
@@ -2164,7 +2205,7 @@ impl ComputeRuntime {
         self.require_suspend_resume()?;
         self.quiesce_sandbox(
             QuiesceOperation::Suspend,
-            QuiesceCause::Requested,
+            &QuiesceCause::Requested,
             workspace,
             name,
         )
@@ -2174,7 +2215,7 @@ impl ComputeRuntime {
     async fn quiesce_sandbox(
         &self,
         operation: QuiesceOperation,
-        cause: QuiesceCause,
+        cause: &QuiesceCause,
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
@@ -2209,7 +2250,7 @@ impl ComputeRuntime {
                     // An explicit stop overrides an idle stop, so connecting
                     // no longer starts the sandbox.
                     if operation == QuiesceOperation::Stop
-                        && cause == QuiesceCause::Requested
+                        && *cause == QuiesceCause::Requested
                         && idle_stop::idle_stop_marked(&current)
                     {
                         let (reason, message) = QuiesceOperation::Stop.settled_condition_explicit();
@@ -2256,7 +2297,7 @@ impl ComputeRuntime {
                     // An explicit stop replaces an idle stop still in flight on
                     // another replica, so it cannot settle as `IdleStopped`.
                     if operation == QuiesceOperation::Stop
-                        && cause == QuiesceCause::Requested
+                        && *cause == QuiesceCause::Requested
                         && idle_stop::idle_stop_marked(&current)
                     {
                         let (reason, message) = operation.requested_condition(cause);
@@ -2303,8 +2344,8 @@ impl ComputeRuntime {
             // The final idle check holds this sandbox's activity gate through
             // this attempt's `Stopping` write, so a report received before
             // the write counts. A retry releases it and checks again.
-            let idle_admission = if cause == QuiesceCause::Idle {
-                match self.final_idle_check(&current).await {
+            let idle_admission = if let QuiesceCause::Idle(confirmation) = cause {
+                match self.final_idle_check(&current, confirmation).await {
                     Some(admission) => Some(admission),
                     None => return Err(Status::aborted("sandbox is no longer idle")),
                 }
@@ -5301,6 +5342,10 @@ impl ComputeRuntime {
     /// sandbox is not stopped.
     async fn run_idle_stop(&self, sandbox: &Sandbox) -> Result<Option<Sandbox>, Status> {
         let sandbox_id = sandbox.object_id();
+        let Some(_in_flight) = IdleStopInFlight::claim(&self.idle_stops_in_flight, sandbox_id)
+        else {
+            return Ok(None);
+        };
         let Some(live) = self.current_live_activity(sandbox_id) else {
             return Ok(None);
         };
@@ -5315,22 +5360,18 @@ impl ComputeRuntime {
         let Some(arrived) = self.confirm_activity(sandbox_id, &live.session_id).await else {
             return Ok(None);
         };
-        self.idle_confirmations
-            .lock()
-            .expect("idle confirmation lock poisoned")
-            .insert(sandbox_id.to_string(), (live.session_id, arrived));
+        let cause = QuiesceCause::Idle(IdleConfirmation {
+            session_id: live.session_id,
+            arrived,
+        });
         let result = self
             .quiesce_sandbox(
                 QuiesceOperation::Stop,
-                QuiesceCause::Idle,
+                &cause,
                 sandbox.object_workspace(),
                 sandbox.object_name(),
             )
             .await;
-        self.idle_confirmations
-            .lock()
-            .expect("idle confirmation lock poisoned")
-            .remove(sandbox_id);
         match result {
             Ok(stopped) => Ok(Some(stopped)),
             Err(status) if status.code() == Code::Aborted => Ok(None),
@@ -5350,22 +5391,18 @@ impl ComputeRuntime {
     async fn final_idle_check(
         &self,
         sandbox: &Sandbox,
+        confirmation: &IdleConfirmation,
     ) -> Option<(tokio::sync::OwnedMutexGuard<()>, Instant)> {
         let sandbox_id = sandbox.object_id();
-        let (session_id, confirmed_at) = self
-            .idle_confirmations
-            .lock()
-            .expect("idle confirmation lock poisoned")
-            .get(sandbox_id)
-            .cloned()?;
-        let deadline = confirmed_at + idle_stop::CONFIRM_FRESHNESS;
+        let session_id = &confirmation.session_id;
+        let deadline = confirmation.arrived + idle_stop::CONFIRM_FRESHNESS;
         let check = async {
             let timeout = self.idle_stop_timeout(sandbox).await?;
             let gate = self.activity_gate(sandbox_id).lock_owned().await;
             let live = self.current_live_activity(sandbox_id)?;
-            if live.session_id != session_id
+            if live.session_id != *session_id
                 || idle_stop::idle_stop_due(sandbox, &live, timeout, SystemTime::now()).is_none()
-                || !self.owned_by_session(sandbox_id, &session_id).await
+                || !self.owned_by_session(sandbox_id, session_id).await
             {
                 return None;
             }
@@ -5556,16 +5593,23 @@ impl ComputeRuntime {
         arrived: Instant,
     ) -> Result<(), String> {
         let received = SystemTime::now();
-        let accepted = {
+        let (current, accepted) = {
             let gate = self.activity_gate(sandbox_id);
             let _gate = gate.lock().await;
             let mut live = self
                 .live_activity
                 .lock()
                 .expect("live activity lock poisoned");
-            let accepted = !live
-                .get(sandbox_id)
-                .is_some_and(|held| held.is_newer_than(session_id, report));
+            // Re-check the session here: a report that passed the session
+            // loop's check before a replacement registered must not displace
+            // the replacement's report.
+            let current = self
+                .supervisor_sessions
+                .is_current_session(sandbox_id, session_id);
+            let accepted = current
+                && !live
+                    .get(sandbox_id)
+                    .is_some_and(|held| held.is_newer_than(session_id, report));
             if accepted {
                 live.insert(
                     sandbox_id.to_string(),
@@ -5578,9 +5622,13 @@ impl ComputeRuntime {
                     ),
                 );
             }
-            accepted
+            (current, accepted)
         };
-        if !report.request_id.is_empty()
+        // A reply from a replaced session confirms nothing. An older reply
+        // from the current session still answers: the newer report it lost
+        // to is at least as fresh.
+        if current
+            && !report.request_id.is_empty()
             && let Some(waiter) = self
                 .activity_requests
                 .lock()
@@ -8564,8 +8612,12 @@ fn apply_driver_snapshot(
 
     // A snapshot of the stopped runtime reports why its container exited; an
     // idle stop keeps its own reason so a connect can start the sandbox.
-    if phase == SandboxPhase::Stopped && idle_stop::idle_stop_marked(sandbox) {
-        upsert_ready_condition(&mut status, idle_stop::idle_stopped_condition());
+    if idle_stop::idle_stop_marked(sandbox) {
+        if phase == SandboxPhase::Stopped {
+            upsert_ready_condition(&mut status, idle_stop::idle_stopped_condition());
+        } else if phase == SandboxPhase::Stopping {
+            upsert_ready_condition(&mut status, idle_stop::idle_stopping_condition());
+        }
     }
     if let Some(metadata) = sandbox.metadata.as_mut() {
         metadata.name.clone_from(sandbox_name);
@@ -9493,7 +9545,7 @@ pub fn new_test_runtime_with_driver(
         provisioning_repair_window_ms: 300_000,
         live_activity: Arc::default(),
         activity_gates: Arc::default(),
-        idle_confirmations: Arc::default(),
+        idle_stops_in_flight: Arc::default(),
         display_writers: Arc::default(),
         activity_requests: Arc::default(),
         sandbox_updates_enabled: false,
@@ -10797,7 +10849,7 @@ mod tests {
             provisioning_repair_window_ms: 300_000,
             live_activity: Arc::default(),
             activity_gates: Arc::default(),
-            idle_confirmations: Arc::default(),
+            idle_stops_in_flight: Arc::default(),
             display_writers: Arc::default(),
             activity_requests: Arc::default(),
             sandbox_updates_enabled: false,
@@ -22997,20 +23049,24 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         });
     }
 
-    /// Mark `id` as confirmed idle just now by "session-1", as `run_idle_stop`
-    /// does after a successful round trip.
-    fn mark_confirmed(runtime: &ComputeRuntime, id: &str) {
+    /// Idle-stop `name` with a "session-1" confirmation whose reply reached the
+    /// handler at `arrived`, as `run_idle_stop` does after a round trip.
+    async fn idle_stop_arrived(
+        runtime: &ComputeRuntime,
+        name: &str,
+        arrived: Instant,
+    ) -> Result<Sandbox, Status> {
+        let cause = QuiesceCause::Idle(IdleConfirmation {
+            session_id: "session-1".to_string(),
+            arrived,
+        });
         runtime
-            .idle_confirmations
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), ("session-1".to_string(), Instant::now()));
+            .quiesce_sandbox(QuiesceOperation::Stop, &cause, "default", name)
+            .await
     }
 
     async fn idle_stop_directly(runtime: &ComputeRuntime, name: &str) -> Result<Sandbox, Status> {
-        runtime
-            .quiesce_sandbox(QuiesceOperation::Stop, QuiesceCause::Idle, "default", name)
-            .await
+        idle_stop_arrived(runtime, name, Instant::now()).await
     }
 
     async fn wait_for_phase(runtime: &ComputeRuntime, id: &str, phase: SandboxPhase) -> Sandbox {
@@ -23278,7 +23334,6 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         due_sandbox(&runtime, "sb-race", "sandbox-race").await;
         // The supervisor confirmed idle, then its next message on the same
         // stream reports a new turn before the stop commits.
-        mark_confirmed(&runtime, "sb-race");
         runtime
             .record_workload_activity(
                 "sb-race",
@@ -23301,7 +23356,6 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         due_sandbox(&runtime, "sb-takeover", "sandbox-takeover").await;
-        mark_confirmed(&runtime, "sb-takeover");
         // Another replica publishes ownership for the supervisor's new
         // session before this replica writes Stopping; this replica's local
         // registry still lists the old session.
@@ -23380,7 +23434,6 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         due_sandbox(&runtime, "sb-disabled", "sandbox-disabled").await;
-        mark_confirmed(&runtime, "sb-disabled");
         set_idle_timeout(&runtime, "sandbox-disabled", 0).await;
         let error = idle_stop_directly(&runtime, "sandbox-disabled")
             .await
@@ -23389,16 +23442,10 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
 
         // A stale confirmation does not authorize the write either.
         set_idle_timeout(&runtime, "sandbox-disabled", 60).await;
-        runtime.idle_confirmations.lock().unwrap().insert(
-            "sb-disabled".to_string(),
-            (
-                "session-1".to_string(),
-                Instant::now()
-                    .checked_sub(idle_stop::CONFIRM_FRESHNESS + Duration::from_secs(1))
-                    .expect("test clock is past the freshness window"),
-            ),
-        );
-        let error = idle_stop_directly(&runtime, "sandbox-disabled")
+        let stale = Instant::now()
+            .checked_sub(idle_stop::CONFIRM_FRESHNESS + Duration::from_secs(1))
+            .expect("test clock is past the freshness window");
+        let error = idle_stop_arrived(&runtime, "sandbox-disabled", stale)
             .await
             .unwrap_err();
         assert_eq!(error.code(), Code::Aborted);
@@ -23513,7 +23560,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             &mut sandbox,
             SandboxPhase::Stopping,
             idle_stop::IDLE_STOPPING_REASON,
-            "Sandbox stop requested after its program waited on the user past its idle timeout",
+            idle_stop::IDLE_STOPPING_MESSAGE,
             1800,
             300_000,
         );
@@ -23539,23 +23586,15 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         due_sandbox(&runtime, "sb-expiry", "sandbox-expiry").await;
         // The confirmation is fresh when the final check starts, but the
         // check waits on the gate past its deadline.
-        runtime.idle_confirmations.lock().unwrap().insert(
-            "sb-expiry".to_string(),
-            (
-                "session-1".to_string(),
-                Instant::now()
-                    .checked_sub(
-                        idle_stop::CONFIRM_FRESHNESS.saturating_sub(Duration::from_millis(100)),
-                    )
-                    .expect("test clock is past the freshness window"),
-            ),
-        );
+        let arrived = Instant::now()
+            .checked_sub(idle_stop::CONFIRM_FRESHNESS.saturating_sub(Duration::from_millis(100)))
+            .expect("test clock is past the freshness window");
         let held = runtime.activity_gate("sb-expiry").lock_owned().await;
         let release = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
             drop(held);
         });
-        let error = idle_stop_directly(&runtime, "sandbox-expiry")
+        let error = idle_stop_arrived(&runtime, "sandbox-expiry", arrived)
             .await
             .unwrap_err();
         assert_eq!(error.code(), Code::Aborted);
@@ -23771,5 +23810,106 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             "the retry sees the takeover and leaves the new owner's status"
         );
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_superseded_sessions_late_report_never_displaces_the_replacement() {
+        use openshell_core::proto::WorkloadProgramState;
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        runtime
+            .store
+            .put_message(&idle_ready_record("sb-replaced", "sandbox-replaced"))
+            .await
+            .unwrap();
+        // Session-2 replaced session-1 and reported `Working`.
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        runtime.supervisor_sessions.register(
+            "sb-replaced".to_string(),
+            "session-2".to_string(),
+            tx,
+            shutdown_tx,
+        );
+        runtime
+            .record_workload_activity(
+                "sb-replaced",
+                "session-2",
+                "instance-1",
+                true,
+                &program_report(WorkloadProgramState::Working, 0),
+            )
+            .await
+            .unwrap();
+        // A `Done` from session-1 that passed the session loop's check
+        // before session-2 registered arrives late, along with a reply.
+        let mut late = still_idle();
+        late.sequence = 99;
+        late.request_id = "late-request".into();
+        let (waiter, mut answered) = oneshot::channel();
+        runtime
+            .activity_requests
+            .lock()
+            .unwrap()
+            .insert("late-request".to_string(), waiter);
+        runtime
+            .record_workload_activity("sb-replaced", "session-1", "instance-1", true, &late)
+            .await
+            .unwrap();
+        let live = runtime.current_live_activity("sb-replaced").unwrap();
+        assert_eq!(live.session_id, "session-2");
+        assert_eq!(live.state, WorkloadProgramState::Working);
+        assert!(
+            answered.try_recv().is_err(),
+            "a replaced session's reply confirms nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_idle_stops_run_one_at_a_time() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        due_sandbox(&runtime, "sb-overlap", "sandbox-overlap").await;
+        // A stop attempt from an earlier sweep is still in flight.
+        let earlier = IdleStopInFlight::claim(&runtime.idle_stops_in_flight, "sb-overlap")
+            .expect("first claim succeeds");
+        let sandbox = stored_sandbox(&runtime, "sb-overlap").await;
+        assert!(runtime.run_idle_stop(&sandbox).await.unwrap().is_none());
+        assert_eq!(
+            driver.stop_calls(),
+            0,
+            "the later sweep does not start a second stop"
+        );
+        drop(earlier);
+        assert!(
+            runtime.run_idle_stop(&sandbox).await.unwrap().is_some(),
+            "once the earlier attempt ends, a later sweep can stop it"
+        );
+        assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_idle_stop_keeps_its_reason_through_driver_snapshots() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let mut sandbox = idle_ready_record("sb-stopping", "sandbox-stopping");
+        apply_lifecycle_phase(
+            &mut sandbox,
+            SandboxPhase::Stopping,
+            idle_stop::IDLE_STOPPING_REASON,
+            idle_stop::IDLE_STOPPING_MESSAGE,
+            1800,
+            300_000,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        assert!(sandbox.idle_stopping());
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox("sb-stopping", "sandbox-stopping"))
+            .await
+            .unwrap();
+        let observed = stored_sandbox(&runtime, "sb-stopping").await;
+        assert_eq!(observed.phase(), SandboxPhase::Stopping as i32);
+        assert!(
+            observed.idle_stopping(),
+            "connect can still tell it is an idle stop"
+        );
     }
 }

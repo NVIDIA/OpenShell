@@ -56,7 +56,14 @@ nothing stops a sandbox on its own and no driver implements suspend.
 - Memory checkpoints. Phase 1 stops compute and loses process memory. CRIU or
   VM snapshots are phase 2 and follow the suspend contract, not this RFC.
 - Detecting idleness for programs that do not report OSC 7501. A sandbox with
-  no reports is never stopped automatically.
+  no reports is never stopped automatically. A waiting report describes only
+  its own program. Phase 1 does not see other work in the same sandbox:
+  - a non-reporting terminal;
+  - a non-PTY `sandbox exec`;
+  - a command run in a shell after its agent exited.
+
+  Users can rely on idle stop only when the reporting agent is the sandbox's
+  only long-running work, and the docs say so.
 - Waking on inbound service traffic. Only an explicit connect or start wakes a
   sandbox in phase 1.
 - Interpreting the free-text `msg` and `title` fields. They are validated and
@@ -312,8 +319,11 @@ sequenceDiagram
 
 When the target is `Stopped` with reason `IdleStopped`,
 `openshell sandbox connect` calls `StartSandbox`, waits for `Ready`, then
-connects as usual, printing a one-line notice. An explicitly stopped sandbox
-keeps today's behavior and returns an error.
+connects as usual, printing a one-line notice. When an idle stop is still in
+flight (`Stopping` with reason `IdleStopping`, which the gateway keeps through
+driver snapshots), connect first waits for `Stopped`. An explicitly stopped
+sandbox keeps today's behavior and returns an error. The wake logic lives in the
+CLI; the TUI and SDK do not wake sandboxes in phase 1.
 
 Exec and SSH proxy paths keep their current errors in phase 1, so scripts do
 not start sandboxes implicitly.
@@ -447,4 +457,20 @@ holding capacity.
   accepted, as RFC 0014 asks of unreleased features? No crate defines such a
   flag yet; phase 1 is off unless the setting is set.
 - Is gateway-over-sandbox precedence right for this setting? It lets operators
-  enforce a fleet timeout but stops users from choosing a longer one.
+  enforce a fleet timeout, but it stops users from choosing a shorter or longer
+  one or exempting a sandbox, and a global `0` disables per-sandbox opt-in.
+  Sandbox-over-gateway, or `min(global, sandbox)` with the global as a ceiling,
+  are alternatives.
+- Should other activity hold off an idle stop: a running non-PTY `exec`, an open
+  terminal with no report, or recent output on one? The supervisor already
+  tracks output time but does not report it.
+- Should a new shell command (OSC 133 `C`) clear a terminal's retained `done`,
+  `error`, or `idle` record, so a non-reporting command started after an agent
+  exits is not judged by the agent's last report? The OSC 7501 spec keeps those
+  records across prompts.
+- Should the final check drop the 15-second input report lag? The confirmed
+  snapshot has no lag, but the sweep would still need it to avoid needless
+  confirmation requests, so the first request is delayed either way.
+- What does `ProgramStatus` display cost fleet-wide? An active agent writes
+  twice per turn, and each write bumps the resource version and notifies
+  watchers. Display writes happen even when idle stop is disabled.

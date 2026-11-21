@@ -44,7 +44,9 @@ pub const INPUT_WRITE_GRANULARITY: Duration = Duration::from_mins(1);
 /// Durable marker that the in-flight stop was started by the idle sweep. It
 /// survives gateway restarts and driver snapshots that rewrite conditions.
 pub const IDLE_STOP_ANNOTATION: &str = "internal.openshell.ai/idle-stop";
-pub const IDLE_STOPPING_REASON: &str = "IdleStopping";
+pub use openshell_core::metadata::IDLE_STOPPING_REASON;
+pub const IDLE_STOPPING_MESSAGE: &str =
+    "Sandbox stop requested after its program waited on the user past its idle timeout";
 pub const IDLE_STOPPED_MESSAGE: &str = "Sandbox stopped after its program waited on the user past its idle timeout; connect to start it";
 /// Reported app names are bounded by OSC 7501; bound them again here.
 const MAX_APP: usize = 32;
@@ -275,6 +277,18 @@ pub fn idle_stopped_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: IDLE_STOPPED_REASON.to_string(),
         message: IDLE_STOPPED_MESSAGE.to_string(),
+        transition_time: None,
+    }
+}
+
+/// The Ready condition of a sandbox whose idle stop is in flight, reapplied
+/// over driver snapshots so a connect can tell it apart from other stops.
+pub fn idle_stopping_condition() -> SandboxCondition {
+    SandboxCondition {
+        r#type: "Ready".to_string(),
+        status: "False".to_string(),
+        reason: IDLE_STOPPING_REASON.to_string(),
+        message: IDLE_STOPPING_MESSAGE.to_string(),
         transition_time: None,
     }
 }

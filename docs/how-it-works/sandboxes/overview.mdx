@@ -1040,8 +1040,16 @@ A sandbox keeps running while its agent reports `working`, and a sandbox whose
 programs never report status is never stopped. `openshell sandbox get` shows the
 latest report as the `ProgramStatus` condition.
 
+A waiting report describes only the program that sent it. Idle stop does not
+see other work in the same sandbox, such as a build in another terminal, a
+command started with `openshell sandbox exec`, or a command you run in the
+agent's shell after the agent exits. If an agent waits past the timeout while
+that work runs, the sandbox stops and the work is lost. Enable idle stop only
+for sandboxes where the agent is the only long-running work.
+
 An idle stop moves the sandbox to `Stopped` with the reason `IdleStopped`.
-`openshell sandbox connect` starts such a sandbox before connecting. Running
+`openshell sandbox connect` starts such a sandbox before connecting. If the stop
+is still in progress, connect waits for it to finish first. Running
 `openshell sandbox stop` on it makes the stop explicit, and connect then
 reports it as stopped instead. Process
 memory is not retained: the canonical command starts fresh, so resume the

@@ -88,6 +88,9 @@ impl ObjectWorkspace for Sandbox {
 /// waited on the user longer than the sandbox's idle timeout.
 pub const IDLE_STOPPED_REASON: &str = "IdleStopped";
 
+/// Ready condition reason of a sandbox whose idle stop is still in flight.
+pub const IDLE_STOPPING_REASON: &str = "IdleStopping";
+
 /// Condition type for the program status workload terminals declare via OSC 7501.
 ///
 /// Its reason is the state (`Idle`, `Working`, `Done`, `Blocked`, or `Error`),
@@ -105,6 +108,18 @@ impl Sandbox {
                     .conditions
                     .iter()
                     .any(|c| c.r#type == "Ready" && c.reason == IDLE_STOPPED_REASON)
+        })
+    }
+
+    /// Whether an idle stop of this sandbox is still in flight, so a connect
+    /// should wait for it to finish and then start the sandbox.
+    pub fn idle_stopping(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| {
+            status.phase == crate::proto::SandboxPhase::Stopping as i32
+                && status
+                    .conditions
+                    .iter()
+                    .any(|c| c.r#type == "Ready" && c.reason == IDLE_STOPPING_REASON)
         })
     }
 
@@ -447,5 +462,56 @@ impl ObjectWorkspace for ObjectForTest {
     }
     fn requires_workspace() -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IDLE_STOPPED_REASON, IDLE_STOPPING_REASON};
+    use crate::proto::{Sandbox, SandboxCondition, SandboxPhase, SandboxStatus};
+
+    fn sandbox(phase: SandboxPhase, reason: &str) -> Sandbox {
+        Sandbox {
+            status: Some(SandboxStatus {
+                phase: phase.into(),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: reason.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn idle_stop_predicates_need_both_phase_and_reason() {
+        assert!(sandbox(SandboxPhase::Stopping, IDLE_STOPPING_REASON).idle_stopping());
+        assert!(sandbox(SandboxPhase::Stopped, IDLE_STOPPED_REASON).idle_stopped());
+        assert!(!sandbox(SandboxPhase::Stopping, "Stopping").idle_stopping());
+        assert!(!sandbox(SandboxPhase::Stopped, "Stopped").idle_stopped());
+        assert!(!sandbox(SandboxPhase::Stopped, IDLE_STOPPING_REASON).idle_stopping());
+        assert!(!sandbox(SandboxPhase::Ready, IDLE_STOPPED_REASON).idle_stopped());
+    }
+
+    #[test]
+    fn a_phase_change_removes_the_program_status_condition() {
+        let mut sandbox = sandbox(SandboxPhase::Ready, "DependenciesReady");
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(SandboxCondition {
+                r#type: super::PROGRAM_STATUS_CONDITION.to_string(),
+                reason: "Done".to_string(),
+                ..Default::default()
+            });
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions.len(), 2);
+        sandbox.set_phase(SandboxPhase::Stopping as i32);
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions.len(), 1);
     }
 }

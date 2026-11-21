@@ -4192,7 +4192,14 @@ pub async fn start_if_idle_stopped(
         .into_diagnostic()?
         .into_inner()
         .sandbox;
-    if !sandbox.is_some_and(|sandbox| sandbox.idle_stopped()) {
+    let Some(mut sandbox) = sandbox else {
+        return Ok(());
+    };
+    if sandbox.idle_stopping() {
+        eprintln!("Sandbox {name} is stopping while idle; starting it once it stops");
+        sandbox = wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
+    }
+    if !sandbox.idle_stopped() {
         return Ok(());
     }
     eprintln!("Sandbox {name} was stopped while idle; starting it");

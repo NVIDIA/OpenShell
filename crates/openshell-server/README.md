@@ -184,7 +184,8 @@ candidate when it is Ready, its program is idle, done, blocked, or in error, and
 input report lag has elapsed. The lag runs from the later of the report's time
 and the main-process start.
 
-Before taking any lifecycle lock, the stop task does three things:
+A sweep starts at most one idle stop per sandbox at a time. Before taking any
+lifecycle lock, the stop task does three things:
 
 1. Requires a fresh shared owner record naming the session.
 2. Sends a `WorkloadActivityRequest`.
@@ -205,7 +206,11 @@ before the write is issued, and an attempt that passes it is abandoned. Every
 live report update takes the same gate. A report that takes the gate before
 the final check counts. One that reaches the handler while the stop holds the
 gate waits behind that write. A conflicting write releases the gate and checks
-again.
+again. The confirmation, with its session and reply arrival time, travels with
+that one stop attempt.
+
+A report is recorded only while its session is still current, checked under the
+gate, so a superseded session's late report never displaces its replacement's.
 
 Live reports carry the supervisor's summary sequence, and an older summary from
 the same session is dropped. One background writer per sandbox persists the
