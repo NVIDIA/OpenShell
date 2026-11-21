@@ -197,12 +197,13 @@ fn apply_remote_driver_overrides(
 }
 
 fn validate_remote_driver_config(cfg: &RemoteDriverConfig, name: &str) -> Result<()> {
-    if !cfg.socket_path.as_os_str().is_empty() {
-        return Ok(());
+    if cfg.socket_path.as_os_str().is_empty() {
+        return Err(Error::config(format!(
+            "remote compute driver '{name}' requires socket_path"
+        )));
     }
-    Err(Error::config(format!(
-        "remote compute driver '{name}' requires socket_path"
-    )))
+    openshell_core::unix_socket_path::check(&cfg.socket_path)
+        .map_err(|err| Error::config(format!("remote compute driver '{name}' socket_path: {err}")))
 }
 
 #[cfg(test)]
@@ -509,5 +510,22 @@ socket_path = "/run/openshell/kyma.sock"
             err.to_string()
                 .contains("remote compute driver 'kyma' requires socket_path")
         );
+    }
+
+    #[test]
+    fn remote_driver_config_rejects_overlong_socket_path() {
+        let socket_path = PathBuf::from(format!(
+            "/{}/kyma.sock",
+            "a".repeat(openshell_core::unix_socket_path::MAX_LEN)
+        ));
+        let endpoint_overrides = BTreeMap::from([("kyma".to_string(), socket_path)]);
+
+        let err = remote_driver_config_from_context(
+            test_context_with_endpoint_overrides(None, &endpoint_overrides),
+            "kyma",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("-byte limit"), "{err}");
     }
 }
