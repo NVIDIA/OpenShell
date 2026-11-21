@@ -222,7 +222,7 @@ jobs:
       - name: Tag images as dev
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
+          REGISTRY="ghcr.io/ai-openshell/openshell"
           for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as dev..."
             docker buildx imagetools create \
