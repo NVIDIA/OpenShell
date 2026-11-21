@@ -28,8 +28,7 @@ pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, T
 pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
-    ResolvedEndpointRecord, ResolvedEndpointStore, ResolvedPortContract, StoreConfig,
-    SyntheticPools,
+    ResolvedEndpointRecord, ResolvedEndpointStore, StoreConfig, SyntheticPools,
 };
 
 use crate::opa::OpaEngine;
@@ -43,8 +42,7 @@ use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint,
     NetworkActivityBuilder, SeverityId, StateId, StatusId,
 };
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -108,6 +106,17 @@ pub(crate) enum ConnectLookupError {
     Backoff,
 }
 
+impl ConnectLookupError {
+    /// The mapping failure a denial reports. A failed or backed-off refresh
+    /// leaves the mapping expired.
+    pub(crate) fn mapping_error(&self) -> MappingLookupError {
+        match self {
+            Self::Mapping(error) => *error,
+            Self::Refresh(_) | Self::Backoff => MappingLookupError::Expired,
+        }
+    }
+}
+
 impl<R: TrustedResolver> PolicyDnsService<R> {
     pub(crate) fn new(
         policy: Arc<OpaEngine>,
@@ -131,16 +140,12 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         address: IpAddr,
         port: u16,
     ) -> Result<MappingLookup, ConnectLookupError> {
-        let generation = self.policy.current_generation();
-        let lookup = || {
-            self.store
-                .lookup_intent(address, port, generation, Instant::now())
-        };
+        let lookup = || self.store.lookup_intent(address, port, Instant::now());
         match lookup() {
             Err(MappingLookupError::Expired) => {}
             result => return result.map_err(Into::into),
         }
-        let record = self.store.expired_for_connect(address, port, generation)?;
+        let record = self.store.expired_for_connect(address)?;
         // Only known, eligible allocations acquire entries, bounded by the
         // store's allocation budget. Concurrent connects share one refresh.
         let refresh = self
@@ -155,9 +160,6 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             Err(MappingLookupError::Expired) => {}
             result => return result.map_err(Into::into),
         }
-        if self.policy.current_generation() != generation {
-            return Err(MappingLookupError::StalePolicy.into());
-        }
         if failed_at.is_some_and(|failed| failed.elapsed() < MIN_MAPPING_TTL) {
             return Err(ConnectLookupError::Backoff);
         }
@@ -170,10 +172,31 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             .await;
         *failed_at = answer.as_ref().err().map(|_| Instant::now());
         let answer = answer?;
-        if (answer.address, answer.policy_generation) != (record.synthetic_address, generation) {
-            return Err(MappingLookupError::StalePolicy.into());
+        // The refresh is judged by the current policy. A name it no longer
+        // approves is staged as an observation at another address.
+        if answer.address != record.synthetic_address {
+            return Err(MappingLookupError::PolicyChanged.into());
         }
         lookup().map_err(Into::into)
+    }
+
+    /// The live mapping to pin an authorized connection to. Authorization runs
+    /// between [`Self::lookup_for_connect`] and this lookup, and a short-lived
+    /// mapping can expire meanwhile, so an expired mapping is refreshed here
+    /// too. Observations pin no address and are refused.
+    pub(crate) async fn lookup_for_pin(
+        &self,
+        address: IpAddr,
+        port: u16,
+    ) -> Result<MappingLookup, MappingLookupError> {
+        let lookup = self
+            .lookup_for_connect(address, port)
+            .await
+            .map_err(|error| error.mapping_error())?;
+        if lookup.record.is_observation() {
+            return Err(MappingLookupError::EndpointMismatch);
+        }
+        Ok(lookup)
     }
 
     pub(crate) async fn answer_query(
@@ -262,15 +285,13 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         // Start the lease after resolution: a TTL-zero answer must still be
         // usable when the trusted resolver takes longer than the TTL floor.
         let now = now + started.elapsed();
-        let allocation_identity = allocation_identity(&eligible);
-        let eligible_ports = eligible
-            .iter()
-            .flat_map(|endpoint| endpoint.ports.iter().copied())
-            .collect();
-        let mut contracts = Vec::new();
-        for endpoint in eligible {
-            for port in endpoint.ports {
-                let Ok(pinned_addresses) = filter_resolved_addresses(
+        // Pin every answer some eligible endpoint permits on one of its ports.
+        // Each connection is filtered again through its own endpoint's rules.
+        let mut permitted = BTreeSet::new();
+        let mut ports = BTreeSet::new();
+        for endpoint in &eligible {
+            for &port in &endpoint.ports {
+                let Ok(addresses) = filter_resolved_addresses(
                     &endpoint.destination_plan,
                     normalized_name.as_str(),
                     port,
@@ -278,18 +299,19 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
                 ) else {
                     continue;
                 };
-                contracts.push(ResolvedPortContract {
-                    endpoint_id: endpoint.endpoint_id.clone(),
-                    port,
-                    destination_plan: endpoint.destination_plan.clone(),
-                    pinned_addresses,
-                });
+                if !addresses.is_empty() {
+                    permitted.extend(addresses);
+                    ports.insert(port);
+                }
             }
         }
-        contracts.sort_by(|left, right| {
-            (&left.endpoint_id, left.port).cmp(&(&right.endpoint_id, right.port))
-        });
-        if contracts.is_empty() {
+        let pinned_addresses = trusted_answer
+            .addresses
+            .iter()
+            .copied()
+            .filter(|address| permitted.contains(address))
+            .collect::<Vec<_>>();
+        if pinned_addresses.is_empty() {
             emit_dns_denial(
                 &normalized_name,
                 "policy_dns_no_valid_address",
@@ -301,11 +323,9 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         let request = PublishRequest {
             normalized_name: normalized_name.clone(),
             family,
-            allocation_identity,
             policy_generation: snapshot.generation,
             ttl,
-            eligible_ports,
-            contracts,
+            pinned_addresses,
         };
         let record = self.publish_guarded(
             &normalized_name,
@@ -314,7 +334,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             snapshot.generation,
             |current_generation| self.store.publish(request, current_generation, now),
         )?;
-        emit_mapping_publication(&record);
+        emit_mapping_publication(&record, &ports);
         Ok(SyntheticAnswer {
             address: record.synthetic_address,
             ttl,
@@ -413,6 +433,10 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         }
     }
 
+    /// The bare store, for tests. Connections look mappings up through
+    /// [`Self::lookup_for_connect`] and [`Self::lookup_for_pin`], which refresh
+    /// expired mappings.
+    #[cfg(test)]
     pub(crate) fn store(&self) -> &Arc<ResolvedEndpointStore> {
         &self.store
     }
@@ -429,7 +453,6 @@ struct EligibleEndpoint {
     endpoint_id: PolicyEndpointId,
     ports: Vec<u16>,
     destination_plan: crate::proxy::destination::DestinationValidationPlan,
-    contract_fingerprint: String,
 }
 
 fn eligible_endpoints(
@@ -476,31 +499,9 @@ fn eligible_endpoints(
             },
             ports,
             destination_plan,
-            contract_fingerprint: endpoint.endpoint.to_string(),
         });
     }
     Ok(eligible)
-}
-
-fn allocation_identity(endpoints: &[EligibleEndpoint]) -> [u8; 32] {
-    let mut contracts = endpoints
-        .iter()
-        .map(|endpoint| {
-            format!(
-                "{}\0{}\0{}",
-                endpoint.endpoint_id.policy_name,
-                endpoint.endpoint_id.endpoint_index,
-                endpoint.contract_fingerprint
-            )
-        })
-        .collect::<Vec<_>>();
-    contracts.sort();
-    let mut hasher = Sha256::new();
-    for contract in contracts {
-        hasher.update(contract.as_bytes());
-        hasher.update([0xff]);
-    }
-    hasher.finalize().into()
 }
 
 fn eligible_endpoint_context(endpoints: &[EligibleEndpoint]) -> Vec<PolicyEndpointId> {
@@ -673,8 +674,8 @@ fn emit_dns_failure(
     ));
 }
 
-fn emit_mapping_publication(record: &ResolvedEndpointRecord) {
-    egress_emit!(build_mapping_publication_event(record));
+fn emit_mapping_publication(record: &ResolvedEndpointRecord, ports: &BTreeSet<u16>) {
+    egress_emit!(build_mapping_publication_event(record, ports));
 }
 
 fn emit_observation_publication(record: &ResolvedEndpointRecord) {
@@ -701,16 +702,21 @@ fn build_observation_publication_event(
         .build()
 }
 
-fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell_ocsf::OcsfEvent {
+/// `ports` are the ports the eligible endpoints allowed at publication, for
+/// operators; each connection is authorized by the policy current when it is
+/// made.
+fn build_mapping_publication_event(
+    record: &ResolvedEndpointRecord,
+    ports: &BTreeSet<u16>,
+) -> openshell_ocsf::OcsfEvent {
     let approved_real_ip_candidates = record
-        .contracts
+        .pinned_addresses
         .iter()
-        .flat_map(|contract| contract.pinned_addresses.iter().copied())
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(|address| address.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let allowed_ports = record.allowed_ports().into_iter().collect::<Vec<_>>();
+    let allowed_ports = ports.iter().copied().collect::<Vec<_>>();
     let mapping_id = record.mapping_id.to_string();
     let message = format!(
         "Policy DNS mapped {} resolved={} synthetic={} ports={} mapping_id={mapping_id}",
@@ -741,6 +747,48 @@ fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell
         .unmapped("mapping_id", mapping_id)
         .message(message)
         .build()
+}
+
+/// A policy DNS service whose trusted resolver answers every name with
+/// `addresses`, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn test_service(
+    policy: Arc<OpaEngine>,
+    store: Arc<ResolvedEndpointStore>,
+    addresses: Vec<IpAddr>,
+) -> PolicyDnsService<impl TrustedResolver> {
+    test_service_with_gateway(policy, store, addresses, None)
+}
+
+/// [`test_service`] with a trusted host gateway for the reserved alias.
+#[cfg(test)]
+pub(crate) fn test_service_with_gateway(
+    policy: Arc<OpaEngine>,
+    store: Arc<ResolvedEndpointStore>,
+    addresses: Vec<IpAddr>,
+    trusted_host_gateway: Option<IpAddr>,
+) -> PolicyDnsService<impl TrustedResolver> {
+    struct FixedResolver(Vec<IpAddr>);
+
+    impl TrustedResolver for FixedResolver {
+        async fn resolve(
+            &self,
+            _name: &NormalizedName,
+            _family: AddressFamily,
+        ) -> Result<TrustedAnswer, resolver::ResolveError> {
+            Ok(TrustedAnswer {
+                addresses: self.0.clone(),
+                ttl: MAX_MAPPING_TTL,
+            })
+        }
+    }
+
+    PolicyDnsService::new(
+        policy,
+        FixedResolver(addresses),
+        store,
+        trusted_host_gateway,
+    )
 }
 
 #[cfg(test)]
@@ -921,12 +969,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 "{case}"
             );
             assert!(matches!(
-                service.store.lookup(
-                    answer.address,
-                    5432,
-                    answer.policy_generation,
-                    Instant::now()
-                ),
+                service.store.lookup(answer.address, 5432, Instant::now()),
                 Err(MappingLookupError::Expired)
             ));
             assert!(matches!(
@@ -943,7 +986,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             assert_eq!(recovered.record.synthetic_address, answer.address);
             assert_ne!(recovered.record.mapping_id, answer.mapping_id);
             assert_eq!(
-                recovered.record.contracts[0].pinned_addresses,
+                recovered.record.pinned_addresses,
                 ["8.8.4.4".parse::<IpAddr>().unwrap()]
             );
             let reused = service
@@ -970,16 +1013,21 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             ],
         );
         let answer = expired_answer(&service).await;
-        service
+        let refreshed = service
             .lookup_for_connect(answer.address, 5432)
             .await
             .unwrap();
-        assert!(matches!(
-            service.lookup_for_connect(answer.address, 443).await,
-            Err(ConnectLookupError::Mapping(
-                MappingLookupError::PortMismatch
-            ))
-        ));
+        assert_eq!(
+            refreshed.record.pinned_addresses,
+            ["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+        // A live mapping serves every port; each connection is pinned to the
+        // addresses its own endpoint permits.
+        let live = service
+            .lookup_for_connect(answer.address, 443)
+            .await
+            .unwrap();
+        assert_eq!(live.record.mapping_id, refreshed.record.mapping_id);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(service.store.expire(Instant::now()).unwrap(), 1);
         let recovered = service
@@ -987,47 +1035,41 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .await
             .unwrap();
         assert_eq!(
-            recovered
-                .pinned_addresses_for(&[PolicyEndpointId {
-                    policy_name: "database".into(),
-                    endpoint_index: 1
-                }])
-                .unwrap(),
-            ["8.8.4.4".parse::<IpAddr>().unwrap()]
+            recovered.record.pinned_addresses,
+            [
+                "8.8.8.8".parse::<IpAddr>().unwrap(),
+                "8.8.4.4".parse().unwrap()
+            ]
         );
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn connect_lookup_rejects_ineligible_refresh_without_dns() {
-        for case in ["wrong port", "expired observation", "stale generation"] {
+        for case in ["expired observation", "policy revoked"] {
             let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
             let answer = expired_answer(&service).await;
-            let (address, port, expected) = match case {
-                "wrong port" => (answer.address, 3306, MappingLookupError::PortMismatch),
-                "expired observation" => {
-                    let observed = service
-                        .answer_query(
-                            "unknown.example",
-                            AddressFamily::Ipv4,
-                            Instant::now().checked_sub(Duration::from_mins(1)).unwrap(),
-                        )
-                        .await
-                        .unwrap();
-                    (observed.address, 5432, MappingLookupError::Expired)
-                }
-                _ => {
-                    service
-                        .policy
-                        .reload(
-                            include_str!("../../data/sandbox-policy.rego"),
-                            "network_policies: {}\n",
-                        )
-                        .unwrap();
-                    (answer.address, 5432, MappingLookupError::StalePolicy)
-                }
+            let (address, expected) = if case == "expired observation" {
+                let observed = service
+                    .answer_query(
+                        "unknown.example",
+                        AddressFamily::Ipv4,
+                        Instant::now().checked_sub(Duration::from_mins(1)).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                (observed.address, MappingLookupError::Expired)
+            } else {
+                service
+                    .policy
+                    .reload(
+                        include_str!("../../data/sandbox-policy.rego"),
+                        "network_policies: {}\n",
+                    )
+                    .unwrap();
+                (answer.address, MappingLookupError::PolicyChanged)
             };
-            let result = service.lookup_for_connect(address, port).await;
+            let result = service.lookup_for_connect(address, 5432).await;
             assert!(
                 matches!(result, Err(ConnectLookupError::Mapping(error)) if error == expected),
                 "{case}: {result:?}"
@@ -1076,6 +1118,48 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         .expect("one DNS response must satisfy all waiting connects");
     }
 
+    /// Authorization runs between the connect lookup and the pin lookup. A
+    /// TTL-0 mapping that expires in between is refreshed, not refused.
+    #[tokio::test]
+    async fn pin_lookup_refreshes_a_mapping_that_expired_during_authorization() {
+        let service = scripted_service(
+            BASE_POLICY,
+            vec![Ok(dns_answer(&["8.8.8.8"])), Ok(dns_answer(&["8.8.4.4"]))],
+        );
+        let answer = service
+            .answer_query("db.example", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+        let connect = service
+            .lookup_for_connect(answer.address, 5432)
+            .await
+            .unwrap();
+        assert_eq!(connect.record.mapping_id, answer.mapping_id);
+
+        tokio::time::sleep(MIN_MAPPING_TTL + Duration::from_millis(100)).await;
+        let pinned = service.lookup_for_pin(answer.address, 5432).await.unwrap();
+        assert_eq!(pinned.record.synthetic_address, answer.address);
+        assert_ne!(pinned.record.mapping_id, answer.mapping_id);
+        assert_eq!(
+            pinned.record.pinned_addresses,
+            ["8.8.4.4".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pin_lookup_refuses_an_observation() {
+        let service = service(BASE_POLICY, vec![]);
+        let observed = service
+            .answer_query("unknown.example", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.lookup_for_pin(observed.address, 443).await.err(),
+            Some(MappingLookupError::EndpointMismatch)
+        );
+    }
+
     #[tokio::test]
     async fn policy_revocation_during_expired_mapping_refresh_fails_closed() {
         let base = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
@@ -1122,12 +1206,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         assert!(
             service
                 .store
-                .lookup_intent(
-                    answer.address,
-                    80,
-                    service.policy.current_generation(),
-                    Instant::now()
-                )
+                .lookup_intent(answer.address, 80, Instant::now())
                 .is_ok()
         );
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
@@ -1142,23 +1221,16 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .await
             .expect("synthetic observation address");
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
-        let generation = service.policy.current_generation();
         assert!(matches!(
-            service.store.lookup(answer.address, 80, generation, now),
-            Err(MappingLookupError::PortMismatch)
+            service.store.lookup(answer.address, 80, now),
+            Err(MappingLookupError::EndpointMismatch)
         ));
         let intent = service
             .store
-            .lookup_intent(answer.address, 80, generation, now)
+            .lookup_intent(answer.address, 80, now)
             .expect("name available for a later denied connection");
         assert_eq!(intent.record.normalized_name.as_str(), "pypi.org");
         assert!(intent.record.is_observation());
-        assert!(matches!(
-            service
-                .store
-                .lookup_intent(answer.address, 80, generation + 1, now),
-            Err(MappingLookupError::StalePolicy)
-        ));
     }
 
     #[tokio::test]
@@ -1404,12 +1476,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             Err(PolicyDnsError::Resolver(resolver::ResolveError::NxDomain))
         ));
         assert!(matches!(
-            store.lookup(
-                "198.18.0.1".parse().unwrap(),
-                5432,
-                service.policy.current_generation(),
-                Instant::now()
-            ),
+            store.lookup("198.18.0.1".parse().unwrap(), 5432, Instant::now()),
             Err(MappingLookupError::Missing)
         ));
     }
@@ -1426,13 +1493,10 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .await
             .unwrap();
         assert_eq!(answer.ttl, MAX_MAPPING_TTL);
-        let mapping = service
-            .store
-            .lookup(answer.address, 5432, answer.policy_generation, now)
-            .unwrap();
+        let mapping = service.store.lookup(answer.address, 5432, now).unwrap();
         assert_eq!(mapping.record.normalized_name.as_str(), "db.example");
         assert_eq!(
-            mapping.record.contracts[0].pinned_addresses,
+            mapping.record.pinned_addresses,
             ["10.2.3.4".parse::<IpAddr>().unwrap()]
         );
     }
@@ -1448,12 +1512,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .answer_query("DB.EXAMPLE.", AddressFamily::Ipv4, now)
             .await
             .unwrap();
-        let mapping = service
-            .store
-            .lookup(answer.address, 5432, answer.policy_generation, now)
-            .unwrap();
+        let mapping = service.store.lookup(answer.address, 5432, now).unwrap();
 
-        let event = build_mapping_publication_event(&mapping.record);
+        let event = build_mapping_publication_event(&mapping.record, &BTreeSet::from([5432]));
         let json = event.to_json().unwrap();
         let unmapped = &json["unmapped"];
         assert_eq!(unmapped["normalized_domain"], "db.example");
@@ -1503,18 +1564,16 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 .answer_query("10.2.3.4.", AddressFamily::Ipv4, now)
                 .await
                 .expect("the exact endpoint must retain its private address grant");
-            let mapping = service
-                .store
-                .lookup(answer.address, 8443, answer.policy_generation, now)
-                .unwrap();
-            assert_eq!(mapping.record.contracts.len(), 1);
-            assert_eq!(mapping.record.contracts[0].pinned_addresses, [ip]);
-            assert!(matches!(
-                service
-                    .store
-                    .lookup(answer.address, 443, answer.policy_generation, now),
-                Err(MappingLookupError::PortMismatch)
-            ));
+            let mapping = service.store.lookup(answer.address, 8443, now).unwrap();
+            assert_eq!(mapping.record.pinned_addresses, [ip]);
+            // Only the exact endpoint grants the private literal: a connection
+            // decided by the wildcard (port 443) reaches no pinned address.
+            let exact =
+                build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], true).unwrap();
+            assert!(mapping.pinned_plan(&exact).is_ok());
+            let denial = build_validation_plan("10.2.3.4", "10.2.3.4", None, None, &[], false)
+                .expect_err("a wildcard cannot authorize an internal IP literal");
+            assert_eq!(denial.kind, DestinationDenialKind::InternalAddress);
         }
     }
 
@@ -1529,14 +1588,12 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 .await
                 .expect("an ineligible numeric name can only stage an observation");
             assert!(matches!(
-                service
-                    .store
-                    .lookup(answer.address, 5432, answer.policy_generation, now),
-                Err(MappingLookupError::PortMismatch)
+                service.store.lookup(answer.address, 5432, now),
+                Err(MappingLookupError::EndpointMismatch)
             ));
             let intent = service
                 .store
-                .lookup_intent(answer.address, 5432, answer.policy_generation, now)
+                .lookup_intent(answer.address, 5432, now)
                 .unwrap();
             assert!(intent.record.is_observation());
             assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
@@ -1615,11 +1672,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                         .answer_query("db.example", family, now)
                         .await
                         .unwrap();
-                    let mapping = service
-                        .store
-                        .lookup(answer.address, 5432, answer.policy_generation, now)
-                        .unwrap();
-                    assert_eq!(mapping.record.contracts[0].pinned_addresses, [public]);
+                    let mapping = service.store.lookup(answer.address, 5432, now).unwrap();
+                    assert_eq!(mapping.record.pinned_addresses, [public]);
                 }
                 // Explicit narrow address permission retains its usual precedence.
                 let yaml = yaml.replace(
@@ -1632,11 +1686,8 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     .answer_query("db.example", family, now)
                     .await
                     .unwrap();
-                let mapping = service
-                    .store
-                    .lookup(answer.address, 5432, answer.policy_generation, now)
-                    .unwrap();
-                assert_eq!(mapping.record.contracts[0].pinned_addresses, [private]);
+                let mapping = service.store.lookup(answer.address, 5432, now).unwrap();
+                assert_eq!(mapping.record.pinned_addresses, [private]);
             }
         }
     }
@@ -1654,12 +1705,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .answer_query("db.example", AddressFamily::Ipv4, now)
             .await
             .unwrap();
-        let mapping = service
-            .store
-            .lookup(answer.address, 5432, answer.policy_generation, now)
-            .unwrap();
+        let mapping = service.store.lookup(answer.address, 5432, now).unwrap();
         assert_eq!(
-            mapping.record.contracts[0].pinned_addresses,
+            mapping.record.pinned_addresses,
             ["10.2.3.4".parse::<IpAddr>().unwrap()]
         );
     }
@@ -1723,12 +1771,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .answer_query("host.openshell.internal", AddressFamily::Ipv4, now)
             .await
             .unwrap();
-        let mapping = service
-            .store
-            .lookup(answer.address, 8080, answer.policy_generation, now)
-            .unwrap();
+        let mapping = service.store.lookup(answer.address, 8080, now).unwrap();
 
-        assert_eq!(mapping.record.contracts[0].pinned_addresses, [trusted]);
+        assert_eq!(mapping.record.pinned_addresses, [trusted]);
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1742,12 +1787,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .answer_query("host.openshell.internal", AddressFamily::Ipv4, now)
             .await
             .unwrap();
-        let mapping = service
-            .store
-            .lookup(answer.address, 8080, answer.policy_generation, now)
-            .unwrap();
+        let mapping = service.store.lookup(answer.address, 8080, now).unwrap();
 
-        assert_eq!(mapping.record.contracts[0].pinned_addresses, [trusted]);
+        assert_eq!(mapping.record.pinned_addresses, [trusted]);
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1843,15 +1885,13 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             query.await.unwrap(),
             Err(PolicyDnsError::StalePolicy)
         ));
-        let mapping = store
-            .lookup(current.address, 5432, current.policy_generation, now)
-            .unwrap();
+        let mapping = store.lookup(current.address, 5432, now).unwrap();
         assert_eq!(
             mapping.record.policy_generation,
             policy.current_generation()
         );
         assert_eq!(
-            mapping.record.contracts[0].pinned_addresses,
+            mapping.record.pinned_addresses,
             ["8.8.4.4".parse::<IpAddr>().unwrap()]
         );
     }
@@ -1927,5 +1967,160 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             Duration::from_secs(10)
         );
         assert_eq!(clamp_mapping_ttl(Duration::from_mins(5)), MAX_MAPPING_TTL);
+    }
+
+    fn claude_proto(extra_hosts: &[&str]) -> openshell_core::proto::SandboxPolicy {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+        let endpoint = |host: &str| NetworkEndpoint {
+            host: host.to_string(),
+            port: 443,
+            ..Default::default()
+        };
+        let mut endpoints = vec![endpoint("api.anthropic.com")];
+        endpoints.extend(extra_hosts.iter().map(|host| endpoint(host)));
+        openshell_core::proto::SandboxPolicy {
+            version: 1,
+            network_policies: std::iter::once((
+                "claude_code".to_string(),
+                NetworkPolicyRule {
+                    name: "claude_code".to_string(),
+                    endpoints,
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/local/bin/claude".to_string(),
+                    }],
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn proto_service(
+        proto: &openshell_core::proto::SandboxPolicy,
+    ) -> PolicyDnsService<FakeResolver> {
+        let pools = SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 8),
+            "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::8".parse::<Ipv6Addr>().unwrap(),
+        )
+        .unwrap();
+        PolicyDnsService::new(
+            Arc::new(OpaEngine::from_proto(proto).unwrap()),
+            FakeResolver {
+                calls: AtomicUsize::new(0),
+                answer: TrustedAnswer {
+                    addresses: vec!["8.8.8.8".parse().unwrap()],
+                    ttl: Duration::from_mins(5),
+                },
+            },
+            Arc::new(ResolvedEndpointStore::new(
+                StoreConfig::new(pools, 16).unwrap(),
+            )),
+            None,
+        )
+    }
+
+    /// Proto conversion stamps the hash of the complete policy into every
+    /// endpoint, so any policy change changes every endpoint object. The stamp
+    /// is not part of an endpoint's contract: a name whose endpoints did not
+    /// change keeps its synthetic address across the reload, rather than
+    /// taking a new one from the never-reused pool each time.
+    #[tokio::test]
+    async fn proto_reload_keeps_the_synthetic_address_of_an_unchanged_endpoint() {
+        let service = proto_service(&claude_proto(&[]));
+        let stamp = |service: &PolicyDnsService<FakeResolver>| {
+            service
+                .policy
+                .policy_dns_eligibility_snapshot()
+                .unwrap()
+                .endpoints[0]
+                .endpoint["policy_hash"]
+                .clone()
+        };
+        let before_stamp = stamp(&service);
+        assert!(matches!(before_stamp, regorus::Value::String(_)));
+        let before = service
+            .answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+
+        // Approve another host in the same policy.
+        service
+            .policy
+            .reload_from_proto(&claude_proto(&["github.com"]))
+            .unwrap();
+        assert_ne!(stamp(&service), before_stamp, "the stamp changed");
+
+        let after = service
+            .answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now())
+            .await
+            .unwrap();
+        assert!(after.policy_generation > before.policy_generation);
+        assert_eq!(after.address, before.address);
+    }
+
+    /// A name keeps its synthetic address when the endpoint that allows it
+    /// moves within its policy or gains a port: an address stands for a name,
+    /// and the current policy decides what each connection to it may do.
+    #[tokio::test]
+    async fn a_name_keeps_its_address_when_its_endpoint_moves_or_changes() {
+        let service = proto_service(&claude_proto(&[]));
+        let lookup =
+            || service.answer_query("api.anthropic.com", AddressFamily::Ipv4, Instant::now());
+        let before = lookup().await.unwrap();
+
+        // github.com inserted before api.anthropic.com.
+        let mut reordered = claude_proto(&["github.com"]);
+        reordered
+            .network_policies
+            .get_mut("claude_code")
+            .unwrap()
+            .endpoints
+            .reverse();
+        service.policy.reload_from_proto(&reordered).unwrap();
+        assert_eq!(lookup().await.unwrap().address, before.address, "moved");
+
+        let mut widened = reordered.clone();
+        for endpoint in &mut widened
+            .network_policies
+            .get_mut("claude_code")
+            .unwrap()
+            .endpoints
+        {
+            endpoint.ports = vec![443, 8443];
+        }
+        service.policy.reload_from_proto(&widened).unwrap();
+        assert_eq!(lookup().await.unwrap().address, before.address, "new port");
+    }
+
+    /// The record pins every answer some eligible endpoint permits, in
+    /// resolver order, and nothing else: here the exact host permits the
+    /// private address, the wildcard the public one, and neither loopback.
+    #[tokio::test]
+    async fn mapping_pins_the_union_of_what_eligible_endpoints_permit() {
+        let policy = BASE_POLICY.replace("db.example", "db.example.com").replace(
+            "filesystem_policy:",
+            "  web:\n    name: web\n    endpoints:\n      - { host: '*.example.com', port: 443 }\n    binaries: [{ path: /usr/bin/curl }]\nfilesystem_policy:",
+        );
+        let service = service(
+            &policy,
+            vec![
+                "8.8.8.8".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+                "10.2.3.4".parse().unwrap(),
+            ],
+        );
+        let now = Instant::now();
+        let answer = service
+            .answer_query("db.example.com", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        let mapping = service.store.lookup(answer.address, 443, now).unwrap();
+        assert_eq!(
+            mapping.record.pinned_addresses,
+            [
+                "8.8.8.8".parse::<IpAddr>().unwrap(),
+                "10.2.3.4".parse().unwrap()
+            ]
+        );
     }
 }

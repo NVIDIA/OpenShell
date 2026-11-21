@@ -72,13 +72,7 @@ async fn allowed_ipv4_endpoint_accepts_mapped_form() {
 async fn policy_dns_recovers_hostname_for_mapped_form() {
     let engine = engine_for("db.example");
     let store = policy_dns_test_store();
-    let record = publish_mapping(
-        &store,
-        "db.example",
-        "database",
-        5432,
-        engine.current_generation(),
-    );
+    let record = publish_mapping(&store, "db.example", engine.current_generation());
     let IpAddr::V4(ipv4) = record.synthetic_address else {
         panic!("test publishes an IPv4 mapping");
     };
