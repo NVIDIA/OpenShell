@@ -163,6 +163,14 @@ supported Sandbox API (`agents.x-k8s.io/v1beta1` or
 `agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
 where Helm cannot discover cluster APIs.
 
+Run `kubectl get storageclass` before installing. For dynamic provisioning
+without a default, set `server.dataStorageClass` (gateway StatefulSet) and
+`server.workspaceStorageClass` (sandbox workspaces).
+
+`storageClass.preflight.enabled=true` checks for a default on fresh StatefulSet
+installs with no gateway class set. It requires cluster-scoped
+`list storageclasses` permission. Preview with `helm template --dry-run=server`.
+
 ## Install on Kubernetes
 
 ```shell
@@ -807,6 +815,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
+| storageClass.preflight.enabled | bool | `false` | On a fresh StatefulSet install with no server.dataStorageClass, check for a default StorageClass. The Helm identity must be allowed to list StorageClasses. |
 | supervisor.affinity | object | `{}` | Affinity rules for the shared supervisor pod, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
 | supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
 | supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |

@@ -1,0 +1,22 @@
+{{/*
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if and .Release.IsInstall .Values.storageClass.preflight.enabled
+    (eq (include "openshell.workloadKind" .) "statefulset")
+    (not .Values.server.dataStorageClass) }}
+{{- $classes := lookup "storage.k8s.io/v1" "StorageClass" "" "" }}
+{{/* Offline Helm renders return an empty map. A live list has an items field. */}}
+{{- if hasKey $classes "items" }}
+{{- $hasDefault := false }}
+{{- range $classes.items }}
+{{- $annotations := .metadata.annotations | default dict }}
+{{- if or (eq (get $annotations "storageclass.kubernetes.io/is-default-class") "true") (eq (get $annotations "storageclass.beta.kubernetes.io/is-default-class") "true") }}
+{{- $hasDefault = true }}
+{{- end }}
+{{- end }}
+{{- if not $hasDefault }}
+{{- fail "The cluster has no default StorageClass. Set server.dataStorageClass for the gateway openshell-data PVC, or disable storageClass.preflight.enabled if you manage the backing storage yourself." }}
+{{- end }}
+{{- end }}
+{{- end }}

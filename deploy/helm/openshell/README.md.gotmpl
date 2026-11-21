@@ -164,6 +164,14 @@ supported Sandbox API (`agents.x-k8s.io/v1beta1` or
 `agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
 where Helm cannot discover cluster APIs.
 
+Run `kubectl get storageclass` before installing. For dynamic provisioning
+without a default, set `server.dataStorageClass` (gateway StatefulSet) and
+`server.workspaceStorageClass` (sandbox workspaces).
+
+`storageClass.preflight.enabled=true` checks for a default on fresh StatefulSet
+installs with no gateway class set. It requires cluster-scoped
+`list storageclasses` permission. Preview with `helm template --dry-run=server`.
+
 ## Install on Kubernetes
 
 ```shell
