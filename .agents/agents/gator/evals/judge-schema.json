@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["expected", "extra_blocking"],
+  "properties": {
+    "expected": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "match", "finding_ids", "rationale"],
+        "properties": {
+          "index": {"type": "integer"},
+          "match": {"type": "string", "enum": ["blocking", "nonblocking", "partial", "none"]},
+          "finding_ids": {"type": "array", "items": {"type": "string"}},
+          "rationale": {"type": "string"}
+        }
+      }
+    },
+    "extra_blocking": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "assessment", "rationale"],
+        "properties": {
+          "finding_id": {"type": "string"},
+          "assessment": {"type": "string", "enum": ["plausible", "dubious"]},
+          "rationale": {"type": "string"}
+        }
+      }
+    }
+  }
+}

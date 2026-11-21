@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Replay one case: check out the PR head, build task.md, run the reviewer,
+# validate its findings, and grade them with the judge. Invoked by run-replay,
+# which exports the environment below.
+
+set -euo pipefail
+
+[[ "$#" -eq 1 ]] || {
+    echo "Usage: run-case CASE_ID (normally invoked by run-replay)" >&2
+    exit 2
+}
+
+: "${REPLAY_RUN_DIR:?}" "${REPLAY_CASES:?}" "${REPLAY_CACHE:?}" "${REPLAY_BIN:?}"
+: "${REPLAY_REVIEWER_COMMAND:?}" "${REPLAY_JUDGE_COMMAND:?}" "${REPLAY_TIMEOUT_SECONDS:?}"
+
+CASE_ID="$1"
+REPLAY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CASE_DIR="$REPLAY_RUN_DIR/cases/$CASE_ID"
+write_result() {
+    local status="$1"
+    jq -n \
+        --slurpfile c case.json \
+        --arg status "$status" \
+        --argjson exit_code "${reviewer_exit:-null}" \
+        --argjson seconds "${reviewer_seconds:-null}" \
+        --argjson tokens "${reviewer_tokens:-null}" \
+        --slurpfile f <(cat findings.json 2>/dev/null || echo '{"findings":[]}') \
+        --slurpfile j <(cat judgment.json 2>/dev/null || echo 'null') '
+        $c[0] as $case | ($f[0].findings // []) as $findings | $j[0] as $judgment |
+        {
+            id: $case.id, kind: $case.kind, tags: $case.tags, status: $status,
+            reviewer_exit: $exit_code, reviewer_seconds: $seconds, reviewer_tokens: $tokens,
+            findings: ($findings | length),
+            blocking: ([$findings[] | select(.blocking)] | length),
+            expected: ($case.expected | length),
+            matches: (if $judgment == null then null else
+                [$judgment.expected[].match] | group_by(.) | map({(.[0]): length}) | add // {}
+            end),
+            extra_blocking: (if $judgment == null then null else
+                [$judgment.extra_blocking[].assessment] | group_by(.) | map({(.[0]): length}) | add // {}
+            end)
+        }' > result.json
+}
+
+log() { printf '[%s] %s\n' "$CASE_ID" "$*" >&2; }
+
+if [[ "${REPLAY_REJUDGE:-0}" == 1 ]]; then
+    # Grade an existing review again; keep the reviewer's recorded metrics.
+    cd "$CASE_DIR"
+    reviewer_exit="$(jq '.reviewer_exit' result.json)"
+    reviewer_seconds="$(jq '.reviewer_seconds' result.json)"
+    reviewer_tokens="$(jq '.reviewer_tokens' result.json)"
+    rm -f judgment.json
+    if [[ ! -s findings.json ]]; then
+        log "no validated findings to judge"
+        exit 0
+    fi
+else
+rm -rf "$CASE_DIR"
+mkdir -p "$CASE_DIR"
+cd "$CASE_DIR"
+
+jq -c --arg id "$CASE_ID" 'select(.id == $id)' "$REPLAY_CASES" > case.json
+[[ -s case.json ]] || {
+    echo "run-case: unknown case $CASE_ID" >&2
+    exit 2
+}
+head_sha="$(jq -r .head_sha case.json)"
+
+# The checkout borrows objects from the cache but only has refs for the PR
+# head, so the reviewer cannot browse later history (including the fix).
+git init -q repo
+printf '%s/objects\n' "$REPLAY_CACHE" > repo/.git/objects/info/alternates
+git -C repo update-ref refs/heads/pr-head "$head_sha"
+git -C repo -c advice.detachedHead=false checkout -q pr-head
+
+"$REPLAY_DIR/build-task" case.json repo .
+
+
+log "reviewing $(jq -r '"#\(.pr) \(.title)"' case.json)"
+start="$(date +%s)"
+set +e
+# Run the reviewer in its own process group so the timeout stops sub-agents too.
+PATH="$REPLAY_BIN:$PATH" perl -e 'setpgrp(0, 0); exec @ARGV' \
+    bash -c "$REPLAY_REVIEWER_COMMAND" > reviewer.stdout 2> reviewer.stderr &
+reviewer_pid=$!
+(
+    deadline=$(( $(date +%s) + REPLAY_TIMEOUT_SECONDS ))
+    while kill -0 "$reviewer_pid" 2>/dev/null; do
+        if (( $(date +%s) >= deadline )); then
+            echo "replay: reviewer timed out after ${REPLAY_TIMEOUT_SECONDS}s" >> reviewer.stderr
+            kill -TERM -- "-$reviewer_pid" 2>/dev/null
+            break
+        fi
+        sleep 2
+    done
+) > /dev/null 2>&1 &
+watchdog_pid=$!
+wait "$reviewer_pid"
+reviewer_exit=$?
+wait "$watchdog_pid" 2>/dev/null
+set -e
+reviewer_seconds=$(( $(date +%s) - start ))
+# Codex prints "tokens used" followed by the count; sum across sub-agents.
+reviewer_tokens="$(awk '
+    found { gsub(/[^0-9]/, ""); if ($0 != "") total += $0; found = 0 }
+    /^tokens used/ { found = 1 }
+    END { print total + 0 }
+' reviewer.stderr reviewer.stdout)"
+
+if [[ "$reviewer_exit" -ne 0 || ! -s review-findings.raw.json ]]; then
+    log "reviewer failed (exit $reviewer_exit)"
+    write_result reviewer_failed
+    exit 0
+fi
+if ! "$REPLAY_BIN/validate-review-findings" review-findings.raw.json > findings.json 2> validate.stderr; then
+    log "reviewer output failed validation"
+    rm -f findings.json
+    write_result invalid_output
+    exit 0
+fi
+fi
+
+jq -n --slurpfile c case.json --slurpfile f findings.json '{
+    expected: [$c[0].expected | to_entries[] | {index: .key} + .value],
+    findings: [$f[0].findings[] | {
+        id, severity, blocking, classification, invariant,
+        changed_location, head_behavior, observable_impact, requested_change, sibling_sites
+    }]
+}' > judge-input.json
+{
+    cat "$REPLAY_DIR/judge.md"
+    printf '\n## Input\n\n```json\n'
+    cat judge-input.json
+    printf '\n```\n'
+} > judge-prompt.md
+
+log "judging"
+if ! bash -c "$REPLAY_JUDGE_COMMAND" _ judge-prompt.md judgment.json "$REPLAY_DIR/judge-schema.json" \
+    > judge.stdout 2> judge.stderr || ! jq -e '.expected | type == "array"' judgment.json >/dev/null 2>&1; then
+    log "judge failed"
+    rm -f judgment.json
+    write_result judge_failed
+    exit 0
+fi
+
+write_result ok
+log "done: $(jq -c '{blocking, matches, extra_blocking}' result.json)"

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Summarize a replay run, or compare two runs case by case.
+#   score RUN_DIR             writes RUN_DIR/summary.json and prints a report
+#   score BASELINE_DIR RUN_DIR  prints a comparison
+
+set -euo pipefail
+
+[[ "$#" -eq 1 || "$#" -eq 2 ]] || {
+    echo "Usage: score RUN_DIR | score BASELINE_DIR CANDIDATE_DIR" >&2
+    exit 2
+}
+
+summarize() {
+    local run="$1"
+    local results=("$run"/cases/*/result.json)
+    [[ -e "${results[0]}" ]] || {
+        echo "no results in $run" >&2
+        return 1
+    }
+    jq -s --slurpfile run "$run/run.json" '
+        def n(f): [.[] | f] | add // 0;
+        def recall(a; b): if b == 0 then null else ((a / b) * 100 | round) end;
+        def totals: {
+            cases: length,
+            ok: ([.[] | select(.status == "ok")] | length),
+            failed: ([.[] | select(.status != "ok")] | length),
+            expected: n(select(.status == "ok") | .expected),
+            caught_blocking: n(.matches.blocking // 0),
+            caught_nonblocking: n(.matches.nonblocking // 0),
+            partial: n(.matches.partial // 0),
+            missed: n(.matches.none // 0),
+            blocking_findings: n(.blocking),
+            extra_plausible: n(.extra_blocking.plausible // 0),
+            extra_dubious: n(.extra_blocking.dubious // 0),
+            reviewer_seconds: n(.reviewer_seconds // 0),
+            reviewer_tokens: n(.reviewer_tokens // 0)
+        } | . + {
+            recall_blocking_pct: recall(.caught_blocking; .expected),
+            recall_any_pct: recall(.caught_blocking + .caught_nonblocking; .expected)
+        };
+        {
+            run: $run[0],
+            totals: totals,
+            by_kind: (group_by(.kind) | map({key: .[0].kind, value: totals}) | from_entries),
+            cases: (sort_by(.id))
+        }' "${results[@]}"
+}
+
+report() {
+    jq -r '
+        def pct: if . == null then "-" else "\(.)%" end;
+        def line(t): "\(t.caught_blocking)/\(t.expected) blocking (\(t.recall_blocking_pct | pct)), " +
+            "\(t.caught_blocking + t.caught_nonblocking)/\(t.expected) any (\(t.recall_any_pct | pct)), " +
+            "\(t.partial) partial; extra blockers \(t.extra_plausible) plausible / \(t.extra_dubious) dubious";
+        "Run: \(.run.label) (model \(.run.model), reasoning \(.run.reasoning))",
+        "Cases: \(.totals.ok) ok, \(.totals.failed) failed",
+        "All: " + line(.totals),
+        (.by_kind | to_entries[] | "  \(.key): " + line(.value)),
+        "Reviewer time \(.totals.reviewer_seconds)s, tokens \(.totals.reviewer_tokens)",
+        "",
+        (.cases[] | "\(.id)\t\(.status)\tblocking=\(.blocking)\tmatches=\(.matches // {} | tojson)\textra=\(.extra_blocking // {} | tojson)\t\(.reviewer_seconds // "-")s")
+    ' "$1"
+}
+
+if [[ "$#" -eq 1 ]]; then
+    summarize "$1" > "$1/summary.json"
+    report "$1/summary.json"
+    exit 0
+fi
+
+base_summary="$(mktemp "${TMPDIR:-/tmp}/gator-replay-score.XXXXXX")"
+cand_summary="$(mktemp "${TMPDIR:-/tmp}/gator-replay-score.XXXXXX")"
+trap 'rm -f "$base_summary" "$cand_summary"' EXIT
+summarize "$1" > "$base_summary"
+summarize "$2" > "$cand_summary"
+echo "== baseline"
+report "$base_summary" | sed -n '1,/^$/p'
+echo "== candidate"
+report "$cand_summary" | sed -n '1,/^$/p'
+echo "== per case (blocking matches / expected; extra plausible+dubious)"
+jq -rn --slurpfile a "$base_summary" --slurpfile b "$cand_summary" '
+    def cell: if . == null then "-" else
+        "\(.matches.blocking // 0)/\(.expected) +\((.extra_blocking.plausible // 0))p\((.extra_blocking.dubious // 0))d" end;
+    ($a[0].cases | map({key: .id, value: .}) | from_entries) as $A |
+    ($b[0].cases | map({key: .id, value: .}) | from_entries) as $B |
+    ([$A, $B | keys[]] | unique)[] as $id |
+    "\($id)\t\($A[$id] | cell)\t\($B[$id] | cell)"
+'

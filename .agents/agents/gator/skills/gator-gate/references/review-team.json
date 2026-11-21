@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "generalist": "principal-engineer-reviewer",
+  "merge": "review-merge",
+  "member_rules": "review-team-member.md",
+  "retries": 1,
+  "members": [
+    {
+      "id": "review-correctness",
+      "prefix": "COR",
+      "modes": [
+        "initial",
+        "follow_up",
+        "critical_only"
+      ],
+      "default": false
+    },
+    {
+      "id": "review-security",
+      "prefix": "SEC",
+      "modes": [
+        "initial",
+        "follow_up",
+        "critical_only"
+      ],
+      "default": false
+    },
+    {
+      "id": "review-contracts",
+      "prefix": "CON",
+      "modes": [
+        "initial",
+        "follow_up"
+      ]
+    },
+    {
+      "id": "review-networking",
+      "prefix": "NET",
+      "modes": [
+        "initial",
+        "follow_up",
+        "critical_only"
+      ],
+      "references": [
+        "networking-checklist.md"
+      ],
+      "when": {
+        "paths": [
+          "^crates/openshell-supervisor-network/",
+          "^crates/openshell-supervisor/src/(app_listener|otlp_relay|shared|sandbox_instance_host)",
+          "^crates/openshell-sandbox/src/(network_broker|accept_errors|boundary_io|boundary_server)",
+          "^crates/openshell-supervisor-process/src/(ssh|supervisor_session|unix_socket|main_session)",
+          "^crates/openshell-server/src/(supervisor_session|multiplex|gateway_listener|tls)",
+          "^crates/openshell-core/src/(net|forward|grpc_client)",
+          "^crates/openshell-sdk/src/(edge_tunnel|transport)",
+          "^crates/openshell-cli/src/(ssh|tls)",
+          "^crates/openshell-driver-[^/]+/src/.*(network|net|callback|endpoint|listener|tls|dns|hosts|port)",
+          "^deploy/helm/.*(networkpolicy|service|gateway|route|listener)"
+        ],
+        "added_lines": "TcpStream|TcpListener|UdpSocket|UnixStream|connect_tcp|hyper::|\\bh2::|rustls|reqwest::|keep_?alive|resolv\\.conf|/etc/hosts|ControlMaster|ProxyCommand|SO_REUSE|set_nodelay"
+      },
+      "checklist": "networking-checklist.md"
+    }
+  ],
+  "member_reasoning": "high"
+}

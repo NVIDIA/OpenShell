@@ -25,7 +25,7 @@ if [[ -x "$PAYLOAD_DIR/runtime/harnesses/codex/codex" ]]; then
 fi
 
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
-CODEX_REASONING="${CODEX_REASONING:-high}"
+CODEX_REASONING="${OPENSHELL_SUBAGENT_REASONING:-${CODEX_REASONING:-high}}"
 
 TASK_FILE="$(mktemp)"
 PROMPT_FILE="$(mktemp)"
