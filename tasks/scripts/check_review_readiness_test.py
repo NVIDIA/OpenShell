@@ -40,6 +40,15 @@ def pr(*labels, requested=(), author="author", draft=False, state="open"):
     }
 
 
+def fork(owner, *, full_name=None, owner_type="User"):
+    return {
+        "repo": {
+            "full_name": full_name or f"{owner}/repo",
+            "owner": {"login": owner, "type": owner_type},
+        }
+    }
+
+
 def reviewers(*, requested=(), engaged=(), manual=()):
     return {"requested": set(requested), "engaged": set(engaged), "manual": set(manual)}
 
@@ -367,6 +376,39 @@ class ReconciliationTests(unittest.TestCase):
                 self.assertIsNone(plan)
                 api.assert_called_once_with(PULL)
                 load.assert_not_called()
+
+    def test_ready_fork_pr_without_maintainer_edits_is_not_ready(self):
+        value = pr("area:build", draft=False)
+        value["head"] = fork("user")
+        value["maintainer_can_modify"] = False
+        with self.assertRaises(routing.MaintainerEditsError) as caught:
+            self.run_routing(CATEGORIES, snapshots=[], responses=[value])
+        self.assertIn("gh pr create", str(caught.exception))
+        self.assertEqual(
+            routing.describe_failure(caught.exception)[0], "Maintainer edits"
+        )
+
+    def test_maintainer_edits_check_applies_only_where_github_offers_it(self):
+        cases = {
+            "enabled": (fork("user"), True, False),
+            "draft": (fork("user"), False, True),
+            "same repository": (fork("owner", full_name=REPO), False, False),
+            "organization fork": (fork("org", owner_type="Organization"), False, False),
+            "deleted fork": ({"repo": None}, False, False),
+            "unknown head": (None, False, False),
+        }
+        for name, (head, allowed, draft) in cases.items():
+            with self.subTest(name):
+                value = pr(draft=draft)
+                value["maintainer_can_modify"] = allowed
+                if head is not None:
+                    value["head"] = head
+                self.assertFalse(routing.needs_maintainer_edits(value, REPO))
+
+    def test_fork_pr_without_maintainer_edits_needs_them(self):
+        value = pr()
+        value["head"] = fork("user")
+        self.assertTrue(routing.needs_maintainer_edits(value, REPO))
 
     def test_preview_makes_no_changes(self):
         plan, api, _ = self.run_routing(
