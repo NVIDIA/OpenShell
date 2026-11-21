@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "routable-host-ip"
+description = "Features suite: sandboxes reach the test host by an IP literal policy endpoint"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/ai-openshell/openshell"
+publish = false
+
+[[test]]
+name = "routable-host-ip"
+path = "tests/routable_host_ip.rs"
+harness = false
+
+[dependencies]
+host-server-support = { path = "../../../support/host-server" }
+sandbox-clients-support = { path = "../../../support/sandbox-clients" }
+openshell-testkit = { path = "../../../testkit/testkit" }

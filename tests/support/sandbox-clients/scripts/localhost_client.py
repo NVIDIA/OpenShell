@@ -1,12 +1,8 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e")]
-
-use openshell_e2e::harness::sandbox::SandboxGuard;
-
-fn localhost_transparent_script() -> &'static str {
-    r#"
+# Serves HTTP on 127.0.0.1 and fetches from it, with no proxy variables in
+# the environment.
 import json
 import os
 import threading
@@ -40,20 +36,3 @@ finally:
     server.shutdown()
     thread.join(timeout=5)
     server.server_close()
-"#
-}
-
-#[tokio::test]
-async fn sandbox_reaches_localhost_without_proxy_environment() {
-    let guard = SandboxGuard::create(&["--", "python3", "-c", localhost_transparent_script()])
-        .await
-        .expect("sandbox create with transparent localhost check");
-
-    assert!(
-        guard
-            .create_output
-            .contains(r#"{"proxy_env_absent": true, "payload": {"message": "hello"}}"#),
-        "expected localhost HTTP request to stay local and succeed:\n{}",
-        guard.create_output
-    );
-}

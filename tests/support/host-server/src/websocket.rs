@@ -1,43 +1,47 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use testkit::{Poll, Result};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 
 use crate::http::read_request;
-use crate::{READ_TIMEOUT, WAIT_INTERVAL, WAIT_TIMEOUT, bind, header};
+use crate::{MAX_REQUEST, READ_TIMEOUT, Server, WAIT_INTERVAL, WAIT_TIMEOUT, header};
 
 /// A WebSocket server that completes the handshake, then reads frames until
-/// the connection closes, and records whether any was a binary frame.
+/// the connection closes. It records whether any was a binary frame, records
+/// each text frame, and answers each text frame with [`TEXT_REPLY`].
 pub struct WebSocketRecorder {
     pub port: u16,
     state: Arc<WebSocketState>,
-    task: JoinHandle<()>,
+    _server: Server,
 }
+
+/// The text frame a [`WebSocketRecorder`] sends after each text frame.
+pub const TEXT_REPLY: &str = "received";
 
 #[derive(Default)]
 struct WebSocketState {
     handshake_seen: AtomicBool,
     binary_seen: AtomicBool,
     finished: AtomicBool,
+    texts: Mutex<Vec<String>>,
 }
 
 impl WebSocketRecorder {
     pub async fn start() -> Result<Self> {
-        let (listener, port) = bind().await?;
         let state = Arc::new(WebSocketState::default());
         let task_state = Arc::clone(&state);
-        let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(accept_websocket(stream, Arc::clone(&task_state)));
-            }
-        });
-        Ok(Self { port, state, task })
+        let server =
+            Server::start(move |stream| accept_websocket(stream, Arc::clone(&task_state))).await?;
+        Ok(Self {
+            port: server.port,
+            state,
+            _server: server,
+        })
     }
 
     /// Wait until a client completed the handshake.
@@ -81,17 +85,20 @@ impl WebSocketRecorder {
         )
         .await
     }
-}
 
-impl Drop for WebSocketRecorder {
-    fn drop(&mut self) {
-        self.task.abort();
+    /// The text frames the server has read so far.
+    pub fn texts(&self) -> Vec<String> {
+        self.state
+            .texts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
 async fn accept_websocket(mut stream: TcpStream, state: Arc<WebSocketState>) {
     let _ = stream.set_nodelay(true);
-    let Some(request) = read_request(&mut stream).await else {
+    let Some(request) = read_request(&mut stream, &mut Vec::new()).await else {
         return;
     };
     let Some(key) = header(&request.head, "sec-websocket-key") else {
@@ -111,8 +118,8 @@ async fn accept_websocket(mut stream: TcpStream, state: Arc<WebSocketState>) {
     state.finished.store(true, Ordering::Release);
 }
 
-/// Read frames until a close frame or the end of the stream, and record a
-/// binary frame.
+/// Read frames until a close frame or the end of the stream, record a
+/// binary frame and each text frame, and answer each text frame.
 async fn read_frames(stream: &mut TcpStream, state: &WebSocketState) -> std::io::Result<()> {
     loop {
         let mut frame_header = [0_u8; 2];
@@ -123,22 +130,68 @@ async fn read_frames(stream: &mut TcpStream, state: &WebSocketState) -> std::io:
             127 => stream.read_u64().await?,
             length => u64::from(length),
         };
-        if opcode == 0x02 {
-            state.binary_seen.store(true, Ordering::Release);
-        }
-        if opcode == 0x08 {
-            return Ok(());
+        match opcode {
+            0x01 => {
+                let text = read_payload(stream, frame_header[1], length).await?;
+                state
+                    .texts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(String::from_utf8_lossy(&text).into_owned());
+                stream.write_all(&server_text_frame(TEXT_REPLY)).await?;
+                continue;
+            }
+            0x02 => state.binary_seen.store(true, Ordering::Release),
+            _ => {}
         }
         let mask = if frame_header[1] & 0x80 == 0 { 0 } else { 4 };
+        // Read a close frame's payload too, since closing with unread bytes
+        // resets the connection.
         let skipped = tokio::io::copy(
             &mut (&mut *stream).take(mask + length),
             &mut tokio::io::sink(),
         )
         .await?;
-        if skipped < mask + length {
+        if opcode == 0x08 || skipped < mask + length {
             return Ok(());
         }
     }
+}
+
+/// Read a text frame's payload, unmasked, up to [`MAX_REQUEST`] bytes.
+async fn read_payload(
+    stream: &mut TcpStream,
+    second_byte: u8,
+    length: u64,
+) -> std::io::Result<Vec<u8>> {
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|length| *length <= MAX_REQUEST)
+        .ok_or_else(|| std::io::Error::other("text frame too large"))?;
+    let mut mask = [0_u8; 4];
+    if second_byte & 0x80 != 0 {
+        stream.read_exact(&mut mask).await?;
+    }
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).await?;
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    Ok(payload)
+}
+
+/// A final, unmasked server text frame.
+fn server_text_frame(text: &str) -> Vec<u8> {
+    let mut frame = vec![0x81];
+    match text.len() {
+        length @ 0..=125 => frame.push(u8::try_from(length).unwrap_or_default()),
+        length => {
+            frame.push(126);
+            frame.extend_from_slice(&u16::try_from(length).unwrap_or(u16::MAX).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(text.as_bytes());
+    frame
 }
 
 #[cfg(test)]
@@ -147,7 +200,7 @@ mod tests {
     use crate::find;
 
     /// Complete a handshake with `recorder`, send `frames`, and close.
-    async fn send_frames(recorder: &WebSocketRecorder, frames: &[(u8, Vec<u8>)]) {
+    async fn send_frames(recorder: &WebSocketRecorder, frames: &[(u8, Vec<u8>)]) -> TcpStream {
         #[allow(
             clippy::disallowed_methods,
             reason = "standalone test support has no openshell-core dependency and enables TCP_NODELAY below"
@@ -181,6 +234,7 @@ mod tests {
             stream.write_all(&frame(*opcode, payload)).await.unwrap();
         }
         stream.write_all(&frame(0x08, &[])).await.unwrap();
+        stream
     }
 
     /// A final, masked client frame.
@@ -202,22 +256,43 @@ mod tests {
     #[tokio::test]
     async fn websocket_recorder_sees_a_binary_frame_after_a_long_text_frame() {
         let recorder = WebSocketRecorder::start().await.unwrap();
-        send_frames(
+        // Hold the connection so the replies to text frames don't reset it.
+        let _stream = send_frames(
             &recorder,
             &[(0x01, vec![b'x'; 300]), (0x02, b"binary".to_vec())],
         )
         .await;
         assert!(recorder.wait_until_finished().await.unwrap());
+        assert_eq!(recorder.texts(), ["x".repeat(300)]);
     }
 
     #[tokio::test]
     async fn websocket_recorder_sees_no_binary_frame_in_text_frames() {
         let recorder = WebSocketRecorder::start().await.unwrap();
-        send_frames(
+        // Hold the connection so the replies to text frames don't reset it.
+        let _stream = send_frames(
             &recorder,
             &[(0x01, vec![b'x'; 300]), (0x01, b"text".to_vec())],
         )
         .await;
         assert!(!recorder.wait_until_finished().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn websocket_recorder_answers_each_text_frame() {
+        let recorder = WebSocketRecorder::start().await.unwrap();
+        let mut stream = send_frames(
+            &recorder,
+            &[(0x01, b"one".to_vec()), (0x01, b"two".to_vec())],
+        )
+        .await;
+        let mut replies = Vec::new();
+        stream.read_to_end(&mut replies).await.unwrap();
+        assert_eq!(
+            replies,
+            [server_text_frame(TEXT_REPLY), server_text_frame(TEXT_REPLY)].concat()
+        );
+        recorder.wait_until_finished().await.unwrap();
+        assert_eq!(recorder.texts(), ["one", "two"]);
     }
 }

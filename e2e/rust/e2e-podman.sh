@@ -22,17 +22,11 @@ source "${ROOT}/e2e/support/conformance.sh"
 # unfiltered e2e:podman task remains available while the omitted targets are
 # stabilized and can be added here.
 PODMAN_CI_TESTS=(
-  bypass_detection
   ephemeral_cleanup
   driver_config_volume
   edge_tunnel_e2e
-  forward_proxy_graphql_l7
-  forward_proxy_jsonrpc_l7
-  forward_proxy_l7_bypass
   host_gateway_alias
-  live_policy_update
   local_driver_token_restart
-  no_proxy
   ocsf_jsonl_conformance
   otlp_relay
   podman_corporate_proxy

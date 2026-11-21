@@ -102,10 +102,6 @@ let
     "provider_auto_create"
     # Needs the SPIFFE fixtures that the wrapper sets up. Wrapper lane.
     "provider_token_exchange"
-    # One test times out reaching support-container IPs from the sandbox in the
-    # rootless guest; the other tests in the binary pass. Nextest archive
-    # filters cannot select individual tests, so keep the complete binary here.
-    "proxy_egress_pipeline"
     # Holds only the on-failure restart test until #5507; the rest moved to
     # testkit. Nextest archive filters cannot select individual tests, so keep
     # the complete binary in the follow-up bucket.

@@ -3,7 +3,7 @@
 
 //! Sandbox policies for tests: [`base`], read from `base-policy.yaml`, plus
 //! [`allow`] and the [`Endpoint`] settings for the network access a test
-//! needs.
+//! needs. [`set`] applies a policy to a running sandbox.
 //!
 //! ```ignore
 //! let mut policy = testkit::policy::base();
@@ -14,7 +14,10 @@
 
 use openshell_sdk::raw::proto;
 
+use crate::cli::CliOutput;
+use crate::context::Sandbox;
 use crate::error::{Error, Result, ResultExt as _};
+use crate::yaml_file::YamlFile;
 
 pub use proto::NetworkAccessPreset as Access;
 
@@ -85,6 +88,52 @@ pub fn binaries_yaml(binaries: &[&str]) -> String {
         .map(|path| format!("{{path: {}}}", serde_json::Value::from(*path)))
         .collect();
     format!("[{}]", paths.join(", "))
+}
+
+/// The policy `yaml` describes, as `sandbox create --policy` reads a file.
+/// Use it for a policy kept as a YAML file, such as an example; build one
+/// with [`base`] and [`allow`] otherwise.
+pub fn from_yaml(yaml: &str) -> Result<proto::SandboxPolicy> {
+    openshell_policy::parse_sandbox_policy(yaml)
+        .map_err(|error| Error::msg(format!("{error:?}")))
+        .context("parse the policy")
+}
+
+/// [`base`] with the top-level sections in `yaml`, such as
+/// `network_policies` or `network_middlewares`, added. Use it for policy
+/// settings [`Endpoint`] doesn't cover, such as L7 rules.
+pub fn base_with(yaml: &str) -> Result<proto::SandboxPolicy> {
+    from_yaml(&format!("{BASE}{yaml}"))
+}
+
+/// Replace `sandbox`'s policy with `policy` through `policy set --wait`, and
+/// wait up to two minutes until the sandbox has loaded it.
+pub async fn set(sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result {
+    try_set(sandbox, policy)
+        .await?
+        .success()
+        .context(format!("set the policy of sandbox {}", sandbox.name()))?;
+    Ok(())
+}
+
+/// Run [`set`]'s `policy set` command and return its output, whether or not
+/// it succeeded, for a test that expects the gateway to reject `policy`.
+pub async fn try_set(sandbox: &Sandbox, policy: &proto::SandboxPolicy) -> Result<CliOutput> {
+    let file = YamlFile::new(&to_yaml(policy)?)?;
+    sandbox
+        .handles()
+        .cli()
+        .run([
+            "policy",
+            "set",
+            sandbox.name(),
+            "--policy",
+            file.path()?,
+            "--wait",
+            "--timeout",
+            "120",
+        ])
+        .await
 }
 
 /// Settings for an endpoint from [`allow`], named as in policy YAML.
@@ -196,5 +245,17 @@ mod tests {
             openshell_policy::parse_sandbox_policy(&to_yaml(&policy).expect("serializes"))
                 .expect("the serialized policy parses");
         assert_eq!(round_trip, expected);
+        assert_eq!(from_yaml(&yaml).expect("the YAML parses"), expected);
+        assert_eq!(
+            base_with(yaml.strip_prefix(BASE).expect("starts with the base"))
+                .expect("the YAML parses"),
+            expected
+        );
+    }
+
+    #[test]
+    fn from_yaml_reports_an_invalid_policy() {
+        let error = from_yaml("network_policies: [").expect_err("invalid YAML");
+        assert!(error.to_string().contains("parse the policy"), "{error}");
     }
 }

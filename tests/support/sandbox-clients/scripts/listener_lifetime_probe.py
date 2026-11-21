@@ -1,11 +1,9 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e")]
-
-use openshell_e2e::harness::sandbox::SandboxGuard;
-
-const LIFETIME_PROBE: &str = r"
+# Closes listeners and exits a child that owns one, and checks each time that
+# the port refuses connections and can be bound again. Prints the child
+# listener's address and socket inode as JSON.
 import errno, json, os, socket, subprocess, sys
 
 def assert_closed(address, inode):
@@ -81,74 +79,3 @@ result = subprocess.run([sys.executable, '-c', child], check=True, capture_outpu
 address, identity = json.loads(result.stdout)
 assert_closed(address, identity)
 print(json.dumps([address, identity]))
-";
-
-#[tokio::test]
-async fn closing_or_exiting_listener_refuses_connections_and_releases_port() {
-    let mut sandbox = SandboxGuard::create(&[]).await.expect("create sandbox");
-    let output = sandbox
-        .exec(&["python3", "-c", LIFETIME_PROBE])
-        .await
-        .expect("listener lifetime probe");
-    let observer = r"
-import json, os, sys
-_, inode = json.loads(sys.argv[1])
-for fd in os.listdir('/proc/self/fd'):
-    try:
-        target = os.readlink('/proc/self/fd/' + fd)
-    except FileNotFoundError:
-        continue
-    assert target != 'socket:[' + str(inode) + ']', (fd, target)
-";
-    sandbox
-        .exec(&["python3", "-c", observer, output.trim()])
-        .await
-        .expect("subsequent exec must not inherit closed listener");
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-async fn unrelated_exec_does_not_inherit_broker_preconnect_socket() {
-    // Request a non-CLOEXEC socket explicitly; Python's socket constructor
-    // otherwise masks broker inheritance bugs by requesting SOCK_CLOEXEC.
-    let owner = r"
-import ctypes, json, os, socket, time
-libc = ctypes.CDLL(None, use_errno=True)
-fd = libc.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-assert fd >= 0, ctypes.get_errno()
-assert os.get_inheritable(fd)
-inode = int(os.readlink('/proc/self/fd/' + str(fd))[8:-1])
-with open('/sandbox/preconnect-inode.json', 'w') as f:
-    json.dump(inode, f)
-while True:
-    time.sleep(60)
-";
-    let mut sandbox = SandboxGuard::create_detached_main(&["python3", "-c", owner])
-        .await
-        .expect("create socket owner");
-    let observer = r"
-import json, os, time
-path = '/sandbox/preconnect-inode.json'
-for _ in range(100):
-    try:
-        with open(path) as f:
-            inode = json.load(f)
-        break
-    except (FileNotFoundError, json.JSONDecodeError):
-        time.sleep(0.1)
-else:
-    raise AssertionError('socket owner did not publish its inode')
-for fd in os.listdir('/proc/self/fd'):
-    try:
-        target = os.readlink('/proc/self/fd/' + fd)
-    except FileNotFoundError:
-        continue
-    assert target != 'socket:[' + str(inode) + ']', (fd, target)
-print('broker socket was not inherited')
-";
-    sandbox
-        .exec(&["python3", "-c", observer])
-        .await
-        .expect("unrelated exec inherited broker descriptor");
-    sandbox.cleanup().await;
-}

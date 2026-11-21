@@ -172,6 +172,9 @@ impl Context {
     }
 
     /// A resource name unique to this run: `test-<run-id>-<suffix>`.
+    ///
+    /// Sandbox names can't exceed [`MAX_SANDBOX_NAME_LEN`], so a sandbox
+    /// suffix can have at most 5 characters.
     pub fn name(&self, suffix: &str) -> String {
         format!("test-{}-{suffix}", self.run_id)
     }
@@ -187,11 +190,27 @@ impl Context {
         SandboxBuilder {
             handles: self.handles.clone(),
             policy: None,
+            driver_config: None,
             spec: SandboxSpec {
                 name: Some(self.sandbox_name(suffix)),
                 ..SandboxSpec::default()
             },
         }
+    }
+
+    /// Start describing a sandbox named `cx.name(suffix)` from
+    /// [`python_image`](crate::python_image) that idles under `policy`, for
+    /// tests that run Python clients in it with [`Sandbox::exec`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Context::sandbox`].
+    #[track_caller]
+    pub fn python_sandbox(&self, suffix: &str, policy: proto::SandboxPolicy) -> SandboxBuilder {
+        self.sandbox(suffix)
+            .image(crate::python_image())
+            .command(["sleep", "infinity"])
+            .policy(policy)
     }
 
     /// Start describing a sandbox named `cx.name(suffix)` that the
@@ -278,6 +297,18 @@ impl Context {
     /// gateway info reports it. Driver suites check this first, so a suite
     /// pointed at another driver's gateway fails instead of testing it.
     pub async fn expect_compute_driver(&self, name: &str) -> Result {
+        let driver = self.compute_driver().await?;
+        crate::ensure!(
+            driver == name,
+            "the gateway runs compute driver {driver}; expected {name}"
+        );
+        Ok(())
+    }
+
+    /// The gateway's compute driver, such as `docker` or `kubernetes`, for
+    /// tests whose setup depends on it. Fails unless gateway info reports
+    /// exactly one driver, under the same configured and driver name.
+    pub async fn compute_driver(&self) -> Result<String> {
         let info = self
             .handles
             .grpc
@@ -287,22 +318,7 @@ impl Context {
             .await
             .context("get gateway info")?
             .into_inner();
-        let drivers: Vec<(&str, &str)> = info
-            .compute_drivers
-            .iter()
-            .map(|driver| {
-                let reported = driver
-                    .capabilities
-                    .as_ref()
-                    .map_or("", |capabilities| capabilities.driver_name.as_str());
-                (driver.name.as_str(), reported)
-            })
-            .collect();
-        crate::ensure!(
-            matches!(drivers.as_slice(), [(configured, reported)] if *configured == name && *reported == name),
-            "the gateway reports compute drivers (name, driver name) {drivers:?}; expected only {name}"
-        );
-        Ok(())
+        single_compute_driver(&info)
     }
 
     /// Run the cleanup hooks, including deleting the sandboxes the test
@@ -310,6 +326,30 @@ impl Context {
     /// reported separately from the test result.
     pub(crate) async fn cleanup(&self) -> Vec<String> {
         self.handles.cleanup.run(CLEANUP_TIMEOUT).await
+    }
+}
+
+/// The one compute driver `info` reports, when its configured name and the
+/// name the driver reports agree.
+fn single_compute_driver(info: &proto::GetGatewayInfoResponse) -> Result<String> {
+    let drivers: Vec<(&str, &str)> = info
+        .compute_drivers
+        .iter()
+        .map(|driver| {
+            let reported = driver
+                .capabilities
+                .as_ref()
+                .map_or("", |capabilities| capabilities.driver_name.as_str());
+            (driver.name.as_str(), reported)
+        })
+        .collect();
+    match drivers.as_slice() {
+        [(configured, reported)] if configured == reported && !configured.is_empty() => {
+            Ok((*configured).to_string())
+        }
+        _ => Err(Error::msg(format!(
+            "the gateway reports compute drivers (name, driver name) {drivers:?}; expected exactly one"
+        ))),
     }
 }
 
@@ -340,17 +380,19 @@ fn track_sandbox(cleanup: &Cleanup, client: &WorkspaceScopedClient, name: &str) 
 
 /// The generated gRPC client, for public API the SDK does not wrap yet.
 #[derive(Clone)]
-struct Grpc {
+pub(crate) struct Grpc {
     client: OpenShellClient,
     workspace: String,
 }
 
 impl Grpc {
-    async fn client(&self) -> Result<AuthedGrpcClient> {
+    pub(crate) async fn client(&self) -> Result<AuthedGrpcClient> {
         Ok(self.client.raw_grpc_fresh().await?)
     }
 
-    fn scope(&self) -> Option<openshell_sdk::raw::proto::datamodel::v1::WorkspaceSelector> {
+    pub(crate) fn scope(
+        &self,
+    ) -> Option<openshell_sdk::raw::proto::datamodel::v1::WorkspaceSelector> {
         Some(proto::workspace_selector(&self.workspace))
     }
 }
@@ -368,6 +410,10 @@ pub(crate) struct Handles {
 impl Handles {
     pub(crate) fn cli(&self) -> &Cli {
         &self.cli
+    }
+
+    pub(crate) fn grpc(&self) -> &Grpc {
+        &self.grpc
     }
 
     pub(crate) fn track(&self, name: &str) {
@@ -394,6 +440,7 @@ impl Handles {
 pub struct SandboxBuilder {
     handles: Handles,
     policy: Option<proto::SandboxPolicy>,
+    driver_config: Option<serde_json::Value>,
     spec: SandboxSpec,
 }
 
@@ -437,6 +484,20 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set the template's `driver_config`, a JSON object keyed by driver
+    /// name, as `sandbox create --driver-config-json` does. The gateway
+    /// passes the block for its driver to the driver.
+    ///
+    /// ```ignore
+    /// let driver = cx.compute_driver().await?;
+    /// cx.sandbox("mount")
+    ///     .driver_config(serde_json::json!({ driver: { "mounts": [] } }))
+    /// ```
+    pub fn driver_config(mut self, config: serde_json::Value) -> Self {
+        self.driver_config = Some(config);
+        self
+    }
+
     /// Full access to the spec for fields without a builder method.
     pub fn spec(mut self, update: impl FnOnce(&mut SandboxSpec)) -> Self {
         update(&mut self.spec);
@@ -456,36 +517,40 @@ impl SandboxBuilder {
     pub async fn create(self) -> Result<Sandbox> {
         let name = self.spec.name.clone().unwrap_or_default();
         self.handles.track(&name);
-        let id = match self.policy {
-            None => {
-                self.handles
-                    .client
-                    .create_sandbox(self.spec)
-                    .await
-                    .context(format!("create sandbox {name}"))?
-                    .id
-            }
-            // The SDK's spec has no policy field, so create through gRPC.
-            Some(policy) => {
-                crate::ensure!(
-                    !self.spec.gpu && self.spec.service_exposures.is_empty(),
-                    "testkit doesn't create a sandbox with a policy and a GPU or service exposures"
-                );
-                let request = policy_create_request(self.spec, policy, self.handles.grpc.scope());
-                self.handles
-                    .grpc
-                    .client()
-                    .await?
-                    .create_sandbox(request)
-                    .await
-                    .context(format!("create sandbox {name}"))?;
-                self.handles
-                    .client
-                    .get_sandbox(&name)
-                    .await
-                    .context(format!("get sandbox {name}"))?
-                    .id
-            }
+        let id = if self.policy.is_none() && self.driver_config.is_none() {
+            self.handles
+                .client
+                .create_sandbox(self.spec)
+                .await
+                .context(format!("create sandbox {name}"))?
+                .id
+        } else {
+            // The SDK's spec has no policy or driver config, so create
+            // through gRPC.
+            crate::ensure!(
+                !self.spec.gpu && self.spec.service_exposures.is_empty(),
+                "testkit doesn't create a sandbox with a policy or driver config and a GPU or service exposures"
+            );
+            let driver_config = self.driver_config.map(driver_config_struct).transpose()?;
+            let request = grpc_create_request(
+                self.spec,
+                self.policy,
+                driver_config,
+                self.handles.grpc.scope(),
+            );
+            self.handles
+                .grpc
+                .client()
+                .await?
+                .create_sandbox(request)
+                .await
+                .context(format!("create sandbox {name}"))?;
+            self.handles
+                .client
+                .get_sandbox(&name)
+                .await
+                .context(format!("get sandbox {name}"))?
+                .id
         };
         Ok(Sandbox {
             handles: self.handles,
@@ -495,15 +560,28 @@ impl SandboxBuilder {
     }
 }
 
-/// The gRPC request for a sandbox created from `spec` with `policy`, built
-/// as the SDK builds one from `spec` alone. The spec is destructured without
-/// `..`, so a field added to the SDK's spec fails to compile here instead of
-/// being dropped. [`SandboxBuilder::create`] rejects a GPU or service
-/// exposures before calling this. A policy field on the SDK's spec would
-/// replace this (#5410).
-fn policy_create_request(
+/// `config` as the protobuf `Struct` the template carries. It must be a JSON
+/// object, keyed by driver name.
+fn driver_config_struct(config: serde_json::Value) -> Result<prost_types::Struct> {
+    let serde_json::Value::Object(fields) = config else {
+        return Err(Error::msg(format!(
+            "driver config must be a JSON object keyed by driver name; got {config}"
+        )));
+    };
+    openshell_core::proto_struct::json_object_to_struct(fields)
+        .map_err(|error| Error::msg(format!("driver config can't be represented: {error}")))
+}
+
+/// The gRPC request for a sandbox created from `spec` with `policy` and
+/// `driver_config`, built as the SDK builds one from `spec` alone. The spec
+/// is destructured without `..`, so a field added to the SDK's spec fails to
+/// compile here instead of being dropped. [`SandboxBuilder::create`] rejects
+/// a GPU or service exposures before calling this. Policy and driver config
+/// fields on the SDK's spec would replace this (#5410).
+fn grpc_create_request(
     spec: SandboxSpec,
-    policy: proto::SandboxPolicy,
+    policy: Option<proto::SandboxPolicy>,
+    driver_config: Option<prost_types::Struct>,
     workspace_scope: Option<proto::datamodel::v1::WorkspaceSelector>,
 ) -> proto::CreateSandboxRequest {
     let SandboxSpec {
@@ -524,14 +602,17 @@ fn policy_create_request(
         workspace_scope,
         spec: Some(proto::SandboxSpec {
             environment,
-            template: image.map(|image| proto::SandboxTemplate {
-                image,
-                ..proto::SandboxTemplate::default()
+            template: (image.is_some() || driver_config.is_some()).then(|| {
+                proto::SandboxTemplate {
+                    image: image.unwrap_or_default(),
+                    driver_config,
+                    ..proto::SandboxTemplate::default()
+                }
             }),
             providers,
             command,
             tty,
-            policy: Some(policy),
+            policy,
             restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
             ..proto::SandboxSpec::default()
         }),
@@ -622,6 +703,10 @@ fn script_summary(script: &str) -> &str {
 impl Sandbox {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn handles(&self) -> &Handles {
+        &self.handles
     }
 
     pub fn id(&self) -> &str {
@@ -1008,12 +1093,83 @@ mod tests {
         };
         let policy = crate::policy::base();
 
-        let spec = policy_create_request(spec, policy.clone(), None)
+        let spec = grpc_create_request(spec, Some(policy.clone()), None, None)
             .spec
             .expect("spec");
 
-        assert_eq!(spec.template.expect("template").image, "python:3");
+        let template = spec.template.expect("template");
+        assert_eq!(template.image, "python:3");
+        assert_eq!(template.driver_config, None);
         assert_eq!(spec.providers, ["provider"]);
         assert_eq!(spec.policy, Some(policy));
+    }
+
+    #[test]
+    fn grpc_create_request_carries_driver_config_without_an_image() {
+        let config = driver_config_struct(serde_json::json!({
+            "docker": { "mounts": [{ "type": "volume", "source": "data" }] }
+        }))
+        .expect("an object converts");
+
+        let spec = grpc_create_request(SandboxSpec::default(), None, Some(config.clone()), None)
+            .spec
+            .expect("spec");
+
+        let template = spec.template.expect("a template for the driver config");
+        assert_eq!(template.image, "", "an empty image selects the default");
+        assert_eq!(template.driver_config, Some(config));
+        assert_eq!(spec.policy, None);
+    }
+
+    #[test]
+    fn grpc_create_request_omits_an_empty_template() {
+        let spec = grpc_create_request(SandboxSpec::default(), None, None, None)
+            .spec
+            .expect("spec");
+        assert_eq!(spec.template, None);
+    }
+
+    #[test]
+    fn driver_config_must_be_an_object() {
+        let error = driver_config_struct(serde_json::json!(["docker"])).expect_err("an array");
+        assert!(
+            error.to_string().contains("keyed by driver name"),
+            "{error}"
+        );
+    }
+
+    fn gateway_info(drivers: &[(&str, &str)]) -> proto::GetGatewayInfoResponse {
+        proto::GetGatewayInfoResponse {
+            compute_drivers: drivers
+                .iter()
+                .map(|(name, reported)| proto::ComputeDriverInfo {
+                    name: (*name).to_string(),
+                    capabilities: Some(proto::ComputeDriverCapabilities {
+                        driver_name: (*reported).to_string(),
+                        ..proto::ComputeDriverCapabilities::default()
+                    }),
+                })
+                .collect(),
+            ..proto::GetGatewayInfoResponse::default()
+        }
+    }
+
+    #[test]
+    fn compute_driver_is_the_single_agreeing_driver() {
+        assert_eq!(
+            single_compute_driver(&gateway_info(&[("docker", "docker")])).expect("one driver"),
+            "docker"
+        );
+        for drivers in [
+            &[][..],
+            &[("docker", "podman")][..],
+            &[("", "")][..],
+            &[("docker", "docker"), ("podman", "podman")][..],
+        ] {
+            assert!(
+                single_compute_driver(&gateway_info(drivers)).is_err(),
+                "{drivers:?} should fail"
+            );
+        }
     }
 }
