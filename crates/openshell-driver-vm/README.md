@@ -14,6 +14,12 @@ binaries.
 
 The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
+Guest init creates missing `/dev/fd` and standard-stream links after mounting
+procfs and devtmpfs, before using Bash process substitution. Existing links to
+the expected procfs paths, or entries that resolve to the same files, stay
+intact. Conflicting entries and unrelated dangling links fail boot with a
+diagnostic rather than being replaced.
+
 ## How it fits together
 
 Caller driver config is disabled by default, including upload workflows
