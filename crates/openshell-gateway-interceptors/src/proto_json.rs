@@ -293,7 +293,6 @@ mod tests {
         CreateProviderRequest, CreateSandboxRequest, GpuResourceRequirements, Provider,
         SandboxSpec, UpdateConfigRequest,
     };
-    use prost::Message as _;
     use prost_types::{
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
         field_descriptor_proto::{Label, Type},

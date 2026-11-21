@@ -162,11 +162,13 @@ impl TryFrom<ProtoLandlockPolicy> for LandlockPolicy {
         let compatibility = match proto.compatibility.as_str() {
             "best_effort" | "" => LandlockCompatibility::BestEffort,
             "hard_requirement" => LandlockCompatibility::HardRequirement,
-            otherwise => miette::bail!(
-                "invalid landlock.compatibility {:?}; accepted: {}",
-                otherwise,
-                LANDLOCK_COMPATIBILITY_VALUES.join(", ")
-            ),
+            otherwise => {
+                miette::bail!(
+                    "invalid landlock.compatibility {:?}; accepted: {}",
+                    otherwise,
+                    LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+                );
+            }
         };
         Ok(Self { compatibility })
     }

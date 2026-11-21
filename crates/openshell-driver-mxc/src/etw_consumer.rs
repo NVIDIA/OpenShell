@@ -805,6 +805,7 @@ unsafe fn raw_event_queued_bytes(event_record: *const EVENT_RECORD) -> Option<us
     Some(bytes)
 }
 
+#[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
 fn try_reserve_queue_bytes(health: &CaptureHealth, event_bytes: usize) -> bool {
     if event_bytes > EVENT_QUEUE_BYTE_CAPACITY {
         return false;

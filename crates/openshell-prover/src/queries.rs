@@ -92,7 +92,9 @@ pub fn check_credential_safety(model: &ReachabilityModel) -> miette::Result<Vec<
             match model.check_sat(&expr) {
                 SatResult::Sat => {}
                 SatResult::Unsat => continue,
-                SatResult::Unknown => miette::bail!("reachability query inconclusive"),
+                SatResult::Unknown => {
+                    miette::bail!("reachability query inconclusive");
+                }
             }
 
             let host_is_link_local = is_link_local_or_metadata_host(&eid.host);

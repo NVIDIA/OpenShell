@@ -21,6 +21,7 @@ impl SandboxProtocol for RenewingGrpcBoundary {
         &self,
         request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        #[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
         if self
             .failures
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
