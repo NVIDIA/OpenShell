@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The workloads family is one crate; each module in `src/` is a workload.
+[package]
+name = "workloads"
+description = "Workloads suite: real tools doing realistic tasks in sandboxes"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+# `openshell-workloads`: the suite as one program to run against a gateway.
+# No test target of its own: cargo test and nextest run the tests through the
+# library.
+[[bin]]
+name = "openshell-workloads"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+openshell-testkit = { path = "../../testkit/testkit" }
+
+[workspace]

@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build the workloads suite's images (tests/suites/workloads) into Docker and
+# publish their names. Environment setup applies this once and caches the
+# disk, keyed on the Dockerfiles, so the tests need no network.
+---
+- name: Workload images for tests
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create the make workload build directory
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/openshell-test/workloads/make
+        state: directory
+        mode: "0755"
+
+    - name: Copy the make workload Dockerfile
+      become: true
+      ansible.builtin.copy:
+        src: "{{ workload_make_dockerfile }}"
+        dest: /var/lib/openshell-test/workloads/make/Dockerfile
+        mode: "0644"
+
+    - name: Build the make workload image
+      become: true
+      ansible.builtin.command:
+        argv: [docker, build, --tag, localhost/openshell/workload-make:dev, /var/lib/openshell-test/workloads/make]
+      changed_when: true
+
+    - name: Publish the workload image variables
+      ansible.builtin.include_tasks: test-env.yaml
+      vars:
+        test_env_name: workloads
+        test_env_vars:
+          OPENSHELL_TEST_WORKLOAD_MAKE_IMAGE: localhost/openshell/workload-make:dev

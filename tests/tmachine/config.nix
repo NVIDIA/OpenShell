@@ -114,6 +114,15 @@ let
       bases = dockerBases ++ podmanBases;
       setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
+    # The workload images, for the workloads suite. Each Dockerfile is an
+    # input, so changing one rebuilds the environment's setup.
+    workloads = {
+      bases = dockerBases;
+      setup = {
+        playbooks = [ "ansible/playbooks/workloads.yaml" ];
+        inputs.workload_make_dockerfile = "../../tests/suites/workloads/make/Dockerfile";
+      };
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases

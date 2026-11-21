@@ -123,7 +123,8 @@ jobs:
             {"environment":"fedora-podman-rootless-userns-keep-id","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"fedora-podman-rootless-userns-private","installer":"rpm","family":"drivers/podman","gateway":"openshell","runner":"ubuntu-24.04"},
             {"environment":"ubuntu-docker-rootful","installer":"deb","family":"continuity","disruption":"gateway-restart","gateway":"openshell","runner":"ubuntu-24.04"},
-            {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","family":"continuity","disruption":"upgrade","gateway":"openshell","runner":"ubuntu-24.04","upgrade_source":true,"upgrade_package":"deb"}
+            {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","family":"continuity","disruption":"upgrade","gateway":"openshell","runner":"ubuntu-24.04","upgrade_source":true,"upgrade_package":"deb"},
+            {"environment":"ubuntu-docker-rootful-workloads","installer":"deb","family":"workloads","gateway":"openshell","runner":"ubuntu-24.04"}
           ]'
           # `suite` names the row's tests in the job and artifact names.
           matrix=$(jq -c --arg family "${FAMILY}" --arg external "${EXTERNAL_DRIVERS}" --arg upgrade "${UPGRADE_SOURCE}" '{include: map(

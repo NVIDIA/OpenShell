@@ -43,6 +43,7 @@ run = [
   "cargo clippy --manifest-path tests/suites/continuity/Cargo.toml --workspace --all-targets -- -D warnings",
   "cargo clippy --manifest-path tests/suites/drivers/podman/Cargo.toml --workspace --all-targets -- -D warnings",
   "cargo clippy --manifest-path tests/suites/features/Cargo.toml --workspace --all-targets -- -D warnings",
+  "cargo clippy --manifest-path tests/suites/workloads/Cargo.toml --workspace --all-targets -- -D warnings",
   "cargo clippy --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
@@ -63,6 +64,7 @@ run = [
   "cargo fmt --manifest-path tests/suites/continuity/Cargo.toml --all",
   "cargo fmt --manifest-path tests/suites/drivers/podman/Cargo.toml --all",
   "cargo fmt --manifest-path tests/suites/features/Cargo.toml --all",
+  "cargo fmt --manifest-path tests/suites/workloads/Cargo.toml --all",
   "cargo fmt --manifest-path tests/support/Cargo.toml --all",
 ]
 hide = true
@@ -82,6 +84,7 @@ run = [
   "cargo fmt --manifest-path tests/suites/continuity/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/suites/drivers/podman/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/suites/features/Cargo.toml --all -- --check",
+  "cargo fmt --manifest-path tests/suites/workloads/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/support/Cargo.toml --all -- --check",
 ]
 hide = true

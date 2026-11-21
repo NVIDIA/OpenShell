@@ -183,7 +183,7 @@ only in `Branch E2E Checks`. The manual Integration Tests workflow runs the
 remaining tmachine testsuites, such as `e2e-podman`, and downloads the packages
 selected by its matrix.
 
-Three opt-in labels enable the long-running E2E suites:
+Four opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
   with both managed and standalone compute drivers in `Branch E2E Checks`
@@ -192,11 +192,14 @@ Three opt-in labels enable the long-running E2E suites:
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 - `test:e2e:continuity` runs the continuity suites in `Branch E2E Checks`. Apply it
   with `test:e2e`, whose builds it reuses.
+- `test:e2e:workloads` runs the workloads suite (`tests/suites/workloads`) in
+  `Branch E2E Checks`. Apply it together with `test:e2e`, which builds what the
+  suite runs on. Manual runs include it.
 
 GPU E2E is disabled because GitHub-hosted runners have no GPUs. `e2e-gpu-test.yaml` stays in the tree, but no workflow calls it.
 
 When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images. Docker, Podman, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
-The `OpenShell / E2E` required status is evaluated from the `Core E2E result` job inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status. `test:e2e:continuity` is optional too.
+The `OpenShell / E2E` required status is evaluated from the `Core E2E result` job inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status. `test:e2e:continuity` and `test:e2e:workloads` are optional too.
 
 The continuity suites (`tests/suites/continuity`) check that state created before
 a disruption survives it. Each row of `e2e-suites.yml` names one disruption:
