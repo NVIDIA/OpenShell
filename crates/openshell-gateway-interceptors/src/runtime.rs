@@ -15,7 +15,7 @@ use openshell_core::proto::gateway_interceptor::v1::{
     InterceptorEvaluation, InterceptorResult, JsonPatch, ModifyOperationEvaluation,
     PostCommitEvaluation, ValidateEvaluation, interceptor_evaluation,
 };
-use openshell_extension_core::BearerTokenSlot;
+use openshell_extension_core::{BearerTokenSlot, call_with_retries};
 use prost::Message as _;
 use prost_types::Struct;
 use serde_json::{Map, Value};
@@ -329,10 +329,20 @@ async fn evaluate_plan(
     };
 
     let start = Instant::now();
-    let result = tokio::time::timeout(
-        plan.timeout,
-        plan.client.clone().evaluate(Request::new(request)),
-    )
+    let deadline = tokio::time::Instant::now() + plan.timeout;
+    let evaluate = || {
+        let mut client = plan.client.clone();
+        let request = Request::new(request.clone());
+        async move { client.evaluate(request).await }
+    };
+    // A fail-open binding is bypassed on its first failure, so a service
+    // that is down does not delay the operation.
+    let result = tokio::time::timeout_at(deadline, async {
+        match plan.failure_policy {
+            FailurePolicy::FailClosed => call_with_retries(Some(deadline), evaluate).await,
+            FailurePolicy::FailOpen => evaluate().await,
+        }
+    })
     .await
     .map_err(|_| InterceptorError::Transport("evaluation timed out".to_string()))?
     .map_err(|status| InterceptorError::Transport(status.to_string()))?
@@ -739,6 +749,32 @@ mod tests {
                 Channel::from_static("http://127.0.0.1:1").connect_lazy(),
                 BearerTokenInterceptor::disabled(),
             ),
+        }
+    }
+
+    /// The test plan's endpoint refuses connections. A fail-closed binding
+    /// keeps trying until its timeout and reports the transport failure; a
+    /// fail-open binding fails on the first attempt.
+    #[tokio::test]
+    async fn an_unreachable_service_is_retried_only_for_a_fail_closed_binding() {
+        let context = EvaluationContext {
+            principal: BTreeMap::new(),
+            validate_current_state: None,
+        };
+        for (failure_policy, retried) in [
+            (FailurePolicy::FailClosed, true),
+            (FailurePolicy::FailOpen, false),
+        ] {
+            let plan = test_modify_plan(failure_policy);
+            let started = Instant::now();
+            let error = evaluate_plan(&plan, serde_json::json!({}), &context)
+                .await
+                .expect_err("the service is unreachable")
+                .to_string();
+            let elapsed = started.elapsed();
+            assert!(!error.contains("timed out"), "{error}");
+            assert_eq!(elapsed > plan.timeout / 2, retried, "{elapsed:?}: {error}");
+            assert!(elapsed < plan.timeout * 2, "{elapsed:?}");
         }
     }
 

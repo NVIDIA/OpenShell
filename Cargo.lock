@@ -4861,7 +4861,9 @@ dependencies = [
 name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
+ "h2",
  "http 1.4.0",
+ "hyper",
  "hyper-util",
  "openshell-crypto",
  "rcgen",

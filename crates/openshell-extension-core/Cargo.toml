@@ -11,6 +11,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+h2 = { workspace = true }
+hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
@@ -24,6 +26,7 @@ http = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["server", "tls-native-roots"] }
 

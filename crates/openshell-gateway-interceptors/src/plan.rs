@@ -19,7 +19,7 @@ use openshell_core::proto::gateway_interceptor::v1::{
 };
 use openshell_extension_core::{
     BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
-    connect_channel,
+    call_with_retries, connect_channel,
 };
 use tonic::Request;
 use tracing::{info, warn};
@@ -208,18 +208,26 @@ impl ExecutionPlan {
                 Some(timeout) => parse_duration(timeout)?,
                 None => DEFAULT_TIMEOUT,
             };
-            let mut client = GatewayInterceptorClient::new(channel.clone())
-                .max_decoding_message_size(
-                    config
-                        .max_response_bytes
-                        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
-                );
+            let client = GatewayInterceptorClient::new(channel.clone()).max_decoding_message_size(
+                config
+                    .max_response_bytes
+                    .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
+            );
             let gateway = gateway_metadata(ExtensionFamily::GatewayInterceptor);
-            let manifest = tokio::time::timeout(
-                timeout,
-                client.describe(Request::new(DescribeRequest {
-                    gateway: Some(gateway.clone()),
-                })),
+            let deadline = tokio::time::Instant::now() + timeout;
+            let manifest = tokio::time::timeout_at(
+                deadline,
+                call_with_retries(Some(deadline), || {
+                    let mut client = client.clone();
+                    let gateway = gateway.clone();
+                    async move {
+                        client
+                            .describe(Request::new(DescribeRequest {
+                                gateway: Some(gateway),
+                            }))
+                            .await
+                    }
+                }),
             )
             .await
             .map_err(|_| {
