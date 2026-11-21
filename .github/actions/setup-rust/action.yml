@@ -46,12 +46,17 @@ runs:
         echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
 
     - name: Configure persistent Cargo target directory
-      if: ${{ env.OPENSHELL_PERSISTENT_CACHE != '' }}
+      id: persistent-cache
       shell: bash
       env:
         NIX_SHELL_HASH: ${{ steps.dev-shell.outputs.hash }}
       run: |
         set -euo pipefail
+        # Pod environment is visible to the shell, not the workflow env context.
+        if [[ -z "${OPENSHELL_PERSISTENT_CACHE:-}" ]]; then
+          exit 0
+        fi
+        echo "enabled=true" >> "$GITHUB_OUTPUT"
         test "$GITHUB_REPOSITORY" = ai-openshell/openshell
         test "$OPENSHELL_PERSISTENT_CACHE" = /mnt/ci-cache
         mountpoint -q "$OPENSHELL_PERSISTENT_CACHE"
@@ -65,7 +70,7 @@ runs:
         df -h "$cache_root/target"
 
     - name: Cache Rust target and registry
-      if: ${{ env.OPENSHELL_PERSISTENT_CACHE == '' }}
+      if: ${{ steps.persistent-cache.outputs.enabled != 'true' }}
       id: cache
       uses: Swatinem/rust-cache@6a7bc3ebce750e0a16a430dd57485acfdb38b05f
       with:
