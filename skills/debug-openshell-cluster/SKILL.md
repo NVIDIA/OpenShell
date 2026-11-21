@@ -1111,6 +1111,17 @@ kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" -o jsonpath="{.spec.template.sp
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
+Workload/supervisor node separation is preferred by default. Check
+`sandbox_runtime.pod_anti_affinity` in gateway configuration (under Helm's
+`gatewayConfig`); the chart derives shared-supervisor rules from it. Required mode needs
+separate eligible nodes; inspect both roles' `FailedScheduling` events. The
+reserved pod label `openshell.ai/runtime-role` has values `workload`,
+`supervisor`, and `gateway`; role anti-affinity selects across all namespaces
+unless `sandbox_runtime.pod_anti_affinity_namespace_selector` restricts scope. Node selectors/tolerations are opt-in: check gateway chart
+fields, `supervisor.nodeSelector` / `supervisor.tolerations`, and
+`sandbox_runtime.workload_placement`. Existing unlabeled pods need recreation.
+The published `/kubernetes/pod-placement` guide covers placement configuration and diagnostics.
+
 The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes. Kubernetes sandboxes take the configured supervisor and runtime images each time they start, so a sandbox that kept running through an upgrade uses its previous images until its next stop and start.
 
 For vulnerability reports, record the running image digest and scan that exact

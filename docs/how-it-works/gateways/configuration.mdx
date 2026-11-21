@@ -1691,6 +1691,8 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.sandbox_runtime]
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
+# Workload/supervisor node separation: preferred (default), required, or off.
+pod_anti_affinity = "preferred"
 ```
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
@@ -1710,6 +1712,21 @@ into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
+
+### Kubernetes pod placement
+
+The following fields are under `[openshell.drivers.kubernetes.sandbox_runtime]`:
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `pod_anti_affinity` | `"preferred"` | Workload/supervisor node separation: `preferred`, `required`, or `off`. |
+| `pod_anti_affinity_namespace_selector` | `{}` | Native Kubernetes label selector for peer namespaces. Empty matches all namespaces. |
+| `workload_placement.node_selector` | `{}` | Operator-owned workload node selector. Conflicting caller values are rejected. |
+| `workload_placement.tolerations` | `[]` | Operator tolerations appended without duplicates to caller tolerations. |
+
+Helm derives the shared-supervisor policy from these gateway settings. See
+[Pod Placement](/kubernetes/pod-placement) for role labels, separation modes,
+node pools, independently deployed supervisors, and Pending-pod diagnostics.
 
 ### Sandbox identity through the SPIFFE Broker API
 
@@ -2219,7 +2236,9 @@ compute_driver = "kyma"
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
 
-## Preflight package configuration {#gateway-config-preflight}
+<a id="gateway-config-preflight" />
+
+## Preflight package configuration
 
 Before starting a package-managed gateway, validate the selected file without
 changing it:

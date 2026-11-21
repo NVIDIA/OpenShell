@@ -834,6 +834,10 @@ fn common_labels(sandbox_id: &str, component: &str) -> BTreeMap<String, String> 
 
 fn control_labels(sandbox_id: &str, gateway_id: &str) -> BTreeMap<String, String> {
     let mut labels = common_labels(sandbox_id, "supervisor");
+    labels.insert(
+        crate::scheduling::ROLE_LABEL.to_string(),
+        "supervisor".to_string(),
+    );
     labels.extend(pair_labels(sandbox_id, "supervisor"));
     labels.insert(
         "openshell.ai/gateway-id".to_string(),

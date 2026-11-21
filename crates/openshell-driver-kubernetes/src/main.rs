@@ -154,6 +154,26 @@ struct Args {
     )]
     sandbox_runtime_boundary_port: u16,
 
+    /// Workload/supervisor node separation: off, preferred, or required.
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_POD_ANTI_AFFINITY",
+        default_value = "preferred"
+    )]
+    pod_anti_affinity: openshell_driver_kubernetes::KubernetesPodAntiAffinity,
+
+    /// Native Kubernetes namespace selector JSON (default: all namespaces).
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_POD_ANTI_AFFINITY_NAMESPACE_SELECTOR",
+        default_value = "{}"
+    )]
+    pod_anti_affinity_namespace_selector: String,
+
+    /// Operator workload placement JSON, with `node_selector` and tolerations.
+    #[arg(long, env = "OPENSHELL_K8S_WORKLOAD_PLACEMENT", default_value = "{}")]
+    workload_placement: String,
+
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
     https_proxy: Option<String>,
@@ -294,6 +314,13 @@ async fn main() -> Result<()> {
                 app_listener:
                     openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
+                pod_anti_affinity: args.pod_anti_affinity,
+                pod_anti_affinity_namespace_selector: serde_json::from_str(
+                    &args.pod_anti_affinity_namespace_selector,
+                )
+                .into_diagnostic()?,
+                workload_placement: serde_json::from_str(&args.workload_placement)
+                    .into_diagnostic()?,
             },
             runtime_bootstrap_grace_seconds: args.runtime_bootstrap_grace_seconds,
             sandbox_attach_request_timeout_seconds: args.sandbox_attach_request_timeout_seconds,

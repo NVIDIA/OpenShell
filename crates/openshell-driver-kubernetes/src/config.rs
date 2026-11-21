@@ -119,6 +119,12 @@ impl FromStr for KubernetesControlConnection {
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
     pub app_listener: KubernetesAppListenerConfig,
+    /// Separation of workload pods from supervisor pods (preferred by default).
+    pub pod_anti_affinity: crate::scheduling::KubernetesPodAntiAffinity,
+    /// Namespaces whose opposite-role pods participate; empty selects all.
+    pub pod_anti_affinity_namespace_selector:
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector,
+    pub workload_placement: crate::scheduling::KubernetesWorkloadPlacement,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
@@ -129,6 +135,10 @@ impl Default for KubernetesSandboxRuntimeConfig {
         Self {
             boundary_port: 5500,
             app_listener: KubernetesAppListenerConfig::default(),
+            pod_anti_affinity: crate::KubernetesPodAntiAffinity::default(),
+            pod_anti_affinity_namespace_selector:
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector::default(),
+            workload_placement: crate::KubernetesWorkloadPlacement::default(),
         }
     }
 }
@@ -146,6 +156,24 @@ pub struct KubernetesAppListenerConfig {
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.app_listener.common.validate()?;
+        for toleration in &self.workload_placement.tolerations {
+            let operator = toleration.operator.as_deref().unwrap_or("Equal");
+            if !matches!(operator, "Equal" | "Exists")
+                || (operator == "Exists"
+                    && toleration
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| !value.is_empty()))
+                || (operator == "Equal" && toleration.key.as_ref().is_none_or(String::is_empty))
+                || toleration.effect.as_deref().is_some_and(|effect| {
+                    !matches!(effect, "" | "NoSchedule" | "PreferNoSchedule" | "NoExecute")
+                })
+                || (toleration.toleration_seconds.is_some()
+                    && toleration.effect.as_deref() != Some("NoExecute"))
+            {
+                return Err("invalid sandbox_runtime.workload_placement.tolerations: use Kubernetes toleration operators and effects".into());
+            }
+        }
         if self.app_listener.common.enabled {
             if !is_dns_subdomain(&self.app_listener.tls_secret_name) {
                 return Err("sandbox_runtime.app_listener.tls_secret_name is required when the app listener is enabled".into());

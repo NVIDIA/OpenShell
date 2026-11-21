@@ -19,4 +19,4 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
 data:
   gateway.toml: |
-{{ include "openshell.gatewayConfigToml" . | nindent 4 }}
+{{ include "openshell.gatewayConfigToml" . | indent 4 }}

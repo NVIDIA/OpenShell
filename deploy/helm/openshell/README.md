@@ -807,7 +807,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
-| supervisor.affinity | object | `{}` | Affinity rules for the shared supervisor pod, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
+| supervisor.affinity | object | `{}` | Additional affinity rules merged with the shared supervisor role policy, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
 | supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
 | supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |
 | supervisor.autoscaling.maxReplicas | int | `4` | Maximum supervisor replicas. Must not exceed the gateway replica count * supervisor.pool.maxMembersPerGateway. |
@@ -820,6 +820,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
 | supervisor.listenAddress | string | `"0.0.0.0"` | Shared supervisor listener IP. Use `::` for IPv6. |
 | supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
+| supervisor.nodeSelector | object | `{}` | Optional node selector for shared supervisors. Empty imposes no pool restriction. |
 | supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
 | supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
@@ -832,6 +833,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. Must not exceed replicaCount * supervisor.pool.maxMembersPerGateway. |
 | supervisor.resources | object | `{}` | Resources of each shared supervisor container, unset by default. Memory grows with the sandboxes a supervisor runs; for the default of 128 sandboxes, request 250m CPU and 768Mi memory with a 1.5Gi memory limit. Refer to Size Sandbox Capacity in the High Availability guide. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
+| supervisor.tolerations | list | `[]` | Optional tolerations for shared supervisors. Empty adds no tolerations. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | topologySpreadConstraints | list | `[]` | Topology spread constraints for the gateway pod, used to spread replicas across zones or nodes. Empty = omit the field. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

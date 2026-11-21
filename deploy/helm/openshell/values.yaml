@@ -158,7 +158,11 @@ supervisor:
     seccompProfile:
       # -- Seccomp profile applied to the shared supervisor pod.
       type: RuntimeDefault
-  # -- Affinity rules for the shared supervisor pod, rendered only when
+  # -- Optional node selector for shared supervisors. Empty imposes no pool restriction.
+  nodeSelector: {}
+  # -- Optional tolerations for shared supervisors. Empty adds no tolerations.
+  tolerations: []
+  # -- Additional affinity rules merged with the shared supervisor role policy, rendered only when
   # gatewayConfig selects supervisor_topology = "gateway". Top-level affinity
   # applies only to the gateway pod.
   affinity: {}

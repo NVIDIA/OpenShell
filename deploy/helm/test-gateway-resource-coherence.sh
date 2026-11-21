@@ -18,7 +18,7 @@ render() {
     --set agentSandbox.preflight.enabled=false \
     "$@" >"${work_dir}/${name}.yaml"
 
-  if invalid_documents="$(yq ea -r 'select(. != null and ((has("apiVersion") | not) or (has("kind") | not))) | .kind // "<unknown>"' "${work_dir}/${name}.yaml")" && [[ -n "${invalid_documents}" ]]; then
+  if invalid_documents="$(yq ea -o=json 'select(. != null and ((has("apiVersion") | not) or (has("kind") | not)))' "${work_dir}/${name}.yaml")" && [[ -n "${invalid_documents}" ]]; then
     printf 'rendered Kubernetes documents without apiVersion or kind:\n%s\n' "${invalid_documents}" >&2
     echo "${name}: rendered an invalid Kubernetes document" >&2
     exit 1
