@@ -39,6 +39,32 @@ workspace namespace modes via `workspace_mode`:
   gateway state; it never deletes or otherwise accesses the operator-managed
   Kubernetes namespace.
 
+## Workload identity
+
+Namespace annotations `openshell.ai/sandbox-uid` and `openshell.ai/sandbox-gid`
+assign an operator-owned pair ahead of driver defaults and SCC discovery.
+`require_namespace_identity` requires this explicit pair for every new sandbox.
+The standalone driver exposes `--require-namespace-identity` and
+`OPENSHELL_REQUIRE_NAMESPACE_IDENTITY`.
+See the [operator setup and precedence](../../docs/how-it-works/sandboxes/runtimes.mdx#namespace-workload-identity).
+
+Creation writes a versioned `openshell.ai/resolved-workload-identity` annotation
+on the Sandbox CR before any workload is released. Start and runtime generation
+installation verify the persisted pair against the stored pod template; they
+never re-resolve namespace identity. The pair drives the boundary, supervisor,
+agent, bootstrap and workspace init, and Pod `fsGroup`. Get/list/watch expose
+the same pair through `DriverSandboxStatus.resolved_identity`, even before
+controller status exists. The existing gateway `WorkloadIdentity` condition
+displays it without a new protobuf field.
+Invalid durable records remain visible with a `WorkloadIdentity=False` condition
+and block restart; get/list/watch do not interpret them as missing sandboxes.
+
+Legacy restart adopts the numeric identity from the stored pod template using
+a resource-version-conditional patch. Missing IDs or disagreement between pod
+and container security contexts fail closed. The workload record is independent
+of generation annotations and survives stop and image updates. Namespace
+annotation changes affect only future creations.
+
 When the gateway configures `[openshell.gateway.otlp]`, Kubernetes
 compute-driver spans export to the same OTLP collector, over its configured
 protocol, with the service

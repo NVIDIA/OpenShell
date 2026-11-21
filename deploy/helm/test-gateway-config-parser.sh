@@ -43,6 +43,24 @@ render "${work_dir}/default.yaml"
 extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
 
+# The namespace identity switch must reach the Kubernetes driver's typed
+# configuration, rather than merely survive the opaque TOML serializer.
+for required in true false; do
+  render "${work_dir}/namespace-identity-${required}.yaml" \
+    --set "gatewayConfig.openshell\\.drivers\\.kubernetes.require_namespace_identity=${required}"
+  extract_toml "${work_dir}/namespace-identity-${required}.yaml" \
+    "${work_dir}/namespace-identity-${required}.toml"
+  preflight "${work_dir}/namespace-identity-${required}.toml"
+done
+render "${work_dir}/namespace-identity-invalid.yaml" \
+  --set-string 'gatewayConfig.openshell\.drivers\.kubernetes.require_namespace_identity=required'
+extract_toml "${work_dir}/namespace-identity-invalid.yaml" \
+  "${work_dir}/namespace-identity-invalid.toml"
+if preflight "${work_dir}/namespace-identity-invalid.toml" >"${work_dir}/namespace-identity-invalid.err" 2>&1; then
+  echo "the Kubernetes driver accepted a non-boolean require_namespace_identity" >&2
+  exit 1
+fi
+
 # Disabling metrics must remove even a raw listener override. Re-enabling
 # with the same retained port must produce a loader-valid custom listener.
 render "${work_dir}/metrics-disabled.yaml" \

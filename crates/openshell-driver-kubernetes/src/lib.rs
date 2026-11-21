@@ -11,6 +11,7 @@ pub mod otel_tracing;
 mod resource_admission;
 mod sandbox_runtime;
 mod shared_supervisor;
+mod workload_identity;
 
 pub use config::{
     DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,

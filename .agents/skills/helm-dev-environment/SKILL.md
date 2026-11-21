@@ -57,6 +57,17 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
+### Namespace workload identity
+
+For tenant identity tests, annotate each pre-provisioned namespace with both
+`openshell.ai/sandbox-uid` and `openshell.ai/sandbox-gid`. Enable
+`require_namespace_identity` in the literal
+`gatewayConfig.openshell.drivers.kubernetes` table to reject missing assignments
+or unreadable namespace metadata. Assignments override driver defaults and SCC
+discovery. Changing annotations affects new sandboxes; existing sandboxes retain
+their pair across stop/start. Use `mise run e2e:kubernetes:workspace-operator`
+for the tenant identity and storage regression.
+
 ### Gateway metrics
 
 The chart enables its dedicated Prometheus endpoint by default. Set
