@@ -178,7 +178,9 @@ each `WatchSandbox` snapshot attach it at read time, only while the sandbox is
 `Ready` and the report belongs to the running main-process instance. A replica
 without the session reads it from the owner with
 `PeerGetSandboxProgramStatus`. A report that changes the state, blocked kind,
-or app notifies local watchers; input alone does not. `ListSandboxes` and
+or app notifies local watchers; input alone does not. The first change
+notifies at once, and further changes within 2 seconds collapse into one
+notification at the end of that window. `ListSandboxes` and
 watchers on other replicas do not see it.
 
 Every replica sweeps its own sessions every 30 seconds. A sandbox becomes a

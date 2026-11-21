@@ -200,7 +200,9 @@ report belongs to the running main-process instance. A replica that does not
 hold the session reads it from the owner with the peer RPC
 `PeerGetSandboxProgramStatus`, using the same owner routing as provider status.
 A report that changes the state, blocked kind, or app notifies local watchers.
-Input alone notifies no one, and the supervisor sends input-only reports only
+The first change notifies at once; quick flips within the next 2 seconds, such
+as `working`, `blocked`, `working`, collapse into one notification at the end
+of that window. Input alone notifies no one, and the supervisor sends input-only reports only
 while the program waits on the user. Reports therefore cost no store writes,
 no resource-version churn for the reconcile sweep, and nothing when idle stop
 is disabled. `ListSandboxes`, and watchers on a replica without the session,

@@ -1022,6 +1022,9 @@ pub struct ComputeRuntime {
     /// Idle stops waiting for their supervisor to confirm, by request ID. The
     /// reply's arrival time at the report handler is sent to the waiter.
     activity_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<Instant>>>>,
+    /// Sandboxes inside a `ProgramStatus` notify window, and whether the
+    /// status changed again since the window's last notification.
+    status_notify_windows: Arc<StdMutex<HashMap<String, bool>>>,
     sandbox_updates_enabled: bool,
     update_recovery_sweep: Arc<tokio::sync::Semaphore>,
     update_recovery_backoff: Arc<Mutex<HashMap<String, image_update::UpdateRecoveryBackoff>>>,
@@ -1149,6 +1152,7 @@ impl ComputeRuntime {
             activity_gates: Arc::default(),
             idle_stops_in_flight: Arc::default(),
             activity_requests: Arc::default(),
+            status_notify_windows: Arc::default(),
             sandbox_updates_enabled: false,
             update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
@@ -5638,9 +5642,51 @@ impl ComputeRuntime {
             let _ = waiter.send(arrived);
         }
         if changed {
-            self.sandbox_watch_bus.notify(sandbox_id);
+            self.notify_program_status(sandbox_id);
         }
         Ok(())
+    }
+
+    /// Tell watchers the displayed `ProgramStatus` changed. The first change
+    /// notifies at once and opens a window; changes inside it collapse into
+    /// one notification at its end, which opens the next window. Quick flips
+    /// such as `Working`, `Blocked`, `Working` cost at most one watch read
+    /// per window, and watchers always read the newest report.
+    fn notify_program_status(&self, sandbox_id: &str) {
+        {
+            let mut windows = self
+                .status_notify_windows
+                .lock()
+                .expect("status notify lock poisoned");
+            if let Some(changed_again) = windows.get_mut(sandbox_id) {
+                *changed_again = true;
+                return;
+            }
+            windows.insert(sandbox_id.to_string(), false);
+        }
+        self.sandbox_watch_bus.notify_existing(sandbox_id);
+        let windows = Arc::clone(&self.status_notify_windows);
+        let bus = self.sandbox_watch_bus.clone();
+        let sandbox_id = sandbox_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(idle_stop::STATUS_NOTIFY_WINDOW).await;
+                let changed_again = {
+                    let mut windows = windows.lock().expect("status notify lock poisoned");
+                    let changed_again = windows.get(&sandbox_id).copied().unwrap_or(false);
+                    if changed_again {
+                        windows.insert(sandbox_id.clone(), false);
+                    } else {
+                        windows.remove(&sandbox_id);
+                    }
+                    changed_again
+                };
+                if !changed_again {
+                    return;
+                }
+                bus.notify_existing(&sandbox_id);
+            }
+        });
     }
 
     /// The session registry this runtime checks reports against. Production
@@ -9440,6 +9486,7 @@ pub fn new_test_runtime_with_driver(
         activity_gates: Arc::default(),
         idle_stops_in_flight: Arc::default(),
         activity_requests: Arc::default(),
+        status_notify_windows: Arc::default(),
         sandbox_updates_enabled: false,
         update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
         update_recovery_backoff: Arc::default(),
@@ -10743,6 +10790,7 @@ mod tests {
             activity_gates: Arc::default(),
             idle_stops_in_flight: Arc::default(),
             activity_requests: Arc::default(),
+            status_notify_windows: Arc::default(),
             sandbox_updates_enabled: false,
             update_recovery_sweep: Arc::new(Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
@@ -23054,6 +23102,64 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         )
         .await;
         assert!(runtime.program_status_condition(&stopping).is_none());
+    }
+
+    #[tokio::test]
+    async fn quick_status_flips_collapse_into_one_notification_per_window() {
+        use openshell_core::proto::WorkloadProgramState;
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        runtime
+            .store
+            .put_message(&idle_ready_record("sb-flips", "sandbox-flips"))
+            .await
+            .unwrap();
+        register_test_supervisor_session(&runtime, "sb-flips");
+        let mut watch = runtime.sandbox_watch_bus.subscribe("sb-flips");
+        let notifications = |watch: &mut tokio::sync::broadcast::Receiver<()>| {
+            std::iter::from_fn(|| watch.try_recv().ok()).count()
+        };
+        tokio::time::pause();
+
+        record(
+            &runtime,
+            "sb-flips",
+            &program_report(WorkloadProgramState::Done, 0),
+        )
+        .await;
+        assert_eq!(
+            notifications(&mut watch),
+            1,
+            "a lone change notifies at once"
+        );
+
+        for state in [
+            WorkloadProgramState::Working,
+            WorkloadProgramState::Blocked,
+            WorkloadProgramState::Working,
+        ] {
+            record(&runtime, "sb-flips", &program_report(state, 0)).await;
+        }
+        assert_eq!(notifications(&mut watch), 0, "flips inside the window wait");
+        tokio::time::sleep(idle_stop::STATUS_NOTIFY_WINDOW).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            notifications(&mut watch),
+            1,
+            "the window ends with one notification"
+        );
+
+        // A quiet window closes, and the next change notifies at once again.
+        tokio::time::sleep(idle_stop::STATUS_NOTIFY_WINDOW).await;
+        tokio::task::yield_now().await;
+        assert_eq!(notifications(&mut watch), 0);
+        assert!(runtime.status_notify_windows.lock().unwrap().is_empty());
+        record(
+            &runtime,
+            "sb-flips",
+            &program_report(WorkloadProgramState::Done, 0),
+        )
+        .await;
+        assert_eq!(notifications(&mut watch), 1);
     }
 
     #[tokio::test]

@@ -38,6 +38,9 @@ pub const CONFIRM_FRESHNESS: Duration = Duration::from_secs(2);
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_millis(200);
+/// Watchers hear the first `ProgramStatus` change at once; further changes
+/// within this window collapse into one notification at its end.
+pub const STATUS_NOTIFY_WINDOW: Duration = Duration::from_secs(2);
 /// Durable marker that the in-flight stop was started by the idle sweep. It
 /// survives gateway restarts and driver snapshots that rewrite conditions.
 pub const IDLE_STOP_ANNOTATION: &str = "internal.openshell.ai/idle-stop";

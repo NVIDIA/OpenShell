@@ -53,6 +53,20 @@ impl SandboxWatchBus {
         let _ = tx.send(());
     }
 
+    /// Notify only a sandbox that already has a bus entry, so a notification
+    /// for an unwatched or deleted sandbox creates none.
+    pub fn notify_existing(&self, sandbox_id: &str) {
+        let tx = self
+            .inner
+            .lock()
+            .expect("sandbox watch bus lock poisoned")
+            .get(sandbox_id)
+            .cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
+    }
+
     /// Subscribe to sandbox updates.
     pub fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<()> {
         self.sender_for(sandbox_id).subscribe()
@@ -158,6 +172,20 @@ pub fn lag_warning_event(n: u64) -> openshell_core::proto::SandboxStreamEvent {
 mod tests {
     use super::*;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
+
+    #[test]
+    fn notify_existing_reaches_watchers_without_creating_entries() {
+        let bus = SandboxWatchBus::new();
+        bus.notify_existing("sb-unwatched");
+        assert!(bus.inner.lock().unwrap().is_empty());
+
+        let mut rx = bus.subscribe("sb-watched");
+        bus.notify_existing("sb-watched");
+        assert!(rx.try_recv().is_ok());
+        bus.remove("sb-watched");
+        bus.notify_existing("sb-watched");
+        assert!(bus.inner.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn sandbox_watch_bus_remove_cleans_up() {
