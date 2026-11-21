@@ -862,6 +862,9 @@ pub enum Request {
     /// plane.
     OpenMediation,
     AcceptNetwork,
+    ReadProcessEvents {
+        after_sequence: u64,
+    },
 }
 
 impl Request {
@@ -975,6 +978,10 @@ impl fmt::Debug for Request {
                 .finish(),
             Self::OpenMediation => formatter.write_str("OpenMediation"),
             Self::AcceptNetwork => formatter.write_str("AcceptNetwork"),
+            Self::ReadProcessEvents { after_sequence } => formatter
+                .debug_struct("ReadProcessEvents")
+                .field("after_sequence", after_sequence)
+                .finish(),
         }
     }
 }
@@ -1040,6 +1047,30 @@ pub enum Response {
         kind: BoundaryErrorKind,
         message: String,
     },
+    ProcessEvents {
+        events: Vec<ProcessEventWire>,
+        /// Events after the requested sequence that are no longer retained.
+        lost: u64,
+    },
+}
+
+/// A workload process the runtime started directly, launched or exited.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessEventWire {
+    pub sequence: u64,
+    pub process: ProcessInstance,
+    pub executable: String,
+    pub kind: ProcessEventKindWire,
+    /// When the runtime observed the event, in milliseconds since the epoch.
+    pub time_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessEventKindWire {
+    Launched,
+    Exited(ExitStatusWire),
 }
 
 /// Sandbox-monotonic timing carried across the boundary protocol.
