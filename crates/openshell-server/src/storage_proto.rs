@@ -228,7 +228,7 @@ mod tests {
     // public-only messages alongside main's public APIs; durable schemas
     // and the public/durable overlap remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ba37ee30d2e8618b947517c67fa6d336a87097978a55cfa82034366ee36a740e";
+        "13e3ccf678a39740af127446f3a9b76b5a9620d5ac4973828078263a992b2deb";
     const DURABLE_SCHEMA_SHA256: &str =
         "9a025fc84af7c71bce42a52a282d1a96a02f8d71319478bcdb0e0c6367305888";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
