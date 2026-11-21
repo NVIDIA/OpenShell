@@ -199,14 +199,20 @@ runs a final check. It requires:
 - a still-due live report from the confirming session;
 - a fresh owner record that still names that session.
 
-The final check holds that sandbox's activity gate through the write. Every live
-report update takes the same gate, so a report received first always counts. A
-conflicting write releases the gate and checks again.
+The final check bounds every wait by the confirmation's deadline and holds that
+sandbox's activity gate through the write. The deadline is checked again just
+before the write is issued, and an attempt that passes it is abandoned. Every
+live report update takes the same gate. A report that takes the gate before
+the final check counts. One that reaches the handler while the stop holds the
+gate waits behind that write. A conflicting write releases the gate and checks
+again.
 
 Live reports carry the supervisor's summary sequence, and an older summary from
-the same session is dropped. The display condition is persisted on a
-background task, so the session never waits on the sandbox lock to read its
-next message.
+the same session is dropped. One background writer per sandbox persists the
+newest report's display condition, coalescing bursts, so the session never
+waits on the sandbox lock to read its next message. Each write attempt rereads
+the newest report and requires a fresh owner record naming its session, so a
+former owner cannot overwrite the current owner's status after a handoff.
 
 The stop records the `internal.openshell.ai/idle-stop` annotation with
 `IdleStopping`. That marker survives gateway recovery and settles the stop as

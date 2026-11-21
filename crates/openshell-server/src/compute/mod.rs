@@ -978,6 +978,9 @@ pub struct ComputeRuntime {
     /// Supervisor confirmations awaiting their idle stop: session and when the
     /// reply arrived.
     idle_confirmations: Arc<StdMutex<HashMap<String, (String, Instant)>>>,
+    /// Sandboxes with a display writer running, and whether a newer report
+    /// arrived since it started. One writer per sandbox persists the newest.
+    display_writers: Arc<StdMutex<HashMap<String, bool>>>,
     /// Idle stops waiting for their supervisor to confirm, by request ID.
     activity_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<()>>>>,
     sandbox_updates_enabled: bool,
@@ -1106,6 +1109,7 @@ impl ComputeRuntime {
             live_activity: Arc::default(),
             activity_gates: Arc::default(),
             idle_confirmations: Arc::default(),
+            display_writers: Arc::default(),
             activity_requests: Arc::default(),
             sandbox_updates_enabled: false,
             update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2298,9 +2302,9 @@ impl ComputeRuntime {
             // The final idle check holds this sandbox's activity gate through
             // this attempt's `Stopping` write, so a report received before
             // the write counts. A retry releases it and checks again.
-            let _idle_gate = if cause == QuiesceCause::Idle {
+            let idle_admission = if cause == QuiesceCause::Idle {
                 match self.final_idle_check(&current).await {
-                    Some(gate) => Some(gate),
+                    Some(admission) => Some(admission),
                     None => return Err(Status::aborted("sandbox is no longer idle")),
                 }
             } else {
@@ -2320,6 +2324,14 @@ impl ComputeRuntime {
                 let (reason, message) = operation.requested_condition(cause);
                 (operation.in_flight_phase(), reason, message)
             };
+            // The confirmation authorizes only a write issued before its
+            // deadline; an attempt that waited past it is abandoned.
+            if idle_admission
+                .as_ref()
+                .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+            {
+                return Err(Status::aborted("idle confirmation expired before the stop"));
+            }
             match self
                 .write_lifecycle_phase(&current, next_phase, reason, message)
                 .await
@@ -5323,15 +5335,17 @@ impl ComputeRuntime {
 
     /// The last check before an idle `Stopping` write, run under the
     /// lifecycle lock. Returns the sandbox's activity gate, which the caller
-    /// holds through the write.
+    /// holds through the write, and the confirmation's deadline, which the
+    /// caller checks again just before issuing it.
     ///
-    /// It requires a fresh supervisor confirmation, the still-enabled
-    /// setting, a live report from the confirming session that is still due,
-    /// and a fresh shared owner record naming that session.
+    /// It requires a confirmation whose deadline has not passed, the
+    /// still-enabled setting, a live report from the confirming session that
+    /// is still due, and a fresh shared owner record naming that session.
+    /// Every wait here is bounded by the deadline.
     async fn final_idle_check(
         &self,
         sandbox: &Sandbox,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Option<(tokio::sync::OwnedMutexGuard<()>, Instant)> {
         let sandbox_id = sandbox.object_id();
         let (session_id, confirmed_at) = self
             .idle_confirmations
@@ -5339,19 +5353,24 @@ impl ComputeRuntime {
             .expect("idle confirmation lock poisoned")
             .get(sandbox_id)
             .cloned()?;
-        if confirmed_at.elapsed() > idle_stop::CONFIRM_FRESHNESS {
-            return None;
-        }
-        let timeout = self.idle_stop_timeout(sandbox).await?;
-        let gate = self.activity_gate(sandbox_id).lock_owned().await;
-        let live = self.current_live_activity(sandbox_id)?;
-        if live.session_id != session_id
-            || idle_stop::idle_stop_due(sandbox, &live, timeout, SystemTime::now()).is_none()
-            || !self.owned_by_session(sandbox_id, &session_id).await
-        {
-            return None;
-        }
-        Some(gate)
+        let deadline = confirmed_at + idle_stop::CONFIRM_FRESHNESS;
+        let check = async {
+            let timeout = self.idle_stop_timeout(sandbox).await?;
+            let gate = self.activity_gate(sandbox_id).lock_owned().await;
+            let live = self.current_live_activity(sandbox_id)?;
+            if live.session_id != session_id
+                || idle_stop::idle_stop_due(sandbox, &live, timeout, SystemTime::now()).is_none()
+                || !self.owned_by_session(sandbox_id, &session_id).await
+            {
+                return None;
+            }
+            Some(gate)
+        };
+        let gate = tokio::time::timeout_at(deadline.into(), check)
+            .await
+            .ok()
+            .flatten()?;
+        (Instant::now() < deadline).then_some((gate, deadline))
     }
 
     /// Ask the session's supervisor for a fresh report and wait for it.
@@ -5506,17 +5525,17 @@ impl ComputeRuntime {
         report: &openshell_core::proto::SupervisorWorkloadActivity,
     ) -> Result<(), String> {
         let received = SystemTime::now();
-        {
+        let accepted = {
             let gate = self.activity_gate(sandbox_id);
             let _gate = gate.lock().await;
             let mut live = self
                 .live_activity
                 .lock()
                 .expect("live activity lock poisoned");
-            if !live
+            let accepted = !live
                 .get(sandbox_id)
-                .is_some_and(|held| held.is_newer_than(session_id, report))
-            {
+                .is_some_and(|held| held.is_newer_than(session_id, report));
+            if accepted {
                 live.insert(
                     sandbox_id.to_string(),
                     idle_stop::live_from_report(
@@ -5528,7 +5547,8 @@ impl ComputeRuntime {
                     ),
                 );
             }
-        }
+            accepted
+        };
         if !report.request_id.is_empty()
             && let Some(waiter) = self
                 .activity_requests
@@ -5538,14 +5558,54 @@ impl ComputeRuntime {
         {
             let _ = waiter.send(());
         }
+        if accepted {
+            self.schedule_display_write(sandbox_id);
+        }
+        Ok(())
+    }
+
+    /// Persist the newest report's display condition, coalescing a burst of
+    /// reports behind at most one running writer per sandbox.
+    fn schedule_display_write(&self, sandbox_id: &str) {
+        let start = {
+            let mut writers = self
+                .display_writers
+                .lock()
+                .expect("display writer lock poisoned");
+            match writers.entry(sandbox_id.to_string()) {
+                std::collections::hash_map::Entry::Occupied(mut running) => {
+                    *running.get_mut() = true;
+                    false
+                }
+                std::collections::hash_map::Entry::Vacant(idle) => {
+                    idle.insert(false);
+                    true
+                }
+            }
+        };
+        if !start {
+            return;
+        }
         let runtime = self.clone();
         let sandbox_id = sandbox_id.to_string();
         tokio::spawn(async move {
-            if let Err(error) = runtime.persist_program_condition(&sandbox_id).await {
-                debug!(sandbox_id = %sandbox_id, %error, "failed to persist program status");
+            loop {
+                if let Err(error) = runtime.persist_program_condition(&sandbox_id).await {
+                    debug!(sandbox_id = %sandbox_id, %error, "failed to persist program status");
+                }
+                let mut writers = runtime
+                    .display_writers
+                    .lock()
+                    .expect("display writer lock poisoned");
+                match writers.get_mut(&sandbox_id) {
+                    Some(dirty) if *dirty => *dirty = false,
+                    _ => {
+                        writers.remove(&sandbox_id);
+                        return;
+                    }
+                }
             }
         });
-        Ok(())
     }
 
     /// Write the latest live report as the displayed `ProgramStatus`
@@ -5553,17 +5613,17 @@ impl ComputeRuntime {
     /// concurrent writes, and only for the running main-process instance.
     async fn persist_program_condition(&self, sandbox_id: &str) -> Result<(), String> {
         let _guard = self.lock_sandbox_local(sandbox_id).await;
-        let Some(live) = self
-            .live_activity
-            .lock()
-            .expect("live activity lock poisoned")
-            .get(sandbox_id)
-            .cloned()
-        else {
-            return Ok(());
-        };
         let mut attempt = 1;
         loop {
+            // Each attempt uses the newest report and is fenced to the
+            // session that owns the sandbox, so a former owner cannot
+            // overwrite the current owner's status after a handoff.
+            let Some(live) = self.current_live_activity(sandbox_id) else {
+                return Ok(());
+            };
+            if !self.owned_by_session(sandbox_id, &live.session_id).await {
+                return Ok(());
+            }
             let Some(existing) = self
                 .store
                 .get_message::<Sandbox>(sandbox_id)
@@ -9402,6 +9462,7 @@ pub fn new_test_runtime_with_driver(
         live_activity: Arc::default(),
         activity_gates: Arc::default(),
         idle_confirmations: Arc::default(),
+        display_writers: Arc::default(),
         activity_requests: Arc::default(),
         sandbox_updates_enabled: false,
         update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -10705,6 +10766,7 @@ mod tests {
             live_activity: Arc::default(),
             activity_gates: Arc::default(),
             idle_confirmations: Arc::default(),
+            display_writers: Arc::default(),
             activity_requests: Arc::default(),
             sandbox_updates_enabled: false,
             update_recovery_sweep: Arc::new(Semaphore::new(1)),
@@ -22952,6 +23014,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let sandbox = idle_ready_record("sb-activity", "sandbox-activity");
         runtime.store.put_message(&sandbox).await.unwrap();
         register_test_supervisor_session(&runtime, sandbox.object_id());
+        publish_owner(&runtime, "sb-activity", "session-1", 1).await;
 
         record(
             &runtime,
@@ -23435,5 +23498,116 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             "the explicit stop wins over the idle one"
         );
         assert!(!idle_stop::idle_stop_marked(&stopped));
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_that_expires_during_the_final_check_is_abandoned() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        due_sandbox(&runtime, "sb-expiry", "sandbox-expiry").await;
+        // The confirmation is fresh when the final check starts, but the
+        // check waits on the gate past its deadline.
+        runtime.idle_confirmations.lock().unwrap().insert(
+            "sb-expiry".to_string(),
+            (
+                "session-1".to_string(),
+                Instant::now()
+                    .checked_sub(
+                        idle_stop::CONFIRM_FRESHNESS.saturating_sub(Duration::from_millis(100)),
+                    )
+                    .expect("test clock is past the freshness window"),
+            ),
+        );
+        let held = runtime.activity_gate("sb-expiry").lock_owned().await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            drop(held);
+        });
+        let error = idle_stop_directly(&runtime, "sandbox-expiry")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.stop_calls(), 0);
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_former_owner_never_overwrites_the_new_owners_status() {
+        use openshell_core::proto::WorkloadProgramState;
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        due_sandbox(&runtime, "sb-handoff", "sandbox-handoff").await;
+        // This replica still holds session-1's `Done`. The supervisor moves to
+        // session-2 on another replica, which persists `Working`.
+        publish_owner(&runtime, "sb-handoff", "session-2", 2).await;
+        let working = idle_stop::condition_from_report(
+            &program_report(WorkloadProgramState::Working, 0),
+            SystemTime::now(),
+        )
+        .unwrap();
+        let current = stored_sandbox(&runtime, "sb-handoff").await;
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                "sb-handoff",
+                sandbox_resource_version(&current),
+                |sandbox| {
+                    let status = sandbox.status.as_mut().unwrap();
+                    status.conditions.retain(|condition| {
+                        condition.r#type != openshell_core::metadata::PROGRAM_STATUS_CONDITION
+                    });
+                    status.conditions.push(working.clone());
+                },
+            )
+            .await
+            .unwrap();
+        // This replica's delayed writer runs now.
+        runtime
+            .persist_program_condition("sb-handoff")
+            .await
+            .unwrap();
+        let shown = stored_sandbox(&runtime, "sb-handoff").await;
+        assert_eq!(
+            idle_stop::program_condition(&shown).unwrap().reason,
+            "Working"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_writes_coalesce_behind_one_writer_per_sandbox() {
+        use openshell_core::proto::WorkloadProgramState;
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        due_sandbox(&runtime, "sb-burst", "sandbox-burst").await;
+        let held = runtime.lock_sandbox_local("sb-burst").await;
+        for index in 0..50_u64 {
+            let state = if index % 2 == 0 {
+                WorkloadProgramState::Working
+            } else {
+                WorkloadProgramState::Done
+            };
+            let mut report = program_report(state, 0);
+            report.sequence = index + 10;
+            runtime
+                .record_workload_activity("sb-burst", "session-1", "instance-1", true, &report)
+                .await
+                .unwrap();
+            assert!(
+                runtime.display_writers.lock().unwrap().len() <= 1,
+                "one writer per sandbox, however many reports arrive"
+            );
+        }
+        drop(held);
+        for _ in 0..200 {
+            if runtime.display_writers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(runtime.display_writers.lock().unwrap().is_empty());
+        let shown = stored_sandbox(&runtime, "sb-burst").await;
+        assert_eq!(
+            idle_stop::program_condition(&shown).unwrap().reason,
+            "Done",
+            "the newest report is persisted"
+        );
     }
 }

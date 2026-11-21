@@ -232,8 +232,10 @@ Before taking any lifecycle lock, the stop task:
 
 No reply, as from a dead or replaced stream, cancels the stop. Keeping the round
 trip outside the lock lets the session keep reading messages throughout. The
-gateway also persists the display condition on a background task, never on the
-message path.
+gateway persists the display condition through one coalescing writer per
+sandbox, never on the message path. Each display write is fenced to the session
+named by the owner record, so a former owner cannot overwrite the new owner's
+status after a handoff.
 
 Under the lifecycle lock, each `Stopping` write attempt runs a final check. It
 requires:
@@ -243,10 +245,15 @@ requires:
 - a still-due live report from the confirming session;
 - a fresh owner record that still names that session.
 
-The check holds the sandbox's activity gate through the write. Every live report
-update takes the same gate, so a report the gateway received before the write,
-such as `Working`, always counts. A conflicting write releases the gate and
-checks again.
+The confirmation's deadline, 2 seconds after its reply arrived, bounds every wait
+in the final check. It is checked again just before the write is issued, and an
+attempt that passes it is abandoned.
+
+The check holds the sandbox's activity gate through the write, and every live
+report update takes the same gate. A report that takes the gate before the
+final check, such as `Working`, always counts. A report that reaches the handler
+while the stop holds the gate waits behind that write. A conflicting write
+releases the gate and checks again.
 
 Every summary carries an increasing sequence number. The supervisor takes one
 lock from snapshot to enqueue for both pushes and replies. The gateway drops an
@@ -256,11 +263,13 @@ push.
 The stop boundary is therefore:
 
 - **Always counted:** everything the supervisor observed before it answered the
-  confirmation, and every report the gateway receives before the `Stopping`
-  write.
+  confirmation, and every report that takes the activity gate before the final
+  check does.
 - **Can race the stop:** input or a new turn between the supervisor's snapshot
-  and the gateway's write. That window is at most one network round trip plus
-  the 2-second confirmation freshness window.
+  and the write. That covers a report waiting for the gate while the stop
+  holds it. The write is issued at most 2 seconds after the reply arrives, so
+  the window is at most one network round trip, plus those 2 seconds, plus the
+  write's own latency.
 
 Closing that window would require the supervisor to hold input while the
 gateway commits, which this RFC does not propose. A takeover by another replica
@@ -371,8 +380,8 @@ sets a gateway value or a user opts in per sandbox.
   start a fresh conversation unless the user runs their resume flag.
 - **Residual stop race.** Input or a new turn between the supervisor's
   confirmation snapshot and the `Stopping` write can still lose the sandbox.
-  The window is at most one round trip plus 2 seconds, and only for a sandbox
-  that already waited past its timeout. Closing it fully would need the
+  The window is at most one round trip, plus 2 seconds, plus the write's
+  latency, and only for a sandbox that already waited past its timeout. Closing it fully would need the
   supervisor to hold input during the commit.
 - **Store churn.** Display writes bump the resource version that the
   reconcile sweep compares. The one-minute input threshold and
