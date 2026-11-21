@@ -54,7 +54,6 @@ openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost-types = { workspace = true }
 rcgen = { workspace = true }
-temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

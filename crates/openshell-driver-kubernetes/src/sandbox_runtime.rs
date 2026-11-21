@@ -392,10 +392,6 @@ pub fn supervisor_pod(
         ),
         env_var("OPENSHELL_LOG_LEVEL", log_level),
         env_var(
-            openshell_core::sandbox_env::TELEMETRY_ENABLED,
-            openshell_core::telemetry::enabled_env_value(),
-        ),
-        env_var(
             openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
             "",
         ),

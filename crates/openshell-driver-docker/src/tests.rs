@@ -1609,15 +1609,8 @@ fn supervisor_otlp_environment_carries_only_configured_signals() {
 fn boundary_environment_contains_only_driver_owned_values() {
     let env = build_boundary_environment(&test_sandbox(), &runtime_config());
 
-    assert_eq!(env.len(), 2);
-    assert!(
-        env.iter()
-            .any(|entry| entry.starts_with("OPENSHELL_LOG_LEVEL="))
-    );
-    assert!(env.iter().any(|entry| entry.starts_with(&format!(
-        "{}=",
-        openshell_core::sandbox_env::TELEMETRY_ENABLED
-    ))));
+    assert_eq!(env.len(), 1);
+    assert!(env[0].starts_with("OPENSHELL_LOG_LEVEL="));
 }
 
 #[test]

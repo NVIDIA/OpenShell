@@ -373,9 +373,6 @@ impl MainProcessConfig {
     }
 }
 
-/// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
-pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
-
 /// Supervisor pod/runtime topology. Kubernetes sidecar mode sets this to
 /// `"sidecar"`; the default combined supervisor path omits it.
 pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
