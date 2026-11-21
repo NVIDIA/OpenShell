@@ -49,6 +49,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -66,6 +67,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -94,6 +96,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -124,6 +127,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -144,6 +148,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -154,6 +159,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -173,6 +179,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -182,6 +189,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -191,6 +199,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -202,6 +211,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -211,6 +221,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }
@@ -220,6 +231,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -229,6 +241,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "create"
       workspace_role: "user"
     };
   }
@@ -256,6 +269,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -265,6 +279,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "delete"
       workspace_role: "user"
     };
   }
@@ -274,6 +289,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "other"
       workspace_role: "user"
     };
   }
@@ -283,6 +299,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "other"
       workspace_role: "user"
     };
   }
@@ -294,6 +311,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "other"
       workspace_role: "user"
     };
   }
@@ -303,6 +321,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -358,6 +377,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -368,6 +388,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -387,6 +408,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -407,6 +429,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -417,6 +440,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -429,6 +453,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -439,6 +464,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -448,6 +474,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -458,6 +485,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -469,6 +497,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "secret:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -496,6 +525,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "secret:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -505,6 +535,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "secret:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -513,7 +544,7 @@ service OpenShell {
   // Disabled unless the gateway sets enable_secret_reveal. Only directly
   // authenticated mTLS operators may call this method. Every call is audited.
   rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse) {
-    option (openshell.options.v1.authorization) = { auth_mode: "operator" };
+    option (openshell.options.v1.authorization) = { auth_mode: "operator" audit: "read" };
   }
 
   // Get sandbox settings by id (called by users, and by supervisors at startup
@@ -549,6 +580,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "dual"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -778,6 +810,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -788,6 +821,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -798,6 +832,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -807,6 +842,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -816,6 +852,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "update"
       workspace_role: "admin"
     };
   }
@@ -826,6 +863,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -872,6 +910,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "create"
       global_role: "platform_admin"
     };
   }
@@ -899,6 +938,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "delete"
       global_role: "platform_admin"
     };
   }
@@ -908,6 +948,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "create"
       workspace_role: "admin"
     };
   }
@@ -917,6 +958,7 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "workspace:write"
+      audit: "delete"
       workspace_role: "admin"
     };
   }
@@ -964,6 +1006,7 @@ service SandboxUpdates {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
+      audit: "update"
       workspace_role: "user"
     };
   }

@@ -22,6 +22,11 @@ message AuthorizationRule {
   string global_role = 3;
   // Required OIDC scope on the bearer path (e.g. "sandbox:read").
   string scope = 4;
+  // API Activity the gateway records for each call by a user or operator:
+  // "create", "update", "delete", "other", or "read". A method with a
+  // "*:write" scope must declare one of the first four; "read" marks a read
+  // that returns secret values.
+  string audit = 5;
 }
 
 extend google.protobuf.MethodOptions {

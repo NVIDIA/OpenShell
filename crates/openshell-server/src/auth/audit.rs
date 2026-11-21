@@ -20,11 +20,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
+use super::descriptor_authz;
 use super::identity::IdentityProvider;
 use super::principal::{Principal, SandboxIdentitySource};
 use crate::grpc::mutation_replay::REPLAYED_HEADER;
 
-pub mod catalog;
 #[cfg(test)]
 pub mod test_support;
 
@@ -463,7 +463,7 @@ where
     F: Future<Output = Result<http::Response<tonic::body::Body>, E>>,
 {
     let audited = matches!(principal, Principal::User(_) | Principal::Operator(_))
-        && catalog::lookup(&path).is_some();
+        && audited_activity(&path).is_some();
     if !audited {
         return with_request(path, origin, handler).await;
     }
@@ -845,6 +845,12 @@ fn emit_denial(
     }
 }
 
+/// The activity a method declares with `audit` in its authorization option,
+/// if the gateway audits it.
+fn audited_activity(path: &str) -> Option<ActivityId> {
+    descriptor_authz::lookup(path).and_then(|entry| entry.audit)
+}
+
 /// An API Activity event for `principal`'s request to `path` from `origin`,
 /// naming the activity of a cataloged method.
 fn api_activity<'a>(
@@ -868,7 +874,7 @@ fn api_activity<'a>(
             .api_service(Service::new(service))
             .http_request(post(path));
     }
-    if let Some(activity) = catalog::lookup(path) {
+    if let Some(activity) = audited_activity(path) {
         builder = builder.activity(activity);
     }
     builder

@@ -72,8 +72,9 @@ identifies the service being exposed.
   wire identity and may therefore differ from declaration order.
 - Document authorization-sensitive selector variants and omission semantics on
   the containing request.
-- Give an RPC that changes gateway state a `*:write` scope and add it to the
-  audit catalog in `crates/openshell-server/src/auth/audit/catalog.rs`.
+- Give an RPC that changes gateway state a `*:write` scope and an `audit`
+  activity (`create`, `update`, `delete`, or `other`) in its authorization
+  option. The gateway refuses to start without one.
 
 ## Schema evolution
 
