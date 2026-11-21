@@ -4,6 +4,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+mod build_git;
 mod build_version;
 
 const PROTO_REL: &str = "../../proto";
@@ -35,11 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Docker/CI builds where .git is absent, this silently does nothing and
     // the binary falls back to CARGO_PKG_VERSION (which is already sed-patched
     // by the build pipeline).
-    for path in git_rerun_paths() {
-        println!("cargo:rerun-if-changed={}", path.display());
-    }
-
-    if let Some(version) = git_version() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let source_root = manifest_dir.ancestors().nth(2).unwrap_or(&manifest_dir);
+    build_git::emit_rerun_if_changed(source_root);
+    if let Some(version) = build_git::version(source_root) {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
     }
 
@@ -59,7 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
@@ -103,75 +102,4 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()
         }
     }
     Ok(())
-}
-
-/// Git metadata files whose changes affect [`git_version`].
-///
-/// In a linked worktree `.git` is a file, so `HEAD` and `logs/HEAD` live in the
-/// per-worktree git dir while branch and tag refs live in the common git dir. Cargo treats a
-/// missing `rerun-if-changed` path as always stale, so only existing paths are
-/// returned. Without git metadata nothing is returned.
-fn git_rerun_paths() -> Vec<PathBuf> {
-    let resolve = |args: &[&str]| {
-        let dir = PathBuf::from(git_output(args)?);
-        // Relative output is relative to the build script's working directory.
-        Some(env::current_dir().ok()?.join(dir))
-    };
-    let mut paths = Vec::new();
-    if let Some(git_dir) = resolve(&["rev-parse", "--git-dir"]) {
-        paths.push(git_dir.join("HEAD"));
-        paths.push(git_dir.join("logs/HEAD"));
-    }
-    if let Some(common_dir) = resolve(&["rev-parse", "--git-common-dir"]) {
-        paths.push(common_dir.join("refs/tags"));
-        paths.push(common_dir.join("packed-refs"));
-        // A new worktree has no `logs/HEAD` until its first ref update, so also
-        // watch the checked-out branch ref, which moves on every commit.
-        if let Some(branch) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
-            paths.push(common_dir.join(branch));
-        }
-    }
-    paths.retain(|path| path.exists());
-    paths
-}
-
-/// Derive the release or development version from git metadata.
-///
-/// Implements the "guess-next-dev" convention used by the release pipeline
-/// (`tasks/scripts/release.py`): exact stable and prerelease tags retain their
-/// version. Otherwise, the latest merged stable release gets a patch bump and
-/// `-dev.<N>+g<sha>` is appended.
-///
-/// Examples:
-///   on tag v0.1.0-pre.1    → "0.1.0-pre.1"
-///   3 commits past v0.0.3  → "0.0.4-dev.3+g2bf9969ab"
-///
-/// Returns `None` when git metadata cannot be read.
-fn git_version() -> Option<String> {
-    let exact_tags = git_output(&["tag", "--points-at", "HEAD"])?;
-    if let Some(version) = build_version::exact_release_version(exact_tags.lines()) {
-        return Some(version);
-    }
-
-    let merged_tags = git_output(&["tag", "--merged", "HEAD", "--list", "v*.*.*"])?;
-    let latest_tag = build_version::latest_stable_tag(merged_tags.lines());
-    let revision_range = latest_tag
-        .as_deref()
-        .map_or_else(|| "HEAD".to_string(), |tag| format!("{tag}..HEAD"));
-    let distance = git_output(&["rev-list", "--count", &revision_range])?
-        .parse()
-        .ok()?;
-    let sha = git_output(&["rev-parse", "--short=9", "HEAD"])?;
-
-    build_version::next_dev_version(latest_tag.as_deref(), distance, &sha)
-}
-
-fn git_output(args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|output| output.trim().to_string())
 }
