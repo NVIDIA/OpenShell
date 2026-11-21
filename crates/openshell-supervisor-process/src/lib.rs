@@ -15,6 +15,7 @@ pub mod skills;
 #[cfg(unix)]
 pub mod ssh;
 pub mod supervisor_session;
+pub mod terminal_state;
 
 #[cfg(unix)]
 mod unix_socket;
