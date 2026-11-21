@@ -321,7 +321,11 @@ When the target is `Stopped` with reason `IdleStopped`,
 `openshell sandbox connect` calls `StartSandbox`, waits for `Ready`, then
 connects as usual, printing a one-line notice. When an idle stop is still in
 flight (`Stopping` with reason `IdleStopping`, which the gateway keeps through
-driver snapshots), connect first waits for `Stopped`. An explicitly stopped
+driver snapshots), connect first waits for the sandbox to leave `Stopping`:
+
+- `Ready`, as after a rolled-back stop, connects directly;
+- `Starting`, as when another client already restarted it, waits for `Ready`;
+- `Stopped` with `IdleStopped` starts it. An explicitly stopped
 sandbox keeps today's behavior and returns an error. The wake logic lives in the
 CLI; the TUI and SDK do not wake sandboxes in phase 1.
 

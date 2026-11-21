@@ -4197,12 +4197,25 @@ pub async fn start_if_idle_stopped(
     };
     if sandbox.idle_stopping() {
         eprintln!("Sandbox {name} is stopping while idle; starting it once it stops");
-        sandbox = wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
-    }
-    if !sandbox.idle_stopped() {
+        // The stop can roll back to Ready, or another client can restart the
+        // sandbox before this watch opens, so wait for it to leave Stopping
+        // rather than for Stopped.
+        sandbox = wait_while_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopping).await?;
+        match SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown) {
+            SandboxPhase::Ready => return Ok(()),
+            SandboxPhase::Starting => {
+                wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+                return Ok(());
+            }
+            _ if sandbox.idle_stopped() => {}
+            // Any other phase is for connect to report.
+            _ => return Ok(()),
+        }
+    } else if sandbox.idle_stopped() {
+        eprintln!("Sandbox {name} was stopped while idle; starting it");
+    } else {
         return Ok(());
     }
-    eprintln!("Sandbox {name} was stopped while idle; starting it");
     sandbox_start(server, name, workspace, tls).await
 }
 
@@ -4322,7 +4335,46 @@ async fn wait_for_lifecycle_phase(
     if let Some(err) = lifecycle_phase_error(&sandbox, target, current) {
         return Err(err);
     }
+    watch_until(
+        client,
+        &sandbox,
+        &format!("reach {target:?}"),
+        |sandbox, phase| {
+            if phase == target {
+                return Ok(true);
+            }
+            lifecycle_phase_error(sandbox, target, phase).map_or(Ok(false), Err)
+        },
+    )
+    .await
+}
 
+/// Wait until the sandbox leaves `phase`, returning its first other phase.
+async fn wait_while_lifecycle_phase(
+    client: &mut crate::tls::GrpcClient,
+    sandbox: Sandbox,
+    phase: SandboxPhase,
+) -> Result<Sandbox> {
+    if sandbox.phase() != phase as i32 {
+        return Ok(sandbox);
+    }
+    watch_until(
+        client,
+        &sandbox,
+        &format!("leave {phase:?}"),
+        |_, current| Ok(current != phase),
+    )
+    .await
+}
+
+/// Watch `sandbox` until `done` accepts a snapshot, within the lifecycle
+/// timeout.
+async fn watch_until(
+    client: &mut crate::tls::GrpcClient,
+    sandbox: &Sandbox,
+    goal: &str,
+    mut done: impl FnMut(&Sandbox, SandboxPhase) -> Result<bool>,
+) -> Result<Sandbox> {
     let timeout = Duration::from_secs(
         std::env::var("OPENSHELL_LIFECYCLE_TIMEOUT")
             .ok()
@@ -4355,7 +4407,7 @@ async fn wait_for_lifecycle_phase(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(miette!(
-                "timed out after {}s waiting for sandbox to reach {target:?}",
+                "timed out after {}s waiting for sandbox to {goal}",
                 timeout.as_secs()
             ));
         }
@@ -4363,21 +4415,18 @@ async fn wait_for_lifecycle_phase(
             .await
             .map_err(|_| {
                 miette!(
-                    "timed out after {}s waiting for sandbox to reach {target:?}",
+                    "timed out after {}s waiting for sandbox to {goal}",
                     timeout.as_secs()
                 )
             })?
-            .ok_or_else(|| miette!("sandbox watch ended before reaching {target:?}"))?
+            .ok_or_else(|| miette!("sandbox watch ended before the sandbox could {goal}"))?
             .into_diagnostic()?;
         if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox)) =
             event.payload
         {
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-            if phase == target {
+            if done(&sandbox, phase)? {
                 return Ok(sandbox);
-            }
-            if let Some(err) = lifecycle_phase_error(&sandbox, target, phase) {
-                return Err(err);
             }
         }
     }

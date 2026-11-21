@@ -91,6 +91,11 @@ struct SandboxState {
     template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
     template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
     template_delete_requests: Arc<Mutex<Vec<DeleteSandboxTemplateRequest>>>,
+    /// Replace the default Ready `GetSandbox` response.
+    get_sandbox_response: Arc<Mutex<Option<Sandbox>>>,
+    /// Replace every `WatchSandbox` stream with these status snapshots.
+    watch_snapshots: Arc<Mutex<Option<Vec<Sandbox>>>>,
+    start_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Default)]
@@ -173,6 +178,17 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        self.state.start_requests.fetch_add(1, Ordering::SeqCst);
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(lifecycle_sandbox(SandboxPhase::Starting, "Starting")),
+            ..Default::default()
+        }))
+    }
+
     async fn stop_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
@@ -194,6 +210,13 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
+        let response = self.state.get_sandbox_response.lock().await.clone();
+        if let Some(sandbox) = response {
+            return Ok(Response::new(SandboxResponse {
+                sandbox: Some(sandbox),
+                ..Default::default()
+            }));
+        }
         let request = request.into_inner();
         let name = request.name;
         let mut sandbox = Sandbox {
@@ -547,6 +570,26 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<WatchSandboxRequest>,
     ) -> Result<Response<tonic::codegen::BoxStream<SandboxStreamEvent>>, Status> {
+        let snapshots = self.state.watch_snapshots.lock().await.clone();
+        if let Some(snapshots) = snapshots {
+            let (tx, rx) = mpsc::channel(snapshots.len().max(1));
+            tokio::spawn(async move {
+                for sandbox in snapshots {
+                    let event = SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(sandbox)),
+                        ..Default::default()
+                    };
+                    if tx.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+                // Keep the stream open, as a live watch would.
+                tx.closed().await;
+            });
+            return Ok(Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            )));
+        }
         let request = request.into_inner();
         let sandbox_id = format!("id-{}", request.sandbox);
         let (tx, rx) = mpsc::channel(4);
@@ -1319,6 +1362,93 @@ fn test_config() -> run::SandboxCreateConfig<'static> {
         auto_providers_override: Some(false),
         ..Default::default()
     }
+}
+
+/// A sandbox named "idle-wake" in `phase` with Ready condition `reason`.
+fn lifecycle_sandbox(phase: SandboxPhase, reason: &str) -> Sandbox {
+    Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "id-idle-wake".into(),
+            name: "idle-wake".into(),
+            workspace: "default".into(),
+            ..Default::default()
+        }),
+        status: Some(SandboxStatus {
+            phase: phase as i32,
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".into(),
+                status: if phase == SandboxPhase::Ready {
+                    "True".into()
+                } else {
+                    "False".into()
+                },
+                reason: reason.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Connect during an in-flight idle stop waits for the sandbox to leave
+/// `Stopping`. It connects to a sandbox that came back `Ready` or `Starting`
+/// without another start, and starts it only once it is `IdleStopped`.
+#[tokio::test]
+async fn connect_during_an_idle_stop_waits_for_the_stop_to_settle() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let config_dir = helpers::tempdir().unwrap();
+    let stopping = lifecycle_sandbox(SandboxPhase::Stopping, "IdleStopping");
+    for (snapshots, starts) in [
+        // The stop rolled back, or another client already restarted it.
+        (
+            vec![lifecycle_sandbox(SandboxPhase::Ready, "DependenciesReady")],
+            0,
+        ),
+        (
+            vec![
+                lifecycle_sandbox(SandboxPhase::Starting, "Starting"),
+                lifecycle_sandbox(SandboxPhase::Ready, "DependenciesReady"),
+            ],
+            0,
+        ),
+        // The idle stop settled; connect starts the sandbox once.
+        (
+            vec![
+                lifecycle_sandbox(SandboxPhase::Stopped, "IdleStopped"),
+                lifecycle_sandbox(SandboxPhase::Ready, "DependenciesReady"),
+            ],
+            1,
+        ),
+    ] {
+        server
+            .openshell
+            .state
+            .start_requests
+            .store(0, Ordering::SeqCst);
+        *server.openshell.state.get_sandbox_response.lock().await = Some(stopping.clone());
+        *server.openshell.state.watch_snapshots.lock().await = Some(snapshots);
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run_async(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    run::start_if_idle_stopped(&server.endpoint, "idle-wake", "default", &tls),
+                )
+                .await
+                .expect("connect must not wait for a phase the sandbox already left")
+                .expect("connect proceeds");
+                assert_eq!(
+                    server.openshell.state.start_requests.load(Ordering::SeqCst),
+                    starts,
+                    "starts issued for this case"
+                );
+            })
+            .await;
+    }
+    *server.openshell.state.get_sandbox_response.lock().await = None;
+    *server.openshell.state.watch_snapshots.lock().await = None;
 }
 
 #[tokio::test]
