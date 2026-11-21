@@ -10,16 +10,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use openshell_core::ObjectId;
 use openshell_core::proto::{
     GetProviderCredentialsRequest, GetProviderCredentialsResponse, Provider,
     ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStrategy,
     ProviderCredentialValue,
 };
+use openshell_core::{GetResourceVersion, ObjectId};
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
-use crate::storage_proto::StoredProviderCredentialRefreshStateV2;
+use crate::storage_proto::StoredProviderCredentialRefreshState;
 
 #[cfg(test)]
 #[path = "provider_credentials_tests.rs"]
@@ -156,9 +156,9 @@ async fn retrieve(
     )
     .ok_or_else(|| {
         Status::failed_precondition("provider has no supported runtime credential profile")
-    })?
-    .to_proto();
-    let broker_keys = super::provider::broker_only_provider_credential_keys(&profile);
+    })?;
+    let profile_proto = profile.to_proto();
+    let broker_keys = super::provider::broker_only_provider_credential_keys(&profile_proto);
     // Prevalidate the entire selection before resolving secrets or minting.
     for key in &request.credential_keys {
         let declaration = profile
@@ -175,7 +175,7 @@ async fn retrieve(
             ));
         }
     }
-    let refreshes: Vec<StoredProviderCredentialRefreshStateV2> = state
+    let refreshes: Vec<StoredProviderCredentialRefreshState> = state
         .refresh
         .list(Some(provider.object_id()))
         .await
@@ -183,6 +183,16 @@ async fn retrieve(
         .iter()
         .map(Into::into)
         .collect();
+    let inactive = super::provider::inactive_github_app_aliases(&profile, &refreshes);
+    if request
+        .credential_keys
+        .iter()
+        .any(|key| inactive.contains(key.as_str()))
+    {
+        return Err(Status::failed_precondition(
+            "selected alias is inactive for this GitHub App credential",
+        ));
+    }
     let mut owners = HashMap::new();
     for key in &request.credential_keys {
         let matching: Vec<_> = refreshes
@@ -222,7 +232,7 @@ async fn retrieve(
     // State and provider reads are not a transaction. Reload after observing
     // refresh generations so a just-completed mint is reused, not repeated
     // against an old provider snapshot paired with a new refresh generation.
-    let initial_provider = load(state, workspace, &request.name).await?;
+    let mut initial_provider = load(state, workspace, &request.name).await?;
     if initial_provider.object_id() != provider.object_id()
         || initial_provider.r#type != provider.r#type
         || initial_provider.profile_workspace != provider.profile_workspace
@@ -232,6 +242,12 @@ async fn retrieve(
     // Resolve initial handles individually so NOT_FOUND can be attributed to
     // a refresh-owned output. A missing static handle or any other backend
     // error still fails closed, without exporting an inline fallback.
+    let version = initial_provider.get_resource_version();
+    super::provider::withhold_stale_github_app_outputs(
+        &mut initial_provider,
+        version,
+        owners.values(),
+    );
     let mut initial = HashMap::new();
     for key in &request.credential_keys {
         match resolve_selected(state, &initial_provider, std::slice::from_ref(key)).await {
@@ -266,7 +282,7 @@ async fn retrieve(
             .await
             .map_err(sanitize)?
             .ok_or_else(|| Status::aborted("credential refresh was deleted"))?;
-        let latest = StoredProviderCredentialRefreshStateV2::from(&latest);
+        let latest = StoredProviderCredentialRefreshState::from(&latest);
         if latest.object_id() != owner.object_id()
             || crate::provider_refresh::effective_authorization_epoch(&latest)?
                 != crate::provider_refresh::effective_authorization_epoch(owner)?
@@ -285,7 +301,7 @@ async fn retrieve(
         }
         delivery_owners.insert(owner.credential_key.clone(), latest);
     }
-    let current = load(state, workspace, &request.name).await?;
+    let mut current = load(state, workspace, &request.name).await?;
     if current.object_id() != provider.object_id()
         || current.r#type != provider.r#type
         || current.profile_workspace != provider.profile_workspace
@@ -293,6 +309,12 @@ async fn retrieve(
         return Err(Status::aborted("provider was replaced or reconfigured"));
     }
     // Fresh handles/expiration come from committed state, never transient minted values.
+    let version = current.get_resource_version();
+    super::provider::withhold_stale_github_app_outputs(
+        &mut current,
+        version,
+        delivery_owners.values(),
+    );
     let values = resolve_selected(state, &current, &request.credential_keys).await?;
     for key in &request.credential_keys {
         if !sufficiently_valid(values.get(key), lifetime)? {
@@ -323,7 +345,7 @@ async fn retrieve(
             .await
             .map_err(sanitize)?
             .ok_or_else(|| Status::aborted("credential refresh was deleted"))?;
-        let latest = StoredProviderCredentialRefreshStateV2::from(&latest);
+        let latest = StoredProviderCredentialRefreshState::from(&latest);
         if latest
             .metadata
             .as_ref()
@@ -353,7 +375,7 @@ async fn retrieve(
         &current.profile_workspace,
     )
     .map(|profile| profile.to_proto());
-    if latest_profile.as_ref() != Some(&profile) {
+    if latest_profile.as_ref() != Some(&profile_proto) {
         return Err(Status::aborted(
             "provider credential declarations changed during retrieval",
         ));
@@ -381,16 +403,10 @@ async fn retrieve(
     })
 }
 
-fn ensure_refreshable(refresh: &StoredProviderCredentialRefreshStateV2) -> Result<(), Status> {
+fn ensure_refreshable(refresh: &StoredProviderCredentialRefreshState) -> Result<(), Status> {
     let strategy = ProviderCredentialRefreshStrategy::try_from(refresh.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-    if !matches!(
-        strategy,
-        ProviderCredentialRefreshStrategy::Oauth2RefreshToken
-            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
-            | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
-    ) {
+    if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
         return Err(Status::failed_precondition(
             "credential has no gateway-managed minting strategy",
         ));

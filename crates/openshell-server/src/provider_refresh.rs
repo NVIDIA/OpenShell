@@ -9,10 +9,7 @@ use crate::persistence::{Store, current_time_ms};
 pub use crate::refresh_store::{get_refresh_state, list_refresh_states_for_provider};
 #[cfg(test)]
 pub use crate::refresh_store::{list_all_refresh_states, put_refresh_state};
-use crate::storage_proto::{
-    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredRefreshMaterialDeletion,
-};
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion};
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
@@ -134,6 +131,25 @@ pub fn refresh_status_from_state(
     }
 }
 
+/// Compare with the live provider inside its conditional write so independently
+/// updated expiries survive deletion of a refresh grant.
+pub fn clear_refresh_owned_expiries(
+    provider: &mut Provider,
+    refresh_expires_at_ms: i64,
+    owned_keys: &[String],
+) {
+    for key in owned_keys {
+        if provider
+            .credential_expiration_times
+            .get(key)
+            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+            .is_some_and(|expires_at_ms| expires_at_ms == refresh_expires_at_ms)
+        {
+            provider.credential_expiration_times.remove(key);
+        }
+    }
+}
+
 /// Whether a refresh expiration was explicitly provided.
 ///
 /// Legacy records infer presence from a nonzero millisecond value. New records
@@ -236,6 +252,8 @@ pub fn new_refresh_state(
         authorization_epoch: uuid::Uuid::new_v4().to_string(),
         secret_material_handles: HashMap::new(),
         pending_secret_deletions: Vec::new(),
+        retired_output_handles: Vec::new(),
+        first_mint_provider_version: 0,
         recovery_action: ProviderCredentialRefreshRecoveryAction::Unspecified as i32,
         failure_code: String::new(),
         provider_error_subtype: String::new(),
@@ -434,8 +452,10 @@ async fn apply_minted_credential(
         attempt.as_ref(),
         key,
         minted,
+        None,
     )
     .await
+    .map(|_| ())
 }
 #[cfg(test)]
 use openshell_credential_issuer::refresh::minter::MintedCredential;
@@ -460,6 +480,38 @@ fn seconds_until_ms(now: i64, target: i64) -> i64 {
         target.saturating_sub(now).max(0) / 1000
     }
 }
+pub use openshell_credential_issuer::refresh::minter::validate_github_app_configuration;
+
+#[cfg(test)]
+pub const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCvCoZ0mVHpCHsF
+zeeqw2caNIe/eb4BQUccFPhZfRnF7sCfyB84zTBmuwG2umRBdjFnVsfIIZRp2HcD
+OESrRYYiE1RGfjBXImGVg2Wtza0HYhL1sLyX1eaEefylxoilmApAgWDh9p36h8J2
+s5YHwyXPTttx4DpdWDnxju1iNmwoIB8uVE/5amWgbNvlETMBOcB1RxDHtnVy+xJz
+jjjrzK4Qz9WsUTHAvngdi4Yyxvci+yKpjYTg5+UWxmAN6iW522TpLe32MDb5Ug1d
+trBvvepWmdQ6CBwPhBHCt/sMoSJAYSO4RKeBnBjeLQBXFTxaOv5iTGIsRTX3K471
+epHp3cT5AgMBAAECggEASQlRv/4nZN5SgsH/K8v7zb3kdHsmUly8AJYpaCGgauvr
+uN/mUyueyga2uNl+MqhQBef6VWHZjO6y/gdw86v/Q2GgVQebQQhKAnpAp2w+Ceoc
+siKMFqi8VkOWLU+xPbM6d97kH3TpRxt1g1T8wYFmWeF0BEiE4eUJzGaQW14M9BJ+
+G0QxmP/zjX9cNpVeApKTjBWKiH4CXG3DuI3pJ93VOMpUlOsrdLXvKGTze0e01itr
+MX/MHHTE+VXB4FB+/zKSA4c36egi676OSXrGC/GDmM8ntJ4CUGeD5uZsMSADiAUn
+iccv5iGRWVMIKxUS5Q4k0jy8uWuK+QVP4Y6cQWYArwKBgQDhuSNORBNpIGRfsKGN
+iJo/h+qinz6pEIpa3D3oVl7rpkyvgIyaTwfXvC1vfdS9V5VIel2gV2Cx0OrI8yrr
+nQu1JuNV/rLmtvqX321fgBLRdoiqF3pAy1gbmdUz1elerAIYL578gXQ6jg1bbdic
+kJpn0MsoDUJGwvJnXcgLqG7q3wKBgQDGhRIa4oJsj1vqICc8zt8YsCAcot3vjWLH
+588X7JdBGOWJdWxfdmGXQRn5Zw9UhMQnYa3uyTBPeVcXopThlPotYeuFhLSU856T
+IJzfpzCJzC4zIQayoyvJFrKe7N70iUQ986dewYy9oxQhHvFKd/qe4ylbzZJXpthX
+eWEuuBSjJwKBgGkqXt6qLPj/1IQYwUw15tfOtW0LEKCoSi3HCzjidNsJ4hSqqdeD
+Fr5WuDyHvcRxt+XKzTBVRYHTOnBhiw+3XasK8UQxpJyFh/+WY1jpTNs2hLnqslTZ
+6LUDWSgLc+1d6qPmHAa9Ma/OWz7L0O4xGR9hUiXY95YMYe/y668yzGq1AoGBAJyU
+Gsqfu7U6gYmxoKEine6QBFPx1dD7GF2KJdq93jMXGvyHZFoLOkAdtgnz0rCcI0bY
+kWKUxwj4MMxQjNM8OPMQl75xBCmz2XA8Od9htDQLmqjzNKAzePabc3lMZTJFDlE6
+29kuGf79IIRbLn/JECDAFT/2baW60Ep2T0OVJ5njAoGAfaCaQ4aVgjI027q7Y5qP
+KfNSI8uuA8PLqmUY30I9KFWzN6VDLu00eKa90F4w3CeWRRQWXW1+007tTz3V1mNw
+20A24Fi3HGQmXc7NyuLDODTJsWBICuOemCnRkvcxIlxb+ec7jp+XRmzDwKkzSnVN
+pM2zFU8SeVkvHKlEuoHaP0s=
+-----END PRIVATE KEY-----";
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -474,7 +526,7 @@ mod tests {
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
-    use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+    use crate::storage_proto::StoredProviderCredentialRefreshState;
 
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -499,6 +551,7 @@ mod tests {
             ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
             ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
             ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+            ProviderCredentialRefreshStrategy::GithubAppInstallation,
         ] {
             assert_eq!(
                 can_mint(strategy as i32),

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Token endpoint normalization for workspace-secret endpoint constraints.
+//! Token endpoint validation for provider profiles and workspace secrets.
 //!
 //! A workspace secret names the only token endpoints its value may be sent to.
 //! Creation and every mint compare endpoints in this normalized form, so the
@@ -17,7 +17,28 @@
 ///
 /// Returns a short description of why the URL is not an acceptable endpoint.
 pub fn normalize_token_endpoint(raw: &str) -> Result<String, &'static str> {
-    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "must be an absolute URL")?;
+    parse_token_endpoint(raw).map(Into::into)
+}
+
+/// Resolve a GitHub App profile's token endpoint while preserving GHES path prefixes.
+///
+/// # Errors
+///
+/// Rejects invalid installation path templates and disallowed token endpoints.
+pub fn github_app_installation_url(template: &str, id: u64) -> Result<url::Url, &'static str> {
+    const PLACEHOLDER: &str = "{installation_id}";
+    if !template.ends_with("/app/installations/{installation_id}/access_tokens")
+        || template.matches(PLACEHOLDER).count() != 1
+    {
+        return Err(
+            "must end with /app/installations/{installation_id}/access_tokens and contain one installation ID placeholder",
+        );
+    }
+    parse_token_endpoint(&template.replace(PLACEHOLDER, &id.to_string()))
+}
+
+fn parse_token_endpoint(raw: &str) -> Result<url::Url, &'static str> {
+    let url = url::Url::parse(raw.trim()).map_err(|_| "must be an absolute URL")?;
     let Some(host) = url.host_str().filter(|host| !host.is_empty()) else {
         return Err("must include a host");
     };
@@ -32,13 +53,12 @@ pub fn normalize_token_endpoint(raw: &str) -> Result<String, &'static str> {
     if url.query().is_some() || url.fragment().is_some() {
         return Err("must not include a query or fragment");
     }
-    Ok(url.to_string())
+    Ok(url)
 }
 
-/// Whether a URL host (as `Url::host_str` returns it, so IPv6 is bracketed) is
-/// a loopback host that may use plain HTTP. Shared by endpoint normalization
-/// and the minter so an endpoint accepted at creation can also mint.
-pub(crate) fn is_loopback_host(host: &str) -> bool {
+/// Whether a token endpoint's URL host may use plain HTTP.
+#[must_use]
+pub fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
@@ -69,7 +89,7 @@ mod tests {
     #[test]
     fn loopback_hosts_match_url_host_strings() {
         for raw in ["http://localhost/", "http://127.0.0.1/", "http://[::1]/"] {
-            let host = reqwest::Url::parse(raw)
+            let host = url::Url::parse(raw)
                 .unwrap()
                 .host_str()
                 .unwrap()

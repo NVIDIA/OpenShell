@@ -4,6 +4,7 @@
 use super::*;
 use crate::auth::identity::{Identity, IdentityProvider};
 use crate::auth::principal::{OperatorPrincipal, Principal};
+use openshell_core::ObjectName;
 use openshell_core::proto::{
     ObjectMeta, ProviderProfile, ProviderProfileCredential, workspace_selector,
 };
@@ -78,6 +79,228 @@ async fn fixture() -> (Arc<ServerState>, Provider) {
     };
     state.store.put_message(&provider).await.unwrap();
     (state, provider)
+}
+
+#[tokio::test]
+async fn github_app_export_withholds_preexisting_static_sibling() {
+    use crate::grpc::provider::{
+        handle_configure_provider_refresh, tests::github_app_refresh_fixture,
+    };
+    let (state, _server, provider, config) = github_app_refresh_fixture().await;
+    let mut request = request(&["GH_TOKEN"]);
+    request.name.clone_from(&config.provider);
+    request.workspace_scope.clone_from(&config.workspace_scope);
+    handle_configure_provider_refresh(&state, crate::grpc::test_support::authed_request(config))
+        .await
+        .unwrap();
+    state
+        .store
+        .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+            current
+                .credentials
+                .insert("GH_TOKEN".into(), "legacy-token".into());
+        })
+        .await
+        .unwrap();
+    let err = handle(&state, authenticated(request)).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(err.message().contains("inactive"));
+}
+
+#[tokio::test]
+async fn github_app_delivery_caps_legacy_provider_expiry() {
+    use crate::grpc::provider::{
+        handle_configure_provider_refresh, resolve_provider_environment_with_credentials,
+        tests::github_app_refresh_fixture,
+    };
+    use wiremock::{Mock, ResponseTemplate, matchers::method};
+
+    let (state, server, provider, config) = github_app_refresh_fixture().await;
+    let key = "GITHUB_TOKEN";
+    let mut request = request(&[key]);
+    request.name.clone_from(&config.provider);
+    request.workspace_scope.clone_from(&config.workspace_scope);
+    handle_configure_provider_refresh(&state, crate::grpc::test_support::authed_request(config))
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "token": "minted-token",
+            "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let grant = state
+        .refresh
+        .rotate("default", provider.object_name(), key)
+        .await
+        .unwrap();
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(&state.store, "default")
+        .await
+        .unwrap();
+    for expiry in [
+        None,
+        Some(grant.expires_at_ms + 60_000),
+        Some(grant.expires_at_ms - 60_000),
+    ] {
+        state
+            .store
+            .update_message_cas::<Provider, _>(provider.object_id(), 0, |record| {
+                if let Some(ms) = expiry {
+                    record.credential_expiration_times.insert(
+                        key.into(),
+                        openshell_core::time::timestamp_from_millis(ms).unwrap(),
+                    );
+                } else {
+                    record.credential_expiration_times.remove(key);
+                }
+            })
+            .await
+            .unwrap();
+        let effective = expiry
+            .unwrap_or(grant.expires_at_ms)
+            .min(grant.expires_at_ms);
+        let values = handle(&state, authenticated(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            values.credentials[key].expiration_time,
+            openshell_core::time::timestamp_from_millis(effective).ok()
+        );
+        let environment = resolve_provider_environment_with_credentials(
+            &state.store,
+            &catalog,
+            "default",
+            std::slice::from_ref(&request.name),
+            &state.credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(environment.credential_expiration_times[key], effective);
+    }
+}
+
+#[tokio::test]
+async fn github_app_scope_reduction_withholds_token_and_respects_retry_after() {
+    use crate::grpc::provider::{
+        handle_configure_provider_refresh, resolve_provider_environment_with_credentials,
+        tests::github_app_refresh_fixture,
+    };
+    use crate::grpc::test_support::authed_request;
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{body_json, method},
+    };
+
+    let (state, server, provider, mut config) = github_app_refresh_fixture().await;
+    let mut request = request(&["GITHUB_TOKEN"]);
+    request.name = config.provider.clone();
+    request.workspace_scope.clone_from(&config.workspace_scope);
+    config
+        .material
+        .insert("repository_ids".into(), "[42,43]".into());
+    handle_configure_provider_refresh(&state, authed_request(config.clone()))
+        .await
+        .unwrap();
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    Mock::given(method("POST"))
+        .and(body_json(
+            serde_json::json!({"repository_ids": [42,43], "permissions": {"contents":"read"}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({"token": "broad", "expires_at": expiry})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let first = handle(&state, authenticated(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.credentials["GITHUB_TOKEN"].value, "broad");
+    let mut old_provider = state
+        .store
+        .get_message::<Provider>(provider.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+
+    config
+        .material
+        .insert("repository_ids".into(), "[42]".into());
+    handle_configure_provider_refresh(&state, authed_request(config))
+        .await
+        .unwrap();
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(body_json(serde_json::json!({
+            "repository_ids": [42], "permissions": {"contents":"read"}
+        })))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "600"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let before = crate::persistence::current_time_ms();
+    for _ in 0..2 {
+        let error = handle(&state, authenticated(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Unavailable);
+    }
+    let grant = state
+        .refresh
+        .get("default", provider.object_id(), "GITHUB_TOKEN")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(grant.next_refresh_at_ms >= before + 600_000);
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(&state.store, "default")
+        .await
+        .unwrap();
+    let environment = resolve_provider_environment_with_credentials(
+        &state.store,
+        &catalog,
+        "default",
+        &[request.name],
+        &state.credentials,
+    )
+    .await
+    .unwrap();
+    assert!(!environment.environment.contains_key("GITHUB_TOKEN"));
+
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(body_json(
+            serde_json::json!({"repository_ids": [42], "permissions": {"contents":"read"}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({"token": "narrow", "expires_at": expiry})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let new_grant = state
+        .refresh
+        .rotate("default", provider.object_name(), "GITHUB_TOKEN")
+        .await
+        .unwrap();
+    let new_grant = StoredProviderCredentialRefreshState::from(&new_grant);
+    // A sandbox may have loaded the provider before it read the new grant.
+    let version = old_provider.get_resource_version();
+    super::super::provider::withhold_stale_github_app_outputs(
+        &mut old_provider,
+        version,
+        [&new_grant],
+    );
+    assert!(!old_provider.credential_handles.contains_key("GITHUB_TOKEN"));
 }
 
 #[tokio::test]
@@ -219,7 +442,7 @@ async fn refresh_fixture(
     state: &ServerState,
     provider: &Provider,
     endpoint: String,
-) -> StoredProviderCredentialRefreshStateV2 {
+) -> StoredProviderCredentialRefreshState {
     let refresh = crate::provider_refresh::new_refresh_state(
         provider,
         "other",

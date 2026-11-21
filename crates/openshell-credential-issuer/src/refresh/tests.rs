@@ -89,7 +89,7 @@ impl RefreshAttempt for Attempt {
     async fn prepare_workspace(&self) -> Result<(), Status> {
         Ok(())
     }
-    async fn commit(&self, outputs: RefreshOutputs<'_>) -> Result<Handles, Status> {
+    async fn commit(&self, outputs: RefreshOutputs<'_>) -> Result<CommittedRefreshOutputs, Status> {
         assert!(
             outputs.inline.is_empty(),
             "handle commits must not carry plaintext"
@@ -104,10 +104,11 @@ impl RefreshAttempt for Attempt {
         }
         self.0.commits.fetch_add(1, Ordering::SeqCst);
         let mut live = self.0.live.lock().unwrap();
-        Ok(std::mem::replace(
-            &mut *live,
-            outputs.handles.unwrap().clone(),
-        ))
+        Ok(CommittedRefreshOutputs {
+            replaced: std::mem::replace(&mut *live, outputs.handles.unwrap().clone()),
+            grant_version: None,
+            provider_version: self.0.commits.load(Ordering::SeqCst) as u64,
+        })
     }
 }
 

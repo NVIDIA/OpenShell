@@ -19,11 +19,8 @@ use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
     profile_response_payload, profile_storage_payload, stored_profile_resource_version,
 };
-use crate::provider_refresh::RefreshStateReader;
-use crate::storage_proto::{
-    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredProviderProfile,
-};
+use crate::provider_refresh::{RefreshStateReader, clear_refresh_owned_expiries};
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
 use openshell_core::dynamic_credential_key::DynamicCredentialKey;
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
@@ -70,6 +67,44 @@ pub(super) fn redact_provider_credentials(mut provider: Provider) -> Provider {
     }
     provider.credential_handles.clear();
     provider
+}
+
+/// Provider and grant snapshots are read separately. An older provider revision
+/// can still contain the previous epoch's token.
+pub(super) fn withhold_stale_github_app_outputs<'a>(
+    provider: &mut Provider,
+    version: u64,
+    refreshes: impl IntoIterator<Item = &'a StoredProviderCredentialRefreshState>,
+) {
+    for grant in refreshes {
+        if grant.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32 {
+            continue;
+        }
+        if grant.first_mint_provider_version == 0
+            || version < grant.first_mint_provider_version
+            || grant
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.deletion_time.is_some())
+        {
+            provider.credentials.remove(&grant.credential_key);
+            provider.credential_handles.remove(&grant.credential_key);
+            provider
+                .credential_expiration_times
+                .remove(&grant.credential_key);
+        } else if grant.last_refresh_at_ms != 0 {
+            // Older gateways allowed a provider update to clear or extend this expiry.
+            let cap = openshell_core::time::timestamp_from_millis(grant.expires_at_ms)
+                .unwrap_or_default();
+            let expiry = provider
+                .credential_expiration_times
+                .entry(grant.credential_key.clone())
+                .or_insert(cap);
+            if (expiry.seconds, expiry.nanos) > (cap.seconds, cap.nanos) {
+                *expiry = cap;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -347,25 +382,69 @@ pub(super) async fn update_provider_record_with_catalog(
 
 async fn reject_refresh_owned_credential_updates(
     refresh: &dyn CredentialRefresh,
-    provider_id: &str,
-    credential_updates: &HashMap<String, String>,
+    provider: &Provider,
+    catalog: &EffectiveProviderProfileCatalog,
+    update: &Provider,
+    clear_expiries: &[String],
 ) -> Result<(), Status> {
-    if credential_updates.is_empty() {
+    if update.credentials.is_empty()
+        && update.credential_expiration_times.is_empty()
+        && clear_expiries.is_empty()
+    {
         return Ok(());
     }
 
     let mut refresh_owned_keys = HashSet::new();
-    for refresh_state in refresh.list(Some(provider_id)).await? {
+    let profile =
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace);
+    for refresh_state in refresh.list(Some(provider.object_id())).await? {
         let strategy =
             ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy).unwrap_or_default();
         if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
             continue;
         }
 
+        if strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+            let key = &refresh_state.credential_key;
+            if refresh_state.first_mint_provider_version != 0 {
+                if clear_expiries.contains(key) {
+                    return Err(Status::failed_precondition(format!(
+                        "cannot clear the minted expiry for {key}"
+                    )));
+                }
+                if let Some(expiry) = update.credential_expiration_times.get(key) {
+                    // During publication the provider may already hold the new token
+                    // while the refresh state still describes the previous one.
+                    let cap = if refresh_state.status == "refresh_committing"
+                        || refresh_state.last_refresh_at_ms == 0
+                    {
+                        provider.credential_expiration_times.get(key).copied()
+                    } else {
+                        openshell_core::time::timestamp_from_millis(refresh_state.expires_at_ms)
+                            .ok()
+                    };
+                    if cap
+                        .is_none_or(|cap| (expiry.seconds, expiry.nanos) > (cap.seconds, cap.nanos))
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "expiry for {key} exceeds the minted token lifetime"
+                        )));
+                    }
+                }
+            }
+            if let Some(profile) = &profile {
+                validate_github_app_static_aliases(profile, key, |alias| {
+                    update
+                        .credentials
+                        .get(alias)
+                        .is_some_and(|value| !value.is_empty())
+                })?;
+            }
+        }
         for key in std::iter::once(refresh_state.credential_key)
             .chain(refresh_state.additional_output_keys.into_values())
         {
-            if credential_updates.contains_key(&key) {
+            if update.credentials.contains_key(&key) {
                 refresh_owned_keys.insert(key);
             }
         }
@@ -432,8 +511,14 @@ async fn update_provider_record_validating(
         ));
     }
 
-    reject_refresh_owned_credential_updates(refresh, existing.object_id(), &provider.credentials)
-        .await?;
+    reject_refresh_owned_credential_updates(
+        refresh,
+        &existing,
+        catalog,
+        &provider,
+        clear_credential_expiration_keys,
+    )
+    .await?;
 
     let current_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
 
@@ -639,6 +724,14 @@ pub(super) async fn delete_provider_record_with_credentials(
     )
     .await?;
 
+    // Refresh deletion may already have unlinked and retired some handles.
+    let Some(provider) = store
+        .get_message::<Provider>(provider.object_id())
+        .await
+        .map_err(|e| Status::internal(format!("fetch remaining provider credentials: {e}")))?
+    else {
+        return Ok(true);
+    };
     credentials
         .delete_provider_credential_handles(
             provider.object_name(),
@@ -1070,14 +1163,15 @@ async fn load_provider_environment_record(
     else {
         return Ok(None);
     };
-    let provider = Provider::decode(record.payload.as_slice())
+    let mut provider = Provider::decode(record.payload.as_slice())
         .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
-    let refresh_states = refresh
+    let refresh_states: Vec<_> = refresh
         .list(Some(&record.id))
         .await?
         .iter()
         .map(Into::into)
         .collect();
+    withhold_stale_github_app_outputs(&mut provider, record.resource_version, &refresh_states);
     Ok(Some(ProviderEnvironmentRecord {
         name: name.to_string(),
         object_id: record.id,
@@ -1233,6 +1327,20 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             &provider.r#type,
             &provider.profile_workspace,
         );
+        let mut provider = std::borrow::Cow::Borrowed(provider);
+        if let Some(profile) = &profile {
+            for alias in inactive_github_app_aliases(profile, &record.refresh_states) {
+                if provider.credentials.contains_key(alias)
+                    || provider.credential_handles.contains_key(alias)
+                {
+                    let filtered = provider.to_mut();
+                    filtered.credentials.remove(alias);
+                    filtered.credential_handles.remove(alias);
+                    filtered.credential_expiration_times.remove(alias);
+                }
+            }
+        }
+        let provider = provider.as_ref();
         let profile_stable_placeholder_keys = profile
             .as_ref()
             .map(|profile| {
@@ -3524,6 +3632,145 @@ fn provider_refresh_defaults(
         .and_then(|credential| credential.refresh.clone())
 }
 
+#[derive(Clone, Copy)]
+enum RefreshCredentialLookup {
+    Resolve,
+    Delete,
+}
+
+/// Existing non-GitHub grants are self-contained, even when a profile source is unavailable.
+async fn existing_refresh_key(
+    state: &ServerState,
+    provider: &Provider,
+    requested_key: &str,
+    lookup: RefreshCredentialLookup,
+) -> Result<String, Status> {
+    let workspace = provider.object_workspace();
+    if let Some(grant) = state
+        .refresh
+        .get(workspace, provider.object_id(), requested_key)
+        .await?
+        && (grant.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+            || matches!(lookup, RefreshCredentialLookup::Delete))
+    {
+        return Ok(requested_key.to_string());
+    }
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    resolve_github_app_refresh_key(&state.refresh, &catalog, provider, requested_key, lookup).await
+}
+
+fn validate_github_app_static_aliases(
+    profile: &ProviderTypeProfile,
+    selected: &str,
+    is_stored: impl Fn(&str) -> bool,
+) -> Result<(), Status> {
+    if let Some(credential) = profile.github_app_credential(selected)
+        && let Some(alias) = credential
+            .env_vars
+            .iter()
+            .find(|alias| alias.as_str() != selected && is_stored(alias))
+    {
+        return Err(Status::failed_precondition(format!(
+            "static credential {alias} conflicts with GitHub App refresh on {selected}; clear {alias} with provider update"
+        )));
+    }
+    Ok(())
+}
+
+/// Also enforce the selected alias when reading providers created before write validation.
+pub(super) fn inactive_github_app_aliases<'a>(
+    profile: &'a ProviderTypeProfile,
+    grants: &[StoredProviderCredentialRefreshState],
+) -> HashSet<&'a str> {
+    let mut inactive = HashSet::new();
+    for grant in grants {
+        if grant.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+            && let Some(credential) = profile.github_app_credential(&grant.credential_key)
+        {
+            inactive.extend(
+                credential
+                    .env_vars
+                    .iter()
+                    .filter(|alias| **alias != grant.credential_key)
+                    .map(String::as_str),
+            );
+        }
+    }
+    inactive
+}
+
+/// A GitHub App credential has one refresh grant, stored under the selected
+/// environment alias. Logical names are selectors, never injectable keys.
+/// Configuration callers must hold the sandbox mutation guard through persist.
+async fn resolve_github_app_refresh_key(
+    refresh: &dyn CredentialRefresh,
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+    requested_key: &str,
+    lookup: RefreshCredentialLookup,
+) -> Result<String, Status> {
+    let Some(profile) =
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
+    else {
+        return Ok(requested_key.to_string());
+    };
+    let Some(credential) = profile.github_app_credential(requested_key) else {
+        return Ok(requested_key.to_string());
+    };
+    let is_logical_name = credential.name == requested_key
+        && !credential
+            .env_vars
+            .iter()
+            .any(|alias| alias == requested_key);
+    let states = refresh.list(Some(provider.object_id())).await?;
+    let mut configured_keys: Vec<_> = states
+        .iter()
+        .filter(|state| {
+            state.credential_key == credential.name
+                || credential.env_vars.contains(&state.credential_key)
+        })
+        .map(|state| state.credential_key.as_str())
+        .collect();
+    configured_keys.sort_unstable();
+    // Exact deletion must remain possible even for legacy logical-name states
+    // or multiple aliases. Do not silently migrate or merge their grants.
+    if matches!(lookup, RefreshCredentialLookup::Delete) && configured_keys.contains(&requested_key)
+    {
+        return Ok(requested_key.to_string());
+    }
+    if configured_keys.len() > 1
+        || configured_keys
+            .iter()
+            .any(|key| !credential.env_vars.iter().any(|alias| alias == key))
+    {
+        return Err(Status::failed_precondition(format!(
+            "GitHub App credential '{}' has conflicting or legacy refresh keys: {}; delete the conflicting refresh configurations by exact key before reconfiguring",
+            credential.name,
+            configured_keys.join(", ")
+        )));
+    }
+    if let Some(existing_key) = configured_keys.first() {
+        if is_logical_name || requested_key == *existing_key {
+            return Ok((*existing_key).to_string());
+        }
+        return Err(Status::failed_precondition(format!(
+            "GitHub App credential '{}' already has refresh configured on {existing_key}; update that key or delete its refresh configuration before switching aliases",
+            credential.name
+        )));
+    }
+    if is_logical_name {
+        return credential.env_vars.first().cloned().ok_or_else(|| {
+            Status::failed_precondition(
+                "github_app_installation requires a credential with an environment alias",
+            )
+        });
+    }
+    Ok(requested_key.to_string())
+}
+
 /// Resolve the env keys a refresh co-mints (beyond its primary credential) from
 /// the provider's profile `additional_outputs`. Returns semantic output id ->
 /// env key. Empty when the provider type has no profile or the credential
@@ -5088,13 +5335,16 @@ pub(super) async fn handle_get_provider_refresh_status(
     let states = if request.credential_key.trim().is_empty() {
         state.refresh.list(Some(provider.object_id())).await?
     } else {
+        let credential_key = existing_refresh_key(
+            state,
+            &provider,
+            request.credential_key.trim(),
+            RefreshCredentialLookup::Resolve,
+        )
+        .await?;
         state
             .refresh
-            .get(
-                &workspace,
-                provider.object_id(),
-                request.credential_key.trim(),
-            )
+            .get(&workspace, provider.object_id(), &credential_key)
             .await?
             .into_iter()
             .collect()
@@ -5133,11 +5383,6 @@ pub(super) async fn handle_configure_provider_refresh(
     }
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
-    }
-    if !is_valid_env_key(credential_key) {
-        return Err(Status::invalid_argument(
-            "credential_key must be a valid environment variable name",
-        ));
     }
     let strategy = ProviderCredentialRefreshStrategy::try_from(request.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
@@ -5275,6 +5520,20 @@ pub(super) async fn handle_configure_provider_refresh(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    let resolved_key = resolve_github_app_refresh_key(
+        &state.refresh,
+        &catalog,
+        &provider,
+        credential_key,
+        RefreshCredentialLookup::Resolve,
+    )
+    .await?;
+    let credential_key = resolved_key.as_str();
+    if !is_valid_env_key(credential_key) {
+        return Err(Status::invalid_argument(
+            "credential_key must resolve to a valid environment variable name",
+        ));
+    }
     validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
         state.store.as_ref(),
         RefreshStateReader::Runtime(&state.refresh),
@@ -5309,6 +5568,27 @@ pub(super) async fn handle_configure_provider_refresh(
         &additional_output_keys,
     )?;
     validate_refresh_material(&supplied_material, refresh_defaults.as_ref())?;
+    if strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+        let defaults = refresh_defaults.as_ref().filter(|defaults| defaults.strategy == strategy)
+            .ok_or_else(|| Status::failed_precondition(
+                "github_app_installation requires a matching provider profile refresh declaration",
+            ))?;
+        if let Some(profile) = get_provider_type_profile_for_scope(
+            &catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) {
+            validate_github_app_static_aliases(&profile, credential_key, |alias| {
+                provider.credentials.contains_key(alias)
+                    || provider.credential_handles.contains_key(alias)
+            })?;
+        }
+        crate::provider_refresh::validate_github_app_configuration(
+            &request.material,
+            &defaults.token_url,
+            request.material_secrets.contains_key("private_key"),
+        )?;
+    }
     let mut secret_material_keys: HashSet<String> =
         request.secret_material_keys.iter().cloned().collect();
     for key in &request.secret_material_keys {
@@ -5416,16 +5696,17 @@ pub(super) async fn handle_configure_provider_refresh(
             .as_ref()
             .map(|metadata| metadata.resource_version)
     });
-    let has_expiration = requested_expiration_ms.is_some()
-        || existing_refresh_state
-            .as_ref()
-            .is_some_and(crate::provider_refresh::refresh_has_expiration);
-    let expires_at_ms = requested_expiration_ms.unwrap_or_else(|| {
-        existing_refresh_state
-            .as_ref()
-            .map(|state| state.expires_at_ms)
-            .unwrap_or_default()
-    });
+    let retain_expiry = strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation
+        && existing_refresh_state.as_ref().is_none_or(|s| {
+            s.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+        });
+    let previous_expiration = existing_refresh_state
+        .as_ref()
+        .filter(|existing| {
+            retain_expiry && crate::provider_refresh::refresh_has_expiration(existing)
+        })
+        .map(|existing| existing.expires_at_ms);
+    let expiration = requested_expiration_ms.or(previous_expiration);
     let mut persisted_material = request.material;
     let secret_material: HashMap<_, _> = secret_material_keys
         .iter()
@@ -5443,7 +5724,7 @@ pub(super) async fn handle_configure_provider_refresh(
             strategy,
             material: persisted_material,
             secret_material_keys,
-            expires_at_ms,
+            expires_at_ms: expiration.unwrap_or_default(),
             token_url,
             scopes,
             refresh_before,
@@ -5453,7 +5734,16 @@ pub(super) async fn handle_configure_provider_refresh(
     )?;
     if let Some(existing) = existing_refresh_state.as_ref() {
         state_record.metadata.clone_from(&existing.metadata);
-        state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
+        state_record
+            .retired_output_handles
+            .clone_from(&existing.retired_output_handles);
+        if retain_expiry {
+            state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
+        } else if let Some(metadata) = state_record.metadata.as_mut() {
+            metadata
+                .annotations
+                .remove(openshell_credential_issuer::refresh::engine::COMPLETED_MINT_ANNOTATION);
+        }
         state_record
             .pending_secret_deletions
             .extend(existing.pending_secret_deletions.clone());
@@ -5465,7 +5755,14 @@ pub(super) async fn handle_configure_provider_refresh(
             );
         }
     }
-    crate::provider_refresh::set_refresh_expiration_presence(&mut state_record, has_expiration);
+    if !retain_expiry {
+        // Workloads cannot use a previous installation token in the new epoch.
+        state_record.next_refresh_at_ms = 0;
+    }
+    crate::provider_refresh::set_refresh_expiration_presence(
+        &mut state_record,
+        expiration.is_some(),
+    );
     // A reconfiguration replaces every binding and drops endpoint constraints
     // on copied values: the caller supplied all material again.
     {
@@ -5596,12 +5893,24 @@ pub(super) async fn handle_rotate_provider_credential(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
+    let provider = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, provider_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider not found"))?;
+    let credential_key = existing_refresh_key(
+        state,
+        &provider,
+        credential_key,
+        RefreshCredentialLookup::Resolve,
+    )
+    .await?;
     let refreshed =
-        CredentialRefresh::rotate(&state.refresh, &workspace, provider_name, credential_key)
+        CredentialRefresh::rotate(&state.refresh, &workspace, provider_name, &credential_key)
             .await?;
     crate::provider_refresh::publish_change(state, &refreshed);
-    let refresh_state =
-        crate::storage_proto::StoredProviderCredentialRefreshStateV2::from(&refreshed);
+    let refresh_state = StoredProviderCredentialRefreshState::from(&refreshed);
 
     replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {
@@ -5654,9 +5963,16 @@ pub(super) async fn handle_inline_provider_refresh_secrets(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    let credential_key = existing_refresh_key(
+        state,
+        &provider,
+        credential_key,
+        RefreshCredentialLookup::Resolve,
+    )
+    .await?;
     let mut refresh: StoredProviderCredentialRefreshState = state
         .refresh
-        .get(&workspace, provider.object_id(), credential_key)
+        .get(&workspace, provider.object_id(), &credential_key)
         .await?
         .as_ref()
         .map(Into::into)
@@ -5828,32 +6144,6 @@ async fn read_workspace_secret(
     )))
 }
 
-/// Remove the expiry for each key the refresh still owns — one whose stored
-/// value equals the refresh's `expires_at_ms`. Independently updated expiries (no
-/// longer matching) are left in place.
-///
-/// This operates on `provider` in place so it can run inside a CAS closure
-/// against the current stored provider. The equality check must see the latest
-/// state, not a snapshot read earlier in the handler: a concurrent rotation or
-/// provider update between the read and the write could otherwise be clobbered
-/// by an unconditional zero (CWE-362).
-fn clear_refresh_owned_expiries(
-    provider: &mut Provider,
-    refresh_expires_at_ms: i64,
-    owned_keys: &[String],
-) {
-    for key in owned_keys {
-        if provider
-            .credential_expiration_times
-            .get(key)
-            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-            .is_some_and(|expires_at_ms| expires_at_ms == refresh_expires_at_ms)
-        {
-            provider.credential_expiration_times.remove(key);
-        }
-    }
-}
-
 pub(super) async fn handle_delete_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRefreshRequest>,
@@ -5885,9 +6175,16 @@ pub(super) async fn handle_delete_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    let credential_key = existing_refresh_key(
+        state,
+        &provider,
+        credential_key,
+        RefreshCredentialLookup::Delete,
+    )
+    .await?;
     let existing_refresh_state = state
         .refresh
-        .get(&workspace, provider.object_id(), credential_key)
+        .get(&workspace, provider.object_id(), &credential_key)
         .await?
         .as_ref()
         .map(Into::<StoredProviderCredentialRefreshState>::into);
@@ -5911,9 +6208,11 @@ pub(super) async fn handle_delete_provider_refresh(
     // inside the CAS closure so they see the current stored provider — deciding
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
-    if crate::provider_refresh::refresh_has_expiration(&refresh_state) {
+    if refresh_state.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+        && crate::provider_refresh::refresh_has_expiration(&refresh_state)
+    {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
-        let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
+        let owned_keys: Vec<String> = std::iter::once(credential_key)
             .chain(refresh_state.additional_output_keys.into_values())
             .collect();
         state
@@ -6059,7 +6358,7 @@ mod refresh_routing_tests;
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{Principal, UserPrincipal};
@@ -7896,6 +8195,7 @@ mod tests {
                 "cursor",
                 "deepinfra",
                 "github",
+                "github-app",
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
@@ -8891,6 +9191,870 @@ mod tests {
 
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("default/global-provider"));
+    }
+
+    pub(in crate::grpc) async fn github_app_refresh_fixture() -> (
+        Arc<ServerState>,
+        wiremock::MockServer,
+        Provider,
+        ConfigureProviderRefreshRequest,
+    ) {
+        let state = test_server_state().await;
+        let server = wiremock::MockServer::start().await;
+        let mut profile = openshell_providers::example_profiles::load("github-app").to_proto();
+        profile.id = "test-github-app".into();
+        profile.credentials[0].refresh.as_mut().unwrap().token_url = format!(
+            "{}/app/installations/{{installation_id}}/access_tokens",
+            server.uri()
+        );
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "test.yaml".into(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(imported.imported, "{:?}", imported.diagnostics);
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "github-app-test".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                r#type: "test-github-app".into(),
+                profile_workspace: "default".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let configure = ConfigureProviderRefreshRequest {
+            provider: "github-app-test".into(),
+            credential_key: "GITHUB_TOKEN".into(),
+            strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation as i32,
+            material: HashMap::from([
+                ("client_id".into(), "Iv1.test".into()),
+                ("installation_id".into(), "123".into()),
+                (
+                    "private_key".into(),
+                    crate::provider_refresh::TEST_RSA_PRIVATE_KEY.into(),
+                ),
+                ("repository_ids".into(), "[42]".into()),
+                ("permissions".into(), r#"{"contents":"read"}"#.into()),
+            ]),
+            // The strategy itself must classify the signing key as secret.
+            secret_material_keys: Vec::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        };
+        (state, server, provider, configure)
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_uses_workspace_private_key() {
+        use openshell_core::proto::{CreateSecretRequest, SecretRefreshUse};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (mut state, server, _, mut configure) = github_app_refresh_fixture().await;
+        configure.credential_key = "GH_TOKEN".into();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .workspace_secrets
+            .enabled = true;
+        let endpoint = format!("{}/app/installations/123/access_tokens", server.uri());
+        super::super::secret::handle_create_secret(
+            &state,
+            authed_request(CreateSecretRequest {
+                name: "app-key".into(),
+                value: configure.material.remove("private_key").unwrap(),
+                refresh_use: Some(SecretRefreshUse {
+                    allowed_endpoints: vec![endpoint],
+                }),
+                workspace_scope: configure.workspace_scope.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        configure
+            .material_secrets
+            .insert("private_key".into(), "app-key".into());
+        configure.secret_material_keys.push("private_key".into());
+
+        // Binding must use the concrete installation endpoint, not its template.
+        configure
+            .material
+            .insert("installation_id".into(), "456".into());
+        let error = handle_configure_provider_refresh(&state, authed_request(configure.clone()))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("does not allow token endpoint"));
+        configure
+            .material
+            .insert("installation_id".into(), "123".into());
+        handle_configure_provider_refresh(&state, authed_request(configure))
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/app/installations/123/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "installation-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        handle_rotate_provider_credential(
+            &state,
+            authed_request(RotateProviderCredentialRequest {
+                provider: "github-app-test".into(),
+                credential_key: "GH_TOKEN".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let inlined = handle_inline_provider_refresh_secrets(
+            &state,
+            authed_request(InlineProviderRefreshSecretsRequest {
+                provider: "github-app-test".into(),
+                credential_key: "api_token".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+        assert_eq!(inlined.credential_key, "GH_TOKEN");
+        assert!(inlined.material_secrets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_aliases_resolve_through_management_and_injection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        for (requested_key, expected_key) in [
+            ("api_token", "GITHUB_TOKEN"),
+            ("GH_TOKEN", "GH_TOKEN"),
+            ("GITHUB_TOKEN", "GITHUB_TOKEN"),
+        ] {
+            server.reset().await;
+            let mut configure = request.clone();
+            configure.credential_key = requested_key.into();
+            let configured =
+                handle_configure_provider_refresh(&state, authed_request(configure.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(configured.status.unwrap().credential_key, expected_key);
+            // A logical-name update retains the explicitly selected alias.
+            configure.credential_key = "api_token".into();
+            let updated = handle_configure_provider_refresh(&state, authed_request(configure))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(updated.status.unwrap().credential_key, expected_key);
+            Mock::given(method("POST"))
+                .and(path("/app/installations/123/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": "installation-token",
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let rotated = handle_rotate_provider_credential(
+                &state,
+                authed_request(RotateProviderCredentialRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(rotated.status.unwrap().credential_key, expected_key);
+            let catalog = state
+                .provider_profile_sources
+                .snapshot_catalog(state.store.as_ref(), "default")
+                .await
+                .unwrap();
+            let environment = resolve_provider_environment_with_credentials(
+                state.store.as_ref(),
+                &catalog,
+                "default",
+                &[provider.object_name().into()],
+                &state.credentials,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                environment.get(expected_key).map(String::as_str),
+                Some("installation-token")
+            );
+            assert!(!environment.contains_key("api_token"));
+            let binding = &environment.static_credential_bindings[expected_key];
+            assert!(!binding.endpoints.is_empty());
+            for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+                assert_eq!(environment.contains_key(key), key == expected_key);
+            }
+            let status = handle_get_provider_refresh_status(
+                &state,
+                authed_request(GetProviderRefreshStatusRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(status.credentials.len(), 1);
+            assert_eq!(status.credentials[0].credential_key, expected_key);
+            handle_delete_provider_refresh(
+                &state,
+                authed_request(DeleteProviderRefreshRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                crate::provider_refresh::list_refresh_states_for_provider(
+                    state.store.as_ref(),
+                    provider.object_id(),
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
+
+    async fn update_github_app_static_token(
+        state: &Arc<ServerState>,
+        provider: &Provider,
+        key: &str,
+        value: &str,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        handle_update_provider(
+            state,
+            authed_request(UpdateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    provider.object_name(),
+                    &provider.r#type,
+                    key,
+                    value,
+                )),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    async fn mock_github_installation_token(server: &wiremock::MockServer) {
+        use wiremock::{Mock, ResponseTemplate, matchers::method};
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "installation-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn github_app_first_mint_is_due_despite_previous_token_expiry() {
+        let (state, server, provider, mut config) = github_app_refresh_fixture().await;
+        let future = crate::persistence::current_time_ms() + 3_600_000;
+        config.expiration_time = Some(openshell_core::time::timestamp_from_millis(future).unwrap());
+        handle_configure_provider_refresh(&state, authed_request(config))
+            .await
+            .unwrap();
+        let mut grant = crate::provider_refresh::get_refresh_state(
+            &state.store,
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(grant.next_refresh_at_ms, 0);
+
+        // An installation configured before upgrade may already have a future first mint.
+        grant.next_refresh_at_ms = future;
+        crate::provider_refresh::put_refresh_state(&state.store, &grant)
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        let changes = state.refresh.sweep().await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].completed_mint.is_some());
+    }
+
+    #[tokio::test]
+    async fn github_app_expiry_update_cannot_outlive_minted_token() {
+        let (state, server, provider, config) = github_app_refresh_fixture().await;
+        handle_configure_provider_refresh(&state, authed_request(config))
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        let key = "GITHUB_TOKEN";
+        let grant = state
+            .refresh
+            .rotate("default", provider.object_name(), key)
+            .await
+            .unwrap();
+        let update = |expires_at: Option<i64>| UpdateProviderRequest {
+            provider: Some(Provider {
+                metadata: Some(openshell_core::proto::ObjectMeta {
+                    name: provider.object_name().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            credential_expiration_times: expires_at
+                .into_iter()
+                .map(|ms| {
+                    (
+                        key.into(),
+                        openshell_core::time::timestamp_from_millis(ms).unwrap(),
+                    )
+                })
+                .collect(),
+            clear_credential_expiration_keys: if expires_at.is_none() {
+                vec![key.into()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        for expiry in [None, Some(grant.expires_at_ms + 1)] {
+            assert_eq!(
+                handle_update_provider(&state, authed_request(update(expiry)))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition
+            );
+        }
+        let shorter = grant.expires_at_ms - 60_000;
+        let updated = handle_update_provider(&state, authed_request(update(Some(shorter))))
+            .await
+            .unwrap()
+            .into_inner()
+            .provider
+            .unwrap();
+        assert_eq!(
+            updated.credential_expiration_times[key],
+            openshell_core::time::timestamp_from_millis(shorter).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_rejects_static_sibling_before_and_after_configuration() {
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        update_github_app_static_token(&state, &provider, "GH_TOKEN", "static-token")
+            .await
+            .unwrap();
+        let err = handle_configure_provider_refresh(&state, authed_request(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("GH_TOKEN"));
+        update_github_app_static_token(&state, &provider, "GH_TOKEN", "")
+            .await
+            .unwrap();
+        handle_configure_provider_refresh(&state, authed_request(request))
+            .await
+            .unwrap();
+        let err = update_github_app_static_token(&state, &provider, "GH_TOKEN", "static-token")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        mock_github_installation_token(&server).await;
+        state
+            .refresh
+            .rotate("default", provider.object_name(), "GITHUB_TOKEN")
+            .await
+            .unwrap();
+
+        // Existing providers can already contain the conflicting alias after an upgrade.
+        state
+            .store
+            .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+                current
+                    .credentials
+                    .insert("GH_TOKEN".into(), "legacy-token".into());
+            })
+            .await
+            .unwrap();
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(&state.store, "default")
+            .await
+            .unwrap();
+        let environment = resolve_provider_environment_with_credentials(
+            &state.store,
+            &catalog,
+            "default",
+            &[provider.object_name().into()],
+            &state.credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            environment.get("GITHUB_TOKEN").map(String::as_str),
+            Some("installation-token")
+        );
+        assert!(!environment.contains_key("GH_TOKEN"));
+        update_github_app_static_token(&state, &provider, "GH_TOKEN", "")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_app_deletion_after_failed_first_publication_preserves_static_token() {
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        update_github_app_static_token(&state, &provider, "GITHUB_TOKEN", "original-static-token")
+            .await
+            .unwrap();
+        handle_configure_provider_refresh(&state, authed_request(request))
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        state.credentials.fail_next_store();
+        let err = handle_rotate_provider_credential(
+            &state,
+            authed_request(RotateProviderCredentialRequest {
+                provider: provider.object_name().into(),
+                credential_key: "GITHUB_TOKEN".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        let grant = state
+            .refresh
+            .get("default", provider.object_id(), "GITHUB_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.first_mint_provider_version, 0);
+        assert_eq!(grant.last_refresh_at_ms, 0);
+        assert!(!openshell_credential_issuer::refresh::refresh_has_expiration(&grant));
+        handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: provider.object_name().into(),
+                credential_key: "GITHUB_TOKEN".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let current = state
+            .store
+            .get_message::<Provider>(provider.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let resolved = state
+            .credentials
+            .resolve_provider_handles(&current, crate::persistence::current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(resolved.values["GITHUB_TOKEN"], "original-static-token");
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_rejects_sibling_alias_including_failed_grants() {
+        for (selected, sibling) in [("GITHUB_TOKEN", "GH_TOKEN"), ("GH_TOKEN", "GITHUB_TOKEN")] {
+            let (state, _server, provider, mut request) = github_app_refresh_fixture().await;
+            request.credential_key = selected.into();
+            handle_configure_provider_refresh(&state, authed_request(request.clone()))
+                .await
+                .unwrap();
+            for status in ["pending", "error"] {
+                let mut original = crate::provider_refresh::get_refresh_state(
+                    state.store.as_ref(),
+                    "default",
+                    provider.object_id(),
+                    selected,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                original.status = status.into();
+                crate::provider_refresh::put_refresh_state(state.store.as_ref(), &original)
+                    .await
+                    .unwrap();
+                let before = crate::provider_refresh::get_refresh_state(
+                    state.store.as_ref(),
+                    "default",
+                    provider.object_id(),
+                    selected,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let mut conflicting = request.clone();
+                conflicting.credential_key = sibling.into();
+                conflicting
+                    .material
+                    .insert("installation_id".into(), "456".into());
+                conflicting
+                    .material
+                    .insert("repository_ids".into(), "[43]".into());
+                let err = handle_configure_provider_refresh(&state, authed_request(conflicting))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code(), Code::FailedPrecondition);
+                assert!(err.message().contains(selected));
+                let after = crate::provider_refresh::list_refresh_states_for_provider(
+                    state.store.as_ref(),
+                    provider.object_id(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(after, vec![before]);
+            }
+            // Updating the chosen alias is still allowed.
+            handle_configure_provider_refresh(&state, authed_request(request))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_concurrent_alias_configuration_has_one_winner() {
+        let (state, _server, provider, first) = github_app_refresh_fixture().await;
+        let mut second = first.clone();
+        second.credential_key = "GH_TOKEN".into();
+        second
+            .material
+            .insert("installation_id".into(), "456".into());
+        let (first, second) = tokio::join!(
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                authed_request(first)
+            )),
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                authed_request(second)
+            )),
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        let err = first.err().or_else(|| second.err()).unwrap();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            crate::provider_refresh::list_refresh_states_for_provider(
+                state.store.as_ref(),
+                provider.object_id(),
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_legacy_conflicts_remain_inspectable_and_deletable() {
+        for legacy_keys in [vec!["api_token"], vec!["GITHUB_TOKEN", "GH_TOKEN"]] {
+            let (state, server, provider, request) = github_app_refresh_fixture().await;
+            // Seed records that the old configure handler allowed. No shared
+            // secret handles: cleanup must target only the selected record.
+            for key in &legacy_keys {
+                let legacy = crate::provider_refresh::new_refresh_state(
+                    &provider,
+                    "default",
+                    key,
+                    crate::provider_refresh::NewRefreshStateConfig {
+                        strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation,
+                        material: request.material.clone(),
+                        secret_material_keys: vec!["private_key".into()],
+                        expires_at_ms: 0,
+                        token_url: format!(
+                            "{}/app/installations/{{installation_id}}/access_tokens",
+                            server.uri()
+                        ),
+                        scopes: Vec::new(),
+                        refresh_before: None,
+                        max_lifetime: None,
+                        additional_output_keys: HashMap::new(),
+                    },
+                )
+                .unwrap();
+                crate::provider_refresh::put_refresh_state(state.store.as_ref(), &legacy)
+                    .await
+                    .unwrap();
+            }
+            let err = handle_configure_provider_refresh(&state, authed_request(request.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            assert!(err.message().contains("exact key"));
+            let err = handle_rotate_provider_credential(
+                &state,
+                authed_request(RotateProviderCredentialRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let status_request = GetProviderRefreshStatusRequest {
+                provider: provider.object_name().into(),
+                credential_key: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            };
+            let listed =
+                handle_get_provider_refresh_status(&state, authed_request(status_request.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(listed.credentials.len(), legacy_keys.len());
+            let err = handle_get_provider_refresh_status(
+                &state,
+                authed_request(GetProviderRefreshStatusRequest {
+                    credential_key: "api_token".into(),
+                    ..status_request
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            for key in &legacy_keys {
+                handle_delete_provider_refresh(
+                    &state,
+                    authed_request(DeleteProviderRefreshRequest {
+                        provider: provider.object_name().into(),
+                        credential_key: (*key).into(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    crate::provider_refresh::get_refresh_state(
+                        state.store.as_ref(),
+                        "default",
+                        provider.object_id(),
+                        key,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            handle_configure_provider_refresh(&state, authed_request(request))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_stores_key_rotates_token_and_expires_closed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        let configure = || request.clone();
+        let mut invalid = configure();
+        invalid
+            .material
+            .insert("repository_ids".into(), "[]".into());
+        assert_eq!(
+            handle_configure_provider_refresh(&state, authed_request(invalid))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        handle_configure_provider_refresh(&state, authed_request(configure()))
+            .await
+            .unwrap();
+        let initial = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!initial.material.contains_key("private_key"));
+        assert!(initial.secret_material_handles.contains_key("private_key"));
+
+        for token in ["installation-token-first", "installation-token-second"] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/app/installations/123/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": token,
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let rotated = crate::provider_refresh::refresh_provider_credential(
+                state.store.as_ref(),
+                "default",
+                &state.credentials,
+                None,
+                "github-app-test",
+                "GITHUB_TOKEN",
+            )
+            .await
+            .unwrap();
+            assert_eq!(rotated.authorization_epoch, initial.authorization_epoch);
+            assert!(rotated.next_refresh_at_ms < rotated.expires_at_ms);
+            let stored = state
+                .store
+                .get_message_by_name::<Provider>("default", "github-app-test")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.credentials.is_empty());
+            assert_eq!(stored.credential_handles.len(), 1);
+            let resolved = state
+                .credentials
+                .resolve_provider_handles(&stored, crate::persistence::current_time_ms())
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved.values.get("GITHUB_TOKEN").map(String::as_str),
+                Some(token)
+            );
+            let expired = state
+                .credentials
+                .resolve_provider_handles(&stored, rotated.expires_at_ms + 1)
+                .await
+                .unwrap();
+            assert!(expired.values.is_empty());
+        }
+        // Replacing a valid signing key starts a new authorization epoch and
+        // stores new secret material; no old key should be reused for the mint.
+        let new_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let mut invalid = configure();
+        invalid
+            .material
+            .insert("private_key".into(), new_key.public_key_pem());
+        let error = handle_configure_provider_refresh(&state, authed_request(invalid))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        let preserved = state
+            .refresh
+            .get("default", provider.object_id(), "GITHUB_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.authorization_epoch, initial.authorization_epoch);
+        assert_eq!(
+            preserved.secret_material_handles,
+            initial.secret_material_handles
+        );
+        let mut replacement = configure();
+        replacement
+            .material
+            .insert("private_key".into(), new_key.serialize_pem().unwrap());
+        handle_configure_provider_refresh(&state, authed_request(replacement))
+            .await
+            .unwrap();
+        let updated = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(updated.authorization_epoch, initial.authorization_epoch);
+        assert_ne!(
+            updated.secret_material_handles,
+            initial.secret_material_handles
+        );
+        assert!(!updated.material.contains_key("private_key"));
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("secret echoed by issuer"))
+            .mount(&server)
+            .await;
+        assert!(
+            crate::provider_refresh::refresh_provider_credential(
+                state.store.as_ref(),
+                "default",
+                &state.credentials,
+                None,
+                "github-app-test",
+                "GITHUB_TOKEN"
+            )
+            .await
+            .is_err()
+        );
+        let failed = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(failed.failure_code, "github_app_authentication_failed");
+        assert!(!failed.last_error.contains("secret echoed"));
+        let public = new_key.public_key_pem();
+        let requests = server.received_requests().await.unwrap();
+        let jwt = requests[0].headers["authorization"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .unwrap();
+        jsonwebtoken::decode::<serde_json::Value>(
+            jwt,
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
+        )
+        .unwrap();
     }
 
     #[tokio::test]

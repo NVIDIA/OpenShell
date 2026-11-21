@@ -67,6 +67,7 @@ pub mod settings;
 pub mod shell;
 pub mod telemetry;
 pub mod time;
+pub mod token_endpoint;
 pub mod token_grant_failure;
 pub mod transport_errors;
 pub mod upload;

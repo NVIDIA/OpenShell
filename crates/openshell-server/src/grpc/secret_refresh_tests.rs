@@ -256,7 +256,7 @@ async fn refresh_uses_the_current_secret_value_and_survives_inlining() {
     mount_token(&server, "first-secret", "token-1").await;
     mount_token(&server, "second-secret", "token-2").await;
 
-    let state = enabled_state().await;
+    let mut state = enabled_state().await;
     import_profile(
         &state,
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
@@ -284,6 +284,13 @@ async fn refresh_uses_the_current_secret_value_and_survives_inlining() {
     assert!(!stored.secret_material_handles.contains_key("client_secret"));
     assert!(!stored.material.contains_key("client_secret"));
 
+    // A source with no usable snapshot must not block exact-key grant management.
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Arc::get_mut(&mut state).unwrap().provider_profile_sources =
+        crate::provider_profile_sources::ProviderProfileSources::from_test_snapshot_sequence(
+            vec![("offline".into(), vec![])],
+            fetches.clone(),
+        );
     rotate(&state).await.expect("mint with the first value");
 
     // Rotating the shared secret reaches the provider's next mint.
@@ -361,6 +368,18 @@ async fn refresh_uses_the_current_secret_value_and_survives_inlining() {
     .unwrap()
     .into_inner();
     assert!(status.credentials[0].material_secrets.is_empty());
+    super::provider::handle_delete_provider_refresh(
+        &state,
+        authed_request(openshell_core::proto::DeleteProviderRefreshRequest {
+            workspace_scope: Some(default_workspace()),
+            provider: PROVIDER.into(),
+            credential_key: KEY.into(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

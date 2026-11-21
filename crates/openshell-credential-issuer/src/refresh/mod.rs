@@ -46,11 +46,19 @@ pub struct RefreshState {
     pub additional_output_keys: HashMap<String, String>,
     pub authorization_epoch: String,
     pub secret_material_handles: Handles,
+    pub first_mint_provider_version: u64,
+    pub retired_output_handles: Vec<openshell_core::proto::CredentialHandle>,
     pub pending_secret_deletions: Vec<RefreshMaterialDeletion>,
     pub recovery_action: i32,
     pub failure_code: String,
     pub provider_error_subtype: String,
     pub last_error_at_ms: i64,
+}
+
+impl RefreshState {
+    fn has_pending_deletions(&self) -> bool {
+        !self.pending_secret_deletions.is_empty() || !self.retired_output_handles.is_empty()
+    }
 }
 
 impl std::fmt::Debug for RefreshState {
@@ -112,6 +120,14 @@ pub trait RefreshStateStore: std::fmt::Debug + Send + Sync {
     async fn list(&self, provider_id: Option<&str>) -> Result<Vec<RefreshState>, Status>;
     async fn create(&self, state: &RefreshState) -> Result<(), Status>;
     async fn replace(&self, state: &RefreshState, version: u64) -> Result<Option<u64>, Status>;
+    /// Change the grant epoch and retire the previous output in the same transaction.
+    async fn replace_configuration(
+        &self,
+        state: &mut RefreshState,
+        version: u64,
+    ) -> Result<Option<u64>, Status> {
+        self.replace(state, version).await
+    }
     async fn delete(&self, id: &str, version: u64) -> Result<(), Status>;
     async fn acquire(&self, provider_id: &str, key: &str) -> Result<Box<dyn RefreshLease>, Status>;
     /// The current handle and endpoint constraint of a live workspace secret,
@@ -129,10 +145,19 @@ pub trait RefreshStateStore: std::fmt::Debug + Send + Sync {
 /// No Debug: inline outputs are secret. Expiration covers exactly the minted keys.
 pub struct RefreshOutputs<'a> {
     pub credential_key: &'a str,
+    /// Epoch and claimed row version of the grant publishing these outputs.
+    pub grant: Option<(&'a str, u64)>,
     pub additional_keys: Vec<String>,
     pub handles: Option<&'a Handles>,
     pub inline: &'a HashMap<String, String>,
     pub expiration: Option<prost_types::Timestamp>,
+}
+
+pub struct CommittedRefreshOutputs {
+    pub replaced: Handles,
+    pub provider_version: u64,
+    /// Grant revision if the provider write also recorded its first mint.
+    pub grant_version: Option<u64>,
 }
 
 /// Snapshot-bound provider integration. The implementation owns its observed
@@ -143,7 +168,7 @@ pub trait RefreshAttempt: Send + Sync {
     async fn prepare_workspace(&self) -> Result<(), Status>;
     /// A successful result means outputs are live. Cleanup errors are not commit
     /// failures. Return only handles replaced in the winning provider CAS.
-    async fn commit(&self, outputs: RefreshOutputs<'_>) -> Result<Handles, Status>;
+    async fn commit(&self, outputs: RefreshOutputs<'_>) -> Result<CommittedRefreshOutputs, Status>;
 }
 
 /// Temporary embedded compatibility port; stable references must remove it
