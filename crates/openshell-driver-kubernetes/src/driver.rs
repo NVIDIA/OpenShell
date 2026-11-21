@@ -38,6 +38,7 @@ use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
     NetworkPolicySpec,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{
@@ -612,6 +613,21 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+fn pod_requests_gpu(pod: &Pod) -> bool {
+    let nonzero = |resources: &Option<BTreeMap<String, Quantity>>| {
+        resources
+            .as_ref()
+            .and_then(|resources| resources.get(GPU_RESOURCE_NAME))
+            .is_some_and(|quantity| quantity.0.trim().parse::<u64>().is_ok_and(|n| n > 0))
+    };
+    pod.spec
+        .iter()
+        .flat_map(|spec| &spec.containers)
+        .filter(|container| container.name == "agent")
+        .filter_map(|container| container.resources.as_ref())
+        .any(|resources| nonzero(&resources.limits) || nonzero(&resources.requests))
+}
+
 fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     use std::fmt::Write as _;
 
@@ -3944,6 +3960,7 @@ impl KubernetesComputeDriver {
             host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
             workload_identity,
             child_env,
+            gpu_requested: pod_requests_gpu(&workload_pod),
         }
         .provision()
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
@@ -9134,6 +9151,36 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_requests_gpu_reads_the_agent_container_only() {
+        let pod = |containers: serde_json::Value| -> Pod {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "pod"},
+                "spec": {"containers": containers},
+            }))
+            .unwrap()
+        };
+        let gpu = |name: &str, field: &str, quantity: &str| serde_json::json!({"name": name, "resources": {field: {GPU_RESOURCE_NAME: quantity}}});
+
+        assert!(pod_requests_gpu(&pod(serde_json::json!([gpu(
+            "agent", "limits", "1"
+        )]))));
+        assert!(pod_requests_gpu(&pod(serde_json::json!([gpu(
+            "agent", "requests", "2"
+        )]))));
+        assert!(!pod_requests_gpu(&pod(serde_json::json!([gpu(
+            "agent", "limits", "0"
+        )]))));
+        assert!(!pod_requests_gpu(&pod(serde_json::json!([gpu(
+            "sidecar", "limits", "1"
+        )]))));
+        assert!(!pod_requests_gpu(&pod(
+            serde_json::json!([{"name": "agent"}])
+        )));
+    }
 
     /// Serve Pod GETs over one reusable HTTP/1 connection per client,
     /// delaying a request for Pod `slow-<millis>` by that many milliseconds.
