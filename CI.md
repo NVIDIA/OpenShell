@@ -21,13 +21,18 @@ environment variable expected by the existing checks and Cachix. The custom
 image preloads Nix shells and configures the signed Cachix substituter globally;
 setup verifies that cache and skips duplicate user-level cache configuration.
 Rust jobs use the shared memcached sccache backend and report cache statistics;
-the existing GitHub Rust target/registry cache remains enabled. The x86 GKE
-lint and test jobs trial separate `gke-rust-*-artifacts-v1` cache namespaces,
-retain workspace crates in the root target directory. Independent-workspace
-targets continue using sccache without expanding the artifact cache trial.
-Compare a populating run with a same-commit rerun, including restore/save time:
-checkout timestamps and build-script invalidation can still trigger rebuilds.
-These trial caches are PR-scoped until compatible caches are seeded on `main`. Inspect the job's
+the standard runner jobs retain the existing GitHub Rust target/registry cache.
+The x86 lint/test jobs instead use `openshell-ci-amd64-pd-lint` and
+`openshell-ci-amd64-pd-test`. Each trial scale set has one worker and an exclusive
+200 GiB SSD persistent disk, mounted at `/mnt/ci-cache`. Setup verifies the mount
+and selects a repository/Nix-shell-specific target directory shared by that
+job's Cargo commands. It skips GitHub Cargo cache restore/save entirely.
+Check the initial target size and runner pod name to distinguish an empty-disk
+run from a warm run on a replacement pod. Checkout and credentials remain
+ephemeral; only Cargo build outputs persist. Cargo still validates artifacts,
+and fresh checkout timestamps can trigger workspace rebuilds. These two lanes
+serialize concurrent jobs during the trial; the ordinary scale set stays 5–20.
+Inspect the job's
 runner name to confirm whether it ran on GKE. ARM, macOS, and fork jobs do not
 use the cluster-local cache endpoint.
 

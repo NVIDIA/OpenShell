@@ -45,7 +45,27 @@ runs:
         shell_drv=$(nix eval --raw --impure .#devShells --apply 'shells: shells.${builtins.currentSystem}.default.drvPath')
         echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
 
+    - name: Configure persistent Cargo target directory
+      if: ${{ env.OPENSHELL_PERSISTENT_CACHE != '' }}
+      shell: bash
+      env:
+        NIX_SHELL_HASH: ${{ steps.dev-shell.outputs.hash }}
+      run: |
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = ai-openshell/openshell
+        test "$OPENSHELL_PERSISTENT_CACHE" = /mnt/ci-cache
+        mountpoint -q "$OPENSHELL_PERSISTENT_CACHE"
+        cache_root="$OPENSHELL_PERSISTENT_CACHE/ai-openshell-openshell/$NIX_SHELL_HASH"
+        mkdir -p "$cache_root/target"
+        echo "CARGO_TARGET_DIR=$cache_root/target" >> "$GITHUB_ENV"
+        echo "Persistent cache lane: $OPENSHELL_CACHE_LANE"
+        echo "Runner pod: $RUNNER_NAME"
+        echo "Target directory: $cache_root/target"
+        du -sh "$cache_root/target"
+        df -h "$cache_root/target"
+
     - name: Cache Rust target and registry
+      if: ${{ env.OPENSHELL_PERSISTENT_CACHE == '' }}
       id: cache
       uses: Swatinem/rust-cache@6a7bc3ebce750e0a16a430dd57485acfdb38b05f
       with:

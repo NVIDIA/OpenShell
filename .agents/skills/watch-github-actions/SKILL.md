@@ -143,10 +143,13 @@ For a preloaded image, `setup-nix` verifies its global Cachix substituter and
 skips adding it again. A cache-configuration permission failure indicates the
 image/setup contract is out of sync. Rust jobs report shared memcached
 sccache statistics; distinguish backend connectivity errors from compiler/test
-failures. The x86 GKE lint/test jobs also trial separate full Cargo artifact
-caches. Confirm the restored key and cache size in setup-rust, and include the
-post-job save time when comparing cold and warm runs. A hit does not guarantee
-Cargo will reuse every artifact. See `CI.md` for the trial scope and cache setup.
+failures. The x86 GKE lint/test jobs use single-worker `openshell-ci-amd64-pd-*`
+scale sets with separate exclusive persistent disks. Setup reports the target
+size before building and skips GitHub Cargo cache restore/save. Compare empty
+and warm runs on different runner pods; a PVC surviving pod replacement is the
+persistence check. `Pending` pods can be waiting for exclusive disk attachment;
+inspect PVC/PV events before treating this as a runner registration failure.
+See `CI.md` for trial scope and cache setup.
 
 ## View Job Logs
 

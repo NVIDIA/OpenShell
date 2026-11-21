@@ -294,7 +294,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64-pd-lint' || 'ubuntu-24.04' }}
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -312,10 +312,8 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          # Trial full artifacts only on GKE; retain hosted cache behavior.
-          cache-key: ${{ matrix.runner == 'openshell-ci-amd64' && 'gke-rust-lint-artifacts-v1' || 'rust-checks-v2' }}
-          save-cache: ${{ matrix.runner == 'openshell-ci-amd64' && 'true' || 'false' }}
-          cache-workspace-crates: ${{ matrix.runner == 'openshell-ci-amd64' && 'true' || 'false' }}
+          cache-key: rust-checks-v2
+          save-cache: "false"
 
       - name: Lint
         shell: nix develop -c bash -euo pipefail {0}
@@ -344,7 +342,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64' || 'ubuntu-24.04' }}
+          - runner: ${{ github.repository == 'ai-openshell/openshell' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'openshell-ci-amd64-pd-test' || 'ubuntu-24.04' }}
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
@@ -362,10 +360,8 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          # Trial full artifacts only on GKE; retain hosted cache behavior.
-          cache-key: ${{ matrix.runner == 'openshell-ci-amd64' && 'gke-rust-test-artifacts-v1' || 'rust-checks-v2' }}
+          cache-key: rust-checks-v2
           save-cache: "true"
-          cache-workspace-crates: ${{ matrix.runner == 'openshell-ci-amd64' && 'true' || 'false' }}
 
       - name: Verify crypto backend independence
         shell: nix develop -c bash -euo pipefail {0}
