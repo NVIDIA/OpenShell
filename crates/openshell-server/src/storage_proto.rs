@@ -233,7 +233,7 @@ mod tests {
     // ProgramStatus condition reuses SandboxCondition, so durable schemas
     // remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "5c3caa7db32e5feef6526bcfd6004d5f5aedffc50c7810a0c9df749e1adc6501";
+        "b05c436c6d9133d948bfe8120a2ba1434f1e8603e28bc69eaba3d3fbedff2702";
     const DURABLE_SCHEMA_SHA256: &str =
         "9a025fc84af7c71bce42a52a282d1a96a02f8d71319478bcdb0e0c6367305888";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

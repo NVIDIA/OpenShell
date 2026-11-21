@@ -837,9 +837,10 @@ async fn run_single_session(
                 if let Some(gateway_message::Payload::WorkloadActivityRequest(request)) = &msg.payload {
                     // Answer before an idle stop so it sees current input and work.
                     if let Some(activity) = &config.workload_activity {
-                        tx.send(crate::program_status::activity_reply(activity, &request.request_id))
+                        activity
+                            .send_report(&tx, &request.request_id)
                             .await
-                            .map_err(|_| "outbound channel closed")?;
+                            .map_err(|()| "outbound channel closed")?;
                     }
                     continue;
                 }

@@ -29,6 +29,10 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// the timeout before asking the supervisor to confirm, which avoids
 /// confirmation requests that pushed input would have answered anyway.
 pub const INPUT_REPORT_LAG: Duration = Duration::from_secs(15);
+/// A confirmation authorizes the `Stopping` write only this long after its
+/// reply arrived. A stop that cannot commit by then, such as one waiting on
+/// the lifecycle lock, is abandoned and confirmed again on a later sweep.
+pub const CONFIRM_FRESHNESS: Duration = Duration::from_secs(2);
 /// How long an idle stop waits for the supervisor to confirm. No answer, as
 /// from a replaced or dead session, cancels the stop.
 #[cfg(not(test))]
@@ -101,6 +105,20 @@ pub struct LiveActivity {
     pub state: WorkloadProgramState,
     /// The later of the state change and the latest client input.
     pub since: SystemTime,
+    /// The supervisor's summary sequence; older summaries are dropped.
+    pub sequence: u64,
+    /// The report itself and when it arrived, for the display condition.
+    pub report: SupervisorWorkloadActivity,
+    pub received: SystemTime,
+}
+
+impl LiveActivity {
+    /// Whether `report` from `session_id` is older than this one. A new
+    /// session always replaces the entry.
+    #[must_use]
+    pub fn is_newer_than(&self, session_id: &str, report: &SupervisorWorkloadActivity) -> bool {
+        self.session_id == session_id && report.sequence != 0 && report.sequence < self.sequence
+    }
 }
 
 /// Live activity for a report received at `now` on `session_id`.
@@ -121,6 +139,9 @@ pub fn live_from_report(
         state: WorkloadProgramState::try_from(report.state)
             .unwrap_or(WorkloadProgramState::Unspecified),
         since,
+        sequence: report.sequence,
+        report: report.clone(),
+        received: now,
     }
 }
 
@@ -296,6 +317,7 @@ mod tests {
             input_age: input_age.map(proto_secs),
             reporting_terminals: 1,
             request_id: String::new(),
+            sequence: 0,
         }
     }
 

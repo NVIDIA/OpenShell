@@ -572,6 +572,9 @@ impl Inner {
 pub struct ProgramActivity {
     inner: Mutex<Inner>,
     changes: watch::Sender<ActivitySummary>,
+    /// Held from snapshot to enqueue, so pushes and request replies leave in
+    /// snapshot order and carry increasing sequence numbers.
+    report_order: tokio::sync::Mutex<u64>,
 }
 
 impl ProgramActivity {
@@ -587,6 +590,7 @@ impl ProgramActivity {
                 revision: 0,
             }),
             changes,
+            report_order: tokio::sync::Mutex::new(0),
         })
     }
 
@@ -886,19 +890,36 @@ pub fn activity_report(
         reporting_terminals: u32::try_from(snapshot.summary.reporting_terminals)
             .unwrap_or(u32::MAX),
         request_id: String::new(),
+        sequence: 0,
     }
 }
 
-/// The answer to a gateway's activity request: the current summary.
-#[must_use]
-pub fn activity_reply(
-    activity: &ProgramActivity,
-    request_id: &str,
-) -> openshell_core::proto::SupervisorMessage {
-    let mut report = activity_report(&activity.snapshot());
-    report.request_id = request_id.to_string();
-    openshell_core::proto::SupervisorMessage {
-        payload: Some(openshell_core::proto::supervisor_message::Payload::WorkloadActivity(report)),
+impl ProgramActivity {
+    /// Snapshot the summary and enqueue it on `tx` as one ordered step.
+    /// `request_id` is set when the summary answers a gateway request.
+    /// Returns the snapshot that was sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session's outbound channel has closed.
+    pub async fn send_report(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<openshell_core::proto::SupervisorMessage>,
+        request_id: &str,
+    ) -> Result<ActivitySnapshot, ()> {
+        let mut sequence = self.report_order.lock().await;
+        *sequence += 1;
+        let snapshot = self.snapshot();
+        let mut report = activity_report(&snapshot);
+        report.request_id = request_id.to_string();
+        report.sequence = *sequence;
+        let message = openshell_core::proto::SupervisorMessage {
+            payload: Some(
+                openshell_core::proto::supervisor_message::Payload::WorkloadActivity(report),
+            ),
+        };
+        tx.send(message).await.map_err(|_| ())?;
+        Ok(snapshot)
     }
 }
 
@@ -917,7 +938,6 @@ pub fn spawn_activity_reporter(
     activity: &Arc<ProgramActivity>,
     tx: tokio::sync::mpsc::Sender<openshell_core::proto::SupervisorMessage>,
 ) -> ReporterGuard {
-    use openshell_core::proto::{SupervisorMessage, supervisor_message::Payload};
     let activity = Arc::clone(activity);
     let mut changes = activity.subscribe();
     ReporterGuard(tokio::spawn(async move {
@@ -931,14 +951,11 @@ pub fn spawn_activity_reporter(
             let input_advanced = snapshot.last_input != reported_input
                 && last_send.is_none_or(|sent| sent.elapsed() >= INPUT_REPORT_INTERVAL);
             if send_now || input_advanced {
-                reported_input = snapshot.last_input;
-                last_send = Some(Instant::now());
-                let message = SupervisorMessage {
-                    payload: Some(Payload::WorkloadActivity(activity_report(&snapshot))),
-                };
-                if tx.send(message).await.is_err() {
+                let Ok(sent) = activity.send_report(&tx, "").await else {
                     return;
-                }
+                };
+                reported_input = sent.last_input;
+                last_send = Some(Instant::now());
             }
             tokio::select! {
                 result = changes.changed() => {
@@ -1248,16 +1265,72 @@ mod tests {
         assert_eq!(*changes.borrow_and_update(), activity.snapshot().summary);
     }
 
-    #[test]
-    fn activity_reply_carries_the_request_id() {
-        let activity = ProgramActivity::new();
-        let message = activity_reply(&activity, "req-1");
+    fn received(
+        message: openshell_core::proto::SupervisorMessage,
+    ) -> openshell_core::proto::SupervisorWorkloadActivity {
         let Some(openshell_core::proto::supervisor_message::Payload::WorkloadActivity(report)) =
             message.payload
         else {
             panic!("expected workload activity");
         };
-        assert_eq!(report.request_id, "req-1");
+        report
+    }
+
+    #[tokio::test]
+    async fn replies_carry_the_request_id_and_every_summary_a_new_sequence() {
+        let activity = ProgramActivity::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        activity.send_report(&tx, "req-1").await.unwrap();
+        activity.send_report(&tx, "").await.unwrap();
+        let reply = received(rx.recv().await.unwrap());
+        let push = received(rx.recv().await.unwrap());
+        assert_eq!(reply.request_id, "req-1");
+        assert!(push.request_id.is_empty());
+        assert!(push.sequence > reply.sequence);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replies_and_pushes_leave_in_snapshot_order() {
+        let activity = ProgramActivity::new();
+        let mut tap = activity.register(|_| {});
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let mut senders = Vec::new();
+        for index in 0..32 {
+            let activity = Arc::clone(&activity);
+            let tx = tx.clone();
+            senders.push(tokio::spawn(async move {
+                let request = if index % 2 == 0 { "req" } else { "" };
+                activity.send_report(&tx, request).await.unwrap();
+            }));
+            let report: &[u8] = if index % 2 == 0 {
+                b"\x1b]7501;state=working\x07"
+            } else {
+                b"\x1b]7501;state=done\x07"
+            };
+            tap.output(report);
+        }
+        for sender in senders {
+            sender.await.unwrap();
+        }
+        activity.send_report(&tx, "").await.unwrap();
+        drop(tx);
+        let mut last = 0;
+        let mut final_state = 0;
+        while let Some(message) = rx.recv().await {
+            let report = received(message);
+            assert!(
+                report.sequence > last,
+                "sequence {} after {last}",
+                report.sequence
+            );
+            last = report.sequence;
+            final_state = report.state;
+        }
+        assert_eq!(
+            final_state,
+            i32::from(openshell_core::proto::WorkloadProgramState::Done),
+            "the newest summary is the last one sent"
+        );
     }
 
     #[test]

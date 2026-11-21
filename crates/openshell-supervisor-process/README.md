@@ -27,7 +27,10 @@ the last keystroke before typing stops. It also answers each
 `WorkloadActivityRequest` with the current summary, which the gateway requires
 before an idle stop. Every transition, including one undone within the same
 read, restarts the state timer and advances a revision. Summaries are published
-under the activity lock, so concurrent terminals never republish an older one. Ages are relative, so supervisor and gateway clocks need
+under the activity lock, so concurrent terminals never republish an older one.
+Pushes and request replies take one ordering lock from snapshot to enqueue and
+carry increasing sequence numbers, so the gateway can drop an older summary that
+arrives late. Ages are relative, so supervisor and gateway clocks need
 not agree.
 
 ## Bounded streaming uploads

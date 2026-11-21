@@ -144,6 +144,7 @@ message SupervisorWorkloadActivity {
   google.protobuf.Duration input_age = 5;  // since last client input, if any
   uint32 reporting_terminals = 6;
   string request_id = 7;                   // set when answering a request
+  uint64 sequence = 8;                     // increases with every summary
 }
 
 message GatewayMessage {
@@ -223,20 +224,49 @@ new session reports, so a workload that resumed work during an outage is not
 stopped on a stale record. Each due sandbox goes through the existing stop path
 on its own task, with an idle cause.
 
-Under the lifecycle lock, admission does four things:
+Before taking any lifecycle lock, the stop task:
 
-1. Requires the shared owner record to still name the session, which covers a
-   former owner after an HA handoff.
-2. Re-reads the setting.
-3. Sends a `WorkloadActivityRequest` and waits up to 5 seconds for the reply. No
-   reply, as from a dead or replaced stream, cancels the stop.
-4. Holds an activity gate, which every live report update also takes, through
-   the final check and the `Stopping` write. A report the gateway received
-   before the write, such as `Working`, always counts.
+1. requires a fresh shared owner record naming the session;
+2. sends a `WorkloadActivityRequest`;
+3. waits up to 5 seconds for the reply.
 
-New input, a new turn, or a timeout that was disabled or extended keeps the
-sandbox running. Only input that arrives after the `Stopping` write is lost,
-which is inherent to stopping.
+No reply, as from a dead or replaced stream, cancels the stop. Keeping the round
+trip outside the lock lets the session keep reading messages throughout. The
+gateway also persists the display condition on a background task, never on the
+message path.
+
+Under the lifecycle lock, each `Stopping` write attempt runs a final check. It
+requires:
+
+- a confirmation at most 2 seconds old;
+- the re-read setting;
+- a still-due live report from the confirming session;
+- a fresh owner record that still names that session.
+
+The check holds the sandbox's activity gate through the write. Every live report
+update takes the same gate, so a report the gateway received before the write,
+such as `Working`, always counts. A conflicting write releases the gate and
+checks again.
+
+Every summary carries an increasing sequence number. The supervisor takes one
+lock from snapshot to enqueue for both pushes and replies. The gateway drops an
+older summary from the same session, so a late reply cannot overwrite a newer
+push.
+
+The stop boundary is therefore:
+
+- **Always counted:** everything the supervisor observed before it answered the
+  confirmation, and every report the gateway receives before the `Stopping`
+  write.
+- **Can race the stop:** input or a new turn between the supervisor's snapshot
+  and the gateway's write. That window is at most one network round trip plus
+  the 2-second confirmation freshness window.
+
+Closing that window would require the supervisor to hold input while the
+gateway commits, which this RFC does not propose. A takeover by another replica
+in the same window is bounded the same way. The new owner publishes ownership
+before it updates the sandbox record, so the final owner check can miss a
+takeover only within that window.
 
 The idle request writes the internal annotation `internal.openshell.ai/idle-stop`
 with the reason `IdleStopping`. The annotation survives gateway recovery and
@@ -339,6 +369,11 @@ sets a gateway value or a user opts in per sandbox.
   on storage that survives stop: the Docker writable layer or workspace volume,
   the Kubernetes PVC, the VM overlay. Agents restarted with their plain command
   start a fresh conversation unless the user runs their resume flag.
+- **Residual stop race.** Input or a new turn between the supervisor's
+  confirmation snapshot and the `Stopping` write can still lose the sandbox.
+  The window is at most one round trip plus 2 seconds, and only for a sandbox
+  that already waited past its timeout. Closing it fully would need the
+  supervisor to hold input during the commit.
 - **Store churn.** Display writes bump the resource version that the
   reconcile sweep compares. The one-minute input threshold and
   transition-only state writes limit this. An active agent still writes twice

@@ -184,16 +184,29 @@ candidate when it is Ready, its program is idle, done, blocked, or in error, and
 input report lag has elapsed. The lag runs from the later of the report's time
 and the main-process start.
 
-Under the lifecycle lock, admission checks four things before stopping:
+Before taking any lifecycle lock, the stop task does three things:
 
-1. The shared owner record must still name the session.
-2. The setting is re-read.
-3. The supervisor must answer a `WorkloadActivityRequest` with a fresh report
-   within 5 seconds. Supervisors that do not advertise
-   `supports_workload_activity_requests` are never idle-stopped.
-4. The activity gate, which every live report update also takes, is held
-   through the final check and the `Stopping` write. A report received first
-   always counts.
+1. Requires a fresh shared owner record naming the session.
+2. Sends a `WorkloadActivityRequest`.
+3. Waits up to 5 seconds for a fresh report.
+
+Supervisors that do not advertise `supports_workload_activity_requests` are
+never idle-stopped. Under the lifecycle lock, each `Stopping` write attempt then
+runs a final check. It requires:
+
+- a confirmation at most 2 seconds old;
+- the re-read setting;
+- a still-due live report from the confirming session;
+- a fresh owner record that still names that session.
+
+The final check holds that sandbox's activity gate through the write. Every live
+report update takes the same gate, so a report received first always counts. A
+conflicting write releases the gate and checks again.
+
+Live reports carry the supervisor's summary sequence, and an older summary from
+the same session is dropped. The display condition is persisted on a
+background task, so the session never waits on the sandbox lock to read its
+next message.
 
 The stop records the `internal.openshell.ai/idle-stop` annotation with
 `IdleStopping`. That marker survives gateway recovery and settles the stop as

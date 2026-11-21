@@ -3483,6 +3483,9 @@ message SupervisorWorkloadActivity {
   uint32 reporting_terminals = 6;
   // Set when this summary answers a WorkloadActivityRequest.
   string request_id = 7;
+  // Increases with every summary the supervisor sends, pushes and replies
+  // alike. The gateway drops a summary older than the one it holds.
+  uint64 sequence = 8;
 }
 
 // Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
