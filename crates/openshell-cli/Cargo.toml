@@ -95,6 +95,7 @@ futures = { workspace = true }
 openshell-server = { path = "../openshell-server", features = ["test-support"] }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
+russh = "0.65.0"
 serde_json = { workspace = true }
 temp-env = "0.3"
 tokio-stream = { workspace = true }

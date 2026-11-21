@@ -21,6 +21,9 @@ use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
+use openshell_core::ssh_host_key::{
+    HostKeyCheck, HostKeyExpectation, KnownHostsPin, permit_unverified,
+};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -680,10 +683,12 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>`
+    ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>
+    ///   --host-key <fingerprint> --known-hosts <file>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
+    ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>
+    ///   --known-hosts <file>`
     #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
@@ -710,6 +715,17 @@ enum Commands {
         /// Sandbox name. Used in name mode.
         #[arg(long)]
         name: Option<String>,
+
+        /// SSH host key the sandbox must present: the fingerprint the gateway
+        /// published, or `unverified`. Token mode only; name mode asks the
+        /// gateway instead.
+        #[arg(long, requires = "known_hosts", conflicts_with = "name")]
+        host_key: Option<HostKeyExpectation>,
+
+        /// Known-hosts file in which the verified host key is pinned for `ssh`.
+        /// Without it the host key is not verified.
+        #[arg(long)]
+        known_hosts: Option<PathBuf>,
     },
 }
 
@@ -3864,7 +3880,7 @@ async fn run_async() -> Result<()> {
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::print_ssh_config(&ctx.name, &name, &cli.workspace);
+                            run::print_ssh_config(&ctx.name, &name, &cli.workspace)?;
                         }
                         SandboxCommands::Provider(command) => match command {
                             SandboxProviderCommands::List {
@@ -4335,10 +4351,35 @@ async fn run_async() -> Result<()> {
             server,
             gateway_name,
             name,
+            host_key,
+            known_hosts,
         }) => {
             match (gateway, sandbox, token, server, gateway_name, name) {
                 // Token mode (existing behavior): pre-created session credentials.
                 (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
+                    let host_key = match (host_key, known_hosts) {
+                        (Some(expectation), Some(known_hosts)) => Some(
+                            KnownHostsPin::at(known_hosts, &sandbox, &cli.workspace)
+                                .and_then(|pin| HostKeyCheck::for_relay(expectation, pin))
+                                .map_err(|err| miette::miette!("{err}"))?,
+                        ),
+                        // An older client starts the proxy this way, and its `ssh`
+                        // accepts any host key.
+                        (None, None) => {
+                            eprintln!(
+                                "openshell: warning: ssh-proxy was started without --host-key and --known-hosts, so the SSH host key is NOT verified.\n\
+                                 If an OpenShell client that predates host-key verification started it, restart that client (the openshell command or openshell term)."
+                            );
+                            permit_unverified().map_err(|err| miette::miette!("{err}"))?;
+                            None
+                        }
+                        // Nothing would pin a key for the `ssh` that reads the file.
+                        _ => {
+                            return Err(miette::miette!(
+                                "--known-hosts requires --host-key when --token is given"
+                            ));
+                        }
+                    };
                     let mut effective_tls = match gateway_name_opt {
                         Some(ref g) => tls.with_gateway_name(g),
                         None => tls,
@@ -4346,8 +4387,15 @@ async fn run_async() -> Result<()> {
                     if let Some(ref g) = gateway_name_opt {
                         apply_auth(&mut effective_tls, g)?;
                     }
-                    run::sandbox_ssh_proxy(&gw, &sandbox, &cli.workspace, &tok, &effective_tls)
-                        .await?;
+                    run::sandbox_ssh_proxy(
+                        &gw,
+                        &sandbox,
+                        &cli.workspace,
+                        &tok,
+                        &effective_tls,
+                        host_key,
+                    )
+                    .await?;
                 }
                 // Name mode with --gateway-name: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(g), Some(n)) => {
@@ -4365,11 +4413,27 @@ async fn run_async() -> Result<()> {
                     };
                     let mut tls = tls.with_gateway_name(&g);
                     apply_auth(&mut tls, &g)?;
-                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
+                    run::sandbox_ssh_proxy_by_name(
+                        &endpoint,
+                        Some(&g),
+                        &n,
+                        &tls,
+                        &cli.workspace,
+                        known_hosts,
+                    )
+                    .await?;
                 }
                 // Legacy name mode with --server only (no --gateway-name).
                 (_, _, _, Some(srv), None, Some(n)) => {
-                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls, &cli.workspace).await?;
+                    run::sandbox_ssh_proxy_by_name(
+                        &srv,
+                        None,
+                        &n,
+                        &tls,
+                        &cli.workspace,
+                        known_hosts,
+                    )
+                    .await?;
                 }
                 _ => {
                     return Err(miette::miette!(
@@ -5379,6 +5443,10 @@ mod tests {
             "tok-abc",
             "--gateway-name",
             "my-gateway",
+            "--host-key",
+            "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA",
+            "--known-hosts",
+            "/home/u/.config/openshell/known_hosts/my-gateway/openshell-my-box.team-a",
         ])
         .expect("TUI proxy command flags must be accepted by the CLI");
         assert_eq!(cli.workspace, "team-a");

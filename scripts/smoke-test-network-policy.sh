@@ -178,8 +178,6 @@ sandbox_exec() {
     echo "$ssh_config" > "$ssh_config_file"
 
     ssh -F "$ssh_config_file" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR \
         -o ConnectTimeout=15 \
         "$ssh_host" "$@" 2>&1

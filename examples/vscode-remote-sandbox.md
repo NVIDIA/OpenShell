@@ -37,19 +37,7 @@ managed SSH config include file.
 
 ### 3. Optional manual workflow
 
-If you want to inspect the generated SSH stanza directly:
-
-```text
-Host openshell-my-sandbox.default
-    User sandbox
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-    GlobalKnownHostsFile /dev/null
-    LogLevel ERROR
-    ProxyCommand openshell ssh-proxy --gateway <gateway-name> --name my-sandbox
-```
-
-You can still print it manually with:
+To inspect the generated SSH stanza, print it with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox
