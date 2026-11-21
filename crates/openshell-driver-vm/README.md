@@ -337,6 +337,17 @@ driver with the Hypervisor entitlement in `post_install` and owns the `brew
 services` gateway lifecycle. The service also leaves `OPENSHELL_DRIVERS` unset
 so driver choice remains automatic unless the user explicitly overrides it.
 
+For organization-signed macOS packages, `OPENSHELL_VM_RUNTIME_DIR` selects a
+separately signed runtime instead of extracting the embedded libraries. The
+driver resolves both dylibs to canonical absolute paths inside that directory
+and passes the firmware path to libkrun before creating a VM context. This
+avoids `DYLD_*` loader variables and process-wide working-directory changes.
+The runtime must be built with the `krun_set_fw_path` entry point added by
+`build-libkrun-macos.sh`; older runtime archives lack it and are rejected.
+The directory must contain `libkrun.dylib` and `libkrunfw.5.dylib` from
+the matching VM runtime build. Keep it writable only by administrators. See
+the [macOS re-signing recipe](../../docs/how-it-works/sandboxes/runtimes.mdx#re-sign-the-macos-vm-driver).
+
 ## TODOs
 
 - The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` note in `crates/openshell-gateway/src/vm.rs`.

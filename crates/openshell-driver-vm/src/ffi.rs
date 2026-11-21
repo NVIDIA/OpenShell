@@ -12,7 +12,11 @@ use std::sync::OnceLock;
 use libc::c_char;
 use libloading::Library;
 
+#[cfg(target_os = "macos")]
+use crate::runtime::external_runtime_selected;
 use crate::runtime::validate_runtime_dir;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt as _;
 
 pub const KRUN_LOG_TARGET_DEFAULT: i32 = -1;
 pub const KRUN_LOG_LEVEL_OFF: u32 = 0;
@@ -27,6 +31,8 @@ pub const KRUN_LOG_OPTION_NO_ENV: u32 = 1;
 type KrunInitLog =
     unsafe extern "C" fn(target_fd: i32, level: u32, style: u32, options: u32) -> i32;
 type KrunCreateCtx = unsafe extern "C" fn() -> i32;
+#[cfg(target_os = "macos")]
+type KrunSetFwPath = unsafe extern "C" fn(*const c_char) -> i32;
 type KrunFreeCtx = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunSetVmConfig = unsafe extern "C" fn(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
 type KrunAddDisk = unsafe extern "C" fn(
@@ -112,12 +118,38 @@ pub fn required_runtime_lib_name() -> &'static str {
 impl LibKrun {
     fn load(runtime_dir: &Path) -> Result<Self, String> {
         let libkrun_path = runtime_dir.join(required_runtime_lib_name());
-        preload_runtime_support_libraries(runtime_dir)?;
+        #[cfg(target_os = "macos")]
+        let (libkrun_path, firmware_path) = if external_runtime_selected() {
+            (
+                canonical_runtime_library(runtime_dir, required_runtime_lib_name())?,
+                Some(canonical_runtime_library(runtime_dir, "libkrunfw.5.dylib")?),
+            )
+        } else {
+            (libkrun_path, None)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let firmware_path: Option<PathBuf> = None;
+
+        preload_runtime_support_libraries(runtime_dir, firmware_path.as_deref())?;
 
         let library = Box::leak(Box::new(unsafe {
             Library::new(&libkrun_path)
                 .map_err(|e| format!("load libkrun from {}: {e}", libkrun_path.display()))?
         }));
+
+        #[cfg(target_os = "macos")]
+        if let Some(firmware_path) = &firmware_path {
+            let set_fw_path: KrunSetFwPath =
+                load_symbol(library, b"krun_set_fw_path\0", &libkrun_path).map_err(|e| {
+                    format!("{e}; rebuild the macOS VM runtime with absolute firmware path support")
+                })?;
+            let path = CString::new(firmware_path.as_os_str().as_bytes())
+                .map_err(|e| format!("invalid firmware path {}: {e}", firmware_path.display()))?;
+            let result = unsafe { set_fw_path(path.as_ptr()) };
+            if result < 0 {
+                return Err(format!("krun_set_fw_path failed with error code {result}"));
+            }
+        }
 
         Ok(Self {
             krun_init_log: load_symbol(library, b"krun_init_log\0", &libkrun_path)?,
@@ -150,31 +182,52 @@ impl LibKrun {
     }
 }
 
-fn preload_runtime_support_libraries(runtime_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let entries = std::fs::read_dir(runtime_dir)
-        .map_err(|e| format!("read {}: {e}", runtime_dir.display()))?;
+#[cfg(target_os = "macos")]
+fn canonical_runtime_library(runtime_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(runtime_dir)
+        .map_err(|e| format!("resolve runtime directory {}: {e}", runtime_dir.display()))?;
+    let path = std::fs::canonicalize(root.join(name))
+        .map_err(|e| format!("resolve runtime library {}: {e}", root.join(name).display()))?;
+    if !path.starts_with(&root) || !path.is_file() {
+        return Err(format!(
+            "runtime library must be a file inside {}",
+            root.display()
+        ));
+    }
+    Ok(path)
+}
 
-    let mut support_libs: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    #[cfg(target_os = "macos")]
-                    {
-                        name.starts_with("libkrunfw")
-                            && Path::new(name)
-                                .extension()
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("dylib"))
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        name.starts_with("libkrunfw") && name.contains(".so")
-                    }
-                })
-        })
-        .collect();
+fn preload_runtime_support_libraries(
+    runtime_dir: &Path,
+    explicit_firmware: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut support_libs: Vec<PathBuf> = if let Some(path) = explicit_firmware {
+        vec![path.to_path_buf()]
+    } else {
+        let entries = std::fs::read_dir(runtime_dir)
+            .map_err(|e| format!("read {}: {e}", runtime_dir.display()))?;
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        #[cfg(target_os = "macos")]
+                        {
+                            name.starts_with("libkrunfw")
+                                && Path::new(name)
+                                    .extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dylib"))
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            name.starts_with("libkrunfw") && name.contains(".so")
+                        }
+                    })
+            })
+            .collect()
+    };
 
     support_libs.sort();
     for path in &support_libs {
