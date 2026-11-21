@@ -10,7 +10,7 @@ replicaCount: 1
 global:
   image:
     # -- Shared OpenShell image registry. Individual image registries take precedence.
-    registry: ghcr.io/nvidia
+    registry: quay.io
     # -- Shared OpenShell image tag. Defaults to the chart appVersion when empty.
     tag: ""
     # -- Shared OpenShell image pull policy. Individual image pull policies take precedence.
@@ -32,7 +32,7 @@ gateway:
     # -- Gateway image registry. Empty uses global.image.registry.
     registry: ""
     # -- Gateway image repository.
-    repository: openshell/gateway
+    repository: ai-openshell/gateway
     # -- Gateway image pull policy. Empty uses global.image.pullPolicy.
     pullPolicy: null
     # -- Gateway image tag. Defaults to the chart appVersion when empty.
@@ -48,7 +48,7 @@ sandboxRuntime:
     # -- Sandbox runtime image registry. Empty uses global.image.registry.
     registry: ""
     # -- Sandbox runtime image repository.
-    repository: openshell/sandbox
+    repository: ai-openshell/sandbox
     # -- Sandbox runtime image pull policy. Empty uses global.image.pullPolicy.
     pullPolicy: null
     # -- Sandbox runtime image tag. Defaults to the chart appVersion when empty.
@@ -62,7 +62,7 @@ supervisor:
     # -- Supervisor image registry. Empty uses global.image.registry.
     registry: ""
     # -- Supervisor image repository.
-    repository: openshell/supervisor
+    repository: ai-openshell/supervisor
     # -- Supervisor image pull policy. Empty uses global.image.pullPolicy.
     # Prefer always, if_not_present, or never; the chart also accepts legacy
     # Kubernetes spellings Always, IfNotPresent, and Never.

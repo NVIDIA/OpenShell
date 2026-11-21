@@ -635,13 +635,13 @@ for peer identity policies, multi-node registrations, and authorization.
 | gateway.image.digest | string | `""` | Gateway image digest. When set, this takes precedence over tag. |
 | gateway.image.pullPolicy | string | `nil` | Gateway image pull policy. Empty uses global.image.pullPolicy. |
 | gateway.image.registry | string | `""` | Gateway image registry. Empty uses global.image.registry. |
-| gateway.image.repository | string | `"openshell/gateway"` | Gateway image repository. |
+| gateway.image.repository | string | `"ai-openshell/gateway"` | Gateway image repository. |
 | gateway.image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
 | gateway.listenAddress | string | `"0.0.0.0"` | Gateway listener IP. Use `::` for IPv6. |
 | gatewayConfig | object | `{"openshell":{"version":2},"openshell.gateway":{"enable_gateway_service_routing":false}}` | Non-secret gateway application configuration. Top-level keys name TOML tables and are rendered into the mounted gateway.toml file. Kubernetes resource inputs remain outside this map; template expressions derive the corresponding runtime values from their resource owner. |
 | gatewayConfig."openshell.gateway".enable_gateway_service_routing | bool | `false` | Opt in to gateway-mediated sandbox service URLs and forwarding. Disabled for Kubernetes; configure application-listener ingress or explicitly enable this path. |
 | global.image.pullPolicy | string | `"IfNotPresent"` | Shared OpenShell image pull policy. Individual image pull policies take precedence. |
-| global.image.registry | string | `"ghcr.io/nvidia"` | Shared OpenShell image registry. Individual image registries take precedence. |
+| global.image.registry | string | `"quay.io"` | Shared OpenShell image registry. Individual image registries take precedence. |
 | global.image.tag | string | `""` | Shared OpenShell image tag. Defaults to the chart appVersion when empty. |
 | grpcRoute.backendTLSPolicy.caCertificateConfigMapName | string | `""` | Name of the ConfigMap containing the CA certificate (key: ca.crt) used to validate the gateway pod's TLS certificate. Defaults to `<fullname>-backend-ca` when empty. The certgen hook auto-creates this: with pkiInitJob (default), immediately on install/upgrade; with cert-manager, the hook polls for pkiInitJob.timeoutSeconds seconds waiting for cert-manager to issue the server certificate, then creates the ConfigMap. A single install usually succeeds; if cert-manager takes longer, increase pkiInitJob.timeoutSeconds. By default (pkiInitJob.failOnTimeout=true), the install fails if the timeout is reached; set failOnTimeout=false to allow the install to succeed and run `helm upgrade` after the certificate is issued. |
 | grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
@@ -710,7 +710,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | sandboxRuntime.image.digest | string | `""` | Sandbox runtime image digest. When set, this takes precedence over tag. |
 | sandboxRuntime.image.pullPolicy | string | `nil` | Sandbox runtime image pull policy. Empty uses global.image.pullPolicy. |
 | sandboxRuntime.image.registry | string | `""` | Sandbox runtime image registry. Empty uses global.image.registry. |
-| sandboxRuntime.image.repository | string | `"openshell/sandbox"` | Sandbox runtime image repository. |
+| sandboxRuntime.image.repository | string | `"ai-openshell/sandbox"` | Sandbox runtime image repository. |
 | sandboxRuntime.image.tag | string | `""` | Sandbox runtime image tag. Defaults to the chart appVersion when empty. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
@@ -816,7 +816,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
 | supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
-| supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
+| supervisor.image.repository | string | `"ai-openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
 | supervisor.listenAddress | string | `"0.0.0.0"` | Shared supervisor listener IP. Use `::` for IPv6. |
 | supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
