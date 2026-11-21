@@ -97,3 +97,18 @@ worsens is a finding; cite the rule in the invariant.
     are retried; state that cannot be verified fails closed.
 33. Descriptors are reclaimed before exhaustion, and every mediated socket is
     closed on every exit path.
+
+## Policy, credential, and configuration changes
+
+34. A policy reload, approval, credential rotation, or provider change
+    disrupts only the connections and requests it affects. State how often
+    the trigger fires in normal operation; approvals and rotations happen
+    while workloads run, so a change that closes or resets unaffected
+    connections on every trigger is a defect even when it is deliberate.
+35. When a change replaces a conservative step (close all, rebuild all,
+    retry all) with a targeted check, every input to that check is
+    consistent when it runs, including state published by code outside the
+    diff. Read the publication order: a generation or version must not
+    become visible before the data it covers is installed. Versions change
+    on every transition, so a value that changes and changes back (A to B
+    to A) is still detected.

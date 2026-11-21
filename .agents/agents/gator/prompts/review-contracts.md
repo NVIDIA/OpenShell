@@ -26,7 +26,12 @@ Check:
 6. **Tests.** The new contract has tests. Missing tests are a Suggestion
    unless they leave a concrete regression introduced by the change
    undetectable.
-7. **Automated compatibility review.** When the task includes findings from
+7. **Claims against the diff.** Compare the pull request description with
+   the diff. When the description says existing behavior is preserved,
+   verify it, and list every user-visible behavior change the diff makes
+   that the description omits or contradicts, including changes stated only
+   in docs or architecture notes inside the diff.
+8. **Automated compatibility review.** When the task includes findings from
    the compatibility review for this head, verify each one against the code.
    Report the ones that hold, with full evidence.
 
