@@ -8161,8 +8161,35 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn list_provider_profiles_returns_built_in_profile_categories() {
-        let state = test_server_state().await;
+    async fn list_provider_profiles_returns_imported_profile_categories() {
+        let state = test_server_state_without_provider_profiles().await;
+        let profiles = [
+            ("alpha", ProviderProfileCategory::SourceControl),
+            ("beta", ProviderProfileCategory::Other),
+        ]
+        .map(|(id, category)| ProviderProfile {
+            category: category as i32,
+            ..custom_profile(id)
+        });
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
+                profiles: profiles
+                    .into_iter()
+                    .map(|profile| ProviderProfileImportItem {
+                        profile: Some(profile),
+                        source: String::new(),
+                    })
+                    .collect(),
+                workspace_scope: None,
+            }),
+        )
+        .await
+        .expect("import at platform scope")
+        .into_inner();
+        assert!(imported.imported, "{:?}", imported.diagnostics);
+
         let response = handle_list_provider_profiles(
             &state,
             authed_request(ListProviderProfilesRequest {
@@ -8177,43 +8204,17 @@ pub(super) mod tests {
         .unwrap()
         .into_inner();
 
-        let ids = response
+        let listed = response
             .profiles
             .iter()
-            .map(|profile| profile.id.as_str())
+            .map(|profile| (profile.id.as_str(), profile.category))
             .collect::<Vec<_>>();
         assert_eq!(
-            ids,
+            listed,
             vec![
-                "anthropic",
-                "aws",
-                "aws-bedrock",
-                "aws-s3",
-                "claude-code",
-                "codex",
-                "copilot",
-                "cursor",
-                "deepinfra",
-                "github",
-                "github-app",
-                "google-cloud",
-                "google-vertex-ai",
-                "nvidia",
-                "oci-genai",
-                "openai",
-                "openrouter",
-                "pypi"
+                ("alpha", ProviderProfileCategory::SourceControl as i32),
+                ("beta", ProviderProfileCategory::Other as i32),
             ]
-        );
-
-        let github = response
-            .profiles
-            .iter()
-            .find(|profile| profile.id == "github")
-            .expect("github profile should be listed");
-        assert_eq!(
-            github.category,
-            ProviderProfileCategory::SourceControl as i32
         );
     }
 
