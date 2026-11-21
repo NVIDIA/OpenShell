@@ -52,6 +52,80 @@ pub fn installed_socket_inodes_excluding(
     Ok(inodes)
 }
 
+/// Count this process's open descriptors, as one enumeration of
+/// `/proc/self/fd` reports them.
+///
+/// An enumeration opens the directory it lists, so its result is the number
+/// of descriptors open before the call plus one. Callers size their headroom
+/// against that value. Linux 6.2 and later report the open-descriptor count as
+/// the size of `/proc/self/fd`, which costs one `stat` instead of an open,
+/// one directory read per batch of entries, and a close. Support is
+/// established once by an active probe, never from the kernel version, and
+/// the fast count adds one to stay equal to an enumeration. Any kernel,
+/// profile, or procfs that does not pass the probe keeps enumerating.
+pub fn open_descriptor_count() -> io::Result<usize> {
+    static STAT_COUNT_SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let supported = *STAT_COUNT_SUPPORTED.get_or_init(|| {
+        stat_count_tracks_enumeration(
+            stat_descriptor_count,
+            || enumerate_descriptor_count().ok(),
+            || rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).ok(),
+        )
+    });
+    if supported && let Some(open) = stat_descriptor_count() {
+        return Ok(open.saturating_add(1));
+    }
+    enumerate_descriptor_count()
+}
+
+fn enumerate_descriptor_count() -> io::Result<usize> {
+    fs::read_dir("/proc/self/fd").map(Iterator::count)
+}
+
+/// Open-descriptor count from the directory size, or `None` where the kernel
+/// does not report one (older kernels report a size of zero).
+fn stat_descriptor_count() -> Option<usize> {
+    let size = fs::metadata("/proc/self/fd").ok()?.len();
+    usize::try_from(size).ok().filter(|count| *count > 0)
+}
+
+/// Decide whether `stat` reports a live descriptor count.
+///
+/// A sample qualifies only when two `stat` counts bracketing an enumeration
+/// agree, the enumeration reports exactly one more (its own directory
+/// descriptor), and holding one extra descriptor raises the `stat` count by
+/// exactly one. Other threads open and close descriptors concurrently, so a
+/// disturbed sample is retried a few times; persistent disagreement selects
+/// enumeration.
+fn stat_count_tracks_enumeration<Held>(
+    mut stat: impl FnMut() -> Option<usize>,
+    mut enumerate: impl FnMut() -> Option<usize>,
+    mut hold_descriptor: impl FnMut() -> Option<Held>,
+) -> bool {
+    const ATTEMPTS: usize = 8;
+    for _ in 0..ATTEMPTS {
+        let Some(before) = stat() else {
+            return false;
+        };
+        let Some(enumerated) = enumerate() else {
+            return false;
+        };
+        let Some(held) = hold_descriptor() else {
+            return false;
+        };
+        let with_held = stat();
+        drop(held);
+        let after = stat();
+        if after == Some(before)
+            && with_held == before.checked_add(1)
+            && Some(enumerated) == before.checked_add(1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Return the socket inode currently installed at `fd` in `tid`'s descriptor
 /// table.
 ///
@@ -182,6 +256,67 @@ mod tests {
             !installed_socket_inodes_excluding(std::process::id())
                 .unwrap()
                 .contains(&inode)
+        );
+    }
+
+    #[test]
+    fn stat_count_is_used_only_when_it_tracks_descriptors() {
+        let hold = || Some(());
+        // A kernel that reports no size never qualifies.
+        assert!(!stat_count_tracks_enumeration(|| None, || Some(8), hold));
+        // A size that ignores a newly held descriptor is not a count.
+        assert!(!stat_count_tracks_enumeration(|| Some(7), || Some(8), hold));
+        // An enumeration that does not include its own descriptor disagrees.
+        let mut counts = [7, 8, 7].into_iter().cycle();
+        assert!(!stat_count_tracks_enumeration(
+            || counts.next(),
+            || Some(7),
+            hold
+        ));
+        // A consistent sample qualifies: before, with one held, after.
+        let mut counts = [7, 8, 7].into_iter().cycle();
+        assert!(stat_count_tracks_enumeration(
+            || counts.next(),
+            || Some(8),
+            hold
+        ));
+        // A sample disturbed by concurrent descriptor churn is retried.
+        let mut counts = [7, 9, 8, 8, 9, 8].into_iter();
+        assert!(stat_count_tracks_enumeration(
+            || counts.next(),
+            || Some(9),
+            hold
+        ));
+        // Failing to enumerate or to hold a descriptor never qualifies.
+        assert!(!stat_count_tracks_enumeration(|| Some(7), || None, hold));
+        assert!(!stat_count_tracks_enumeration(
+            || Some(7),
+            || Some(8),
+            || None::<()>
+        ));
+    }
+
+    #[test]
+    fn descriptor_count_follows_open_descriptors() {
+        // Other tests open and close descriptors concurrently, so compare
+        // against a large deliberate change rather than an exact value.
+        const HELD: usize = 64;
+        let before = open_descriptor_count().unwrap();
+        assert!(before > 3, "count includes the standard descriptors");
+        let held = (0..HELD)
+            .map(|_| File::open("/dev/null").expect("open descriptor"))
+            .collect::<Vec<_>>();
+        let during = open_descriptor_count().unwrap();
+        drop(held);
+        let after = open_descriptor_count().unwrap();
+        assert!(during >= before + HELD / 2, "{before} -> {during}");
+        assert!(after + HELD / 2 <= during, "{during} -> {after}");
+        // The fast count and an enumeration agree to within concurrent churn.
+        let enumerated = enumerate_descriptor_count().unwrap();
+        let counted = open_descriptor_count().unwrap();
+        assert!(
+            enumerated.abs_diff(counted) < HELD / 2,
+            "{enumerated} vs {counted}"
         );
     }
 }

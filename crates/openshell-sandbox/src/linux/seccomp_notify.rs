@@ -28,7 +28,7 @@ const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(test, target_arch = "x86_64"))]
 const BPF_JMP_JSET_K: u16 = 0x45;
 const BPF_ALU_AND_K: u16 = 0x54;
 const BPF_RET_K: u16 = 0x06;
@@ -46,6 +46,22 @@ const CONNECTED_SEND_FLAGS: u32 =
     (libc::MSG_DONTWAIT | libc::MSG_EOR | libc::MSG_MORE | libc::MSG_NOSIGNAL | libc::MSG_OOB)
         as u32;
 const PROBE_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Scalar `(level, option)` pairs `setsockopt` may set without a broker round
+/// trip.
+///
+/// The broker decides `setsockopt` from these two scalar arguments alone and
+/// continues every pair it does not deny, so allowing an exact pair in the
+/// filter returns the same result without waking the broker. The list is a
+/// narrow whitelist rather than the complement of the broker's denied set:
+/// every other pair, and every call whose level or option does not fit a
+/// non-negative C `int`, still notifies and keeps the broker's `EPERM` and
+/// `EINVAL` results.
+pub(crate) const SETSOCKOPT_FAST_PATH: &[(i32, i32)] = &[
+    (libc::IPPROTO_TCP, libc::TCP_NODELAY),
+    (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+    (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+];
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -180,6 +196,13 @@ impl NotificationProbeReport {
     #[must_use]
     pub fn connected_send_fast_path(self) -> bool {
         self.features.0 & 4 != 0
+    }
+
+    /// Whether whitelisted scalar `setsockopt` pairs bypassed notification
+    /// while other pairs and unrepresentable arguments remained mediated.
+    #[must_use]
+    pub fn scalar_setsockopt_fast_path(self) -> bool {
+        self.features.0 & 8 != 0
     }
 }
 
@@ -336,10 +359,14 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
             "at least one notified syscall is required",
         ));
     }
-    verify_notification_sizes()?;
-    set_no_new_privileges()?;
-
-    install_notification_filter(syscalls)
+    let mut syscalls = syscalls.to_vec();
+    syscalls.sort_unstable();
+    syscalls.dedup();
+    let rules = syscalls
+        .into_iter()
+        .map(FilterRule::Notify)
+        .collect::<Vec<_>>();
+    install_rules(&rules)
 }
 
 /// Install the capability-free workload networking listener on the calling
@@ -353,8 +380,23 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 /// `send()`/null-destination
 /// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
 /// natively: the broker binds every INET socket to loopback before injecting
-/// it, and accepted sockets inherit their listener's binding.
+/// it, and accepted sockets inherit their listener's binding. `setsockopt`
+/// allows the [`SETSOCKOPT_FAST_PATH`] pairs in the filter. Every `open`,
+/// `openat`, and `openat2` notifies: the broker serves provider files by
+/// descriptor injection.
 pub fn install_workload_listener() -> io::Result<NotificationListener> {
+    install_rules(&workload_filter_rules())
+}
+
+/// Qualify the notification ABI, set `no_new_privs` on the calling thread,
+/// and install `rules` there.
+fn install_rules(rules: &[FilterRule]) -> io::Result<NotificationListener> {
+    verify_notification_sizes()?;
+    set_no_new_privileges()?;
+    install_notification_filter(rules)
+}
+
+fn workload_filter_rules() -> Vec<FilterRule> {
     #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
     let mut syscalls = vec![
         libc::SYS_socket,
@@ -380,7 +422,34 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
     );
     #[cfg(target_arch = "x86_64")]
     syscalls.push(libc::SYS_open);
-    install_listener(&syscalls)
+    syscalls
+        .into_iter()
+        .map(|syscall| {
+            if syscall == libc::SYS_setsockopt {
+                return FilterRule::ScalarSetsockopt;
+            }
+            FilterRule::Notify(syscall)
+        })
+        .collect()
+}
+
+/// One syscall's treatment in a listener filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterRule {
+    /// Notify with the syscall's standing treatment: connected `sendto` and
+    /// non-`SIGCONT` thread signals keep their audited fast paths.
+    Notify(i64),
+    /// `setsockopt`, allowing only [`SETSOCKOPT_FAST_PATH`] pairs natively.
+    ScalarSetsockopt,
+}
+
+impl FilterRule {
+    const fn syscall(self) -> i64 {
+        match self {
+            Self::Notify(syscall) => syscall,
+            Self::ScalarSetsockopt => libc::SYS_setsockopt,
+        }
+    }
 }
 
 /// Run a no-capability conformance probe.
@@ -392,8 +461,9 @@ pub fn probe_notification_api() -> io::Result<NotificationProbeReport> {
     probe_scalar_round_trip()?;
     probe_addfd_send()?;
     probe_connected_sendto_fast_path()?;
+    probe_scalar_setsockopt_fast_path()?;
     Ok(NotificationProbeReport {
-        features: NotificationProbeFeatures(1 | 2 | 4),
+        features: NotificationProbeFeatures(1 | 2 | 4 | 8),
     })
 }
 
@@ -615,6 +685,129 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
     Ok(())
 }
 
+/// Raw `setsockopt` whose level and option keep all 64 argument bits, so the
+/// probe can present values a C `int` prototype would truncate.
+fn raw_setsockopt(fd: RawFd, level: u64, option: u64) -> io::Result<()> {
+    let value: libc::c_int = 1;
+    // SAFETY: the value pointer and length describe one live C int.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_setsockopt,
+            fd,
+            level,
+            option,
+            std::ptr::addr_of!(value),
+            size_of::<libc::c_int>(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn expect_errno(result: io::Result<()>, errno: i32, what: &str) -> io::Result<()> {
+    match result {
+        Err(error) if error.raw_os_error() == Some(errno) => Ok(()),
+        Ok(()) => Err(io::Error::other(format!("{what} unexpectedly succeeded"))),
+        Err(error) => Err(io::Error::other(format!(
+            "{what} returned {error} instead of errno {errno}"
+        ))),
+    }
+}
+
+const fn unsigned_argument(value: libc::c_int) -> u64 {
+    value.unsigned_abs() as u64
+}
+
+fn probe_scalar_setsockopt_fast_path() -> io::Result<()> {
+    const HIGH_WORD: u64 = 1 << 32;
+    const ABOVE_INT_MAX: u64 = 0x8000_0000;
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair()?;
+    let level_tcp = unsigned_argument(libc::IPPROTO_TCP);
+    let level_socket = unsigned_argument(libc::SOL_SOCKET);
+    let nodelay = unsigned_argument(libc::TCP_NODELAY);
+    let reuse = unsigned_argument(libc::SO_REUSEADDR);
+    let bind_device = unsigned_argument(libc::SO_BINDTODEVICE);
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let launcher = thread::spawn(move || -> io::Result<()> {
+        let listener = install_rules(&[FilterRule::ScalarSetsockopt])?;
+        sender
+            .send(listener)
+            .map_err(|_| io::Error::other("setsockopt broker disappeared"))?;
+        let fd = socket.as_raw_fd();
+        // Whitelisted pairs run in the kernel. SO_REUSEADDR succeeds on any
+        // socket; TCP_NODELAY on this UNIX socket returns the kernel's own
+        // EOPNOTSUPP, which no broker response in this probe produces.
+        raw_setsockopt(fd, level_socket, reuse)?;
+        expect_errno(
+            raw_setsockopt(fd, level_tcp, nodelay),
+            libc::EOPNOTSUPP,
+            "native TCP_NODELAY on a UNIX socket",
+        )?;
+        // Everything else notifies, in this order.
+        expect_errno(
+            raw_setsockopt(fd, level_socket, bind_device),
+            libc::EPERM,
+            "denied socket option",
+        )?;
+        expect_errno(
+            raw_setsockopt(fd, level_tcp | HIGH_WORD, nodelay),
+            libc::EINVAL,
+            "socket option level with a nonzero upper word",
+        )?;
+        expect_errno(
+            raw_setsockopt(fd, level_tcp, nodelay | HIGH_WORD),
+            libc::EINVAL,
+            "socket option name with a nonzero upper word",
+        )?;
+        expect_errno(
+            raw_setsockopt(fd, level_tcp, nodelay | ABOVE_INT_MAX),
+            libc::EINVAL,
+            "socket option name above INT_MAX",
+        )
+    });
+
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(launcher, "setsockopt"));
+    };
+    for (level, option, errno) in [
+        (level_socket, bind_device, libc::EPERM),
+        (level_tcp | HIGH_WORD, nodelay, libc::EINVAL),
+        (level_tcp, nodelay | HIGH_WORD, libc::EINVAL),
+        (level_tcp, nodelay | ABOVE_INT_MAX, libc::EINVAL),
+    ] {
+        let notification = match receive_probe_notification(&listener) {
+            Ok(notification) => notification,
+            Err(error) => {
+                // A launcher that failed on its own explains the missing
+                // notification better than the timeout does.
+                return Err(match launcher.join() {
+                    Ok(Err(launcher_error)) => launcher_error,
+                    _ => error,
+                });
+            }
+        };
+        if i64::from(notification.syscall) != libc::SYS_setsockopt
+            || notification.args[1] != level
+            || notification.args[2] != option
+        {
+            let _ = listener.respond_errno(notification.id, libc::EIO);
+            let _ = launcher.join();
+            return Err(io::Error::other(
+                "scalar setsockopt fast path notified an unexpected call",
+            ));
+        }
+        listener.respond_errno(notification.id, errno)?;
+    }
+    launcher
+        .join()
+        .map_err(|_| io::Error::other("setsockopt launcher panicked"))??;
+    Ok(())
+}
+
 /// Recover the real error from a probe launcher that exited before handing its
 /// listener to the broker.
 ///
@@ -662,8 +855,8 @@ fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Not
     listener.receive()
 }
 
-fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListener> {
-    let mut program = build_filter(syscalls)?;
+fn install_notification_filter(rules: &[FilterRule]) -> io::Result<NotificationListener> {
+    let mut program = build_filter(rules)?;
     let length = u16::try_from(program.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seccomp filter is too large"))?;
     let mut fprog = libc::sock_fprog {
@@ -691,7 +884,7 @@ fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListe
     Ok(NotificationListener { fd })
 }
 
-fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
+fn build_filter(rules: &[FilterRule]) -> io::Result<Vec<libc::sock_filter>> {
     let mut program = vec![
         stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
         jump(BPF_JMP_JEQ_K, native_audit_arch(), 1, 0),
@@ -705,10 +898,27 @@ fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
         stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
     ]);
 
-    let mut syscalls = syscalls.to_vec();
-    syscalls.sort_unstable();
-    syscalls.dedup();
-    for syscall in syscalls {
+    // One rule per syscall, in ascending syscall order. A syscall named twice
+    // is rejected rather than letting the first block silently win.
+    let mut rules = rules.to_vec();
+    rules.sort_unstable_by_key(|rule| rule.syscall());
+    if rules
+        .windows(2)
+        .any(|pair| pair[0].syscall() == pair[1].syscall())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seccomp filter names a syscall more than once",
+        ));
+    }
+    for rule in rules {
+        let syscall = match rule {
+            FilterRule::Notify(syscall) => syscall,
+            FilterRule::ScalarSetsockopt => {
+                append_setsockopt_filter(&mut program)?;
+                continue;
+            }
+        };
         if syscall == libc::SYS_sendto {
             append_sendto_filter(&mut program)?;
             continue;
@@ -758,6 +968,49 @@ fn append_sendto_filter(program: &mut Vec<libc::sock_filter>) -> io::Result<()> 
         stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
         stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
     ]);
+    Ok(())
+}
+
+/// Allow exactly the [`SETSOCKOPT_FAST_PATH`] pairs; notify everything else.
+///
+/// The kernel reads `level` and `optname` as C `int`s, ignoring the upper
+/// argument words. The broker instead refuses any value that does not fit a
+/// non-negative `i32` with `EINVAL`, so a nonzero upper word must notify
+/// rather than be compared by its low word. Whitelisted values are small
+/// positive constants, so an exact low-word match with a zero upper word is
+/// exactly a value the broker would accept and continue.
+fn append_setsockopt_filter(program: &mut Vec<libc::sock_filter>) -> io::Result<()> {
+    const HIGH_WORD_CHECKS: usize = 6;
+    const PAIR_LENGTH: usize = 5;
+    let syscall = u32::try_from(libc::SYS_setsockopt)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative setsockopt syscall"))?;
+    let body = HIGH_WORD_CHECKS + PAIR_LENGTH * SETSOCKOPT_FAST_PATH.len() + 1;
+    let skip = u8::try_from(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "setsockopt filter too long"))?;
+    program.push(jump(BPF_JMP_JEQ_K, syscall, 0, skip));
+    for argument in [1, 2] {
+        program.extend([
+            stmt(BPF_LD_W_ABS, argument_word_offset(argument, 1)),
+            jump(BPF_JMP_JEQ_K, 0, 1, 0),
+            stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
+        ]);
+    }
+    for (level, option) in SETSOCKOPT_FAST_PATH {
+        let level = u32::try_from(*level).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "negative socket option level")
+        })?;
+        let option = u32::try_from(*option).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "negative socket option name")
+        })?;
+        program.extend([
+            stmt(BPF_LD_W_ABS, argument_word_offset(1, 0)),
+            jump(BPF_JMP_JEQ_K, level, 0, 3),
+            stmt(BPF_LD_W_ABS, argument_word_offset(2, 0)),
+            jump(BPF_JMP_JEQ_K, option, 0, 1),
+            stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+        ]);
+    }
+    program.push(stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF));
     Ok(())
 }
 
@@ -933,9 +1186,230 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
+    /// Evaluate a classic-BPF seccomp program over one syscall, supporting
+    /// exactly the instructions this module emits.
+    fn evaluate(program: &[libc::sock_filter], syscall: i64, args: [u64; 6]) -> u32 {
+        let data = SeccompData {
+            nr: i32::try_from(syscall).unwrap(),
+            arch: native_audit_arch(),
+            instruction_pointer: 0,
+            args,
+        };
+        let word = |offset: u32| -> u32 {
+            let offset = offset as usize;
+            if offset == 0 {
+                return data.nr.cast_unsigned();
+            }
+            if offset == 4 {
+                return data.arch;
+            }
+            let index = (offset - 16) / 8;
+            let value = data.args[index];
+            if (offset - 16).is_multiple_of(8) {
+                (value & 0xffff_ffff) as u32
+            } else {
+                (value >> 32) as u32
+            }
+        };
+        let mut accumulator = 0_u32;
+        let mut pc = 0_usize;
+        loop {
+            let instruction = program[pc];
+            pc += 1;
+            match instruction.code {
+                BPF_LD_W_ABS => accumulator = word(instruction.k),
+                BPF_ALU_AND_K => accumulator &= instruction.k,
+                BPF_RET_K => return instruction.k,
+                BPF_JMP_JEQ_K | BPF_JMP_JSET_K => {
+                    let taken = if instruction.code == BPF_JMP_JEQ_K {
+                        accumulator == instruction.k
+                    } else {
+                        accumulator & instruction.k != 0
+                    };
+                    pc += usize::from(if taken {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    });
+                }
+                other => panic!("unsupported BPF opcode {other:#x}"),
+            }
+        }
+    }
+
+    fn arg(value: i32) -> u64 {
+        u64::from(value.cast_unsigned())
+    }
+
+    #[test]
+    fn workload_filter_allows_only_whitelisted_scalar_setsockopt() {
+        const HIGH: u64 = 1 << 32;
+        {
+            let program = build_filter(&workload_filter_rules()).unwrap();
+            let decide = |level: u64, option: u64| {
+                evaluate(
+                    &program,
+                    libc::SYS_setsockopt,
+                    [3, level, option, 0x7000_0000_1000, 4, 0],
+                )
+            };
+            for (level, option) in SETSOCKOPT_FAST_PATH {
+                let (level, option) = (arg(*level), arg(*option));
+                assert_eq!(decide(level, option), SECCOMP_RET_ALLOW);
+                // The broker refuses values outside a non-negative i32 with
+                // EINVAL; none of them may take the fast path.
+                for (level, option) in [
+                    (level | HIGH, option),
+                    (level, option | HIGH),
+                    (level | 0x8000_0000, option),
+                    (level, option | 0x8000_0000),
+                    (level | (u64::MAX << 32), option),
+                    (option, level),
+                ] {
+                    if SETSOCKOPT_FAST_PATH
+                        .iter()
+                        .any(|pair| (arg(pair.0), arg(pair.1)) == (level, option))
+                    {
+                        continue;
+                    }
+                    assert_eq!(
+                        decide(level, option),
+                        SECCOMP_RET_USER_NOTIF,
+                        "{level:#x}/{option:#x}"
+                    );
+                }
+            }
+            // Every pair outside the whitelist notifies, including each
+            // denied option and other benign ones.
+            for (level, option) in [
+                (libc::SOL_SOCKET, libc::SO_BINDTODEVICE),
+                (libc::SOL_SOCKET, libc::SO_BINDTOIFINDEX),
+                (libc::IPPROTO_IP, libc::IP_UNICAST_IF),
+                (libc::IPPROTO_IP, libc::IP_MULTICAST_IF),
+                (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF),
+                (libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF),
+                (libc::IPPROTO_IPV6, libc::IPV6_ADDRFORM),
+                (libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT),
+                (libc::IPPROTO_TCP, libc::TCP_FASTOPEN),
+                (libc::SOL_SOCKET, libc::SO_RCVBUF),
+                (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
+                (libc::IPPROTO_IP, libc::TCP_NODELAY),
+                (libc::IPPROTO_TCP, libc::SO_REUSEADDR),
+            ] {
+                assert_eq!(
+                    decide(arg(level), arg(option)),
+                    SECCOMP_RET_USER_NOTIF,
+                    "{level}/{option}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workload_filter_keeps_precedence_around_the_new_fast_paths() {
+        let unsupported_arch = |program: &[libc::sock_filter]| {
+            // A foreign architecture is killed before any syscall rule.
+            let mut pc = 0;
+            assert_eq!(program[pc].code, BPF_LD_W_ABS);
+            assert_eq!(program[pc].k, SECCOMP_DATA_ARCH_OFFSET);
+            pc += 1;
+            assert_eq!(program[pc].k, native_audit_arch());
+            assert_eq!(program[pc + 1].k, SECCOMP_RET_KILL_PROCESS);
+        };
+        {
+            let program = build_filter(&workload_filter_rules()).unwrap();
+            unsupported_arch(&program);
+            let decide = |syscall: i64, args: [u64; 6]| evaluate(&program, syscall, args);
+            // Mediated syscalls on either side of setsockopt and openat in
+            // number order still notify; unrelated syscalls are allowed.
+            for syscall in [
+                libc::SYS_socket,
+                libc::SYS_connect,
+                libc::SYS_bind,
+                libc::SYS_listen,
+                libc::SYS_sendmsg,
+                libc::SYS_sendmmsg,
+                libc::SYS_kill,
+                libc::SYS_tkill,
+                libc::SYS_rt_sigqueueinfo,
+                libc::SYS_openat2,
+            ] {
+                assert_eq!(decide(syscall, [0; 6]), SECCOMP_RET_USER_NOTIF, "{syscall}");
+            }
+            for syscall in [libc::SYS_getpid, libc::SYS_read, libc::SYS_getsockopt] {
+                assert_eq!(decide(syscall, [0; 6]), SECCOMP_RET_ALLOW, "{syscall}");
+            }
+            // The audited sendto and resume-signal paths are unchanged.
+            assert_eq!(
+                decide(libc::SYS_sendto, [3, 1, 1, 0, 0, 0]),
+                SECCOMP_RET_ALLOW
+            );
+            assert_eq!(
+                decide(libc::SYS_sendto, [3, 1, 1, 0, 0x1000, 16]),
+                SECCOMP_RET_USER_NOTIF
+            );
+            assert_eq!(
+                decide(libc::SYS_tgkill, [1, 1, arg(libc::SIGCONT), 0, 0, 0]),
+                SECCOMP_RET_USER_NOTIF
+            );
+            assert_eq!(
+                decide(libc::SYS_tgkill, [1, 1, arg(libc::SIGURG), 0, 0, 0]),
+                SECCOMP_RET_ALLOW
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                evaluate(
+                    &program,
+                    libc::SYS_setsockopt | i64::from(X32_SYSCALL_BIT),
+                    [3, arg(libc::IPPROTO_TCP), arg(libc::TCP_NODELAY), 0, 4, 0]
+                ),
+                SECCOMP_RET_KILL_PROCESS
+            );
+        }
+    }
+
+    #[test]
+    fn workload_filter_notifies_every_open() {
+        let program = build_filter(&workload_filter_rules()).unwrap();
+        for flags in [
+            libc::O_RDONLY,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            libc::O_WRONLY,
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+        ] {
+            assert_eq!(
+                evaluate(&program, libc::SYS_openat, [0, 0x1000, arg(flags), 0, 0, 0]),
+                SECCOMP_RET_USER_NOTIF,
+                "{flags:#o}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                evaluate(&program, libc::SYS_open, [0x1000, arg(flags), 0, 0, 0, 0]),
+                SECCOMP_RET_USER_NOTIF,
+                "{flags:#o}"
+            );
+        }
+        assert_eq!(
+            evaluate(&program, libc::SYS_openat2, [0, 0x1000, 0x2000, 24, 0, 0]),
+            SECCOMP_RET_USER_NOTIF
+        );
+    }
+
+    #[test]
+    fn filter_rejects_a_syscall_named_twice() {
+        let error = build_filter(&[
+            FilterRule::Notify(libc::SYS_setsockopt),
+            FilterRule::ScalarSetsockopt,
+        ])
+        .expect_err("duplicate syscall must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
     #[test]
     fn active_notification_probe_passes() {
         let report = probe_notification_api().expect("active notification probe");
+        assert!(report.scalar_setsockopt_fast_path());
         assert!(report.notification_round_trip());
         assert!(report.addfd_send());
         assert!(report.connected_send_fast_path());

@@ -26,6 +26,57 @@ the last workload reference to a listener removes it without waiting for registr
 collection. Broker source descriptors always use close-on-exec independently of
 the workload's requested descriptor flags.
 
+A blocking loopback `connect` waits on a small pool of reusable worker threads
+rather than a thread per call. A job never queues behind a busy worker: it goes
+to a parked worker or starts a new one, and a pool with neither refuses with
+`EAGAIN`, so a slow or full listener cannot delay another connect or the
+dispatcher. Three bounds hold together. Each job carries an admission slot
+shared with external opens (256 in all), which its worker releases only after
+the pool records that worker parked or retired. Live workers are capped at that
+same number under the pool's own lock. At most four workers stay parked, for up
+to 30 seconds; a worker that finishes beyond that exits at once.
+
+`setsockopt` calls for `TCP_NODELAY`, `SO_REUSEADDR`, and `SO_KEEPALIVE` run in
+the kernel without a notification. The broker decides `setsockopt` from its two
+scalar arguments and would continue these pairs. Every other pair, and any
+level or option that does not fit a non-negative C `int`, still notifies and
+keeps the broker's `EPERM` and `EINVAL` results. The active qualification
+probe exercises both sides.
+
+## Provider files
+
+Provider files appear to the workload beneath `/run/openshell/providers`.
+Every workload `open`, `openat`, and `openat2` notifies the broker, which
+serves a provider path by injecting a read-only descriptor for a sealed
+in-memory file and continues every other open.
+
+Each published file is an immutable revision backed by one in-memory file. The
+runtime creates that file when the revision is published, not when the
+workload opens it: it writes the content, seals the file against writes,
+growing, shrinking, and further sealing, and keeps only a read-only descriptor
+for it. Each workload open reopens that descriptor through the runtime's own
+`/proc/self/fd`, so every open gets its own read-only open file description
+and file offset, positioned at the start.
+
+An update prepares every new revision before it replaces the published set in
+one step, so a failed update leaves the previous set in place. A file whose
+bytes did not change keeps its revision. Opens after an update see the new
+revisions, descriptors opened earlier keep the bytes they opened, and a
+detached file is `ENOENT` for later opens.
+
+All opens of one revision refer to one file, which the workload owns: it can
+change that file's mode or reopen a descriptor for writing. Neither reaches
+the content, which the seals protect, and the runtime restores the mode if it
+denies an open. The runtime holds one descriptor per published file, at most
+64.
+
+The broker classifies each open from an exact copy of the first six bytes of
+its path. Six bytes identify a `/proc/` path and the start of a provider path;
+only those candidates have their whole path read and decided. An open whose
+first six bytes cannot be read, or match neither, continues, and unrelated
+`openat2` calls do not require a copy of their `open_how`. Every continued
+open remains subject to the kernel and Landlock.
+
 A boundary configured with `RuntimeInitiatedTlsTcp` binds no listener. It dials
 only the driver-provided supervisor addresses, which must be concrete,
 non-loopback, and share one port, and serves TLS and gRPC over that outbound
