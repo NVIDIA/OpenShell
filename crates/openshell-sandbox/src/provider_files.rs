@@ -258,26 +258,37 @@ pub fn read_path(tid: u32, address: u64) -> io::Result<String> {
 }
 
 /// A NUL-terminated path in `tid`'s memory, as the bytes the kernel sees.
-pub fn read_path_bytes(tid: u32, mut address: u64) -> io::Result<Vec<u8>> {
+pub fn read_path_bytes(tid: u32, address: u64) -> io::Result<Vec<u8>> {
+    match read_string_bytes(tid, address, MAX_PATH_BYTES - 1)? {
+        (path, true) => Ok(path),
+        (_, false) => Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG)),
+    }
+}
+
+/// Up to `limit` bytes of the NUL-terminated string at `address` in `tid`'s
+/// memory, and whether that is the whole string.
+pub fn read_string_bytes(tid: u32, mut address: u64, limit: usize) -> io::Result<(Vec<u8>, bool)> {
     if address == 0 {
         return Err(io::Error::from_raw_os_error(libc::EFAULT));
     }
-    let mut path = Vec::with_capacity(128);
-    while path.len() < MAX_PATH_BYTES {
+    let mut string = Vec::with_capacity(limit.min(128));
+    // One byte past the limit tells a string of exactly `limit` bytes apart.
+    while string.len() <= limit {
         // VMAs are page aligned. Never read across a page boundary before
         // finding NUL, because the following page may be unmapped.
         let page_remaining = 4096 - usize::try_from(address & 4095).expect("page offset fits");
-        let length = page_remaining.min(MAX_PATH_BYTES - path.len());
+        let length = page_remaining.min(limit + 1 - string.len());
         let mut chunk = vec![0; length];
         task_memory::read_exact(tid, address, &mut chunk)?;
         if let Some(end) = chunk.iter().position(|byte| *byte == 0) {
-            path.extend_from_slice(&chunk[..end]);
-            return Ok(path);
+            string.extend_from_slice(&chunk[..end]);
+            return Ok((string, true));
         }
-        path.extend_from_slice(&chunk);
+        string.extend_from_slice(&chunk);
         address += length as u64;
     }
-    Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG))
+    string.truncate(limit);
+    Ok((string, false))
 }
 
 fn open_flags(notification: &Notification) -> io::Result<i32> {

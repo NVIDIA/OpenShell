@@ -210,6 +210,12 @@ With `ocsf_process_exec_enabled`, a shell in the sandbox running `/usr/bin/true`
 OCSF PROC:LAUNCH [INFO] /usr/bin/true(84)
 ```
 
+With `ocsf_process_cmdline_enabled`, the same record with its arguments:
+
+```text
+OCSF PROC:LAUNCH [INFO] /usr/bin/sleep(86) [cmd:/bin/sleep 0.01]
+```
+
 Execs the sandbox did not record because they exceeded its rate:
 
 ```text

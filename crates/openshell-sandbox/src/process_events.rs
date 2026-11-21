@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use openshell_isolation_interface::contract::ProcessInstance;
 use openshell_sandbox_backend::boundary_protocol::{
-    ExitStatusWire, ProcessEventKindWire, ProcessEventWire,
+    CommandLineWire, ExitStatusWire, ProcessEventKindWire, ProcessEventWire,
 };
 
 const CAPACITY: usize = 4096;
@@ -35,12 +35,17 @@ const EXEC_BURST: u64 = 500;
 const EXEC_RATE_PER_SECOND: u64 = 200;
 /// Shortest time between two reports of suppressed execs.
 const SUPPRESSED_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// Most arguments recorded for one process.
+const MAX_ARGUMENTS: usize = 256;
+/// Most argument bytes recorded for one process.
+const MAX_COMMAND_LINE_BYTES: usize = 4096;
 /// Execs waiting for their files to be looked up.
 const EXEC_QUEUE: usize = 256;
 
 static LOG: LazyLock<ProcessEventLog> =
     LazyLock::new(|| ProcessEventLog::with_exec_rate(CAPACITY, EXEC_BURST, EXEC_RATE_PER_SECOND));
 static RECORD_EXECUTIONS: AtomicBool = AtomicBool::new(false);
+static RECORD_COMMAND_LINES: AtomicBool = AtomicBool::new(false);
 
 /// The runtime's process event log.
 pub fn log() -> &'static ProcessEventLog {
@@ -53,9 +58,9 @@ pub struct Launched {
     executable: String,
 }
 
-/// Record the launch of a process the runtime just spawned from `program`.
-/// `None` when procfs no longer reports it.
-pub fn record_launch(pid: u32, program: &str) -> Option<Launched> {
+/// Record the launch of a process the runtime just spawned from `program`
+/// with `arguments`. `None` when procfs no longer reports it.
+pub fn record_launch(pid: u32, program: &str, arguments: &[String]) -> Option<Launched> {
     let Some(process) = openshell_binary_identity::observe_process(pid) else {
         tracing::warn!(
             pid,
@@ -66,7 +71,13 @@ pub fn record_launch(pid: u32, program: &str) -> Option<Launched> {
     // A process that already exited has no readable executable link.
     let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
         .map_or_else(|_| program.to_string(), |path| path.display().to_string());
-    log().record(process, &executable, ProcessEventKindWire::Launched);
+    let command_line = records_command_lines().then(|| launched_command_line(program, arguments));
+    log().record_with(
+        process,
+        &executable,
+        ProcessEventKindWire::Launched,
+        command_line,
+    );
     Some(Launched {
         process,
         executable,
@@ -81,6 +92,89 @@ impl Launched {
             ProcessEventKindWire::Exited(status),
         );
     }
+}
+
+/// Whether the supervisor asked for each recorded process's arguments.
+pub fn records_command_lines() -> bool {
+    RECORD_COMMAND_LINES.load(Ordering::Acquire)
+}
+
+/// Apply the supervisor's latest choice of recording arguments.
+pub fn set_record_command_lines(record: bool) {
+    RECORD_COMMAND_LINES.store(record, Ordering::Release);
+}
+
+/// The arguments the runtime started a process with, as its `argv`.
+fn launched_command_line(program: &str, arguments: &[String]) -> CommandLineWire {
+    let mut argv = std::iter::once(program).chain(arguments.iter().map(String::as_str));
+    command_line_of(|budget| {
+        let argument = argv.next()?.as_bytes();
+        let kept = argument.len().min(budget);
+        Some(Ok((argument[..kept].to_vec(), kept == argument.len())))
+    })
+}
+
+/// The arguments `next` yields within the limits. `next` returns up to
+/// `budget` bytes of the next argument and whether that is all of it, or
+/// `None` after the last; an argument it cannot read shortens the list.
+fn command_line_of(
+    mut next: impl FnMut(usize) -> Option<io::Result<(Vec<u8>, bool)>>,
+) -> CommandLineWire {
+    let mut command_line = CommandLineWire::default();
+    let mut budget = MAX_COMMAND_LINE_BYTES;
+    loop {
+        if command_line.arguments.len() == MAX_ARGUMENTS {
+            command_line.truncated = next(0).is_some();
+            return command_line;
+        }
+        let (argument, whole) = match next(budget) {
+            None => return command_line,
+            Some(Ok(read)) => read,
+            Some(Err(_)) => (Vec::new(), false),
+        };
+        // Nothing of an argument that could not be read, or that starts once
+        // the bytes are spent, is recorded.
+        if !whole && argument.is_empty() {
+            command_line.truncated = true;
+            return command_line;
+        }
+        budget -= argument.len();
+        command_line
+            .arguments
+            .push(String::from_utf8_lossy(&argument).into_owned());
+        if !whole {
+            command_line.truncated = true;
+            return command_line;
+        }
+    }
+}
+
+/// The arguments an exec passes, read from the caller's memory.
+fn requested_command_line(tid: u32, argv: u64) -> CommandLineWire {
+    let mut index: u64 = 0;
+    command_line_of(|budget| {
+        if argv == 0 {
+            return None;
+        }
+        let Some(slot) = index
+            .checked_mul(8)
+            .and_then(|offset| argv.checked_add(offset))
+        else {
+            return Some(Err(io::Error::from_raw_os_error(libc::EFAULT)));
+        };
+        index += 1;
+        let mut pointer = [0; 8];
+        if let Err(error) = crate::linux::task_memory::read_exact(tid, slot, &mut pointer) {
+            return Some(Err(error));
+        }
+        let address = u64::from_ne_bytes(pointer);
+        if address == 0 {
+            return None;
+        }
+        Some(crate::provider_files::read_string_bytes(
+            tid, address, budget,
+        ))
+    })
 }
 
 /// Whether the supervisor asked for each exec in the workload.
@@ -159,6 +253,7 @@ fn record_requested_exec(listener: &NotificationListener, notification: Notifica
             previous_executable: exec.previous_executable,
             parent_executable: exec.parent_executable,
         },
+        exec.command_line,
     );
     if !recorded {
         return;
@@ -172,6 +267,7 @@ fn record_requested_exec(listener: &NotificationListener, notification: Notifica
 
 struct RequestedExec {
     process: ProcessInstance,
+    command_line: Option<CommandLineWire>,
     executable: String,
     previous_executable: String,
     parent_executable: String,
@@ -183,17 +279,24 @@ struct RequestedExec {
 /// named as the caller gave it.
 fn requested_exec(notification: &Notification) -> Option<RequestedExec> {
     let tid = notification.tid;
-    let (dirfd, path_address, flags) = if i64::from(notification.syscall) == libc::SYS_execveat {
-        (
-            u32::try_from(notification.args[0] & u64::from(u32::MAX))
-                .ok()?
-                .cast_signed(),
-            notification.args[1],
-            notification.args[4],
-        )
-    } else {
-        (libc::AT_FDCWD, notification.args[0], 0)
-    };
+    let (dirfd, path_address, argv, flags) =
+        if i64::from(notification.syscall) == libc::SYS_execveat {
+            (
+                u32::try_from(notification.args[0] & u64::from(u32::MAX))
+                    .ok()?
+                    .cast_signed(),
+                notification.args[1],
+                notification.args[2],
+                notification.args[4],
+            )
+        } else {
+            (
+                libc::AT_FDCWD,
+                notification.args[0],
+                notification.args[1],
+                0,
+            )
+        };
     let path = crate::provider_files::read_path_bytes(tid, path_address).ok()?;
     let process = openshell_binary_identity::observe_process(tid)?;
     let executable = if path.is_empty()
@@ -218,6 +321,7 @@ fn requested_exec(notification: &Notification) -> Option<RequestedExec> {
             .unwrap_or_else(|_| PathBuf::from(OsString::from_vec(path)))
     };
     Some(RequestedExec {
+        command_line: records_command_lines().then(|| requested_command_line(tid, argv)),
         executable: executable.display().to_string(),
         previous_executable: executable_of(process.pid),
         parent_executable: executable_of(process.parent_pid),
@@ -364,8 +468,24 @@ impl ProcessEventLog {
     }
 
     pub fn record(&self, process: ProcessInstance, executable: &str, kind: ProcessEventKindWire) {
+        self.record_with(process, executable, kind, None);
+    }
+
+    pub fn record_with(
+        &self,
+        process: ProcessInstance,
+        executable: &str,
+        kind: ProcessEventKindWire,
+        command_line: Option<CommandLineWire>,
+    ) {
         let mut state = self.lock();
-        self.push(&mut state, process, executable.to_string(), kind);
+        self.push(
+            &mut state,
+            process,
+            executable.to_string(),
+            kind,
+            command_line,
+        );
         drop(state);
         self.changed.notify_all();
     }
@@ -378,10 +498,17 @@ impl ProcessEventLog {
         process: ProcessInstance,
         executable: &str,
         kind: ProcessEventKindWire,
+        command_line: Option<CommandLineWire>,
     ) -> bool {
         let mut state = self.lock();
         if state.exec_tokens.take(self.exec_rate_per_second) {
-            self.push(&mut state, process, executable.to_string(), kind);
+            self.push(
+                &mut state,
+                process,
+                executable.to_string(),
+                kind,
+                command_line,
+            );
             drop(state);
             self.changed.notify_all();
             true
@@ -412,6 +539,7 @@ impl ProcessEventLog {
         process: ProcessInstance,
         executable: String,
         kind: ProcessEventKindWire,
+        command_line: Option<CommandLineWire>,
     ) {
         let time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -429,6 +557,7 @@ impl ProcessEventLog {
             executable,
             kind,
             time_ms,
+            command_line,
         });
     }
 
@@ -502,6 +631,7 @@ impl ProcessEventLog {
             *runtime,
             executable.clone(),
             ProcessEventKindWire::Suppressed { count },
+            None,
         );
     }
 
@@ -521,7 +651,14 @@ fn encoded_size(event: &ProcessEventWire) -> usize {
         } => previous_executable.len() + parent_executable.len(),
         _ => 0,
     };
-    event.executable.len() + previous + 128
+    let arguments = event.command_line.as_ref().map_or(0, |command_line| {
+        command_line
+            .arguments
+            .iter()
+            .map(|argument| argument.len() + 8)
+            .sum()
+    });
+    event.executable.len() + previous + arguments + 128
 }
 
 #[cfg(test)]
@@ -644,7 +781,7 @@ mod tests {
     fn execs_over_the_rate_are_reported_as_one_suppressed_count() {
         let log = ProcessEventLog::with_exec_rate(8, 2, 1);
         for pid in 1..=5 {
-            log.record_exec(process(pid), "/bin/true", executed());
+            log.record_exec(process(pid), "/bin/true", executed(), None);
         }
         log.record(process(9), "/bin/sh", ProcessEventKindWire::Launched);
 
@@ -669,12 +806,12 @@ mod tests {
     fn suppressed_execs_are_reported_at_most_once_per_interval() {
         let log = ProcessEventLog::with_exec_rate(16, 0, 1)
             .reporting_suppressed_every(Duration::from_millis(200));
-        log.record_exec(process(1), "/bin/true", executed());
+        log.record_exec(process(1), "/bin/true", executed(), None);
         let (first, _) = log.read(0, MAX_READ, Duration::ZERO);
         assert_eq!(first[0].kind, ProcessEventKindWire::Suppressed { count: 1 });
 
         for pid in 2..=4 {
-            log.record_exec(process(pid), "/bin/true", executed());
+            log.record_exec(process(pid), "/bin/true", executed(), None);
         }
         let after = first[0].sequence;
         let (events, _) = log.read(after, MAX_READ, Duration::ZERO);
@@ -699,7 +836,7 @@ mod tests {
         let writer = log.clone();
         let recorder = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            writer.record_exec(process(7), "/bin/true", executed());
+            writer.record_exec(process(7), "/bin/true", executed(), None);
         });
         let (events, _) = log.read(0, MAX_READ, Duration::from_secs(10));
         recorder.join().unwrap();
@@ -727,12 +864,80 @@ mod tests {
     }
 
     #[test]
+    fn a_command_line_keeps_the_arguments_within_its_limits() {
+        let arguments = |count: usize, length: usize| {
+            let mut remaining =
+                (0..count).map(move |index| vec![b'a' + u8::try_from(index % 26).unwrap(); length]);
+            command_line_of(move |budget| {
+                let argument = remaining.next()?;
+                let kept = argument.len().min(budget);
+                Some(Ok((argument[..kept].to_vec(), kept == argument.len())))
+            })
+        };
+        let whole = arguments(3, 2);
+        assert_eq!(whole.arguments, ["aa", "bb", "cc"]);
+        assert!(!whole.truncated);
+
+        let many = arguments(MAX_ARGUMENTS + 1, 1);
+        assert_eq!(many.arguments.len(), MAX_ARGUMENTS);
+        assert!(many.truncated);
+        assert!(!arguments(MAX_ARGUMENTS, 1).truncated);
+
+        let long = arguments(3, MAX_COMMAND_LINE_BYTES / 2 + 1);
+        assert_eq!(long.arguments.len(), 2);
+        assert_eq!(
+            long.arguments.iter().map(String::len).sum::<usize>(),
+            MAX_COMMAND_LINE_BYTES
+        );
+        assert!(long.truncated);
+
+        // An argument that starts once the bytes are spent is not recorded
+        // as an empty one.
+        let exact = arguments(3, MAX_COMMAND_LINE_BYTES / 2);
+        assert_eq!(exact.arguments.len(), 2);
+        assert!(exact.truncated);
+
+        // An argument that cannot be read shortens the list.
+        let mut reads = 0;
+        let unreadable = command_line_of(|_| {
+            reads += 1;
+            Some(if reads == 1 {
+                Ok((b"sh".to_vec(), true))
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EFAULT))
+            })
+        });
+        assert_eq!(unreadable.arguments, ["sh"]);
+        assert!(unreadable.truncated);
+    }
+
+    #[test]
+    fn a_launched_process_command_line_is_the_argv_it_was_started_with() {
+        let arguments = ["-c".to_string(), "read _".to_string(), "it's".to_string()];
+        let command_line = launched_command_line("/bin/sh", &arguments);
+        assert_eq!(command_line.arguments, ["/bin/sh", "-c", "read _", "it's"]);
+        assert!(!command_line.truncated);
+
+        let long = ["x".repeat(MAX_COMMAND_LINE_BYTES)];
+        let command_line = launched_command_line("/bin/sh", &long);
+        assert!(command_line.truncated);
+        assert_eq!(
+            command_line
+                .arguments
+                .iter()
+                .map(String::len)
+                .sum::<usize>(),
+            MAX_COMMAND_LINE_BYTES
+        );
+    }
+
+    #[test]
     fn the_exec_rate_refills_over_time() {
         let log = ProcessEventLog::with_exec_rate(8, 1, 1_000);
-        log.record_exec(process(1), "/bin/true", executed());
-        log.record_exec(process(2), "/bin/true", executed());
+        log.record_exec(process(1), "/bin/true", executed(), None);
+        log.record_exec(process(2), "/bin/true", executed(), None);
         std::thread::sleep(Duration::from_millis(20));
-        log.record_exec(process(3), "/bin/true", executed());
+        log.record_exec(process(3), "/bin/true", executed(), None);
 
         let (events, _) = log.read(0, MAX_READ, Duration::ZERO);
         let pids: Vec<_> = events
@@ -755,6 +960,7 @@ mod tests {
         impl Drop for Recording {
             fn drop(&mut self) {
                 set_record_executions(false);
+                set_record_command_lines(false);
             }
         }
         if std::env::var_os(CHILD_MARKER).is_some() {
@@ -776,6 +982,7 @@ mod tests {
         }
 
         set_record_executions(true);
+        set_record_command_lines(true);
         let _recording = Recording;
         let first = log().lock().next_sequence;
         let (launcher, listener) = crate::linux::workload_launcher::start().expect("launcher");
@@ -836,6 +1043,22 @@ mod tests {
             linked.executable
         );
         assert_eq!(linked.process.parent_pid, shell.process.pid);
+        // Each exec carries the arguments it passed.
+        let arguments = |event: &ProcessEventWire| {
+            event
+                .command_line
+                .as_ref()
+                .map(|command_line| command_line.arguments.clone())
+        };
+        assert_eq!(
+            arguments(reexec),
+            Some(vec![
+                "/proc/self/exe".to_string(),
+                "-c".to_string(),
+                "exec /bin/true".to_string(),
+            ])
+        );
+        assert_eq!(arguments(replaced), Some(vec!["/bin/true".to_string()]));
         // `/proc/self` names the caller, not the runtime.
         assert_eq!(reexec.process, shell.process);
         assert_eq!(reexec.executable, shell_exe);

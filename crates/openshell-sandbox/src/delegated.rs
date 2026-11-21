@@ -144,7 +144,7 @@ pub async fn spawn_workload(
             .build()
     );
 
-    let recorded_launch = crate::process_events::record_launch(handle.pid(), program);
+    let recorded_launch = crate::process_events::record_launch(handle.pid(), program, args);
 
     Ok(SpawnedAgent {
         handle,
