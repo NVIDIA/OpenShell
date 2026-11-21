@@ -897,10 +897,15 @@ fn endpoint_layer_label(endpoint: &NetworkEndpoint) -> &str {
 
 fn format_allow_rule(allow: &L7Allow) -> String {
     let mut parts = Vec::new();
-    if !allow.method.is_empty() || !allow.path.is_empty() {
+    let method = if allow.method.is_empty() && allow.params.contains_key("name") {
+        "tools/call"
+    } else {
+        &allow.method
+    };
+    if !method.is_empty() || !allow.path.is_empty() {
         parts.push(format!(
             "{} {}",
-            non_empty_or(&allow.method, "*"),
+            non_empty_or(method, "*"),
             non_empty_or(&allow.path, "*")
         ));
     }
@@ -917,20 +922,26 @@ fn format_allow_rule(allow: &L7Allow) -> String {
     if !allow.fields.is_empty() {
         parts.push(format!("fields {}", allow.fields.join(",")));
     }
-    append_query_matchers(&mut parts, &allow.query);
+    append_matchers(&mut parts, "query", &allow.query);
+    append_matchers(&mut parts, "params", &allow.params);
     if parts.is_empty() {
         "*".to_string()
     } else {
-        parts.join("; ")
+        parts.join("; ").escape_debug().to_string()
     }
 }
 
 fn format_deny_rule(deny: &L7DenyRule) -> String {
     let mut parts = Vec::new();
-    if !deny.method.is_empty() || !deny.path.is_empty() {
+    let method = if deny.method.is_empty() && deny.params.contains_key("name") {
+        "tools/call"
+    } else {
+        &deny.method
+    };
+    if !method.is_empty() || !deny.path.is_empty() {
         parts.push(format!(
             "{} {}",
-            non_empty_or(&deny.method, "*"),
+            non_empty_or(method, "*"),
             non_empty_or(&deny.path, "*")
         ));
     }
@@ -947,22 +958,24 @@ fn format_deny_rule(deny: &L7DenyRule) -> String {
     if !deny.fields.is_empty() {
         parts.push(format!("fields {}", deny.fields.join(",")));
     }
-    append_query_matchers(&mut parts, &deny.query);
+    append_matchers(&mut parts, "query", &deny.query);
+    append_matchers(&mut parts, "params", &deny.params);
     if parts.is_empty() {
         "*".to_string()
     } else {
-        parts.join("; ")
+        parts.join("; ").escape_debug().to_string()
     }
 }
 
-fn append_query_matchers(
+fn append_matchers(
     parts: &mut Vec<String>,
-    query: &std::collections::HashMap<String, L7QueryMatcher>,
+    label: &str,
+    matchers: &std::collections::HashMap<String, L7QueryMatcher>,
 ) {
-    if query.is_empty() {
+    if matchers.is_empty() {
         return;
     }
-    let mut entries: Vec<_> = query.iter().collect();
+    let mut entries: Vec<_> = matchers.iter().collect();
     entries.sort_by_key(|(key, _)| *key);
     let formatted = entries
         .into_iter()
@@ -975,7 +988,7 @@ fn append_query_matchers(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    parts.push(format!("query {formatted}"));
+    parts.push(format!("{label} {formatted}"));
 }
 
 fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
@@ -1000,6 +1013,109 @@ mod tests {
     use crate::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn draft_mcp_tool_selectors_are_visible_in_summary_and_details() {
+        for (selector, expected) in [
+            ("delete_repo", "params name=delete_repo"),
+            ("{any: [read_*, list_*]}", "params name in [read_*,list_*]"),
+        ] {
+            let policy = openshell_policy::parse_sandbox_policy(&format!(
+                r"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: allow.example.com
+        port: 443
+        protocol: mcp
+        mcp:
+          allow_all_known_mcp_methods: true
+        rules:
+          - allow:
+              tool: {selector}
+      - host: deny.example.com
+        port: 443
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/call
+        deny_rules:
+          - method: tools/call
+            tool: {selector}
+    binaries:
+      - path: /usr/bin/curl
+"
+            ))
+            .unwrap();
+            let endpoints = &policy.network_policies["mcp"].endpoints;
+            assert!(format_endpoint_summary(&endpoints[0]).contains(expected));
+            assert!(
+                format_endpoint_details(&endpoints[0])
+                    .iter()
+                    .any(|line| line == &format!("Allow: tools/call *; {expected}"))
+            );
+            assert!(format_endpoint_summary(&endpoints[1]).contains(expected));
+            let details = format_endpoint_details(&endpoints[1]);
+            assert!(details.iter().any(|line| line == "Allow: tools/call *"));
+            assert!(
+                details
+                    .iter()
+                    .any(|line| line == &format!("Deny: tools/call *; {expected}"))
+            );
+        }
+    }
+
+    #[test]
+    fn draft_rule_matchers_escape_controls_and_preserve_other_protocols() {
+        let params = std::collections::HashMap::from([(
+            "name".to_string(),
+            L7QueryMatcher {
+                glob: "read_public\u{1b}[2J\nWRITE".to_string(),
+                ..Default::default()
+            },
+        )]);
+        let allow = L7Allow {
+            method: "tools/call".to_string(),
+            params: params.clone(),
+            ..Default::default()
+        };
+        let deny = L7DenyRule {
+            method: "tools/call".to_string(),
+            params,
+            ..Default::default()
+        };
+        for rendered in [format_allow_rule(&allow), format_deny_rule(&deny)] {
+            assert!(!rendered.chars().any(char::is_control));
+            assert!(rendered.contains(r"read_public\u{1b}[2J\nWRITE"));
+        }
+        let query = std::collections::HashMap::from([(
+            "state".to_string(),
+            L7QueryMatcher {
+                glob: "open".to_string(),
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            format_allow_rule(&L7Allow {
+                method: "GET".to_string(),
+                path: "/repos/**".to_string(),
+                query,
+                ..Default::default()
+            }),
+            "GET /repos/**; query state=open"
+        );
+        assert_eq!(
+            format_deny_rule(&L7DenyRule {
+                operation_type: "mutation".to_string(),
+                operation_name: "DeleteRepo".to_string(),
+                fields: vec!["deleteRepository".to_string()],
+                ..Default::default()
+            }),
+            "graphql mutation DeleteRepo; fields deleteRepository"
+        );
+    }
 
     /// Column width computed independently of the production `display_width`.
     ///
