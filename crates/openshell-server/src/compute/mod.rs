@@ -981,8 +981,9 @@ pub struct ComputeRuntime {
     /// Sandboxes with a display writer running, and whether a newer report
     /// arrived since it started. One writer per sandbox persists the newest.
     display_writers: Arc<StdMutex<HashMap<String, bool>>>,
-    /// Idle stops waiting for their supervisor to confirm, by request ID.
-    activity_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<()>>>>,
+    /// Idle stops waiting for their supervisor to confirm, by request ID. The
+    /// reply's arrival time at the report handler is sent to the waiter.
+    activity_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<Instant>>>>,
     sandbox_updates_enabled: bool,
     update_recovery_sweep: Arc<tokio::sync::Semaphore>,
     update_recovery_backoff: Arc<Mutex<HashMap<String, image_update::UpdateRecoveryBackoff>>>,
@@ -5306,14 +5307,18 @@ impl ComputeRuntime {
         if !live.confirms
             || !self.owned_by_session(sandbox_id, &live.session_id).await
             || self.idle_stop_due_now(sandbox).await.is_none()
-            || !self.confirm_activity(sandbox_id, &live.session_id).await
         {
             return Ok(None);
         }
+        // The deadline starts when the reply reached the report handler, so
+        // scheduling delay before this task resumes counts against it.
+        let Some(arrived) = self.confirm_activity(sandbox_id, &live.session_id).await else {
+            return Ok(None);
+        };
         self.idle_confirmations
             .lock()
             .expect("idle confirmation lock poisoned")
-            .insert(sandbox_id.to_string(), (live.session_id, Instant::now()));
+            .insert(sandbox_id.to_string(), (live.session_id, arrived));
         let result = self
             .quiesce_sandbox(
                 QuiesceOperation::Stop,
@@ -5374,7 +5379,8 @@ impl ComputeRuntime {
     }
 
     /// Ask the session's supervisor for a fresh report and wait for it.
-    async fn confirm_activity(&self, sandbox_id: &str, session_id: &str) -> bool {
+    /// Returns when the reply reached the report handler.
+    async fn confirm_activity(&self, sandbox_id: &str, session_id: &str) -> Option<Instant> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.activity_requests
@@ -5394,11 +5400,14 @@ impl ComputeRuntime {
                 ),
             },
         );
-        let answered = sent
-            && matches!(
-                tokio::time::timeout(idle_stop::CONFIRM_TIMEOUT, rx).await,
-                Ok(Ok(()))
-            );
+        let answered = if sent {
+            tokio::time::timeout(idle_stop::CONFIRM_TIMEOUT, rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        } else {
+            None
+        };
         self.activity_requests
             .lock()
             .expect("activity request lock poisoned")
@@ -5524,6 +5533,28 @@ impl ComputeRuntime {
         confirms: bool,
         report: &openshell_core::proto::SupervisorWorkloadActivity,
     ) -> Result<(), String> {
+        self.record_workload_activity_at(
+            sandbox_id,
+            session_id,
+            instance_id,
+            confirms,
+            report,
+            Instant::now(),
+        )
+        .await
+    }
+
+    /// [`Self::record_workload_activity`] for a report that reached the
+    /// handler at `arrived`.
+    async fn record_workload_activity_at(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        instance_id: &str,
+        confirms: bool,
+        report: &openshell_core::proto::SupervisorWorkloadActivity,
+        arrived: Instant,
+    ) -> Result<(), String> {
         let received = SystemTime::now();
         let accepted = {
             let gate = self.activity_gate(sandbox_id);
@@ -5556,7 +5587,7 @@ impl ComputeRuntime {
                 .expect("activity request lock poisoned")
                 .remove(&report.request_id)
         {
-            let _ = waiter.send(());
+            let _ = waiter.send(arrived);
         }
         if accepted {
             self.schedule_display_write(sandbox_id);
@@ -5615,15 +5646,10 @@ impl ComputeRuntime {
         let _guard = self.lock_sandbox_local(sandbox_id).await;
         let mut attempt = 1;
         loop {
-            // Each attempt uses the newest report and is fenced to the
-            // session that owns the sandbox, so a former owner cannot
-            // overwrite the current owner's status after a handoff.
-            let Some(live) = self.current_live_activity(sandbox_id) else {
-                return Ok(());
-            };
-            if !self.owned_by_session(sandbox_id, &live.session_id).await {
-                return Ok(());
-            }
+            // Read the versioned sandbox first and check ownership second. A
+            // takeover before the check fails it; a newer status write after
+            // the read fails the conditional write and the retry checks
+            // ownership again, so a former owner never overwrites it.
             let Some(existing) = self
                 .store
                 .get_message::<Sandbox>(sandbox_id)
@@ -5632,6 +5658,12 @@ impl ComputeRuntime {
             else {
                 return Ok(());
             };
+            let Some(live) = self.current_live_activity(sandbox_id) else {
+                return Ok(());
+            };
+            if !self.owned_by_session(sandbox_id, &live.session_id).await {
+                return Ok(());
+            }
             let Some(status) = existing.status.as_ref() else {
                 return Ok(());
             };
@@ -23609,5 +23641,135 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             "Done",
             "the newest report is persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_reached_the_handler_too_long_ago_never_stops() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        due_sandbox(&runtime, "sb-late", "sandbox-late").await;
+        // The reply reached the handler, but the stop task resumed only after
+        // the freshness window had passed.
+        let (tx, mut rx) = mpsc::channel::<openshell_core::proto::GatewayMessage>(8);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        runtime.supervisor_sessions.register(
+            "sb-late".to_string(),
+            "session-1".to_string(),
+            tx,
+            shutdown_tx,
+        );
+        let responder = runtime.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let Some(
+                    openshell_core::proto::gateway_message::Payload::WorkloadActivityRequest(
+                        request,
+                    ),
+                ) = message.payload
+                {
+                    let mut reply = still_idle();
+                    reply.request_id = request.request_id;
+                    let arrived = Instant::now()
+                        .checked_sub(idle_stop::CONFIRM_FRESHNESS + Duration::from_millis(100))
+                        .expect("test clock is past the freshness window");
+                    let _ = responder
+                        .record_workload_activity_at(
+                            "sb-late",
+                            "session-1",
+                            "instance-1",
+                            true,
+                            &reply,
+                            arrived,
+                        )
+                        .await;
+                }
+            }
+        });
+        let sandbox = stored_sandbox(&runtime, "sb-late").await;
+        assert!(runtime.run_idle_stop(&sandbox).await.unwrap().is_none());
+        assert_eq!(driver.stop_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_takeover_during_a_display_write_never_overwrites_the_new_owner() {
+        use openshell_core::proto::WorkloadProgramState;
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let mut runtime = test_runtime(ControlledDriver::new()).await;
+        runtime.store = store;
+        due_sandbox(&runtime, "sb-mid", "sandbox-mid").await;
+        // The displayed status is `Working`; this replica's live report is an
+        // older `Done` it has not persisted yet.
+        record(
+            &runtime,
+            "sb-mid",
+            &program_report(WorkloadProgramState::Working, 0),
+        )
+        .await;
+        // Let the background writers from setup finish first.
+        for _ in 0..200 {
+            if runtime.display_writers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            idle_stop::program_condition(&stored_sandbox(&runtime, "sb-mid").await)
+                .unwrap()
+                .reason,
+            "Working"
+        );
+        runtime.live_activity.lock().unwrap().insert(
+            "sb-mid".to_string(),
+            idle_stop::live_from_report(
+                &still_idle(),
+                "session-1",
+                "instance-1",
+                true,
+                SystemTime::now(),
+            ),
+        );
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect takeover injector");
+        sqlx::query("CREATE TABLE injected_takeovers (marker TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create takeover marker table");
+        // Another replica takes ownership and writes the sandbox between this
+        // replica's ownership check and its conditional write.
+        sqlx::query(
+            "CREATE TRIGGER inject_takeover \
+             BEFORE UPDATE OF payload ON objects \
+             WHEN instr(NEW.payload, CAST('claude-code is done' AS BLOB)) > 0 \
+               AND NOT EXISTS (SELECT 1 FROM injected_takeovers WHERE marker = 'takeover') \
+             BEGIN \
+               INSERT INTO injected_takeovers (marker) VALUES ('takeover'); \
+               UPDATE objects SET payload = CAST(replace(CAST(payload AS TEXT), \
+                   '\"session_id\":\"session-1\"', '\"session_id\":\"session-2\"') AS BLOB) \
+                 WHERE object_type = 'supervisor_session_owner'; \
+               UPDATE objects SET resource_version = resource_version + 1 \
+                 WHERE object_type = OLD.object_type AND id = OLD.id; \
+               SELECT RAISE(IGNORE); \
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install takeover trigger");
+
+        runtime.persist_program_condition("sb-mid").await.unwrap();
+        let injected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM injected_takeovers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(injected, 1, "the stale write reached the conditional write");
+        let shown = stored_sandbox(&runtime, "sb-mid").await;
+        assert_eq!(
+            idle_stop::program_condition(&shown).unwrap().reason,
+            "Working",
+            "the retry sees the takeover and leaves the new owner's status"
+        );
+        pool.close().await;
     }
 }
