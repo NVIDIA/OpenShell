@@ -18,6 +18,7 @@ target (`harness = false`), so `openshell-conformance run`,
 | `ssh` | The SSH host key: the same in get, list, and `ssh`; kept across stop and start; new for a recreated sandbox |
 | `persistent-workspace` | Files in `/sandbox` survive stop and start |
 | `policy-advisor` | `policy.local` accepts a proposed rule; a denied address or hostname yields one draft rule |
+| `policy-dns` | A client that keeps a policy DNS address can open new connections to it after the lookup |
 | `file-transfer` | `sandbox upload` and `download`: round trips, file modes and symlinks outside the workspace, `.gitignore` filtering, workspace-escape and option-looking names, a large upload |
 | `create-upload` | `sandbox create --upload`: directory basename and nested files, multiple uploads, a single file |
 | `credential-gating` | Provider credentials: admission of credentialed endpoints, REST body placeholders and rewriting, WebSocket binary frames, live policy binding |
