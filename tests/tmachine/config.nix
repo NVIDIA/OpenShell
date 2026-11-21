@@ -114,6 +114,12 @@ let
       bases = dockerBases ++ podmanBases;
       setup.playbooks = [ "ansible/playbooks/cdi.yaml" ];
     };
+    # A gateway that pushes configuration to supervisors
+    # (`config_delivery_mode = "push"`), for the conformance family.
+    config-push = {
+      bases = dockerBases;
+      setup.playbooks = [ "ansible/playbooks/config-push.yaml" ];
+    };
   };
   featureEnvironments = pkgs.lib.concatMap (
     feature: map (base: withSetup base feature features.${feature}.setup) features.${feature}.bases

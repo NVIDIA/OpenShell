@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Make the gateway push configuration to supervisors.
+#
+# Writes `[openshell.gateway] config_delivery_mode = "push"` to
+# /etc/openshell-test/gateway-overrides.toml, which the `binaries`, `deb` and
+# `rpm` installers apply to the gateway's configuration (k3s installers ignore
+# it).
+---
+- name: Gateway configuration push for tests
+  hosts: all
+  gather_facts: false
+  vars:
+    config_push_overrides: /etc/openshell-test/gateway-overrides.toml
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create the test configuration directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ config_push_overrides | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # A managed block keeps tables that earlier playbooks wrote. Some writers
+    # replace the whole file: drivers/podman/userns.yaml and the cdi_fixtures
+    # role in environment setup, which must run before this playbook, and the
+    # openshell_external_driver role in the deb-external-docker-driver
+    # installer, which always runs after it, so don't pair that installer with
+    # this environment.
+    #
+    # TODO: https://github.com/NVIDIA/OpenShell/pull/5489 installs this file
+    # as a gateway.d drop-in config, which must declare `[openshell]
+    # version = 2`. When it lands, add that table here unless an earlier
+    # writer already does; TOML rejects a table defined twice.
+    - name: Write the configuration delivery mode
+      become: true
+      ansible.builtin.blockinfile:
+        path: "{{ config_push_overrides }}"
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+        marker: "# {mark} config-push.yaml"
+        block: |
+          [openshell.gateway]
+          config_delivery_mode = "push"
