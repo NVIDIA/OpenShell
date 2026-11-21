@@ -14,5 +14,5 @@ use std::process::ExitCode;
 use conformance as _;
 
 fn main() -> ExitCode {
-    testkit::main()
+    testkit::program::main_for(env!("CARGO_PKG_NAME"), env!("CARGO_BIN_NAME"))
 }

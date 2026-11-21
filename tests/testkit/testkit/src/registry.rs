@@ -59,7 +59,7 @@ impl Test {
 
 /// Names a test cannot have at the top level: the program would read them as
 /// its own subcommands, so nextest could not run the test by name.
-pub const RESERVED_NAMES: &[&str] = &["help", "list", "ready", "run"];
+pub const RESERVED_NAMES: &[&str] = &["help", "list", "ready", "run", "nextest-metadata"];
 
 /// Check the tests can be told apart by name.
 pub fn validate(tests: &[Test]) -> Result<(), String> {

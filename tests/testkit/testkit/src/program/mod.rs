@@ -12,12 +12,14 @@
 //! }
 //! ```
 //!
-//! It has three subcommands:
+//! Its subcommands:
 //!
 //! - `list [FILTER]...` prints each test's name and description.
 //! - `ready [--timeout SECS]` waits for the gateway, as `testkit-ready` does.
 //! - `run [FILTER]...` runs tests one at a time, each in its own process with
 //!   a timeout, and can write a `JUnit` report. Unix only.
+//! - `nextest-metadata DIR` describes the executable to nextest, so it can
+//!   run the prebuilt program without Cargo.
 //!
 //! Any other arguments are libtest's, so the program also works as a
 //! `harness = false` test target under `cargo test` and nextest: it answers
@@ -33,6 +35,7 @@
 mod capture;
 #[cfg(unix)]
 mod junit;
+mod nextest;
 #[cfg(unix)]
 mod process;
 #[cfg(unix)]
@@ -62,9 +65,19 @@ pub fn main() -> ExitCode {
     main_with(&TESTS)
 }
 
+/// Run a suite program with the package and binary names it has under Cargo.
+/// These names are used by `nextest-metadata`, even if the executable is renamed.
+pub fn main_for(package: &str, binary: &str) -> ExitCode {
+    dispatch(&TESTS, Some((package, binary)))
+}
+
 /// [`main`] over `tests` instead of every registered test.
 #[doc(hidden)]
 pub fn main_with(tests: &'static [Test]) -> ExitCode {
+    dispatch(tests, None)
+}
+
+fn dispatch(tests: &'static [Test], identity: Option<(&str, &str)>) -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let program = program_name(&args);
     // A suite crate that the program never names is not linked, and its
@@ -96,7 +109,7 @@ pub fn main_with(tests: &'static [Test]) -> ExitCode {
                 return ExitCode::from(if error.use_stderr() { ERROR_EXIT } else { 0 });
             }
         };
-        command(&program, tests, unsupported, cli.command)
+        command(&program, tests, unsupported, cli.command, identity)
     } else {
         libtest(tests, unsupported, args)
     }
@@ -118,6 +131,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write metadata to run the prebuilt executable with cargo-nextest.
+    NextestMetadata {
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
     /// Print each test's name and description, including ignored tests.
     List {
         /// Show tests whose name contains any of these (all if none).
@@ -167,8 +185,23 @@ fn command(
     tests: &'static [Test],
     unsupported: Unsupported,
     command: Command,
+    identity: Option<(&str, &str)>,
 ) -> ExitCode {
     match command {
+        Command::NextestMetadata { dir } => {
+            let package = tests[0].package();
+            let (package, binary) = identity.unwrap_or((package, program));
+            match nextest::write(&dir, package, binary) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!(
+                        "{program}: write nextest metadata to {}: {error}",
+                        dir.display()
+                    );
+                    ExitCode::from(ERROR_EXIT)
+                }
+            }
+        }
         Command::List { filters } => {
             list(tests, &unsupported, filters);
             ExitCode::SUCCESS

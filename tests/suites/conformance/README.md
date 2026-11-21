@@ -77,6 +77,10 @@ Add a `#[testkit::test]` function to a suite, or for a new area, a new file in
 `src/` and a `mod` line for it in `src/lib.rs`. `openshell-conformance`
 includes every test in the crate.
 
+Tests must be safe to run concurrently on a shared gateway. Use test-unique
+names, selectors, and host fixtures; assert on test-owned resources, not
+gateway-wide counts. Do not change gateway-wide settings or routes.
+
 ## What a test may assert
 
 These tests run on every compute driver, so they check the public contract and

@@ -8,6 +8,7 @@
 //! provides the guest cross-compilation toolchain, QEMU, Ansible, and the
 //! tmachine configuration.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -84,6 +85,9 @@ struct RunArgs {
     /// the guest's architecture (a `*-unknown-linux-musl` build).
     #[arg(long, value_name = "PATH", conflicts_with = "packages")]
     program: Option<PathBuf>,
+    /// Maximum number of tests nextest runs at once [default: 1].
+    #[arg(long, value_name = "N")]
+    test_threads: Option<NonZeroUsize>,
     /// The gateway name the installer registers with the CLI. The packaged
     /// installers register `openshell`.
     #[arg(long, default_value = "openshell")]
@@ -181,6 +185,7 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
             gateway: &args.gateway,
             bundle: &bundle,
             filters: &filters,
+            test_threads: args.test_threads,
             results: &results,
             keep: args.keep,
             disruption,
@@ -256,6 +261,29 @@ fn repo_root() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_threads_accepts_a_positive_count_for_programs_and_bundles() {
+        let args = [
+            "runner",
+            "run",
+            "--environment",
+            "ubuntu-k3s",
+            "--installer",
+            "k3s",
+            "--family",
+            "conformance",
+            "--test-threads",
+        ];
+        assert!(Cli::try_parse_from(args.into_iter().chain(["0", "--program", "p"])).is_err());
+        for source in ["--program", "--bundle"] {
+            let cli = Cli::try_parse_from(args.into_iter().chain(["4", source, "p"])).unwrap();
+            let Command::Run(run) = cli.command else {
+                panic!("not run")
+            };
+            assert_eq!(run.test_threads.map(NonZeroUsize::get), Some(4));
+        }
+    }
 
     #[test]
     fn family_is_a_path_under_tests_suites() {

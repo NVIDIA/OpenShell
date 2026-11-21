@@ -96,6 +96,22 @@ if [[ ! -s "${work}/nextest" ]] || ! diff -u "${work}/nextest" "${work}/program"
 fi
 echo "openshell-conformance lists the same $(wc -l < "${work}/program" | tr -d ' ') tests as nextest"
 
+# Check the same inventory from a renamed prebuilt binary without Cargo on PATH.
+messages="$(cargo build --locked --manifest-path "${conformance}" --bin openshell-conformance --message-format json)"
+program="$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' <<< "${messages}")"
+cp "${program}" "${work}/test-program"
+"${work}/test-program" nextest-metadata "${work}/metadata"
+nextest="$(command -v cargo-nextest)"
+(
+    cd "${work}/metadata"
+    PATH=/usr/bin:/bin OPENSHELL_TEST_UNSUPPORTED="${unsupported}" \
+        "${nextest}" nextest list --color never --run-ignored all \
+        --cargo-metadata cargo-metadata.json --binaries-metadata binaries-metadata.json \
+        --message-format oneline
+) > "${work}/prebuilt"
+grep -q '^conformance::bin/openshell-conformance ' "${work}/prebuilt"
+awk '{print $2}' "${work}/prebuilt" | sort | diff -u "${work}/program" -
+
 if [[ -n "${unsupported}" ]]; then
     for manifest in "${manifests[@]}"; do
         OPENSHELL_TEST_UNSUPPORTED="${unsupported}" \

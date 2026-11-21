@@ -107,5 +107,6 @@ jobs:
 
       - name: Run tests
         env:
+          OPENSHELL_TESTKIT_THREADS: "4"
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
         run: ${{ matrix.cmd }}
