@@ -8,14 +8,14 @@ metadata:
 # Build OpenShell-MXC for Windows
 
 This skill maintains the existing native Windows MSVC build lane in the
-OpenShell repository's [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+OpenShell repository's [`windows` branch](https://github.com/ai-openshell/openshell/tree/windows).
 That branch owns native Windows implementation and releases. Shared docs may
 also appear on `main`; always direct Windows work to `windows` and use explicit
 Windows branch links for implementation details. See
-[Native Windows support](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
+[Native Windows support](https://github.com/ai-openshell/openshell/blob/windows/WINDOWS.md).
 
 Before running the tasks below, use a `windows`-based checkout and read the
-[skill from that branch](https://github.com/NVIDIA/OpenShell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md).
+[skill from that branch](https://github.com/ai-openshell/openshell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md).
 The task and runtime descriptions refer to that checkout, not to any older
 Windows source snapshot retained on `main`.
 
@@ -157,7 +157,7 @@ Out of scope:
 ## Recommended Checkout Flow
 
 From a fork checkout where `upstream` points to the official
-`NVIDIA/OpenShell` GitHub repository, use:
+`ai-openshell/openshell` GitHub repository, use:
 
 ```powershell
 git fetch upstream windows
@@ -289,16 +289,16 @@ order:
 The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
-dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy for the
+dependency artifacts. Pull requests labeled `test:windows` run Clippy for the
 Windows-supported workspace and e2e crates plus Rust tests. Pushes to `windows` and
 manual dispatches on that branch run the same lint and test commands in a cache-seed job,
 followed by a dependent release-binary build job. The seed and PR jobs use the
-same cache namespaces, but pull-request mirrors cannot restore the
+same cache namespaces, but pull requests cannot restore the
 `windows` branch cache because GitHub scopes caches by branch. Merge queues do
 not run this workflow. Release-branch seed
 and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
-failures normally. Applying the label alone does not start a run: re-run all
-jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.
+failures normally. Applying the label starts a run, and later commits to the PR
+run it again. The binaries are not uploaded or published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
@@ -312,9 +312,9 @@ compatibility under emulation is not part of these tasks. The aggregate
 commands above on an ARM64 host.
 
 The repository-wide `mise run pre-commit` task is also supported on Windows.
-Run `rust:lockfiles:check` and `sdk:ts:ci` through the Windows-aware tasks
-when validating those surfaces. Do not count POSIX permission-bit skips as
-security coverage. SDK test dependencies must remain at their lockfile versions.
+Run `rust:lockfiles:check` through the Windows-aware task
+when validating that surface. Do not count POSIX permission-bit skips as
+security coverage.
 Its Rust check, Clippy, and test dependencies enter the same MSVC environment
 for the native host target and use an inherited compiler wrapper when it is
 available. Linux glibc

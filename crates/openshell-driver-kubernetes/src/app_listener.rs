@@ -28,7 +28,10 @@ pub fn configure_supervisor_pod(mut pod: Pod, config: &KubernetesAppListenerConf
             "OPENSHELL_APP_LISTEN_ADDRESS",
             format!("0.0.0.0:{}", config.common.port),
         ),
-        ("OPENSHELL_APP_SERVICE_DOMAIN", config.common.domain.clone()),
+        (
+            "OPENSHELL_APP_BASE_URL",
+            config.common.base_url.clone().unwrap_or_default(),
+        ),
         ("OPENSHELL_APP_TLS_CERT", format!("{TLS_PATH}/tls.crt")),
         ("OPENSHELL_APP_TLS_KEY", format!("{TLS_PATH}/tls.key")),
     ] {
@@ -85,5 +88,42 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(configure_supervisor_pod(pod.clone(), &config), pod);
+    }
+
+    #[test]
+    fn supervisor_receives_base_url_separately_from_its_listener_port() {
+        let pod = Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                containers: vec![k8s_openapi::api::core::v1::Container {
+                    name: "supervisor".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = KubernetesAppListenerConfig {
+            common: openshell_core::app_listener::AppListenerConfig {
+                enabled: true,
+                port: 9443,
+                base_url: Some("https://services.example.com:10443".into()),
+            },
+            tls_secret_name: "app-tls".into(),
+        };
+        config.common.validate().unwrap();
+        let pod = configure_supervisor_pod(pod, &config);
+        let env = pod.spec.unwrap().containers.remove(0).env.unwrap();
+        let value = |name| {
+            env.iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .value
+                .as_deref()
+        };
+        assert_eq!(
+            value("OPENSHELL_APP_BASE_URL"),
+            Some("https://services.example.com:10443")
+        );
+        assert_eq!(value("OPENSHELL_APP_LISTEN_ADDRESS"), Some("0.0.0.0:9443"));
     }
 }

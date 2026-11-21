@@ -497,9 +497,13 @@ fleet. Sandbox start, stop, and delete lock only on the replica that runs them,
 and only a gateway-global change on that replica blocks them directly.
 Provider, workspace-profile, and other replicas' gateway-global changes delay
 them only while another operation on the same sandbox waits behind the change.
-Sandbox create, start, restart, and delete also take one fleet-wide lock while
-they provision or remove the sandbox's SSH host identity, so that step runs for
-one sandbox at a time across all replicas. For other
+Sandbox create, start, restart, and delete also lock the sandbox's SSH host
+identity while they provision or remove it, so that step runs for different
+sandboxes at once. During a rollout, replicas from an earlier release still
+take a fleet-wide lock for that step, so it can wait on other sandboxes' steps
+until the rollout finishes. Each replica runs at most half of
+`database_max_connections` of these steps and provider refreshes at once, and a
+step that can't start within 10 seconds returns `UNAVAILABLE`. For other
 mutations, a lock wait longer than 10 seconds returns `UNAVAILABLE` with the
 reason `MUTATION_LOCK_TIMEOUT`, and clients can retry the request. A request
 that carried a `request_id` leaves its admission unresolved, like any other
@@ -665,6 +669,55 @@ window. If your release uses older values, upgrade with
 `--reset-then-reuse-values` as described in
 [Autoscale with a HorizontalPodAutoscaler](#autoscale-with-a-horizontalpodautoscaler).
 When you disable the HPA, set `supervisor.replicas` in the same upgrade.
+
+### Size Sandbox Capacity
+
+Three values set how many sandboxes the cluster can run:
+
+| Value | Default | Range | Meaning |
+|---|---|---|---|
+| `supervisor.pool.maxInstancesPerMember` | `128` | `1` to `1024` | Sandboxes one supervisor runs. |
+| `supervisor.pool.maxMembersPerGateway` | `32` | `1` or more | Supervisors one gateway replica serves. |
+| `replicaCount` | `1` | | Gateway replicas. |
+
+The pool runs at most `replicaCount` × `maxMembersPerGateway` ×
+`maxInstancesPerMember` sandboxes, and never more than 131,072. The gateway
+places each new sandbox on the supervisor running the fewest. When either
+limit is reached, `openshell sandbox create` fails at once with
+`sandbox capacity reached`.
+Rendering fails when
+`supervisor.replicas` or `supervisor.autoscaling.maxReplicas` exceeds
+`replicaCount` × `maxMembersPerGateway`; with gateway autoscaling, the chart
+uses `autoscaling.minReplicas`.
+
+To run more supervisors, raise `replicaCount` or `maxMembersPerGateway`. More
+than one gateway replica needs an external PostgreSQL database and a
+Deployment workload; refer to
+[Size PostgreSQL Connections](#size-postgresql-connections). For example,
+three gateways serve up to 96 supervisors at the default 32 each:
+
+```shell
+helm install openshell <chart> -n openshell \
+  --set replicaCount=3 --set workload.kind=deployment \
+  --set server.externalDbSecret=<secret> --set supervisor.replicas=80
+```
+
+Supervisor memory grows with the sandboxes it runs. The chart sets no
+`supervisor.resources` by default. For 128 sandboxes per supervisor, request
+`250m` CPU and `768Mi` memory, with a `1.5Gi` memory limit, and scale memory
+with `maxInstancesPerMember`.
+
+The chart ships `values-scale-10k.yaml` as a starting point for about 10,000
+sandboxes: 2 gateway replicas with up to 40 supervisors each, and a supervisor
+HPA from 10 to 80 replicas at 128 sandboxes each. It needs an external
+database. Pull the chart to get the file, then install from the extracted
+copy:
+
+```shell
+helm pull oci://ghcr.io/nvidia/openshell/helm-chart --version <version> --untar
+helm install openshell ./helm-chart -n openshell \
+  -f helm-chart/values-scale-10k.yaml --set server.externalDbSecret=<secret>
+```
 
 ## Next Steps
 

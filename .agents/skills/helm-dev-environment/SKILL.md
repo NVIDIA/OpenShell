@@ -79,7 +79,7 @@ gatewayConfig:
 ```
 
 The gateway chart creates a shared supervisor Deployment (`supervisor.replicas`,
-default one), Service, NetworkPolicy, and an empty
+default two), Service, NetworkPolicy, and an empty
 `<release>-supervisor-token` Secret in
 the release namespace, regardless of shared/managed/operator workspace mode.
 The gateway mints a supervisor token from its sandbox-JWT signing key, writes
@@ -107,7 +107,52 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
   mise run e2e:kubernetes:shared-supervisor
 ```
 
+`mise run e2e:kubernetes:shared-supervisor-spiffe` installs pinned SPIRE charts
+(`ci/values-spire-broker-stack.yaml`) and the `openshell.gateway.spiffe_broker`
+overlay (`ci/values-supervisor-spiffe.yaml`). It exercises provider exchange and
+abrupt supervisor takeover over TLS, using Sandbox CR UID registrations and
+enforced Kubernetes authorization. Workload generation, Pod, process, and stable
+SPIFFE identity survive; the new owner acquires a fresh provider token and the
+broker rejects the old bearer. The fixture's 30-second workload X.509-SVIDs
+exercise acquisition after credential rotation. The gateway Pod must pass
+Restricted Pod Security admission. The task owns its SPIRE install and cluster.
+
+The task creates three nodes (`HELM_K3S_AGENT_COUNT=2` adds two k3d agents) and
+requires three SPIRE agents. Its cluster-scoped `server_spiffe_id_prefix` accepts
+the concrete node identities, and a node alias distributes Sandbox registrations
+to all eligible agents. The test selects each Broker backend in turn and forces
+a new generation's acquisition, then replaces one agent and checks acquisition
+without re-registering the sandbox. Exact-ID mode remains available for a fixed
+endpoint. The installed SPIRE version and operator must expose the experimental
+Broker API.
+
+For remote clusters, set `OPENSHELL_E2E_HOST_GATEWAY_IP` to a host reachable
+from Pods. Optional `OPENSHELL_E2E_SPIFFE_STS_PORT` and
+`OPENSHELL_E2E_SPIFFE_TARGET_PORT` fix the test's host listener ports so an
+operator can forward them through a reverse tunnel. Keep the tunnel available
+through the test and remove it afterward. Use an explicit kubeconfig and context
+to avoid repository environment defaults targeting a local cluster.
+`OPENSHELL_E2E_SPIFFE_DRIVER_CONFIG_JSON` can pass a driver override to test
+sandbox creation, such as a node selector for a Landlock-capable pool. Enable
+`allow_driver_config` in the test gateway when using this override. GKE COS
+nodes may lack Landlock; use compatible Ubuntu nodes for sandbox workloads.
+For remote abrupt-failover coverage, set
+`OPENSHELL_E2E_SUPERVISOR_PROCESS_CONTROL=1`. Before creating sandboxes, the test
+adds an unprivileged process-control sidecar and enables the supervisor Pod's
+shared process namespace. The sidecar sends SIGKILL to the supervisor as the
+same UID; it needs no host PID namespace, capabilities, or runtime socket.
+The default k3d/kind test continues to kill through the node container runtime.
+
 ### Shared supervisor high availability
+
+`mise run e2e:kubernetes:shared-supervisor-spiffe-node-local` validates direct
+node-local Broker TCP routing. The chart injects `OPENSHELL_NODE_IP` from
+`status.hostIP` for `spiffe_broker.node_local_port`; it creates no Broker Service.
+The task uses an external PostgreSQL fixture and a gateway Deployment, moves
+the gateway across the SPIRE nodes, restricts Broker egress to its current node,
+and forces fresh token acquisition on each node and after local agent replacement.
+The shared-supervisor failover, credential rotation, and identity fencing checks
+also run. Keep gateway/supervisor/sandbox images from the same branch.
 
 The shared supervisor is always a pool of `supervisor.replicas` members
 (default 1), or an HPA-managed pool when `supervisor.autoscaling.enabled=true`.
@@ -121,9 +166,11 @@ expects Helm to own replicas. Changing HPA bounds or target must leave the
 gateway config and supervisor Pod template unchanged, as checked by
 `deploy/helm/test-supervisor-pool-scaling.sh`. With the gateway topology the
 chart renders the gateway's
-`[openshell.gateway.supervisor_pool]` tuning table (only
-`recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
-the driver's `shared_supervisor` table stays unchanged), a
+`[openshell.gateway.supervisor_pool]` tuning table (`recovery_timeout_secs`
+from `supervisor.recoveryTimeoutSeconds`, default 60, plus
+`max_instances_per_member` and `max_members_per_gateway` from
+`supervisor.pool.maxInstancesPerMember` and `.maxMembersPerGateway`; the
+driver's `shared_supervisor` table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with a 60-second
 grace period, no affinity unless `supervisor.affinity` is set (top-level
 `affinity` applies only to the gateway), the pool identity env vars
@@ -447,8 +494,19 @@ Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
 Set `OPENSHELL_E2E_KUBE_TEST=kubernetes_image_update` to scope the Rust suite to
 combined image, command, environment, and metadata updates with retained sandbox,
 SSH, and PVC identities. The next start verifies the new argv and environment. This target is
-included in both existing Agent Sandbox API-version lanes; unlike the Python
-Docker suite, it exercises the driver that supports image updates.
+included in both existing Agent Sandbox API-version lanes. Docker separately
+supports image-only updates on stopped, opt-in persistent `/sandbox` workspaces;
+this Kubernetes lane does not qualify that path. Docker requires locally cached
+images, a matching numeric target `USER UID:GID`, and no image-declared volumes.
+Do not treat a skipped Docker lane as live image-replacement coverage.
+
+The separate `docker-updates` testkit suite qualifies the full Docker path
+through an owned mTLS gateway, including SSH exec, image replacement, restart,
+credential-publication repair and deletion. Follow
+`tests/suites/features/docker-updates/README.md`; the wrapper's
+`OPENSHELL_E2E_DOCKER_IMAGE_UPDATES=1` opts in only its fresh gateway and refuses
+an existing endpoint. On Docker Desktop without host networking, select the
+documented bridge override rather than changing engine settings.
 
 Image updates default to disabled outside test fixtures. The e2e wrapper opts
 in only for a fresh gateway fixture that it owns; set

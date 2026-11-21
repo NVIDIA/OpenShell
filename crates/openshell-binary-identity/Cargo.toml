@@ -14,5 +14,8 @@ repository.workspace = true
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-crypto = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["param"] }
+
 [lints]
 workspace = true

@@ -151,8 +151,10 @@ jobs:
           mv "${gateway_rpms[0]}" artifacts/packages/rpm/openshell-gateway.rpm
           rm -rf "$download_dir"
 
-      - name: Log in to GHCR
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+      - uses: ./.github/actions/load-e2e-images
+        with:
+          platform-arch: amd64
+          run-id: ${{ inputs['artifact-run-id'] }}
 
       - name: Export OpenShell images
         env:
@@ -160,16 +162,13 @@ jobs:
         run: |
           mkdir -p artifacts/images
 
-          docker pull "ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG}"
-          docker tag "ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG}" openshell/gateway:tmachine
+          docker tag "ghcr.io/ai-openshell/openshell/gateway:${IMAGE_TAG}" openshell/gateway:tmachine
           docker save --output artifacts/images/openshell-gateway-tmachine.tar openshell/gateway:tmachine
 
-          docker pull "ghcr.io/nvidia/openshell/sandbox:${IMAGE_TAG}"
-          docker tag "ghcr.io/nvidia/openshell/sandbox:${IMAGE_TAG}" openshell/sandbox:tmachine
+          docker tag "ghcr.io/ai-openshell/openshell/sandbox:${IMAGE_TAG}" openshell/sandbox:tmachine
           docker save --output artifacts/images/openshell-sandbox-tmachine.tar openshell/sandbox:tmachine
 
-          docker pull "ghcr.io/nvidia/openshell/supervisor:${IMAGE_TAG}"
-          docker tag "ghcr.io/nvidia/openshell/supervisor:${IMAGE_TAG}" openshell/supervisor:tmachine
+          docker tag "ghcr.io/ai-openshell/openshell/supervisor:${IMAGE_TAG}" openshell/supervisor:tmachine
           docker save --output artifacts/images/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
 
       - name: Download test inputs

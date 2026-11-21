@@ -4262,7 +4262,7 @@ mod tests {
                                     "query": "quarterly",
                                     "filters": {
                                         "scope": "workspace/main",
-                                        "repository": { "any": ["NVIDIA/OpenShell", "NVIDIA/*"] }
+                                        "repository": { "any": ["ai-openshell/openshell", "NVIDIA/*"] }
                                     }
                                 }
                             }

@@ -56,7 +56,7 @@ def material(kind="issue"):
         )
         index["patch:proxy"] = source("patch", {"patch": "@@ -1 +1 @@\n-old\n+new"})
     return {
-        "repository": "NVIDIA/OpenShell",
+        "repository": "ai-openshell/openshell",
         "number": 12,
         "kind": kind,
         "item_id": "I_12",

@@ -8,8 +8,13 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/ai-openshell/openshell"
 publish = false
+
+[[test]]
+name = "cdi"
+path = "tests/injection.rs"
+harness = false
 
 [dependencies]
 openshell-testkit = { path = "../../../testkit/testkit" }

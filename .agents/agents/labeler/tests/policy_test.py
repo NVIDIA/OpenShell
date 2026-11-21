@@ -49,7 +49,7 @@ NAMES = [
 def snapshot():
     return {
         "schema_version": 1,
-        "repository": "NVIDIA/OpenShell",
+        "repository": "ai-openshell/openshell",
         "number": 12,
         "kind": "issue",
         "snapshot_id": "snap-1",
@@ -87,7 +87,7 @@ def snapshot():
 def result():
     return {
         "schema_version": 1,
-        "repository": "NVIDIA/OpenShell",
+        "repository": "ai-openshell/openshell",
         "number": 12,
         "kind": "issue",
         "snapshot_id": "snap-1",

@@ -9,8 +9,18 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/ai-openshell/openshell"
 publish = false
+
+[[test]]
+name = "podman-oci-identity"
+path = "tests/oci_identity.rs"
+harness = false
+
+[[test]]
+name = "podman-userns"
+path = "tests/userns.rs"
+harness = false
 
 [dependencies]
 container-engine-support = { path = "../../../support/container-engine" }

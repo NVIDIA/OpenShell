@@ -58,7 +58,7 @@ Copy the five identity fields from the manifest and supply the complete desired 
 ```json
 {
   "schema_version": 1,
-  "repository": "NVIDIA/OpenShell",
+  "repository": "ai-openshell/openshell",
   "number": 1234,
   "kind": "issue",
   "snapshot_id": "example-snapshot-id",

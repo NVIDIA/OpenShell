@@ -12,6 +12,10 @@ use container_engine_support::Engine;
 use podman_support::{Userns, normalize_uid_map, reference_uid_map};
 use testkit::{Context, Error, ResultExt as _};
 
+fn main() -> std::process::ExitCode {
+    testkit::main()
+}
+
 const WORKSPACE_OK: &str = "podman-userns-workspace-ok";
 const WORKSPACE_AND_UID_MAP_PROBE: &str = r#"set -eu
 workload_owner="$(id -u):$(id -g)"

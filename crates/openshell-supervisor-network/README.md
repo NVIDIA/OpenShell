@@ -22,14 +22,44 @@ Before the supervisor forwards a connection it cannot inspect (`tls: skip`, tran
 ## Sandbox instance inputs
 
 `run_networking` takes a `SandboxInstanceNetwork` with the sandbox identity,
-the sandbox instance's `GatewayEndpoint`, the SPIFFE Workload API socket for
+the sandbox instance's `GatewayEndpoint`, the `ProviderIdentitySource` for
 provider token grants, the `policy.local` denial source, and proxy CA files.
 None of these are read from the process environment, so one process can run
-several sandbox instances. Each instance owns its provider token cache and
-HTTP client; a token acquired for one sandbox is never served to another.
-Without a Workload API socket, token grants fail closed. A process hosting
-several instances serves `/v1/denials` from a per-instance
-`SandboxInstanceDenialLog` instead of the shared shorthand log files.
+several sandbox instances. `run_networking` selects the instance's token grant
+resolver once from its identity source; a token acquired for one sandbox is
+never served to another.
+
+A dedicated supervisor uses `SpiffeTokenGrantResolver` with its SPIFFE Workload
+API socket. That resolver owns the instance's token cache and HTTP client and
+uses the gateway only for the intermediate exchange of RFC 8693 grants.
+Without a socket, its grants fail closed. Shared sandbox instances use
+`GatewayTokenGrantResolver`, which holds only the instance's authenticated
+gateway channel, connected on the first grant and reused. Each admitted
+operation forwards a configured dynamic credential key and request ID; the
+gateway derives the sandbox identity,
+validates current authorization, resolves grant parameters, and obtains the
+final access token, which the resolver validates. No SPIRE client, SVID,
+intermediate token, or grant cache is used in the shared supervisor.
+`mise run e2e:kubernetes:shared-supervisor-spiffe` exercises the gateway's
+SPIFFE Broker API flow against a real server and agent. A process hosting
+several instances serves
+`/v1/denials` from a per-instance `SandboxInstanceDenialLog` instead of the shared
+shorthand log files.
+
+## Policy DNS expiry
+
+Synthetic identities remain allocated after their DNS mappings expire. New
+transparent connections lazily refresh expired, policy-backed mappings through
+the same trusted resolver and destination-validation path as sandbox DNS
+queries. Refreshes for one address share a lock; failed refreshes back off for
+one second and never authorize expired upstream addresses.
+`PolicyDnsService::lookup_for_connect` owns refresh coordination and returns
+the resulting mapping; the underlying store stays synchronous. Observation-only
+mappings, wrong ports, and mappings from a previous policy generation cannot refresh.
+Refresh eligibility uses the authored ports, independently of which ports the
+latest DNS addresses satisfied. Dispatch reauthorizes mapped connections and
+rebuilds their connectors from current pins instead of retaining staged pins
+across a refresh.
 
 ## Reserved destinations
 

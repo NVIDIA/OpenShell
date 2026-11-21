@@ -8,8 +8,13 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/ai-openshell/openshell"
 publish = false
+
+[[test]]
+name = "keycloak-provider-refresh"
+path = "tests/provider_refresh.rs"
+harness = false
 
 [dependencies]
 keycloak-support = { path = "../../../support/keycloak" }

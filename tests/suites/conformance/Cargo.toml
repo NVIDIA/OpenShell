@@ -9,16 +9,19 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/ai-openshell/openshell"
 publish = false
 
 # `openshell-conformance`: the suite as one program to run against a gateway.
-# No test target of its own: cargo test and nextest run the tests through the
-# library.
+# It is also the test target, with testkit's libtest interface as its harness,
+# so `openshell-conformance run`, cargo test and nextest all run the same code.
+[lib]
+test = false
+
 [[bin]]
 name = "openshell-conformance"
 path = "src/main.rs"
-test = false
+harness = false
 
 [dependencies]
 host-server-support = { path = "../../support/host-server" }
@@ -26,6 +29,6 @@ openshell-crypto = { path = "../../../crates/openshell-crypto" }
 openshell-testkit = { path = "../../testkit/testkit" }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["process", "time"] }
 
 [workspace]

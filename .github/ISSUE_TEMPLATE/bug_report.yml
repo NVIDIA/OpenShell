@@ -9,7 +9,7 @@ body:
 
         Describe who encountered the bug, the problem it creates, why it matters, and the observable criteria for a fix. Please check the latest OpenShell release and search existing issues for possible duplicates before filing.
 
-        Do not report security vulnerabilities here; follow [SECURITY.md](https://github.com/NVIDIA/OpenShell/blob/main/SECURITY.md) instead.
+        Do not report security vulnerabilities here; follow [SECURITY.md](https://github.com/ai-openshell/openshell/blob/main/SECURITY.md) instead.
 
   - type: textarea
     id: user-story

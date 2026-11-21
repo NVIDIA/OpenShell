@@ -1477,8 +1477,11 @@ mod tests {
         use std::os::unix::process::CommandExt as _;
 
         let runtime = BoundaryRuntimeState::new();
+        // The root must `exec` its sleep. Otherwise dash starts it with vfork,
+        // and a SIGSTOP that lands before the child execs stops the child and
+        // leaves the root in an uninterruptible vfork wait instead of stopped.
         let mut root = std::process::Command::new("/bin/sh")
-            .args(["-c", "echo ready; sleep 600"])
+            .args(["-c", "echo ready; exec sleep 600"])
             .process_group(0)
             .stdout(std::process::Stdio::piped())
             .spawn()

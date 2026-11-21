@@ -20,20 +20,11 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 
 ## First-Time Contributors
 
-We use a vouch system. This exists because AI makes it trivial to generate plausible-looking but low-quality contributions, and we can no longer trust by default.
-
-1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.
-2. Describe what you want to change and why.
-3. Write in your own words. AI-generated vouch requests will be denied.
-4. A maintainer will comment `/vouch` if approved, and the request discussion
-   will close automatically.
-5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
-
-**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Org members and collaborators with push access bypass this check.
+Pull requests from authors without write access must link an issue labeled `state:accepted`. See [Pull Requests](#pull-requests).
 
 ### Finding Work
 
-Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
+Issues labeled [`good first issue`](https://github.com/ai-openshell/openshell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
 An open issue is not necessarily accepted or ready for implementation. Inspect the repository’s current `state:*` labels and ask a maintainer when its status is unclear. A direct user request authorizes an agent to perform the requested phase without changing the issue’s disposition.
 
@@ -59,7 +50,7 @@ The project includes optional [agent skills](#agent-skills) for using OpenShell 
 
 ### When NOT to Open an Issue
 
-- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions).
+- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/ai-openshell/openshell/discussions).
 - Security vulnerabilities — follow [SECURITY.md](SECURITY.md) instead.
 
 ## Before You Submit a Change
@@ -72,7 +63,9 @@ Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTA
 
 Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Once your pull request represents [accepted work](#accepted-work), apply exactly one `area:` label and any relevant `topic:` labels. Follow [Labeling and Notifications](#labeling-and-notifications) before applying classification labels. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md), excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Reviewers do not need repository write access to receive requests or review PRs. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
+Once your pull request represents [accepted work](#accepted-work), it needs exactly one `area:` label and any relevant `topic:` labels; see [Labeling and Notifications](#labeling-and-notifications) for guidance. The [reviewer routing workflow](.github/workflows/review-readiness.yml) adds reviewers from [REVIEWERS.md](REVIEWERS.md) based on these labels.
+
+Branch Checks requires accounts in `REVIEWERS.md` to appear in the repository collaborator list or have confirmed write or admin permission. Public read access alone does not qualify; read and triage accounts must appear in the collaborator list.
 
 If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
@@ -82,7 +75,7 @@ OpenShell keeps skills for using the product separate from skills for developing
 
 ### Skills for Using OpenShell
 
-Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add ai-openshell/openshell`.
 
 | Skill | Purpose |
 | --- | --- |
@@ -156,7 +149,7 @@ Apply `area:` and `topic:` classification labels only after the issue or PR meet
 
 Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
 
-Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/NVIDIA/OpenShell/issues/5261). Until that policy changes, defer classification labels until acceptance.
+Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/ai-openshell/openshell/issues/5261). Until that policy changes, defer classification labels until acceptance.
 
 ### Label Discovery
 
@@ -174,7 +167,7 @@ When recording a triage outcome, replace the previous assessment state rather th
 
 ## Prerequisites
 
-Native Windows development uses the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Native Windows development uses the [`windows` branch](https://github.com/ai-openshell/openshell/tree/windows).
 Follow [Native Windows support](WINDOWS.md) for checkout, MSVC prerequisites,
 runtime requirements, and limitations. Target Windows implementation PRs at
 `windows`. Shared documentation can merge into `main`, but Windows-specific
@@ -319,7 +312,7 @@ mise run --skip-tools windows:build:x64
 
 For ARM64, use `windows:build:arm64` with ARM64 MSVC components and host-native
 LLVM. Keep the matching `libz3.dll` staged by the build beside the executables.
-See [Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+See [Windows validation](https://github.com/ai-openshell/openshell/blob/windows/TESTING.md#native-windows-validation)
 for native tests and MXC E2E requirements. Docker is not required for the native
 Windows build or MXC runtime.
 
@@ -422,6 +415,10 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run monitoring:check` | Check and render the monitoring mixin            |
 | `mise run clean`     | Clean build artifacts                                   |
 
+## TypeScript SDK contributions
+
+The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript); open TypeScript SDK PRs there.
+
 ## Project Structure
 
 | Path            | Purpose                                       |
@@ -430,7 +427,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
-| `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
+| `sdk/typescript/` | Deprecated `@nvidia/openshell-sdk` stub re-exporting `@ai-openshell/sdk` (moved to ai-openshell/sdk-typescript) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
@@ -497,7 +494,7 @@ For release notes, describe the user-facing change in a few short, easy-to-read 
 
 Every PR must close an existing issue, except automated dependency updates and the build and flaky-test fixes described below. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
-Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
+Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, and other labels do not bypass acceptance.
 
 The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acceptance` job result for the triggering PR when it is opened, edited, reopened, or updated with new commits. It does not publish a shared commit status; lookup and execution errors fail the job. Link accepted issues in this repository using `Fixes #NNN` or `Closes #NNN`; GitHub recognizes closing references when a PR targets the default branch. Rerun the workflow after issue labels change. Making the job required for merging and configuring any required Actions event policy are separate repository settings; merge-queue support is not included.
 
@@ -517,7 +514,7 @@ Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor br
 
 For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. A PR without an issue omits the issue ID, such as `fix/flaky-sandbox-tests/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
 
-Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
+Branches created by automation, such as Dependabot, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 
 ### Choose Verification for the Change
 
@@ -611,7 +608,7 @@ git commit --signoff --message "feat(sandbox): add new capability"
 DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
 
 - **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
-- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+- **Cryptographic commit signing** applies to org members and collaborators only; see [CI.md](CI.md#commit-signing) for setup.
 
 ### PR testing checklist
 
@@ -619,4 +616,4 @@ Only mark a checklist item as complete after you have run and verified it, not a
 
 ## CI
 
-How PR CI runs, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels, and commit-signing setup are documented in [CI.md](CI.md).

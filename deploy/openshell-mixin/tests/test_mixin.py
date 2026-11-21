@@ -190,7 +190,7 @@ class MixinTest(unittest.TestCase):
                     "GIT_CONFIG_GLOBAL": os.devnull,
                     "GIT_CONFIG_COUNT": "1",
                     "GIT_CONFIG_KEY_0": f"url.{repository.as_uri()}.insteadOf",
-                    "GIT_CONFIG_VALUE_0": "ssh://git@github.com/NVIDIA/OpenShell.git",
+                    "GIT_CONFIG_VALUE_0": "ssh://git@github.com/ai-openshell/openshell.git",
                 }
             )
             subprocess.run(
@@ -200,7 +200,7 @@ class MixinTest(unittest.TestCase):
                 [
                     "jb",
                     "install",
-                    "ssh://git@github.com/NVIDIA/OpenShell.git/deploy/openshell-mixin@"
+                    "ssh://git@github.com/ai-openshell/openshell.git/deploy/openshell-mixin@"
                     + revision,
                 ],
                 cwd=consumer,
@@ -209,7 +209,7 @@ class MixinTest(unittest.TestCase):
                 capture_output=True,
             )
             vendor_import = (
-                "github.com/NVIDIA/OpenShell/deploy/openshell-mixin/mixin.libsonnet"
+                "github.com/ai-openshell/openshell/deploy/openshell-mixin/mixin.libsonnet"
             )
             expression = (
                 '(import "'

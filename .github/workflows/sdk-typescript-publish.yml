@@ -3,24 +3,11 @@
 
 name: Publish TypeScript SDK
 
+# Publishes the deprecated @nvidia/openshell-sdk stub, which re-exports
+# @ai-openshell/sdk. Run it by hand after ai-openshell/sdk-typescript publishes
+# the matching @ai-openshell/sdk release. That release needs the core tag
+# first, so the core Release workflow can't publish the stub.
 on:
-  workflow_call:
-    inputs:
-      release-tag:
-        required: true
-        type: string
-      source-ref:
-        description: Commit to build the package from
-        required: true
-        type: string
-      npm-version:
-        required: true
-        type: string
-      make-latest:
-        description: Whether this release may update the npm latest dist-tag
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
     inputs:
       release-tag:
@@ -44,7 +31,7 @@ permissions:
 jobs:
   publish:
     name: Publish TypeScript SDK
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
       run:
@@ -53,13 +40,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.source-ref || inputs.release-tag }}
+          ref: ${{ inputs.release-tag }}
 
       - uses: ./.github/actions/setup-nix
-
-      - name: Install TypeScript dependencies
-        working-directory: ./sdk/typescript
-        run: npm ci
 
       - name: Configure npm auth for GitHub Packages
         working-directory: ./sdk/typescript
@@ -94,7 +77,17 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # The package is a stub that re-exports @ai-openshell/sdk from npmjs.org.
+          # Depend on the same minor line, and refuse to publish a stub that
+          # npm cannot install yet.
+          IFS=. read -r major minor _ <<<"${OPENSHELL_NPM_VERSION}"
+          sdk_range="^${major}.${minor}.0"
+          if [[ -z "$(npm view "@ai-openshell/sdk@${sdk_range}" version --registry=https://registry.npmjs.org/)" ]]; then
+            echo "::error title=@ai-openshell/sdk missing::No @ai-openshell/sdk version matches ${sdk_range} on npmjs.org. Release ai-openshell/sdk-typescript first, then run this workflow again."
+            exit 1
+          fi
           npm pkg set version="${OPENSHELL_NPM_VERSION}"
+          npm pkg set "dependencies.@ai-openshell/sdk=${sdk_range}"
           package="$(npm pkg get name | tr -d '"')@${OPENSHELL_NPM_VERSION}"
           if npm view "${package}" version >/dev/null 2>&1; then
             echo "${package} is already published."

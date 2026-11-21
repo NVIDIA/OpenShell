@@ -112,6 +112,7 @@ async fn forward_denials_use_the_saved_connect_parent() {
                 binary_pid: None,
                 ancestors: vec![],
                 cmdline_paths: vec![],
+                process: None,
             };
             let denial = DestinationDenial {
                 kind: DestinationDenialKind::InternalAddress,
@@ -128,9 +129,7 @@ async fn forward_denials_use_the_saved_connect_parent() {
                 443,
                 "/",
                 "curl",
-                "42",
-                "-",
-                "curl",
+                &Process::from_bypass("curl", "42", "-").with_cmd_line("curl"),
                 "forward-policy",
                 &decision,
                 None,

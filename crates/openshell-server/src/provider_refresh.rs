@@ -20,7 +20,7 @@ use openshell_core::proto::{
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 pub use openshell_credential_issuer::refresh::minter::{
     material_scopes, next_refresh_at_ms, parse_material_i64, refresh_strategy_name,
-    strategy_secret_material_keys,
+    strategy_secret_material_keys, validate_oauth_client_material,
 };
 use openshell_credential_issuer::refresh::{
     CredentialRefresh, RefreshCommitSink, RefreshRuntime, RefreshState, RefreshStateStore,
@@ -121,6 +121,16 @@ pub fn refresh_status_from_state(
         )
         .ok()
         .flatten(),
+        // A malformed annotation is reported by the refresh itself; status
+        // reads stay available.
+        material_secrets:
+            openshell_credential_issuer::refresh::secret_refs::material_secret_bindings(
+                state.metadata.as_ref(),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(material_key, binding)| (material_key, binding.name))
+            .collect(),
     }
 }
 
@@ -318,6 +328,9 @@ pub fn spawn_refresh_worker(state: Arc<crate::ServerState>, interval: Duration) 
                 Err(err) => {
                     warn!(error = %err, "provider credential refresh worker tick failed");
                 }
+            }
+            if let Err(err) = crate::grpc::secret::sweep_workspace_secrets(&state).await {
+                warn!(error = %err, "workspace secret cleanup sweep failed");
             }
         }
     });

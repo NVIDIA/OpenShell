@@ -6,9 +6,7 @@ name: Helm Lint
 on:
   merge_group:
     types: [checks_requested]
-  push:
-    branches:
-      - "pull-request/[0-9]+"
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -19,28 +17,12 @@ permissions:
   packages: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  pr_metadata:
-    name: Resolve PR metadata
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - id: gate
-        uses: ./.github/actions/pr-gate
-
   helm_changes:
     name: Detect Helm changes
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -49,25 +31,15 @@ jobs:
       should_run: ${{ steps.default.outputs.should_run || steps.changes.outputs.any_changed }}
     steps:
       - id: default
-        if: github.event_name != 'push'
+        if: github.event_name != 'pull_request'
         shell: bash
         run: echo "should_run=true" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'push'
-
-      - id: merge-base
-        if: github.event_name == 'push'
-        uses: ./.github/actions/pr-merge-base
-        with:
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
-
+      # On pull_request, changed-files reads the PR file list from the API.
       - id: changes
-        if: github.event_name == 'push'
+        if: github.event_name == 'pull_request'
         uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
         with:
-          base_sha: ${{ steps.merge-base.outputs.base_sha }}
-          skip_initial_fetch: ${{ steps.merge-base.outputs.base_sha != '' }}
           files: |
             deploy/helm/**
             mise.toml
@@ -77,11 +49,11 @@ jobs:
 
   helm-lint:
     name: Helm Lint
-    needs: [pr_metadata, helm_changes]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.helm_changes.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    needs: helm_changes
+    if: needs.helm_changes.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/ai-openshell/openshell/ci:82e753ba3ffdfb40c118e7cb416ced7f350381d5@sha256:d816f3b4b2de675928e2ecfd26ec6b937be35fe9986542c87d440bc3de5a29de
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

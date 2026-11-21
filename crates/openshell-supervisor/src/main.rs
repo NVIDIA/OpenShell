@@ -102,6 +102,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP")]
     pool_advertise_ip: Option<std::net::IpAddr>,
 
+    /// Most sandbox instances this pool member runs, from 1 to 1024. Set it
+    /// to the gateway's `[openshell.gateway.supervisor_pool]`
+    /// `max_instances_per_member`; it also sizes the gateway stream's message
+    /// bounds.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES",
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u32).range(1..=1024)
+    )]
+    pool_max_instances: u32,
+
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
     role: SupervisorRole,
@@ -675,11 +687,14 @@ fn main() -> Result<()> {
                         args.attach_request_timeout_seconds,
                     ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
-                    provider_workload_api_socket: std::env::var_os(
-                        openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-                    )
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from),
+                    provider_identity:
+                        openshell_supervisor_network::run::ProviderIdentitySource::WorkloadApi(
+                            std::env::var_os(
+                                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                            )
+                            .filter(|path| !path.is_empty())
+                            .map(PathBuf::from),
+                        ),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,

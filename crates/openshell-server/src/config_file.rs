@@ -31,8 +31,8 @@ use openshell_core::proto::{
 };
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_core::{
-    ExtensionBindingPolicy, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
+    ExtensionBindingPolicy, GatewayAuditConfig, GatewayAuthConfig, GatewayInterceptorConfig,
+    GatewayJwtConfig, GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::{Deserialize, Serialize};
@@ -111,6 +111,9 @@ pub struct GatewayFileSection {
     pub log_level: Option<String>,
 
     // ── Database ─────────────────────────────────────────────────────────
+    /// Explicit identity source; connection URL stays environment-only.
+    #[serde(default)]
+    pub database_auth: Option<openshell_core::config::DatabaseAuthMode>,
     /// Connection ceiling for the persistence pool. One shared pool serves
     /// every database-backed RPC, so this is also the gateway's ceiling on
     /// concurrent database work. On Postgres, each replica also opens up to
@@ -120,8 +123,10 @@ pub struct GatewayFileSection {
     /// which must stay under the server's own `max_connections`. Omit to keep
     /// the backend default (10 for Postgres, 5 for on-disk `SQLite`); an
     /// in-memory `SQLite` database is always a single connection. Postgres
-    /// needs at least 2, because the SSH identity lock keeps one connection
-    /// while it queries the pool.
+    /// needs at least 2: an SSH identity or provider-refresh lock holder keeps
+    /// one data connection for its lock and queries the pool on another, and
+    /// the gateway caps those holders at half of `database_max_connections`
+    /// per replica.
     #[serde(default)]
     pub database_max_connections: Option<u32>,
 
@@ -168,6 +173,12 @@ pub struct GatewayFileSection {
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
     pub enable_sandbox_updates: Option<bool>,
+    /// Explicit activation only after every serving gateway supports workspace secrets.
+    #[serde(default)]
+    pub enable_workspace_secrets: Option<bool>,
+    /// Allow control-plane callers to read workspace secret values.
+    #[serde(default)]
+    pub enable_secret_reveal: Option<bool>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
@@ -180,6 +191,9 @@ pub struct GatewayFileSection {
     pub config_delivery_mode: Option<openshell_core::config::ConfigDeliveryMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
+    /// Publish gateway URLs and forward application requests. Defaults to true.
+    #[serde(default)]
+    pub enable_gateway_service_routing: Option<bool>,
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[serde(default)]
@@ -220,7 +234,11 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
+    pub audit: Option<GatewayAuditConfig>,
+    #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    #[serde(default)]
+    pub spiffe_broker: Option<openshell_core::config::SpiffeBrokerConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]
@@ -255,6 +273,46 @@ pub struct SupervisorPoolConfig {
     /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_timeout_secs: Option<u32>,
+    /// Most sandbox instances the gateway places on one pool member, from 1
+    /// to 1024; unset places
+    /// [`openshell_supervisor_control::DEFAULT_MAX_INSTANCES_PER_MEMBER`].
+    /// Each member must run with the same cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances_per_member: Option<u32>,
+    /// Pool members one gateway replica is sized to serve, at least 1; unset
+    /// sizes for
+    /// [`openshell_supervisor_control::DEFAULT_MAX_MEMBERS_PER_GATEWAY`]. The
+    /// pool runs at most live replicas × this × `max_instances_per_member`
+    /// instances, never past
+    /// [`openshell_supervisor_control::MAX_POOL_INSTANCES_CEILING`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_members_per_gateway: Option<u32>,
+}
+
+impl SupervisorPoolConfig {
+    /// The configured pool limits, defaults filled in.
+    ///
+    /// # Errors
+    ///
+    /// A limit is outside its range.
+    pub fn limits(
+        &self,
+    ) -> Result<
+        openshell_supervisor_control::PoolLimits,
+        openshell_supervisor_control::PoolLimitsError,
+    > {
+        use openshell_supervisor_control as pool;
+        pool::PoolLimits::new(
+            self.max_instances_per_member
+                .map_or(pool::DEFAULT_MAX_INSTANCES_PER_MEMBER, |value| {
+                    value as usize
+                }),
+            self.max_members_per_gateway
+                .map_or(pool::DEFAULT_MAX_MEMBERS_PER_GATEWAY, |value| {
+                    value as usize
+                }),
+        )
+    }
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.
@@ -357,11 +415,12 @@ pub struct MetricsTlsFileConfig {
 /// `[openshell.gateway.otlp]` section and its per-signal tables.
 ///
 /// `endpoint` is the collector for every enabled signal, and on its own
-/// enables trace export. `[otlp.traces]` overrides the trace endpoint,
-/// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records, and
-/// `[otlp.agent]` with `enabled = true` relays workload traces, each
-/// optionally to a different endpoint. SDK tuning knobs are deliberately absent — see
-/// [`crate::otel_tracing`] for what this table owns and what the `OTEL_*`
+/// enables trace export. `[otlp.traces]` overrides the trace endpoint;
+/// `[otlp.metrics]` with `enabled = true` exports gateway metrics;
+/// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records; and
+/// `[otlp.agent]` with `enabled = true` relays workload traces. Each signal
+/// can use a different endpoint. SDK tuning knobs are deliberately absent —
+/// see [`crate::otel_tracing`] for what this table owns and what the `OTEL_*`
 /// environment variables own.
 ///
 /// Endpoints are resolved when parsing, so each enabled signal carries its own.
@@ -375,6 +434,14 @@ pub struct OtlpConfig {
     /// Trace export, when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traces: Option<OtlpTracesConfig>,
+
+    /// Gateway metric export, when enabled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_enabled"
+    )]
+    pub metrics: Option<OtlpCollectorConfig>,
 
     /// OCSF event export as OTLP log records, when enabled.
     #[serde(
@@ -861,6 +928,8 @@ pub struct AgentOtlpConfig {
 #[serde(deny_unknown_fields)]
 struct RawOtlpConfig {
     #[serde(default)]
+    metrics: Option<RawOtlpMetrics>,
+    #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
     protocol: Option<OtlpProtocol>,
@@ -887,6 +956,27 @@ struct RawOtlpConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAgentOtlp {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    protocol: Option<OtlpProtocol>,
+    #[serde(default)]
+    headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    headers_file: Option<PathBuf>,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
+    #[serde(default)]
+    cert_file: Option<PathBuf>,
+    #[serde(default)]
+    key_file: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOtlpMetrics {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
@@ -1040,6 +1130,11 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
             }
             (None, None) => None,
         };
+        let metrics = raw
+            .metrics
+            .filter(|metrics| metrics.enabled)
+            .map(|metrics| raw_collector!(metrics).resolve("otlp.metrics", shared.as_ref()))
+            .transpose()?;
         let traces = match raw.traces {
             Some(traces) => Some(raw_collector!(traces).resolve("otlp.traces", shared.as_ref())?),
             None => shared.clone(),
@@ -1064,14 +1159,12 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                 })
             })
             .transpose()?;
-        if traces.is_none() && ocsf.is_none() && agent.is_none() {
-            return Err(
-                "otlp needs an endpoint, or otlp.ocsf or otlp.agent with enabled = true"
-                    .to_string(),
-            );
+        if traces.is_none() && metrics.is_none() && ocsf.is_none() && agent.is_none() {
+            return Err("otlp needs an endpoint, or an enabled signal table".to_string());
         }
         let config = Self {
             service_name: raw.service_name,
+            metrics,
             traces,
             ocsf,
             agent,
@@ -1565,6 +1658,24 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
             field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
             message: "must be between 30 and 300 seconds",
         });
+    }
+    if let Some(Err(error)) = file
+        .openshell
+        .gateway
+        .supervisor_pool
+        .map(|pool| pool.limits())
+    {
+        let (field, message) = match error {
+            openshell_supervisor_control::PoolLimitsError::InstancesPerMember => (
+                "openshell.gateway.supervisor_pool.max_instances_per_member",
+                "must be between 1 and 1024",
+            ),
+            openshell_supervisor_control::PoolLimitsError::MembersPerGateway => (
+                "openshell.gateway.supervisor_pool.max_members_per_gateway",
+                "must be at least 1",
+            ),
+        };
+        return Err(ConfigFileError::InvalidValue { field, message });
     }
     if let Some((name, _)) = file
         .openshell
@@ -2084,6 +2195,19 @@ service_name = "openshell-gateway-dev"
     }
 
     #[test]
+    fn gateway_audit_capture_is_opt_in() {
+        let tmp = write_tmp(
+            "[openshell.gateway.audit]\ncapture_setting_values = true\ncapture_exec_command = true\n",
+        );
+        let audit = load(tmp.path()).unwrap().openshell.gateway.audit.unwrap();
+        assert!(audit.capture_setting_values);
+        assert!(audit.capture_exec_command);
+        let defaults = GatewayAuditConfig::default();
+        assert!(!defaults.capture_setting_values);
+        assert!(!defaults.capture_exec_command);
+    }
+
+    #[test]
     fn gateway_accepts_a_single_ocsf_log_destination() {
         let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\n");
         let config = load(tmp.path())
@@ -2171,6 +2295,57 @@ service_name = "openshell-gateway-dev"
         assert_eq!(otlp.traces_endpoint(), Some("http://127.0.0.1:4317"));
         assert!(otlp.service_name.is_none());
         assert_eq!(otlp.ocsf, None);
+        assert!(otlp.metrics.is_none());
+    }
+
+    #[test]
+    fn otlp_metrics_use_the_shared_collector_and_roundtrip() {
+        let config = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://shared:4318'\n\
+             protocol = 'http/protobuf'\n\
+             headers = { authorization = 'Bearer shared' }\n\n\
+             [openshell.gateway.otlp.metrics]\nenabled = true\n\n\
+             [openshell.gateway.otlp.traces]\nendpoint = 'http://traces:4317'\n",
+        );
+        let metrics = config.metrics.as_ref().unwrap();
+        assert_eq!(metrics.endpoint, "http://shared:4318");
+        assert_eq!(metrics.protocol, OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            metrics.headers.header_map()["authorization"],
+            "Bearer shared"
+        );
+        assert_eq!(config.traces_endpoint(), Some("http://traces:4317"));
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("[metrics]\nenabled = true"));
+        assert_eq!(toml::from_str::<OtlpConfig>(&encoded).unwrap(), config);
+        assert_eq!(
+            config.supervisor_otlp().traces.unwrap().endpoint,
+            "http://traces:4317"
+        );
+    }
+
+    #[test]
+    fn otlp_metrics_are_opt_in_and_can_use_their_own_endpoint() {
+        let disabled = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\n\
+             [openshell.gateway.otlp.metrics]\n",
+        );
+        assert!(disabled.metrics.is_none());
+
+        let own = otlp(
+            "[openshell.gateway.otlp.metrics]\nenabled = true\n\
+             endpoint = 'http://metrics:4318'\nprotocol = 'http/protobuf'\n",
+        );
+        let metrics = own.metrics.as_ref().unwrap();
+        assert_eq!(metrics.endpoint, "http://metrics:4318");
+        assert_eq!(metrics.protocol, OtlpProtocol::HttpProtobuf);
+        assert!(own.traces.is_none());
+
+        let error = toml::from_str::<OtlpConfig>(
+            "[metrics]\nenabled = true\n[traces]\nendpoint = 'http://traces:4317'\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("otlp.metrics needs an endpoint"));
     }
 
     #[test]
@@ -3395,6 +3570,47 @@ database_lock_max_connections = 0
             assert!(
                 matches!(pool(unknown), Err(ConfigFileError::Parse { .. })),
                 "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_and_bounds_the_supervisor_pool_limits() {
+        let pool = |table: &str| {
+            let tmp = write_tmp(&format!("[openshell.gateway.supervisor_pool]\n{table}"));
+            load(tmp.path()).map(|file| file.openshell.gateway.supervisor_pool.unwrap())
+        };
+        assert_eq!(
+            pool("").unwrap().limits(),
+            Ok(openshell_supervisor_control::PoolLimits::default())
+        );
+        assert_eq!(
+            pool("max_instances_per_member = 16\nmax_members_per_gateway = 2\n")
+                .unwrap()
+                .limits(),
+            openshell_supervisor_control::PoolLimits::new(16, 2)
+        );
+        for valid in [
+            "max_instances_per_member = 1",
+            "max_members_per_gateway = 500",
+        ] {
+            assert!(pool(valid).is_ok(), "{valid}");
+        }
+        for (invalid, field) in [
+            ("max_instances_per_member = 0", "max_instances_per_member"),
+            (
+                "max_instances_per_member = 1025",
+                "max_instances_per_member",
+            ),
+            ("max_members_per_gateway = 0", "max_members_per_gateway"),
+        ] {
+            assert!(
+                matches!(
+                    pool(invalid),
+                    Err(ConfigFileError::InvalidValue { field: rejected, .. })
+                        if rejected.ends_with(field)
+                ),
+                "{invalid}"
             );
         }
     }

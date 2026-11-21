@@ -23,6 +23,7 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-sdk = { path = "../openshell-sdk" }
 openshell-tui = { path = "../openshell-tui" }
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }

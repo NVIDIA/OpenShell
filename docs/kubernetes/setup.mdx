@@ -38,7 +38,7 @@ Make sure the following are in place before you install.
 
 | Prerequisite | Required | Notes |
 |---|---|---|
-| Kubernetes 1.29+ with RBAC enabled | Yes | No additional notes. |
+| Kubernetes cluster with RBAC enabled | Yes | Minimum tested version is 1.33. Older cluster versions are untested. |
 | CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces | Yes | Verify enforcement on your cluster. |
 | Helm 3.x | Yes | No additional notes. |
 | Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
@@ -335,7 +335,7 @@ helm upgrade --install openshell \
 ```
 
 <Warning>
-`server.dataStorageSize` and `server.dataStorageClass` feed the gateway StatefulSet's immutable `volumeClaimTemplates`. Set them at install time. Changing them later fails the upgrade and does not move existing data; refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md#data-pvc-storage) for migration steps.
+`server.dataStorageSize` and `server.dataStorageClass` feed the gateway StatefulSet's immutable `volumeClaimTemplates`. Set them at install time. Changing them later fails the upgrade and does not move existing data; refer to the [Helm chart README](https://github.com/ai-openshell/openshell/blob/main/deploy/helm/openshell/README.md#data-pvc-storage) for migration steps.
 </Warning>
 
 To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret

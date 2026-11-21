@@ -9,7 +9,7 @@ use blake3::Hasher;
 use crate::config::{Environment, Machine};
 
 use super::ansible_hash::hash_sources;
-use super::layer::{cached_layer, hash_file, hash_files, hash_inputs};
+use super::layer::{SETUP_DISKS, cached_layer, hash_file, hash_files, hash_inputs};
 
 const SETUP_CACHE_VERSION: &[u8] = b"tmachine-disk-blake3-v1";
 
@@ -18,8 +18,9 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
         return Ok(machine.base_image.clone());
     }
 
-    let hash = setup_hash(machine, environment)?;
+    let hash = setup_layer_key(machine, environment)?;
     cached_layer(
+        SETUP_DISKS,
         &machine.base_image,
         &hash,
         environment.setup.use_galaxy,
@@ -29,7 +30,8 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
     .await
 }
 
-fn setup_hash(machine: &Machine, environment: &Environment) -> Result<String> {
+/// The hash that names the environment's setup layer (`disks/setup/<hash>.qcow2`).
+pub fn setup_layer_key(machine: &Machine, environment: &Environment) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(SETUP_CACHE_VERSION);
     hash_file(&mut hasher, &machine.base_image)

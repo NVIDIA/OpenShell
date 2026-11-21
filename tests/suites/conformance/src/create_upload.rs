@@ -4,7 +4,7 @@
 //! `sandbox create --upload`.
 //!
 //! Ported from `e2e/rust/tests/upload_create.rs`, reworked in
-//! NVIDIA/OpenShell#4606 by politerealism. The behavior is not driver-specific.
+//! ai-openshell/openshell#4606 by politerealism. The behavior is not driver-specific.
 //!
 //! `--upload` cannot be combined with a command, so these tests create the
 //! sandbox with the target's default image and workload and check the files

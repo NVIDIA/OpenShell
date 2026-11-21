@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Sizing profile for a cluster that targets about 10,000 sandboxes on the
+# shared supervisor pool: 2 gateway replicas, each serving up to 40
+# supervisors, each running up to 128 sandboxes. At the HPA's maximum of 80
+# supervisors the pool holds 80 * 128 = 10,240 sandboxes.
+#
+# Multiple gateway replicas need an external database. Set
+# server.externalDbSecret:
+#
+#   helm install openshell deploy/helm/openshell \
+#     -f deploy/helm/openshell/values-scale-10k.yaml \
+#     --set server.externalDbSecret=<secret>
+
+replicaCount: 2
+
+workload:
+  kind: deployment
+
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+
+supervisor:
+  pool:
+    maxInstancesPerMember: 128
+    maxMembersPerGateway: 40
+  resources:
+    requests:
+      cpu: 250m
+      memory: 768Mi
+    limits:
+      memory: 1.5Gi
+  autoscaling:
+    enabled: true
+    minReplicas: 10
+    maxReplicas: 80

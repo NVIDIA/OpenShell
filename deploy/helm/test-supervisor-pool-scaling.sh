@@ -64,9 +64,9 @@ for name in two three; do
   fi
 done
 
-# The pool table, with the chart's default recovery deadline, is present at
-# every count, and the gateway's config checksum (which rolls the gateway when
-# it changes) is the same.
+# The pool table, with the chart's default recovery deadline and limits, is
+# present at every count, and the gateway's config checksum (which rolls the
+# gateway when it changes) is the same.
 for name in one two three; do
   yq ea -e -r 'select(.kind == "ConfigMap" and (.data | has("gateway.toml"))) | .data."gateway.toml"' \
     "${work_dir}/${name}.yaml" >"${work_dir}/${name}.toml"
@@ -74,6 +74,10 @@ for name in one two three; do
     || fail "the ${name}-replica pool renders no supervisor_pool table"
   grep -q '^recovery_timeout_secs = 60$' "${work_dir}/${name}.toml" \
     || fail "the ${name}-replica pool renders no recovery deadline"
+  grep -q '^max_instances_per_member = 128$' "${work_dir}/${name}.toml" \
+    || fail "the ${name}-replica pool renders no per-member cap"
+  grep -q '^max_members_per_gateway = 32$' "${work_dir}/${name}.toml" \
+    || fail "the ${name}-replica pool renders no members-per-gateway cap"
 done
 
 echo "supervisor pool scaling: only the replica count changes across 1, 2, and 3 replicas"
@@ -98,3 +102,52 @@ for name in autoscaled tuned; do
     || fail "supervisor autoscaling changed the gateway or supervisor Pod template"
 done
 echo "supervisor autoscaling: enabling and tuning the HPA preserves gateway and supervisor Pod templates"
+
+# Defaults stay small: one gateway, one supervisor, autoscaling off.
+render defaults
+[[ "$(supervisor_replicas defaults)" == "1" ]] || fail "the default pool renders $(supervisor_replicas defaults) replicas"
+yq ea -e 'select(.kind == "HorizontalPodAutoscaler") | .metadata.name' "${work_dir}/defaults.yaml" >/dev/null 2>&1 \
+  && fail "the default pool renders an HPA"
+yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor")
+  | .spec.template.spec.containers[0] | has("resources") | not' \
+  "${work_dir}/defaults.yaml" >/dev/null || fail "the supervisor renders resources by default"
+
+# The pool limits reach the gateway table and every supervisor alike.
+render limits --set supervisor.pool.maxInstancesPerMember=16 --set supervisor.pool.maxMembersPerGateway=4
+yq ea -e -r 'select(.kind == "ConfigMap" and (.data | has("gateway.toml"))) | .data."gateway.toml"' \
+  "${work_dir}/limits.yaml" >"${work_dir}/limits.toml"
+grep -q '^max_instances_per_member = 16$' "${work_dir}/limits.toml" || fail "maxInstancesPerMember does not reach the gateway"
+grep -q '^max_members_per_gateway = 4$' "${work_dir}/limits.toml" || fail "maxMembersPerGateway does not reach the gateway"
+yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor")
+  | .spec.template.spec.containers[0].env[] | select(.name == "OPENSHELL_SUPERVISOR_POOL_MAX_INSTANCES") | .value == "16"' \
+  "${work_dir}/limits.yaml" >/dev/null || fail "maxInstancesPerMember does not reach the supervisor"
+
+# Out-of-range limits, and more supervisors than the gateways can serve, fail
+# the render.
+refused() {
+  local reason="$1"
+  shift
+  if render refused "$@" 2>"${work_dir}/refused.err"; then
+    fail "the chart accepted ${reason}"
+  fi
+}
+refused "maxInstancesPerMember=0" --set supervisor.pool.maxInstancesPerMember=0
+refused "maxInstancesPerMember=1025" --set supervisor.pool.maxInstancesPerMember=1025
+refused "maxMembersPerGateway=0" --set supervisor.pool.maxMembersPerGateway=0
+refused "3 supervisors for 1 gateway * 2 members" \
+  --set supervisor.replicas=3 --set supervisor.pool.maxMembersPerGateway=2
+refused "an HPA maximum of 5 for 1 gateway * 4 members" \
+  --set supervisor.autoscaling.enabled=true --set supervisor.autoscaling.maxReplicas=5 \
+  --set supervisor.pool.maxMembersPerGateway=4
+render two-gateways --set supervisor.replicas=4 --set supervisor.pool.maxMembersPerGateway=2 \
+  --set replicaCount=2 --set workload.kind=deployment --set server.externalDbSecret=scaling-pg
+[[ "$(supervisor_replicas two-gateways)" == "4" ]] || fail "two gateways do not serve 4 supervisors at 2 each"
+
+# The 10k profile renders 2 gateways and a 10..80 supervisor HPA.
+render scale-10k --values "${chart}/values-scale-10k.yaml" --set server.externalDbSecret=scaling-pg
+yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell") | .spec.replicas == 2' \
+  "${work_dir}/scale-10k.yaml" >/dev/null || fail "the scale profile does not run 2 gateways"
+yq ea -e 'select(.kind == "HorizontalPodAutoscaler" and .metadata.name == "scaling-openshell-supervisor")
+  | (.spec.minReplicas == 10 and .spec.maxReplicas == 80)' \
+  "${work_dir}/scale-10k.yaml" >/dev/null || fail "the scale profile does not autoscale supervisors from 10 to 80"
+echo "supervisor pool limits: defaults stay small, limits reach gateway and supervisors, and oversized pools fail"

@@ -39,6 +39,11 @@ fn test_case(run: &TestRun<'_>) -> TestCase {
             });
             status
         }
+        Outcome::Unsupported(issue) => {
+            let mut status = TestCaseStatus::skipped();
+            status.set_message(format!("unsupported: {issue}"));
+            status
+        }
         Outcome::Failed(message) => non_success(NonSuccessKind::Failure, "failure", message),
         Outcome::TimedOut(message) => non_success(NonSuccessKind::Failure, "timeout", message),
         Outcome::Error(message) => non_success(NonSuccessKind::Error, "error", message),
@@ -48,6 +53,9 @@ fn test_case(run: &TestRun<'_>) -> TestCase {
     case.set_classname(run.test.module_path)
         .add_property(Property::new("family", run.test.family()))
         .add_property(Property::new("description", run.test.info.description));
+    if let Outcome::Unsupported(issue) = &run.outcome {
+        case.add_property(Property::new("unsupported", issue));
+    }
     if let Some(duration) = run.duration {
         case.set_time(duration);
     }
@@ -89,9 +97,11 @@ mod tests {
     const PASSED: Test = test("sandbox::smoke", "create_exec_delete", false);
     const FAILED: Test = test("sandbox::lifecycle", "stop_start", false);
     const SKIPPED: Test = Test {
-        ignore_reason: Some("https://github.com/NVIDIA/OpenShell/issues/1"),
+        ignore_reason: Some("https://github.com/ai-openshell/openshell/issues/1"),
         ..test("sandbox::lifecycle", "later", true)
     };
+
+    const UNSUPPORTED: Test = test("sandbox::lifecycle", "unsupported_here", false);
 
     #[test]
     fn reports_every_outcome() {
@@ -110,16 +120,23 @@ mod tests {
                 Some(Duration::from_secs(1)),
             ),
             run(&SKIPPED, Outcome::Skipped, None),
+            run(
+                &UNSUPPORTED,
+                Outcome::Unsupported("https://github.com/ai-openshell/openshell/issues/2".into()),
+                None,
+            ),
         ];
         let xml = report("openshell-conformance", &runs).to_string().unwrap();
         for expected in [
-            r#"<testsuites name="openshell-conformance" tests="3" skipped="1" failures="1" errors="0">"#,
-            r#"<testsuite name="conformance" tests="3" skipped="1" errors="0" failures="1">"#,
+            r#"<testsuites name="openshell-conformance" tests="4" skipped="2" failures="1" errors="0">"#,
+            r#"<testsuite name="conformance" tests="4" skipped="2" errors="0" failures="1">"#,
             r#"<testcase name="smoke::create_exec_delete" classname="sandbox::smoke" time="1.500">"#,
             r#"<property name="family" value="conformance"/>"#,
             r#"<property name="description" value="A test."/>"#,
             r#"<failure message="timed out after 1s" type="timeout"/>"#,
-            r#"<skipped message="ignored: https://github.com/NVIDIA/OpenShell/issues/1"/>"#,
+            r#"<skipped message="ignored: https://github.com/ai-openshell/openshell/issues/1"/>"#,
+            r#"<skipped message="unsupported: https://github.com/ai-openshell/openshell/issues/2"/>"#,
+            r#"<property name="unsupported" value="https://github.com/ai-openshell/openshell/issues/2"/>"#,
             "<system-out>out\n</system-out>",
         ] {
             assert!(xml.contains(expected), "missing {expected} in\n{xml}");
