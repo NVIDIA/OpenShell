@@ -69,6 +69,14 @@ pub fn userns_preserves_host_groups(userns: Option<&str>) -> bool {
     userns.is_some_and(|mode| mode.split(':').next() == Some("keep-id"))
 }
 
+/// Whether the sandbox process may hold supplementary groups beyond the
+/// resolved workload identity. A GPU or CDI device request can add groups at
+/// container creation (CDI `containerEdits.additionalGids`), independent of the
+/// user-namespace mode, so the claim is set for either reason.
+pub fn allow_extra_supplementary_groups(userns: Option<&str>, gpu_requested: bool) -> bool {
+    gpu_requested || userns_preserves_host_groups(userns)
+}
+
 fn invalid(error: impl std::fmt::Display) -> ComputeDriverError {
     ComputeDriverError::Precondition(error.to_string())
 }
@@ -188,6 +196,9 @@ pub struct RestartMetadata {
     pub(crate) runtime_initiated: bool,
     pub(crate) workload_identity: ResolvedWorkloadIdentity,
     pub(crate) child_env: HashMap<String, String>,
+    /// Persisted so a restart keeps the claim a GPU/CDI request required.
+    #[serde(default)]
+    pub(crate) allow_extra_supplementary_groups: bool,
 }
 
 pub struct BootstrapArchivesInput<'a> {
@@ -341,6 +352,7 @@ pub fn bootstrap_archives(
         generation: generation.to_string(),
         workload_identity: identity.clone(),
         child_env,
+        allow_extra_supplementary_groups,
     };
     supervisor.file(
         RESTART_METADATA_PATH,
@@ -645,5 +657,62 @@ mod tests {
         assert!(!userns_preserves_host_groups(Some("auto")));
         assert!(!userns_preserves_host_groups(Some("private")));
         assert!(!userns_preserves_host_groups(None));
+    }
+
+    #[test]
+    fn gpu_or_cdi_request_allows_extra_groups_under_any_userns_mode() {
+        assert!(allow_extra_supplementary_groups(None, true));
+        assert!(allow_extra_supplementary_groups(Some("auto"), true));
+        assert!(allow_extra_supplementary_groups(Some("keep-id"), false));
+        assert!(!allow_extra_supplementary_groups(None, false));
+        assert!(!allow_extra_supplementary_groups(Some("auto"), false));
+    }
+
+    #[test]
+    fn extra_groups_claim_is_projected_and_persisted_for_restart() {
+        let identity = ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let archives = bootstrap_archives(BootstrapArchivesInput {
+            runtime_initiated: false,
+            sandbox_id: "sandbox",
+            container_id: "container",
+            generation: "generation-1",
+            host_gateway_ip: "127.0.0.1".parse().unwrap(),
+            identity: &identity,
+            allow_extra_supplementary_groups: allow_extra_supplementary_groups(None, true),
+            child_env: HashMap::new(),
+            launch_authentication: &authentication(),
+        })
+        .unwrap();
+        let workload = files(&archives.channel);
+        let supervisor = files(&archives.supervisor);
+        let config: BoundaryConfig = serde_json::from_slice(
+            workload
+                .get(&PathBuf::from("sandbox/bootstrap.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .resource_claims
+                .get(ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM)
+                .map(String::as_str),
+            Some("true")
+        );
+        let restart_metadata: RestartMetadata = serde_json::from_slice(
+            supervisor
+                .get(&PathBuf::from(
+                    RESTART_METADATA_PATH.trim_start_matches('/'),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(restart_metadata.allow_extra_supplementary_groups);
     }
 }

@@ -93,6 +93,13 @@ supplementary groups. Root and unresolved identities fail before provisioning.
 Images must not prepopulate the reserved `/.openshell` hierarchy; this prevents
 image-controlled symlinks from aliasing private control state into user mounts.
 
+The sandbox requires the workload's supplementary groups to equal the resolved
+identity. The driver relaxes that to "must include the resolved groups" only
+when a GPU or CDI device is requested (CDI `containerEdits.additionalGids` adds
+groups at container creation) or the user namespace is `keep-id`. Extra groups
+may extend but never replace the image-derived identity. The claim is persisted
+in the restart metadata so restarts keep it.
+
 `sandbox_runtime_image` supplies the statically linked musl
 `/openshell-sandbox` binary. Podman's read-only image volume delivers it to the
 workload; user-namespace modes that cannot use image volumes retain the trusted
