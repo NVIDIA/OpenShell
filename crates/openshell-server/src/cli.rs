@@ -325,6 +325,10 @@ struct RunArgs {
     )]
     server_sans: Vec<String>,
 
+    /// Authenticate sandbox application requests using configured gateway auth.
+    #[arg(long, env = "OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH", default_value_t = false, action = ArgAction::Set)]
+    enable_gateway_service_auth: bool,
+
     /// Hostname format for exposed sandbox services: `readable` (default)
     /// keeps `<workspace>--<sandbox>[--<service>]` hostnames; `hashed` mints
     /// opaque one-label hostnames discriminated by the gateway installation
@@ -674,8 +678,13 @@ fn prepare_server_config_with_drivers(
         .with_server_sans(args.server_sans.clone())
         .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
         .with_service_routing(args.enable_gateway_service_routing)
+        .with_service_auth(args.enable_gateway_service_auth)
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
+    config.service_routing.auth_login_origins = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.service_auth_login_origins.clone())
+        .unwrap_or_default();
     config
         .service_routing
         .validate(&config.name)
@@ -1086,6 +1095,11 @@ async fn run_from_args(
 
     if prepared.config.service_routing.enabled {
         info!("Gateway-based service routing enabled");
+        if prepared.config.service_routing.auth_enabled {
+            info!("Gateway-mediated service authentication enabled");
+        } else {
+            info!("Gateway-mediated service authentication disabled");
+        }
     }
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
@@ -1687,6 +1701,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_gateway_service_routing")
     {
         args.enable_gateway_service_routing = enabled;
+    }
+    if let Some(enabled) = file.enable_gateway_service_auth
+        && arg_defaulted(matches, "enable_gateway_service_auth")
+    {
+        args.enable_gateway_service_auth = enabled;
     }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
@@ -4279,6 +4298,79 @@ enabled = false
                     &matches,
                     Some(&file)
                 ));
+            });
+    }
+
+    #[test]
+    fn browser_service_login_origins_load_from_gateway_configuration() {
+        Environment::new().run(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gateway.toml");
+            std::fs::write(
+                &path,
+                r#"
+[openshell]
+version = 2
+[openshell.gateway]
+service_auth_login_origins = ["https://gateway.example.com:8443"]
+"#,
+            )
+            .unwrap();
+            let (mut args, matches) = parse_with_args(&[
+                "openshell-gateway",
+                "--config",
+                path.to_str().unwrap(),
+                "--db-url",
+                "sqlite::memory:",
+                "--compute-driver",
+                "podman",
+                "--disable-tls",
+            ]);
+            let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+            assert_eq!(
+                prepared.config.service_routing.auth_login_origins,
+                ["https://gateway.example.com:8443"]
+            );
+        });
+    }
+
+    #[test]
+    fn service_auth_is_opt_in_with_explicit_cli_environment_and_file_precedence() {
+        Environment::new()
+            .remove("OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH")
+            .run(|| {
+                let file = toml::from_str::<ConfigFile>(
+                    "[openshell.gateway]\nenable_gateway_service_auth = true\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                assert!(!args.enable_gateway_service_auth);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(args.enable_gateway_service_auth);
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-auth",
+                    "false",
+                ]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_gateway_service_auth);
+            });
+        Environment::new()
+            .set("OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH", "false")
+            .run(|| {
+                let file = toml::from_str::<ConfigFile>(
+                    "[openshell.gateway]\nenable_gateway_service_auth = true\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_gateway_service_auth);
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-gateway-service-auth",
+                    "true",
+                ]);
+                assert!(args.enable_gateway_service_auth);
             });
     }
 

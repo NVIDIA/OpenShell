@@ -24,9 +24,10 @@ This is the internal-refactoring increment of RFC phase 2, not remote readiness.
 
 ## Owners and compatibility
 
-`SecretOwner` scopes each operation to a workspace and one of three kinds:
+`SecretOwner` scopes each operation to a workspace and one of four kinds:
 
 - `Provider`: the existing provider UUID and name.
+- `ApplicationSession`: the gateway browser session storage identity (`service-session-<session ID>`), using the existing `gateway-service-session` driver scope.
 - `Sandbox`: the sandbox UUID for its SSH host identity.
 - `SupervisorInstance`: the sandbox UUID owning a launch-material assignment, not the shared supervisor route or host.
 

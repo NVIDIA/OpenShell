@@ -51,6 +51,46 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_gateway_service_routing\s*=\s*false$'
+  - it: leaves gateway application auth disabled by the runtime default when omitted
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'enable_gateway_service_auth\s*='
+
+  - it: enables application auth without enabling the app listener
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          enable_gateway_service_auth: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_gateway_service_auth\s*=\s*true$'
+
+  - it: disables application auth through canonical configuration
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          enable_gateway_service_auth: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_gateway_service_auth\s*=\s*false$'
+
+  - it: renders exact trusted browser login origins
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          service_auth_login_origins:
+            - https://gateway.example.com:8443
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_auth_login_origins\s*=\s*\["https://gateway\.example\.com:8443"\]'
 
   - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
     template: templates/gateway-config.yaml

@@ -999,7 +999,7 @@ impl Authenticator for OidcAuthenticator {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     fn transport_test_config(issuer: impl Into<String>) -> OidcConfig {
@@ -1561,7 +1561,7 @@ mod tests {
     }
 
     /// Sign `claims` with the test key, tagging the header with `kid`.
-    fn mint_rs256(claims: &serde_json::Value, kid: &str) -> String {
+    pub fn mint_rs256(claims: &serde_json::Value, kid: &str) -> String {
         crate::install_jsonwebtoken_crypto_provider();
 
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
@@ -1571,7 +1571,7 @@ mod tests {
         openshell_crypto::jwt::encode(&header, claims, &key).expect("sign RS256 token")
     }
 
-    fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
+    pub fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
         serde_json::json!({
             "sub": "user-42",
             "preferred_username": "ada",
@@ -1585,7 +1585,7 @@ mod tests {
 
     /// Serve an OIDC discovery document and a JWKS carrying the test key, then
     /// build a cache against them the same way production does.
-    async fn cache_with_mock_issuer(server: &wiremock::MockServer) -> JwksCache {
+    pub async fn cache_with_mock_issuer(server: &wiremock::MockServer) -> JwksCache {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -2078,6 +2078,106 @@ mod tests {
                 let result = cache.validate_token(&token).await;
                 assert!(result.is_ok(), "validation failed for {name}: {result:?}");
                 assert_eq!(result.unwrap().subject, "user-1");
+            }
+        }
+
+        #[tokio::test]
+        async fn application_revocation_covers_equivalent_ecdsa_signatures() {
+            use crate::auth::{service_access, service_session};
+            use axum::body::Body;
+            use http::{HeaderMap, Method, Request, StatusCode, header};
+            use tower::ServiceExt;
+
+            for (curve, order) in [
+                (
+                    "P-256",
+                    "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+                ),
+                (
+                    "P-384",
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973",
+                ),
+            ] {
+                let key = ec_test_key("application-key", curve);
+                let (cache, issuer, mut config, _issuer_server) =
+                    cache_from_jwks(serde_json::json!({"keys": [key.jwk]})).await;
+                config.scopes_claim.clear();
+                let (_server, mut state, _) = service_session::tests::fixture().await;
+                let inner = Arc::get_mut(&mut state).unwrap();
+                inner.admin_role.clone_from(&config.admin_role);
+                let role = config.user_role.clone();
+                inner.config.oidc = Some(config.clone());
+                inner.oidc_cache = Some(Arc::new(cache));
+                let mut header = Header::new(key.algorithm);
+                header.kid = Some(key.kid);
+                let mut claims = serde_json::json!({
+                    "sub": "user-42", "iss": issuer, "aud": config.audience,
+                    "exp": now_secs() + 3600, "roles": [role], "jti": "original"
+                });
+                let token = encode(&header, &claims, &key.encoding_key).unwrap();
+                let (signed, encoded_signature) = token.rsplit_once('.').unwrap();
+                let mut signature = URL_SAFE_NO_PAD.decode(encoded_signature).unwrap();
+                let width = signature.len() / 2;
+                // ECDSA (r, n-s) verifies the same authenticated signing input.
+                let mut borrow = 0i16;
+                for i in (0..width).rev() {
+                    let n = u8::from_str_radix(&order[2 * i..2 * i + 2], 16).unwrap();
+                    let result = i16::from(n) - i16::from(signature[width + i]) - borrow;
+                    borrow = i16::from(result < 0);
+                    signature[width + i] = u8::try_from(result.rem_euclid(256)).unwrap();
+                }
+                assert_eq!(borrow, 0);
+                let twin = format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature));
+                assert_ne!(token, twin);
+                let headers = |token: &str| {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::AUTHORIZATION,
+                        format!("Bearer {token}").parse().unwrap(),
+                    );
+                    headers
+                };
+                let peer = service_access::ServicePeer {
+                    secure: true,
+                    ..Default::default()
+                };
+                for variant in [&token, &twin] {
+                    service_access::authorize(&state, &headers(variant), &peer, "default")
+                        .await
+                        .unwrap();
+                }
+                let app = "https://default--demo--web.services.example.com";
+                let mut revoke = Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("{app}/.openshell/service-auth/credential"))
+                    .header(header::HOST, "default--demo--web.services.example.com")
+                    .header(header::ORIGIN, app)
+                    .header(header::AUTHORIZATION, format!("Bearer {twin}"))
+                    .body(Body::empty())
+                    .unwrap();
+                revoke.extensions_mut().insert(peer.clone());
+                assert_eq!(
+                    crate::http::http_router(state.clone())
+                        .oneshot(revoke)
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::NO_CONTENT
+                );
+                for variant in [&token, &twin] {
+                    assert_eq!(
+                        service_access::authorize(&state, &headers(variant), &peer, "default")
+                            .await
+                            .unwrap_err()
+                            .code(),
+                        tonic::Code::Unauthenticated
+                    );
+                }
+                claims["jti"] = "fresh".into();
+                let fresh = encode(&header, &claims, &key.encoding_key).unwrap();
+                service_access::authorize(&state, &headers(&fresh), &peer, "default")
+                    .await
+                    .unwrap();
             }
         }
 

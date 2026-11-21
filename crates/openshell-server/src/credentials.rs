@@ -48,6 +48,75 @@ impl CredentialRuntime {
         }
     }
 
+    /// Browser session tokens stay behind the configured credential issuer;
+    /// session metadata stores only their opaque credential handles.
+    pub async fn store_application_token(
+        &self,
+        workspace: &str,
+        id: &str,
+        token: &str,
+    ) -> Result<CredentialHandle, Status> {
+        let storage_id = format!("service-session-{id}");
+        let mut handles = self
+            .store_secrets_with_object_id(
+                SecretOwner::application_session(workspace, &storage_id),
+                &storage_id,
+                &HashMap::from([("gateway-access-token".into(), token.into())]),
+                &Handles::new(),
+            )
+            .await?;
+        handles
+            .remove("gateway-access-token")
+            .filter(|handle| !handle.handle.is_empty())
+            .ok_or_else(|| Status::internal("empty or missing application credential handle"))
+    }
+
+    pub async fn resolve_application_token(
+        &self,
+        workspace: &str,
+        id: &str,
+        handle: CredentialHandle,
+    ) -> Result<String, Status> {
+        let storage_id = format!("service-session-{id}");
+        let values = self
+            .issuer
+            .resolve(
+                SecretOwner::application_session(workspace, &storage_id),
+                &Handles::from([("gateway-access-token".into(), handle)]),
+            )
+            .await?;
+        if values.len() != 1
+            || values[0].credential_key != "gateway-access-token"
+            || values[0].value.is_empty()
+        {
+            return Err(Status::unauthenticated(
+                "application credential unavailable",
+            ));
+        }
+        if let Some(expires) = &values[0].expiration_time
+            && openshell_core::time::timestamp_to_millis(expires)
+                .map_err(|_| Status::unavailable("invalid application credential expiration"))?
+                <= openshell_core::time::now_ms()
+        {
+            return Err(Status::unauthenticated("expired application credential"));
+        }
+        Ok(values.into_iter().next().unwrap().value)
+    }
+
+    pub async fn delete_application_token(
+        &self,
+        workspace: &str,
+        id: &str,
+        handle: CredentialHandle,
+    ) -> Result<(), Status> {
+        let storage_id = format!("service-session-{id}");
+        self.delete_secrets(
+            SecretOwner::application_session(workspace, &storage_id),
+            &Handles::from([("gateway-access-token".into(), handle)]),
+        )
+        .await
+    }
+
     pub fn from_config(config: &Config) -> CoreResult<Self> {
         Ok(Self::from_embedded(EmbeddedCredentialIssuer::from_config(
             &IssuerConfig::from(config),
@@ -382,6 +451,76 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn application_tokens_preserve_issuer_scope_and_backend_ownership() {
+        let storage = tempfile::tempdir().unwrap();
+        let key_path = storage.path().join("key-encryption-key.bin");
+        let store = Arc::new(crate::persistence::test_store().await);
+        let file = config_file(&format!(
+            "[openshell.gateway.credential_storage]\nkey_encryption_key_path = {}\n",
+            toml_path(&key_path),
+        ));
+        let runtime =
+            CredentialRuntime::from_config_file_with_store(&Config::new(None), Some(&file), store)
+                .await
+                .unwrap();
+        let handle = runtime
+            .store_application_token("workspace-a", "session-a", "session-secret")
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .resolve_application_token("workspace-a", "session-a", handle.clone())
+                .await
+                .unwrap(),
+            "session-secret"
+        );
+        // Storage validates provider/key ownership; the gateway retains
+        // workspace/session authorization before resolving its private handle.
+        for (provider, key) in [
+            ("another-provider", "gateway-access-token"),
+            ("gateway-service-session", "another-key"),
+        ] {
+            assert!(
+                runtime
+                    .resolve_secrets(
+                        SecretOwner::provider("workspace-a", "service-session-session-a", provider),
+                        &Handles::from([(key.into(), handle.clone())]),
+                        openshell_core::time::now_ms(),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        // The explicit owner kind must preserve the already deployed driver scope.
+        let resolved = runtime
+            .resolve_secrets(
+                SecretOwner::provider(
+                    "workspace-a",
+                    "service-session-session-a",
+                    "gateway-service-session",
+                ),
+                &Handles::from([("gateway-access-token".into(), handle.clone())]),
+                openshell_core::time::now_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("gateway-access-token").unwrap(),
+            "session-secret"
+        );
+        runtime
+            .delete_application_token("workspace-a", "session-a", handle.clone())
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .resolve_application_token("workspace-a", "session-a", handle)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

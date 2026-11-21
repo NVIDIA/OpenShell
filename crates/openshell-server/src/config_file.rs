@@ -194,6 +194,12 @@ pub struct GatewayFileSection {
     /// Publish gateway URLs and forward application requests. Defaults to true.
     #[serde(default)]
     pub enable_gateway_service_routing: Option<bool>,
+    /// Opt in to gateway authentication for sandbox application requests.
+    #[serde(default)]
+    pub enable_gateway_service_auth: Option<bool>,
+    /// Exact trusted HTTPS control-plane origins for browser service login.
+    #[serde(default)]
+    pub service_auth_login_origins: Option<Vec<String>>,
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[serde(default)]

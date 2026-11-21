@@ -2437,3 +2437,36 @@ that a supervisor installed the route or ingress is ready.
 Upgrade the CLI alongside the gateway when enabling `base_url`. Older CLI
 versions can replace the public application port with the gateway connection's
 port.
+
+Gateway-mediated service authentication is independently opt-in:
+
+```toml
+[openshell.gateway]
+enable_gateway_service_auth = true
+```
+
+This setting applies only when `enable_gateway_service_routing` is `true`. Disabling
+gateway service routing also disables the application login endpoint.
+
+The default is `false`, preserving existing service routing. Enable it with
+`--enable-gateway-service-auth true`, `OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH=true`, or Helm
+`gatewayConfig."openshell.gateway".enable_gateway_service_auth`. Precedence is CLI > environment >
+TOML > default, including explicit `false` values. This setting works with the
+app listener enabled or disabled and with any compute driver supporting gateway
+service forwarding. It uses the gateway's configured authentication and workspace
+access controls. See
+[application request authentication](/how-it-works/gateways/authentication#sandbox-service-requests)
+for browser sessions, application credential passthrough, and revocation.
+Direct app-listener authentication belongs to the ingress provider.
+
+Browser login additionally requires `service_auth_login_origins` in
+`[openshell.gateway]`, for example `["https://gateway.example.com:8443"]`.
+Only exact HTTPS control-plane origins are allowed; wildcards, credentials,
+paths, queries, and fragments are invalid. The default empty list disables
+browser login while preserving bearer and mTLS application access. Helm uses
+`gatewayConfig."openshell.gateway".service_auth_login_origins`.
+
+When service authentication is enabled, TLS gateways advertise HTTPS for gateway service access, including
+on loopback, so clients can present an mTLS identity. The separate plaintext
+loopback service listener cannot accept a client-certificate identity or browser
+sessions; use an explicit gateway bearer credential there.

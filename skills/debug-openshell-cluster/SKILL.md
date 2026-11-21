@@ -1864,6 +1864,37 @@ an app domain need distinct gateway names; replicas of one installation share
 its name. Changing the mode or installation name requires fresh route
 installation before discovery can advertise the replacement.
 
+When `enable_gateway_service_auth` is true, gateway-mediated service HTTP requests and
+WebSocket upgrades require configured gateway authentication and workspace user
+access with the app listener disabled or enabled. OIDC scope enforcement requires `sandbox:write` (or `openshell:all`),
+as for TCP forwarding. Check HTTP 401 for missing/invalid/expired/revoked
+credentials and 403 for role/scope/membership/origin denial. Browser login starts
+at the control-plane `/auth/services?service_origin=...`. Configure exact trusted control-plane origins in
+`openshell.gateway.service_auth_login_origins`. An empty list disables browser
+login; include the public port and use the same list on every replica. The app host receives
+only a single-use code and a Secure/HttpOnly cookie. Check shared database and
+credential-driver availability across replicas. Browser sessions expire within
+ten minutes and reauthorize on every request. DELETE the same-origin app paths
+`/.openshell/service-auth/session` to log out or
+`/.openshell/service-auth/credential` to revoke the current application-access
+credential. `X-OpenShell-Authorization` separates gateway bearer auth from an
+application Authorization header. Gateway headers and reserved cookies are
+stripped; application cookies and explicit bearer passthrough remain available.
+Only explicit local-development unauthenticated access bypasses gateway auth.
+Direct listener authentication belongs to the ingress provider.
+
+### Gateway-mediated application authentication
+
+Gateway service auth is opt-in with `[openshell.gateway].enable_gateway_service_auth = true`,
+`--enable-gateway-service-auth true`, or `OPENSHELL_ENABLE_GATEWAY_SERVICE_AUTH=true`. Helm uses
+`gatewayConfig."openshell.gateway".enable_gateway_service_auth`.
+It defaults to false and is independent of `supervisor_app_listener.enabled`.
+When debugging unexpected application 401/403 responses or browser login, check
+this flag before inspecting the configured gateway authentication and workspace
+membership. Direct app-listener authentication remains the ingress provider's
+responsibility. Disabling service auth retains gateway application routing; it
+does not disable the gateway data path.
+
 ## Azure PostgreSQL workload identity
 
 When `database_auth = "azure-workload-identity"` is configured, verify the gateway

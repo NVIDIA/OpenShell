@@ -312,7 +312,8 @@ supervisor to reload application certificates.
 This path uses application or trusted-edge authentication independently from
 gateway authentication. It validates Host against SNI, preserves public
 Host/Origin and application cookies, strips gateway/edge identity material, and
-retains service-specific bearer passthrough. Hop-by-hop headers are removed from
+retains service-specific bearer passthrough. Reserved gateway authentication cookies
+are removed from both requests and responses. Hop-by-hop headers are removed from
 requests and responses, preserving successful WebSocket upgrades. An application
 closing its upstream HTTP connection does not close the client connection.
 It has no discovery API or public
