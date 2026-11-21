@@ -100,7 +100,8 @@ const BUFFER_UNDERFLOW: &str = "buffer underflow";
 /// The request could not be enriched.
 #[derive(Debug)]
 pub enum EnrichError {
-    /// The bytes are not a well-formed protobuf message for this schema.
+    /// The bytes are not a well-formed protobuf message for this schema, or a
+    /// JSON body is not a well-formed OTLP/JSON request.
     Malformed(String),
     /// More than [`MAX_RESOURCE_SPANS`] entries.
     TooManyResourceSpans,
@@ -108,6 +109,8 @@ pub enum EnrichError {
     TooManyResourceAttributes,
     /// The `resource` fields of the request exceed [`MAX_RESOURCE_BYTES`].
     ResourceTooLarge,
+    /// A JSON body exceeds the shape limits in [`super::json`].
+    JsonTooComplex,
 }
 
 impl std::fmt::Display for EnrichError {
@@ -126,6 +129,12 @@ impl std::fmt::Display for EnrichError {
                     "resource fields exceed {MAX_RESOURCE_BYTES} bytes in total"
                 )
             }
+            Self::JsonTooComplex => write!(
+                f,
+                "JSON body nests more than {} levels or holds more than {} values",
+                super::json::MAX_DEPTH,
+                super::json::MAX_VALUES
+            ),
         }
     }
 }

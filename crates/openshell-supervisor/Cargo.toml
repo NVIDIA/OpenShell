@@ -40,7 +40,8 @@ hyper-util = { workspace = true, features = ["tokio", "http1", "server", "server
 miette = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-proto = { workspace = true }
+# `with-serde` is the JSON half of the OTLP/HTTP relay's transcoding.
+opentelemetry-proto = { workspace = true, features = ["with-serde"] }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rustls = { workspace = true }

@@ -3,10 +3,10 @@
 
 //! Supervisor-direct OTLP trace relay.
 //!
-//! A sandboxed agent exports OTLP/HTTP protobuf traces to the reserved
-//! address [`openshell_core::sandbox_env::OTLP_RELAY_ADDR`]. The sandbox
-//! broker stages that connection to the supervisor, the network proxy hands
-//! the stream to [`receiver::OtlpConnectionServer`], and the accepted batch
+//! A sandboxed agent exports OTLP/HTTP traces, as protobuf or JSON, to the
+//! reserved address [`openshell_core::sandbox_env::OTLP_RELAY_ADDR`]. The
+//! sandbox broker stages that connection to the supervisor, the network proxy
+//! hands the stream to [`receiver::OtlpConnectionServer`], and the accepted batch
 //! is enriched with the sandbox id, buffered, and forwarded over OTLP/gRPC or
 //! OTLP/HTTP to the collector the gateway names in
 //! `OPENSHELL_OTLP_AGENT_ENDPOINT`, using `OPENSHELL_OTLP_AGENT_PROTOCOL`. The
@@ -15,6 +15,7 @@
 pub mod buffer;
 pub mod enrichment;
 pub mod exporter;
+pub mod json;
 pub mod receiver;
 
 use std::net::SocketAddr;
@@ -46,11 +47,13 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// export buffer, [`BUFFER_CAPACITY`] batches of this size (about 67 MiB);
 /// bodies read but not yet enriched, [`MAX_CONCURRENT_CONNECTIONS`] times
 /// [`MAX_BODY_BYTES`] (32 MiB); and the working set of the
-/// [`ENRICHMENT_CONCURRENCY`] enrichments in progress, each about twice the
-/// body plus at most about 1 MiB of decoded resource elements (about
-/// 12 MiB). On top of that, the export task holds the batch it took from
-/// the buffer and tonic encodes a copy of it, one batch each (about 4 MiB).
-/// Every allocation is sized to its content before it is held.
+/// [`ENRICHMENT_CONCURRENCY`] enrichments in progress. A protobuf body
+/// takes about twice its size plus at most about 1 MiB of decoded resource
+/// elements (about 12 MiB for both). A JSON body is decoded in full first,
+/// which peaked at about 44 MiB in the worst shape measured within the
+/// limits in [`json`], about 88 MiB for both. On top of that, the export task holds the batch it took
+/// from the buffer and tonic encodes a copy of it, one batch each (about
+/// 4 MiB). Every allocation is sized to its content before it is held.
 pub const MAX_ENRICHED_BYTES: usize =
     MAX_BODY_BYTES + enrichment::MAX_RESOURCE_SPANS * enrichment::ATTRIBUTION_BYTES_PER_ENTRY;
 /// How long a connection may idle before a complete request header arrives.
@@ -62,9 +65,10 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 /// Requests enriched at the same time.
 ///
-/// Enrichment is a short CPU-bound copy whose working set is about twice the
-/// body plus the decoded resources, so two slots bound that transient
-/// regardless of how many connections hold a body.
+/// Enrichment is a CPU-bound copy, run on the blocking pool, whose working
+/// set is about twice the body plus the decoded resources, or the decoded
+/// request for a JSON body, so two slots bound that transient regardless of
+/// how many connections hold a body.
 pub const ENRICHMENT_CONCURRENCY: usize = 2;
 /// Number of enriched batches held between receipt and export.
 pub const BUFFER_CAPACITY: usize = 32;
@@ -101,11 +105,15 @@ pub struct RelayCounters {
     /// Metrics and logs exports acknowledged and dropped, since the relay
     /// forwards traces only.
     discarded_signals: AtomicU64,
+    /// Trace exports refused with 400, 413 or 415 because the request itself
+    /// was unacceptable.
+    invalid_requests: AtomicU64,
     /// Whether the most recent export attempt failed. Cleared by the next
     /// success; flushes skip waiting while it is set.
     last_export_failed: AtomicBool,
     first_rejection_logged: AtomicBool,
     first_discard_logged: AtomicBool,
+    first_invalid_logged: AtomicBool,
     first_failure_logged: AtomicBool,
     final_summary_logged: AtomicBool,
 }
@@ -144,6 +152,24 @@ impl RelayCounters {
     /// Metrics and logs exports discarded so far.
     pub fn discarded_signals(&self) -> u64 {
         self.discarded_signals.load(Ordering::Relaxed)
+    }
+
+    /// Records one export refused with `status` (400, 413 or 415) because
+    /// the request was malformed, over a limit or in an unsupported encoding.
+    /// Warns on the first occurrence only; the reason is logged at debug.
+    pub fn record_invalid_request(&self, status: u16) {
+        self.invalid_requests.fetch_add(1, Ordering::Relaxed);
+        if !self.first_invalid_logged.swap(true, Ordering::Relaxed) {
+            warn!(
+                status,
+                "OTLP relay refused an agent export as invalid; the response states the reason"
+            );
+        }
+    }
+
+    /// Exports refused as invalid so far.
+    pub fn invalid_requests(&self) -> u64 {
+        self.invalid_requests.load(Ordering::Relaxed)
     }
 
     /// Records one export attempt that failed or timed out. Warns on the
@@ -200,6 +226,7 @@ impl RelayCounters {
             rejected,
             export_failures,
             discarded_signals = self.discarded_signals(),
+            invalid_requests = self.invalid_requests(),
             "OTLP relay summary"
         );
     }
@@ -490,14 +517,14 @@ fn assemble(
 }
 
 /// Logs the cumulative counts every [`SUMMARY_INTERVAL`], but only while the
-/// rejected or failed counts keep changing.
+/// rejected, invalid or failed counts keep changing.
 async fn summary_loop(counters: Arc<RelayCounters>) {
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + SUMMARY_INTERVAL,
         SUMMARY_INTERVAL,
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_reported = (0, 0);
+    let mut last_reported = (0, 0, 0);
     loop {
         interval.tick().await;
         let CounterSnapshot {
@@ -505,8 +532,9 @@ async fn summary_loop(counters: Arc<RelayCounters>) {
             export_failures,
             ..
         } = counters.snapshot();
-        if (rejected, export_failures) != last_reported {
-            last_reported = (rejected, export_failures);
+        let current = (rejected, counters.invalid_requests(), export_failures);
+        if current != last_reported {
+            last_reported = current;
             counters.log_summary();
         }
     }
@@ -1252,6 +1280,33 @@ mod tests {
             1
         );
         assert_eq!(counters.snapshot().rejected, 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_requests_warn_once_and_reach_the_summary() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let counters = Arc::new(RelayCounters::default());
+        let summary = tokio::spawn(summary_loop(Arc::clone(&counters)));
+        // Let the loop start its interval before time moves.
+        tokio::task::yield_now().await;
+        for status in [400, 413, 415] {
+            counters.record_invalid_request(status);
+        }
+        assert_eq!(
+            logs.count(
+                tracing::Level::WARN,
+                "OTLP relay refused an agent export as invalid; the response states the reason"
+            ),
+            1
+        );
+
+        tokio::time::advance(SUMMARY_INTERVAL + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let summaries = logs.events(tracing::Level::INFO, "OTLP relay summary");
+        assert_eq!(summaries.len(), 1, "invalid requests alone trigger it");
+        assert_eq!(summaries[0].field("invalid_requests"), Some(3));
+        summary.abort();
     }
 
     #[tokio::test]
