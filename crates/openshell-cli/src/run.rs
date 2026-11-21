@@ -101,7 +101,7 @@ fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::D
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
+    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward,
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{
@@ -109,7 +109,7 @@ pub use openshell_core::forward::{
 };
 
 #[derive(Debug, PartialEq, Eq)]
-enum SandboxUploadPlan {
+pub(crate) enum SandboxUploadPlan {
     GitAware {
         base_dir: PathBuf,
         files: Vec<String>,
@@ -1082,10 +1082,11 @@ pub async fn sandbox_create(
                 }
                 // Boxed so the upload state machine lives on the heap instead of
                 // inflating the `sandbox_create` future (clippy::large_futures).
-                Box::pin(sandbox_upload_planned(
+                Box::pin(crate::ssh::sandbox_upload_planned(
                     upload_plan,
                     &effective_server,
                     &sandbox_name,
+                    Some(sandbox.object_id()),
                     Path::new(local_path),
                     dest,
                     &effective_tls,
@@ -5367,38 +5368,6 @@ fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
     Ok(SandboxUploadPlan::GitAware { base_dir, files })
 }
 
-async fn sandbox_upload_planned(
-    plan: SandboxUploadPlan,
-    server: &str,
-    name: &str,
-    local_path: &Path,
-    sandbox_path: Option<&str>,
-    tls: &TlsOptions,
-    workspace: &str,
-) -> Result<Option<String>> {
-    match plan {
-        SandboxUploadPlan::GitAware { base_dir, files } => {
-            sandbox_sync_up_files(
-                server,
-                name,
-                &base_dir,
-                &files,
-                local_path,
-                sandbox_path,
-                tls,
-                workspace,
-            )
-            .await?;
-            Ok(None)
-        }
-        SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace)
-                .await
-                .map(Some)
-        }
-    }
-}
-
 /// Upload a local path to a sandbox.
 ///
 /// Symlink sources, including dangling links, bypass Git-aware filtering so
@@ -5420,10 +5389,11 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    let uploaded_path = sandbox_upload_planned(
+    let uploaded_path = crate::ssh::sandbox_upload_planned(
         upload_plan,
         server,
         name,
+        None,
         local_path,
         sandbox_path,
         tls,

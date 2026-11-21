@@ -24,8 +24,8 @@ pub enum Event {
     ListRefreshCompleted(crate::ListRefreshResult),
     /// Completed per-sandbox draft-count refresh from a background task.
     DraftCountsRefreshCompleted(crate::DraftCountsRefreshResult),
-    /// Result of a create sandbox request: `Ok((name, workspace))` or `Err(message)`.
-    CreateResult(Result<(String, String), String>),
+    /// Identity returned by the create sandbox request.
+    CreateResult(Result<openshell_core::ssh_handoff::SshTarget, String>),
     /// Result of creating a provider on the gateway: `Ok(name)` or `Err(message)`.
     ProviderCreateResult(Result<String, String>),
     /// Provider detail fetched from gateway.

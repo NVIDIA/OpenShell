@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
@@ -675,41 +675,24 @@ enum Commands {
         shell: CompletionShell,
     },
 
-    /// SSH proxy (used by `ProxyCommand`).
-    ///
-    /// Two mutually exclusive modes:
-    ///
-    /// **Token mode** (used internally by `sandbox connect`):
-    ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>`
-    ///
-    /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
+    /// Mint an SSH session and relay SSH over the selected gateway.
     #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshProxy {
-        /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
-        /// Required in token mode. In name mode, can be a gateway name.
-        #[arg(long, short = 'g')]
-        gateway: Option<String>,
-
-        /// Sandbox name. Required in token mode.
-        #[arg(long)]
-        sandbox: Option<String>,
-
-        /// SSH session token. Required in token mode.
-        #[arg(long)]
-        token: Option<String>,
-
-        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
+        /// Gateway endpoint override.
         #[arg(long)]
         server: Option<String>,
 
-        /// Gateway name. Used with --name to resolve gateway from metadata.
+        /// One-use local relay grant prepared by the parent.
+        #[arg(long, conflicts_with_all = ["server", "gateway_name"])]
+        handoff: Option<String>,
+
+        /// Registered gateway to use for credentials and endpoint discovery.
         #[arg(long)]
         gateway_name: Option<String>,
 
-        /// Sandbox name. Used in name mode.
-        #[arg(long)]
-        name: Option<String>,
+        /// Sandbox to connect to.
+        #[arg(long, alias = "sandbox")]
+        name: String,
     },
 }
 
@@ -2799,7 +2782,20 @@ fn run_main() -> Result<()> {
 async fn run_async() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
-    let cli = Cli::parse();
+    let (cli, explicit_gateway) = {
+        let mut args = Cli::command().get_matches();
+        let explicit_gateway =
+            args.value_source("gateway") == Some(clap::parser::ValueSource::CommandLine);
+        if explicit_gateway
+            && args.value_source("gateway_endpoint") == Some(clap::parser::ValueSource::EnvVariable)
+        {
+            args.remove_one::<String>("gateway_endpoint");
+        }
+        (
+            Cli::from_arg_matches_mut(&mut args).unwrap_or_else(|err| err.exit()),
+            explicit_gateway,
+        )
+    };
 
     // Resolve colorization before anything is printed, so no command can emit
     // escape sequences into a pipe.
@@ -3864,7 +3860,7 @@ async fn run_async() -> Result<()> {
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::print_ssh_config(&ctx.name, &name, &cli.workspace);
+                            run::print_ssh_config(&ctx.name, &name, &cli.workspace)?;
                         }
                         SandboxCommands::Provider(command) => match command {
                             SandboxProviderCommands::List {
@@ -4329,53 +4325,39 @@ async fn run_async() -> Result<()> {
                 .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
         }
         Some(Commands::SshProxy {
-            gateway,
-            sandbox,
-            token,
             server,
             gateway_name,
             name,
+            handoff,
         }) => {
-            match (gateway, sandbox, token, server, gateway_name, name) {
-                // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
-                    let mut effective_tls = match gateway_name_opt {
-                        Some(ref g) => tls.with_gateway_name(g),
-                        None => tls,
-                    };
-                    if let Some(ref g) = gateway_name_opt {
-                        apply_auth(&mut effective_tls, g)?;
-                    }
-                    run::sandbox_ssh_proxy(&gw, &sandbox, &cli.workspace, &tok, &effective_tls)
-                        .await?;
-                }
-                // Name mode with --gateway-name: resolve endpoint from metadata.
-                (_, _, _, server_override, Some(g), Some(n)) => {
-                    let endpoint = if let Some(srv) = server_override {
-                        srv
-                    } else {
-                        let meta = load_gateway_metadata(&g).map_err(|_| {
-                            miette::miette!(
-                                "Unknown gateway '{g}'.\n\
-                                  Register it first: openshell gateway add <endpoint> --name {g}\n\
-                                  Or list available gateways: openshell gateway select"
-                            )
-                        })?;
-                        meta.gateway_endpoint
-                    };
-                    let mut tls = tls.with_gateway_name(&g);
-                    apply_auth(&mut tls, &g)?;
-                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
-                }
-                // Legacy name mode with --server only (no --gateway-name).
-                (_, _, _, Some(srv), None, Some(n)) => {
-                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls, &cli.workspace).await?;
-                }
-                _ => {
-                    return Err(miette::miette!(
-                        "provide either --gateway/--sandbox/--token or --gateway-name/--name (or --server/--name)"
-                    ));
-                }
+            if let Some(handle) = handoff {
+                let (grant, peer) = openshell_core::ssh_handoff::receive(&handle).await?;
+                let mut tls = tls.with_gateway_name(&grant.gateway_name);
+                apply_auth(&mut tls, &grant.gateway_name)?;
+                openshell_cli::ssh::relay_prepared_ssh(grant, peer, &name, &cli.workspace, &tls)
+                    .await?;
+            } else {
+                // A saved profile resolves its own endpoint. A local --server
+                // can explicitly pair an endpoint with the chosen profile.
+                let (profile, endpoint) = if server.is_some() {
+                    (
+                        gateway_name.or_else(|| cli.gateway.filter(|_| explicit_gateway)),
+                        server,
+                    )
+                } else if gateway_name.is_some() {
+                    (gateway_name, None)
+                } else if cli.gateway_endpoint.is_some() {
+                    (
+                        cli.gateway.filter(|_| explicit_gateway),
+                        cli.gateway_endpoint,
+                    )
+                } else {
+                    (cli.gateway, cli.gateway_endpoint)
+                };
+                let ctx = resolve_gateway(&profile, &endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
+                run::sandbox_ssh_proxy_by_name(&ctx.endpoint, &name, &tls, &cli.workspace).await?;
             }
         }
 
@@ -5359,48 +5341,46 @@ mod tests {
         });
     }
 
-    /// Verify the flag names the TUI uses to build its `ProxyCommand` are
-    /// accepted by the `SshProxy` subcommand and land in the right fields.
-    /// This catches drift when CLI flags are renamed or restructured.
     #[test]
-    fn ssh_proxy_token_mode_flags_match_tui_proxy_command() {
-        // This is the exact flag pattern constructed by the TUI in lib.rs
-        // (handle_shell_connect, handle_exec, handle_port_forward).
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "ssh-proxy",
-            "--gateway",
-            "https://gw.example.com:8080/proxy/connect",
-            "--sandbox",
-            "my-box",
-            "--workspace",
-            "team-a",
-            "--token",
-            "tok-abc",
-            "--gateway-name",
-            "my-gateway",
-        ])
-        .expect("TUI proxy command flags must be accepted by the CLI");
-        assert_eq!(cli.workspace, "team-a");
+    fn ssh_proxy_rejects_tokens_in_arguments() {
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "ssh-proxy",
+                "--gateway",
+                "gw",
+                "--sandbox",
+                "demo",
+                "--token",
+                "test-token",
+            ])
+            .is_err()
+        );
+    }
 
-        match cli.command {
-            Some(Commands::SshProxy {
-                gateway,
-                sandbox,
-                token,
-                gateway_name,
-                ..
-            }) => {
-                assert_eq!(
-                    gateway.as_deref(),
-                    Some("https://gw.example.com:8080/proxy/connect"),
-                    "gateway URL must land in SshProxy.gateway, not the global flag"
-                );
-                assert_eq!(sandbox.as_deref(), Some("my-box"));
-                assert_eq!(token.as_deref(), Some("tok-abc"));
-                assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
-            }
-            other => panic!("expected SshProxy, got: {other:?}"),
+    #[test]
+    fn ssh_proxy_accepts_generated_and_saved_commands() {
+        for name_flag in ["--sandbox", "--name"] {
+            let cli = Cli::try_parse_from([
+                "openshell",
+                "ssh-proxy",
+                "--gateway-name",
+                "my-gateway",
+                name_flag,
+                "my-box",
+                "--workspace",
+                "team-a",
+            ])
+            .unwrap();
+            assert_eq!(cli.workspace, "team-a");
+            let Some(Commands::SshProxy {
+                gateway_name, name, ..
+            }) = cli.command
+            else {
+                panic!("expected ssh-proxy")
+            };
+            assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
+            assert_eq!(name, "my-box");
         }
     }
 

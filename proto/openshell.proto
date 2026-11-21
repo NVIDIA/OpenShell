@@ -1950,11 +1950,9 @@ message CreateSshSessionRequest {
 
 // Create SSH session response.
 //
-// Fields are interpolated into an SSH `ProxyCommand` string that OpenSSH
-// executes through `/bin/sh -c` on the caller's workstation. Servers MUST
-// uphold the charset contract below; clients MUST reject responses that
-// violate it. The client's own escaping provides defense-in-depth, but
-// narrow charsets close injection vectors at the trust boundary.
+// Servers MUST uphold the charset contract below. Clients MUST validate the
+// response before using it to open a relay. Send the session token only in the
+// authenticated gateway RPCs that use it. Keep it out of SSH command lines.
 message CreateSshSessionResponse {
   reserved 8;
   reserved "expires_at_ms";

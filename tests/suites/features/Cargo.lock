@@ -2365,6 +2365,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2372,6 +2373,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4041,6 +4043,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "slab",

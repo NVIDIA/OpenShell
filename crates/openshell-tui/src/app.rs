@@ -324,8 +324,7 @@ pub struct CreateSandboxForm {
     /// When the create animation started (for pacman timing).
     pub anim_start: Option<Instant>,
     /// Buffered create result — held until min display time elapses.
-    /// `Ok((name, workspace))` or `Err(message)`.
-    pub create_result: Option<Result<(String, String), String>>,
+    pub create_result: Option<Result<openshell_core::ssh_handoff::SshTarget, String>>,
 }
 
 // ---------------------------------------------------------------------------
