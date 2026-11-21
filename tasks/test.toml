@@ -101,7 +101,7 @@ hide = true
 
 ["test:maintainer-approval"]
 description = "Test the maintainer approval gate and change-alert tools"
-run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/check_maintainer_approval_test.py tasks/scripts/alert_maintainer_change_test.py"
+run = "uv run --no-project --with pytest --with pyyaml pytest -o \"python_files=*_test.py\" tasks/scripts/check_maintainer_approval_test.py tasks/scripts/alert_maintainer_change_test.py"
 hide = true
 
 ["test:review-readiness"]
