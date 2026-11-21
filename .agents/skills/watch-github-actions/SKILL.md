@@ -131,6 +131,26 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 `Release Dev` finishes its active run and replaces pending runs when new commits arrive. Other callers retain E2E cancellation. Inspect job annotations for cancellation reasons.
 
+## GKE runner trial
+
+Branch Checks Linux amd64 jobs from ai-openshell/openshell branches run on the
+`openshell-ci-amd64` ARC scale set during the GKE trial. Fork, ARM, and macOS jobs
+keep their hosted runners. Confirm the runner name in the job details before
+attributing a result to GKE. For a job-container or PostgreSQL startup failure,
+check the runner pod's Docker sidecar first. A missing `gh` executable or
+Cachix's `$USER must be set` error indicates incomplete runner bootstrap.
+For a preloaded image, `setup-nix` verifies its global Cachix substituter and
+skips adding it again. A cache-configuration permission failure indicates the
+image/setup contract is out of sync. Rust jobs report shared memcached
+sccache statistics; distinguish backend connectivity errors from compiler/test
+failures. The x86 GKE lint/test jobs use single-worker `openshell-ci-amd64-pd-*`
+scale sets with separate exclusive persistent disks. Setup reports the target
+size before building and skips GitHub Cargo cache restore/save. Compare empty
+and warm runs on different runner pods; a PVC surviving pod replacement is the
+persistence check. `Pending` pods can be waiting for exclusive disk attachment;
+inspect PVC/PV events before treating this as a runner registration failure.
+See `CI.md` for trial scope and cache setup.
+
 ## View Job Logs
 
 For Branch Checks `Reviewer Roster` failures, the log lists non-collaborators in

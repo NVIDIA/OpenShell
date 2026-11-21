@@ -6,7 +6,35 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 ## Overview
 
-PR CI runs on standard GitHub-hosted runners. `Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`. Workflow runs from outside contributors wait for a maintainer to approve them in the Actions tab.
+`Branch Checks` uses the `openshell-ci-amd64` GKE ARC scale set for Linux amd64
+jobs from branches in `ai-openshell/openshell`, manual runs, and merge groups.
+Fork PRs use GitHub-hosted runners; ARM and macOS jobs keep their existing
+runner labels. This is a branch trial and does not change main until merged.
+`Branch Checks` and `Helm Lint` trigger on `pull_request` and `merge_group`.
+Workflow runs from outside contributors wait for a maintainer to approve them
+in the Actions tab.
+
+The GKE scale set maintains five idle runners and permits twenty total. Each
+runner has an isolated Docker daemon for job containers and Docker-backed tests.
+Runner bootstrap provides GitHub CLI, compression utilities, and the `USER`
+environment variable expected by the existing checks and Cachix. The custom
+image preloads Nix shells and configures the signed Cachix substituter globally;
+setup verifies that cache and skips duplicate user-level cache configuration.
+Rust jobs use the shared memcached sccache backend and report cache statistics;
+the standard runner jobs retain the existing GitHub Rust target/registry cache.
+The x86 lint/test jobs instead use `openshell-ci-amd64-pd-lint` and
+`openshell-ci-amd64-pd-test`. Each trial scale set has one worker and an exclusive
+200 GiB SSD persistent disk, mounted at `/mnt/ci-cache`. Setup verifies the mount
+and selects a repository/Nix-shell-specific target directory shared by that
+job's Cargo commands. It skips GitHub Cargo cache restore/save entirely.
+Check the initial target size and runner pod name to distinguish an empty-disk
+run from a warm run on a replacement pod. Checkout and credentials remain
+ephemeral; only Cargo build outputs persist. Cargo still validates artifacts,
+and fresh checkout timestamps can trigger workspace rebuilds. These two lanes
+serialize concurrent jobs during the trial; the ordinary scale set stays 5–20.
+Inspect the job's
+runner name to confirm whether it ran on GKE. ARM, macOS, and fork jobs do not
+use the cluster-local cache endpoint.
 
 `pull_request` runs from forks get a read-only token and no secrets, so they cannot post statuses. `Required CI Gates` runs from the base repository (`pull_request_target` and `workflow_run`), never checks out PR code, and posts the required `OpenShell / ...` statuses on the PR head SHA. E2E suites are opt-in because they are more expensive.
 

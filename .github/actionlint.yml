@@ -3,6 +3,7 @@
 
 self-hosted-runner:
   labels:
+    - openshell-ci-amd64
     - ubuntu-26.04
     - windows-arm64
 
