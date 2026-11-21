@@ -32,9 +32,17 @@ runs:
         extra-conf: |
           http2 = false
 
+    - name: Verify GKE image cache configuration
+      if: ${{ startsWith(runner.name, 'openshell-ci-amd64-') }}
+      shell: bash
+      run: |
+        nix config show --json | jq -e '.substituters.value | index("https://openshell.cachix.org") != null' > /dev/null
+
     - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
       with:
         name: openshell
+        # The image configures the substituter globally before dropping to runner.
+        skipAddingSubstituter: ${{ startsWith(runner.name, 'openshell-ci-amd64-') }}
         authToken: ${{ inputs.cachix-auth-token }}
         skipPush: ${{ inputs.cachix-auth-token == '' }}
 

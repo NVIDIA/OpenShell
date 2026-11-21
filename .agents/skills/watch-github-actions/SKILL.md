@@ -139,7 +139,9 @@ keep their hosted runners. Confirm the runner name in the job details before
 attributing a result to GKE. For a job-container or PostgreSQL startup failure,
 check the runner pod's Docker sidecar first. A missing `gh` executable or
 Cachix's `$USER must be set` error indicates incomplete runner bootstrap.
-Rust jobs report shared memcached
+For a preloaded image, `setup-nix` verifies its global Cachix substituter and
+skips adding it again. A cache-configuration permission failure indicates the
+image/setup contract is out of sync. Rust jobs report shared memcached
 sccache statistics; distinguish backend connectivity errors from compiler/test
 failures. See `CI.md` for the trial scope and cache setup.
 
