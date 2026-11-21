@@ -30,14 +30,12 @@
 /tasks/scripts/check_review_readiness_test.py @ai-openshell/maintainers
 /tasks/scripts/check_reviewer_collaborators.py @ai-openshell/maintainers
 /tasks/scripts/check_reviewer_collaborators_test.py @ai-openshell/maintainers
+/.agents/agents/labeler/ @ai-openshell/maintainers
+/.agents/skills/label-issue @ai-openshell/maintainers
 
 # PR issue acceptance checks
 /tasks/scripts/check_issue_acceptance.cjs @ai-openshell/maintainers
 /tasks/scripts/check_issue_acceptance.test.cjs @ai-openshell/maintainers
-
-# Accepted-work classification
-/tasks/scripts/label_accepted_work.py @ai-openshell/maintainers
-/tasks/scripts/label_accepted_work_test.py @ai-openshell/maintainers
 
 # Auditable SBOM check
 /tasks/scripts/verify-image-sbom.sh @ai-openshell/maintainers

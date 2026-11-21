@@ -10,17 +10,20 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from check_maintainer_approval import parse_maintainers
-from label_accepted_work import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tasks" / "scripts"))
+
+from acceptance import (
     CLOSING_ISSUES_QUERY,
     check_issue_accepted_work,
     check_pr_accepted_work,
 )
-from label_issue_policy import load_taxonomy
+from check_maintainer_approval import parse_maintainers
+from policy import load_taxonomy
 from stale_closure import is_stale_closed
 
 LIMIT = 2 * 1024 * 1024

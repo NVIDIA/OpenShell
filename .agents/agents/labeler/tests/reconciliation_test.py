@@ -12,10 +12,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from label_issue import _lock_path, apply, main, prepare, preview
-from label_issue_evidence import expand_evidence
-from label_issue_evidence_test import API, REPO, ROOT
-from label_issue_github import GitHubError
+from evidence import expand_evidence
+from evidence_test import API, REPO, ROOT
+from github import GitHubError
+from reconciliation import _lock_path, apply, main, prepare, preview
 
 
 class LiveAPI(API):
@@ -499,8 +499,8 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(self.api.writes, [])
 
     def test_final_packet_omission_does_not_credit_intermediate_body_delivery(self):
-        from label_issue_evidence import prepare_snapshot
-        from label_issue_policy import is_inspected_source, validate_result
+        from evidence import prepare_snapshot
+        from policy import is_inspected_source, validate_result
 
         self.api.item["pull_request"] = {"url": "pull"}
         self.api.pull.update(body="x" * 50000, changed_files=0)
@@ -508,7 +508,7 @@ class BoundaryTests(unittest.TestCase):
             {"id": i, "body": "context", "user": {"login": "reader", "type": "User"}}
             for i in range(30)
         ]
-        with mock.patch("label_issue_evidence.LIMIT", 65536):
+        with mock.patch("evidence.LIMIT", 65536):
             standalone = prepare_snapshot(
                 REPO, 3, Path(self.temp.name) / "standalone", api=self.api
             )
@@ -747,7 +747,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertFalse(report["checkpoint_verified"])
 
     def test_inspecting_an_ordinary_comment_does_not_break_next_unchanged_skip(self):
-        from label_issue_evidence import expand_evidence
+        from evidence import expand_evidence
 
         self.api.collections["comments"] = [
             {
@@ -1067,8 +1067,8 @@ class BoundaryTests(unittest.TestCase):
         )
 
     def test_deadline_429_transport_fields_survive_actual_client_to_prepare(self):
-        from label_issue_github import GitHubClient
-        from label_issue_github_test import Clock, Runner, response
+        from github import GitHubClient
+        from github_test import Clock, Runner, response
 
         clock = Clock()
         client = GitHubClient(
@@ -1091,8 +1091,8 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(report["telemetry"]["requests"], 1)
 
     def test_prepare_never_skips_valid_candidate_with_approved_temporary_leftover(self):
-        import label_issue as core
-        import label_issue_checkpoint as cp
+        import checkpoint as cp
+        import reconciliation as core
 
         self.api.labels.append("meta:labeler-checkpoint")
         snapshot = self.prepared()

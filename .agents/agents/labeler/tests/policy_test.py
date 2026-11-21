@@ -5,7 +5,7 @@
 import copy
 import unittest
 
-from label_issue_policy import (
+from policy import (
     format_report,
     load_taxonomy,
     plan_labels,

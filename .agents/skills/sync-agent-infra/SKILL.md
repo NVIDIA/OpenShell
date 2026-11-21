@@ -35,13 +35,13 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 | SBOM workflow | `sbom` |
 | RFC workflow | `create-rfc` |
 
-Search both `skills/` and `.agents/skills/` for affected commands, fields, and components; the map is a starting point.
+Search `skills/`, `.agents/skills/`, and `.agents/agents/` for affected commands, fields, and components; follow discovery aliases to their canonical skill directories.
 
 ## Consistency check
 
-1. Compare `skills/*/SKILL.md` and `.agents/skills/*/SKILL.md` with the inventories in `CONTRIBUTING.md`. Public skills must work outside a checkout and use installed CLI help and published documentation. Contributor skills must set `metadata.internal: true`. Confirm names are unique and local links resolve.
+1. Compare `skills/*/SKILL.md`, `.agents/skills/*/SKILL.md`, and `.agents/agents/*/skills/*/SKILL.md` with the inventories in `CONTRIBUTING.md`. Public skills must work outside a checkout and use installed CLI help and published documentation. Contributor skills must set `metadata.internal: true`. Discovery aliases and their canonical directories represent one skill; confirm other names are unique and local links resolve.
 2. Compare `crates/` with the architecture table in `AGENTS.md`. Check the public and contributor skill rows.
-3. Check issue guidance against [Label Discovery](../../../CONTRIBUTING.md#label-discovery), [accepted work](../../../CONTRIBUTING.md#accepted-work), and [`label-issue`](../label-issue/SKILL.md). Preserve caller confirmation rules and phase authorization. Skills use `state:*` definitions without duplicating the label inventory or depending on `agent:*` labels.
+3. Check issue guidance against [Label Discovery](../../../CONTRIBUTING.md#label-discovery), [accepted work](../../../CONTRIBUTING.md#accepted-work), and [`label-issue`](../../agents/labeler/skills/label-issue/SKILL.md). Preserve caller confirmation rules and phase authorization. Skills use `state:*` definitions without duplicating the label inventory or depending on `agent:*` labels.
 4. Check issue templates, `create-github-issue`, `create-spike`, and `triage-issue` for the first-hand OpenShell User Story, OpenShell-only bug reproduction, notional UX examples, and consideration of applicable extension points.
 5. Check the PR template, `create-github-pr`, `build-from-issue`, `fix-security-issue`, and `CONTRIBUTING.md`: every PR must close an existing issue covering its scope, except automated dependency updates and build or flaky-test fixes from authors with write access, as described in `CONTRIBUTING.md`. Multi-PR work needs an issue per PR; a separate issue may track the overall effort.
 6. Check contributor branch instructions and examples against Branch Names in `CONTRIBUTING.md`; AGENTS.md and skills should refer to that convention. Check `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/workflows/`, `.agents/agents/`, and related skill cross references for stale workflow statements. Keep user-facing documentation changes minimal and avoid duplicated internal explanations.

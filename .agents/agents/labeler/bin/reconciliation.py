@@ -20,10 +20,10 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-import label_issue_checkpoint as checkpoint
-import label_issue_evidence as evidence
-from label_issue_github import GitHubClient
-from label_issue_policy import format_report, is_inspected_source, plan_labels
+import checkpoint as checkpoint
+import evidence as evidence
+from github import GitHubClient
+from policy import format_report, is_inspected_source, plan_labels
 
 # Bump when classification or reconciliation semantics change.
 POLICY_VERSION = "openshell-labeler-policy-v5"

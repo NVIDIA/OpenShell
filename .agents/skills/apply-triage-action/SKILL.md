@@ -34,7 +34,7 @@ Before any external write, re-read the target and determine whether it materiall
 
 You MUST ALWAYS preview the exact payload, item ID, source report, and canonical target, then receive explicit confirmation for each individual external write. Selecting or deferring an item is not confirmation; comments, label changes, and closures require separate confirmations. Revalidate immediately before execution; changed payloads require a new preview and confirmation. Never reuse confirmation for a later invocation.
 
-Use the [`/label-issue` skill](../label-issue/SKILL.md) to apply and reconcile labels. Pass triage assessment outcomes through its assessment-only path when classification must stay unchanged.
+Use the [`/label-issue` skill](../../agents/labeler/skills/label-issue/SKILL.md) to apply and reconcile labels. Pass triage assessment outcomes through its assessment-only path when classification must stay unchanged.
 
 Apply the confirmation rule above to every request in `mutation_requests`, including checkpoint bookkeeping. Pass the confirmed preview to `apply --expected-preview`.
 

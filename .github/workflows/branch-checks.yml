@@ -624,8 +624,12 @@ jobs:
       - name: Test release qualification summary
         run: mise run test:qualification-summary
 
-      - name: Test accepted-work library, review-readiness, and issue labeling
-        run: "mise run test:accepted-work ::: test:review-readiness ::: test:label-issue"
+      - name: Test review readiness and stale closure provenance
+        run: "mise run test:review-readiness ::: test:stale-closure"
+
+      - name: Test labeling agent
+        run: mise run test:labeling-agent
+
   python-sdk-freeze:
     # The Python SDK moved to ai-openshell/sdk-python (#5287), which imported it
     # at v0.1.7. Its files stay only until core removes them, so PRs must not

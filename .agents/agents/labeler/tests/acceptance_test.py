@@ -9,7 +9,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from label_accepted_work import (
+from acceptance import (
     ACCEPTED_LABEL,
     ClosingIssue,
     check_pr_accepted_work,
@@ -120,7 +120,7 @@ class PredicateTests(unittest.TestCase):
 
 class GitHubAdapterTests(unittest.TestCase):
     def test_structured_evidence_for_accepted_authorities(self):
-        from label_accepted_work import evaluate_pr_accepted_work
+        from acceptance import evaluate_pr_accepted_work
 
         for author, permission, expected in (
             ("MAINTAINER", None, {"basis": "maintainer"}),
@@ -138,7 +138,7 @@ class GitHubAdapterTests(unittest.TestCase):
                 self.assertEqual(result, expected)
 
     def test_structured_evidence_names_qualifying_issue_and_relationship(self):
-        from label_accepted_work import evaluate_pr_accepted_work
+        from acceptance import evaluate_pr_accepted_work
 
         api = mock.Mock(
             side_effect=[
@@ -154,7 +154,7 @@ class GitHubAdapterTests(unittest.TestCase):
         )
 
     def test_structured_evidence_for_issue_author_and_unaccepted_work(self):
-        from label_accepted_work import evaluate_pr_accepted_work
+        from acceptance import evaluate_pr_accepted_work
 
         api = mock.Mock(
             side_effect=[
@@ -320,7 +320,7 @@ class GitHubAdapterTests(unittest.TestCase):
 
 class IssueAdapterTests(unittest.TestCase):
     def test_recorded_acceptance_uses_paginated_labels(self):
-        from label_accepted_work import check_issue_accepted_work
+        from acceptance import check_issue_accepted_work
 
         api = mock.Mock(return_value=[{"name": ACCEPTED_LABEL}])
         self.assertTrue(
@@ -333,7 +333,7 @@ class IssueAdapterTests(unittest.TestCase):
         )
 
     def test_authority_and_errors(self):
-        from label_accepted_work import check_issue_accepted_work
+        from acceptance import check_issue_accepted_work
 
         item = {"number": 9, "user": {"login": "x"}}
         api = mock.Mock(side_effect=[[], {"permission": "write"}])
@@ -345,7 +345,7 @@ class IssueAdapterTests(unittest.TestCase):
             check_issue_accepted_work(REPO, item, {"m"}, api=api)
 
     def test_issue_adapter_rejects_prs_instead_of_using_recorded_pr_label(self):
-        from label_accepted_work import check_issue_accepted_work
+        from acceptance import check_issue_accepted_work
 
         api = mock.Mock(return_value=[{"name": ACCEPTED_LABEL}])
         with self.assertRaises(ValueError):
@@ -357,7 +357,7 @@ class IssueAdapterTests(unittest.TestCase):
             )
 
     def test_maintainer_issue_needs_no_permission_lookup(self):
-        from label_accepted_work import check_issue_accepted_work
+        from acceptance import check_issue_accepted_work
 
         api = mock.Mock(return_value=[])
         self.assertTrue(
@@ -368,7 +368,7 @@ class IssueAdapterTests(unittest.TestCase):
         self.assertEqual(api.call_count, 1)
 
     def test_noncollaborator_issue_404_is_unaccepted_other_errors_propagate(self):
-        from label_accepted_work import check_issue_accepted_work
+        from acceptance import check_issue_accepted_work
 
         item = {"number": 9, "user": {"login": "x"}}
         for status in (404, 403, 429, 500):

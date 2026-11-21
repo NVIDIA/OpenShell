@@ -28,8 +28,13 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parents[2] / ".agents" / "agents" / "labeler" / "bin"),
+)
+
+from acceptance import ACCEPTED_LABEL, evaluate_pr_accepted_work
 from check_maintainer_approval import parse_maintainers
-from label_accepted_work import ACCEPTED_LABEL, evaluate_pr_accepted_work
 
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
 LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
