@@ -204,6 +204,18 @@ The same process exiting with status 3:
 OCSF PROC:TERMINATE [INFO] /usr/bin/sleep(49) [exit:3]
 ```
 
+With `ocsf_process_exec_enabled`, a shell in the sandbox running `/usr/bin/true`:
+
+```text
+OCSF PROC:LAUNCH [INFO] /usr/bin/true(84)
+```
+
+Execs the sandbox did not record because they exceeded its rate:
+
+```text
+OCSF PROC:OTHER [LOW] /.openshell/runtime/openshell-sandbox(1) [count:251]
+```
+
 A policy reload after a settings change:
 
 ```text

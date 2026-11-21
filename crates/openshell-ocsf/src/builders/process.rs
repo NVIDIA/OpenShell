@@ -24,6 +24,7 @@ pub struct ProcessActivityBuilder<'a, ActorState = MissingActor> {
     message: Option<String>,
     time_ms: Option<i64>,
     uid: Option<String>,
+    count: Option<u64>,
     actor_state: std::marker::PhantomData<ActorState>,
 }
 
@@ -59,6 +60,7 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
             message: None,
             time_ms: None,
             uid: None,
+            count: None,
             actor_state: std::marker::PhantomData,
         }
     }
@@ -80,6 +82,7 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
             message: self.message,
             time_ms: self.time_ms,
             uid: self.uid,
+            count: self.count,
             actor_state: std::marker::PhantomData,
         }
     }
@@ -110,6 +113,12 @@ impl<ActorState> ProcessActivityBuilder<'_, ActorState> {
     #[must_use]
     pub fn time(mut self, time_ms: i64) -> Self {
         self.time_ms = Some(time_ms);
+        self
+    }
+    /// How many occurrences the event stands for.
+    #[must_use]
+    pub fn count(mut self, count: u64) -> Self {
+        self.count = Some(count);
         self
     }
     /// Replace the random event identifier with one that repeats when the
@@ -147,6 +156,9 @@ impl ProcessActivityBuilder<'_, HasActor> {
         );
         if let Some(time_ms) = self.time_ms {
             base.set_time(time_ms);
+        }
+        if let Some(count) = self.count {
+            base.set_count(count);
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
@@ -218,5 +230,21 @@ mod tests {
         let json = event.to_json().unwrap();
         assert_eq!(json["time"], 1_793_750_401_000_i64);
         assert_eq!(json["metadata"]["uid"], "proc:42:1793750400123:exit");
+    }
+
+    #[test]
+    fn process_activity_carries_a_count() {
+        let ctx = test_sandbox_context();
+        let event = ProcessActivityBuilder::new(&ctx)
+            .activity(ActivityId::Other)
+            .process(Process::new("openshell-sandbox", 1))
+            .actor_process(Process::new("openshell-sandbox", 1))
+            .count(12)
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["count"], 12);
+        let round_trip: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, event);
     }
 }

@@ -864,6 +864,9 @@ pub enum Request {
     AcceptNetwork,
     ReadProcessEvents {
         after_sequence: u64,
+        /// Whether the runtime records each exec in the workload from now on.
+        /// `None` keeps its current choice.
+        executions: Option<bool>,
     },
 }
 
@@ -978,9 +981,13 @@ impl fmt::Debug for Request {
                 .finish(),
             Self::OpenMediation => formatter.write_str("OpenMediation"),
             Self::AcceptNetwork => formatter.write_str("AcceptNetwork"),
-            Self::ReadProcessEvents { after_sequence } => formatter
+            Self::ReadProcessEvents {
+                after_sequence,
+                executions,
+            } => formatter
                 .debug_struct("ReadProcessEvents")
                 .field("after_sequence", after_sequence)
+                .field("executions", executions)
                 .finish(),
         }
     }
@@ -1066,11 +1073,25 @@ pub struct ProcessEventWire {
     pub time_ms: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessEventKindWire {
     Launched,
     Exited(ExitStatusWire),
+    /// The process replaced `previous_executable` with the event's
+    /// executable. `parent_executable` is its parent's at the time.
+    Executed {
+        previous_executable: String,
+        parent_executable: String,
+    },
+    /// Exec events not recorded because they exceeded the runtime's rate. The
+    /// event's process is the runtime.
+    Suppressed {
+        count: u64,
+    },
+    /// A process whose exec the runtime recorded exited, with its status when
+    /// the runtime could read it.
+    Ended(Option<ExitStatusWire>),
 }
 
 /// Sandbox-monotonic timing carried across the boundary protocol.

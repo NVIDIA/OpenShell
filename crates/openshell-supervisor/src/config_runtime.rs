@@ -689,6 +689,7 @@ impl ConfigRuntime {
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_process_exec_setting(&result.settings);
         report_deprecated_ocsf_schema_version(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
@@ -1296,6 +1297,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         runtime.applied_revision = Some(sandbox_config_revision(&result));
                     }
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_process_exec_setting(&result.settings);
                     report_deprecated_ocsf_schema_version(
                         &ctx.ocsf_schema_version,
                         &result.settings,
@@ -1341,6 +1343,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
                 (InitialPollDisposition::TrackOnly, _) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_process_exec_setting(&result.settings);
                     report_deprecated_ocsf_schema_version(
                         &ctx.ocsf_schema_version,
                         &result.settings,
@@ -1505,6 +1508,14 @@ fn apply_ocsf_json_setting(
     if new_ocsf != prev_ocsf {
         info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
     }
+}
+
+fn apply_process_exec_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    crate::process_activity::request_exec_events(
+        extract_bool_setting(settings, "ocsf_process_exec_enabled").unwrap_or(false),
+    );
 }
 
 /// Extract a bool value from an effective setting, if present.
@@ -1752,6 +1763,20 @@ mod tests {
         apply_ocsf_json_setting(&enabled, &settings);
 
         assert!(enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn process_exec_setting_requests_exec_events_while_set() {
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            "ocsf_process_exec_enabled".to_string(),
+            effective_bool(true),
+        );
+        apply_process_exec_setting(&settings);
+        assert!(process_activity::exec_events_requested());
+
+        apply_process_exec_setting(&std::collections::HashMap::new());
+        assert!(!process_activity::exec_events_requested());
     }
 
     #[test]

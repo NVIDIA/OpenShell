@@ -111,7 +111,7 @@ pub use finding::DetectionFindingBuilder;
 pub use http::HttpActivityBuilder;
 pub use lifecycle::AppLifecycleBuilder;
 pub use network::NetworkActivityBuilder;
-pub use process::ProcessActivityBuilder;
+pub use process::{HasActor, ProcessActivityBuilder};
 pub use ssh::SshActivityBuilder;
 
 use std::net::IpAddr;

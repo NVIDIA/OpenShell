@@ -115,6 +115,13 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
+    // When true the sandbox records each exec in the workload and the
+    // supervisor emits it as OCSF Process Activity. Defaults to false.
+    RegisteredSetting {
+        key: "ocsf_process_exec_enabled",
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
     // Deprecated and ignored: OpenShell emits OCSF 1.8.0 only. Still
     // registered so existing values load; the supervisor reports a set value.
     RegisteredSetting {

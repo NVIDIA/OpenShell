@@ -252,7 +252,13 @@ fn thread_group_of(tid: u32) -> Option<u32> {
         .ok()
 }
 
-fn read_path(tid: u32, mut address: u64) -> io::Result<String> {
+pub fn read_path(tid: u32, address: u64) -> io::Result<String> {
+    String::from_utf8(read_path_bytes(tid, address)?)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// A NUL-terminated path in `tid`'s memory, as the bytes the kernel sees.
+pub fn read_path_bytes(tid: u32, mut address: u64) -> io::Result<Vec<u8>> {
     if address == 0 {
         return Err(io::Error::from_raw_os_error(libc::EFAULT));
     }
@@ -266,7 +272,7 @@ fn read_path(tid: u32, mut address: u64) -> io::Result<String> {
         task_memory::read_exact(tid, address, &mut chunk)?;
         if let Some(end) = chunk.iter().position(|byte| *byte == 0) {
             path.extend_from_slice(&chunk[..end]);
-            return String::from_utf8(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL));
+            return Ok(path);
         }
         path.extend_from_slice(&chunk);
         address += length as u64;

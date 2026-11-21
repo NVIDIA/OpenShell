@@ -372,6 +372,8 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_rt_sigqueueinfo,
         libc::SYS_openat,
         libc::SYS_openat2,
+        libc::SYS_execve,
+        libc::SYS_execveat,
     ];
     syscalls.extend(
         crate::linux::process_sched::MEDIATED_PROCESS_SCHED_SYSCALLS

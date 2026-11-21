@@ -696,6 +696,9 @@ fn dispatch_notification(
     if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
         return queues.provider_files.handle_open(&listener, notification);
     }
+    if syscall == libc::SYS_execve || syscall == libc::SYS_execveat {
+        return crate::process_events::observe_exec(&listener, notification);
+    }
     #[cfg(target_arch = "x86_64")]
     if syscall == libc::SYS_open {
         return queues.provider_files.handle_open(&listener, notification);
