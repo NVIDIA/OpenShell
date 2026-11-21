@@ -553,6 +553,8 @@ jobs:
           chart-version: 0.0.0-dev
           app-version: dev
           release-kind: dev
+          registry-namespace: ghcr.io/ai-openshell/openshell
+          image-registry: ghcr.io/ai-openshell
           pin-sha: ${{ github.sha }}
 
   publish-fern-docs:

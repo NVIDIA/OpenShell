@@ -381,6 +381,9 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
     env:
       KIND_CLUSTER_NAME: release-canary-${{ github.run_id }}
       RELEASE_NAME: openshell
@@ -408,10 +411,23 @@ jobs:
       - name: Install Agent Sandbox controller
         run: bash e2e/support/install-agent-sandbox.sh
 
+      - name: Pull dev runtime images into kind
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          for component in gateway sandbox supervisor; do
+            image="ghcr.io/ai-openshell/openshell/${component}:dev"
+            docker pull "$image"
+            kind load docker-image "$image" --name "$KIND_CLUSTER_NAME"
+          done
+
       - name: Install OpenShell Helm chart from GHCR OCI
         run: |
           set -euo pipefail
-          helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
+          helm install "$RELEASE_NAME" oci://ghcr.io/ai-openshell/openshell/helm-chart \
             --version 0.0.0-dev \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \
